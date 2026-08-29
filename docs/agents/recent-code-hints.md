@@ -3815,6 +3815,61 @@ Every one of the ~25 whole-tree gates had the same exposure. Two rules now:
   all. `name not in observed or observed[name] != values[name]` is exactly
   `observed.get(name) != values[name]` whenever the right-hand side cannot be None —
   prove that side before converting, and say how you proved it.
+- **2026-08-29 — what a `@trust_boundary` suppression walk actually follows
+  (MEASURED, and it CORRECTS the guidance in circulation).** Three throwaway
+  probe modules scanned under a private `--root` with the allowlist disabled
+  (tier-B26, Wave 4) settle what `source_param` propagates through. Read the
+  KEEP/LOSE table before you place a boundary; guessing costs a redesign.
+  - KEEP: `x = helper(param)` — a helper's RETURN VALUE **does** carry the
+    trail. `_assign_targets_from_value` marks a target derived when the RHS
+    *mentions* a derived name (`expression_depends_on_current_names`, a
+    whole-subtree scan), NOT via `subject_is_rooted`. Earlier lane briefs said
+    helper returns lose the trail; that is wrong. It is why
+    `_validate_tf_binding_receipt(path, ...)` can carry `source_param="path"`
+    while the document arrives as `_read_protected_document(path)`.
+  - KEEP: `json.loads(param["k"])` outside a try; `for item in derived:`;
+    comprehension and genexp generators over a derived name or subscript;
+    branched assignment (`if: x = p["a"] else: x = p["b"]`); `list(...)` and
+    `cast(...)`-style wrapping of a derived value.
+  - **LOSE: a name assigned inside a `try:` body and read AFTER the try.** The
+    visitor intersects derived-name snapshots across the handler paths and the
+    handler does not assign the name — true whether the handler raises,
+    returns, or reassigns. Reading the name INSIDE the same try keeps it.
+    **This is why both exemplars (`ecs_metadata.fetch_task_identity`,
+    `operator_telemetry.AWSOperatorTelemetryQueries._trace_documents`) wrap the
+    WHOLE parse in ONE `try:`, `raise ValueError` internally, and convert in the
+    handler.** That shape is not stylistic; it is what keeps the trail. Write
+    every new boundary that way.
+  - LOSE: nested `def` / closure bodies (`iter_own_scope` stops at nested
+    scopes) — hoist the closure to a module-level named projection with its own
+    boundary.
+  - LOSE: `zip(...)` and `enumerate(...)` loop targets — the iter is a `Call`
+    whose func is a bare `Name`, so `subject_is_rooted` is False. Do NOT drop
+    `strict=True` or rewrite into index arithmetic to make them rootable; that
+    trades a real guarantee for a hidden finding. Rationalise those sites.
+  - LOSE: `cast(T, derived["k"]).get(...)` — `subject_is_rooted` descends
+    `Call.func`, which bottoms out at `Name("cast")`. A `cast` in the receiver
+    position severs the trail even though a `cast` on the RHS of an assignment
+    does not.
+  - Mechanics worth knowing before you write the decorator: `suppresses=` may
+    only ever name R1 and R5, and the honest minimal set is the house style
+    (`("R1",)` and `("R5",)` are both common in the tree). A boundary that
+    returns a sentinel instead of raising is an `observation_boundary`, takes no
+    `test_ref`/`test_fingerprint`, and needs no test — but the gate mechanically
+    proves no `raise` in its body is control-dependent on a derived guard.
+    NEVER hand-compute `test_fingerprint`: write the decorator without one and
+    paste the value `elspeth-lints check --rules trust_boundary.tests` reports.
+    A `test_ref` must resolve to a test whose OWN body holds the
+    `pytest.raises`, calls the decorated function directly through
+    `source_param`, and names an exception the `invariant` prose also names.
+    Pointing two boundaries at one shared parametrized test works, but any lane
+    that later adds a param case to it will trip
+    `R_TB_TESTS_FINGERPRINT_MISMATCH`.
+  - One shape that looks like a fix and is not: extracting a
+    `_decode_or_none(raw)` helper to escape the try-body loss introduces a NEW
+    R6 whenever the helper's handler returns a bare `None`. Either move the
+    reads into the existing try, or give the extracted helper a raising
+    contract (tier-B26 measured both).
 
 - **2026-08-25 — pdf_rasterize / out-of-process render seam.** First plugin in
   the tree to load a native library and to use `setrlimit`; both traps are

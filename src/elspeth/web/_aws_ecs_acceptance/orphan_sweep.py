@@ -15,6 +15,8 @@ from typing import Any, cast
 
 from botocore.exceptions import ClientError
 
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+
 from .contracts import AcceptanceCheckError, _sha256, _task_definition_family, _utc_timestamp
 from .manifest_schema import _load_retained_evidence, _read_control_manifest
 from .receipt_contracts import _validate_bounded_receipt_document
@@ -122,6 +124,16 @@ def _build_orphan_sweep_clients(region: str) -> OrphanSweepClients:
         raise AcceptanceCheckError("orphan_sweep_runtime") from None
 
 
+@observation_boundary(
+    tier=3,
+    source="exception raised by a boto3 client call, and the Error envelope a botocore ClientError carries",
+    source_param="exc",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns the provider error code only when the exception is a botocore ClientError carrying a string "
+        "Error.Code, and None for every other exception or response shape; never raises and never invents a code"
+    ),
+)
 def _aws_error_code(exc: Exception) -> str | None:
     if not isinstance(exc, ClientError):
         return None
@@ -155,6 +167,21 @@ _ORPHAN_NOT_FOUND_CODES = frozenset(
 )
 
 
+@trust_boundary(
+    tier=3,
+    source="one bound boto3 client operation and the response object it returns",
+    source_param="method",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') on any provider error other than the closed set of "
+        "not-found codes, and on a response that is not a mapping; returns None only for a resource the provider "
+        "reports absent"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_orphan_sweep_botocore.py::test_unmodelled_client_error_code_is_projected_as_a_sweep_api_failure"
+    ),
+    test_fingerprint="5531925bb912eeb5c1f4d11ba4233b388dbf99819c464681d5f26f29c0619008",
+)
 def _orphan_call(method: Callable[..., object], **kwargs: object) -> Mapping[str, object] | None:
     try:
         response = method(**kwargs)
@@ -167,6 +194,18 @@ def _orphan_call(method: Callable[..., object], **kwargs: object) -> Mapping[str
     return response
 
 
+@trust_boundary(
+    tier=3,
+    source="one AWS list-operation response envelope returned through _orphan_call",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') when the named collection is not a list or carries more "
+        "than the bounded item ceiling; returns an empty list only for an absent resource"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_orphan_response_items_rejects_unbounded_or_non_list_collections",
+    test_fingerprint="8dc14be0d08f6b20f15e7db576e2eb40ab1d6e35a47cfca548431ee5d7d4fd51",
+)
 def _orphan_response_items(response: Mapping[str, object] | None, field: str) -> list[object]:
     if response is None:
         return []
@@ -176,6 +215,19 @@ def _orphan_response_items(response: Mapping[str, object] | None, field: str) ->
     return items
 
 
+@trust_boundary(
+    tier=3,
+    source="one bound boto3 paginated client operation and the continuation tokens its responses carry",
+    source_param="method",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') on a continuation token that is not a string, on a token "
+        "the provider has already served, and on a page walk that exceeds the bounded page or item ceiling; never "
+        "follows a cycle and never returns an unbounded collection"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_orphan_paged_items_rejects_repeated_and_non_string_continuation_tokens",
+    test_fingerprint="0f8be17cfe7ecea989b7e3fff7908772445c3bdf17c92d6640a4a448a2a5d243",
+)
 def _orphan_paged_items(
     method: Callable[..., object],
     *,
@@ -215,6 +267,21 @@ def _orphan_inventory_values(inventory: Mapping[str, object]) -> tuple[dict[str,
     return values, orphan
 
 
+@trust_boundary(
+    tier=3,
+    source="ECS client whose DescribeTaskDefinition response carries the task definition's provider-held tag set",
+    source_param="client",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_binding') unless the described task definition carries a tag "
+        "list holding an ACCEPTANCE_RUN_ID tag whose value is this run; never treats an absent or malformed tag "
+        "list as ownership"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_orphan_sweep_botocore.py::test_describe_task_definition_without_the_run_tag_refuses_ownership"
+    ),
+    test_fingerprint="6a2a2a229d07c094885d2cb140b138889622b49a7eb41b1de16d1eba7658302c",
+)
 def _task_definition_owned(
     client: Any,
     task_definition_arn: str,
@@ -236,6 +303,19 @@ def _task_definition_owned(
         raise AcceptanceCheckError("orphan_sweep_binding")
 
 
+@trust_boundary(
+    tier=3,
+    source="X-Ray GetIndexingRules response items projected into the transaction-search baseline",
+    source_param="indexing_rules",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') on a rule that is not a mapping carrying exactly Name and "
+        "Rule (optionally ModifiedAt), on a duplicate or oversized rule name, on a Rule that is not exactly a "
+        "Probabilistic mapping, and on a sampling percentage that is not a finite number in 0..100"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_transaction_search_projection_rejects_malformed_indexing_rules",
+    test_fingerprint="7e7043e096ff0bbe060f7d3678f211ff89dcb5feb053069fad06cc5471b5ac9a",
+)
 def _transaction_search_projection(
     *,
     destination: object,
@@ -280,6 +360,198 @@ def _transaction_search_projection(
         "indexing_rules": sorted(projected_rules, key=lambda item: cast(str, item["name"])),
         "spans_log_group_present": spans_log_group_present,
     }
+
+
+@observation_boundary(
+    tier=3,
+    source="items of one AWS list-operation page, each expected to name a resource under a known field",
+    source_param="items",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "counts only items that are mappings whose named field holds one of the expected values; every other "
+        "shape, including a non-mapping item or an absent field, counts as no match and never raises"
+    ),
+)
+def _named_item_count(items: list[object], *, field: str, expected: frozenset[str]) -> int:
+    """Count page items whose ``field`` names one of the expected resources."""
+
+    return sum(isinstance(item, Mapping) and item.get(field) in expected for item in items)
+
+
+@trust_boundary(
+    tier=3,
+    source="IAM GetRole response for a role the inventory claims this run owns",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') unless the response carries a Role mapping whose RoleName "
+        "is exactly the role the sweep asked about; never accepts a response describing a different role"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_iam_role_identity_rejects_a_response_describing_another_role",
+    test_fingerprint="36b809ab9daa439bad11a3f60fa003c6f8367b4d149c44b06bc1f04b01b151e1",
+)
+def _assert_iam_role_identity(response: Mapping[str, object], *, role_name: str) -> None:
+    """Reject an IAM GetRole response that does not describe the requested role."""
+
+    role = response.get("Role")
+    if not isinstance(role, Mapping) or role.get("RoleName") != role_name:
+        raise AcceptanceCheckError("orphan_sweep_api")
+
+
+@trust_boundary(
+    tier=3,
+    source="CloudWatch Logs DescribeResourcePolicies page items",
+    source_param="policies",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') on any policy that is not a mapping carrying a string "
+        "policyName, then counts only the policies the inventory expected this run to own"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_resource_policy_count_rejects_policies_without_a_string_name",
+    test_fingerprint="25f7f2f3ccbc2020cb2a083ea87e85ca6be5869613732c75b8fbd7ff53bab889",
+)
+def _expected_resource_policy_count(policies: list[object], *, expected: frozenset[str]) -> int:
+    """Count surviving log resource policies this run is responsible for."""
+
+    survivors = 0
+    for policy in policies:
+        if not isinstance(policy, Mapping) or type(policy.get("policyName")) is not str:
+            raise AcceptanceCheckError("orphan_sweep_api")
+        if policy["policyName"] in expected:
+            survivors += 1
+    return survivors
+
+
+@observation_boundary(
+    tier=3,
+    source="one CloudWatch metric dimension entry from a ListMetrics page",
+    source_param="item",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "projects the dimension's Name and Value for ordering only; an absent field sorts as None and no shape is "
+        "asserted here, because the comparison against the expected dimension set is the admission test"
+    ),
+)
+def _metric_dimension_sort_key(item: Any) -> tuple[object, object]:
+    """Order one CloudWatch dimension entry for comparison against the inventory."""
+
+    return item.get("Name"), item.get("Value")
+
+
+@observation_boundary(
+    tier=3,
+    source="CloudWatch ListMetrics page items for one retained metric series",
+    source_param="metrics",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "counts only metrics that are mappings carrying exactly Namespace, MetricName and Dimensions, whose "
+        "namespace and name equal the retained query's and whose dimension list equals the expected set; every "
+        "other shape counts as no match and never raises"
+    ),
+)
+def _exact_metric_count(
+    metrics: list[object],
+    *,
+    namespace: object,
+    metric_name: object,
+    expected_dimensions: list[dict[str, str]],
+) -> int:
+    """Count ListMetrics entries that are exactly the retained series the inventory pins."""
+
+    return sum(
+        isinstance(metric, Mapping)
+        and set(metric) == {"Namespace", "MetricName", "Dimensions"}
+        and metric.get("Namespace") == namespace
+        and metric.get("MetricName") == metric_name
+        and isinstance(metric.get("Dimensions"), list)
+        and sorted(metric["Dimensions"], key=_metric_dimension_sort_key) == expected_dimensions
+        for metric in metrics
+    )
+
+
+@observation_boundary(
+    tier=3,
+    source="X-Ray GetSamplingRules page records",
+    source_param="records",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "counts only records that are mappings carrying a SamplingRule mapping whose RuleName is one this run "
+        "owns; every other shape counts as no match and never raises"
+    ),
+)
+def _sampling_rule_match_count(records: list[object], *, expected: frozenset[str]) -> int:
+    """Count surviving X-Ray sampling rules this run is responsible for."""
+
+    return sum(
+        isinstance(record, Mapping)
+        and isinstance(record.get("SamplingRule"), Mapping)
+        and record["SamplingRule"].get("RuleName") in expected
+        for record in records
+    )
+
+
+@observation_boundary(
+    tier=3,
+    source="X-Ray BatchGetTraces page traces",
+    source_param="traces",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns the Id of every trace that is a mapping carrying a string Id, and silently omits any other "
+        "shape; the caller compares the returned ids against the ids it requested, so an omission shows up as a "
+        "survivor rather than as a pass"
+    ),
+)
+def _observed_trace_ids(traces: list[object]) -> list[str]:
+    """Project the trace ids a BatchGetTraces page actually returned."""
+
+    return [
+        trace_id for trace in traces if isinstance(trace, Mapping) and type(trace.get("Id")) is str for trace_id in [cast(str, trace["Id"])]
+    ]
+
+
+@trust_boundary(
+    tier=3,
+    source="X-Ray GetTraceSegmentDestination response",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') on any destination outside the closed set of None, XRay "
+        "and CloudWatchLogs; never projects an unrecognised destination into the transaction-search baseline"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_trace_segment_destination_rejects_an_unrecognised_destination",
+    test_fingerprint="559978f56b5a94e8c586ccfd2087f0ec4885a5cae2344543f8f24ffe6c73ad36",
+)
+def _trace_segment_destination(response: Mapping[str, object]) -> object:
+    """Admit the X-Ray trace segment destination the account currently reports."""
+
+    destination = response.get("Destination")
+    if destination not in {None, "XRay", "CloudWatchLogs"}:
+        raise AcceptanceCheckError("orphan_sweep_api")
+    return destination
+
+
+@trust_boundary(
+    tier=3,
+    source="Resource Groups Tagging API GetResources page items for this run's tag",
+    source_param="mappings",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') on any mapping that is not a mapping carrying a string "
+        "ResourceARN, then counts every tagged ARN outside the set the sweep has already proved is deleting"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_tagged_resource_count_rejects_entries_without_a_string_arn",
+    test_fingerprint="c59fde703a1be67aa36eaa05fd6da9271de1e54b973675ca7e872e2ea9c5c35e",
+)
+def _unapproved_tagged_resource_count(mappings: list[object], *, allowed: set[str]) -> int:
+    """Count tagged resources that survived outside the approved deleting set."""
+
+    survivors = 0
+    for mapping in mappings:
+        if not isinstance(mapping, Mapping) or type(mapping.get("ResourceARN")) is not str:
+            raise AcceptanceCheckError("orphan_sweep_api")
+        if mapping["ResourceARN"] not in allowed:
+            survivors += 1
+    return survivors
 
 
 def orphan_sweep(
@@ -613,9 +885,7 @@ def orphan_sweep(
                     response = _orphan_call(clients.iam.get_role, RoleName=role_name)
                     counts["iam"]["queried"] += 1
                     if response is not None:
-                        role = response.get("Role")
-                        if not isinstance(role, Mapping) or role.get("RoleName") != role_name:
-                            raise AcceptanceCheckError("orphan_sweep_api")
+                        _assert_iam_role_identity(response, role_name=role_name)
                         counts["iam"]["unapproved_survivors"] += 1
                 resource_policies = _orphan_paged_items(
                     clients.logs.describe_resource_policies,
@@ -624,13 +894,12 @@ def orphan_sweep(
                     response_token="nextToken",
                     kwargs={"limit": 50},
                 )
-                expected_resource_policies = set(cast(list[str], orphan["log_resource_policy_names"]))
+                expected_resource_policies = frozenset(cast(list[str], orphan["log_resource_policy_names"]))
                 counts["logs"]["queried"] += 1
-                for policy in resource_policies:
-                    if not isinstance(policy, Mapping) or type(policy.get("policyName")) is not str:
-                        raise AcceptanceCheckError("orphan_sweep_api")
-                    if policy["policyName"] in expected_resource_policies:
-                        counts["logs"]["unapproved_survivors"] += 1
+                counts["logs"]["unapproved_survivors"] += _expected_resource_policy_count(
+                    resource_policies,
+                    expected=expected_resource_policies,
+                )
                 log_group_names = {
                     str(values[field]) for field in ("WEB_LOG_GROUP", "DOCTOR_LOG_GROUP", "ECS_DEPLOYMENT_EVENT_LOG_GROUP") if values[field]
                 } | set(cast(list[str], orphan["log_group_names"]))
@@ -643,8 +912,10 @@ def orphan_sweep(
                         kwargs={"logGroupNamePrefix": log_group_name, "limit": 50},
                     )
                     counts["logs"]["queried"] += 1
-                    counts["logs"]["unapproved_survivors"] += sum(
-                        isinstance(group, Mapping) and group.get("logGroupName") == log_group_name for group in groups
+                    counts["logs"]["unapproved_survivors"] += _named_item_count(
+                        groups,
+                        field="logGroupName",
+                        expected=frozenset({log_group_name}),
                     )
                 for dashboard_name in cast(list[str], orphan["cloudwatch_dashboard_names"]):
                     dashboards = _orphan_paged_items(
@@ -655,8 +926,10 @@ def orphan_sweep(
                         kwargs={"DashboardNamePrefix": dashboard_name},
                     )
                     counts["cloudwatch"]["queried"] += 1
-                    counts["cloudwatch"]["unapproved_survivors"] += sum(
-                        isinstance(entry, Mapping) and entry.get("DashboardName") == dashboard_name for entry in dashboards
+                    counts["cloudwatch"]["unapproved_survivors"] += _named_item_count(
+                        dashboards,
+                        field="DashboardName",
+                        expected=frozenset({dashboard_name}),
                     )
                 for alarm_name in cast(list[str], orphan["cloudwatch_alarm_names"]):
                     response = _orphan_call(clients.cloudwatch.describe_alarms, AlarmNames=[alarm_name], MaxRecords=100)
@@ -685,17 +958,13 @@ def orphan_sweep(
                         ({"Name": dimension["name"], "Value": dimension["value"]} for dimension in dimensions),
                         key=lambda item: (item["Name"], item["Value"]),
                     )
-                    exact = [
-                        metric
-                        for metric in metrics
-                        if isinstance(metric, Mapping)
-                        and set(metric) == {"Namespace", "MetricName", "Dimensions"}
-                        and metric.get("Namespace") == metric_query["namespace"]
-                        and metric.get("MetricName") == metric_query["metric_name"]
-                        and isinstance(metric.get("Dimensions"), list)
-                        and sorted(metric["Dimensions"], key=lambda item: (item.get("Name"), item.get("Value"))) == expected_dimensions
-                    ]
-                    if len(metrics) != 1 or len(exact) != 1:
+                    exact_matches = _exact_metric_count(
+                        metrics,
+                        namespace=metric_query["namespace"],
+                        metric_name=metric_query["metric_name"],
+                        expected_dimensions=expected_dimensions,
+                    )
+                    if len(metrics) != 1 or exact_matches != 1:
                         counts["cloudwatch"]["unapproved_survivors"] += max(1, abs(len(metrics) - 1))
                     else:
                         observed_retained_metrics += 1
@@ -706,11 +975,9 @@ def orphan_sweep(
                     response_token="NextToken",
                     kwargs={},
                 )
-                expected_groups = set(cast(list[str], orphan["xray_group_names"]))
+                expected_groups = frozenset(cast(list[str], orphan["xray_group_names"]))
                 counts["xray"]["queried"] += 1
-                counts["xray"]["unapproved_survivors"] += sum(
-                    isinstance(group, Mapping) and group.get("GroupName") in expected_groups for group in groups
-                )
+                counts["xray"]["unapproved_survivors"] += _named_item_count(groups, field="GroupName", expected=expected_groups)
                 sampling_rules = _orphan_paged_items(
                     clients.xray.get_sampling_rules,
                     item_field="SamplingRuleRecords",
@@ -718,13 +985,11 @@ def orphan_sweep(
                     response_token="NextToken",
                     kwargs={},
                 )
-                expected_sampling_rules = set(cast(list[str], orphan["xray_sampling_rule_names"]))
+                expected_sampling_rules = frozenset(cast(list[str], orphan["xray_sampling_rule_names"]))
                 counts["xray"]["queried"] += 1
-                counts["xray"]["unapproved_survivors"] += sum(
-                    isinstance(record, Mapping)
-                    and isinstance(record.get("SamplingRule"), Mapping)
-                    and record["SamplingRule"].get("RuleName") in expected_sampling_rules
-                    for record in sampling_rules
+                counts["xray"]["unapproved_survivors"] += _sampling_rule_match_count(
+                    sampling_rules,
+                    expected=expected_sampling_rules,
                 )
                 trace_ids = cast(list[str], orphan["xray_retained_trace_ids"])
                 for offset in range(0, len(trace_ids), 5):
@@ -736,12 +1001,7 @@ def orphan_sweep(
                     if _orphan_response_items(response, "UnprocessedTraceIds"):
                         raise AcceptanceCheckError("orphan_sweep_api")
                     counts["xray"]["queried"] += 1
-                    observed_trace_ids = [
-                        trace_id
-                        for trace in traces
-                        if isinstance(trace, Mapping) and type(trace.get("Id")) is str
-                        for trace_id in [cast(str, trace["Id"])]
-                    ]
+                    observed_trace_ids = _observed_trace_ids(traces)
                     if len(traces) != len(requested_trace_ids) or sorted(observed_trace_ids) != sorted(requested_trace_ids):
                         counts["xray"]["unapproved_survivors"] += max(1, abs(len(traces) - len(requested_trace_ids)))
                     else:
@@ -749,9 +1009,7 @@ def orphan_sweep(
                 destination_response = _orphan_call(clients.xray.get_trace_segment_destination)
                 if destination_response is None:
                     raise AcceptanceCheckError("orphan_sweep_api")
-                destination = destination_response.get("Destination")
-                if destination not in {None, "XRay", "CloudWatchLogs"}:
-                    raise AcceptanceCheckError("orphan_sweep_api")
+                destination = _trace_segment_destination(destination_response)
                 indexing_rules = _orphan_paged_items(
                     clients.xray.get_indexing_rules,
                     item_field="IndexingRules",
@@ -770,9 +1028,7 @@ def orphan_sweep(
                 transaction_projection = _transaction_search_projection(
                     destination=destination,
                     indexing_rules=indexing_rules,
-                    spans_log_group_present=any(
-                        isinstance(group, Mapping) and group.get("logGroupName") == "aws/spans" for group in spans_groups
-                    ),
+                    spans_log_group_present=_named_item_count(spans_groups, field="logGroupName", expected=frozenset({"aws/spans"})) > 0,
                 )
                 counts["xray"]["queried"] += 2
                 counts["logs"]["queried"] += 1
@@ -846,11 +1102,10 @@ def orphan_sweep(
                     )
                     counts["cognito"]["queried"] += 1
                     counts["cognito"]["unapproved_survivors"] += len(users)
-            for mapping in tagged:
-                if not isinstance(mapping, Mapping) or type(mapping.get("ResourceARN")) is not str:
-                    raise AcceptanceCheckError("orphan_sweep_api")
-                if mapping["ResourceARN"] not in allowed_deleting_task_definitions:
-                    counts["tagging"]["unapproved_survivors"] += 1
+            counts["tagging"]["unapproved_survivors"] += _unapproved_tagged_resource_count(
+                tagged,
+                allowed=allowed_deleting_task_definitions,
+            )
         except AcceptanceCheckError:
             raise
         except Exception:

@@ -6,9 +6,10 @@ import json
 import re
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.llm_profiles import LLMProfileSettings, validate_profile_alias
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
 from elspeth.web.composer.provider_config import infer_provider_from_model_name, infer_provider_from_unprefixed_model_name
@@ -126,6 +127,21 @@ def _scenario_inventory_hash(inventory: Mapping[str, object]) -> str:
     return _sha256(json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
 
+def _admit_scenario_value_json(raw: object) -> Any:
+    """Decode one JSON-encoded scenario value, or reject the inventory.
+
+    Every ``values`` entry is already pinned to ``str`` by
+    :func:`_validate_scenario_inventory` before this runs; the ``TypeError``
+    arm keeps the rejection honest for any other caller rather than letting a
+    non-string escape as an unhandled crash.
+    """
+
+    try:
+        return json.loads(cast(str, raw))
+    except (TypeError, json.JSONDecodeError):
+        raise AcceptanceCheckError("scenario_inventory_schema") from None
+
+
 def _validate_gateway_profiles(values: Mapping[str, object]) -> None:
     try:
         profile_payload = json.loads(cast(str, values["ELSPETH_WEB__LLM_PROFILES"]))
@@ -156,6 +172,20 @@ def _validate_gateway_profiles(values: Mapping[str, object]) -> None:
         raise AcceptanceCheckError("scenario_inventory_schema")
 
 
+@trust_boundary(
+    tier=3,
+    source="orphan_sweep section of an operator-protected AWS ECS acceptance scenario inventory document",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before any use on a payload that is not a mapping carrying exactly the "
+        "orphan-inventory fields, on any identity list that is oversized, duplicated, or not a list of bounded "
+        "control-free strings, on a malformed retained-metric query, event rule, or guardrail entry, and on a "
+        "tag_key that is not ACCEPTANCE_RUN_ID"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_manifest_schema_inventory.py::test_orphan_inventory_admission_rejects_a_foreign_document_shape",
+    test_fingerprint="b60ef83499a6ce3ebd2cca014fd3f00b9f07edc6994254f379743c3505c027f7",
+)
 def _validate_orphan_inventory(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict) or set(payload) != _ORPHAN_INVENTORY_FIELDS:
         raise AcceptanceCheckError("scenario_inventory_schema")
@@ -307,6 +337,20 @@ def _validate_orphan_inventory(payload: object) -> dict[str, object]:
     return payload
 
 
+@trust_boundary(
+    tier=3,
+    source="operator-protected Terraform binding receipt document named by the scenario inventory",
+    source_param="path",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before any use on a receipt that is not a mapping carrying exactly the "
+        "tf-binding v1 fields, on a receipt whose run, scenario, account, region, or backend posture does not "
+        "match the caller's expectation, on a malformed commit, digest, version, or workspace value, and on a "
+        "canonical digest that does not equal the expected sha256"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_manifest_schema_inventory.py::test_tf_binding_receipt_admission_rejects_a_foreign_document_shape",
+    test_fingerprint="b119fcdb0f54c2e97c1cdfe4b8b118862376fee62e6858fc566b0790eef697b5",
+)
 def _validate_tf_binding_receipt(
     path: Path,
     *,
@@ -496,6 +540,111 @@ def _validate_scenario_resource_bindings(
         raise AcceptanceCheckError("scenario_inventory_binding")
 
 
+@trust_boundary(
+    tier=3,
+    source="DOCTOR_NETWORK_CONFIGURATION value of an operator-protected AWS ECS acceptance scenario inventory",
+    source_param="raw",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before any use on a value that is not JSON, that is not an object carrying "
+        "exactly awsvpcConfiguration, or whose awsvpcConfiguration is not an object carrying exactly non-empty "
+        "subnets and securityGroups lists of non-empty strings plus an assignPublicIp of ENABLED or DISABLED"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_manifest_schema_inventory.py::test_doctor_network_configuration_admission_rejects_a_foreign_shape",
+    test_fingerprint="676736ca0a690c2c7fe35da85c439bbe62b5784f765442adf5f7a0088b2ae3b3",
+)
+def _validate_doctor_network_configuration(raw: object) -> None:
+    """Admit one doctor awsvpc network configuration, or reject the inventory."""
+
+    try:
+        network = json.loads(cast(str, raw))
+        if not isinstance(network, dict) or set(network) != {"awsvpcConfiguration"}:
+            raise ValueError
+        awsvpc = network["awsvpcConfiguration"]
+        if (
+            not isinstance(awsvpc, dict)
+            or set(awsvpc) != {"subnets", "securityGroups", "assignPublicIp"}
+            or not isinstance(awsvpc["subnets"], list)
+            or not awsvpc["subnets"]
+            or not isinstance(awsvpc["securityGroups"], list)
+            or not awsvpc["securityGroups"]
+            or awsvpc["assignPublicIp"] not in {"ENABLED", "DISABLED"}
+            or any(type(item) is not str or not item for item in [*awsvpc["subnets"], *awsvpc["securityGroups"]])
+        ):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise AcceptanceCheckError("scenario_inventory_schema") from None
+
+
+@trust_boundary(
+    tier=3,
+    source="FIRST_DEPLOY_FORWARD_ACTIONS / FIRST_DEPLOY_DISABLED_ACTIONS values of an operator-protected scenario inventory",
+    source_param="raw",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before any use on a value that is not JSON, that is not a non-empty list, "
+        "or that carries any element which is not a JSON object; otherwise returns the owned action list"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_manifest_schema_inventory.py::test_listener_action_admission_rejects_a_foreign_shape",
+    test_fingerprint="c9737b090e6017bd3e8e2c484b4201cc976aa4a70170448c85f8070f6a6b45c0",
+)
+def _admit_listener_actions(raw: object) -> list[Mapping[str, object]]:
+    """Admit one listener action list, or reject the inventory."""
+
+    try:
+        actions = json.loads(cast(str, raw))
+        if not isinstance(actions, list) or not actions or any(not isinstance(action, dict) for action in actions):
+            raise ValueError
+        return cast(list[Mapping[str, object]], actions)
+    except (TypeError, ValueError):
+        raise AcceptanceCheckError("scenario_inventory_schema") from None
+
+
+@observation_boundary(
+    tier=3,
+    source="one admitted listener action from an operator-protected AWS ECS acceptance scenario inventory",
+    source_param="action",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns True only for a forward action bound to the expected target group either directly or through a "
+        "ForwardConfig target list; every other shape returns False; never raises"
+    ),
+)
+def _action_forwards_to_target(action: Mapping[str, object], *, expected_target_group: object) -> bool:
+    """Return whether one listener action forwards to the expected target group."""
+
+    if action.get("Type") != "forward":
+        return False
+    if action.get("TargetGroupArn") == expected_target_group:
+        return True
+    forward_config = action.get("ForwardConfig")
+    if not isinstance(forward_config, Mapping):
+        return False
+    targets = forward_config.get("TargetGroups")
+    return isinstance(targets, list) and any(
+        isinstance(target, Mapping) and target.get("TargetGroupArn") == expected_target_group for target in targets
+    )
+
+
+@observation_boundary(
+    tier=3,
+    source="one admitted listener action from an operator-protected AWS ECS acceptance scenario inventory",
+    source_param="action",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns True only for a fixed-response action whose FixedResponseConfig is a mapping carrying "
+        "StatusCode 503; every other shape returns False; never raises"
+    ),
+)
+def _action_serves_disabled_fixed_response(action: Mapping[str, object]) -> bool:
+    """Return whether one listener action serves the disabled 503 fixed response."""
+
+    if action.get("Type") != "fixed-response":
+        return False
+    fixed_response = action.get("FixedResponseConfig")
+    return isinstance(fixed_response, Mapping) and fixed_response.get("StatusCode") == "503"
+
+
 def _validate_resolved_scenario_values(
     values: Mapping[str, object],
     *,
@@ -566,61 +715,17 @@ def _validate_resolved_scenario_values(
         or namespace not in bucket
     ):
         raise AcceptanceCheckError("scenario_inventory_schema")
-    try:
-        network = json.loads(cast(str, values["DOCTOR_NETWORK_CONFIGURATION"]))
-    except json.JSONDecodeError:
-        raise AcceptanceCheckError("scenario_inventory_schema") from None
-    if not isinstance(network, dict) or set(network) != {"awsvpcConfiguration"}:
-        raise AcceptanceCheckError("scenario_inventory_schema")
-    awsvpc = network["awsvpcConfiguration"]
-    if (
-        not isinstance(awsvpc, dict)
-        or set(awsvpc) != {"subnets", "securityGroups", "assignPublicIp"}
-        or not isinstance(awsvpc["subnets"], list)
-        or not awsvpc["subnets"]
-        or not isinstance(awsvpc["securityGroups"], list)
-        or not awsvpc["securityGroups"]
-        or awsvpc["assignPublicIp"] not in {"ENABLED", "DISABLED"}
-        or any(type(item) is not str or not item for item in [*awsvpc["subnets"], *awsvpc["securityGroups"]])
-    ):
-        raise AcceptanceCheckError("scenario_inventory_schema")
+    _validate_doctor_network_configuration(values["DOCTOR_NETWORK_CONFIGURATION"])
     listener_fields = {"FIRST_DEPLOY_LISTENER_RULE_ARN", "FIRST_DEPLOY_FORWARD_ACTIONS", "FIRST_DEPLOY_DISABLED_ACTIONS"}
     if any(not values[field] for field in listener_fields):
         raise AcceptanceCheckError("scenario_inventory_binding")
     for field in ("FIRST_DEPLOY_FORWARD_ACTIONS", "FIRST_DEPLOY_DISABLED_ACTIONS"):
-        try:
-            actions = json.loads(cast(str, values[field]))
-        except json.JSONDecodeError:
-            raise AcceptanceCheckError("scenario_inventory_schema") from None
-        if not isinstance(actions, list) or not actions or any(not isinstance(action, dict) for action in actions):
-            raise AcceptanceCheckError("scenario_inventory_schema")
+        actions = _admit_listener_actions(values[field])
         if field == "FIRST_DEPLOY_FORWARD_ACTIONS":
             target_group = values["TARGET_GROUP_ARN"]
-
-            def forwards_to_expected_target(
-                action: Mapping[str, object],
-                expected_target_group: object = target_group,
-            ) -> bool:
-                if action.get("Type") != "forward":
-                    return False
-                if action.get("TargetGroupArn") == expected_target_group:
-                    return True
-                forward_config = action.get("ForwardConfig")
-                if not isinstance(forward_config, Mapping):
-                    return False
-                targets = forward_config.get("TargetGroups")
-                return isinstance(targets, list) and any(
-                    isinstance(target, Mapping) and target.get("TargetGroupArn") == expected_target_group for target in targets
-                )
-
-            if not any(forwards_to_expected_target(cast(Mapping[str, object], action)) for action in actions):
+            if not any(_action_forwards_to_target(action, expected_target_group=target_group) for action in actions):
                 raise AcceptanceCheckError("scenario_inventory_binding")
-        elif not any(
-            action.get("Type") == "fixed-response"
-            and isinstance(action.get("FixedResponseConfig"), Mapping)
-            and cast(Mapping[str, object], action["FixedResponseConfig"]).get("StatusCode") == "503"
-            for action in actions
-        ):
+        elif not any(_action_serves_disabled_fixed_response(action) for action in actions):
             raise AcceptanceCheckError("scenario_inventory_binding")
 
     if scenario_id in {"A", "C"}:
@@ -672,6 +777,22 @@ def _validate_resolved_scenario_values(
             raise AcceptanceCheckError("scenario_inventory_schema")
 
 
+@trust_boundary(
+    tier=3,
+    source="operator-protected AWS ECS acceptance scenario inventory document (preapply or resolved phase)",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before any use on a payload that is not a mapping carrying exactly the "
+        "scenario-inventory v9 fields, on a schema, run, candidate, account, region, scenario, or phase that "
+        "does not match the caller's expectation, on a gateway identity that is absent when required or present "
+        "when forbidden, on a values mapping that is not exactly the scenario value fields of bounded "
+        "control-free strings, and on guardrail profile or default documents that are not JSON of the shape the "
+        "phase requires"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_manifest_schema_inventory.py::test_scenario_inventory_v9_rejects_invalid_gateway_identity_shape",
+    test_fingerprint="bd90bca61a241aaa3a3f54679c48ef889e8b19350e8819134543c421511585e7",
+)
 def _validate_scenario_inventory(
     payload: object,
     *,
@@ -802,10 +923,7 @@ def _validate_scenario_inventory(
     for name in PLUGIN_POLICY_ASSIGNMENT_NAMES:
         if name == "ELSPETH_WEB__DEFAULT_LLM_PROFILE":
             continue
-        try:
-            json.loads(cast(str, values[name]))
-        except json.JSONDecodeError:
-            raise AcceptanceCheckError("scenario_inventory_schema") from None
+        _admit_scenario_value_json(values[name])
     if scenario_id == "C":
         _validate_gateway_profiles(values)
     for field in (
@@ -835,17 +953,11 @@ def _validate_scenario_inventory(
     _control_path(values["SCENARIO_TF_VARS"])
     _control_path(values["SCENARIO_TF_BINDING_FILE"])
     orphan = _validate_orphan_inventory(payload["orphan_sweep"])
-    try:
-        guardrail_profiles_payload = json.loads(cast(str, values["ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES"]))
-    except json.JSONDecodeError:
-        raise AcceptanceCheckError("scenario_inventory_schema") from None
+    guardrail_profiles_payload = _admit_scenario_value_json(values["ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES"])
     if scenario_id == "C":
         if guardrail_profiles_payload != []:
             raise AcceptanceCheckError("scenario_inventory_schema")
-        try:
-            guardrail_defaults = json.loads(cast(str, values["ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES"]))
-        except json.JSONDecodeError:
-            raise AcceptanceCheckError("scenario_inventory_schema") from None
+        guardrail_defaults = _admit_scenario_value_json(values["ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES"])
         if guardrail_defaults != {} or orphan["bedrock_guardrails"] != []:
             raise AcceptanceCheckError("scenario_inventory_schema")
     elif expected_phase == "preapply":
@@ -863,10 +975,7 @@ def _validate_scenario_inventory(
             "aws_bedrock_content_safety",
         } or any(profile.region != aws_region for profile in guardrail_profiles):
             raise AcceptanceCheckError("scenario_inventory_binding")
-        try:
-            guardrail_defaults = json.loads(cast(str, values["ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES"]))
-        except json.JSONDecodeError:
-            raise AcceptanceCheckError("scenario_inventory_schema") from None
+        guardrail_defaults = _admit_scenario_value_json(values["ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES"])
         if (
             not isinstance(guardrail_defaults, dict)
             or set(guardrail_defaults)

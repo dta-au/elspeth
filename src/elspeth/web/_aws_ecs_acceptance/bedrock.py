@@ -31,6 +31,7 @@ from elspeth.contracts.errors import ExecutionError
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.orchestrator import prepare_for_run
@@ -128,6 +129,18 @@ def _suppress_process_output() -> Iterator[None]:
         restore()
 
 
+@trust_boundary(
+    tier=3,
+    source="Bedrock chat-completion response returned through the litellm composer boundary; either a Mapping or an attribute object",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('bedrock_content') before use whenever the choices/message/content chain is "
+        "absent, wrongly shaped, or not a non-blank str; never returns unchecked provider text"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_bedrock_guardrails.py::test_bedrock_content_rejects_malformed_provider_response",
+    test_fingerprint="9c0af612db06826f8896a47483d16e8dfa2008efb26d978e5e20f960fa82bbbc",
+)
 def _bedrock_content(response: Any) -> str:
     try:
         choices = response.get("choices") if isinstance(response, Mapping) else response.choices
@@ -200,7 +213,9 @@ async def verify_bedrock(
 
     if any(name in env for name in FORBIDDEN_AWS_OVERRIDE_ENV):
         raise AcceptanceCheckError("bedrock_aws_override")
-    model = env.get("ELSPETH_BEDROCK_LIVE_TEST_MODEL")
+    if "ELSPETH_BEDROCK_LIVE_TEST_MODEL" not in env:
+        raise AcceptanceCheckError("bedrock_input")
+    model = env["ELSPETH_BEDROCK_LIVE_TEST_MODEL"]
     if (
         type(model) is not str
         or not model.startswith("bedrock/")
@@ -251,6 +266,16 @@ _GUARDRAIL_GATE_ENV = "ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS"
 _MAX_GUARDRAIL_CONFIG_ENV_BYTES = 64 * 1024
 
 
+@observation_boundary(
+    tier=3,
+    source="rendered guardrail policy environment (ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES and ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES) supplied by the ECS task definition",
+    source_param="env",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns (None, None) or (alias, None) on absent, oversized, undecodable, wrongly shaped, or non-matching "
+        "rendered config; never raises on env and never invents an alias or a guardrail version"
+    ),
+)
 def _guardrail_config_defaults(env: Mapping[str, str], plugin_id: str) -> tuple[str | None, str | None]:
     """Derive (alias, version) defaults from the rendered guardrail policy env.
 
@@ -276,23 +301,36 @@ def _guardrail_config_defaults(env: Mapping[str, str], plugin_id: str) -> tuple[
     try:
         defaults = json.loads(raw_defaults)
         profiles = json.loads(raw_profiles)
+        if not isinstance(defaults, dict) or not isinstance(profiles, list):
+            return None, None
+        alias = defaults.get(plugin_id)
+        if type(alias) is not str or not alias:
+            return None, None
+        versions = [
+            profile.get("guardrail_version")
+            for profile in profiles
+            if isinstance(profile, dict) and profile.get("plugin") == plugin_id and profile.get("alias") == alias
+        ]
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None, None
-    if not isinstance(defaults, dict) or not isinstance(profiles, list):
-        return None, None
-    alias = defaults.get(plugin_id)
-    if type(alias) is not str or not alias:
-        return None, None
-    versions = [
-        profile.get("guardrail_version")
-        for profile in profiles
-        if isinstance(profile, dict) and profile.get("plugin") == plugin_id and profile.get("alias") == alias
-    ]
     if len(versions) != 1 or type(versions[0]) is not str:
         return alias, None
     return alias, versions[0]
 
 
+@trust_boundary(
+    tier=3,
+    source="operator-supplied guardrail live-check environment (gate, per-plugin profile alias, safe/blocked probe texts, expected guardrail version)",
+    source_param="env",
+    suppresses=("R1",),
+    invariant=(
+        "raises AcceptanceCheckError('guardrails_live_inputs_missing'/'guardrails_gate'/'guardrails_input') before "
+        "any live call whenever the gate is absent or not '1', an input is missing, or a resolved value is not a "
+        "non-empty str, a probe text longer than 1,000,000 characters, or a version outside [1-9][0-9]{0,7}"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_bedrock_guardrails.py::test_guardrail_live_inputs_rejects_absent_gate_and_malformed_operator_inputs",
+    test_fingerprint="ec87e0ed5ec0f33b6ddd167ee8d27ae9a21e9a867a62addebe1927152dac3de1",
+)
 def _guardrail_live_inputs(env: Mapping[str, str]) -> tuple[tuple[str, str, str, str, str], ...]:
     gate = env.get(_GUARDRAIL_GATE_ENV)
     if gate is None:
@@ -378,14 +416,18 @@ def build_plugin_policy_acceptance(
     content_id = PluginId("transform", "aws_bedrock_content_safety")
     llm_id = PluginId("transform", "llm")
     try:
-        expected_binding_sha256 = env.get("ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256")
+        if "ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256" not in env:
+            raise ValueError("policy binding mismatch")
+        expected_binding_sha256 = env["ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256"]
         if (
             type(expected_binding_sha256) is not str
             or _SHA256_PATTERN.fullmatch(expected_binding_sha256) is None
             or plugin_policy_binding_sha256(env) != expected_binding_sha256
         ):
             raise ValueError("policy binding mismatch")
-        live_model = env.get("ELSPETH_BEDROCK_LIVE_TEST_MODEL")
+        if "ELSPETH_BEDROCK_LIVE_TEST_MODEL" not in env:
+            raise ValueError("live model missing")
+        live_model = env["ELSPETH_BEDROCK_LIVE_TEST_MODEL"]
         if type(live_model) is not str or not live_model.startswith("bedrock/"):
             raise ValueError("live model missing")
         live_region = _resolve_aws_region(env, check="plugin_policy_settings")

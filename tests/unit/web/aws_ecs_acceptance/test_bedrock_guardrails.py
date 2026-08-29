@@ -173,6 +173,21 @@ async def test_verify_bedrock_rejects_empty_content_or_malformed_metadata_with_s
     assert "bedrock/model" not in str(raised.value)
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        SimpleNamespace(),
+        SimpleNamespace(choices=[]),
+        SimpleNamespace(choices=[SimpleNamespace(message=None)]),
+        {"choices": [{"message": {"content": "  "}}]},
+        {"choices": [{"message": {"content": 7}}]},
+    ],
+)
+def test_bedrock_content_rejects_malformed_provider_response(response: object) -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="bedrock_content"):
+        bedrock._bedrock_content(response=response)
+
+
 @pytest.mark.asyncio
 async def test_verify_bedrock_timeout_and_provider_failures_are_static_and_fd_suppressed(capfd: pytest.CaptureFixture[str]) -> None:
     async def provider_failure(**_kwargs: object) -> object:
@@ -271,6 +286,27 @@ def _guardrail_env(**updates: str) -> dict[str, str]:
     values.update(updates)
     values.setdefault("ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256", acceptance.plugin_policy_binding_sha256(values))
     return values
+
+
+def _guardrail_env_without(name: str) -> dict[str, str]:
+    values = _guardrail_env()
+    del values[name]
+    return values
+
+
+@pytest.mark.parametrize(
+    ("env", "check"),
+    [
+        (_guardrail_env_without("ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS"), "guardrails_live_inputs_missing"),
+        (_guardrail_env_without("ELSPETH_LIVE_BEDROCK_PROMPT_SAFE_TEXT"), "guardrails_live_inputs_missing"),
+        (_guardrail_env(ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS="0"), "guardrails_gate"),
+        (_guardrail_env(ELSPETH_LIVE_BEDROCK_PROMPT_EXPECTED_VERSION="DRAFT"), "guardrails_input"),
+        (_guardrail_env(ELSPETH_LIVE_BEDROCK_CONTENT_BLOCKED_TEXT=""), "guardrails_input"),
+    ],
+)
+def test_guardrail_live_inputs_rejects_absent_gate_and_malformed_operator_inputs(env: dict[str, str], check: str) -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match=check):
+        bedrock._guardrail_live_inputs(env=env)
 
 
 def _web_policy_evidence() -> WebPluginPolicyEvidence:

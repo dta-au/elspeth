@@ -495,6 +495,88 @@ def test_scenario_inventory_v9_rejects_invalid_gateway_identity_shape(
         )
 
 
+def test_orphan_inventory_admission_rejects_a_foreign_document_shape() -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="scenario_inventory_schema"):
+        scenario_inventory._validate_orphan_inventory({"tag_key": "ACCEPTANCE_RUN_ID"})
+
+
+def test_tf_binding_receipt_admission_rejects_a_foreign_document_shape(tmp_path: Path) -> None:
+    binding_path = tmp_path / "tf-binding-foreign.json"
+    binding_path.write_text(json.dumps({"schema": "elspeth.aws-ecs-tf-binding.v1"}))
+    os.chmod(binding_path, 0o600)
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="tf_binding_schema"):
+        scenario_inventory._validate_tf_binding_receipt(
+            binding_path,
+            scenario_id="A",
+            acceptance_run_id="4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48",
+            aws_account_id="123456789012",
+            aws_region="ap-southeast-2",
+            expected_sha256="a" * 64,
+        )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param("not-json", id="not-json"),
+        pytest.param("[]", id="not-an-object"),
+        pytest.param('{"awsvpcConfiguration": {}, "extra": 1}', id="extra-top-level-key"),
+        pytest.param('{"awsvpcConfiguration": {}}', id="incomplete-awsvpc"),
+        pytest.param(
+            '{"awsvpcConfiguration": {"subnets": [], "securityGroups": ["sg-1"], "assignPublicIp": "DISABLED"}}',
+            id="empty-subnets",
+        ),
+        pytest.param(
+            '{"awsvpcConfiguration": {"subnets": ["subnet-1"], "securityGroups": ["sg-1"], "assignPublicIp": "MAYBE"}}',
+            id="unknown-assign-public-ip",
+        ),
+        pytest.param(
+            '{"awsvpcConfiguration": {"subnets": [1], "securityGroups": ["sg-1"], "assignPublicIp": "ENABLED"}}',
+            id="non-string-subnet",
+        ),
+    ],
+)
+def test_doctor_network_configuration_admission_rejects_a_foreign_shape(raw: str) -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="scenario_inventory_schema"):
+        scenario_inventory._validate_doctor_network_configuration(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param("not-json", id="not-json"),
+        pytest.param('{"Type": "forward"}', id="not-a-list"),
+        pytest.param("[]", id="empty-list"),
+        pytest.param('["forward"]', id="element-is-not-an-object"),
+    ],
+)
+def test_listener_action_admission_rejects_a_foreign_shape(raw: str) -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="scenario_inventory_schema"):
+        scenario_inventory._admit_listener_actions(raw)
+
+
+def test_listener_action_predicates_read_only_the_bound_shapes() -> None:
+    target = "arn:aws:elasticloadbalancing:ap-southeast-2:123456789012:targetgroup/tg/0123456789abcdef"
+
+    assert scenario_inventory._action_forwards_to_target({"Type": "forward", "TargetGroupArn": target}, expected_target_group=target)
+    assert scenario_inventory._action_forwards_to_target(
+        {"Type": "forward", "ForwardConfig": {"TargetGroups": [{"TargetGroupArn": target}]}},
+        expected_target_group=target,
+    )
+    assert not scenario_inventory._action_forwards_to_target({"Type": "forward", "ForwardConfig": []}, expected_target_group=target)
+    assert not scenario_inventory._action_forwards_to_target({"Type": "fixed-response"}, expected_target_group=target)
+
+    assert scenario_inventory._action_serves_disabled_fixed_response(
+        {"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "503"}}
+    )
+    assert not scenario_inventory._action_serves_disabled_fixed_response(
+        {"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "200"}}
+    )
+    assert not scenario_inventory._action_serves_disabled_fixed_response({"Type": "fixed-response", "FixedResponseConfig": "503"})
+    assert not scenario_inventory._action_serves_disabled_fixed_response({"Type": "forward"})
+
+
 @pytest.mark.parametrize(
     ("profile_override", "default_profile"),
     [

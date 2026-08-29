@@ -949,3 +949,162 @@ def test_orphan_sweep_rejects_repeated_pagination_token_and_closes_clients(tmp_p
             environ={},
         )
     assert all(client.closed for client in clients)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param({"Rules": "not-a-list"}, id="collection_is_not_a_list"),
+        pytest.param({}, id="collection_absent"),
+        pytest.param({"Rules": [None] * (owner._ORPHAN_MAX_ITEMS + 1)}, id="collection_over_the_item_ceiling"),
+    ],
+)
+def test_orphan_response_items_rejects_unbounded_or_non_list_collections(response: Mapping[str, object]) -> None:
+    with pytest.raises(owner.AcceptanceCheckError, match="orphan_sweep_api"):
+        owner._orphan_response_items(response, "Rules")
+
+
+def test_orphan_response_items_reads_an_absent_resource_as_an_empty_collection() -> None:
+    assert owner._orphan_response_items(None, "Rules") == []
+    assert owner._orphan_response_items({"Rules": []}, "Rules") == []
+
+
+@pytest.mark.parametrize(
+    "pages",
+    [
+        pytest.param([{"Items": [], "Next": 7}], id="non_string_continuation_token"),
+        pytest.param([{"Items": [], "Next": "a"}, {"Items": [], "Next": "a"}], id="repeated_continuation_token"),
+    ],
+)
+def test_orphan_paged_items_rejects_repeated_and_non_string_continuation_tokens(pages: list[Mapping[str, object]]) -> None:
+    served = iter(pages)
+
+    def method(**_kwargs: object) -> Mapping[str, object]:
+        return next(served)
+
+    with pytest.raises(owner.AcceptanceCheckError, match="orphan_sweep_api"):
+        owner._orphan_paged_items(
+            method,
+            item_field="Items",
+            request_token="Next",
+            response_token="Next",
+            kwargs={},
+        )
+
+
+@pytest.mark.parametrize(
+    "indexing_rules",
+    [
+        pytest.param(["not-a-mapping"], id="rule_is_not_a_mapping"),
+        pytest.param([{"Name": "Default"}], id="rule_without_a_rule_body"),
+        pytest.param(
+            [{"Name": "Default", "Rule": {"Probabilistic": {"DesiredSamplingPercentage": 1.0}}, "Extra": 1}],
+            id="rule_with_an_unknown_field",
+        ),
+        pytest.param(
+            [
+                {"Name": "Default", "Rule": {"Reservoir": {}}},
+            ],
+            id="rule_body_is_not_probabilistic",
+        ),
+        pytest.param(
+            [{"Name": "Default", "Rule": {"Probabilistic": {"DesiredSamplingPercentage": 101.0}}}],
+            id="desired_percentage_out_of_range",
+        ),
+        pytest.param(
+            [
+                {"Name": "Default", "Rule": {"Probabilistic": {"DesiredSamplingPercentage": 1.0}}},
+                {"Name": "Default", "Rule": {"Probabilistic": {"DesiredSamplingPercentage": 1.0}}},
+            ],
+            id="duplicate_rule_name",
+        ),
+    ],
+)
+def test_transaction_search_projection_rejects_malformed_indexing_rules(indexing_rules: list[object]) -> None:
+    with pytest.raises(owner.AcceptanceCheckError, match="orphan_sweep_api"):
+        owner._transaction_search_projection(
+            destination="CloudWatchLogs",
+            indexing_rules=indexing_rules,
+            spans_log_group_present=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param({}, id="role_absent"),
+        pytest.param({"Role": "not-a-mapping"}, id="role_is_not_a_mapping"),
+        pytest.param({"Role": {"RoleName": "another-run-task-role"}}, id="role_names_a_different_role"),
+    ],
+)
+def test_iam_role_identity_rejects_a_response_describing_another_role(response: Mapping[str, object]) -> None:
+    with pytest.raises(owner.AcceptanceCheckError, match="orphan_sweep_api"):
+        owner._assert_iam_role_identity(response, role_name="elspeth-task-role")
+
+
+def test_iam_role_identity_admits_the_role_the_sweep_asked_about() -> None:
+    assert owner._assert_iam_role_identity({"Role": {"RoleName": "elspeth-task-role"}}, role_name="elspeth-task-role") is None
+
+
+@pytest.mark.parametrize(
+    "policies",
+    [
+        pytest.param(["not-a-mapping"], id="policy_is_not_a_mapping"),
+        pytest.param([{"policyName": 7}], id="policy_name_is_not_a_string"),
+        pytest.param([{}], id="policy_name_absent"),
+    ],
+)
+def test_resource_policy_count_rejects_policies_without_a_string_name(policies: list[object]) -> None:
+    with pytest.raises(owner.AcceptanceCheckError, match="orphan_sweep_api"):
+        owner._expected_resource_policy_count(policies, expected=frozenset({"elspeth-policy"}))
+
+
+def test_resource_policy_count_counts_only_the_policies_this_run_owns() -> None:
+    policies: list[object] = [{"policyName": "elspeth-policy"}, {"policyName": "someone-elses-policy"}]
+    assert owner._expected_resource_policy_count(policies, expected=frozenset({"elspeth-policy"})) == 1
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param({"Destination": "S3"}, id="unrecognised_destination"),
+        pytest.param({"Destination": ""}, id="empty_destination"),
+    ],
+)
+def test_trace_segment_destination_rejects_an_unrecognised_destination(response: Mapping[str, object]) -> None:
+    with pytest.raises(owner.AcceptanceCheckError, match="orphan_sweep_api"):
+        owner._trace_segment_destination(response)
+
+
+def test_trace_segment_destination_admits_the_closed_destination_set() -> None:
+    assert owner._trace_segment_destination({}) is None
+    assert owner._trace_segment_destination({"Destination": "XRay"}) == "XRay"
+    assert owner._trace_segment_destination({"Destination": "CloudWatchLogs"}) == "CloudWatchLogs"
+
+
+@pytest.mark.parametrize(
+    "mappings",
+    [
+        pytest.param(["not-a-mapping"], id="entry_is_not_a_mapping"),
+        pytest.param([{"ResourceARN": 7}], id="arn_is_not_a_string"),
+        pytest.param([{}], id="arn_absent"),
+    ],
+)
+def test_tagged_resource_count_rejects_entries_without_a_string_arn(mappings: list[object]) -> None:
+    with pytest.raises(owner.AcceptanceCheckError, match="orphan_sweep_api"):
+        owner._unapproved_tagged_resource_count(mappings, allowed=set())
+
+
+def test_tagged_resource_count_excludes_only_the_arns_already_proved_deleting() -> None:
+    mappings: list[object] = [{"ResourceARN": "arn:aws:ecs:x:1:task-definition/a:1"}, {"ResourceARN": "arn:aws:logs:x:1:log-group:b"}]
+    assert owner._unapproved_tagged_resource_count(mappings, allowed={"arn:aws:ecs:x:1:task-definition/a:1"}) == 1
+
+
+def test_named_item_count_ignores_shapes_that_do_not_name_a_resource() -> None:
+    items: list[object] = [
+        {"logGroupName": "elspeth-web"},
+        {"logGroupName": "someone-else"},
+        "not-a-mapping",
+        {},
+    ]
+    assert owner._named_item_count(items, field="logGroupName", expected=frozenset({"elspeth-web"})) == 1
