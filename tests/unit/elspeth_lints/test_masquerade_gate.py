@@ -17,8 +17,7 @@ Test order is deliberate and load-bearing, not decorative:
    fire. AGENTS.md's documented failure mode is a gate that reports zero
    findings because its path filter or site-enumerator matched nothing
    (``elspeth-lints check`` once defaulted ``--rules`` to ``nothing`` and
-   exited 0 on any tree; Wardline needs ``--fail-on-inert`` for the same
-   reason).
+   exited 0 on any tree).
 2. Per-root coverage — the live scan must have visited files AND examined
    candidate sites in EVERY one of the four covered roots individually,
    not just in aggregate (a single global count would let three roots

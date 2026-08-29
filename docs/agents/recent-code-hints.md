@@ -683,7 +683,7 @@ is a working document under the normal delivery posture.
   function's R1 findings, verified by the `R_TB_SUPPRESSED` stream. Corollary
   from the same lane: `@observation_boundary` on a genuine non-raising
   projector passes `trust_boundary.tests,scope,tier --fail-on-inert` with no
-  `test_ref` obligation and drew no wardline PY-WL-102.
+  `test_ref` obligation.
 - **2026-08-29 — three traps from B39 (`web/composer/tools/generation.py`).**
   (a) **`type(x) is C` on a closed OWNED union needs `@final` on `C`, or mypy
   refuses to narrow the NEGATIVE branch.** Converting
@@ -1141,9 +1141,7 @@ is a working document under the normal delivery posture.
   must exist to bind. Budget a rationale when it does not. Six such
   `observation_boundary` decorators landed clean on B49 (`guided_blob_refs` ×3,
   `prompts` ×2, `yaml_generator` ×1); `trust_boundary.tests,scope,tier` pass
-  with `--fail-on-inert`, and wardline reports no PY-WL-102 for any of them
-  (PY-WL-102 fires on a declared EXTERNAL_RAW -> ASSURED boundary with no
-  rejection path, which is exactly what a non-raising observation is not).
+  with `--fail-on-inert`.
 
 - **2026-08-29 — a whole-tree `trust_tier.tier_model` run under the REAL
   allowlist currently UNDER-suppresses, because one stale entry makes the
@@ -3830,6 +3828,27 @@ Every one of the ~25 whole-tree gates had the same exposure. Two rules now:
   IS a gate input from the moment it exists.
 
 ## Recent conventions (prune when archived)
+
+- **2026-08-29 — a SKIPPED ledger row is not a verdict: never read
+  `ValidationCheck.passed` alone for a check the ledger may not have reached.**
+  `execution/validation.py::_skipped_checks` emits every check DOWNSTREAM of a
+  halted stage as `passed=False` with
+  `outcome_code=CHECK_OUTCOME_SKIPPED_AFTER_FAILURE` — including
+  `advisor_signoff` — so every pending-handoff strict preflight carries a
+  "failing" advisor check that means NEVER EVALUATED. Reading it as a failure
+  published the "advisory review did not clear" notice over a CLEAN advisor
+  verdict (elspeth-fa18d54eef; live in three sessions before the telemetry
+  caught it). Dispatch through
+  `execution/completion_gates.advisor_signoff_check_failed` (skipped-aware),
+  or for a new check name, discriminate on `outcome_code` yourself. The
+  companion trap is FIXTURE DIVERGENCE: `_handoff_result()`-style hand-built
+  ValidationResults with `checks=[]` pin a shape `validate_pipeline` never
+  emits (the real producer appends the skipped tail), which is exactly why
+  seven scripted reproductions missed a bug three live sessions hit — when a
+  consumer dispatches on checks, give the fixture the producer's skipped rows
+  (`_producer_honest_handoff_result` in
+  `tests/unit/web/composer/test_advisor_terminal_publication.py` is the
+  worked example).
 
 - **2026-08-29 — advisor-cohort terminal copy carries a SHARED withheld-prose
   disclosure, and every publication site is attributed.**

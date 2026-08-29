@@ -15,7 +15,7 @@ Design constraints (from the prototype plan, all load-bearing):
 * The judge is rule-agnostic — it consumes ``(file, rule_id, symbol,
   rationale, surrounding_code)`` and the input shape does not bake in
   ``tier_model``-specific assumptions. This is the abstraction that
-  ports to ``wardline``.
+  ports to other rule packages.
 * The judge's rationale is the new audit primitive. It is recorded
   verbatim and is independently re-readable months later when an auditor
   asks "why did we exempt this?". The YAML answers without re-running
@@ -53,8 +53,8 @@ from typing import Any, cast
 from elspeth_lints.core.allowlist import JudgeVerdict
 
 # Default model identifier (OpenRouter slug — vendor prefix required).
-# The prototype is single-vendor by design; wardline will make this
-# configurable per-project.
+# The prototype is single-vendor by design; per-project configuration
+# is deferred.
 DEFAULT_JUDGE_MODEL: str = "anthropic/claude-opus-4-7"
 DEFAULT_JUDGE_MAX_TOKENS: int = 1024
 

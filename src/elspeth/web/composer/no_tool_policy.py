@@ -110,7 +110,7 @@ ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE: Final = (
 
 _ADVISOR_SIGNOFF_PENDING_NOTICE: Final = (
     "Completion advisory review did not clear after the available attempts. "
-    "Composer completion is withheld. Review the pipeline and retry the evidence-scoped advisor review. "
+    "Composer completion is withheld. Review the pipeline; validation and the advisory review run again on your next message. "
     + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
 )
 _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_PENDING_NOTICE

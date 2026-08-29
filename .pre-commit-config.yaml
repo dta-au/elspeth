@@ -259,21 +259,7 @@ repos:
         # be set to false here (the framework's commit-msg stage passes the
         # message file path as the sole positional argument).
         always_run: true
-# The wardline-scan hook was REMOVED here (2026-07-03, operator-approved),
-# per the wardline team's RCA of the "intermittent first-commit failure":
-# pre-commit fails any hook whose execution window sees the tracked-file diff
-# change, and this whole-tree scan was the slowest, last-running hook — so a
-# concurrent agent session's writes during its ~15s window were misattributed
-# to it and the commit was rejected ("files were modified by this hook", no
-# exit-code line). It also violated this file's header contract (whole-repo
-# gates belong to CI, triggered locally only by their own policy metadata)
-# and was inert at removal time. The agent-level gate is now a single documented
-# command (see "ELSPETH's Wardline invocation" in AGENTS.md): `wardline scan .`
-# with `--fail-on ERROR --fail-on-inert`, the declared vocabulary pack's trust
-# grants, and `--local-only`. It superseded the `scripts/wardline_gate.py`
-# wrapper once Wardline shipped `--fail-on-inert` upstream (2026-08-06); the
-# wrapper existed only to assert non-inertness, which the flag now does.
-# Re-run the installer as `wardline install --no-pre-commit` so it does not
-# re-add this hook. Reinstate enforcement in CI (not here) only once Wardline is
-# installable from the project's dependency graph and the active finding corpus
-# is resolved without baselines or waivers.
+# No wardline hook: the whole-tree wardline-scan hook was removed 2026-07-03
+# (its ~15s window misattributed sibling-session writes as "modified by this
+# hook"), and Wardline itself was retired from the project on 2026-08-29
+# (ADR-043). Do not re-add either.

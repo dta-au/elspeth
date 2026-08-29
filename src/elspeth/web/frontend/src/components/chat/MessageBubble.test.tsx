@@ -455,7 +455,7 @@ describe("MessageBubble", () => {
               {
                 kind: "trusted_system_notice",
                 content:
-                  "Re-read the actual state via `get_pipeline_state` before making further claims about pipeline configuration.",
+                  "Re-check the actual pipeline state before making further claims about pipeline configuration.",
               },
             ],
           })}

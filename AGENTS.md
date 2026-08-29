@@ -106,6 +106,16 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 - `AGENTS.md` and `CLAUDE.md` are tracked in git (since 2026-07-28) so fresh
   worktrees inherit them. Commit edits to them like any other file; installer
   upgrades that rewrite these files show up as diffs — review before staging.
+- Wardline is NOT part of this project (rolled back 2026-08-29,
+  [ADR-043](docs/architecture/adr/043-project-tooling.md)): do not run
+  Wardline scans, do not add `weft.toml`, a `wardline-gate` skill, or an
+  `.mcp.json` server for it. It arrived via a Loomweave upgrade, and
+  `wardline install` rewrites all of those on every run — a guidance test pins
+  their absence. The same ADR retires Legis and Warpline and rules out any
+  tool other than Filigree and Loomweave until a superseding ADR names it.
+  Older plans, ledgers, and hints that cite them are history.
+  Trust-boundary honesty is enforced by `elspeth-lints` (`trust_boundary.tests`
+  and the masquerade gate) alone.
 - Directory-scoped guides exist where the details live:
   `examples/AGENTS.md` (how to run every example) and
   `src/elspeth/plugins/transforms/AGENTS.md` (row data vs audit provenance).
@@ -130,6 +140,16 @@ signatures, checksums, audit chains, or admission gates that protect actual
 code, releases, exports, runtime data, or deployed artifacts. If removing a
 practice is a marginal call or may discard a real safeguard, surface the tradeoff
 to the developer before removing it.
+
+Audit grade is a characteristic of the product, not of the project's own
+tooling ([ADR-046](docs/architecture/adr/046-audit-grade-is-a-product-characteristic.md)).
+The issue tracker, code map, hooks, scan stores, and installed helpers get
+ordinary hygiene: purge, delete, reset, or uninstall with the tool's own verbs
+(or direct SQL/`rm` when it has none) and report it — no status-semantics
+debates for tool-internal rows, no ADR for a cache, no backups staged as
+evidence. Destructive shared-state actions still get an operator go-ahead;
+what is removed is the ceremony, not the check. Adding or removing a tool that
+carries standing agent instructions is still a recorded decision.
 
 ## Composer invariants (non-negotiable)
 
@@ -358,82 +378,28 @@ does Y".
 Full reference: `loomweave-workflow` skill, `loomweave --help`, MCP schemas.
 <!-- /loomweave:instructions -->
 
-<!-- warpline:instructions:v1.2.0 -->
-## Warpline (temporal change-impact)
+### ELSPETH's Loomweave usage
 
-`warpline` is the Weft federation's temporal / change-impact authority — "if I
-touch X, what breaks, and what must I re-verify?". Prefer the MCP tools
-(`mcp__warpline__*`); fall back to the `warpline` CLI. Endorsed names and short
-shims return identical schema+data.
+The block above is installer-written. ELSPETH's own guidance
+([ADR-043](docs/architecture/adr/043-project-tooling.md)):
 
-- `warpline_change_list` / `changed` — changed entities for a rev range; call first.
-- `warpline_impact_radius_get` / `blast_radius` — downstream affected set.
-- `warpline_reverify_worklist_get` / `reverify` — worklist to recheck before done.
-- `warpline_entity_timeline_get` / `timeline`, `warpline_entity_churn_count_get` /
-  `churn`, `warpline_edge_snapshot_capture` / `capture_snapshot` (only mutating
-  tool; writes `.weft/warpline/` only).
-
-Enrich-only and local-only: every response is `meta.local_only: true`,
-`peer_side_effects: []`. `enrichment` is a CLOSED vocab
-(`present|absent|unavailable`); sibling absence is explicit, never an implied
-clean/allowed state. warpline facts are advisory and never gate. See the
-`warpline-workflow` skill for the full loop.
-<!-- /warpline:instructions -->
-
-<!-- legis:instructions:v1.5.0:37065fbc -->
-## Legis (git/CI + governance)
-
-Legis is the git/CI and governance layer of the Weft suite: graded policy
-enforcement over branch/commit/PR/check context, recorded in an append-only
-audit trail keyed to stable code identity (SEI), so it survives rename/move.
-
-Reach for it when a policy fires at the CI/git boundary, when a change needs a
-recordable override or human sign-off, or when you need git/CI context.
-
-- Prefer the `mcp__legis__*` MCP tools; fall back to the `legis` CLI.
-- Clear a fired policy through `override_submit` (MCP-only), which grades it
-  (self-clear / judged / escalated) and records it — routing around it leaves
-  no trail.
-
-Full reference: the `legis-workflow` skill, `legis --help`, MCP schemas.
-<!-- /legis:instructions -->
-
-<!-- wardline:instructions:v1:df4787d1 -->
-<!-- wardline:last-writer:wardline install -->
-This project uses **wardline** as its trust-boundary gate. Before handing back code that touches external input, run `wardline scan . --fail-on ERROR --trust-pack scripts.wardline_pack --allow-custom-packs` (exit 0 = clean, 1 = gate tripped, 2 = wardline error) and fix findings at the boundary, not the sink. This project declares trust-grammar pack(s) scripts.wardline_pack in weft.toml; the grant flags shown are REQUIRED — without them the scan exits 2 (pack not trusted), because repository config cannot self-authorise importing code. The full scan -> explain -> fix -> rescan loop and the baseline-vs-waiver discipline live in the `wardline-gate` skill and in `docs/agents.md`.
-<!-- /wardline:instructions -->
-
-### ELSPETH's Wardline invocation
-
-The block above is written and overwritten by `wardline install` — never edit
-inside it. It now renders ELSPETH's pack grants itself. The one thing it does not
-carry is **`--fail-on-inert`**: Wardline exits 0 on a scan that recognised zero
-trust boundaries, so without that flag a green gate is indistinguishable from a
-gate that checked nothing. The gate of record is therefore:
-
-```bash
-wardline scan . --fail-on ERROR --fail-on-inert \
-  --trust-pack scripts.wardline_pack --allow-custom-packs --local-only
-```
-
-Exit `0` = clean *and* non-inert; `1` = active ERROR findings, or an
-inert/zero-boundary gate; `2` = pack not granted, or a Wardline/configuration
-error. The `mcp__wardline__*` tools are equivalent — `.mcp.json` carries the same
-grants at server launch.
-
-Why the grants are required: ELSPETH marks its Tier-3 boundaries with its own
-`@trust_boundary` (`src/elspeth/contracts/trust_boundary.py`), whose
-`tier`/`source_param`/`suppresses`/`invariant` metadata the elspeth-lints tier
-model also consumes — Wardline is the second consumer, not the owner.
-`scripts/wardline_pack.py` maps that vocabulary onto Wardline's grammar, and
-Wardline trusts a pack only when the *caller* grants it (there is no
-machine-level trust store, so repository config cannot self-authorise importing
-code).
-
-Re-run the installer as **`wardline install --no-pre-commit`** — the whole-tree
-scan belongs in CI, not the commit path (see the header contract in
-`.pre-commit-config.yaml`). Everything else is Wardline's to own: let it rewrite
-its own block and skill rather than hand-patching them.
+- **Reach for it for:** who calls X (`entity_callers_list`), what subclasses
+  or implements X (`entity_relation_list`, `direction=in`), execution paths /
+  call trees (`entity_execution_path_list`, `entity_orientation_pack_get`),
+  and where X is defined in a large file (`entity_find`). These measured
+  correct against `ast` ground truth and have no grep equivalent.
+- **Do not rely on it for** semantic search, dead-code lists, HTTP-route
+  inventories, or test-caller lists until the salvage worklist closes; on
+  those `git grep` measured as good or better.
+- `entity_find` takes **`pattern`** — not `name`, not `query`; 43 % of all
+  historical calls failed on that.
+- **Zero callers is not "no callers".** Read `traversal_complete`,
+  `scope_excludes`, and `unresolved_candidates` before concluding; class
+  instantiations and calls from large test files may sit there as
+  `why: dynamic`. Confirm a negative with `git grep`.
+- Check `project_status_get` staleness first; a re-analyze is triggered by
+  the git hooks on the main checkout, not by worktree commits. Any list over
+  ~100 rows overflows the MCP result cap — page with the cursor.
 
 ## Judge-signature stage (tier-model allowlist signing)
 

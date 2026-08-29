@@ -397,7 +397,6 @@ notes/resign/*
 .agents/skills/loomweave-workflow/.fingerprint
 .agents/skills/loomweave-workflow/SKILL.md
 loomweave.yaml
-wardline.yaml
 .loomweave/.gitignore
 .loomweave/config.json
 .loomweave/instance_id
@@ -407,19 +406,12 @@ wardline.yaml
 # Filigree issue tracker
 .weft/
 
-# Legis — local working dir / config (regenerated/local; never commit)
-.weft/legis/
-/.weft/legis/operator_session.json
-/.weft/legis/operator.age
 
 # Codex CLI drops a routine ./error.log in its working dir; never commit it
 error.log
-.wardline
 
 # Codex panel review writes model-authored raw findings here; never commit them
 /docs/quality-audit/findings-panel-raw/
-# Wardline scan artifacts
-findings.jsonl
 
 # Local debugging screenshots — not part of the repo
 /images/

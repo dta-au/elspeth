@@ -67,6 +67,7 @@ from sqlalchemy.engine import Engine
 from elspeth.core.canonical import canonical_json
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.audit_readiness.models import AuditReadinessSnapshot
+from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.telemetry_phase8 import (
     SessionsTelemetry,
@@ -109,15 +110,17 @@ _NOT_MARKED_READY_DETAIL = "current composition state has not been marked ready 
 class CompositionNotRunnableError(Exception):
     """Raised when the composition fails the mark-for-review gates.
 
-    Two distinct failure modes carry the same exception type because the
-    route layer maps both to HTTP 409 with the same user-facing message
-    ("the composition is not in a shareable state — fix the surfaced
-    errors and try again").
+    Every failure mode carries the same exception type; the route layer
+    maps them all to HTTP 409 and forwards ``detail`` as the user-facing
+    message, so ``detail`` is written in user register.
 
     The ``reason`` field disambiguates for logs and tests:
 
     * ``"validation_failed"`` — ``ExecutionService.validate`` returned
-      ``is_valid=False``.
+      ``is_valid=False`` for a genuine validation failure.
+    * ``"review_pending"`` — validation halted ONLY because interpretation
+      review cards are pending (the soft-halt handoff shape); there are no
+      errors to fix (elspeth-3830c620a2).
     * ``"completion_not_ready"`` — validation succeeded, but a completion
       gate (such as advisor sign-off) withheld ``completion_ready``.
     * ``"readiness_error_row"`` — ``ReadinessService.compute_snapshot``
@@ -383,6 +386,20 @@ class ShareableReviewService:
             completion_gates=parse_completion_gates(state_record.composer_meta),
         )
         if not validation.is_valid:
+            # elspeth-3830c620a2: a pending-interpretation handoff is
+            # ``is_valid=False`` by design (soft halt; authoring validated and
+            # the only blocker is a resolvable review card). Refusing it as
+            # "validation failed; fix errors" told the user to fix errors that
+            # do not exist. The share stays blocked — a reviewer of an
+            # un-reviewed composition would be attesting over unresolved
+            # cards — but the reason tells the truth. Allowing
+            # share-while-pending is a separate product decision (tracked on
+            # the ticket); this branch does not foreclose it.
+            if is_pending_interpretation_handoff(validation):
+                raise CompositionNotRunnableError(
+                    reason="review_pending",
+                    detail="interpretation review cards are waiting; resolve them before sharing",
+                )
             raise CompositionNotRunnableError(
                 reason="validation_failed",
                 detail="composition validation failed; fix errors before sharing",

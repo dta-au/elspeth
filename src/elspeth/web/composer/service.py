@@ -194,6 +194,7 @@ from elspeth.web.composer.tools import (
     get_tool_definitions,
     normalize_tool_result_validation,
 )
+from elspeth.web.execution.completion_gates import advisor_signoff_check_failed
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightCoordinator,
@@ -1257,7 +1258,7 @@ def _replace_advisor_repair_public_result(
             raw_assistant_content=None,
         )
     if _is_pending_interpretation_handoff(runtime_result):
-        if any(check.name == CHECK_ADVISOR_SIGNOFF and not check.passed for check in runtime_result.checks):
+        if advisor_signoff_check_failed(runtime_result.checks):
             # elspeth-66717f0c99: reachable only since the END gate began
             # PRESERVING this shape instead of replacing it with the all-red
             # advisor result. The review card is genuinely pending, but the
@@ -9403,11 +9404,11 @@ def _advisor_signoff_blocked_wording(*, reason: str, findings: str, findings_bac
         if findings_backend_authored and findings:
             return (
                 f"{_ADVISOR_SIGNOFF_PENDING_NOTICE} {findings}",
-                "Remove the flagged text from the named field and retry the evidence-scoped advisor review.",
+                "Remove the flagged text from the named field; the advisory review runs again on your next message.",
             )
         return (
             _ADVISOR_SIGNOFF_PENDING_NOTICE,
-            "Review the pipeline and retry the evidence-scoped advisor review.",
+            "Review the pipeline; validation and the advisory review run again on your next message.",
         )
     if reason == "unavailable":
         return (

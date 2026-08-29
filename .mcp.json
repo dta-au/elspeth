@@ -38,39 +38,11 @@
       "command": "/home/john/.local/bin/filigree-mcp",
       "type": "stdio"
     },
-    "legis": {
-      "args": [
-        "mcp",
-        "--agent-id",
-        "claude-code"
-      ],
-      "command": "/home/john/.local/bin/legis",
-      "env": {},
-      "type": "stdio"
-    },
     "loomweave": {
       "args": [
         "serve"
       ],
       "command": "/home/john/.local/share/uv/tools/loomweave/bin/loomweave",
-      "env": {},
-      "type": "stdio"
-    },
-    "wardline": {
-      "args": [
-        "mcp",
-        "--root",
-        ".",
-        "--trust-pack",
-        "scripts.wardline_pack",
-        "--allow-custom-packs"
-      ],
-      "command": "/home/john/.local/bin/wardline",
-      "type": "stdio"
-    },
-    "warpline": {
-      "args": [],
-      "command": "/home/john/.local/bin/warpline-mcp",
       "env": {},
       "type": "stdio"
     }
