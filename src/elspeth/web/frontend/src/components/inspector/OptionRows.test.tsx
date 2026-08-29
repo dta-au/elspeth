@@ -83,4 +83,27 @@ describe("OptionRows", () => {
     expect(within(region).getByText("project_brief_urls.json")).toBeInTheDocument();
     expect(within(region).queryByText("Uploaded sample data")).not.toBeInTheDocument();
   });
+
+  // Live-check finding (session 39578c6f, Spec tab, show_advanced off):
+  // `guaranteed_fields` rendered raw in a <dt> under the source's `schema`
+  // value — a nested object walked by ConfigValue's own recursion
+  // (ConfigRows.tsx), not by OptionRows' pick()/optionLabel top-level
+  // relabeling. Structural KEYS get the same titleCaseLabel humanising;
+  // VALUES (the reader's own data, e.g. column names) must stay verbatim.
+  it("humanises nested structural keys inside a schema-shaped option value, keeping the raw key recoverable in title", () => {
+    const options = {
+      schema: { mode: "observed", guaranteed_fields: ["id", "email"] },
+    };
+    render(<OptionRows options={options} ariaLabel="source options" />);
+    const region = screen.getByRole("region", { name: "source options" });
+
+    const nestedTerm = within(region).getByText("Guaranteed Fields");
+    expect(nestedTerm).toBeInTheDocument();
+    expect(nestedTerm).toHaveAttribute("title", "guaranteed_fields");
+    expect(within(region).queryByText("guaranteed_fields")).not.toBeInTheDocument();
+    expect(within(region).getByText("Mode")).toBeInTheDocument();
+    // Values are the reader's own data (field names here), never relabeled.
+    expect(within(region).getByText("id")).toBeInTheDocument();
+    expect(within(region).getByText("email")).toBeInTheDocument();
+  });
 });

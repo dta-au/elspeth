@@ -49,9 +49,18 @@ function routingLabel(field: string): string {
 function routingValue(field: string, value: unknown): string {
   if (value === "discard") return "dropped (recorded in the audit trail)";
   if (Array.isArray(value)) return value.map(String).join(", ");
-  if (field === "routes" && typeof value === "object" && value !== null) {
+  // A coalesce/row_union's `branches` map and a gate's `routes` map are both
+  // alias→target objects; render both as prose, never as a JSON string
+  // outside <code>/<details> (elspeth-b9ebdf9011 live-check fix: `branches`
+  // was missing here, so a coalesce's fan-in map rendered as a raw
+  // `{"branch_a":"target_a",...}` string in a plain <dd>). `branches` can
+  // also arrive as a bare string[] (fan-in with no aliasing) — that shape is
+  // already handled by the Array.isArray branch above.
+  if ((field === "routes" || field === "branches") && typeof value === "object" && value !== null) {
     const entries = Object.entries(value as Record<string, unknown>);
-    if (entries.every(([, target]) => target === "fork")) return "every row continues to all branches";
+    if (field === "routes" && entries.every(([, target]) => target === "fork")) {
+      return "every row continues to all branches";
+    }
     return entries.map(([when, target]) => `${when} → ${String(target)}`).join("; ");
   }
   return displayValue(value);

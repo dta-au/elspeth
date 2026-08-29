@@ -219,6 +219,54 @@ describe("PipelineSpecView", () => {
     expect(node).toHaveTextContent("union");
   });
 
+  // Live-check finding (session 39578c6f, Spec tab, show_advanced off):
+  // `routingValue()` humanised the `routes` alias→target map into prose but
+  // not the structurally identical `branches` map, so a coalesce's fan-in
+  // map rendered as a raw `{"branch_invest_cs1":"invest_cs1_done",...}`
+  // JSON string in a plain <dd> — not wrapped in <code>/<details>.
+  it("renders a coalesce's branch map as prose, never a raw JSON string", () => {
+    useSessionStore.setState({
+      compositionState: makeComposition(8, {
+        sources: {
+          source: { plugin: "csv", options: {}, on_success: "docs" },
+        },
+        nodes: [
+          {
+            id: "merge_invest",
+            node_type: "coalesce",
+            plugin: null,
+            input: "assess_invest_cs1_done",
+            on_success: "tidy_output",
+            on_error: null,
+            branches: {
+              branch_invest_cs1: "invest_cs1_done",
+              branch_invest_cs2: "invest_cs2_done",
+            },
+            policy: "require_all",
+            merge: "union",
+            options: {},
+          },
+        ],
+        outputs: [
+          {
+            name: "tidy_output",
+            plugin: "csv",
+            on_write_failure: "discard",
+            options: {},
+          },
+        ],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node merge_invest" });
+    expect(node).not.toHaveTextContent('{"');
+    expect(node).toHaveTextContent(
+      "branch_invest_cs1 → invest_cs1_done; branch_invest_cs2 → invest_cs2_done",
+    );
+  });
+
   it("projects a collector's scope binding — which group it closes, under which policy", () => {
     // Parity gap found by adversarial review of the coalesce fix: that fix
     // closed the fan-in arm of a defect it had itself diagnosed as general,

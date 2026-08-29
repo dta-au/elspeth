@@ -358,11 +358,15 @@ describe("GraphView", () => {
     // "prompt" and "output_schema" are not in ESSENTIAL_OPTION_KEYS, so they
     // land under "Advanced settings" and are relabeled by optionLabel's
     // titleCaseLabel fallback like every other row (copy register: no
-    // internal identifiers in visible text) — elspeth-a6ea581e8a.
+    // internal identifiers in visible text) — elspeth-a6ea581e8a. The
+    // NESTED key `fields` inside `output_schema` gets the same treatment
+    // from ConfigValue's own titleCaseLabel humanising (elspeth-b9ebdf9011
+    // live-check fix) — only the structural key is relabeled; "url" is the
+    // reader's own field-name data and stays verbatim.
     expect(within(panel).getByText("Prompt")).toBeInTheDocument();
     expect(within(panel).getByText("Find colours")).toBeInTheDocument();
     expect(within(panel).getByText("Output Schema")).toBeInTheDocument();
-    expect(within(panel).getByText("fields")).toBeInTheDocument();
+    expect(within(panel).getByText("Fields")).toBeInTheDocument();
     expect(within(panel).getByText("url")).toBeInTheDocument();
     expect(within(panel).queryByText(/^\{.*\}$/)).not.toBeInTheDocument();
     // Authored settings come first; wiring is collapsed (elspeth-a6ea581e8a).

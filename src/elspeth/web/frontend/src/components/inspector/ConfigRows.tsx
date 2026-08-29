@@ -4,6 +4,12 @@
 // creating an import cycle back into GraphView; elspeth-a6ea581e8a).
 // ============================================================================
 
+// `titleCaseLabel` only (not OptionRows' `optionLabel`, which also checks a
+// curated OPTION_LABELS map): OptionRows.tsx imports ConfigRows/ConfigValue
+// from this module, so importing OptionRows back here would be a cycle.
+// `titleCaseLabel` has no such dependency (leaf module).
+import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -35,7 +41,16 @@ export function ConfigValue({ value }: { value: unknown }): JSX.Element {
       <dl className="graph-config-nested">
         {entries.map(([key, nestedValue]) => (
           <div key={key}>
-            <dt>{key}</dt>
+            {/* Structural keys inside a nested value (e.g. a source's
+                `schema.guaranteed_fields`) are the shape ELSPETH owns, not
+                user data — humanise them the same way OptionRows humanises
+                top-level option keys (copy register: no snake_case in
+                visible text). VALUES stay verbatim: they're the reader's
+                own data (column names, prompt text), not ours to relabel.
+                The raw key is kept recoverable via `title`, mirroring
+                OptionRows' own title-attribute discipline
+                (elspeth-b9ebdf9011 live-check fix). */}
+            <dt title={key}>{titleCaseLabel(key)}</dt>
             <dd>
               <ConfigValue value={nestedValue} />
             </dd>
