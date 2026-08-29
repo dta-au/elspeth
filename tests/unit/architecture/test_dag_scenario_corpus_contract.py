@@ -984,9 +984,21 @@ sinks:
 
 DAG_HUB_PATH = REPOSITORY_ROOT / "docs/architecture/dag/README.md"
 CORPUS_README_PATH = REPOSITORY_ROOT / "docs/architecture/dag/scenario-corpus/README.md"
-CURRENT_ASSESSMENT_ROOT = REPOSITORY_ROOT / "docs/architecture/dag/assessments/2026-07-18-0319"
-CURRENT_ASSESSMENT_DOCUMENTS = tuple(sorted(CURRENT_ASSESSMENT_ROOT.rglob("*.md")))
-ACTIVE_CORPUS_ISSUE = "elspeth-ef29ef6ba4"
+ASSESSMENT_FRAMEWORK_PATH = REPOSITORY_ROOT / "docs/architecture/dag/assessment-framework.md"
+COMPLETENESS_CRITERIA_PATH = REPOSITORY_ROOT / "docs/architecture/dag/completeness-criteria.md"
+DOCS_INDEX_PATH = REPOSITORY_ROOT / "docs/README.md"
+LIVE_DAG_DOCUMENTS = (
+    DAG_HUB_PATH,
+    CORPUS_README_PATH,
+    ASSESSMENT_FRAMEWORK_PATH,
+    COMPLETENESS_CRITERIA_PATH,
+    DOCS_INDEX_PATH,
+)
+ACTIVE_CORPUS_ISSUES = (
+    "elspeth-ef29ef6ba4",
+    "elspeth-cb1053fe46",
+    "elspeth-be41d0ea25",
+)
 
 EXPECTED_HAPPY_PATH_YAML = b"""sources:
   primary:
@@ -1392,13 +1404,42 @@ def _repository_relative_link_targets(path: Path) -> tuple[str, ...]:
     return tuple(relative_targets)
 
 
+def _markdown_heading_fragments(path: Path) -> frozenset[str]:
+    fragments: set[str] = set()
+    occurrences: dict[str, int] = {}
+    tokens = MarkdownIt("commonmark").parse(path.read_text(encoding="utf-8"))
+    for index, token in enumerate(tokens):
+        if token.type != "heading_open" or index + 1 >= len(tokens):
+            continue
+        inline = tokens[index + 1]
+        heading = "".join(child.content for child in inline.children or () if child.type in {"text", "code_inline"})
+        normalized = "".join(character for character in heading.casefold() if character.isalnum() or character in " -_")
+        base = "-".join(normalized.split())
+        fragment = base
+        while fragment in fragments:
+            occurrence = occurrences.get(base, 0) + 1
+            occurrences[base] = occurrence
+            fragment = f"{base}-{occurrence}"
+        fragments.add(fragment)
+        occurrences.setdefault(fragment, 0)
+    return frozenset(fragments)
+
+
 def _missing_repository_relative_link_targets(path: Path) -> tuple[str, ...]:
     repository_root = REPOSITORY_ROOT.resolve()
     missing_targets: list[str] = []
-    for target in _repository_relative_link_targets(path):
-        resolved_target = (path.parent / target).resolve()
+    for target in _markdown_link_targets(path):
+        parsed = urlsplit(target)
+        if parsed.scheme or parsed.netloc or parsed.path.startswith("/"):
+            continue
+        relative_path = unquote(parsed.path)
+        resolved_target = (path.parent / relative_path).resolve() if relative_path else path.resolve()
         if not resolved_target.is_relative_to(repository_root) or not resolved_target.exists():
-            missing_targets.append(target)
+            missing_targets.append(relative_path)
+            continue
+        fragment = unquote(parsed.fragment)
+        if fragment and resolved_target.suffix.casefold() == ".md" and fragment not in _markdown_heading_fragments(resolved_target):
+            missing_targets.append(f"{relative_path}#{fragment}")
     return tuple(missing_targets)
 
 
@@ -1450,6 +1491,27 @@ def test_missing_repository_relative_link_target_is_reported(tmp_path: Path, mon
     assert _missing_repository_relative_link_targets(document) == ("missing.md",)
 
 
+def test_missing_repository_relative_markdown_fragment_is_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = tmp_path / "repository"
+    document = repository_root / "docs/document.md"
+    document.parent.mkdir(parents=True)
+    (document.parent / "present.md").write_text("# Present heading\n", encoding="utf-8")
+    document.write_text("[missing heading](present.md#missing-heading)\n", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPOSITORY_ROOT", repository_root)
+
+    assert _missing_repository_relative_link_targets(document) == ("present.md#missing-heading",)
+
+
+def test_markdown_heading_fragments_allocate_interleaved_duplicate_collisions(tmp_path: Path) -> None:
+    document = tmp_path / "document.md"
+    document.write_text("# Foo\n\n# Foo\n\n# Foo-1\n\n# Foo\n\n# Foo-1\n", encoding="utf-8")
+
+    assert _markdown_heading_fragments(document) == frozenset({"foo", "foo-1", "foo-1-1", "foo-2", "foo-1-2"})
+
+
 def test_parent_traversal_to_existing_repository_target_is_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repository_root = tmp_path / "repository"
     document = repository_root / "docs/nested/document.md"
@@ -1472,8 +1534,16 @@ def test_parent_traversal_to_existing_target_outside_repository_is_reported(tmp_
     assert _missing_repository_relative_link_targets(document) == ("../../outside.md",)
 
 
-def test_dag_hub_links_the_live_scenario_corpus() -> None:
-    assert "scenario-corpus/README.md" in _markdown_link_targets(DAG_HUB_PATH)
+def test_dag_hub_links_the_live_scenario_corpus_authorities() -> None:
+    targets = _markdown_link_targets(DAG_HUB_PATH)
+    content = DAG_HUB_PATH.read_text(encoding="utf-8")
+
+    assert {
+        "scenario-corpus/README.md",
+        "scenario-corpus/v1/manifest.yaml",
+        "../../../tests/unit/architecture/test_dag_scenario_corpus_contract.py",
+    }.issubset(targets)
+    assert "authoritative live" in content.lower()
 
 
 def test_scenario_corpus_readme_links_manifest_criteria_and_active_issue() -> None:
@@ -1482,11 +1552,28 @@ def test_scenario_corpus_readme_links_manifest_criteria_and_active_issue() -> No
 
     assert "v1/manifest.yaml" in targets
     assert "../completeness-criteria.md" in targets
-    assert ACTIVE_CORPUS_ISSUE in content
-    assert f"filigree show {ACTIVE_CORPUS_ISSUE} --json" in content
+    for issue_id in ACTIVE_CORPUS_ISSUES:
+        assert issue_id in content
+        assert f"filigree show {issue_id} --json" in content
 
 
-@pytest.mark.parametrize("document", [DAG_HUB_PATH, CORPUS_README_PATH, *CURRENT_ASSESSMENT_DOCUMENTS])
+def test_dag_docs_explain_product_criteria_and_executable_lifecycle_cells() -> None:
+    content = "\n".join(path.read_text(encoding="utf-8") for path in (DAG_HUB_PATH, CORPUS_README_PATH, ASSESSMENT_FRAMEWORK_PATH)).lower()
+
+    assert "15 product-quality criteria" in content
+    assert "11 executable lifecycle cells" in content
+
+
+@pytest.mark.parametrize("document", LIVE_DAG_DOCUMENTS)
+def test_live_dag_documents_do_not_depend_on_dated_assessment_paths(document: Path) -> None:
+    assert "assessments/2026-" not in document.read_text(encoding="utf-8")
+
+
+def test_docs_index_links_the_live_dag_hub() -> None:
+    assert "architecture/dag/README.md" in _markdown_link_targets(DOCS_INDEX_PATH)
+
+
+@pytest.mark.parametrize("document", LIVE_DAG_DOCUMENTS)
 def test_dag_corpus_document_repository_relative_links_resolve(document: Path) -> None:
     assert _missing_repository_relative_link_targets(document) == ()
 

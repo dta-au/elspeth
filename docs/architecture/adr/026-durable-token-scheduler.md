@@ -5,7 +5,7 @@
 Preconditions*; the separate deployment-shape ADR required by
 Precondition #9 is now authored as ADR-030 — proposed at slice
 0 of its landing plan, → Accepted at slice 5)
-**Deciders:** John Morrissey, Claude Opus
+**Deciders:** ELSPETH maintainer
 **Tags:** scheduler, checkpoint, resume, leases, cas, audit-integrity,
           embedded-database, rc6, multi-source-token-scheduler
 
@@ -414,7 +414,7 @@ it.
   concern, not just a trade-off: another worker can
   transition the row in the window between SELECT and
   UPDATE. G27 collapsed the pair into a single CAS UPDATE
-  (closed, commit `f79332aa8`; see Precondition #4).
+  (closed, commit `7868bc715`; see Precondition #4).
 
 ### RC6 Preconditions
 
@@ -435,7 +435,7 @@ session that chooses to ship N=1 still owes every item in
 this list.
 
 1. **Lease ownership semantics (G1 / elspeth-941f1508f5,
-   commit `3025168b2`). Done.** `recover_expired_leases`
+   commit `ead4bedd9`). Done.** `recover_expired_leases`
    originally added an explicit `caller_owner` and filtered
    `lease_owner != caller_owner`; the strict API now derives that identity
    from its leader token. At N=1 this
@@ -444,7 +444,7 @@ this list.
    the lease window.
 
 2. **PENDING_SINK drain isolation (G3 / elspeth-5c5e88b071,
-   commit `3dcebe9ec`). Done.** Resume converges in one
+   commit `a33667822`). Done.** Resume converges in one
    `_drain_scheduler_claims` invocation regardless of how
    many tokens crashed mid-sink. Required for crash
    recovery at any N.
@@ -466,7 +466,7 @@ this list.
    single-row predicate, or the two-statement form inside
    `BEGIN IMMEDIATE`). Genuinely sharper under N>1, but
    the *correctness* claim does not depend on N. Closed by
-   commit `f79332aa8` (a lost claim race surfaces as "no
+   commit `7868bc715` (a lost claim race surfaces as "no
    work", never a stale write); the cross-process residual
    is closed by ADR-030's write-intent `BEGIN IMMEDIATE`
    discipline on every scheduler/coordination write path.
@@ -669,7 +669,7 @@ scheduler discipline were discovered and fixed on 2026-05-22 and
 2026-05-23 as part of the dim1 engine audit; this ADR records
 the post-fix contract.
 
-- **Commit `3025168b2`** — *fix(scheduler): worker no longer
+- **Commit `ead4bedd9`** — *fix(scheduler): worker no longer
   steals back its own in-flight lease.* G1 / elspeth-941f1508f5.
   Added `caller_owner` to `recover_expired_leases` plus the
   filter `lease_owner != caller_owner` (and `lease_owner IS
@@ -680,7 +680,7 @@ the post-fix contract.
   subsequent `mark_terminal` / `mark_pending_sink` /
   `mark_blocked` write.
 
-- **Commit `3dcebe9ec`** — *fix(scheduler): drain all pre-
+- **Commit `a33667822`** — *fix(scheduler): drain all pre-
   existing PENDING_SINK rows on resume.* G3 /
   elspeth-5c5e88b071. Removed the
   `created_pending_sink_this_drain` flag that limited resume
@@ -713,9 +713,9 @@ token and broken audit identity.
 ### P0 fixes already landed on this branch
 
 - **G1 / elspeth-941f1508f5** — lease self-steal (commit
-  `3025168b2`).
+  `ead4bedd9`).
 - **G3 / elspeth-5c5e88b071** — PENDING_SINK drain starvation
-  (commit `3dcebe9ec`).
+  (commit `a33667822`).
 
 ### RC6 preconditions covered by this ADR
 
@@ -728,7 +728,7 @@ the §A / §B split in *RC6 Preconditions* above.
   `claim_pending_sink` SELECT-then-UPDATE CAS-race fix.
   Correctness claim under WAL regardless of worker count;
   sharper at N>1 but the gate is not multi-worker-specific.
-  **Closed** (commit `f79332aa8`; cross-process residual
+  **Closed** (commit `7868bc715`; cross-process residual
   closed by ADR-030's write-intent `BEGIN IMMEDIATE`
   discipline — see Precondition #4).
 - **G28 / elspeth-8536552dcb** — PRAGMA discipline on
@@ -845,9 +845,8 @@ for the move.
 - **Postgres backend.** If the project ever needs a non-
   embedded backend, the same scheduler schema, CAS
   discipline, and lease semantics port directly to
-  Postgres. The decision to remain SQLite-only at the
-  v1 layer (memory `project_phase9_sqlite_only`) is
-  preserved here.
+  Postgres. ADR-030 records the historical SQLite one-host profile and
+  ADR-041 governs the current supported state-engine profiles.
 
 ## Revision history
 
@@ -859,7 +858,7 @@ for the move.
   "an RC6 deliverable" and the *RC6 Preconditions* list was
   presented as eight ordered, independent gates.
 - **2026-05-23** — *Related Decisions* updated to resolve the
-  ADR-001 amendment contradiction (commit `9c3bfe85d1`,
+  ADR-001 amendment contradiction (commit `46d22822f`,
   elspeth-d678a718fd). Source-iteration axis preserved by
   ADR-025; worker-execution axis amended by this ADR; ADR-001
   *Amendments* section is canonical.
@@ -944,7 +943,7 @@ for the move.
       from `contracts/scheduler.py`. Delayed retry is a
       `READY` row with a future `available_at`, not a status.
     - *G27 (Precondition #4) marked Done.* The single-CAS
-      claim fix landed as commit `f79332aa8` (a lost claim
+      claim fix landed as commit `7868bc715` (a lost claim
       race surfaces as "no work"); the cross-process residual
       is closed by ADR-030's write-intent `BEGIN IMMEDIATE`
       discipline. The "Required" markers here and in the §A
@@ -996,9 +995,8 @@ for the move.
   Tier-3 boundary classification is unchanged.
 - **ADR-023** (custom Python CI analyzer) — the
   `tier-model` rule under `elspeth-lints` will see
-  fingerprint rotation as scheduler-related code lands
-  (memory `feedback_ast_shift_fingerprint_rotation`); the
-  enforcement contract is preserved.
+  fingerprint rotation as scheduler-related code lands; the
+  enforcement contract and `docs/judge-signature-handoff.md` workflow apply.
 - **ADR-024** (delivery governance for single-maintainer
   mode) — preserved and load-bearing. The embedded-database
   discipline, the no-external-broker discipline, and the
@@ -1050,21 +1048,14 @@ for the move.
 
 ### Commits
 
-- `3025168b2` — G1 lease self-steal fix.
-- `3dcebe9ec` — G3 PENDING_SINK drain starvation fix.
+- `ead4bedd9` — G1 lease self-steal fix.
+- `a33667822` — G3 PENDING_SINK drain starvation fix.
 
-### Review notes
+### Review history
 
-- `notes/branch-review-multi-source-token-scheduler-architecture-2026-05-22.md`
-  — load-bearing primitives, the scheduler-primitive overview,
-  the *post-fix* determinism story.
-- `notes/branch-review-multi-source-token-scheduler-consolidation-2026-05-22.md`
-  — the 32 canonical findings, tier-1 sequencing, the
-  *"scheduler primitive itself is well-designed"* framing.
-- `.worktrees/multi-source-token-scheduler/notes/multi-source-audit-dedup-map.md`
-  — execution-detail dedup map.
-- `notes/RC6-large-list.md` — canonical RC6 ticket
-  enumeration.
+- Commit `e73509ad6` preserves the historical consolidation review.
+- Commit `1e53826e3` records the later claim-order, scheduler-event, and
+  source-document reconciliation.
 
 ### Project policy
 
@@ -1073,12 +1064,10 @@ for the move.
   `AuditIntegrityError` paths embody), *No Legacy Code
   Policy* (the `_drain_in_memory_work_queue` cleanup
   precondition).
-- Memory `project_phase9_sqlite_only` — SQLite-only baseline
-  (rationale for the embedded-database choice).
-- Memory `project_db_migration_policy` — *delete the old DB*
-  rather than migrate.
-- Memory `project_multi_source_token_scheduler_rc6` — this
-  branch targets RC6.
+- ADR-030 and ADR-041 — historical SQLite profile and current supported
+  state-engine profiles.
+- `docs/reference/configuration.md` — pre-1.0 Landscape schema policy.
+- `CHANGELOG.md` — the 0.6.0 multi-source and scheduler release record.
 
 ## Notes
 

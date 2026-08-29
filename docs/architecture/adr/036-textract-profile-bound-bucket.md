@@ -2,9 +2,8 @@
 
 **Date:** 2026-08-04
 **Status:** Accepted
-**Deciders:** ELSPETH maintainers, on a three-seat design review (systems
-thinking, solution architecture, Python engineering) of Filigree
-`elspeth-cd0f6a6cd9`
+**Deciders:** ELSPETH maintainer
+**Review evidence:** Advisory systems-thinking, solution-architecture, and Python-engineering review recorded on Filigree `elspeth-cd0f6a6cd9`
 **Tags:** operator-profiles, custody, aws, textract, web-composer, audit
 
 ## Context

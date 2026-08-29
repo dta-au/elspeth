@@ -9,18 +9,22 @@ branch-protection, elspeth-lints
 
 ## Context
 
-ELSPETH started as a public open-source project maintained by one developer. It
-is now being built out as government-directed work while still having one
-assigned developer. That creates two governance tensions.
+ELSPETH is a public pre-release project operating in single-maintainer mode.
+That operating constraint creates two governance tensions.
 
 The first is assurance:
 
-- government-facing delivery needs explicit control evidence;
-- the repository cannot honestly use two-person review while only one developer is assigned;
+- delivery assurance needs explicit control evidence;
+- a single-maintainer repository cannot honestly claim independent two-person review;
 - self-approval would add ceremony without improving safety;
-- automated controls are already load-bearing through CI, `elspeth-lints`, CodeQL, redaction gates, signed container images, and release smoke tests.
+- automated controls must provide compensating evidence through required CI
+  and policy gates, security analysis, redaction controls, artifact provenance,
+  and release smoke tests.
 
-Without a recorded decision, a reviewer could misread `required_approving_review_count: 0` as an accidental waiver of review discipline. The real posture is different: ELSPETH is in a deliberate single-maintainer mode with compensating automated controls, and it has a defined step-up path for the moment a second developer is assigned.
+Without a recorded decision, a zero-human-approval posture could be misread as
+an accidental waiver of review discipline. The intended posture is deliberate
+single-maintainer governance with compensating automated controls and a defined
+step-up trigger when independent review becomes routinely available.
 
 The second is project control. As delivery continues, project decision-makers
 need a short, reliable answer to four questions:
@@ -38,11 +42,13 @@ layer over those sources, not a full project-management method.
 
 ## Decision
 
-ELSPETH will operate in **single-maintainer mode** until a second developer receives regular write access or participates in release-critical delivery.
+ELSPETH will operate in **single-maintainer mode** until a second maintainer
+regularly participates in release-critical delivery.
 
 In single-maintainer mode:
 
-- human approval count remains zero because self-review is not a meaningful control;
+- the required human approval count is zero while no independent maintainer is
+  routinely available; self-review cannot satisfy an approval requirement;
 - default-branch and release-critical merges must be protected by mandatory automated gates;
 - required evidence comes from CI, policy lints, CodeQL, redaction governance, artifact provenance, signatures, and smoke tests;
 - release images must be tied to commits that have passed the required CI gate;
@@ -70,8 +76,8 @@ The project-control reporting layer consists of four living artifacts:
    approved source records, it reports time, cost, or both by stable outcome or
    workstream. It states the unit or currency and actuals-through date;
    separates booked actuals, accruals or estimates, and forecast; shows the
-   approved resource envelope where one exists, or a clearly labelled planning
-   assumption where it does not; reconciles allocated and unallocated
+   approved resource envelope where one exists, or records Unknown until an
+   accountable source supplies one; reconciles allocated and unallocated
    consumption to the authoritative total; and explains material variance. It
    does not infer rates, reconstruct unsupported allocations, or treat recorded
    hours as individual productivity. Detailed timesheets, rates, invoices, and
@@ -89,8 +95,10 @@ The project-control reporting layer consists of four living artifacts:
    than copied.
 4. **Milestone and forecast register — one to two pages.** It records the next
    load-bearing milestones, their intended outcomes, accountable owner, original
-   and current approved commitment where one exists (otherwise **not set**),
-   previous and current forecast range and confidence, critical dependencies,
+   and current approved commitment where one exists; otherwise it records
+   **Unknown**, or **not set** only when the accountable authority confirms
+   that no commitment exists; previous and current forecast range and confidence,
+   critical dependencies,
    status, and change since the previous report. A target, forecast, and
    commitment are labelled separately. Any rebaseline records its reason,
    authority, and date; repeated replanning cannot silently reset variance to
@@ -121,20 +129,22 @@ The control artifacts aggregate, but do not replace, their canonical sources:
   code and enforced controls;
 - ADRs, contracts, and release guarantees are authoritative for durable design
   and assurance commitments; and
-- the organisation's approved time-recording, financial, procurement, or
-  contract system is authoritative for T&M actuals and rates.
+- an approved time-recording, financial, procurement, or contract system is
+  authoritative for T&M actuals and rates when the accountable organisation
+  identifies and supplies that source; otherwise the PCR records Unknown and
+  the action needed to establish it.
 
-ELSPETH is a public repository. Commercially sensitive rates, invoices,
-personal time records, internal forecasts, and other controlled project material
-must remain in an appropriately controlled system. When controls require that
-protection, the full issued PCR and affected registers live in that system and
-are authoritative. Any repository version is an optional, clearly labelled
+ELSPETH is a public repository. Where rates, invoices, personal time records,
+internal forecasts, or other project material require protection, they must
+remain in an appropriately controlled system. When such a controlled issued
+pack exists, it and the affected registers are authoritative. Any repository
+version is an optional, clearly labelled
 sanitized derivative carrying the same report identifier and as-of date; it may
 contain a non-sensitive aggregate or reference, but no sensitive link, rate,
 personal time record, or commercial term. Repository publication is not the
 price of project visibility.
 
-Each issued PCR is retained through the ordinary version history of its
+Each issued PCR must be retained through the ordinary version history of its
 authoritative system. This preserves previous forecasts, commitments, and
 rebaselines without creating signed receipts, hash manifests, or evidence
 sidecars for a working report.
@@ -161,14 +171,16 @@ Material means likely to breach a recorded resource or milestone tolerance,
 change a committed outcome or critical path, or require action beyond delegated
 authority. Each exception or decision ask states the decision owner,
 recommendation or real options, decision-by date, consequence of delay, and
-escalation route. If a decision owner or route has not been established, the PCR
-records **not set** and makes establishing it part of the ask rather than
-inventing one.
+escalation route. If source evidence does not establish a decision owner or
+route, the PCR records **Unknown** and makes establishing it part of the ask.
+It records **not set** only when the accountable authority confirms there is
+no such value.
 
 The PCR records tolerances set by the actual budget, contract, or other
-accountable authority. Where none has been set, it records **not set** and
-raises the gap to that authority as a decision ask; the maintainer does not
-invent or self-approve a tolerance.
+accountable authority. Where evidence is unavailable it records **Unknown**;
+where that authority confirms no tolerance exists it records **not set**. In
+either case it raises the gap as needed; the maintainer does not invent or
+self-approve a tolerance.
 
 Status is recorded separately for outcome/scope, T&M, milestone/timing, and
 risk/assurance. **Green** means current evidence supports delivery within the
@@ -220,7 +232,8 @@ prevents a concrete failure should be removed. If removing a practice is a
 marginal call or may discard a real safeguard, the tradeoff must be surfaced to
 the maintainer before removal.
 
-When a second developer is assigned, ELSPETH will step up to **two-maintainer mode** by enabling:
+When a second independent maintainer regularly participates in release-critical delivery,
+ELSPETH automatically enters **two-maintainer mode** and enables:
 
 - one required approving review;
 - stale-review dismissal on new commits;
@@ -233,10 +246,10 @@ When a second developer is assigned, ELSPETH will step up to **two-maintainer mo
 
 ### Positive Consequences
 
-- The current zero-reviewer setting is explainable as an honest staffing-mode decision, not an uncontrolled gap.
+- A zero-human-approval posture is explainable as an honest operating-mode decision, not an uncontrolled gap.
 - Automated controls become more important and must be wired as required checks, not merely present as optional workflows.
-- The project can move quickly while there is one maintainer without pretending to have a team process.
-- The step-up path is already defined for government review and for future maintainers.
+- The project can move quickly in single-maintainer mode without pretending to have a team process.
+- The step-up trigger is defined for future maintainers.
 - Decision-makers receive a consistent view of T&M allocation, delivery
   confidence, risks, milestones, and decisions without reading the engineering
   tracker.
@@ -247,8 +260,10 @@ When a second developer is assigned, ELSPETH will step up to **two-maintainer mo
 
 ### Negative Consequences
 
-- Single-maintainer mode still has concentration risk: one person can author and merge changes if automated checks pass.
-- Some controls remain platform configuration rather than repository-tracked code, so periodic ruleset inspection is necessary.
+- Single-maintainer mode still has concentration risk: independent human review
+  is unavailable within the mode.
+- Platform-configured controls require periodic inspection before they can be
+  claimed as enforced.
 - Review quality depends heavily on CI coverage, policy lints, and disciplined issue/ADR records until a second maintainer exists.
 - The maintainer must reconcile information from engineering and organisational
   systems on every reporting cycle.
@@ -271,7 +286,7 @@ When a second developer is assigned, ELSPETH will step up to **two-maintainer mo
 
 ### Require one approving review immediately
 
-**Description:** Configure GitHub to require one human approval even while there is only one developer.
+**Description:** Require one human approval while no independent maintainer is available.
 
 **Rejected because:** This would force self-approval or block delivery. Self-approval would be theatre and would teach reviewers to distrust the rest of the control set.
 
@@ -279,7 +294,10 @@ When a second developer is assigned, ELSPETH will step up to **two-maintainer mo
 
 **Description:** Keep the current practical setup and explain it verbally when asked.
 
-**Rejected because:** Government-facing delivery needs durable evidence. The important distinction between "no review control" and "single-maintainer mode with compensating automated controls" should be discoverable without oral history.
+**Rejected because:** Assurance-sensitive delivery needs durable evidence. The
+important distinction between "no independent review available" and
+"single-maintainer mode with compensating automated controls" should be
+discoverable without oral history.
 
 ### Use only manual release discipline
 

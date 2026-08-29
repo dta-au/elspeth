@@ -2,7 +2,7 @@
 
 **Date:** 2026-01-22
 **Status:** Accepted (amended 2026-05-23 by ADR-026 along the worker-execution axis; see *Amendments* below)
-**Deciders:** Architecture team, Core maintainers
+**Deciders:** ELSPETH maintainer
 **Tags:** concurrency, architecture, orchestrator, plugins, audit-integrity
 
 ## Amendments

@@ -1,16 +1,16 @@
 # ADR: Declarative DAG Wiring — Explicit Input/Output Connections on All Nodes
 
-**Status:** Approved (P3 future extension)
-**Bead:** `elspeth-rapid-tbia`
+**Status:** Accepted
+**Decision history:** commits `00d3c6bae` and `074e15e87`
 **Date:** 2026-02-09
-**Decision Makers:** Architecture Review Board
-**Depends On:** ADR-explicit-sink-routing (`elspeth-rapid-o639` — CLOSED), processor refactoring (`elspeth-rapid-hscm` — CLOSED)
-**Review Board Verdict:** Unanimous Approve (3/3) with conditions — all incorporated below
-**Design Decisions (2026-02-10):** on_success lifted to settings level (3a3f-A), settings.name drives node IDs (0wfr), aggregations stay post-transform (8q0m-A)
+**Decision Makers:** ELSPETH maintainer
+**Depends On:** ADR-004 explicit sink routing and the completed processor refactoring
+**Review evidence:** Three-lens advisory design review; conditions are incorporated below
+**Design Decisions (2026-02-10):** `on_success` lifted to settings level, `settings.name` drives node IDs, and aggregations stay post-transform
 
 ## Context
 
-The `on_success` ADR (elspeth-rapid-o639) makes output routing explicit — every terminal node declares where its output goes. But input routing remains implicit: transforms receive data based on YAML list position. The DAG builder infers edges from ordering.
+ADR-004 makes output routing explicit — every terminal node declares where its output goes. But input routing remains implicit: transforms receive data based on YAML list position. The DAG builder infers edges from ordering.
 
 This creates two description models coexisting in one YAML:
 
@@ -23,7 +23,11 @@ For simple linear pipelines, implicit inputs are fine. For complex topologies (f
 
 The current model encodes graph topology in list ordering — a form of *positional encoding* where information is carried by arrangement rather than declaration. This creates invisible invariants: the meaning of `transforms[2]` depends on the existence and position of `transforms[0]` and `transforms[1]`. Insert a new node at position 1 and you've implicitly rewired everything downstream without touching any explicit configuration.
 
-This pattern is a known fragility in ordered-list-as-graph representations. Systems that moved from implicit to explicit wiring (Apache Beam, Airflow, dbt, Terraform) all succeeded architecturally. dbt's `ref()` model is the closest analogue — every model explicitly declares its upstream dependencies, creating a fully declarative DAG. dbt has 50,000+ active projects and nobody complains about `ref()` being too verbose — because explicitness IS the feature for data lineage.
+This pattern is a known fragility in ordered-list-as-graph representations.
+Established data and infrastructure tools use named dependencies to make graph
+topology explicit. dbt's `ref()` model is the closest analogue: every model
+declares its upstream dependencies, creating a declarative DAG in which
+explicitness supports lineage.
 
 ### Current Model (Post on_success ADR)
 
@@ -79,9 +83,9 @@ Every processing node declares where it receives data:
 
 ```python
 class TransformSettings(BaseModel):
-    name: str                     # NEW: user-facing wiring label, drives node IDs (0wfr)
+    name: str                     # NEW: user-facing wiring label, drives node IDs
     input: str                    # NEW: named input connection
-    on_success: str | None = None # LIFTED from options to settings level (3a3f-A)
+    on_success: str | None = None # LIFTED from options to settings level
     plugin: str                   # existing
     options: dict | None = None   # existing (on_success removed from here)
 ```
@@ -195,11 +199,11 @@ No transforms, no `input:` fields needed. Source → sink via named connection.
 
 ## Prerequisites
 
-### Prerequisite 1: on_success ADR (elspeth-rapid-o639)
+### Prerequisite 1: ADR-004 `on_success`
 
 The on_success ADR must be implemented first. It establishes the `on_success` field on protocols and config, removes `default_sink`, and creates the explicit output routing foundation.
 
-### Prerequisite 2: Processor Refactoring (`elspeth-rapid-hscm` — CLOSED)
+### Prerequisite 2: Processor Refactoring (completed)
 
 **COMPLETED (2026-02-10).** The processor now uses `node_id`-based traversal:
 
@@ -257,7 +261,7 @@ A 3-transform linear pipeline goes from 0 wiring lines to 6 (3 `input:` + 3 `on_
 
 ### R2: Namespace confusion (LOW if separate namespaces enforced)
 
-Connection names colliding with sink names was identified as the primary risk loop. Mitigated by the review board's decision to use separate namespaces with collision-as-error validation.
+Connection names colliding with sink names was identified as the primary risk loop. The decision uses separate namespaces with collision-as-error validation.
 
 ### R3: DAG construction rewrite (HIGH)
 
@@ -267,40 +271,40 @@ Connection names colliding with sink names was identified as the primary risk lo
 
 ~800+ references across tests and examples. Mechanical but extensive. Mitigated by updating `tests/fixtures/pipeline.py` first (single leverage point) and using migration scripts for example YAMLs.
 
-## Review Board Decisions
+## Decision Clarifications
 
-| Question | Decision | Vote |
-|----------|----------|------|
-| Q1: Connection namespace | Separate from sink namespace; collision is `GraphValidationError` | Unanimous |
-| Q2: Multiple `input:` on transforms | Single input only; multiple inputs reserved for coalesce | Unanimous |
-| Q3: Backward compatibility | Atomic change, no phased rollout | Unanimous |
-| Q4: Does `path:` survive | Moot — no `path:` field exists on `TransformSettings`; fork branch association is via `fork_to:` on gates, which maps naturally to connection names | Unanimous |
-| Q5: YAML ordering | Enforce topological order as transitional constraint until processor refactored to follow DAG edges | Unanimous |
-| Q6: Verbosity mitigation | Accept verbosity now (option a); `chain:` syntactic sugar deferred to post-release user feedback | Unanimous |
-| Processor refactoring | Must be completed BEFORE declarative wiring; `start_step` → `node_id` is a separate work item | Unanimous |
-| Implementation sequencing | on_success ADR → processor refactoring → declarative wiring (three sequential phases) | Unanimous |
+| Question | Decision |
+|----------|----------|
+| Q1: Connection namespace | Separate from sink namespace; collision is `GraphValidationError` |
+| Q2: Multiple `input:` on transforms | Single input only; multiple inputs reserved for coalesce |
+| Q3: Backward compatibility | Atomic change, no phased rollout |
+| Q4: Does `path:` survive | Moot — no `path:` field exists on `TransformSettings`; fork branch association is via `fork_to:` on gates, which maps naturally to connection names |
+| Q5: YAML ordering | Enforce topological order as transitional constraint until processor refactored to follow DAG edges |
+| Q6: Verbosity mitigation | Accept verbosity now; `chain:` syntactic sugar deferred to post-release user feedback |
+| Processor refactoring | Must be completed before declarative wiring; `start_step` → `node_id` is a separate work item |
+| Implementation sequencing | ADR-004 → processor refactoring → declarative wiring |
 
 ## Implementation Sequencing
 
 ```
-Phase 1: on_success ADR (elspeth-rapid-o639)    ← CLOSED
+Phase 1: ADR-004 on_success                     ← COMPLETE
     ↓
-Phase 2: Processor refactoring (elspeth-rapid-hscm) ← CLOSED
+Phase 2: Processor refactoring                  ← COMPLETE
     (start_step → node_id, completed)
     ↓
 Phase 3: Declarative DAG wiring (this ADR)       ← READY (all prerequisites met)
     (from_plugin_instances() rewrite, ~900+ test refs)
 ```
 
-Phases 1 and 2 are complete. Phase 3 implementation proceeds in waves: config models → core rewrite → propagation → tests → verification. See `elspeth-rapid-tbia` for the full wave breakdown.
+Phases 1 and 2 are complete. Phase 3 implementation proceeds in waves: config models → core rewrite → propagation → tests → verification.
 
 ### Design Decisions (resolved 2026-02-10)
 
-| Bead | Decision | Rationale |
+| Topic | Decision | Rationale |
 |------|----------|-----------|
-| `3a3f` | **Option A**: Lift `on_success` from `options:` (plugin config) to settings level for all node types | Aligns with CoalesceSettings (already at settings level). All wiring fields (`name`, `input`, `on_success`) at same YAML level. High blast radius accepted. |
-| `0wfr` | `settings.name` drives node IDs, appears in audit, must be unique | Matches gates/aggregations. Eliminates sequence-dependent node IDs. Position-independent checkpoint resume. |
-| `8q0m` | **Option A**: Aggregations stay post-transform; `input:` makes wiring explicit within that constraint | Mid-chain aggregations deferred to P4 (`elspeth-rapid-ipwc`). Current model supports accumulate-then-transform via natural chain order. |
+| `on_success` location | Lift `on_success` from `options:` (plugin config) to settings level for all node types | Aligns with CoalesceSettings (already at settings level). All wiring fields (`name`, `input`, `on_success`) at same YAML level. High blast radius accepted. |
+| Node identity | `settings.name` drives node IDs, appears in audit, must be unique | Matches gates/aggregations. Eliminates sequence-dependent node IDs. Position-independent checkpoint resume. |
+| Aggregation ordering | Aggregations stay post-transform; `input:` makes wiring explicit within that constraint | Mid-chain aggregations require a future decision. Current model supports accumulate-then-transform via natural chain order. |
 
 ### Runtime Semantics (Phase 3 additions)
 
@@ -315,7 +319,7 @@ Phase 3 extends DAG construction AND runtime route resolution:
 ## References
 
 - Prerequisite ADR: `docs/architecture/adr/004-adr-explicit-sink-routing.md` (on_success — Phase 1 CLOSED)
-- Prerequisite refactoring: `elspeth-rapid-hscm` (processor node_id traversal — Phase 2 CLOSED)
+- Prerequisite refactoring: processor `node_id` traversal (completed)
 - DAG construction: `core/dag.py:from_plugin_instances()` (lines 561-1110, ~550 lines)
 - Processor traversal: `engine/processor.py` (`current_node_id`, `_WorkItem`) — node_id based
 - Gate routing: `core/config.py:GateSettings.routes`
@@ -323,5 +327,5 @@ Phase 3 extends DAG construction AND runtime route resolution:
 - Node ID derivation: `core/dag.py:node_id()` (lines 601-629)
 - Config models: `core/config.py:TransformSettings` (line 552), `GateSettings` (line 292), `AggregationSettings` (line 238)
 - Plugin config: `plugins/config_base.py:TransformDataConfig.on_success` (line 359), `SourceDataConfig.on_success` (line 153)
-- Design decisions: `3a3f` (on_success level), `0wfr` (name identity), `8q0m` (aggregation ordering)
+- Design decisions: `on_success` level, name identity, and aggregation ordering
 - Analogous systems: dbt `ref()`, Apache Beam PCollections, Airflow `>>` operator

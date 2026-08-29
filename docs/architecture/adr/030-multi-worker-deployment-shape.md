@@ -3,7 +3,7 @@
 **Date:** 2026-06-11
 **Status:** Accepted (Proposed at slice 0; Accepted at slice 5 of
 elspeth-1396d3f790; amended by ADR-041 on 2026-08-11)
-**Deciders:** John Morrissey, Claude Fable 5
+**Deciders:** ELSPETH maintainer
 **Tags:** scheduler, coordination, multi-worker, deployment, sqlite, wal,
           leader-election, fencing, multi-source-token-scheduler, adr-026,
           precondition-9
@@ -277,10 +277,8 @@ follower auto-promotion.
 ### Tickets
 
 - **elspeth-1396d3f790** — cross-process multi-worker run coordination
-  (option c), the feature this ADR shapes. Readable only in the pre-Jun-30
-  archived store (`.weft/filigree/filigree.db`); it was not carried across the
-  2026-06-30 tracker cutover. Not re-filed, because this ADR reached Accepted
-  at its slice 5 and live successors now carry the work: `elspeth-b5d7aa5655`
+  (option c), the feature this ADR shapes. Commits `cb0680166` and `b5b3eb035`
+  preserve its design and acceptance. Live successors are `elspeth-b5d7aa5655`
   (make web runtime multi-replica safe) and `elspeth-4d6c0dd0f5` (remediate
   deferred-platform review failures before multi-replica integration).
 - **elspeth-2f23292372** — resume() entry guard (option b), landed; gains

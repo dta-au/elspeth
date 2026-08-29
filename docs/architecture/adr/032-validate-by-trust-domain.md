@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-31
 **Status:** Accepted
-**Deciders:** John Morrissey, Claude Fable 5
+**Deciders:** ELSPETH maintainer
 **Tags:** trust-tier, elspeth-lints, judge-policy, external-boundary,
           duck-typing, composer, testing-doctrine
 
@@ -32,7 +32,7 @@ mechanism (`__pydantic_extra__`) and resolve only through
 `BaseModel.__getattr__`. The guard therefore rejected **every genuine
 tool call from every provider**.
 
-Approximately 33,000 unit tests passed. One live HTTP call found it.
+The existing unit suite passed. One live HTTP call found it.
 The unit tests fed the guard hand-written typed fakes — plain
 dataclasses with real, statically-visible attributes — which satisfy a
 guard that reality fails.

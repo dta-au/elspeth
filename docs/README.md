@@ -23,6 +23,19 @@ history.
 | Developing plugins | [Data Trust and Error Handling](guides/data-trust-and-error-handling.md), [Plugin Development Guide](../PLUGIN.md), then [Plugin Protocol](contracts/plugin-protocol.md) |
 | Contributing to the codebase | [Contributing](../CONTRIBUTING.md) |
 | Evaluating ELSPETH | [Executive Summary](release/executive-summary.md), [Composer Guide](release/composer-guide.md), [Platform Architecture](release/platform-architecture.md), [Public-Sector Assessment Mapping](release/assessment-mapping.md), and [Audit and Lineage Guarantees](release/guarantees.md) |
+| Reviewing delivery confidence and decisions | [Project Control Report](project-control/project-control-report.md), with the supporting [T&M](project-control/tm-register.md), [RAID](project-control/raid-register.md), and [milestone forecast](project-control/milestone-forecast-register.md) registers |
+
+---
+
+## Project Control
+
+ELSPETH uses a lean four-document control set, not a full project-management
+method. Start with the [Project Control Report](project-control/project-control-report.md)
+for the current status, exceptions, and asks. Its supporting registers are:
+
+- [T&M Register](project-control/tm-register.md) — resource evidence, allocation, and reconciliation gaps
+- [RAID Register](project-control/raid-register.md) — live material risks, assumptions, issues, and dependencies
+- [Milestone and Forecast Register](project-control/milestone-forecast-register.md) — commitments, forecasts, dependencies, and change
 
 ---
 
@@ -37,7 +50,7 @@ Current architecture and design references.
 - [Subsystems](architecture/subsystems.md) — compatibility pointer to current subsystem diagrams and ADRs
 - [Token Lifecycle](architecture/token-lifecycle.md) — row identity through forks and joins
 - [State Engine](architecture/state_engine/README.md) — canonical durable scheduler, barrier, sink-effect, proof-catalog, and assessment authority
-- [DAG Information and Completeness](architecture/dag/README.md) — permanent criteria, assessment framework, current verdict, and dated evidence
+- [DAG Information and Completeness](architecture/dag/README.md) — live criteria, executable scenario evidence, current verdict, and delivery ownership
 - [Landscape System](architecture/landscape.md) — audit trail architecture
 - [Landscape Entry Points](architecture/landscape-entry-points.md) — where audit records are created
 - [Barrier Machinery](architecture/barrier-machinery.md) — aggregation and coalesce as structural twins; paired-surfaces table and paired-change checklist

@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-20
 **Status:** Accepted
-**Deciders:** Codex synthesis from the Phase 2B panel-reviewed plan
+**Deciders:** ELSPETH maintainer
 **Tags:** declaration-contract, transform, pre-emission, tier-1, audit-integrity
 **Supersedes:** None
 **Depends on:** [ADR-010](010-declaration-trust-framework.md)
@@ -175,5 +175,4 @@ for this contract include `raw_schema_config`, `config_dict`, `options`, and
 - `src/elspeth/engine/executors/declared_required_fields.py`
 - `src/elspeth/contracts/errors.py`
 - `src/elspeth/plugins/infrastructure/base.py`
-- Historical Phase 2B declaration-trust plan: preserved in git history or
-  maintainer-local archives
+- Phase 2B implementation history: commits `85dfa6608` and `56e003a0c`
