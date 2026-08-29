@@ -82,17 +82,12 @@ from elspeth.web.sessions.protocol import (
     guided_json_payload_id,
 )
 from elspeth.web.sessions.schemas import (
-    AddComponentAction,
     ConvertGuidedRequest,
-    EditComponentAction,
-    FinishComponentsAction,
     GuidedStartOperationCompletedResponse,
     GuidedStartOperationFailedResponse,
     GuidedStartOperationInProgressResponse,
     GuidedStartOperationReconciliationResponse,
     ReenterGuidedRequest,
-    RemoveComponentAction,
-    ReorderComponentsAction,
     StartGuidedRequest,
     TutorialSampleResponse,
 )
@@ -180,7 +175,6 @@ if TYPE_CHECKING:
     from .guided_chat_atomic import GuidedChatProviderOutcome
 
 _COMPLETED_TERMINAL_BEFORE_EXIT_META_KEY = "guided_completed_terminal_before_user_exit"
-_MISSING_COMPLETED_TERMINAL_MARKER = object()
 # Bound on the scrubbed ``str(exc)`` logged when a guided /respond body is
 # rejected by the turn contract. Log-only — the closed 400 detail is
 # unchanged. Scrub first, then truncate: truncation is a bound, never a
@@ -194,7 +188,10 @@ def _resolve_shield_available(snapshot: PluginAvailabilitySnapshot) -> bool:
     Uses the same principal snapshot as every other policy surface.  Missing
     selection is the fail-safe State C result.
     """
-    return dict(snapshot.selected).get(PluginCapability.PROMPT_SHIELD) is not None
+    selected_by_capability = dict(snapshot.selected)
+    if PluginCapability.PROMPT_SHIELD not in selected_by_capability:
+        return False
+    return selected_by_capability[PluginCapability.PROMPT_SHIELD] is not None
 
 
 def _turn_payload_response(
@@ -374,8 +371,8 @@ def _build_get_guided_turn(
     if step is GuidedStep.STEP_1_SOURCE:
         target = guided.active_edit_target
         if target is not None and target.kind == "source":
-            edit_intent = guided.pending_source_intents.get(target.stable_id)
-            if edit_intent is not None:
+            if target.stable_id in guided.pending_source_intents:
+                edit_intent = guided.pending_source_intents[target.stable_id]
                 if edit_intent.phase != "inspection_review":
                     raise InvariantError("active source edit has unsupported pending review custody")
                 return build_step_1_inspect_and_confirm_turn_from_intent(edit_intent)
@@ -409,8 +406,8 @@ def _build_get_guided_turn(
     if step is GuidedStep.STEP_2_SINK:
         target = guided.active_edit_target
         if target is not None and target.kind == "output":
-            edit_intent = guided.pending_output_intents.get(target.stable_id)
-            if edit_intent is not None:
+            if target.stable_id in guided.pending_output_intents:
+                edit_intent = guided.pending_output_intents[target.stable_id]
                 if edit_intent.phase != "field_review":
                     raise InvariantError("active output edit has unsupported pending review custody")
                 observed_columns = tuple(
@@ -1153,14 +1150,10 @@ async def post_guided_reenter(
         existing_meta: dict[str, Any] = {}
         if state_record.composer_meta is not None:
             existing_meta = dict(deep_thaw(state_record.composer_meta))
-        completed_terminal_raw = existing_meta.get(
-            _COMPLETED_TERMINAL_BEFORE_EXIT_META_KEY,
-            _MISSING_COMPLETED_TERMINAL_MARKER,
-        )
-
         restored_terminal: TerminalState | None = None
         completed_content_changed = False
-        if completed_terminal_raw is not _MISSING_COMPLETED_TERMINAL_MARKER:
+        if _COMPLETED_TERMINAL_BEFORE_EXIT_META_KEY in existing_meta:
+            completed_terminal_raw = existing_meta[_COMPLETED_TERMINAL_BEFORE_EXIT_META_KEY]
             try:
                 if not isinstance(completed_terminal_raw, Mapping):
                     raise InvariantError("completed terminal re-entry marker must be a mapping")
@@ -1658,9 +1651,14 @@ async def post_guided_start(
             # reserve either observes the winner or performs the sole takeover.
             continue
         except asyncio.CancelledError as exc:
-            if exc.__dict__.get(_GUIDED_ATOMIC_SETTLEMENT_COMPLETED) is True:
+            # Same marker-reading shape as the post_guided_respond handler: the
+            # settlement helper stamps these two keys onto the cancellation it
+            # re-raises, so an absent key is "this cancellation carries no
+            # settlement evidence", read as membership rather than defaulted.
+            exc_dict = exc.__dict__
+            if _GUIDED_ATOMIC_SETTLEMENT_COMPLETED in exc_dict and exc_dict[_GUIDED_ATOMIC_SETTLEMENT_COMPLETED] is True:
                 raise
-            settlement_failure = exc.__dict__.get(_GUIDED_ATOMIC_SETTLEMENT_FAILURE)
+            settlement_failure = exc_dict[_GUIDED_ATOMIC_SETTLEMENT_FAILURE] if _GUIDED_ATOMIC_SETTLEMENT_FAILURE in exc_dict else None
             if isinstance(settlement_failure, GuidedOperationFenceLostError):
                 raise
             if settlement_failure is not None:
@@ -2048,7 +2046,7 @@ def _schema8_permitted_plugins(turn: Turn) -> tuple[str, ...]:
         raise InvariantError("single-select turn has no server-held option list")
     plugins: list[str] = []
     for option in options:
-        if not isinstance(option, Mapping) or type(option.get("id")) is not str:
+        if not isinstance(option, Mapping) or "id" not in option or type(option["id"]) is not str:
             raise InvariantError("single-select turn contains a malformed option")
         plugins.append(option["id"])
     return tuple(plugins)
@@ -2096,12 +2094,12 @@ def _schema8_active_source_edit_blob_id(guided: GuidedSession) -> UUID | None:
     active = guided.active_edit_target
     if active is None or active.kind != "source":
         return None
-    source = guided.reviewed_sources.get(active.stable_id)
-    if source is None:
+    if active.stable_id not in guided.reviewed_sources:
         raise InvariantError("active source edit target is not reviewed")
-    raw_blob_id = source.options.get("blob_ref")
+    source = guided.reviewed_sources[active.stable_id]
+    raw_blob_id = source.options["blob_ref"] if "blob_ref" in source.options else None
     if raw_blob_id is None:
-        path = source.options.get("path")
+        path = source.options["path"] if "path" in source.options else None
         raw_blob_id = path.removeprefix("blob:") if type(path) is str and path.startswith("blob:") else None
     if raw_blob_id is None:
         return None
@@ -2282,7 +2280,9 @@ def _schema8_require_runnable_sink_options(
         raise SinkAdmissionRejectedError(f"Output path is not allowed: {exc}") from exc
     allowed = allowed_sink_directories(data_dir, session_id=session_id)
     for key in SINK_LOCAL_PATH_OPTION_KEYS:
-        value = options.get(key)
+        if key not in options:
+            continue
+        value = options[key]
         if type(value) is not str or not value or value.startswith(BLOB_REF_PATH_PREFIX):
             continue
         resolved = resolve_sink_data_path(value, data_dir, session_id=session_id)
@@ -2319,24 +2319,32 @@ def _schema8_transition(
         if type(review_kind) is not str or review_kind not in {"source", "output"}:
             raise InvariantError("component review turn has no valid server-held component kind")
         action = body.component_action
-        action_kind = action.target.kind if isinstance(action, (EditComponentAction, RemoveComponentAction)) else action.component_kind
+        # Dispatch on the union's own declared discriminator rather than on the
+        # concrete model classes: ``GuidedComponentAction`` is
+        # ``Field(discriminator="action")``, so pydantic already guarantees the
+        # tag matches the class it built, and mypy narrows the tag on BOTH
+        # branches (an exact-class test does not).
+        if action.action == "edit" or action.action == "remove":
+            action_kind: str = action.target.kind
+        else:
+            action_kind = action.component_kind
         if action_kind != review_kind:
             raise ValueError("component action kind does not match the current review stage")
-        if isinstance(action, AddComponentAction):
+        if action.action == "add":
             updated = add_component_intent(guided, action.component_kind, new_stable_id)
-        elif isinstance(action, EditComponentAction):
+        elif action.action == "edit":
             updated = begin_component_edit(
                 guided,
                 ComponentTarget(kind=action.target.kind, stable_id=str(action.target.stable_id)),
             )
-        elif isinstance(action, RemoveComponentAction):
+        elif action.action == "remove":
             updated = remove_reviewed_component(
                 guided,
                 ComponentTarget(kind=action.target.kind, stable_id=str(action.target.stable_id)),
             )
-        elif isinstance(action, ReorderComponentsAction):
+        elif action.action == "reorder":
             updated = reorder_reviewed_components(guided, action.component_kind, tuple(action.stable_ids))
-        elif isinstance(action, FinishComponentsAction):
+        elif action.action == "finish":
             updated = finish_component_review(guided, action.component_kind)
         else:  # pragma: no cover - closed discriminated request union
             raise InvariantError("component review received an unsupported action model")
@@ -2822,7 +2830,7 @@ async def post_guided_respond(
         matches = [
             component
             for component in raw_components
-            if type(component) is dict and component.get("stable_id") == body.edit_target.stable_id
+            if type(component) is dict and "stable_id" in component and component["stable_id"] == body.edit_target.stable_id
         ]
         if len(matches) != 1:
             if public_error:
@@ -2958,11 +2966,14 @@ async def post_guided_respond(
 
         if set(edited) not in ({"revision_instruction"}, {"revision_instruction", "revision_mode"}):
             reject("Guided proposal revision values have an invalid closed shape.")
-        instruction = edited.get("revision_instruction")
+        # ``reject`` always raises, so past the exact key-set check above
+        # ``revision_instruction`` is proven present and ``revision_mode`` is
+        # the one genuinely optional member of the closed shape.
+        instruction = edited["revision_instruction"]
         if type(instruction) is not str or not instruction.strip() or len(instruction) > 8192:
             reject("Guided proposal revision instruction must be a non-empty string of at most 8192 characters.")
         assert type(instruction) is str
-        mode = edited.get("revision_mode", "amend")
+        mode = edited["revision_mode"] if "revision_mode" in edited else "amend"
         if type(mode) is not str or mode not in {"amend", "replace"}:
             reject("Guided proposal revision mode must be amend or replace.")
         assert type(mode) is str
@@ -5091,9 +5102,12 @@ async def post_guided_respond(
                 rejoin_after_lock = True
             except asyncio.CancelledError as exc:
                 exc_dict = exc.__dict__
-                if exc_dict.get(_GUIDED_ATOMIC_SETTLEMENT_COMPLETED) is True:
+                # Membership reads, like the ``llm_calls`` / ``planner_attempts``
+                # markers below: an absent key means this cancellation carries no
+                # settlement evidence, which is a fact, not a default.
+                if _GUIDED_ATOMIC_SETTLEMENT_COMPLETED in exc_dict and exc_dict[_GUIDED_ATOMIC_SETTLEMENT_COMPLETED] is True:
                     raise
-                settlement_failure = exc_dict.get(_GUIDED_ATOMIC_SETTLEMENT_FAILURE)
+                settlement_failure = exc_dict[_GUIDED_ATOMIC_SETTLEMENT_FAILURE] if _GUIDED_ATOMIC_SETTLEMENT_FAILURE in exc_dict else None
                 if isinstance(settlement_failure, GuidedOperationFenceLostError):
                     raise
                 caller_task = asyncio.current_task()
