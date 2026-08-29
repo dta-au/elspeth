@@ -79,7 +79,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _ToolBatchCancellationRequested,
     _ToolOutcome,
 )
-from elspeth.web.composer.advisor_checkpoint_telemetry import record_advisor_checkpoint_pass
+from elspeth.web.composer.advisor_checkpoint_telemetry import record_advisor_checkpoint_pass, record_advisor_terminal_publication
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import (
     BufferingRecorder,
@@ -1205,10 +1205,22 @@ def _announce_staged_review_handoff(result: ComposerResult, raw_content: str | N
     return _append_interpretation_review_handoff_message(result, raw_content)
 
 
+def _advisor_preflight_shape(runtime_result: ValidationResult | None) -> Literal["absent", "green", "pending_handoff", "red"]:
+    """Closed preflight-shape vocabulary for terminal-publication telemetry."""
+    if runtime_result is None:
+        return "absent"
+    if runtime_result.is_valid:
+        return "green"
+    if _is_pending_interpretation_handoff(runtime_result):
+        return "pending_handoff"
+    return "red"
+
+
 def _replace_advisor_repair_public_result(
     result: ComposerResult,
     *,
     outstanding_findings: ValidationResult | None = None,
+    session_id: str | None = None,
 ) -> ComposerResult:
     """Publish fixed prose after hidden advisor repair context was introduced.
 
@@ -1229,13 +1241,16 @@ def _replace_advisor_repair_public_result(
     Only a preflight that actually ran and passed may assert readiness.
     """
     runtime_result = result.runtime_preflight
+    preflight_shape = _advisor_preflight_shape(runtime_result)
     if runtime_result is None:
+        record_advisor_terminal_publication(session_id=session_id, branch="repair_unverified", reason=None, preflight_shape=preflight_shape)
         return replace(
             result,
             message=_ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE,
             raw_assistant_content=None,
         )
     if runtime_result.is_valid and runtime_result.readiness.completion_ready:
+        record_advisor_terminal_publication(session_id=session_id, branch="repair_success", reason=None, preflight_shape=preflight_shape)
         return replace(
             result,
             message=_ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE,
@@ -1253,6 +1268,9 @@ def _replace_advisor_repair_public_result(
             # failures (elspeth-ac85b0ab0e, battery round 7 g03 terminated
             # exactly here on the bare notice), the qualified shape names the
             # validator's objection alongside the handoff.
+            record_advisor_terminal_publication(
+                session_id=session_id, branch="repair_handoff_signoff_failed", reason=None, preflight_shape=preflight_shape
+            )
             return replace(
                 result,
                 message=_compose_advisor_pending_handoff_message(
@@ -1267,22 +1285,32 @@ def _replace_advisor_repair_public_result(
             # unverified — the masked re-validation found failures in the
             # stages that never ran. Name them instead of claiming ready.
             detail = _outstanding_findings_detail(outstanding_findings)
+            record_advisor_terminal_publication(
+                session_id=session_id, branch="repair_review_with_findings", reason=None, preflight_shape=preflight_shape
+            )
             return replace(
                 result,
                 message=_ADVISOR_REPAIR_REVIEW_WITH_FINDINGS_PUBLIC_MESSAGE.format(detail=detail),
                 raw_assistant_content=None,
             )
+        record_advisor_terminal_publication(session_id=session_id, branch="repair_review", reason=None, preflight_shape=preflight_shape)
         return replace(
             result,
             message=_ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE,
             raw_assistant_content=None,
         )
     if not runtime_result.is_valid:
+        record_advisor_terminal_publication(
+            session_id=session_id, branch="repair_preflight_failure", reason=None, preflight_shape=preflight_shape
+        )
         return replace(
             result,
             message=_compose_preflight_failure_message("", runtime_result=runtime_result),
             raw_assistant_content="",
         )
+    record_advisor_terminal_publication(
+        session_id=session_id, branch="repair_signoff_pending", reason=None, preflight_shape=preflight_shape
+    )
     return replace(
         result,
         message=_compose_advisor_signoff_pending_message(""),
@@ -2772,7 +2800,7 @@ class ComposerServiceImpl:
                 llm_calls=result.llm_calls,
                 plugin_snapshot=plugin_snapshot,
             )
-        return _replace_advisor_repair_public_result(result, outstanding_findings=outstanding_findings)
+        return _replace_advisor_repair_public_result(result, outstanding_findings=outstanding_findings, session_id=session_id)
 
     async def _attempt_empty_state_uploaded_blob_repair(
         self,
@@ -5809,6 +5837,7 @@ class ComposerServiceImpl:
             return _TerminalNoToolAdvisorGateOutcome(
                 action="return",
                 result=self._advisor_blocked_result(
+                    session_id=session_id,
                     reason=(
                         "flagged_final_pass"
                         if verdict.ok and is_last_pass
@@ -7362,6 +7391,7 @@ class ComposerServiceImpl:
         persisted_tool_call_turn: bool,
         runtime_preflight: ValidationResult | None,
         outstanding_findings: ValidationResult | None,
+        session_id: str | None = None,
     ) -> ComposerResult:
         """Build the end-gate ``ComposerResult`` for a sign-off that did not pass.
 
@@ -7403,6 +7433,12 @@ class ComposerServiceImpl:
         (elspeth-cd9af8e61d).
         """
         del assistant_message
+        record_advisor_terminal_publication(
+            session_id=session_id,
+            branch="terminal_block",
+            reason=reason,
+            preflight_shape=_advisor_preflight_shape(runtime_preflight),
+        )
         raw_content = ""
         validated_base = runtime_preflight if runtime_preflight is not None and runtime_preflight.is_valid else None
         if validated_base is not None:

@@ -94,9 +94,24 @@ _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE = (
 # it states what actually happened and what to do, and — unlike the preflight
 # wrapper — carries no interpolated diagnostic, so the whole suffix is fixed
 # operator-authored prose.
+# elspeth-ff4f0068a4: every advisor-cohort terminal replaces the model's
+# prose with fixed backend copy, so a turn in which the composer explained
+# that part of the user's request could not be applied (live case: one served
+# LLM profile, the user asked for two different LLMs) published nothing that
+# said so — the user learned it a full turn later. The model-facing withheld
+# disclosure already carries this fact into later provider context; this is
+# the USER-facing counterpart, one fixed operator-authored sentence appended
+# to each terminal that withholds prose. The transient repair status line
+# ("ELSPETH is applying a pipeline correction.") is deliberately excluded:
+# the terminal is where the user decides what the turn did.
+ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE: Final = (
+    "ELSPETH withheld the composer's own summary of this exchange; verify the pipeline before assuming every requested change was applied."
+)
+
 _ADVISOR_SIGNOFF_PENDING_NOTICE: Final = (
     "Completion advisory review did not clear after the available attempts. "
-    "Composer completion is withheld. Review the pipeline and retry the evidence-scoped advisor review."
+    "Composer completion is withheld. Review the pipeline and retry the evidence-scoped advisor review. "
+    + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
 )
 _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_PENDING_NOTICE
 
@@ -114,7 +129,7 @@ _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_
 _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE: Final = (
     "A required interpretation review is pending, and the completion advisory review did not clear "
     "after the available attempts. Resolve the pending review cards; validation and the advisory "
-    "review both run again on the next request."
+    "review both run again on the next request. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
 )
 _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX = (
     _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE
@@ -200,24 +215,33 @@ _ADVISOR_SIGNOFF_PENDING_HANDOFF_UNRENDERED_DETAIL: Final = (
 # only prose published for that repair cohort; the state, tool calls, provider
 # audit, and deterministic validation result remain unchanged.
 ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE: Final = "ELSPETH is applying a pipeline correction."
-ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE: Final = "The pipeline is configured and ready."
+ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE: Final = "The pipeline is configured and ready. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
 ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE: Final = (
-    "The pipeline update is ready for the required review. Resolve the pending review before running it."
+    "The pipeline update is ready for the required review. Resolve the pending review before running it. "
+    + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
 )
 # elspeth-5a372d3267: published instead of the bare review message when the
 # authoring-masked re-validation behind a pending-review handoff found
 # failures in the stages the strict ledger never reached — "ready for the
 # required review" would falsely imply the review is the only thing between
 # the user and execution.
+# The disclosure sits BEFORE the interpolated validator detail so the fixed
+# operator-authored sentence is never visually attributed to the untrusted
+# diagnostic tail.
 ADVISOR_REPAIR_REVIEW_WITH_FINDINGS_PUBLIC_MESSAGE: Final = (
-    "A required interpretation review is pending. Validation also found issues that must be fixed before this pipeline can run: {detail}"
+    "A required interpretation review is pending. "
+    + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+    + " Validation also found issues that must be fixed before this pipeline can run: {detail}"
 )
 # elspeth-88592f5be7: published when the advisor-repair turn ends with
 # ``runtime_preflight=None`` — no deterministic validation ran this turn, so
 # readiness is UNKNOWN, not ready. ``None`` is documented as fail-closed
 # unknown by the END advisor gate; this surface must not read the same
 # sentinel as an affirmative readiness claim.
-ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE: Final = "ELSPETH completed the advisor repair turn. Pipeline readiness was not determined this turn; run validation to confirm the pipeline state."
+ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE: Final = (
+    "ELSPETH completed the advisor repair turn. Pipeline readiness was not determined this turn; "
+    "run validation to confirm the pipeline state. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+)
 
 _MAX_INTENT_CLASSIFICATION_CHARS: Final = 4_096
 

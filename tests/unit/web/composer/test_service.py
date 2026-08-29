@@ -29,6 +29,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.core.canonical import canonical_json
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer import no_tool_policy as _no_tool_policy_module
 from elspeth.web.composer.advisor_checkpoint_telemetry import record_advisor_checkpoint_pass
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.planning import GuidedRevisionAuthority
@@ -1751,7 +1752,7 @@ class TestComposerMultiTurnToolCalls:
             mock_llm.side_effect = _fake_call_llm
             result = await service.compose("Review this pipeline", [], state)
 
-        assert result.message == "The pipeline is configured and ready."
+        assert result.message == _no_tool_policy_module.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
         assert len(captured_messages) == 3
         # Turn 2 (the repair call) saw the injected advisor findings.
         assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[1])
@@ -1854,7 +1855,7 @@ class TestComposerMultiTurnToolCalls:
                 .all()
             )
 
-        assert result.message == "The pipeline is configured and ready."
+        assert result.message == _no_tool_policy_module.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
         assert result.raw_assistant_content is None
         assert result.state.metadata.name == "Repaired"
         assert len(persisted_assistant_rows) == 1
@@ -2035,7 +2036,7 @@ class TestComposerMultiTurnToolCalls:
             mock_llm.side_effect = _fake_call_llm
             result = await service.compose("Review this pipeline", [], state)
 
-        assert result.message == "The pipeline is configured and ready."
+        assert result.message == _no_tool_policy_module.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
         assert len(captured_messages) == 4
         # Turn 2 (discovery-only) still sees it — not drained by a non-mutating turn.
         assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[1])
