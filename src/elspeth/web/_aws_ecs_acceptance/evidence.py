@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+
 from .contracts import (
     _EVIDENCE_KINDS,
     _SHA256_PATTERN,
@@ -50,6 +52,40 @@ def _safe_projection_value(field: str, value: object) -> object | None:
     return None
 
 
+@observation_boundary(
+    tier=3,
+    source="the message field of one CloudWatch log event, which a deployed container may emit either as a JSON string or as an already-decoded mapping",
+    source_param="message",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "never raises on a malformed message: a value that is not a string or mapping, an oversized string, an "
+        "undecodable string, and a string that decodes to something other than a mapping all return None, which "
+        "leaves the caller projecting the raw log event instead"
+    ),
+)
+def _decoded_log_message(message: object) -> Mapping[str, object] | None:
+    if isinstance(message, Mapping):
+        return message
+    if not isinstance(message, str) or len(message.encode("utf-8")) > MAX_JSON_RESPONSE_BYTES:
+        return None
+    try:
+        decoded = json.loads(message)
+        return decoded if isinstance(decoded, Mapping) else None
+    except json.JSONDecodeError:
+        return None
+
+
+@observation_boundary(
+    tier=3,
+    source="one CloudWatch log event, EventBridge deployment-event detail, or JSON-decoded log message emitted by the deployed web or doctor container",
+    source_param="record",
+    suppresses=("R1",),
+    invariant=(
+        "never raises on a malformed record: every field is admitted only through _safe_projection_value's "
+        "closed pattern and range checks, an unparseable timestamp is dropped rather than recorded, and an "
+        "unrecognised field is omitted, so the projection carries no free-form external content"
+    ),
+)
 def _project_log_record(record: Mapping[str, object], *, timestamp: object | None = None) -> dict[str, object]:
     projected: dict[str, object] = {}
     candidate_timestamp = timestamp if timestamp is not None else record.get("timestamp")
@@ -69,6 +105,24 @@ def _project_log_record(record: Mapping[str, object], *, timestamp: object | Non
     return projected
 
 
+@trust_boundary(
+    tier=3,
+    source="a raw diagnostic JSON document captured from the live acceptance account: a CloudWatch log page, an EventBridge deployment event, an ECS DescribeTaskDefinition response, or a terraform plan",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use on an unknown evidence kind, a payload that is not a dict, a "
+        "plan_sha256 present for a non-terraform kind or absent for a terraform one, an events/resource_changes "
+        "member that is not a bounded list, a log event or resource change that is not a mapping, a task "
+        "definition whose revision, networkMode, containerDefinitions, volumes or requiresCompatibilities fail "
+        "their shape, and a resource change carrying an action outside the closed terraform set; "
+        "never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_evidence_gate_ledger.py::test_sanitize_evidence_rejects_malformed_top_level_for_every_kind"
+    ),
+    test_fingerprint="8068669f831627ee5afbbbab3e579a58f547353c6f4360911b20e327d548a306",
+)
 def sanitize_evidence(kind: str, payload: object, *, plan_sha256: str | None = None) -> dict[str, object]:
     """Project raw diagnostic JSON into one closed, content-free evidence schema."""
 
@@ -94,17 +148,8 @@ def sanitize_evidence(kind: str, payload: object, *, plan_sha256: str | None = N
         for event in events:
             if not isinstance(event, Mapping):
                 raise AcceptanceCheckError("sanitize_evidence_schema")
-            message = event.get("message")
-            if isinstance(message, str) and len(message.encode("utf-8")) <= MAX_JSON_RESPONSE_BYTES:
-                try:
-                    decoded = json.loads(message)
-                except json.JSONDecodeError:
-                    decoded = None
-            elif isinstance(message, Mapping):
-                decoded = message
-            else:
-                decoded = None
-            source = decoded if isinstance(decoded, Mapping) else event
+            decoded = _decoded_log_message(event.get("message"))
+            source = event if decoded is None else decoded
             projected = _project_log_record(source, timestamp=event.get("timestamp"))
             if projected:
                 records.append(projected)
@@ -220,6 +265,24 @@ def _verify_stored_receipts(manifest_path: Path, manifest: Mapping[str, object])
     return len(receipts) + len(approvals), _sha256(json.dumps(evidence_records, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
 
+@trust_boundary(
+    tier=3,
+    source="the evidence-export receipt JSON document read back from disk, written by an evidence owner after an external export",
+    source_param="path",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use on a receipt that is not a mapping carrying exactly the closed "
+        "evidence-export field set, and on a schema, acceptance run identity, destination digest, receipts digest "
+        "or ledger-records digest that does not bind to the manifest and ledger the caller derived, on a verified "
+        "flag that is not exactly True, on an artifact_count that is not a positive int, and on an exported_at "
+        "outside the control timestamp grammar; never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_evidence_gate_ledger.py::"
+        "test_evidence_export_receipt_validators_reject_a_tampered_receipt_document"
+    ),
+    test_fingerprint="536452f07491e9717123ddf54d31ac792fe8201f99290bf3444e97abee5b3b0e",
+)
 def _validate_evidence_export_receipt(
     path: Path,
     *,
@@ -256,6 +319,23 @@ def _validate_evidence_export_receipt(
     return receipt, _sha256(canonical)
 
 
+@trust_boundary(
+    tier=3,
+    source="an evidence-export receipt JSON document re-read from disk to prove a manifest-recorded binding still holds",
+    source_param="path",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use on a receipt whose receipts_sha256 or ledger_records_sha256 is "
+        "absent, is not a str, or is not a well-formed sha256, on anything _validate_evidence_export_receipt "
+        "rejects when re-derived against those digests, and on a canonical digest that does not equal the "
+        "manifest-recorded expected_sha256; never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_evidence_gate_ledger.py::"
+        "test_evidence_export_receipt_validators_reject_a_tampered_receipt_document"
+    ),
+    test_fingerprint="536452f07491e9717123ddf54d31ac792fe8201f99290bf3444e97abee5b3b0e",
+)
 def _reverify_bound_evidence_export_receipt(
     path: Path,
     *,

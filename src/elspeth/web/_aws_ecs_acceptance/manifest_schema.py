@@ -8,6 +8,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
 
+from elspeth.contracts.trust_boundary import trust_boundary
+
 from .contracts import (
     _GIT_SHA_PATTERN,
     _SHA256_PATTERN,
@@ -79,6 +81,24 @@ _RETAINED_EVIDENCE_FIELDS = frozenset(
 )
 
 
+@trust_boundary(
+    tier=3,
+    source="the acceptance control-manifest JSON document read back from disk, written by a prior run or edited by an operator",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use on a document that is not a mapping carrying exactly the closed "
+        "control-manifest field set, on a wrong schema version, on a run identity that is not a canonical UUID, on a "
+        "candidate sha, account id, region, path, timestamp, digest or sha256 that fails its pattern, on scenarios A "
+        "and B sharing an inventory, binding or terraform state identity, and on a final_evidence record whose phase "
+        "and commit fields disagree; never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_manifest_schema_inventory.py::"
+        "test_validate_control_manifest_rejects_payloads_outside_the_closed_field_set"
+    ),
+    test_fingerprint="40a76656bd5972d885ce9edd465bbcc91d705487f0a0ea3418eea9c3f4e9e428",
+)
 def _validate_control_manifest(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict) or set(payload) != _CONTROL_MANIFEST_FIELDS:
         raise AcceptanceCheckError("control_manifest_schema")
@@ -350,6 +370,25 @@ def _require_mutable_control_manifest(manifest: Mapping[str, object]) -> None:
             raise AcceptanceCheckError("control_manifest_finalized")
 
 
+@trust_boundary(
+    tier=3,
+    source="the retained-evidence receipt document read back from disk, carrying CloudWatch metric series and X-Ray trace ids an operator captured",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use on a receipt that is not a mapping carrying exactly the closed "
+        "retained-evidence field set, on a schema, run identity or candidate sha that does not bind to the manifest, "
+        "on a scenarios member that is not exactly A and B, on per-scenario evidence outside the closed retained "
+        "field set or failing the orphan-inventory shape, on mismatched metric and trace counts, on a metric not "
+        "dimensioned to its own scenario namespace, and on scenarios A and B sharing a metric or trace id; "
+        "never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_manifest_schema_inventory.py::"
+        "test_validate_retained_evidence_receipt_rejects_payloads_outside_the_closed_field_set"
+    ),
+    test_fingerprint="0a72b600d7eece64e0bf9e7c43fc1a81c3f199956fed6e9493b10e2bcb3df9a7",
+)
 def _validate_retained_evidence_receipt(
     payload: object,
     *,

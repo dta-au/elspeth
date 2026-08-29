@@ -763,3 +763,52 @@ def test_gate_ledger_cleanup_and_finalize_serialize_from_the_preliminary_read(tm
     finalized = ledger["finalized"]
     assert isinstance(finalized, dict)
     assert finalized["records_sha256"] == acceptance._gate_ledger_records_hash(ledger)
+
+
+def test_evidence_export_receipt_validators_reject_a_tampered_receipt_document(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "control.json"
+    manifest = _init_control_manifest(manifest_path)
+    ledger_path = Path(str(manifest["gate_ledger_path"]))
+    _gate_ledger_init(ledger_path)
+    _fill_gate_ledger_prefix(ledger_path)
+    output_path = tmp_path / "initial-export.json"
+    receipt = acceptance.create_evidence_export_receipt(
+        manifest_path,
+        ledger_path=ledger_path,
+        output_path=output_path,
+        artifact_count=10,
+        now=lambda: datetime(2026, 7, 14, 1, 2, 30, tzinfo=UTC),
+    )
+    read_manifest = acceptance._read_control_manifest(manifest_path)
+    receipts_sha256 = str(receipt["receipts_sha256"])
+    ledger_records_sha256 = str(receipt["ledger_records_sha256"])
+
+    bound, bound_sha256 = evidence_owner._validate_evidence_export_receipt(
+        output_path,
+        manifest=read_manifest,
+        receipts_sha256=receipts_sha256,
+        ledger_records_sha256=ledger_records_sha256,
+    )
+    assert bound == receipt
+    evidence_owner._reverify_bound_evidence_export_receipt(output_path, manifest=read_manifest, expected_sha256=bound_sha256)
+
+    for document in (
+        ["not", "a", "mapping"],
+        {**receipt, "surplus_field": True},
+        {name: value for name, value in receipt.items() if name != "verified"},
+        {**receipt, "verified": "true"},
+        {**receipt, "artifact_count": 0},
+        {**receipt, "receipts_sha256": "z" * 64},
+        {**receipt, "destination_sha256": "a" * 64},
+    ):
+        output_path.write_text(json.dumps(document))
+        os.chmod(output_path, 0o600)
+        with pytest.raises(acceptance.AcceptanceCheckError, match="evidence_export"):
+            evidence_owner._validate_evidence_export_receipt(
+                output_path,
+                manifest=read_manifest,
+                receipts_sha256=receipts_sha256,
+                ledger_records_sha256=ledger_records_sha256,
+            )
+        with pytest.raises(acceptance.AcceptanceCheckError, match="evidence_export"):
+            evidence_owner._reverify_bound_evidence_export_receipt(output_path, manifest=read_manifest, expected_sha256=bound_sha256)

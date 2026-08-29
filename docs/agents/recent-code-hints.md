@@ -3774,6 +3774,48 @@ Every one of the ~25 whole-tree gates had the same exposure. Two rules now:
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-29 — a `@trust_boundary` whose `source_param` is a `Path` DOES suppress
+  the reads of the document that function opens itself, and the precise try-join
+  rule is about where the READ sits, not whether the handler raises.** Measured in
+  B27 on `web/_aws_ecs_acceptance/`, 215 findings, with the rule's own
+  `scan_file_with_observations`. Four facts that each cost a lane time:
+  1. **`source_param="path"` works.** `receipt = _read_protected_document(path,
+     check=...)` leaves `receipt` derived, because assignment propagation uses the
+     PERMISSIVE subtree scan (`_value_depends_on_boundary` →
+     `_expr_contains_derived_reference`) rather than `subject_is_rooted`, so a value
+     passing through a call still carries the trail. Both
+     `evidence.py::_validate_evidence_export_receipt` and
+     `::_reverify_bound_evidence_export_receipt` went to zero findings this way.
+     This is the same shape `ecs_metadata.py::fetch_task_identity` already uses with
+     `source_param="raw_uri"`: the parameter names the external SOURCE and the
+     function fetches the bytes itself. Do not split such a function into a
+     caller-reads/boundary-parses pair on the assumption that a call launders the
+     trail — measure first.
+  2. **The try-join rule, stated correctly:** a name bound in a `try:` body is
+     derived for reads INSIDE that try and loses derivation only AFTER it, because
+     `_visit_try_like` intersects the body-end and handler-end snapshots. It has
+     nothing to do with whether the handler raises or returns. The remedy is the
+     shape `fetch_task_identity` and `_trace_documents` already use in this package:
+     put the shape check inside the same `try` and `raise ValueError` there, letting
+     the single existing `except` translate it to the domain error. That is not
+     lint-dodging — it also removes the wart of one function rejecting malformed
+     input through two different mechanisms.
+  3. **Every `@trust_boundary` argument must be a LITERAL.** A non-literal (a lane
+     probed with `"0"*64`) emits `R_TB_NONLITERAL` and silently voids EVERY
+     suppression in that file — a 6-finding file went back to 15 with no error. And
+     `@classmethod` must be the OUTERMOST decorator; `@trust_boundary` above it
+     raises `TypeError: <classmethod(...)> is not a callable object` at import.
+  4. **`test_fingerprint` survives `ruff format`.** It is
+     `sha256(ast.dump(..., include_attributes=False))` of the referenced test, so
+     line joins and rewraps are free — verified by recomputing after the format hook
+     rewrote two of the pinning tests and getting the identical hash. Editing the
+     test's statements still rotates it.
+  Corollary for burn-down lanes: `.get()` on a mapping the function BUILDS ITSELF
+  (an accumulator proven `(str, str)` by the loop above it) is not a Tier-3 read at
+  all. `name not in observed or observed[name] != values[name]` is exactly
+  `observed.get(name) != values[name]` whenever the right-hand side cannot be None —
+  prove that side before converting, and say how you proved it.
+
 - **2026-08-25 — pdf_rasterize / out-of-process render seam.** First plugin in
   the tree to load a native library and to use `setrlimit`; both traps are
   reusable for the next native-dependency plugin:

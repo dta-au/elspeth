@@ -62,8 +62,58 @@ def test_cloudwatch_sidecar_fails_loudly_for_incomplete_bound_inventory_contract
         task_definition._validate_cloudwatch_agent_sidecar(
             {"name": "cloudwatch-agent", "image": "example.invalid/agent"},
             {},
-            {},
         )
+
+
+_TRACKED_SIDECAR_IMAGE = "example.invalid/cloudwatch-agent@sha256:" + "c" * 64
+_TRACKED_SIDECAR_VALUES = {"CLOUDWATCH_AGENT_IMAGE": _TRACKED_SIDECAR_IMAGE}
+
+
+def _tracked_cloudwatch_sidecar(environment: object) -> dict[str, object]:
+    return {
+        "name": "cloudwatch-agent",
+        "image": _TRACKED_SIDECAR_IMAGE,
+        "essential": False,
+        "memoryReservation": 192,
+        "entryPoint": ["/bin/sh", "-ceu"],
+        "command": [_CLOUDWATCH_AGENT_COMMAND],
+        "healthCheck": _CLOUDWATCH_AGENT_HEALTH_CHECK,
+        "environment": environment,
+    }
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        pytest.param("ELSPETH_CW_AGENT_CONFIG_JSON_B64=abc", id="not-a-list"),
+        pytest.param(["ELSPETH_CW_AGENT_CONFIG_JSON_B64=abc", "b", "c", "d"], id="entries-are-not-mappings"),
+        pytest.param(
+            [{"name": "ELSPETH_CW_AGENT_CONFIG_JSON_B64", "value": "abc", "valueFrom": "arn:aws:secretsmanager:x"}] * 4,
+            id="entry-carries-a-surplus-key",
+        ),
+    ],
+)
+def test_cloudwatch_sidecar_rejects_a_non_mapping_environment_entry(environment: object) -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
+        task_definition._validate_cloudwatch_agent_sidecar(_tracked_cloudwatch_sidecar(environment), _TRACKED_SIDECAR_VALUES)
+
+
+def test_cloudwatch_json_object_rejects_content_that_is_not_a_json_object() -> None:
+    assert task_definition._cloudwatch_json_object(b'{"agent": {"metrics_collection_interval": 10}}') == {
+        "agent": {"metrics_collection_interval": 10}
+    }
+
+    for content in (b'["not", "an", "object"]', b"null", b"{not json}", b'{"a": 1, "a": 2}', b"\xff\xfe"):
+        with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
+            task_definition._cloudwatch_json_object(content)
+
+
+def test_cloudwatch_yaml_object_rejects_content_that_is_not_a_yaml_mapping() -> None:
+    assert task_definition._cloudwatch_yaml_object(b"receivers:\n  otlp: {}\n") == {"receivers": {"otlp": {}}}
+
+    for content in (b"- not\n- a\n- mapping\n", b"just-a-scalar\n", b"key: [unclosed\n", b"\xff\xfe"):
+        with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
+            task_definition._cloudwatch_yaml_object(content)
 
 
 def test_manifest_and_task_definition_owners_are_facade_reexports_by_identity() -> None:
@@ -1078,3 +1128,14 @@ def test_task_definition_policy_binding_allows_missing_cloudwatch_agent_for_one_
         container_name=container_name,
         expected_user="1654:1654",
     )
+
+
+def test_control_manifest_get_rejects_selectors_that_the_document_does_not_resolve(tmp_path: Path) -> None:
+    path = tmp_path / "control.json"
+    _init_control_manifest(path)
+
+    assert acceptance.control_manifest_get(path, "cleanup_states.orphan_sweep") == "pending"
+
+    for field in ("", "x" * 257, "no_such_field", "cleanup_states.no_such_gate", "schema.nested"):
+        with pytest.raises(acceptance.AcceptanceCheckError, match="control_manifest_field"):
+            acceptance.control_manifest_get(path, field)

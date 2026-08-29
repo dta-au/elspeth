@@ -12,6 +12,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from elspeth.contracts.trust_boundary import trust_boundary
+
 from .contracts import _SHA256_PATTERN, AcceptanceCheckError, _control_timestamp, _sha256, _utc_timestamp
 from .manifest_schema import (
     _INFRASTRUCTURE_APPROVAL_SCOPES,
@@ -67,6 +71,25 @@ def _decode_approval_base64url(value: object, *, expected_bytes: int) -> bytes:
     return decoded
 
 
+@trust_boundary(
+    tier=3,
+    source="the approval keyring path (ELSPETH_ACCEPTANCE_APPROVAL_KEYRING) in the acceptance harness process environment and the protected Ed25519 keyring document it names",
+    source_param="environ",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before any signature can be trusted when the variable is unset or "
+        "empty, when the named document is not an owner-only regular file or does not decode to a JSON "
+        "object, when its keys are not exactly schema and keys, when the schema is not "
+        "elspeth.aws-ecs-approval-keyring.v1, when keys is not a mapping of 1 to 64 entries, when a key id "
+        "is not a bounded [A-Za-z0-9][A-Za-z0-9._-]{0,127} identifier, or when a key does not decode to "
+        "exactly 32 canonical base64url bytes; never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_receipts_approvals.py::"
+        "test_configured_approval_verifier_rejects_absent_or_malformed_keyring"
+    ),
+    test_fingerprint="78b11e4f68f759e82a805405cd618e55adcbdf7e1df465e94199e1f331969559",
+)
 def _configured_approval_signature_verifier(
     environ: Mapping[str, str],
 ) -> Callable[[bytes, str, str], bool]:
@@ -86,13 +109,11 @@ def _configured_approval_signature_verifier(
         decoded_keys[key_id] = _decode_approval_base64url(encoded_key, expected_bytes=32)
 
     def verify(payload: bytes, signature: str, key_id: str) -> bool:
-        public_key_bytes = decoded_keys.get(key_id)
-        if public_key_bytes is None:
+        if key_id not in decoded_keys:
             return False
+        public_key_bytes = decoded_keys[key_id]
         signature_bytes = _decode_approval_base64url(signature, expected_bytes=64)
         try:
-            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
             Ed25519PublicKey.from_public_bytes(public_key_bytes).verify(signature_bytes, payload)
         except Exception:
             return False

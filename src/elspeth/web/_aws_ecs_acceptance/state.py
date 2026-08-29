@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, Self
 
+from elspeth.contracts.trust_boundary import trust_boundary
+
 from .contracts import (
     _ARTIFACT_ID_PATTERN,
     _SHA256_PATTERN,
@@ -55,6 +57,23 @@ class AcceptanceCredentials:
     bearer_token: str | None = None
 
     @classmethod
+    @trust_boundary(
+        tier=3,
+        source="the acceptance authentication assignment (ELSPETH_ACCEPTANCE_USERNAME / ELSPETH_ACCEPTANCE_PASSWORD / ELSPETH_ACCEPTANCE_BEARER_TOKEN) in the acceptance harness process environment",
+        source_param="env",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "raises AcceptanceInputError before use unless the environment supplies exactly one complete "
+            "authentication mode - both local names and no bearer token, or a bearer token and neither "
+            "local name - and never echoes a credential value into the error; returns only the owned "
+            "frozen AcceptanceCredentials"
+        ),
+        test_ref=(
+            "tests/unit/web/aws_ecs_acceptance/test_contracts_secure_state.py::"
+            "test_auth_input_rejects_missing_partial_or_mixed_modes_without_echo"
+        ),
+        test_fingerprint="a51e2c2305179ac0b8a94f65977545487d6286a11eb0206a4cd2e138505ca35c",
+    )
     def from_env(cls, env: Mapping[str, str]) -> Self:
         username = env.get("ELSPETH_ACCEPTANCE_USERNAME") or None
         password = env.get("ELSPETH_ACCEPTANCE_PASSWORD") or None
@@ -281,6 +300,6 @@ def read_acceptance_state(path: Path) -> AcceptanceState:
             decoded = json.loads(content)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise AcceptanceStateError("acceptance state schema is invalid") from None
-        if not isinstance(decoded, dict):
+        if type(decoded) is not dict:
             raise AcceptanceStateError("acceptance state schema is invalid")
         return AcceptanceState.from_dict(decoded)

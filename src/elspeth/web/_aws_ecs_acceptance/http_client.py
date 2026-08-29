@@ -10,6 +10,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from elspeth.contracts.trust_boundary import trust_boundary
+
 from .contracts import (
     CONNECT_TIMEOUT_SECONDS,
     MAX_BLOB_RESPONSE_BYTES,
@@ -40,9 +42,9 @@ def _require_readable_ca_bundle(env: Mapping[str, str]) -> None:
     """Fail closed with a named code when a declared CA bundle is unreadable."""
 
     for name in _CA_BUNDLE_ENV_VARS:
-        value = env.get(name)
-        if not value:
+        if name not in env or not env[name]:
             continue
+        value = env[name]
         try:
             with open(value, "rb") as handle:
                 handle.read(1)
@@ -97,7 +99,7 @@ class AcceptanceHttpClient:
     ) -> Self:
         with acceptance_step("client_setup"):
             _require_readable_ca_bundle(env)
-            origin = normalize_acceptance_origin(env.get("ELSPETH_ACCEPTANCE_BASE_URL", ""))
+            origin = normalize_acceptance_origin(env["ELSPETH_ACCEPTANCE_BASE_URL"] if "ELSPETH_ACCEPTANCE_BASE_URL" in env else "")
             credentials = AcceptanceCredentials.from_env(env)
         return cls(origin=origin, credentials=credentials, transport=transport)
 
@@ -218,7 +220,24 @@ class AcceptanceHttpClient:
             )
             self._accept_auth_token(body)
 
+    @trust_boundary(
+        tier=3,
+        source="JSON body of POST /api/auth/login and POST /api/auth/register returned by the deployed web service",
+        source_param="body",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "raises AcceptanceCheckError('authentication_response') before the token is retained when the "
+            "authentication response body is not a dict, its access_token is not a non-empty str of at most 64 KiB, "
+            "or its token_type is not exactly 'bearer'; never coerces external values"
+        ),
+        test_ref=(
+            "tests/unit/web/aws_ecs_acceptance/test_http_capture.py::test_accept_auth_token_rejects_a_non_contractual_authentication_body"
+        ),
+        test_fingerprint="85cc7fa3bd32be401645a1b5c7dddbcf8336e755611b3060665c8212ecaf60c3",
+    )
     def _accept_auth_token(self, body: object) -> None:
+        """Retain a bearer token only from a contractual authentication response."""
+
         if not isinstance(body, dict):
             raise AcceptanceCheckError("authentication_response")
         token = body.get("access_token")
