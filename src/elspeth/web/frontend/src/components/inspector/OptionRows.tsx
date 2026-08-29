@@ -17,7 +17,21 @@ import { CodeBlock } from "@/components/chat/CodeBlock";
 import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
 import { useShowAdvanced } from "@/stores/preferencesStore";
 
-import { ConfigRows } from "./ConfigRows";
+import { ConfigRows, ConfigValue } from "./ConfigRows";
+
+// Wire sentinel for a blob-backed source's `path` knob (mirrors
+// BLOB_REF_PATH_PREFIX in web/composer/guided/protocol.py and
+// components/chat/guided/SchemaFormTurn.tsx's `maskBlobRef`): the guided
+// emitter commits `blob:<blob_ref>` in place of the absolute storage_path,
+// but a raw UUID means nothing to the reader and duplicates the decoy
+// `blob_ref` internal key this component already hides. `path` is
+// essential-tier (below), so it renders unconditionally — the raw sentinel
+// must never reach visible text, only a `title` attribute (copy-register
+// rule: identifiers go in title/data-* or a <code> inside a closed
+// <details>; a <details> is not itself a firewall since its children still
+// land in `textContent`) (elspeth-b9ebdf9011).
+const BLOB_REF_PATH_PREFIX = "blob:";
+const BLOB_REF_FRIENDLY_LABEL = "Uploaded sample data";
 
 // Visible labels for the authored keys (copy-register rule: no snake_case in
 // visible text). Anything not listed falls back to titleCaseLabel(key), the
@@ -87,7 +101,26 @@ export function OptionRows({
       ) : (
         <>
           {Object.keys(essential).length > 0 && (
-            <ConfigRows values={essential} emptyText="" />
+            <dl className="graph-config-rows">
+              {Object.entries(essential).map(([label, value]) => {
+                const maskBlobPath =
+                  label === optionLabel("path") &&
+                  typeof value === "string" &&
+                  value.startsWith(BLOB_REF_PATH_PREFIX);
+                return (
+                  <div key={label}>
+                    <dt>{label}</dt>
+                    <dd>
+                      {maskBlobPath ? (
+                        <span title={value as string}>{BLOB_REF_FRIENDLY_LABEL}</span>
+                      ) : (
+                        <ConfigValue value={value} />
+                      )}
+                    </dd>
+                  </div>
+                );
+              })}
+            </dl>
           )}
           {advancedKeys.length > 0 && (
             <details className="option-rows-advanced" open={showAdvanced}>

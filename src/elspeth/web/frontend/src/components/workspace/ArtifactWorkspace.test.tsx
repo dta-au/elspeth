@@ -1020,10 +1020,29 @@ describe("ArtifactWorkspace", () => {
       event.preventDefault();
     };
     window.addEventListener("error", preventExpectedWindowError);
+    // A malformed advanced-tier option value must still crash the Spec pane
+    // into its error boundary rather than the whole app. Options now render
+    // through the shared OptionRows/ConfigValue walk (elspeth-b9ebdf9011),
+    // which tolerates a bare BigInt (`String(1n)` succeeds, unlike the prior
+    // unconditional `JSON.stringify(row.options)`). ConfigValue still throws
+    // synchronously on a value whose own keys cannot be enumerated —
+    // `Object.entries` propagates the `ownKeys` trap's throw — so a hostile
+    // Proxy reproduces the same crash-into-boundary behavior without relying
+    // on an unbounded recursive walk (a self-referential value here grows the
+    // React element tree without ever unwinding a JS call stack, so it OOMs
+    // the worker instead of throwing a catchable RangeError).
+    const hostileOptionValue = new Proxy(
+      {},
+      {
+        ownKeys(): never {
+          throw new Error("Cannot enumerate this option value");
+        },
+      },
+    );
     useSessionStore.setState({
       compositionState: makeComposition(1, {
         sources: {
-          input: { plugin: "csv", options: { unsupported: 1n } },
+          input: { plugin: "csv", options: { unsupported: hostileOptionValue } },
         },
         nodes: [],
       }),

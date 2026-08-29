@@ -150,17 +150,17 @@ describe("PipelineSpecView", () => {
     render(<PipelineSpecView />);
 
     const source = screen.getByRole("article", { name: "Source input" });
-    expect(source).toHaveTextContent("on_success");
-    expect(source).not.toHaveTextContent("on_validation_failure");
+    expect(within(source).getByText("Then")).toBeInTheDocument();
+    expect(within(source).queryByText("Rows failing validation")).not.toBeInTheDocument();
     const node = screen.getByRole("article", { name: "Node rows" });
-    expect(node).toHaveTextContent("input");
-    expect(node).toHaveTextContent("on_success");
-    expect(node).toHaveTextContent("routes");
-    expect(node).not.toHaveTextContent("on_error");
-    expect(node).not.toHaveTextContent("fork_to");
+    expect(within(node).getByText("Reads from")).toBeInTheDocument();
+    expect(within(node).getByText("Then")).toBeInTheDocument();
+    expect(within(node).getByText("Routes")).toBeInTheDocument();
+    expect(within(node).queryByText("On error")).not.toBeInTheDocument();
+    expect(within(node).queryByText("Forks every row to")).not.toBeInTheDocument();
     expect(node).not.toHaveTextContent("DO_NOT_DERIVE_PRIVATE_GRAPH_CONFIG");
     const output = screen.getByRole("article", { name: "Output accepted" });
-    expect(output).toHaveTextContent("on_write_failure");
+    expect(within(output).getByText("If writing fails")).toBeInTheDocument();
     expect(screen.queryByText("DO_NOT_RENDER_EDGE")).not.toBeInTheDocument();
     expect(screen.queryByText("DO_NOT_RENDER_VALIDATION")).not.toBeInTheDocument();
   });
@@ -206,13 +206,16 @@ describe("PipelineSpecView", () => {
     render(<PipelineSpecView />);
 
     const node = screen.getByRole("article", { name: "Node merge_branches" });
-    expect(node).toHaveTextContent("branches");
+    expect(within(node).getByText("Merges branches")).toBeInTheDocument();
     // Both aliases, including the one `input` does not name.
     expect(node).toHaveTextContent("branch_a");
     expect(node).toHaveTextContent("hex_done");
-    expect(node).toHaveTextContent("policy");
+    expect(within(node).getByText("Merge policy")).toBeInTheDocument();
     expect(node).toHaveTextContent("require_all");
-    expect(node).toHaveTextContent("merge");
+    // Exact match: "Merge" is a prefix of "Merges branches" and "Merge
+    // policy", both present on this same card, so a substring check here
+    // would pass regardless of whether this row rendered at all.
+    expect(within(node).getByText("Merge")).toBeInTheDocument();
     expect(node).toHaveTextContent("union");
   });
 
@@ -265,15 +268,17 @@ describe("PipelineSpecView", () => {
     render(<PipelineSpecView />);
 
     const node = screen.getByRole("article", { name: "Node gather_pages" });
-    expect(node).toHaveTextContent("scope_name");
+    // Exact match: "Scope" is a prefix of "Scope opened by" and "Scope
+    // policy", both present on this same card.
+    expect(within(node).getByText("Scope")).toBeInTheDocument();
     expect(node).toHaveTextContent("doc_pages");
-    expect(node).toHaveTextContent("scope_opener");
+    expect(within(node).getByText("Scope opened by")).toBeInTheDocument();
     expect(node).toHaveTextContent("explode_pages");
-    expect(node).toHaveTextContent("scope_policy");
+    expect(within(node).getByText("Scope policy")).toBeInTheDocument();
     expect(node).toHaveTextContent("require_all");
-    expect(node).toHaveTextContent("output_mode");
+    expect(node).toHaveTextContent("Output mode");
     expect(node).toHaveTextContent("passthrough");
-    expect(node).toHaveTextContent("timeout_seconds");
+    expect(node).toHaveTextContent("Waits up to (seconds)");
     expect(node).toHaveTextContent("300");
   });
 
@@ -303,52 +308,23 @@ describe("PipelineSpecView", () => {
     render(<PipelineSpecView />);
 
     const node = screen.getByRole("article", { name: "Node enrich" });
-    expect(node).toHaveTextContent("input");
-    expect(node).not.toHaveTextContent("branches");
-    expect(node).not.toHaveTextContent("policy");
-    expect(node).not.toHaveTextContent("merge");
+    expect(node).toHaveTextContent("Reads from");
+    expect(node).not.toHaveTextContent("Merges branches");
+    expect(node).not.toHaveTextContent("Merge policy");
+    expect(node).not.toHaveTextContent("Merge");
   });
 
-  it("formats options deterministically in focusable labelled code regions", () => {
-    useSessionStore.setState({
-      compositionState: makeComposition(2, {
-        sources: {
-          input: {
-            plugin: "csv",
-            options: { delimiter: ",", header: true },
-          },
-        },
-        nodes: [],
-        outputs: [],
-      }),
-    });
-
-    render(<PipelineSpecView />);
-
-    const options = screen.getByRole("region", {
-      name: "Source input options",
-    });
-    expect(options).toHaveAttribute("tabindex", "0");
-    // Prove the highlighted JSON path rendered, not the plain fallback.
-    const highlighted = options.querySelector("[data-codeblock-format='json']");
-    expect(highlighted).not.toBeNull();
-    expect(
-      options.querySelector("[data-codeblock-format='plain']"),
-    ).toBeNull();
-    // Byte-exact oracle, indentation included. The shared prism highlighter
-    // renders one <div> per line, so the container's textContent loses the
-    // newlines with no separator — reconstruct them from the per-line
-    // children rather than normalising whitespace away. Deleting the
-    // whitespace would leave 2-space pretty-printing unpinned, and
-    // pretty-printing is the whole reason the Spec tab routes through
-    // CodeBlock with prettyJson.
-    const renderedLines = Array.from(highlighted?.children ?? []).map(
-      (line) => line.textContent ?? "",
-    );
-    expect(renderedLines.join("\n")).toBe(
-      JSON.stringify({ delimiter: ",", header: true }, null, 2),
-    );
-  });
+  // The always-visible pretty-printed JSON dump this test pinned
+  // ("formats options deterministically in focusable labelled code
+  // regions") is deliberately removed: options now render through the
+  // shared OptionRows (elspeth-b9ebdf9011), whose own suite
+  // (OptionRows.test.tsx) covers the essential/advanced split and the
+  // show_advanced-gated raw-JSON block that supersede it. The removed
+  // test also pinned `tabIndex=0` on the options wrapper, which made
+  // sense for a scrollable code block but not for structured dl rows —
+  // OptionRows renders `role="region"` with no tabIndex, and this file's
+  // new "renders options through OptionRows..." test below covers the
+  // Spec tab's integration with it.
 
   it("keeps each dt/dd pair wrapped in a div so the spec-card grid contract holds", () => {
     // .pipeline-spec-card dl lays out via grid + display:contents on the
@@ -481,5 +457,33 @@ describe("PipelineSpecView", () => {
     expect(
       undescribedCard.querySelector(".pipeline-spec-step-description"),
     ).toBeNull();
+  });
+
+  it("renders options through OptionRows and never shows hashes or blob refs by default", () => {
+    useSessionStore.setState({
+      compositionState: makeComposition(7, {
+        sources: {
+          source: {
+            plugin: "csv",
+            on_success: "raw_rows",
+            on_validation_failure: "discard",
+            options: {
+              path: "blob:f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0",
+              blob_ref: "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0",
+              interpretation_requirements: [{ accepted_artifact_hash: "3".repeat(64) }],
+              schema: { mode: "observed" },
+            },
+          },
+        },
+      }),
+    });
+    render(<PipelineSpecView />);
+    const card = screen.getByRole("article", { name: "Source source" });
+    expect(within(card).getByRole("region", { name: "Source source settings" })).toBeInTheDocument();
+    expect(card.textContent).not.toMatch(/f976fd8b-4432/);
+    expect(card.textContent).not.toMatch(/3{64}/);
+    expect(within(card).queryByText("None")).not.toBeInTheDocument();
+    expect(within(card).getByText("Rows failing validation")).toBeInTheDocument();
+    expect(within(card).getByText("dropped (recorded in the audit trail)")).toBeInTheDocument();
   });
 });

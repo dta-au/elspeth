@@ -1,5 +1,5 @@
-import { CodeBlock } from "@/components/chat/CodeBlock";
 import { PipelineGloss } from "@/components/chat/guided/PipelineGloss";
+import { OptionRows } from "@/components/inspector/OptionRows";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { CompositionState } from "@/types/index";
 
@@ -19,6 +19,42 @@ interface SpecSectionProps {
 
 function displayValue(value: unknown): string {
   return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+// Humanised labels/values for the routing dl (elspeth-b9ebdf9011). The
+// plugin `options` block routes through the shared OptionRows renderer
+// instead — this covers only the wiring fields projected in *Rows() below.
+const ROUTING_LABELS: Record<string, string> = {
+  input: "Reads from",
+  on_success: "Then",
+  on_error: "On error",
+  on_validation_failure: "Rows failing validation",
+  on_write_failure: "If writing fails",
+  fork_to: "Forks every row to",
+  routes: "Routes",
+  branches: "Merges branches",
+  policy: "Merge policy",
+  merge: "Merge",
+  scope_name: "Scope",
+  scope_opener: "Scope opened by",
+  scope_policy: "Scope policy",
+  output_mode: "Output mode",
+  timeout_seconds: "Waits up to (seconds)",
+};
+
+function routingLabel(field: string): string {
+  return ROUTING_LABELS[field] ?? field;
+}
+
+function routingValue(field: string, value: unknown): string {
+  if (value === "discard") return "dropped (recorded in the audit trail)";
+  if (Array.isArray(value)) return value.map(String).join(", ");
+  if (field === "routes" && typeof value === "object" && value !== null) {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.every(([, target]) => target === "fork")) return "every row continues to all branches";
+    return entries.map(([when, target]) => `${when} → ${String(target)}`).join("; ");
+  }
+  return displayValue(value);
 }
 
 function SpecSection({ name, rows }: SpecSectionProps): JSX.Element {
@@ -53,37 +89,23 @@ function SpecSection({ name, rows }: SpecSectionProps): JSX.Element {
                 )}
                 <dl>
                   <div>
-                    <dt>id</dt>
-                    <dd>{row.id}</dd>
-                  </div>
-                  <div>
-                    <dt>kind</dt>
+                    <dt>Kind</dt>
                     <dd>{row.kind}</dd>
                   </div>
-                  <div>
-                    <dt>plugin</dt>
-                    <dd>{row.plugin ?? "None"}</dd>
-                  </div>
+                  {row.plugin !== null && (
+                    <div>
+                      <dt>Plugin</dt>
+                      <dd>{row.plugin}</dd>
+                    </div>
+                  )}
                   {routingEntries.map(([field, value]) => (
                     <div key={field}>
-                      <dt>{field}</dt>
-                      <dd>{displayValue(value)}</dd>
+                      <dt>{routingLabel(field)}</dt>
+                      <dd>{routingValue(field, value)}</dd>
                     </div>
                   ))}
                 </dl>
-                <div
-                  className="pipeline-spec-options"
-                  role="region"
-                  aria-label={`${singular} ${row.id} options`}
-                  tabIndex={0}
-                >
-                  <CodeBlock
-                    code={JSON.stringify(row.options, null, 2)}
-                    language="json"
-                    prettyJson
-                    showCopy={false}
-                  />
-                </div>
+                <OptionRows options={row.options} ariaLabel={`${singular} ${row.id} settings`} />
               </article>
             );
           })}
