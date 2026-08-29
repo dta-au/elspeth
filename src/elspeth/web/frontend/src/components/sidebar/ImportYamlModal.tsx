@@ -9,8 +9,10 @@ import {
   OPEN_IMPORT_YAML_MODAL_EVENT,
 } from "@/lib/composer-events";
 import { PREFILL_CHAT_INPUT_EVENT } from "@/components/catalog/PluginCard";
-import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
-import { UnavailableComponentRow } from "@/components/catalog/UnavailableComponentRow";
+import {
+  UnavailableComponentRow,
+  unavailablePluginDisplayName,
+} from "@/components/catalog/UnavailableComponentRow";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { BlobMetadata } from "@/types/api";
@@ -1088,7 +1090,7 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
                           <>
                             <Button
                               className="btn-small"
-                              aria-label={`Remove disabled component ${finding.component_id} (${pluginDisplayName(finding.plugin_id)})`}
+                              aria-label={`Remove disabled component ${finding.component_id} (${unavailablePluginDisplayName(finding.plugin_id)})`}
                               title={finding.plugin_id}
                               onClick={() => requestDisabledComponentRemoval(finding)}
                             >
@@ -1096,7 +1098,7 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
                             </Button>
                             <Button
                               className="btn-small"
-                              aria-label={`Replace disabled component ${finding.component_id} (${pluginDisplayName(finding.plugin_id)}) with an available ${pluginKind(finding.plugin_id)}`}
+                              aria-label={`Replace disabled component ${finding.component_id} (${unavailablePluginDisplayName(finding.plugin_id)}) with an available ${pluginKind(finding.plugin_id)}`}
                               title={finding.plugin_id}
                               onClick={requestDisabledComponentReplacement}
                             >

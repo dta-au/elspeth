@@ -17,6 +17,19 @@ export interface UnavailableComponentFindingLike {
   reason_code: string;
 }
 
+/** `finding.plugin_id` is the wire composite `kind:name` (e.g.
+ *  "transform:legacy_llm"), not the bare plugin name `pluginDisplayName`
+ *  expects — passing the composite straight through humanises the "kind:"
+ *  prefix instead of dropping it, producing wrong copy like
+ *  "Transform:legacy LLM". Split off the kind prefix first so the row (and
+ *  every aria-label referencing it) shows the plugin's actual display name
+ *  ("Legacy LLM"); the raw composite id stays available via `title`. */
+export function unavailablePluginDisplayName(pluginId: string): string {
+  const separatorIndex = pluginId.indexOf(":");
+  const namePart = separatorIndex === -1 ? pluginId : pluginId.slice(separatorIndex + 1);
+  return pluginDisplayName(namePart);
+}
+
 export function UnavailableComponentRow({
   finding,
   reasonLabel,
@@ -30,7 +43,7 @@ export function UnavailableComponentRow({
     <li className="validation-banner-error-item">
       <div>
         <strong>{finding.component_id}</strong>{" "}
-        <span title={finding.plugin_id}>{pluginDisplayName(finding.plugin_id)}</span>{" "}
+        <span title={finding.plugin_id}>{unavailablePluginDisplayName(finding.plugin_id)}</span>{" "}
         — {reasonLabel}
       </div>
       <div className="import-yaml-actions">{actions}</div>

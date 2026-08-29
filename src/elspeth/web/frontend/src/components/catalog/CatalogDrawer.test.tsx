@@ -6,7 +6,7 @@ import * as api from "@/api/client";
 import { useAuthStore } from "@/stores/authStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { useSessionStore } from "@/stores/sessionStore";
-import { pluginDisplayName } from "./pluginDisplayName";
+import { unavailablePluginDisplayName } from "./UnavailableComponentRow";
 
 vi.mock("@/api/client", () => ({
   fetchPluginPolicy: vi.fn().mockResolvedValue({
@@ -266,6 +266,14 @@ describe("CatalogDrawer", () => {
     expect(onClose).toHaveBeenCalled();
   });
 
+  // Pins the contract directly rather than only self-referentially (a caller
+  // that hardcodes the same expression as the assertion could drift silently
+  // with it): the composite wire id's "kind:" prefix must be dropped before
+  // humanising, not humanised in place.
+  it("unavailablePluginDisplayName drops the kind prefix before humanising", () => {
+    expect(unavailablePluginDisplayName("transform:legacy_llm")).toBe("Legacy LLM");
+  });
+
   it("renders disabled saved components with keyboard and screen-reader repair actions", async () => {
     useSessionStore.setState({
       compositionState: {
@@ -293,13 +301,13 @@ describe("CatalogDrawer", () => {
       name: /unavailable saved components/i,
     });
     expect(repairRegion).toHaveTextContent("legacy_transform");
-    expect(repairRegion).toHaveTextContent(pluginDisplayName("transform:legacy_llm"));
+    expect(repairRegion).toHaveTextContent(unavailablePluginDisplayName("transform:legacy_llm"));
     expect(repairRegion).toHaveTextContent("Not enabled");
     expect(within(repairRegion).getAllByTitle("transform:legacy_llm").length).toBeGreaterThan(0);
     expect(
       screen.getByRole("button", {
         name: new RegExp(
-          `remove disabled component legacy_transform.*${pluginDisplayName("transform:legacy_llm")}`,
+          `remove disabled component legacy_transform.*${unavailablePluginDisplayName("transform:legacy_llm")}`,
           "i",
         ),
       }),

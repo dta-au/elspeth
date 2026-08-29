@@ -21,7 +21,7 @@ import * as api from "@/api/client";
 import type { BlobMetadata } from "@/types/api";
 import type { CompositionState } from "@/types/index";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
-import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
+import { unavailablePluginDisplayName } from "@/components/catalog/UnavailableComponentRow";
 
 vi.mock("yaml", async (importOriginal) => {
   const actual = await importOriginal<typeof import("yaml")>();
@@ -1061,13 +1061,13 @@ describe("ImportYamlModal", () => {
       name: /unavailable saved components/i,
     });
     expect(repairRegion).toHaveTextContent("legacy_output");
-    expect(repairRegion).toHaveTextContent(pluginDisplayName("sink:database"));
+    expect(repairRegion).toHaveTextContent(unavailablePluginDisplayName("sink:database"));
     expect(repairRegion).toHaveTextContent("Credential unavailable");
     expect(within(repairRegion).getAllByTitle("sink:database").length).toBeGreaterThan(0);
     expect(
       screen.getByRole("button", {
         name: new RegExp(
-          `remove disabled component legacy_output.*${pluginDisplayName("sink:database")}`,
+          `remove disabled component legacy_output.*${unavailablePluginDisplayName("sink:database")}`,
           "i",
         ),
       }),
