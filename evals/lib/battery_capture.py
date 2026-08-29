@@ -289,7 +289,12 @@ def tool_outcomes(capture: Capture) -> dict[str, str]:
             invocation = env.get("invocation")
             delta = invocation if isinstance(invocation, dict) else {}
             vb, va = delta.get("version_before"), delta.get("version_after")
-            if isinstance(vb, int) and isinstance(va, int) and va > vb:
+            # Exact ``int``, mirroring _tool_call_outcomes_by_call_id: the
+            # envelope round-trips through JSON, so a real version is an exact
+            # ``int`` and a JSON ``true`` must not be admitted as version 1.
+            # Keep the two classifiers in lockstep — they diverged on exactly
+            # this line within one merge range (lens-B F1, 2026-08-29).
+            if type(vb) is int and type(va) is int and va > vb:
                 out[row.tool_call_id] = "applied"
                 continue
             status = delta.get("status")
