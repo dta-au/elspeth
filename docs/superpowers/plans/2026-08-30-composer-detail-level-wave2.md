@@ -78,7 +78,7 @@
 - [ ] **Step 1: Capture the lint corpus at the branch point**
 
 ```bash
-ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth > /tmp/claude-1000/-home-john-elspeth/w2-lints-before.txt; grep -c . /tmp/claude-1000/-home-john-elspeth/w2-lints-before.txt
+ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth > /tmp/claude-1000/-home-john-elspeth/w2-lints-before.txt; grep -c . /tmp/claude-1000/-home-john-elspeth/w2-lints-before.txt  # grep -c prints 0 and exits 1 on zero matches — do not wrap in set -e
 ```
 
 Record the count and the HEAD sha beside it. This must happen before Task 1 lands, or another lane's churn is attributed to this wave.
@@ -2249,7 +2249,7 @@ With the local stack up (`docs/agents`/`examples/AGENTS.md` describe the runnabl
 
 ```bash
 ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth > /tmp/claude-1000/-home-john-elspeth/w2-lints-after.txt
-diff /tmp/claude-1000/-home-john-elspeth/w2-lints-before.txt /tmp/claude-1000/-home-john-elspeth/w2-lints-after.txt; grep -c . /tmp/claude-1000/-home-john-elspeth/w2-lints-after.txt
+diff /tmp/claude-1000/-home-john-elspeth/w2-lints-before.txt /tmp/claude-1000/-home-john-elspeth/w2-lints-after.txt; grep -c . /tmp/claude-1000/-home-john-elspeth/w2-lints-after.txt  # grep -c prints 0 and exits 1 on zero matches — do not wrap in set -e
 ```
 
 Expected: no added findings, identical counts (COUNT the corpus, never `tail` it). Task 5's `protocol.py` edits use the file's existing Mapping-membership parse idiom under the standing `@trust_boundary` decorators — no new dynamic-attribute sites; if the diff disagrees, the code is wrong, not the gate.
