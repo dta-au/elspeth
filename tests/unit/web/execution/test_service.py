@@ -2494,6 +2494,27 @@ def _row_union_node(
     )
 
 
+def _fork_gate_node(*, node_id: str, input_label: str, fork_to: tuple[str, ...]) -> Any:
+    """Fork gate duplicating each row into every ``fork_to`` branch."""
+    from elspeth.web.composer.state import NodeSpec
+
+    return NodeSpec(
+        id=node_id,
+        node_type="gate",
+        plugin=None,
+        input=input_label,
+        on_success=None,
+        on_error=None,
+        options={},
+        condition="True",
+        routes={"true": "fork", "false": "fork"},
+        fork_to=list(fork_to),
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
 def _queue_fan_in_state(*, sources: dict[str, Any], extra_nodes: tuple[Any, ...] = ()) -> Any:
     """CompositionState: ``sources`` fan into queue ``inbound`` feeding an LLM."""
     from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -3193,6 +3214,115 @@ class TestExecutionFanoutGuard:
         assert guard_forward.risks[0].estimated_provider_calls == 120
         assert guard_reverse.risks[0].estimated_provider_calls == 120
         assert sorted(guard_forward.risks[0].upstream_fanout) == sorted(guard_reverse.risks[0].upstream_fanout)
+
+    # ── Deterministic fork fan-out arithmetic (elspeth session 39578c6f) ─
+    # A fork gate duplicates each row exactly once per branch, so fork-only
+    # topologies keep provable per-row and total call counts. Only genuinely
+    # unbounded expansion (creates_tokens / collector / transform-mode
+    # aggregation) or a fork recombined by a combining fan-in stays unknown.
+
+    def test_fork_gate_keeps_estimate_and_reports_per_row_calls(self, tmp_path: Path) -> None:
+        """Fork-only topology: per-node estimate = rows x 1, risk graded by magnitude."""
+        from elspeth.web.composer.state import CompositionState, PipelineMetadata
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        rows = tmp_path / "rows.txt"
+        rows.write_text("\n".join(f"row-{i}" for i in range(5)) + "\n", encoding="utf-8")
+        state = CompositionState(
+            sources={"rows": _text_source(rows, "raw_rows")},
+            nodes=(
+                _fork_gate_node(node_id="fan_out", input_label="raw_rows", fork_to=("branch_a", "branch_b")),
+                _fanout_llm_node("branch_a", node_id="assess_a"),
+                _fanout_llm_node("branch_b", node_id="assess_b"),
+            ),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        guard = evaluate_execution_fanout_guard(state, data_dir=tmp_path)
+
+        assert guard is not None, "fork markers still require an acknowledgement"
+        assert len(guard.risks) == 2
+        for risk in guard.risks:
+            # Each source row reaches each leaf exactly once: 5 rows x 1 call.
+            assert risk.estimated_provider_calls == 5
+            assert risk.provider_calls_per_row == 1
+            # A known, small estimate is graded by magnitude, not by the mere
+            # presence of a fork marker.
+            assert risk.risk_level == "medium"
+            assert "per source row" in risk.message
+        assert guard.risk_level == "medium"
+        # The pipeline-level per-row cost is the number an operator can
+        # sanity-check against intent: 2 calls per source row, 10 total.
+        assert "2 provider call(s) per source row" in guard.summary
+        assert "estimated 10 total" in guard.summary
+
+    def test_fork_gate_with_unknown_rows_reports_per_row_calls(self, tmp_path: Path) -> None:
+        """Unknown row count + deterministic forks: say the per-row cost, stay high."""
+        from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        unknown = SourceSpec(
+            plugin="csv",
+            on_success="raw_rows",
+            options={"schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+        )
+        state = CompositionState(
+            sources={"rows": unknown},
+            nodes=(
+                _fork_gate_node(node_id="fan_out", input_label="raw_rows", fork_to=("branch_a", "branch_b")),
+                _fanout_llm_node("branch_a", node_id="assess_a"),
+                _fanout_llm_node("branch_b", node_id="assess_b"),
+            ),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        guard = evaluate_execution_fanout_guard(state, data_dir=tmp_path)
+
+        assert guard is not None
+        for risk in guard.risks:
+            assert risk.estimated_provider_calls is None
+            assert risk.risk_level == "high", "unknown row count keeps spend unbounded"
+            assert "1 openrouter model openai/gpt-4o-mini call(s) per source row" in risk.message
+        assert "2 provider call(s) per source row" in guard.summary
+        assert "could not be estimated" in guard.summary
+
+    def test_fork_recombined_by_row_union_refuses_the_arithmetic(self, tmp_path: Path) -> None:
+        """Fork copies rejoined by a row_union would double-count the deduped source."""
+        from elspeth.web.composer.state import CompositionState, PipelineMetadata
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        rows = tmp_path / "rows.txt"
+        rows.write_text("\n".join(f"row-{i}" for i in range(5)) + "\n", encoding="utf-8")
+        state = CompositionState(
+            sources={"rows": _text_source(rows, "raw_rows")},
+            nodes=(
+                _fork_gate_node(node_id="fan_out", input_label="raw_rows", fork_to=("branch_a", "branch_b")),
+                _row_union_node(branches={"a": "branch_a", "b": "branch_b"}),
+                _fanout_llm_node("unioned_rows"),
+            ),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        guard = evaluate_execution_fanout_guard(state, data_dir=tmp_path)
+
+        assert guard is not None
+        risk = guard.risks[0]
+        # The truth is 10 calls (2 copies x 5 rows) but the source dedup
+        # counts 5; the guard must refuse the estimate rather than publish it.
+        assert risk.estimated_provider_calls is None
+        assert risk.risk_level == "high"
+        assert "unknown number" in risk.message
+        assert "per source row" not in risk.message
 
 
 class TestWebRuntimeInfrastructure:
