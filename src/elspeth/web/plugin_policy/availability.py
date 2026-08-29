@@ -98,10 +98,10 @@ def build_plugin_snapshot(
     profile_bindings: list[tuple[PluginId, str, str, str]] = []
 
     for plugin_id in sorted(policy.authorized):
-        summary = catalog_items.get(plugin_id)
-        if summary is None:
+        if plugin_id not in catalog_items:
             unavailable.append(PluginAvailability(plugin_id, PluginUnavailableReason.NOT_INSTALLED))
             continue
+        summary = catalog_items[plugin_id]
         if summary.web_config_authority is WebConfigAuthority.OPERATOR_PROFILED:
             profile_states = profiles.profile_availability(
                 plugin_id,
@@ -147,15 +147,19 @@ def build_plugin_snapshot(
 
     declared_by_capability: dict[PluginCapability, set[PluginId]] = {capability: set() for capability in PluginCapability}
     for plugin_id in policy.authorized:
+        if plugin_id not in catalog_items:
+            # Already declined as NOT_INSTALLED above. Indexing it here raised
+            # KeyError out of a request path whose every other outcome is a
+            # recorded PluginAvailability; an authorization the catalog does
+            # not carry declares no capability.
+            continue
         item = catalog_items[plugin_id]
         for declaration in item.policy_capabilities:
             declared_by_capability[declaration.capability].add(plugin_id)
     preferences = dict(policy.preferences)
     selected: list[tuple[PluginCapability, PluginId | None]] = []
     for capability in PluginCapability:
-        ordered = preferences.get(capability)
-        if ordered is None:
-            ordered = tuple(sorted(declared_by_capability[capability]))
+        ordered = preferences[capability] if capability in preferences else tuple(sorted(declared_by_capability[capability]))
         selected.append((capability, next((plugin_id for plugin_id in ordered if plugin_id in available), None)))
 
     alias_tuple = tuple(usable_profile_aliases)

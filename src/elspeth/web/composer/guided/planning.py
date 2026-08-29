@@ -3309,7 +3309,26 @@ def _canonical_state_from_private_pipeline(raw: dict[str, JsonValue]) -> Composi
     ``from_dict`` constructors are strict. Apply the same defaults the
     freeform candidate builder applies so a schema-legal plan cannot die at
     this adapter.
+
+    ``raw`` must be a THAWED, mutable mapping: this adapter applies its
+    defaults by mutating ``raw`` in place. The control that supplies one is
+    ``_state_from_proposal``, the sole production caller, which passes
+    ``deep_thaw(proposal.pipeline)`` — ``PipelineProposal.__post_init__``
+    deep-freezes ``pipeline``, so the proposal's own mapping is a
+    ``mappingproxy`` whose nested blocks are frozen too. Without that thaw the
+    mutations raise a bare ``AttributeError`` (``mappingproxy`` has no
+    ``pop``) or ``TypeError`` (no item assignment) from outside the
+    canonicalisation ``try``, so the failure escapes as an unclassified
+    builtin instead of this module's audit-integrity signal. The guard below
+    states that requirement as a reject-gate, in the same
+    ``AuditIntegrityError`` currency as every other malformed-authority answer
+    on this path. A frozen NESTED block under a mutable ``raw`` is already
+    fail-closed: the defaulting loops skip it, ``CompositionState.from_dict``
+    raises ``KeyError`` on the missing canonical key, and the ``except`` below
+    converts that to the same ``AuditIntegrityError``.
     """
+    if type(raw) is not dict:
+        raise AuditIntegrityError("guided proposal private pipeline must be canonicalised from a thawed mapping")
     if "source" in raw and "sources" not in raw:
         source = raw.pop("source")
         raw["sources"] = {"source": source} if source is not None else {}

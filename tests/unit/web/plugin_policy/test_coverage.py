@@ -20,6 +20,7 @@ from elspeth.web.composer.state import (
     _validate_prompt_template_variable_bindings,
 )
 from elspeth.web.plugin_policy.coverage import (
+    _declared_scan_scopes,
     _translate_protected_fields_through_mapper,
     build_output_stream_graph,
     control_coverage_findings,
@@ -1668,6 +1669,35 @@ def test_mismatched_shield_still_fires_and_carries_both_field_sets() -> None:
     ]
     assert findings[0].protected_fields == ("untrusted_prompt",)
     assert findings[0].scanned_fields == ("benign_label",)
+
+
+def test_declared_scan_scopes_renders_a_frozen_authored_list_and_fails_soft() -> None:
+    """The DIAGNOSIS read must survive ``freeze_fields``, and never raise.
+
+    ``NodeSpec.__post_init__`` deep-freezes ``options``, so an authored
+    ``fields: [...]`` list arrives as a ``tuple`` and an exact ``list`` check
+    here would silently render every real control's scope as empty — an
+    accept-gate failure the coverage assertions could not see, because the set
+    is diagnosis-only and never decides credit.
+    """
+    node = _shield("shield", "raw", "llm_in", fields=("prompt", "context"))
+    assert type(node.options["fields"]) is tuple
+    assert _declared_scan_scopes(node.options) == frozenset({"prompt", "context"})
+
+    # A non-string ENTRY is dropped, never stringified: this set is echoed
+    # verbatim into an author-facing rejection, so rendering str(7) would state
+    # that the control scans a field named "7" — not a field name, and not
+    # something the author wrote. Under-reporting a malformed scope is the safe
+    # direction; the rejection itself stands either way.
+    mixed = _node("s", "azure_prompt_shield", "raw", "out", options={"fields": ["prompt", 7, None, "context"]})
+    assert _declared_scan_scopes(mixed.options) == frozenset({"prompt", "context"})
+
+    # A string scope is one name; every other shape, and an absent key, render
+    # as nothing rather than raising — this walk must not abort a rejection
+    # message it exists to enrich.
+    assert _declared_scan_scopes(_node("s", "azure_prompt_shield", "raw", "out", options={"fields": "all"}).options) == frozenset({"all"})
+    for malformed in ({}, {"fields": None}, {"fields": 7}, {"fields": {"prompt": True}}, {"fields": b"prompt"}):
+        assert _declared_scan_scopes(_node("s", "azure_prompt_shield", "raw", "out", options=malformed).options) == frozenset()
 
 
 def test_all_fields_control_is_credited_for_output_coverage_too() -> None:

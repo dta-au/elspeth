@@ -16,6 +16,7 @@ from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import (
+    PluginAvailability,
     PluginAvailabilitySnapshot,
     PluginId,
     PluginUnavailableReason,
@@ -182,6 +183,49 @@ def _build_internal_llm_source(
         secret_inventory=inventory or _Inventory(),
         generation_key=b"task-8-internal-source-generation-key",
     )
+
+
+def test_authorized_plugin_absent_from_the_catalog_is_declined_not_a_keyerror() -> None:
+    """A policy authorization the catalog does not carry stays a recorded decline.
+
+    ``build_plugin_snapshot`` already answers NOT_INSTALLED for such a plugin in
+    its availability sweep; the capability sweep afterwards indexed the same
+    catalog map unguarded, so the divergence the first loop is written to handle
+    raised ``KeyError`` out of a request path whose every other outcome is a
+    ``PluginAvailability``.
+    """
+    present = PluginId("source", "llm")
+    missing = PluginId("transform", "not_in_catalog")
+    settings = _settings()
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = WebPluginPolicy.create(
+        required=frozenset({present, missing}),
+        configured_optional=frozenset(),
+        preferences=(),
+        control_modes=(),
+        plugin_code_identities=((present, "1.0.0", "internal-task-8"),),
+    )
+
+    snapshot = build_plugin_snapshot(
+        policy=policy,
+        catalog=_InternalLLMSourceCatalog(),
+        profiles=OperatorProfileRegistry(policy=policy, settings=runtime),
+        principal_scope="local:alice",
+        secret_inventory=_Inventory(),
+        generation_key=b"catalog-divergence-generation-key",
+    )
+
+    assert missing not in snapshot.available
+    assert PluginAvailability(missing, PluginUnavailableReason.NOT_INSTALLED) in snapshot.unavailable
+    # The catalog-carried plugin is still swept normally: it is OPERATOR_PROFILED
+    # with no configured profile, so it is declined PROFILE_UNAVAILABLE rather
+    # than silently dropped along with the missing one.
+    assert present not in snapshot.available
+    assert PluginAvailability(present, PluginUnavailableReason.PROFILE_UNAVAILABLE) in snapshot.unavailable
+    # The capability sweep completed: every capability has an entry, and the
+    # plugin the catalog never carried contributes no capability.
+    assert set(dict(snapshot.selected)) == set(PluginCapability)
+    assert dict(snapshot.selected)[PluginCapability.LLM] is None
 
 
 def test_llm_source_has_no_flat_discovery_credential_requirement() -> None:

@@ -995,12 +995,18 @@ class TestSelectedControlProfile:
         from elspeth.web.composer.planner_authoring_aids import _selected_control_profile
 
         view, snapshot = _direct_control_view(tmp_path)
-        # Precondition: the controls really are selected with zero aliases.
+        # Precondition, stated as the ABSENT-PAIR fact rather than a defaulted
+        # read: build_plugin_snapshot records a usable_profile_aliases pair
+        # only for a WebConfigAuthority.OPERATOR_PROFILED plugin, and these
+        # Azure controls are USER_CONFIGURABLE_WITH_POLICY, so the pair is
+        # missing entirely. _selected_control_profile must answer the
+        # restrictive () to that absence, never credit the control with an
+        # alias the snapshot did not grant it.
         aliases_by_plugin = dict(snapshot.usable_profile_aliases)
         for capability in (PluginCapability.PROMPT_SHIELD, PluginCapability.CONTENT_SAFETY):
             selected = dict(snapshot.selected)[capability]
             assert selected is not None
-            assert not aliases_by_plugin.get(selected, ())
+            assert selected not in aliases_by_plugin
 
         assert _selected_control_profile(view, PluginCapability.PROMPT_SHIELD) == ("azure_prompt_shield", None)
         assert _selected_control_profile(view, PluginCapability.CONTENT_SAFETY) == ("azure_content_safety", None)

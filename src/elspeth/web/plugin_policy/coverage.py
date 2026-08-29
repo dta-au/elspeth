@@ -102,19 +102,32 @@ def build_output_stream_graph(nodes: Sequence[NodeSpec]) -> OutputStreamGraph:
     queue_predecessors: dict[str, dict[str, NodeSpec]] = {queue_id: {} for queue_id in queue_ids}
     consumers: dict[str, dict[str, NodeSpec]] = {}
 
+    def register_first(index: dict[str, dict[str, NodeSpec]], stream: str, node: NodeSpec) -> None:
+        """Record ``node`` under ``stream`` unless that id is already indexed.
+
+        First-wins on a repeated node id, spelled as an explicit membership
+        test: the whole point of these indexes is that the answer does not
+        depend on where a node sits in ``nodes``.
+        """
+        if stream not in index:
+            index[stream] = {}
+        entries = index[stream]
+        if node.id not in entries:
+            entries[node.id] = node
+
     def register(stream: str | None, producer: NodeSpec) -> None:
         if stream is None or stream == "" or stream in _NON_PRODUCED_ROUTE_TARGETS:
             return
         if stream in queue_ids and producer.id != stream:
-            queue_predecessors[stream].setdefault(producer.id, producer)
+            register_first(queue_predecessors, stream, producer)
             return
-        ordinary.setdefault(stream, {}).setdefault(producer.id, producer)
+        register_first(ordinary, stream, producer)
 
     for node in nodes:
         for stream in _node_output_streams(node):
             register(stream, node)
         for stream in _node_input_streams(node):
-            consumers.setdefault(stream, {}).setdefault(node.id, node)
+            register_first(consumers, stream, node)
 
     for node in nodes:
         if node.node_type == "queue":
@@ -158,10 +171,11 @@ def node_has_blocking_control(
     tier=3,
     source="NodeSpec carrying web-authored control options (untrusted 'fields' scope value)",
     source_param="node",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "returns False (not credited) for any 'fields' scope value other than the literal string 'all' or a "
-        "well-formed sequence of non-empty strings; never raises on a malformed scope"
+        "well-formed sequence of non-empty strings; never raises on a malformed scope. An ABSENT 'fields' key "
+        "reads as None and takes that same not-credited path — the absent case is never a credit"
     ),
 )
 def _control_covers_fields(node: NodeSpec, protected_fields: frozenset[str]) -> bool:
@@ -197,10 +211,13 @@ def _control_covers_fields(node: NodeSpec, protected_fields: frozenset[str]) -> 
     tier=3,
     source="NodeSpec carrying web-authored LLM 'queries' options (untrusted query definitions and field names)",
     source_param="node",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "returns a _ProtectedFields with provable=False whenever 'queries' or any query definition, its "
-        "input_fields mapping, or a row-field name deviates from the expected shape; never raises on malformed queries"
+        "input_fields mapping, or a row-field name deviates from the expected shape; never raises on malformed "
+        "queries. ABSENT keys are the plugin defaults, not a softening: an absent 'queries' is a single-query "
+        "node (LLMConfig.queries), an absent 'prompt_template' is an unparseable template and therefore already "
+        "unprovable, and an absent per-query 'template' means that query renders the node-level one"
     ),
 )
 def _llm_input_fields(node: NodeSpec) -> _ProtectedFields:
@@ -210,12 +227,12 @@ def _llm_input_fields(node: NodeSpec) -> _ProtectedFields:
     queries = node.options.get("queries")
     if queries is None:
         return prompt_fields
-    if isinstance(queries, Mapping):
-        definitions = tuple(queries.values())
-    elif isinstance(queries, Sequence) and not isinstance(queries, (str, bytes)):
-        definitions = tuple(queries)
-    else:
+    if not isinstance(queries, (Mapping, Sequence)) or isinstance(queries, (str, bytes)):
         return _ProtectedFields(prompt_fields.fields, False)
+    # A mapping's query definitions are its VALUES; a value that is both a
+    # Mapping and a Sequence keeps the mapping reading, as in the ordered
+    # if/elif this replaced.
+    definitions = tuple(queries.values()) if isinstance(queries, Mapping) else tuple(queries)
 
     # Each query renders its own ``template`` override when present and falls
     # back to the node-level ``prompt_template`` otherwise (QueryDefinition,
@@ -248,6 +265,16 @@ def _llm_input_fields(node: NodeSpec) -> _ProtectedFields:
     return _ProtectedFields(frozenset(fields), provable)
 
 
+@observation_boundary(
+    tier=3,
+    source="web-authored Jinja2 prompt template value read off NodeSpec.options (untrusted type and syntax)",
+    source_param="template",
+    suppresses=("R5",),
+    invariant=(
+        "returns a _ProtectedFields with provable=False whenever the template is not a string or does not parse; "
+        "never raises on a malformed template"
+    ),
+)
 def _template_input_fields(template: object) -> _ProtectedFields:
     """Extract static row-field accesses; dynamic or malformed templates are unprovable."""
     if not isinstance(template, str):
@@ -268,10 +295,13 @@ def _llm_output_fields(node: NodeSpec) -> frozenset[str]:
     tier=3,
     source="NodeSpec.options for a web-authored LLM node (untrusted response_field/queries values)",
     source_param="options",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "returns an empty frozenset whenever response_field, or 'queries' (its keys, entries, or a query's "
-        "'name'), deviates from the expected shape; never raises on malformed options"
+        "'name'), deviates from the expected shape; never raises on malformed options. The 'llm_response' default "
+        "for an absent response_field is the plugin's own declared default (LLMConfig.response_field, "
+        "plugins/transforms/llm/base.py and plugins/sources/llm/config.py), so it names the field the node will "
+        "actually write rather than assuming one; an absent 'queries' is a single-query node"
     ),
 )
 def _llm_output_fields_from_options(options: Mapping[str, object]) -> frozenset[str]:
@@ -305,8 +335,12 @@ def _llm_output_fields_from_options(options: Mapping[str, object]) -> frozenset[
     tier=3,
     source="SourceSpec carrying web-authored/deserialized LLM source options (untrusted response_field value)",
     source_param="source",
-    suppresses=("R5",),
-    invariant="returns None whenever source.options or its response_field deviates from the expected shape; never raises on malformed options",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns None whenever source.options or its response_field deviates from the expected shape; never raises "
+        "on malformed options. An absent response_field takes the plugin's own declared default 'llm_response' "
+        "(plugins/sources/llm/config.py), the field the source will actually write"
+    ),
 )
 def _llm_source_output_fields(source: SourceSpec) -> frozenset[str] | None:
     """Return the one generated field, or ``None`` when options are malformed."""
@@ -506,8 +540,13 @@ def control_coverage_findings(
 def _upstream_producers(node: NodeSpec, graph: OutputStreamGraph) -> tuple[NodeSpec, ...]:
     """Return the nodes producing this node's inputs, queue predecessors included."""
     if node.node_type == "queue":
-        return graph.queue_predecessors.get(node.id, ())
-    return tuple(producer for stream in _node_input_streams(node) for producer in graph.producers_by_stream.get(stream, ()))
+        return graph.queue_predecessors[node.id] if node.id in graph.queue_predecessors else ()
+    return tuple(
+        producer
+        for stream in _node_input_streams(node)
+        if stream in graph.producers_by_stream
+        for producer in graph.producers_by_stream[stream]
+    )
 
 
 def _upstream_control_scan_scopes(
@@ -536,14 +575,48 @@ def _upstream_control_scan_scopes(
         seen.add(producer.id)
         if node_has_blocking_control(producer, capability, ControlRole.INPUT):
             found = True
-            configured = producer.options.get("fields")
-            if isinstance(configured, str):
-                scopes.add(configured)
-            elif isinstance(configured, Sequence) and not isinstance(configured, (str, bytes)):
-                scopes.update(str(field) for field in configured)
+            scopes.update(_declared_scan_scopes(producer.options))
             continue
         frontier.extend(_upstream_producers(producer, graph))
     return tuple(sorted(scopes)) if found else None
+
+
+@observation_boundary(
+    tier=3,
+    source="the 'fields' scope value authored on a web control node (NodeSpec.options, untrusted)",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns only the field names the scope literally contains as strings; a non-string entry contributes "
+        "nothing and is never rendered into a name. Returns an empty frozenset whenever 'fields' is absent or is "
+        "neither a string nor a non-string sequence; never raises on a malformed scope. DIAGNOSIS ONLY — never a "
+        "credit decision"
+    ),
+)
+def _declared_scan_scopes(options: Mapping[str, object]) -> frozenset[str]:
+    """Return the field names a control's ``fields`` scope literally states.
+
+    DIAGNOSIS ONLY, and deliberately weaker than ``_control_covers_fields``:
+    that function decides credit and refuses a malformed scope outright, while
+    this one reports what the author wrote so the rejection message can name it.
+    Weaker on ADMISSION, never on honesty — a non-string entry is DROPPED rather
+    than stringified. The set is echoed verbatim into an author-facing rejection
+    that ``web/composer/required_controls.py`` also renders into a proposal
+    message, so ``str(7)`` there would state that the control scans a field
+    named ``7``, which is not a field name and not something the author wrote.
+    Dropping instead means the message under-reports a malformed scope, which is
+    the safe direction: the rejection stands either way, and only its explanatory
+    field list is affected.
+
+    ``Sequence`` (not ``list``) is required because ``NodeSpec.__post_init__``
+    deep-freezes ``options``, so an authored list arrives here as a ``tuple``.
+    """
+    configured = options["fields"] if "fields" in options else None
+    if isinstance(configured, str):
+        return frozenset({configured})
+    if isinstance(configured, Sequence) and not isinstance(configured, (str, bytes)):
+        return frozenset(field for field in configured if isinstance(field, str))
+    return frozenset()
 
 
 def _node_output_streams(node: NodeSpec) -> tuple[str, ...]:
@@ -582,10 +655,13 @@ def _node_input_streams(node: NodeSpec) -> tuple[str, ...]:
     tier=3,
     source="NodeSpec carrying web-authored field_mapper options (untrusted mapping/select_only values)",
     source_param="node",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "returns None whenever node.options['mapping'] or node.options['select_only'], or a mapping entry's "
-        "source/target, deviates from the expected shape; never raises on a malformed mapper config"
+        "source/target, deviates from the expected shape; never raises on a malformed mapper config. The absent-key "
+        "defaults are the plugin's own (FieldMapperConfig.mapping default_factory=dict, select_only default False), "
+        "so an absent key models what the mapper will actually do — an empty mapping renames nothing and passes "
+        "every protected field through unchanged"
     ),
 )
 def _translate_protected_fields_through_mapper(
@@ -666,10 +742,11 @@ def _translate_protected_fields_through_mapper(
     tier=3,
     source="NodeSpec carrying web-authored value_transform options (untrusted operations list)",
     source_param="node",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
-        "returns None whenever node.options['operations'] or an operation's 'target' deviates from the expected "
-        "shape; never raises on a malformed operations list"
+        "returns None whenever node.options['operations'], including an ABSENT one, or an operation's 'target' "
+        "deviates from the expected shape; never raises on a malformed operations list. Absent reads as None and "
+        "takes the same fail-closed path as malformed: an unproven write set means coverage cannot be credited"
     ),
 )
 def _deterministic_written_fields(node: NodeSpec) -> frozenset[str] | None:
@@ -718,9 +795,9 @@ def _stream_proves_input_control(
     at fault. The probe is never a credit decision: coverage is decided by the
     call with the real protected set.
     """
-    if not isinstance(stream, str) or not stream:
+    if type(stream) is not str or not stream:
         return False
-    producers = graph.producers_by_stream.get(stream)
+    producers = graph.producers_by_stream[stream] if stream in graph.producers_by_stream else ()
     if producers:
         return all(
             _producer_proves_input_control(
@@ -757,7 +834,7 @@ def _producer_proves_input_control(
     ):
         return True
     if producer.node_type == "queue":
-        predecessors = graph.queue_predecessors.get(producer.id, ())
+        predecessors = graph.queue_predecessors[producer.id] if producer.id in graph.queue_predecessors else ()
         return bool(predecessors) and all(
             _producer_proves_input_control(
                 predecessor,
@@ -844,7 +921,7 @@ def _stream_proves_output_control(
         return True
     if stream in sink_streams:
         return False
-    consumers = graph.consumers_by_stream.get(stream)
+    consumers = graph.consumers_by_stream[stream] if stream in graph.consumers_by_stream else ()
     if not consumers:
         return False
     return all(

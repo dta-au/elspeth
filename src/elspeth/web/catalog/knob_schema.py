@@ -358,9 +358,35 @@ def _attach_default(field: KnobField, info: FieldInfo) -> None:
     field["default"] = default
 
 
-def _attach_tier(field: KnobField, info: FieldInfo) -> None:
+def _composer_extras(info: FieldInfo) -> Mapping[str, Any] | None:
+    """Return the composer extras a field declares, or ``None`` for none.
+
+    ``FieldInfo.json_schema_extra`` is typed ``JsonDict | Callable[[JsonDict],
+    None] | None``. Absence and the callable-mutator form are both honest
+    "this field declares no composer extras" answers, so both are the no-op
+    every reader below already treats as permissive.
+
+    A present mapping is read whether it is a plain ``dict`` or the
+    ``MappingProxyType`` ``deep_freeze`` renders a mapping as. That pair is
+    the point of this helper: every reader here answers a question whose
+    *silent* branch is the permissive one — an unread ``composer_hidden``
+    means the field IS offered as a knob — so an exact-``dict`` test does not
+    abstain conservatively, it disables the declaration while every existing
+    test stays green. Anything else present is an authoring mistake in a model
+    we own (``KnobSchema`` is Tier 1) and raises at catalog load rather than
+    shipping a silently wrong composer surface.
+    """
     extra = info.json_schema_extra
-    if type(extra) is not dict:
+    if extra is None or callable(extra):
+        return None
+    if type(extra) not in (dict, types.MappingProxyType):
+        raise TypeError(f"json_schema_extra must be a mapping, a callable, or None, got {type(extra).__name__}")
+    return extra
+
+
+def _attach_tier(field: KnobField, info: FieldInfo) -> None:
+    extra = _composer_extras(info)
+    if extra is None:
         return
     if "composer_tier" not in extra:
         return
@@ -380,9 +406,14 @@ def _attach_required_when(field: KnobField, info: FieldInfo) -> None:
     and so does the exact-type test: the predicate is authored as a ``dict``
     literal inside ``json_schema_extra`` (``config_base.py``) and lowers to the
     ``VisibilityPredicate`` wire shape, so ``dict`` is the whole permitted set.
+    Deliberately narrower than ``_composer_extras``, which admits the frozen
+    form of the extras mapping itself: a frozen predicate would mean the
+    declaration reached here through some path other than the authored dict
+    literal, and this gate REJECTS — loudly, at catalog load — rather than
+    quietly dropping a requiredness rule the composer would then not enforce.
     """
-    extra = info.json_schema_extra
-    if type(extra) is not dict:
+    extra = _composer_extras(info)
+    if extra is None:
         return
     if "composer_required_when" not in extra:
         return
@@ -434,17 +465,25 @@ def _is_composer_hidden(info: FieldInfo) -> bool:
 
     Hidden fields are still valid Pydantic inputs (the runtime writes them
     via the resolve helper); they simply must not be surfaced as knobs in
-    the composer catalog UI. The membership-then-index pattern mirrors the
-    offensive idiom used elsewhere in this module — direct indexing
-    surfaces any non-bool value as a load-bearing crash rather than a
-    silently-false default.
+    the composer catalog UI. ``lower_model_to_knob_schema`` names what that
+    protects: these are audit-anchor fields the runtime writes, and a
+    user-set value would falsify the audit trail. So every branch that
+    cannot read the declaration fails CLOSED — a malformed extras mapping
+    raises out of ``_composer_extras``, and a ``composer_hidden`` that is
+    not an exact ``bool`` raises here — rather than answering the permissive
+    ``False`` and offering the anchor as a knob. The exact-``bool`` test is
+    the same strictness ``planner_authoring_aids`` applies to the lowered
+    projection of this flag (``schema.get("composer_hidden") is True``).
     """
-    extra = info.json_schema_extra
-    if type(extra) is not dict:
+    extra = _composer_extras(info)
+    if extra is None:
         return False
     if "composer_hidden" not in extra:
         return False
-    return bool(extra["composer_hidden"])
+    hidden = extra["composer_hidden"]
+    if type(hidden) is not bool:
+        raise TypeError(f"json_schema_extra['composer_hidden'] must be a bool, got {hidden!r}")
+    return hidden
 
 
 def _composer_str_extra(info: FieldInfo, key: str) -> str | None:
@@ -456,8 +495,8 @@ def _composer_str_extra(info: FieldInfo, key: str) -> str | None:
     catalog load rather than degrading to the CLI text and shipping a
     composer surface nobody notices is wrong.
     """
-    extra = info.json_schema_extra
-    if type(extra) is not dict:
+    extra = _composer_extras(info)
+    if extra is None:
         return None
     if key not in extra:
         return None

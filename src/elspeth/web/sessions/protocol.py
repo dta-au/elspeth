@@ -1000,8 +1000,8 @@ def guided_json_payload_id(
 
     if purpose not in {"turn", "turn_response"}:
         raise AuditIntegrityError("guided JSON payload purpose is outside the closed vocabulary")
-    if not isinstance(payload, Mapping):
-        raise AuditIntegrityError("guided JSON payload must be a mapping")
+    if type(payload) not in (dict, MappingProxyType):
+        raise AuditIntegrityError("guided JSON payload must be an exact mapping")
     return stable_hash(
         {
             "schema": "guided.json-payload.v1",
@@ -1051,7 +1051,7 @@ class PreparedGuidedAuditRow:
             "planner": "planner_attempt_audit",
             "chat": "chat_turn_audit",
         }[self.kind]
-        if self.envelope.get("_kind") != expected_discriminator:
+        if "_kind" not in self.envelope or self.envelope["_kind"] != expected_discriminator:
             raise AuditIntegrityError("PreparedGuidedAuditRow envelope discriminator does not match kind")
         freeze_fields(self, "envelope")
 
@@ -1467,10 +1467,10 @@ class GuidedResponseDescriptor:
         if set(value) != expected_keys or value["schema"] != "guided.operation-replay.v1":
             raise AuditIntegrityError("GuidedResponseDescriptor persisted shape is malformed")
         raw_turn = value["next_turn"]
-        if raw_turn is not None and not isinstance(raw_turn, Mapping):
+        if raw_turn is not None and type(raw_turn) not in (dict, MappingProxyType):
             raise AuditIntegrityError("GuidedResponseDescriptor next_turn is malformed")
         raw_findings = value["plugin_policy_findings"]
-        if type(raw_findings) not in (list, tuple) or any(not isinstance(item, Mapping) for item in raw_findings):
+        if type(raw_findings) not in (list, tuple) or any(type(item) not in (dict, MappingProxyType) for item in raw_findings):
             raise AuditIntegrityError("GuidedResponseDescriptor plugin policy findings are malformed")
         return cls(
             kind=value["kind"],
@@ -1611,8 +1611,12 @@ class GuidedStateOperationCommand:
             # (exit-to-freeform, the binding-exempt universal escape). The
             # settlement re-verifies the exact transition either way.
             composer_meta = self.state.composer_meta
-            guided_meta = composer_meta.get("guided_session") if isinstance(composer_meta, Mapping) else None
-            terminal = guided_meta.get("terminal") if isinstance(guided_meta, Mapping) else None
+            if composer_meta is not None and type(composer_meta) not in (dict, MappingProxyType):
+                raise AuditIntegrityError("GuidedStateOperationCommand.state.composer_meta must be an exact mapping or None")
+            guided_meta = composer_meta["guided_session"] if composer_meta is not None and "guided_session" in composer_meta else None
+            if guided_meta is not None and type(guided_meta) not in (dict, MappingProxyType):
+                raise AuditIntegrityError("Guided session composer metadata must be an exact mapping")
+            terminal = guided_meta["terminal"] if guided_meta is not None and "terminal" in guided_meta else None
             if terminal is None:
                 raise AuditIntegrityError("Pending proposal invalidation requires a deferred intent action or a terminal exit checkpoint")
 
@@ -1647,8 +1651,8 @@ class GuidedStateOperationCommand:
             raise AuditIntegrityError("GuidedStateOperationCommand.payloads must not repeat a payload_id")
         payloads_by_id = {payload.payload_id: payload for payload in self.payloads}
         if self.response.next_turn is not None:
-            next_payload = payloads_by_id.get(self.response.next_turn.payload_id)
-            if next_payload is None or next_payload.purpose != "turn":
+            next_payload_id = self.response.next_turn.payload_id
+            if next_payload_id not in payloads_by_id or payloads_by_id[next_payload_id].purpose != "turn":
                 raise AuditIntegrityError("Guided response next-turn payload must be present with purpose=turn")
         if type(self.audit_evidence) is not GuidedAuditEvidence:
             raise AuditIntegrityError("GuidedStateOperationCommand.audit_evidence must be exact typed evidence")
@@ -1756,8 +1760,8 @@ class GuidedPipelineProposalStageCommand:
         if type(self.payloads) is not tuple or not self.payloads:
             raise AuditIntegrityError("Guided proposal stage requires prepared payloads")
         payloads_by_id = {payload.payload_id: payload for payload in self.payloads}
-        proposal_payload = payloads_by_id.get(self.response.next_turn.payload_id)
-        if proposal_payload is None or proposal_payload.purpose != "turn":
+        proposal_payload_id = self.response.next_turn.payload_id
+        if proposal_payload_id not in payloads_by_id or payloads_by_id[proposal_payload_id].purpose != "turn":
             raise AuditIntegrityError("Guided proposal stage payload does not bind the response")
         if type(self.audit_evidence) is not GuidedAuditEvidence:
             raise AuditIntegrityError("Guided proposal stage audit evidence must be exact")

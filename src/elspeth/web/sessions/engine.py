@@ -95,7 +95,8 @@ def create_session_engine(url: str, **kwargs: Any) -> Engine:
     def _begin_immediate(conn: Connection) -> None:
         if conn.dialect.name != "sqlite":
             return
-        if conn.get_execution_options().get(_SESSION_WRITE_INTENT_OPTION, False):
+        execution_options = conn.get_execution_options()
+        if _SESSION_WRITE_INTENT_OPTION in execution_options and execution_options[_SESSION_WRITE_INTENT_OPTION]:
             conn.exec_driver_sql("BEGIN IMMEDIATE")
         else:
             conn.exec_driver_sql("BEGIN")

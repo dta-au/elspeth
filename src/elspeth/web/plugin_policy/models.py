@@ -39,6 +39,19 @@ class PluginId:
             raise ValueError("invalid kind-qualified plugin id")
         return cls(cast(PluginKind, match.group(1)), match.group(2))
 
+    @classmethod
+    def for_name(cls, kind: PluginKind, name: object) -> PluginId | None:
+        """Return the id for an untrusted authored plugin name, else ``None``.
+
+        The grammar lives on the type that owns it, so a caller holding a
+        web-authored ``name`` of unknown type gets an owned ``PluginId`` or an
+        explicit absence instead of having to drive ``__post_init__``'s
+        ``ValueError`` as control flow.
+        """
+        if type(name) is not str or _PLUGIN_ID.fullmatch(f"{kind}:{name}") is None:
+            return None
+        return cls(kind, name)
+
     def __str__(self) -> str:
         return f"{self.kind}:{self.name}"
 

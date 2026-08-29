@@ -2399,13 +2399,27 @@ def normalize_set_pipeline_redacted_arguments(value: Any) -> Any:
     Pydantic materializes ``source.inline_blob=None`` while proposal custody
     treats an omitted field as absent. Both spellings mean no inline blob, so
     their persisted redacted authority projection must be identical.
+
+    Both mapping tests name ``(dict, MappingProxyType)`` — exactly
+    ``deep_freeze``'s output pair — rather than ``type(x) is dict``. Returning
+    the argument unchanged is this function's "nothing to normalise" answer,
+    so a mapping it fails to recognise is indistinguishable from a mapping
+    that needed no work, and the two spellings of "no inline blob" then
+    persist as DIFFERENT redacted authority projections. The nested test is
+    the load-bearing one: ``ComposerToolInvocation`` (``pipeline_commit``)
+    rejects a non-``dict`` outer value outright, but a plain ``dict`` whose
+    ``source`` is frozen — what a shallow ``dict(mappingproxy)`` produces —
+    passes that gate, leaves ``normalized_arguments is restored_arguments``
+    True, and banks ``semantic_arguments_hash = stored_authority_hash`` over
+    an unnormalised projection. Recognising the frozen form keeps the
+    ``composer_authority_hash`` recomputation on the path that needs it.
     """
-    if type(value) is not dict:
+    if type(value) not in (dict, MappingProxyType):
         return value
     if "source" not in value:
         return value
     source = value["source"]
-    if type(source) is not dict or "inline_blob" not in source or source["inline_blob"] is not None:
+    if type(source) not in (dict, MappingProxyType) or "inline_blob" not in source or source["inline_blob"] is not None:
         return value
     normalized_source = dict(source)
     del normalized_source["inline_blob"]

@@ -61,6 +61,72 @@ is a working document under the normal delivery posture.
   silently skipping every audit row — but the same value read behind an
   accept-gate elsewhere would go quiet.
 
+- **2026-08-29 — POLARITY decides how bad a `type(x) is dict` freeze trap is,
+  and an accept-gate that GATES A CONTROL BLOCK is fail-OPEN, not a
+  conservative abstention.** Landed by the Wave-3 hygiene lane over the four
+  sites the frozen-narrowing audit flagged. The rule the audit produced: read
+  what the SILENT branch of the gate causes, not just whether the gate is
+  wrong. `_discover_blob_rows_sources` (`web/execution/service.py`) returning
+  `[]` does not skip one field — it skips the whole `blob_rows` admission
+  block: session-ownership (IDOR), `ready` status, payload-hash and
+  metadata-divergence checks. `FrozenRunSettings.__post_init__` freezes
+  `executable_config`, so the ONLY thing that made the exact-`dict` test work
+  was a `deep_thaw` several hundred lines away in `_run_pipeline`; moving or
+  removing that thaw would have disabled admission with every test still
+  green. Same shape in `web/catalog/knob_schema.py`, where an unread
+  `json_schema_extra` answers "not hidden" and offers an audit-anchor field as
+  a user-editable knob. Fixes, in this order of preference: name
+  `(dict, MappingProxyType)` so the gate reads the frozen form (house
+  spelling is `type(x) in (dict, MappingProxyType)` — `isinstance` would add
+  an R5 the boundary must then suppress); or make the gate reject. What NOT
+  to do is pin "frozen input -> `[]`" — that is a criterion written from the
+  defect and it expires with the fix. Pin the commuting property instead:
+  frozen and thawed forms of the SAME value produce the SAME answer, built
+  through the real freezing owner (`FrozenRunSettings`, `PipelineProposal`),
+  plus an untouched arm. Measured corollaries: a frozen mapping reaching
+  `_canonical_state_from_private_pipeline` raises **AttributeError**
+  (`mappingproxy` has no `pop`) BEFORE it can raise `TypeError` on item
+  assignment — that adapter mutates `raw` in place, so its contract is a
+  thawed mapping and a reject-gate in `AuditIntegrityError` currency states
+  it; and a `dict(mappingproxy)` shallow thaw leaves a REAL outer dict with
+  FROZEN children, which sails through any outer-only exact-`dict` reject-gate
+  (`ComposerToolInvocation` in `pipeline_commit.py` is one), so the nested
+  test is usually the load-bearing one.
+
+- **2026-08-29 — the tier-model boundary walk loses `source_param` derivation
+  through a BRANCHED assignment, not through `tuple(...)`.** Measured on B54
+  with the rule's own `scan_file`. A name assigned in an `if`/`elif` (even when
+  every branch's RHS mentions the boundary parameter) is NOT derived afterwards,
+  so every `.get()`/`isinstance` on it, on its loop targets, and on anything
+  further downstream re-appears as R1/R5 despite the decorator. The SAME
+  expression written as one assignment keeps the trail — including through
+  `tuple(x.values())`, later `tuple(view.values())` hops, plain `for` targets,
+  and generator-expression targets:
+
+  ```python
+  # trail LOST for `definitions` and everything read off it
+  if isinstance(queries, Mapping):
+      definitions = tuple(queries.values())
+  elif isinstance(queries, Sequence) and not isinstance(queries, (str, bytes)):
+      definitions = tuple(queries)
+  else:
+      return _unprovable()
+
+  # trail KEPT — guard first, then ONE assignment
+  if not isinstance(queries, (Mapping, Sequence)) or isinstance(queries, (str, bytes)):
+      return _unprovable()
+  definitions = tuple(queries.values()) if isinstance(queries, Mapping) else tuple(queries)
+  ```
+
+  So when a boundary-decorated function still reports findings, hoist the
+  refusal into a guard and collapse the binding to one expression before
+  reaching for a rationale. Confirm from the `R_TB_SUPPRESSED` lines in the
+  after-corpus, never by reading the decorator. Two other trail-losers
+  re-confirmed here: a value bound from a helper call (`_stable_source_items(state)`,
+  `_upstream_producers(node, graph)`) is never rooted at any `source_param`, so
+  a Tier-3 parse that must be suppressed has to live in a function that takes
+  the untrusted mapping AS its `source_param` (B54 extracted
+  `coverage._declared_scan_scopes(options)` for exactly that).
 - **2026-08-29 — the `deep_freeze` trap is NOT limited to composition state:
   `ToolResult.data` is frozen too, and tracing a value's PRODUCERS is not a
   valid check.** B43b shipped a real regression this way, caught only by
