@@ -534,4 +534,29 @@ describe("PipelineSpecView", () => {
     expect(within(card).getByText("Rows failing validation")).toBeInTheDocument();
     expect(within(card).getByText("dropped (recorded in the audit trail)")).toBeInTheDocument();
   });
+
+  // Round-3 review finding, Spec-tab side: OptionRows' nested-key
+  // humanising must fail closed on `field_mapping` (a reader-keyed
+  // column→target map, not ELSPETH's own schema vocabulary) through THIS
+  // integration path too, not only in OptionRows' own unit tests.
+  it("renders field_mapping's reader-authored keys verbatim through the Spec tab", () => {
+    useSessionStore.setState({
+      compositionState: makeComposition(9, {
+        sources: {
+          source: {
+            plugin: "csv",
+            on_success: "rows",
+            options: {
+              field_mapping: { weird_header: "b" },
+            },
+          },
+        },
+      }),
+    });
+    render(<PipelineSpecView />);
+    const card = screen.getByRole("article", { name: "Source source" });
+    expect(within(card).getByText("weird_header")).toBeInTheDocument();
+    expect(within(card).queryByText("Weird Header")).not.toBeInTheDocument();
+    expect(card.textContent).not.toMatch(/Weird Header/);
+  });
 });

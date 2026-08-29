@@ -17,7 +17,7 @@ import { CodeBlock } from "@/components/chat/CodeBlock";
 import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
 import { useShowAdvanced } from "@/stores/preferencesStore";
 
-import { ConfigRows, ConfigValue } from "./ConfigRows";
+import { ConfigRows, ConfigValue, STRUCTURAL_OPTION_CONTAINER_KEYS } from "./ConfigRows";
 
 // Wire sentinel for a blob-backed source's `path` knob (mirrors
 // BLOB_REF_PATH_PREFIX in web/composer/guided/protocol.py and
@@ -59,6 +59,15 @@ export function optionLabel(key: string): string {
 
 export const ESSENTIAL_OPTION_KEYS: readonly string[] = Object.keys(OPTION_LABELS);
 
+// STRUCTURAL_OPTION_CONTAINER_KEYS by LABEL, not raw key: both call sites
+// below hand ConfigValue/ConfigRows a value that has already been re-keyed
+// by `pick()` (essential rows) or IS the raw key (GraphView's Connections &
+// schema, which never opts in at all — see ConfigRows.tsx). Computing this
+// once here keeps that re-keying detail local to this module.
+const STRUCTURAL_OPTION_CONTAINER_LABELS: ReadonlySet<string> = new Set(
+  Array.from(STRUCTURAL_OPTION_CONTAINER_KEYS, optionLabel),
+);
+
 export const INTERNAL_OPTION_KEYS: ReadonlySet<string> = new Set([
   "interpretation_requirements",
   "blob_ref",
@@ -91,7 +100,7 @@ function EssentialValue({ label, value }: { label: string; value: unknown }): JS
   ) {
     return <span title={value}>{BLOB_REF_FRIENDLY_LABEL}</span>;
   }
-  return <ConfigValue value={value} />;
+  return <ConfigValue value={value} humaniseKeys={STRUCTURAL_OPTION_CONTAINER_LABELS.has(label)} />;
 }
 
 export function OptionRows({
@@ -130,7 +139,7 @@ export function OptionRows({
           {advancedKeys.length > 0 && (
             <details className="option-rows-advanced" open={showAdvanced}>
               <summary>Advanced settings ({advancedKeys.length})</summary>
-              <ConfigRows values={advanced} emptyText="" />
+              <ConfigRows values={advanced} emptyText="" structuralKeys={STRUCTURAL_OPTION_CONTAINER_LABELS} />
             </details>
           )}
         </>
