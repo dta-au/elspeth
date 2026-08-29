@@ -79,6 +79,21 @@ function pick(options: Record<string, unknown>, keys: readonly string[]): Record
   return out;
 }
 
+// Renders one essential-row value, masking the blob-path sentinel (above) in
+// place of the generic ConfigValue walk. A plain `if` here lets TypeScript
+// narrow `value` to `string` for the `title` attribute directly from the
+// `typeof` check, with no cast.
+function EssentialValue({ label, value }: { label: string; value: unknown }): JSX.Element {
+  if (
+    label === optionLabel("path") &&
+    typeof value === "string" &&
+    value.startsWith(BLOB_REF_PATH_PREFIX)
+  ) {
+    return <span title={value}>{BLOB_REF_FRIENDLY_LABEL}</span>;
+  }
+  return <ConfigValue value={value} />;
+}
+
 export function OptionRows({
   options,
   ariaLabel,
@@ -102,24 +117,14 @@ export function OptionRows({
         <>
           {Object.keys(essential).length > 0 && (
             <dl className="graph-config-rows">
-              {Object.entries(essential).map(([label, value]) => {
-                const maskBlobPath =
-                  label === optionLabel("path") &&
-                  typeof value === "string" &&
-                  value.startsWith(BLOB_REF_PATH_PREFIX);
-                return (
-                  <div key={label}>
-                    <dt>{label}</dt>
-                    <dd>
-                      {maskBlobPath ? (
-                        <span title={value as string}>{BLOB_REF_FRIENDLY_LABEL}</span>
-                      ) : (
-                        <ConfigValue value={value} />
-                      )}
-                    </dd>
-                  </div>
-                );
-              })}
+              {Object.entries(essential).map(([label, value]) => (
+                <div key={label}>
+                  <dt>{label}</dt>
+                  <dd>
+                    <EssentialValue label={label} value={value} />
+                  </dd>
+                </div>
+              ))}
             </dl>
           )}
           {advancedKeys.length > 0 && (
