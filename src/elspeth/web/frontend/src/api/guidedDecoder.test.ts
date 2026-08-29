@@ -729,6 +729,41 @@ describe("guided schema-10 wire decoder", () => {
     }
   });
 
+  it("decodes a tiered pair on a PROPOSAL node too (same helper, second call site)", () => {
+    // node_options_summary rides both projections (emitters.py and
+    // planning.py), and the proposal node has a different plugin shape from
+    // the wire node, so its decoder is a separate call site. Both route
+    // through the one nodeOptionsSummary helper — this pins that.
+    const response = JSON.parse(
+      JSON.stringify(rowUnionProposalWireResponse()),
+    ) as Record<string, unknown>;
+    const payload = (response.next_turn as { payload: { nodes: Array<Record<string, unknown>> } })
+      .payload;
+    payload.nodes[1].plugin = { kind: "transform", id: "field_mapper" };
+    payload.nodes[1].node_options_summary = [
+      { key: "mapping", value: "given_name → first_name", tier: "common" },
+      { key: "select_only", value: "only the mapped fields are kept" },
+    ];
+
+    const decoded = decodeGetGuidedResponse(response);
+
+    expect(decoded.next_turn?.type).toBe("propose_pipeline");
+    if (decoded.next_turn?.type !== "propose_pipeline") {
+      throw new Error("proposal fixture did not decode as a proposal");
+    }
+    expect(decoded.next_turn.payload.nodes[1].node_options_summary).toEqual([
+      { key: "mapping", value: "given_name → first_name", tier: "common" },
+      { key: "select_only", value: "only the mapped fields are kept" },
+    ]);
+
+    const bad = JSON.parse(JSON.stringify(response)) as Record<string, unknown>;
+    (bad.next_turn as { payload: { nodes: Array<Record<string, unknown>> } })
+      .payload.nodes[1].node_options_summary = [
+      { key: "mapping", value: "a → b", tier: "loud" },
+    ];
+    expect(() => decodeGetGuidedResponse(bad)).toThrow(/tier/);
+  });
+
   it("decodes a tiered pair and leaves a pre-tier pair untiered", () => {
     // elspeth-ca456d9d8d: the backend emits `tier` on every fresh projection,
     // but durable turns written before it landed replay through this decoder

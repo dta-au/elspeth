@@ -617,7 +617,9 @@ test.describe("guided collector authoring (mocked wire-contract canary)", () => 
     // The strict decoder admitted the collector node shape (or this heading
     // never mounts), and the review card names the node kind, its plugin, the
     // opener (by ordinal label), and the closed policy in plain words.
-    await expect(page.getByText("node-2 · collector · batch_stats")).toBeVisible();
+    // elspeth-ca456d9d8d: the components list names a plugin by its catalog
+    // display label ("Batch Stats"), not its raw id.
+    await expect(page.getByText("node-2 · collector · Batch Stats")).toBeVisible();
     await expect(
       page.getByText(/Collects every row expanded by node-1 and releases the group as one batch, requiring every member to arrive\./),
     ).toBeVisible();
@@ -639,8 +641,15 @@ test.describe("guided collector authoring (mocked wire-contract canary)", () => 
     await expect(page.getByRole("listitem", { name: /from_id|to_id/ })).toHaveCount(0);
 
     // Collector behavior details: opener named by label, closed policy, and
-    // the batch-in cardinality claim.
+    // the batch-in cardinality claim. These are technical facts, so each
+    // component row keeps them behind its own "Technical details" disclosure
+    // (elspeth-ca456d9d8d) — open every row before asserting on them.
     await expect(page.getByText("Closes the row group opened by Collector step")).toHaveCount(0);
+    for (const summary of await page
+      .locator("details.wire-stage__row-technical > summary")
+      .all()) {
+      await summary.click();
+    }
     await expect(page.getByText("Closes the row group opened by Explode step")).toBeVisible();
     await expect(page.getByText("Policy: require all")).toBeVisible();
     await expect(page.getByText(/Cardinality: batch → zero or many/)).toBeVisible();
