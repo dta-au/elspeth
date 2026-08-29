@@ -4,7 +4,7 @@
 | --- | --- |
 | Publication class | **Sanitized public derivative** |
 | Report ID | `PCR-2026-001` |
-| As of | `2026-08-29T18:14:30+10:00` |
+| As of | `2026-08-29T18:14:31+10:00` |
 | Reporting period | **Unknown** — an approved reporting-period baseline was not available in the reviewed sources |
 | Intended reader and task | ELSPETH maintainer and authorized project decision-makers; assess delivery confidence, exceptions, and open decisions |
 | Canonical sources and cut-offs | Git delivery branch `feature/unified-lineage` at `29faafe4e8b5f72ebd3d556ccd8411e2a9c1423e` (captured `2026-08-29T18:14:31+10:00`); Filigree critical path (captured `2026-08-29T18:14:30+10:00`) and selected release-assurance records (captured `2026-08-29T18:14:21+10:00` to `18:14:24+10:00`); ADR-024 as accepted and amended `2026-08-29`; approved organisational resource records were not supplied or checked |

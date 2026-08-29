@@ -5,7 +5,7 @@
 | Field | Value |
 | --- | --- |
 | Publication class | **Sanitized public derivative** |
-| Report ID / as of | `PCR-2026-001` / `2026-08-29T18:14:30+10:00` |
+| Report ID / as of | `PCR-2026-001` / `2026-08-29T18:14:31+10:00` |
 | Intended reader and task | Authorized decision-makers and milestone owners; distinguish sequence, target, commitment, and forecast and act on timing gaps |
 | Canonical sources and cut-offs | Filigree critical path captured `2026-08-29T18:14:30+10:00`; selected release-assurance records captured `2026-08-29T18:14:21+10:00` to `18:14:24+10:00`; ADR-024 as amended `2026-08-29` |
 | Authority boundary | This register reports current source state. It does not create a target, commitment, forecast, confidence level, rebaseline, or release approval |

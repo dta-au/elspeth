@@ -5,7 +5,7 @@
 | Field | Value |
 | --- | --- |
 | Publication class | **Sanitized public derivative** |
-| Report ID / as of | `PCR-2026-001` / `2026-08-29T18:14:30+10:00` |
+| Report ID / as of | `PCR-2026-001` / `2026-08-29T18:14:31+10:00` |
 | Intended reader and task | Authoritative resource source owner and authorized decision-makers; establish and reconcile the T&M position |
 | Canonical sources and cut-offs | Approved organisational resource records: **Unknown** — not supplied or checked; Filigree workstream context captured `2026-08-29T18:14:30+10:00`; ADR-024 as amended `2026-08-29` |
 | Authority boundary | This register is not an accounting record, approval, or measure of individual productivity. Organisational records remain authoritative |

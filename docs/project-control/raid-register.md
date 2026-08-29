@@ -5,7 +5,7 @@
 | Field | Value |
 | --- | --- |
 | Publication class | **Sanitized public derivative** |
-| Report ID / as of | `PCR-2026-001` / `2026-08-29T18:14:30+10:00` |
+| Report ID / as of | `PCR-2026-001` / `2026-08-29T18:14:31+10:00` |
 | Intended reader and task | ELSPETH maintainer and authorized decision-makers; review live material exposure and act on exceptions |
 | Canonical sources and cut-offs | Filigree critical path captured `2026-08-29T18:14:30+10:00`; selected release-assurance records captured `2026-08-29T18:14:21+10:00` to `18:14:24+10:00`; ADR-024 as amended `2026-08-29`; approved resource records not supplied or checked |
 | Authority boundary | This register summarizes governing facts and actions. It does not accept risk, approve release, or replace Filigree and organisational sources |
