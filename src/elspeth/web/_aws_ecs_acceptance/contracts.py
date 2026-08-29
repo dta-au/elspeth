@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel
 
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.config import WebSettings
 
 _MAX_IDENTITY_CHARS = 128
@@ -329,12 +330,25 @@ def _safe_loc_segment(part: object) -> str:
     schema whitelist so an operator-controlled mapping key (a profile alias,
     for example) can never reach the envelope verbatim.
     """
-    if isinstance(part, int):
+    if type(part) is int:
         return str(part)
     text = str(part)
     return text if text in _STATIC_SCHEMA_FIELD_NAMES else _REDACTED_LOC_SEGMENT
 
 
+@trust_boundary(
+    tier=3,
+    source="an exception object raised by a settings or storage loader ELSPETH does not own (a pydantic ValidationError, or any third-party exception)",
+    source_param="exc",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "never raises on exc: probes errors() behind a sentinel getattr, admits only Mapping error entries, "
+        "redacts every loc segment that is not a declared WebSettings field name, and falls back to static "
+        "ELSPETH_* message tokens; returns a static AcceptanceCheckError carrying only the exception class "
+        "name and redacted field identifiers, never message text or parsed values"
+    ),
+    non_raising=True,
+)
 def check_error_with_cause(check: str, exc: BaseException) -> AcceptanceCheckError:
     """Build a named check failure carrying only static cause identity.
 
@@ -460,13 +474,15 @@ def _canonical_uuid(value: str, *, label: str) -> str:
 
 
 def _mapping(value: object, *, check: str) -> Mapping[str, object]:
-    if not isinstance(value, dict):
+    if type(value) is not dict:
         raise AcceptanceCheckError(check)
     return value
 
 
 def _string_field(value: Mapping[str, object], field: str, *, check: str) -> str:
-    candidate = value.get(field)
+    if field not in value:
+        raise AcceptanceCheckError(check)
+    candidate = value[field]
     if type(candidate) is not str or not candidate:
         raise AcceptanceCheckError(check)
     return candidate
@@ -522,7 +538,9 @@ def plugin_policy_binding_sha256(values: Mapping[str, str]) -> str:
 
     projection: dict[str, str] = {}
     for name in PLUGIN_POLICY_ASSIGNMENT_NAMES:
-        value = values.get(name)
+        if name not in values:
+            raise AcceptanceCheckError("plugin_policy_binding")
+        value = values[name]
         if type(value) is not str or not value or len(value) > 16 * 1024:
             raise AcceptanceCheckError("plugin_policy_binding")
         if any(ord(character) < 32 or ord(character) == 127 for character in value):
@@ -590,6 +608,22 @@ class SanitizedResourceIdentity:
             raise ValueError("cloud_provider must be aws")
 
 
+@trust_boundary(
+    tier=3,
+    source="the AWS region assignment (AWS_REGION / AWS_DEFAULT_REGION) in the acceptance harness process environment, set by the deployment rather than by ELSPETH",
+    source_param="env",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use when both names are absent, when either is present but "
+        "empty, when the two disagree, or when the resolved value exceeds 64 characters or is not "
+        "[A-Za-z0-9-]+; returns only a validated region string and never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_contracts_secure_state.py::"
+        "test_resolve_aws_region_rejects_absent_blank_conflicting_or_malformed_assignments"
+    ),
+    test_fingerprint="d8d7c127beead7f8336731c80c8b0784843c3f116329277f8f9fe5e3f3ec10d1",
+)
 def _resolve_aws_region(env: Mapping[str, str], *, check: str) -> str:
     primary_region = env.get("AWS_REGION")
     default_region = env.get("AWS_DEFAULT_REGION")
@@ -605,6 +639,24 @@ def _resolve_aws_region(env: Mapping[str, str], *, check: str) -> str:
     return region
 
 
+@trust_boundary(
+    tier=3,
+    source="the acceptance S3 evidence-location assignment (ELSPETH_ACCEPTANCE_S3_BUCKET / ELSPETH_ACCEPTANCE_S3_PREFIX) in the acceptance harness process environment",
+    source_param="env",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use on a bucket that is absent, blank, longer than 2048 "
+        "characters or carries control characters, on a prefix that is absent, is not stripped of slashes, "
+        "has an empty or dot segment, carries control characters, or whose final segment is not a canonical "
+        "UUID, and on a region the AWS region assignment cannot resolve; returns only a validated "
+        "(bucket, prefix, region) triple and never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_contracts_secure_state.py::"
+        "test_resolve_acceptance_s3_location_rejects_malformed_bucket_prefix_or_region"
+    ),
+    test_fingerprint="73e3fe8d4a1d24652a00802cb924244f1e279fb87e8f798ec3ddeb690031a9e7",
+)
 def _resolve_acceptance_s3_location(env: Mapping[str, str], *, check: str) -> tuple[str, str, str]:
     """Validate and return the acceptance (bucket, prefix, region) triple."""
 

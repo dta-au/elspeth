@@ -884,6 +884,50 @@ def test_approval_verify_fails_closed_without_configured_signature_verifier(tmp_
         )
 
 
+def test_configured_approval_verifier_rejects_absent_or_malformed_keyring(tmp_path: Path) -> None:
+    """The keyring is the trust root of every approval, so it is admitted only after full validation."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="approval_verifier"):
+        approvals_owner._configured_approval_signature_verifier({})
+
+    keyring_path = tmp_path / "approval-keyring.json"
+    for document in (
+        {"schema": "elspeth.aws-ecs-approval-keyring.v1", "keys": []},
+        {"schema": "elspeth.aws-ecs-approval-keyring.v1", "keys": {}},
+        {"schema": "elspeth.aws-ecs-approval-keyring.v0", "keys": {"owner-key-1": "A" * 43}},
+        {"schema": "elspeth.aws-ecs-approval-keyring.v1", "keys": {"bad key": "A" * 43}},
+        {"schema": "elspeth.aws-ecs-approval-keyring.v1", "keys": {"owner-key-1": "not base64url!"}},
+        {"schema": "elspeth.aws-ecs-approval-keyring.v1", "keys": {"owner-key-1": "A" * 40}},
+    ):
+        keyring_path.write_text(json.dumps(document))
+        os.chmod(keyring_path, 0o600)
+        with pytest.raises(acceptance.AcceptanceCheckError, match="approval_verifier"):
+            approvals_owner._configured_approval_signature_verifier({"ELSPETH_ACCEPTANCE_APPROVAL_KEYRING": str(keyring_path)})
+
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    keyring_path.write_text(
+        json.dumps(
+            {
+                "schema": "elspeth.aws-ecs-approval-keyring.v1",
+                "keys": {"owner-key-1": base64.urlsafe_b64encode(public_key).decode().rstrip("=")},
+            }
+        )
+    )
+    os.chmod(keyring_path, 0o600)
+
+    verify = approvals_owner._configured_approval_signature_verifier({"ELSPETH_ACCEPTANCE_APPROVAL_KEYRING": str(keyring_path)})
+    signature = base64.urlsafe_b64encode(private_key.sign(b"payload")).decode().rstrip("=")
+    assert verify(b"payload", signature, "owner-key-1") is True
+    assert verify(b"other-payload", signature, "owner-key-1") is False
+    assert verify(b"payload", signature, "unknown-key") is False
+
+
 def test_approval_verify_uses_protected_ed25519_keyring_when_no_verifier_is_injected(tmp_path: Path) -> None:
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey

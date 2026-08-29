@@ -17,6 +17,7 @@ import httpx
 import yaml
 
 from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -91,6 +92,19 @@ def _fixed_pipeline_document(canonical_session_id: str, *, source_path: str) -> 
     }
 
 
+@trust_boundary(
+    tier=3,
+    source="ELSPETH_WEB__DATA_DIR in the acceptance harness process environment, set from the deployment inventory",
+    source_param="env",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceInputError before any request when ELSPETH_WEB__DATA_DIR is absent, is not a str, is empty, "
+        "is not an absolute POSIX path, or does not equal its own canonical form (a trailing slash, a '.' segment, or "
+        "a '..' segment); never coerces or normalises the operator value"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_http_capture.py::test_server_data_dir_rejects_a_noncanonical_deployment_data_dir",
+    test_fingerprint="f2b79dd91b3591ba0f31574cecfd4f227c8ac1bf894bda7161ca307a20871214",
+)
 def _server_data_dir(env: Mapping[str, str]) -> str:
     """Return the canonical absolute data directory the web service runs with.
 
@@ -234,6 +248,22 @@ def build_canonical_tutorial_pipeline_yaml(*, profile_alias: str) -> str:
     return generate_public_yaml(_canonical_tutorial_policy_state(profile_alias=profile_alias))
 
 
+@trust_boundary(
+    tier=3,
+    source="JSON body of GET /api/runs/{run_id} and GET /api/runs/{run_id}/results returned by the deployed web service",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use on a run payload that is not a mapping, whose status is not exactly "
+        "'completed', whose landscape_run_id is not a canonical UUID, whose accounting, accounting.source or "
+        "accounting.tokens member is not a mapping, whose source.rows_processed is not a positive int, or whose "
+        "tokens.failed is not int 0; never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_http_capture.py::test_run_facts_rejects_a_run_payload_that_is_not_a_completed_clean_run"
+    ),
+    test_fingerprint="fb512cf4cca7a4bce4223fa0f7b1fefe209a7c360840e91351c36552f836067c",
+)
 def _run_facts(payload: object, *, check: str) -> tuple[str, int, int]:
     run = _mapping(payload, check=check)
     if _string_field(run, "status", check=check) != "completed":
@@ -251,6 +281,23 @@ def _run_facts(payload: object, *, check: str) -> tuple[str, int, int]:
     return landscape_run_id, source_rows, failed_tokens
 
 
+@trust_boundary(
+    tier=3,
+    source="JSON body of GET /api/runs/{run_id}/outputs (the artifact manifest) returned by the deployed web service",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use on a manifest that is not a mapping, whose artifacts member is not a "
+        "list, that does not carry exactly one artifact bound to the expected sink node id, or whose selected artifact "
+        "is not a file or sink_file that reports exists_now and downloadable True with a well-formed artifact_id and "
+        "sha256 content_hash; never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_http_capture.py::"
+        "test_select_output_artifact_rejects_a_manifest_without_one_downloadable_matching_file"
+    ),
+    test_fingerprint="8ad6cf8930fee497245f7619b011679d8f1610a7a40b10eb410bc358ae8f2704",
+)
 def _select_output_artifact(payload: object, *, expected_sink_node_id: str, check: str) -> tuple[str, str]:
     manifest = _mapping(payload, check=check)
     artifacts = manifest.get("artifacts")
@@ -267,6 +314,94 @@ def _select_output_artifact(payload: object, *, expected_sink_node_id: str, chec
     return _artifact_id_field(artifact, "artifact_id", check=check), _sha256_field(artifact, "content_hash", check=check)
 
 
+@trust_boundary(
+    tier=3,
+    source="JSON body of POST /api/sessions/{session_id}/state/yaml returned by the deployed web service",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError when the state-import response is not a mapping or its is_valid member is not "
+        "exactly True; never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_http_capture.py::test_require_import_valid_rejects_a_state_import_that_did_not_validate"
+    ),
+    test_fingerprint="acbf8a049c930c075cb82c0df8abc497280217b28348abe4f6894041955e33a1",
+)
+def _require_import_valid(payload: object, *, check: str) -> None:
+    """Require a state/yaml import response that reports a valid pipeline."""
+
+    imported = _mapping(payload, check=check)
+    if imported.get("is_valid") is not True:
+        raise AcceptanceCheckError(check)
+
+
+@trust_boundary(
+    tier=3,
+    source="JSON body of POST /api/sessions/{session_id}/state/yaml for the canonical tutorial candidate",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError when the tutorial state-import response is not a mapping or its is_valid member is "
+        "not exactly False -- the canonical core-only tutorial candidate must fail required-control coverage, so a valid "
+        "import is itself the failure; never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_http_capture.py::"
+        "test_require_import_rejected_rejects_a_tutorial_import_that_was_not_refused"
+    ),
+    test_fingerprint="4fd5e286a24f2db18b7b0735c022b4dbe6e05ba220d317c9796a379d9fb8efcb",
+)
+def _require_import_rejected(payload: object, *, check: str) -> None:
+    """Require a state/yaml import response that reports an invalid pipeline."""
+
+    imported = _mapping(payload, check=check)
+    if imported.get("is_valid") is not False:
+        raise AcceptanceCheckError(check)
+
+
+@trust_boundary(
+    tier=3,
+    source="JSON body of POST /api/sessions/{session_id}/validate returned by the deployed web service",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError when the validate response is not a mapping, its readiness member is not a mapping, "
+        "its is_valid member is not exactly True, or readiness.execution_ready is not exactly True; never coerces "
+        "external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_http_capture.py::"
+        "test_require_execution_ready_rejects_a_validate_body_that_is_not_execution_ready"
+    ),
+    test_fingerprint="75335b535169244c075ffcb1eae1e7895b12d7ae9847410646dee6504a64b572",
+)
+def _require_execution_ready(payload: object, *, check: str) -> None:
+    """Require a validate response that reports an execution-ready pipeline."""
+
+    validated = _mapping(payload, check=check)
+    readiness = _mapping(validated.get("readiness"), check=check)
+    if validated.get("is_valid") is not True or readiness.get("execution_ready") is not True:
+        raise AcceptanceCheckError(check)
+
+
+@trust_boundary(
+    tier=3,
+    source="ELSPETH_ACCEPTANCE_REGISTER and ELSPETH_WEB__DEFAULT_LLM_PROFILE in the acceptance harness process environment",
+    source_param="env",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceInputError before any HTTP request when ELSPETH_ACCEPTANCE_REGISTER is present and is "
+        "neither '0' nor '1', when ELSPETH_WEB__DEFAULT_LLM_PROFILE is absent, is not a str, is empty or blank, or "
+        "carries leading or trailing whitespace, or when _server_data_dir rejects ELSPETH_WEB__DATA_DIR; never "
+        "coerces or defaults an operator environment value"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_http_capture.py::"
+        "test_capture_rejects_missing_or_noncanonical_server_data_dir_before_any_request"
+    ),
+    test_fingerprint="a35dfb625c84ce74cf0904e8a04b7b36514aee0d86bce12ea7f44c41e12847ab",
+)
 def capture(
     env: Mapping[str, str],
     *,
@@ -312,7 +447,7 @@ def capture(
         if _sha256_field(blob, "content_hash", check="blob_upload") != uploaded_sha256:
             raise AcceptanceCheckError("blob_upload_integrity")
 
-        imported = _mapping(
+        _require_import_valid(
             client.request_json(
                 "POST",
                 f"/api/sessions/{session_id}/state/yaml",
@@ -324,15 +459,10 @@ def capture(
             ),
             check="yaml_import",
         )
-        if imported.get("is_valid") is not True:
-            raise AcceptanceCheckError("yaml_import")
-        validated = _mapping(
+        _require_execution_ready(
             client.request_json("POST", f"/api/sessions/{session_id}/validate", expected_statuses={200}),
             check="pipeline_validate",
         )
-        readiness = _mapping(validated.get("readiness"), check="pipeline_validate")
-        if validated.get("is_valid") is not True or readiness.get("execution_ready") is not True:
-            raise AcceptanceCheckError("pipeline_validate")
 
         launched = _mapping(
             client.request_json("POST", f"/api/sessions/{session_id}/execute", expected_statuses={202}),
@@ -393,7 +523,7 @@ def capture(
         tutorial_blob_id = _uuid_field(tutorial_blob, "id", check="tutorial_blob_upload")
         if _sha256_field(tutorial_blob, "content_hash", check="tutorial_blob_upload") != _sha256(TUTORIAL_INPUT_BYTES):
             raise AcceptanceCheckError("tutorial_blob_upload")
-        imported_tutorial = _mapping(
+        _require_import_rejected(
             client.request_json(
                 "POST",
                 f"/api/sessions/{tutorial_session_id}/state/yaml",
@@ -405,8 +535,6 @@ def capture(
             ),
             check="tutorial_state_import",
         )
-        if imported_tutorial.get("is_valid") is not False:
-            raise AcceptanceCheckError("tutorial_state_import")
 
     state = AcceptanceState(
         schema_version=1,
@@ -429,11 +557,27 @@ def capture(
     return state
 
 
-def _verify_plugin_policy_http_contract(client: AcceptanceHttpClient, *, tutorial_session_id: str) -> None:
-    status = _mapping(
-        client.request_json("GET", "/api/system/status", expected_statuses={200}),
-        check="plugin_policy_readiness",
-    )
+@trust_boundary(
+    tier=3,
+    source="JSON body of GET /api/system/status returned by the deployed web service",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use when the status body is not a mapping, its plugin_policy_readiness "
+        "member is not a mapping, tutorial_ready is not exactly True on both the status body and the readiness block, "
+        "the readiness rows are not a list of mappings each carrying a unique str id and a str status, or the observed "
+        "row ids are not exactly the six required readiness controls with policy_compilation, required_core and "
+        "local_capability_configuration reporting 'ok' and no row reporting 'error'; never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_http_capture.py::test_require_plugin_policy_ready_rejects_an_incomplete_readiness_body"
+    ),
+    test_fingerprint="9401862e274fb84b30a99be733185e4b4c4a3ebfda62e7b1a6306df2252f4b3a",
+)
+def _require_plugin_policy_ready(payload: object) -> None:
+    """Require the deployed service to report every plugin-policy readiness control."""
+
+    status = _mapping(payload, check="plugin_policy_readiness")
     readiness = _mapping(status.get("plugin_policy_readiness"), check="plugin_policy_readiness")
     rows = readiness.get("rows")
     if status.get("tutorial_ready") is not True or readiness.get("tutorial_ready") is not True or not isinstance(rows, list):
@@ -464,18 +608,41 @@ def _verify_plugin_policy_http_contract(client: AcceptanceHttpClient, *, tutoria
     ):
         raise AcceptanceCheckError("plugin_policy_readiness")
 
-    rejected = _mapping(
+
+@trust_boundary(
+    tier=3,
+    source="JSON body of the 409 rejection returned by POST /api/tutorial/run for the canonical tutorial session",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError when the rejection body is not a mapping, its detail member is not a mapping, or "
+        "detail.error_type and detail.code are not exactly 'tutorial_not_ready' and "
+        "'tutorial_required_control_coverage'; never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_http_capture.py::test_require_tutorial_not_ready_rejects_a_non_contractual_rejection_body"
+    ),
+    test_fingerprint="9cedf02f813de79d119e01d2d12831dc7ac3c478b55211ea608405e0ffb9ca4e",
+)
+def _require_tutorial_not_ready(payload: object) -> None:
+    """Require the tutorial launch rejection to name required-control coverage."""
+
+    rejected = _mapping(payload, check="tutorial_required_control_coverage")
+    detail = _mapping(rejected.get("detail"), check="tutorial_required_control_coverage")
+    if detail.get("error_type") != "tutorial_not_ready" or detail.get("code") != "tutorial_required_control_coverage":
+        raise AcceptanceCheckError("tutorial_required_control_coverage")
+
+
+def _verify_plugin_policy_http_contract(client: AcceptanceHttpClient, *, tutorial_session_id: str) -> None:
+    _require_plugin_policy_ready(client.request_json("GET", "/api/system/status", expected_statuses={200}))
+    _require_tutorial_not_ready(
         client.request_json(
             "POST",
             "/api/tutorial/run",
             expected_statuses={409},
             json_body={"session_id": tutorial_session_id},
-        ),
-        check="tutorial_required_control_coverage",
+        )
     )
-    detail = _mapping(rejected.get("detail"), check="tutorial_required_control_coverage")
-    if detail.get("error_type") != "tutorial_not_ready" or detail.get("code") != "tutorial_required_control_coverage":
-        raise AcceptanceCheckError("tutorial_required_control_coverage")
 
 
 def verify_api(

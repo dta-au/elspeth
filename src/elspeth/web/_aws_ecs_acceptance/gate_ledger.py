@@ -73,11 +73,11 @@ def _gate_ledger_cleanup_prefix_hash(ledger: Mapping[str, object]) -> str:
 
 
 def _validate_gate_record_stream(records: object, order: tuple[str, ...]) -> list[dict[str, object]]:
-    if not isinstance(records, list) or len(records) > len(order):
+    if type(records) is not list or len(records) > len(order):
         raise AcceptanceCheckError("gate_ledger_schema")
     seen: set[str] = set()
     for index, record in enumerate(records):
-        if not isinstance(record, dict) or set(record) != _GATE_RECORD_FIELDS:
+        if type(record) is not dict or set(record) != _GATE_RECORD_FIELDS:
             raise AcceptanceCheckError("gate_ledger_schema")
         check_id = record["check_id"]
         if type(check_id) is not str or check_id != order[index] or check_id in seen:
@@ -100,7 +100,7 @@ def _validate_gate_record_stream(records: object, order: tuple[str, ...]) -> lis
 
 
 def _validate_gate_ledger(payload: object) -> dict[str, object]:
-    if not isinstance(payload, dict) or set(payload) != _GATE_LEDGER_FIELDS:
+    if type(payload) is not dict or set(payload) != _GATE_LEDGER_FIELDS:
         raise AcceptanceCheckError("gate_ledger_schema")
     if payload["schema"] != "elspeth.aws-ecs-gate-ledger.v4":
         raise AcceptanceCheckError("gate_ledger_schema")
@@ -145,7 +145,7 @@ def _validate_gate_ledger(payload: object) -> dict[str, object]:
         raise AcceptanceCheckError("gate_ledger_schema")
     finalized = payload["finalized"]
     if finalized is not None:
-        if not isinstance(finalized, dict) or set(finalized) != {
+        if type(finalized) is not dict or set(finalized) != {
             "candidate_sha",
             "record_count",
             "records_sha256",

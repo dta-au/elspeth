@@ -134,6 +134,57 @@ def test_auth_input_rejects_missing_partial_or_mixed_modes_without_echo(env: dic
     assert "bearer-secret" not in rendered
 
 
+@pytest.mark.parametrize(
+    "env",
+    [
+        {},
+        {"AWS_REGION": ""},
+        {"AWS_DEFAULT_REGION": ""},
+        {"AWS_REGION": "ap-southeast-2", "AWS_DEFAULT_REGION": "us-east-1"},
+        {"AWS_REGION": "ap southeast 2"},
+        {"AWS_REGION": "a" * 65},
+    ],
+)
+def test_resolve_aws_region_rejects_absent_blank_conflicting_or_malformed_assignments(env: dict[str, str]) -> None:
+    """The AWS region assignment is deployment-supplied Tier-3 input, admitted only after validation."""
+    with pytest.raises(contracts.AcceptanceCheckError, match="bedrock_input"):
+        contracts._resolve_aws_region(env, check="bedrock_input")
+
+    assert contracts._resolve_aws_region({"AWS_REGION": "ap-southeast-2"}, check="bedrock_input") == "ap-southeast-2"
+    assert contracts._resolve_aws_region({"AWS_DEFAULT_REGION": "ap-southeast-2"}, check="bedrock_input") == "ap-southeast-2"
+
+
+_ACCEPTANCE_S3_ENV = {
+    "ELSPETH_ACCEPTANCE_S3_BUCKET": "acceptance-bucket",
+    "ELSPETH_ACCEPTANCE_S3_PREFIX": "plan10/764dd764-c265-40d7-a907-390255dccb64",
+    "AWS_REGION": "ap-southeast-2",
+}
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"ELSPETH_ACCEPTANCE_S3_BUCKET": ""},
+        {"ELSPETH_ACCEPTANCE_S3_BUCKET": "bucket\x01name"},
+        {"ELSPETH_ACCEPTANCE_S3_PREFIX": "plan10/not-a-uuid"},
+        {"ELSPETH_ACCEPTANCE_S3_PREFIX": "/plan10/764dd764-c265-40d7-a907-390255dccb64"},
+        {"ELSPETH_ACCEPTANCE_S3_PREFIX": "plan10/../764dd764-c265-40d7-a907-390255dccb64"},
+        {"AWS_REGION": ""},
+        {"AWS_DEFAULT_REGION": "us-east-1"},
+    ],
+)
+def test_resolve_acceptance_s3_location_rejects_malformed_bucket_prefix_or_region(updates: dict[str, str]) -> None:
+    """The S3 evidence location is deployment-supplied Tier-3 input; the prefix must end in a run UUID."""
+    with pytest.raises(contracts.AcceptanceCheckError, match="s3_input"):
+        contracts._resolve_acceptance_s3_location({**_ACCEPTANCE_S3_ENV, **updates}, check="s3_input")
+
+    assert contracts._resolve_acceptance_s3_location(_ACCEPTANCE_S3_ENV, check="s3_input") == (
+        "acceptance-bucket",
+        "plan10/764dd764-c265-40d7-a907-390255dccb64",
+        "ap-southeast-2",
+    )
+
+
 def test_state_file_round_trip_is_mode_0600_and_closed_schema(tmp_path: Path) -> None:
     path = tmp_path / "acceptance-state.json"
     state = _valid_state()

@@ -20,6 +20,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPrepareRequest,
     SinkEffectReconcileKind,
 )
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.aws_s3_common import build_s3_client
 from elspeth.plugins.sinks.aws_s3_sink import AWSS3Sink, S3ConditionalWriteRejectedError
 from elspeth.plugins.sources.aws_s3_source import AWSS3Source
@@ -78,6 +79,19 @@ def _resolve_s3_acceptance_inputs(env: Mapping[str, str]) -> tuple[str, str, str
     return bucket, key, region
 
 
+@trust_boundary(
+    tier=3,
+    source="the botocore ClientError.response payload returned by the live acceptance account for S3 HeadObject and DeleteObject",
+    source_param="error",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns False for any exception that is not a botocore ClientError - including an impostor that merely "
+        "carries a response attribute - and for a ClientError whose Error or ResponseMetadata member is absent or "
+        "is not a Mapping; only an explicit 404/NoSuchKey/NotFound error code or an HTTP 404 status returns True. "
+        "Never coerces external values and never raises"
+    ),
+    non_raising=True,
+)
 def _s3_not_found(error: BaseException) -> bool:
     if not isinstance(error, ClientError):
         return False
@@ -89,6 +103,18 @@ def _s3_not_found(error: BaseException) -> bool:
     return code in {"404", "NoSuchKey", "NotFound"} or status == 404
 
 
+@trust_boundary(
+    tier=3,
+    source="the audit call records the shipped AWSS3Source plugin writes into the harness context during a live S3 GetObject read",
+    source_param="context",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns None unless exactly one recorded call carries a Mapping response_data whose content_hash is an "
+        "exact str matching _SHA256_PATTERN; a missing, non-mapping, mistyped, absent or ambiguous record yields "
+        "None, which verify_s3 then treats as an s3_integrity failure. Never coerces external values and never raises"
+    ),
+    non_raising=True,
+)
 def _s3_source_hash(context: _S3AcceptanceContext) -> str | None:
     hashes: list[str] = []
     for call in context.calls:
@@ -189,17 +215,16 @@ def _drive_s3_acceptance_effect(
     try:
         result = sink.commit_effect(plan, context)  # type: ignore[attr-defined]
     except Exception:
-        cleanup_owned = False
         try:
             post_commit = sink.reconcile_effect(plan, context)  # type: ignore[attr-defined]
         except Exception:
-            pass
-        else:
-            cleanup_owned = (
+            raise _S3EffectFailure(cleanup_owned=False) from None
+        raise _S3EffectFailure(
+            cleanup_owned=(
                 post_commit.kind is SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR
                 and post_commit.descriptor == plan.expected_descriptor
             )
-        raise _S3EffectFailure(cleanup_owned=cleanup_owned) from None
+        ) from None
     if tuple(result.accepted_ordinals) != (0,) or result.diverted_ordinals:
         raise _S3EffectFailure(cleanup_owned=True)
     return result.descriptor, False

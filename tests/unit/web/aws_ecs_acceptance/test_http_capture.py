@@ -1147,3 +1147,250 @@ def test_verify_payloads_rejects_invalid_landscape_identity_before_settings_load
 
     with pytest.raises(acceptance.AcceptanceInputError, match="landscape run identity"):
         acceptance.verify_payloads("../not-a-run")
+
+
+# ---------------------------------------------------------------------------
+# Tier-3 boundary honesty tests.
+#
+# Each test below is the ``test_ref`` of one ``@trust_boundary`` in capture.py
+# or http_client.py: it calls the decorated function DIRECTLY through its
+# declared ``source_param`` with malformed input and asserts the exception the
+# decorator's ``invariant`` names, then asserts the accepting arm so a mutation
+# that makes the boundary reject everything cannot pass.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "data_dir",
+    [None, "", "var/lib/elspeth", "/var/lib/elspeth/", "/var/lib/../elspeth", "/var/./lib/elspeth"],
+)
+def test_server_data_dir_rejects_a_noncanonical_deployment_data_dir(data_dir: str | None) -> None:
+    env: dict[str, str] = {} if data_dir is None else {"ELSPETH_WEB__DATA_DIR": data_dir}
+
+    with pytest.raises(acceptance.AcceptanceInputError, match="ELSPETH_WEB__DATA_DIR"):
+        capture_module._server_data_dir(env)
+
+    assert capture_module._server_data_dir({"ELSPETH_WEB__DATA_DIR": "/var/lib/elspeth"}) == "/var/lib/elspeth"
+
+
+@pytest.mark.parametrize("register", ["", "2", "true", "yes"])
+def test_capture_rejects_a_noncontractual_register_flag_before_any_request(tmp_path: Path, register: str) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={})
+
+    with pytest.raises(acceptance.AcceptanceInputError, match="ELSPETH_ACCEPTANCE_REGISTER"):
+        acceptance.capture(
+            _auth_env(ELSPETH_ACCEPTANCE_REGISTER=register),
+            state_file=tmp_path / "state.json",
+            transport=httpx.MockTransport(handler),
+            now=lambda: datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
+            sleep=lambda _seconds: None,
+        )
+
+    assert calls == 0
+    assert not (tmp_path / "state.json").exists()
+
+
+_CLEAN_RUN: dict[str, object] = {
+    "status": "completed",
+    "landscape_run_id": _LANDSCAPE_RUN_ID,
+    "accounting": {"source": {"rows_processed": 1}, "tokens": {"failed": 0}},
+}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [],
+        {**_CLEAN_RUN, "status": "failed"},
+        {**_CLEAN_RUN, "landscape_run_id": "../not-a-uuid"},
+        {"status": "completed", "landscape_run_id": _LANDSCAPE_RUN_ID},
+        {**_CLEAN_RUN, "accounting": {"source": {"rows_processed": 0}, "tokens": {"failed": 0}}},
+        {**_CLEAN_RUN, "accounting": {"source": {"rows_processed": "1"}, "tokens": {"failed": 0}}},
+        {**_CLEAN_RUN, "accounting": {"source": {"rows_processed": 1}, "tokens": {"failed": 1}}},
+    ],
+)
+def test_run_facts_rejects_a_run_payload_that_is_not_a_completed_clean_run(payload: object) -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="run_terminal"):
+        capture_module._run_facts(payload, check="run_terminal")
+
+    assert capture_module._run_facts(_CLEAN_RUN, check="run_terminal") == (_LANDSCAPE_RUN_ID, 1, 0)
+
+
+_ARTIFACT_CONTENT_HASH = hashlib.sha256(_ARTIFACT_BYTES).hexdigest()
+
+_MANIFEST_ARTIFACT: dict[str, object] = {
+    "sink_node_id": _FIXED_OUTPUT_SINK_NODE_ID,
+    "artifact_type": "file",
+    "exists_now": True,
+    "downloadable": True,
+    "artifact_id": _ARTIFACT_ID,
+    "content_hash": _ARTIFACT_CONTENT_HASH,
+}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {"artifacts": {}},
+        {"artifacts": []},
+        {"artifacts": [_MANIFEST_ARTIFACT, _MANIFEST_ARTIFACT]},
+        {"artifacts": [{**_MANIFEST_ARTIFACT, "sink_node_id": "sink_output_000000000000"}]},
+        {"artifacts": [{**_MANIFEST_ARTIFACT, "artifact_type": "log"}]},
+        {"artifacts": [{**_MANIFEST_ARTIFACT, "exists_now": False}]},
+        {"artifacts": [{**_MANIFEST_ARTIFACT, "downloadable": False}]},
+        {"artifacts": [{**_MANIFEST_ARTIFACT, "content_hash": "not-a-digest"}]},
+    ],
+)
+def test_select_output_artifact_rejects_a_manifest_without_one_downloadable_matching_file(payload: object) -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="artifact_manifest"):
+        capture_module._select_output_artifact(
+            payload,
+            expected_sink_node_id=_FIXED_OUTPUT_SINK_NODE_ID,
+            check="artifact_manifest",
+        )
+
+    assert capture_module._select_output_artifact(
+        {"artifacts": [_MANIFEST_ARTIFACT]},
+        expected_sink_node_id=_FIXED_OUTPUT_SINK_NODE_ID,
+        check="artifact_manifest",
+    ) == (_ARTIFACT_ID, _ARTIFACT_CONTENT_HASH)
+
+
+@pytest.mark.parametrize("payload", [None, [], {}, {"is_valid": False}, {"is_valid": "true"}, {"is_valid": 1}])
+def test_require_import_valid_rejects_a_state_import_that_did_not_validate(payload: object) -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="yaml_import"):
+        capture_module._require_import_valid(payload, check="yaml_import")
+
+    capture_module._require_import_valid({"is_valid": True}, check="yaml_import")
+
+
+@pytest.mark.parametrize("payload", [None, [], {}, {"is_valid": True}, {"is_valid": "false"}, {"is_valid": 0}])
+def test_require_import_rejected_rejects_a_tutorial_import_that_was_not_refused(payload: object) -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="tutorial_state_import"):
+        capture_module._require_import_rejected(payload, check="tutorial_state_import")
+
+    capture_module._require_import_rejected({"is_valid": False}, check="tutorial_state_import")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [],
+        {"is_valid": True},
+        {"is_valid": True, "readiness": None},
+        {"is_valid": False, "readiness": {"execution_ready": True}},
+        {"is_valid": True, "readiness": {"execution_ready": False}},
+        {"is_valid": True, "readiness": {}},
+    ],
+)
+def test_require_execution_ready_rejects_a_validate_body_that_is_not_execution_ready(payload: object) -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="pipeline_validate"):
+        capture_module._require_execution_ready(payload, check="pipeline_validate")
+
+    capture_module._require_execution_ready(
+        {"is_valid": True, "readiness": {"execution_ready": True}},
+        check="pipeline_validate",
+    )
+
+
+_READY_ROWS: list[dict[str, object]] = [
+    {"id": "policy_compilation", "status": "ok"},
+    {"id": "required_core", "status": "ok"},
+    {"id": "local_capability_configuration", "status": "ok"},
+    {"id": "live_health", "status": "not_applicable"},
+    {"id": "tutorial_profile", "status": "warning"},
+    {"id": "tutorial_required_control_coverage", "status": "not_applicable"},
+]
+
+_READY_STATUS: dict[str, object] = {
+    "tutorial_ready": True,
+    "plugin_policy_readiness": {"tutorial_ready": True, "rows": _READY_ROWS},
+}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [],
+        {"tutorial_ready": True},
+        {**_READY_STATUS, "tutorial_ready": False},
+        {"tutorial_ready": True, "plugin_policy_readiness": {"tutorial_ready": False, "rows": _READY_ROWS}},
+        {"tutorial_ready": True, "plugin_policy_readiness": {"tutorial_ready": True, "rows": {}}},
+        {"tutorial_ready": True, "plugin_policy_readiness": {"tutorial_ready": True, "rows": [*_READY_ROWS, "not-a-row"]}},
+        {"tutorial_ready": True, "plugin_policy_readiness": {"tutorial_ready": True, "rows": _READY_ROWS[:-1]}},
+        {
+            "tutorial_ready": True,
+            "plugin_policy_readiness": {"tutorial_ready": True, "rows": [*_READY_ROWS, {"id": "extra", "status": "ok"}]},
+        },
+        {"tutorial_ready": True, "plugin_policy_readiness": {"tutorial_ready": True, "rows": [*_READY_ROWS, _READY_ROWS[0]]}},
+        {
+            "tutorial_ready": True,
+            "plugin_policy_readiness": {
+                "tutorial_ready": True,
+                "rows": [{**_READY_ROWS[0], "status": "error"}, *_READY_ROWS[1:]],
+            },
+        },
+        {
+            "tutorial_ready": True,
+            "plugin_policy_readiness": {"tutorial_ready": True, "rows": [{"id": "policy_compilation", "status": 1}, *_READY_ROWS[1:]]},
+        },
+    ],
+)
+def test_require_plugin_policy_ready_rejects_an_incomplete_readiness_body(payload: object) -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="plugin_policy_readiness"):
+        capture_module._require_plugin_policy_ready(payload)
+
+    capture_module._require_plugin_policy_ready(_READY_STATUS)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [],
+        {},
+        {"detail": None},
+        {"detail": {"error_type": "tutorial_not_ready"}},
+        {"detail": {"error_type": "validation_error", "code": "tutorial_required_control_coverage"}},
+        {"detail": {"error_type": "tutorial_not_ready", "code": "tutorial_profile"}},
+    ],
+)
+def test_require_tutorial_not_ready_rejects_a_non_contractual_rejection_body(payload: object) -> None:
+    with pytest.raises(acceptance.AcceptanceCheckError, match="tutorial_required_control_coverage"):
+        capture_module._require_tutorial_not_ready(payload)
+
+    capture_module._require_tutorial_not_ready(
+        {"detail": {"error_type": "tutorial_not_ready", "code": "tutorial_required_control_coverage"}}
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        None,
+        [],
+        {},
+        {"access_token": "issued-token"},
+        {"access_token": "", "token_type": "bearer"},
+        {"access_token": 1, "token_type": "bearer"},
+        {"access_token": "x" * (64 * 1024 + 1), "token_type": "bearer"},
+        {"access_token": "issued-token", "token_type": "basic"},
+    ],
+)
+def test_accept_auth_token_rejects_a_non_contractual_authentication_body(body: object) -> None:
+    client = acceptance.AcceptanceHttpClient.from_env(_auth_env())
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="authentication_response"):
+        client._accept_auth_token(body)
+
+    client._accept_auth_token({"access_token": "issued-token", "token_type": "bearer"})
+    assert client._bearer_token == "issued-token"

@@ -1128,3 +1128,14 @@ def test_task_definition_policy_binding_allows_missing_cloudwatch_agent_for_one_
         container_name=container_name,
         expected_user="1654:1654",
     )
+
+
+def test_control_manifest_get_rejects_selectors_that_the_document_does_not_resolve(tmp_path: Path) -> None:
+    path = tmp_path / "control.json"
+    _init_control_manifest(path)
+
+    assert acceptance.control_manifest_get(path, "cleanup_states.orphan_sweep") == "pending"
+
+    for field in ("", "x" * 257, "no_such_field", "cleanup_states.no_such_gate", "schema.nested"):
+        with pytest.raises(acceptance.AcceptanceCheckError, match="control_manifest_field"):
+            acceptance.control_manifest_get(path, field)

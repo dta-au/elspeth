@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+from elspeth.contracts.trust_boundary import trust_boundary
+
 from .contracts import _SCENARIO_VALUE_FIELDS, AcceptanceCheckError, _control_timestamp, _utc_timestamp
 from .manifest_schema import (
     _CLEANUP_SURFACES,
@@ -438,6 +440,23 @@ def control_manifest_bind_scenario(
     return manifest
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "the control-manifest JSON document read back from disk at `path`, already admitted by "
+        "manifest_schema._validate_control_manifest and projected here at arbitrary depth by an "
+        "operator-supplied dotted field selector that the top-level schema does not pin"
+    ),
+    source_param="path",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use on an empty or over-long field selector, on a selector segment "
+        "that is absent from the document or is reached through a member that is not a Mapping, and on a selected "
+        "value that is not a bool, None, dict, list, str or int; never coerces external values"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_manifest_task_definition.py::test_control_manifest_get_rejects_selectors_that_the_document_does_not_resolve",
+    test_fingerprint="d919e09494572842967afc4cdda9f9a96bdc376e7542a3c059ae30ab36cd6080",
+)
 def control_manifest_get(path: Path, field: str) -> str:
     value: object = _read_control_manifest(path)
     if not field or len(field) > 256:
