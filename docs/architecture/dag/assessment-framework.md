@@ -78,18 +78,9 @@ may support a claim, but only `harness` or `pytest` evidence can support
 
 ## Product-criteria rating scale
 
-Use this five-point scale only when the evidence for the relevant product
-criterion is complete enough to rate:
-
-| Score | Meaning |
-| --- | --- |
-| 1 | Absent or contradicted by current behavior. |
-| 2 | Demonstrated only on narrow happy paths or by incomplete evidence. |
-| 3 | Works on representative paths, with material supportability gaps. |
-| 4 | Broadly production-ready with bounded, owned residual gaps. |
-| 5 | Complete, maintained, and continuously verified at the declared envelope. |
-
-Record `U` rather than guessing when evidence is unknown. Hard-gate failure
+Use the [normative 0–5 and `U` rating scale](completeness-criteria.md#evidence-and-rating-scale)
+when assessing a product criterion. Do not infer a rating from a lifecycle
+cell status or create a second scale in an assessment. Hard-gate failure
 overrides any average and keeps the overall verdict `not_complete`.
 
 ## Reassessment workflow
@@ -106,8 +97,9 @@ overrides any average and keeps the overall verdict `not_complete`.
 6. Run the contract test again and confirm the derived verdict.
 7. Query Filigree for current work status, dependencies, and ownership. Do not
    copy tracker-maintained case counts into the assessment.
-8. Update the live hub or corpus guide only when their derived summary has
-   changed.
+8. Update the live hub or corpus guide only when navigation, authority
+   boundaries, or maintainer guidance changes. Do not restate values derived
+   from the manifest.
 
 ## Review checks
 

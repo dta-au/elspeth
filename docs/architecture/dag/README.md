@@ -16,19 +16,15 @@ between competing dated reports.
 | What delivery work is open and who owns it? | [Live scenario corpus and Filigree references](scenario-corpus/README.md#active-filigree-work) |
 
 The manifest and its contract test are the **authoritative live** assessment
-record. The manifest currently declares schema version `2`, 15 scenarios, 11
-dimensions, 114 evidence records, and a derived verdict of `not_complete`.
-Those values must change in the manifest and contract test before any summary
-claims a different state.
+record. Read the manifest for its current schema version, scenario and
+dimension inventories, evidence registry, and derived verdict; this page does
+not copy those changeable values.
 
 ## Two related views
 
-The [completeness criteria](completeness-criteria.md) define **15
-product-quality criteria** for judging the DAG capability as a supported
-product. The manifest applies **11 executable lifecycle cells** to each of 15
-mandatory scenarios: configuration, build, contracts, runtime, audit,
-recovery, concurrency, freeform authoring, guided authoring, round trip, and
-scale.
+The [completeness criteria](completeness-criteria.md) define product-quality
+criteria for judging the DAG capability as a supported product. The manifest
+applies executable lifecycle cells to every mandatory scenario.
 
 These are different axes. The product criteria describe what a credible
 completeness claim must cover; the lifecycle cells record executable evidence

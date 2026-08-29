@@ -1415,9 +1415,13 @@ def _markdown_heading_fragments(path: Path) -> frozenset[str]:
         heading = "".join(child.content for child in inline.children or () if child.type in {"text", "code_inline"})
         normalized = "".join(character for character in heading.casefold() if character.isalnum() or character in " -_")
         base = "-".join(normalized.split())
-        occurrence = occurrences.get(base, 0)
-        occurrences[base] = occurrence + 1
-        fragments.add(base if occurrence == 0 else f"{base}-{occurrence}")
+        fragment = base
+        while fragment in fragments:
+            occurrence = occurrences.get(base, 0) + 1
+            occurrences[base] = occurrence
+            fragment = f"{base}-{occurrence}"
+        fragments.add(fragment)
+        occurrences.setdefault(fragment, 0)
     return frozenset(fragments)
 
 
@@ -1499,6 +1503,13 @@ def test_missing_repository_relative_markdown_fragment_is_reported(
     monkeypatch.setattr(sys.modules[__name__], "REPOSITORY_ROOT", repository_root)
 
     assert _missing_repository_relative_link_targets(document) == ("present.md#missing-heading",)
+
+
+def test_markdown_heading_fragments_allocate_interleaved_duplicate_collisions(tmp_path: Path) -> None:
+    document = tmp_path / "document.md"
+    document.write_text("# Foo\n\n# Foo\n\n# Foo-1\n\n# Foo\n\n# Foo-1\n", encoding="utf-8")
+
+    assert _markdown_heading_fragments(document) == frozenset({"foo", "foo-1", "foo-1-1", "foo-2", "foo-1-2"})
 
 
 def test_parent_traversal_to_existing_repository_target_is_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

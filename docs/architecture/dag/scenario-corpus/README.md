@@ -4,10 +4,10 @@ This directory contains the live, executable inventory used to answer one
 question: which parts of ELSPETH's mandatory DAG lifecycle have current
 production-path evidence?
 
-Start with the [v1 corpus manifest](v1/manifest.yaml). It is schema version `2`
-and currently contains 15 scenarios, 11 dimensions, 114 evidence records, and
-a derived verdict of `not_complete`. The [DAG information hub](../README.md)
-explains how this evidence fits the broader product-quality criteria.
+Start with the [v1 corpus manifest](v1/manifest.yaml). It is the sole source for
+the current schema version, scenario and dimension inventories, evidence
+registry, and derived verdict. The [DAG information hub](../README.md) explains
+how this evidence fits the broader product-quality criteria.
 
 ## Authority boundary
 
@@ -37,10 +37,8 @@ evidence gaps to work but do not replace live tracker state.
 ## Product criteria and lifecycle cells
 
 The assessment uses two related but non-interchangeable views. The framework
-defines **15 product-quality criteria** for the overall DAG capability. The
-manifest evaluates **11 executable lifecycle cells** for each mandatory
-scenario: `config`, `build`, `contracts`, `runtime`, `audit`, `recovery`,
-`concurrency`, `freeform`, `guided`, `round_trip`, and `scale`.
+defines product-quality criteria for the overall DAG capability. The manifest
+evaluates executable lifecycle cells for each mandatory scenario.
 
 The criteria judge whether the product is supportable as a whole. The cells
 show exactly where executable scenario evidence exists or remains incomplete.
