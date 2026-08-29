@@ -66,10 +66,22 @@ function SuggestionList({
   // content to the list's textContent, so a reader that only wants the
   // list's own words would still see the raw dump. Keeping the disclosure a
   // sibling of the list, not a descendant, is what keeps it out.
-  const humanisedSuggestions = suggestions.map((s) => ({
-    suggestion: s,
-    finding: humaniseValidationMessage(s.message, phraseFor, stepLabelFor),
-  }));
+  //
+  // Splitting the row from its disclosure loses the DOM containment that
+  // would otherwise tie them together, so each pair gets an explicit
+  // association (review round 1): a stable per-row id feeds the Apply
+  // button's aria-describedby, and the <summary> carries a per-row
+  // humanised label (never the raw component id) — with 2+ suggestions
+  // carrying raw text, an assistive-tech user needs both the announced
+  // link AND a visually distinguishing label to tell whose dump is whose.
+  const humanisedSuggestions = suggestions.map((s, i) => {
+    const finding = humaniseValidationMessage(s.message, phraseFor, stepLabelFor);
+    return {
+      suggestion: s,
+      finding,
+      technicalId: finding.raw !== null ? `side-rail-suggestion-technical-${i}` : undefined,
+    };
+  });
   const hasTechnicalDetails = humanisedSuggestions.some(
     ({ finding }) => finding.raw !== null,
   );
@@ -107,7 +119,7 @@ function SuggestionList({
       )}
       {expanded && (
         <ul className="side-rail-suggestion-list" aria-label="Suggestions">
-          {humanisedSuggestions.map(({ suggestion: s, finding }, i) => (
+          {humanisedSuggestions.map(({ suggestion: s, finding, technicalId }, i) => (
             <li key={i} className="side-rail-suggestion-item">
               <span className="side-rail-suggestion-item-text">
                 <strong>{phraseFor(s.component)}:</strong> {finding.headline}
@@ -121,6 +133,7 @@ function SuggestionList({
                     ? composeGateReason
                     : undefined
                 }
+                aria-describedby={technicalId}
                 onClick={() => handleApply(s)}
               >
                 {isComposing ? "Applying..." : "Apply"}
@@ -131,10 +144,10 @@ function SuggestionList({
       )}
       {expanded && hasTechnicalDetails && (
         <div className="side-rail-suggestion-technical">
-          {humanisedSuggestions.map(({ finding }, i) =>
+          {humanisedSuggestions.map(({ suggestion: s, finding, technicalId }, i) =>
             finding.raw !== null ? (
-              <details key={i} className="validation-banner-technical">
-                <summary>Technical details</summary>
+              <details key={i} id={technicalId} className="validation-banner-technical">
+                <summary>Technical details — {phraseFor(s.component)}</summary>
                 <pre>{finding.raw}</pre>
               </details>
             ) : null,

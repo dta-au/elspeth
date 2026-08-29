@@ -1,6 +1,6 @@
 import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ValidationResultBanner } from "./ValidationResult";
 import { usePreferencesStore } from "@/stores/preferencesStore";
@@ -43,6 +43,16 @@ function makePassResult(overrides: Partial<ValidationResult> = {}): ValidationRe
 }
 
 describe("ValidationResultBanner", () => {
+  // Review round 1, Important-1: this describe block has no store reset, so
+  // the two tests below that set showAdvanced:true were leaking it into
+  // every later test in the file — the two forced-advisory-visibility tests
+  // that follow (identity_node_advisory, advisor_signoff) were incidentally
+  // passing via the FULL-LIST branch instead of the forced-guidance branch
+  // they exist to cover, since showAdvanced never went back to false.
+  afterEach(() => {
+    resetStore(usePreferencesStore);
+  });
+
   it("collapses a clean pass to a one-line summary without check details", () => {
     render(<ValidationResultBanner result={makePassResult()} />);
 
@@ -101,6 +111,17 @@ describe("ValidationResultBanner", () => {
   });
 
   it("auto-expands when a passed check carries identity_node_advisory guidance and offers no Collapse", () => {
+    // Mixed checks array (review round 1, Important-1): an ordinary passing
+    // check (graph_structure) rides alongside the advisory one specifically
+    // so this test can DISCRIMINATE the forced-guidance branch from the
+    // full-list branch — the two render identical text for a solo advisory
+    // check, since showAdvanced leaking true would ALSO show the advisory
+    // detail (just via the other branch). The forced branch renders only
+    // [...advisoryChecks, ...failedAdvisorChecks]; the full-list branch
+    // renders every check. So with showAdvanced genuinely false (the
+    // describe block's afterEach reset keeps it that way), graph_structure's
+    // detail must be ABSENT — if it were present, showAdvanced leaked true
+    // and this is exercising the wrong branch.
     render(
       <ValidationResultBanner
         result={makePassResult({
@@ -114,18 +135,40 @@ describe("ValidationResultBanner", () => {
               affected_nodes: ["passthrough_1"],
               outcome_code: null,
             },
+            {
+              name: "graph_structure",
+              passed: true,
+              detail: "Graph structure is valid",
+              affected_nodes: [],
+              outcome_code: null,
+            },
           ],
         })}
       />,
     );
 
+    // The "name: detail" prefix only the forced-guidance list renders (the
+    // full list drops it for every check but advisor_signoff) — a second,
+    // stronger pin that this specific row came from the forced branch. The
+    // detail's own text starts with "Node 'passthrough_1' is an..."; "Consider
+    // removing it" is a later sentence within it, not the start.
+    expect(
+      screen.getByText(/identity_node_advisory: Node 'passthrough_1'/),
+    ).toBeInTheDocument();
     expect(screen.getByText(/Consider removing it/)).toBeInTheDocument();
+    expect(screen.queryByText("Graph structure is valid")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /collapse validation details/i }),
     ).toBeNull();
   });
 
   it("auto-expands a failed completion advisory check without exposing its compatibility key", () => {
+    // Mixed checks array (review round 1, Important-1): advisor_signoff gets
+    // the SAME prefixed "Completion advisory review: ..." text from EITHER
+    // branch (the full list special-cases it identically to the forced
+    // list), so its own text can't tell the two branches apart. An ordinary
+    // passing check (graph_structure) alongside it can: the forced branch
+    // never renders it, so its presence would mean showAdvanced leaked true.
     render(
       <ValidationResultBanner
         result={makePassResult({
@@ -135,6 +178,13 @@ describe("ValidationResultBanner", () => {
               passed: false,
               detail:
                 "The evidence-scoped completion advisory review has not covered this pipeline version.",
+              affected_nodes: [],
+              outcome_code: null,
+            },
+            {
+              name: "graph_structure",
+              passed: true,
+              detail: "Graph structure is valid",
               affected_nodes: [],
               outcome_code: null,
             },
@@ -161,6 +211,9 @@ describe("ValidationResultBanner", () => {
       screen.getByText(/Completion advisory review: The evidence-scoped/),
     ).toBeInTheDocument();
     expect(screen.queryByText(/advisor_signoff:/)).toBeNull();
+    // Discriminates the forced branch from the full-list branch (see comment
+    // above): only the full list would render this ordinary check's detail.
+    expect(screen.queryByText("Graph structure is valid")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /validation passed\. show details\./i }),
     ).toBeNull();

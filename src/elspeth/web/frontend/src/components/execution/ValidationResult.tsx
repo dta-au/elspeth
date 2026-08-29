@@ -130,6 +130,14 @@ export function ValidationResultBanner({
       advisoryChecks.length > 0 ||
       failedAdvisorChecks.length > 0;
     const showExpanded = hasForcedGuidance || userExpanded;
+    // "checks" here can span more than authoring/execution validity — e.g. a
+    // failed advisor_signoff (completion-readiness) check can sit alongside
+    // is_valid=true — so the standard-view summary must count, not assume
+    // (review round 1: "All N checks passed" was unconditional and read as
+    // fabricated on a result carrying a genuinely failed check). The slot
+    // stays present either way (global constraint: every gated item needs a
+    // plain summary in its place), just truthful about the count.
+    const passedChecksCount = result.checks.filter((check) => check.passed).length;
 
     if (!showExpanded) {
       return (
@@ -182,7 +190,9 @@ export function ValidationResultBanner({
         </div>
         {result.checks.length > 0 && !showAdvanced && (
           <p className="validation-banner-checks-summary">
-            All {result.checks.length} checks passed.
+            {passedChecksCount === result.checks.length
+              ? `All ${result.checks.length} checks passed.`
+              : `${passedChecksCount} of ${result.checks.length} checks passed.`}
           </p>
         )}
         {result.checks.length > 0 && showAdvanced && (
