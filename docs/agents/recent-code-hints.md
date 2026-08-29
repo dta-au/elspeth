@@ -8,6 +8,31 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — the tier_model `_R5_NAMED_BOUNDARY_CONTEXTS` exemption map is
+  MEASURED now: every entry must resolve to exactly ONE live definition, and a
+  moved function is NOT successor-included.** Before elspeth-0bd4fb6042 the
+  map carried 12 dead entries (2 dead file keys incl. `web/sessions/routes.py`,
+  7 dead function keys) and 2 bare-name collisions (`state.py::from_dict`
+  matched SIX classmethods, `redaction.py::provider` two closures) that nothing
+  reported. Now: (a) keys are qualified `symbol_stack` paths, so a same-named
+  method on another class or a future function reusing a retired name inherits
+  nothing; (b) `resolve_named_boundary_contexts(root)` is the single authority —
+  `tests/unit/elspeth_lints/test_tier_model_named_boundary_map.py` pins the
+  live tree and prints the failing rows as a table, and every whole-tree
+  `collect_check_result` on a `src/elspeth` root re-runs it and reports a stale
+  entry as an ERROR (`STALE NAMED-BOUNDARY MAP ENTRIES` / JSON
+  `stale_named_boundary_contexts` / lint message "Stale tier-model
+  named-boundary map entry"), the same fail-closed treatment a stale allowlist
+  entry gets; pre-commit `files=` mode skips it like allowlist staleness.
+  Consequences: adding an entry needs audit evidence AND the pin passing;
+  deleting a function named in the map turns the whole-tree gate red until the
+  entry goes; when a function MOVES to another file, do NOT add the new
+  location — its findings surface and go through the allowlist like any other
+  site. Deleting a DEAD entry moves the corpus by ZERO (it suppressed nothing);
+  the "+3 for `_extract_runtime_model_snapshot`" expected by lens B had already
+  surfaced at the package split (`routes/_helpers.py:964/970/971` are in the
+  2594 baseline at 99d43f87d — 2594, not 2535: the hub's earlier count dropped
+  digit-bearing filenames).
 - **2026-08-29 — masquerade resolver STOP RULES (do not re-walk the six-freeze
   road).** The sparse-SSA `flow.py` prototype (archived at
   `/home/john/codex-cleanup-archive-2026-08-16/orphaned-work/ac-masquerade-bounded/`)
@@ -123,7 +148,9 @@ is a working document under the normal delivery posture.
   A minimal probe file reproduced the chain and DID fire, which rules out any
   general "exception dispatch is exempt" behaviour. The cause is
   `TierModelVisitor._is_allowed_r5_context` → `_is_named_tier3_boundary_context`,
-  which looks the CURRENT FUNCTION'S NAME up in a `ClassVar[dict[str,
+  which looks the current definition's QUALIFIED path (`".".join(symbol_stack)`,
+  e.g. `CompositionState.from_dict`; bare names only for module-level
+  functions — qualified since elspeth-0bd4fb6042) up in a `ClassVar[dict[str,
   frozenset[str]]]` keyed by scan-root-relative file path
   (`elspeth-lints/.../trust_tier/tier_model/rule.py`, ~line 418); the map
   already lists `web/sessions/_auto_title.py: {"_auto_title_exception_class",
