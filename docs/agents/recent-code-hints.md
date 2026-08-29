@@ -3801,8 +3801,12 @@ Every one of the ~25 whole-tree gates had the same exposure. Two rules now:
      lint-dodging — it also removes the wart of one function rejecting malformed
      input through two different mechanisms.
   3. **Every `@trust_boundary` argument must be a LITERAL.** A non-literal (a lane
-     probed with `"0"*64`) emits `R_TB_NONLITERAL` and silently voids EVERY
-     suppression in that file — a 6-finding file went back to 15 with no error. And
+     probed with `"0"*64`) emits an `R_TB_NONLITERAL` diagnostic and voids THAT
+     decorator's suppression — its function surfaces its R5/R1 again while a
+     sibling literal boundary in the same file stays fully suppressed
+     (`parse_trust_boundary_decorator` returns `(None, diagnostics)` per call;
+     re-measured by the W4 audit, `auditW4B/probes/web/p4_nonliteral.py`). It is
+     reported, not silent, but the diagnostic is easy to miss in a large corpus. And
      `@classmethod` must be the OUTERMOST decorator; `@trust_boundary` above it
      raises `TypeError: <classmethod(...)> is not a callable object` at import.
   4. **`test_fingerprint` survives `ruff format`.** It is

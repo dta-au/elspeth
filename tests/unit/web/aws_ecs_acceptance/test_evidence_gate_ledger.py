@@ -791,6 +791,8 @@ def test_evidence_export_receipt_validators_reject_a_tampered_receipt_document(t
     )
     assert bound == receipt
     evidence_owner._reverify_bound_evidence_export_receipt(output_path, manifest=read_manifest, expected_sha256=bound_sha256)
+    with pytest.raises(acceptance.AcceptanceCheckError, match="evidence_export"):
+        evidence_owner._reverify_bound_evidence_export_receipt(output_path, manifest=read_manifest, expected_sha256="0" * 64)
 
     for document in (
         ["not", "a", "mapping"],
@@ -812,3 +814,18 @@ def test_evidence_export_receipt_validators_reject_a_tampered_receipt_document(t
             )
         with pytest.raises(acceptance.AcceptanceCheckError, match="evidence_export"):
             evidence_owner._reverify_bound_evidence_export_receipt(output_path, manifest=read_manifest, expected_sha256=bound_sha256)
+
+
+@pytest.mark.parametrize("message", ["\ud800", "[" * 100000])
+def test_decoded_log_message_returns_none_for_lone_surrogate_and_too_deep_nesting(message: str) -> None:
+    """A lone surrogate (what json.loads yields for the escape "\\ud800" in an
+    operator evidence file) must not fail the size measurement, and nesting
+    that exhausts json's recursion budget is malformed input, not a crash."""
+    assert evidence_owner._decoded_log_message(message) is None
+
+
+def test_sanitize_evidence_web_log_survives_a_lone_surrogate_message() -> None:
+    sanitized = acceptance.sanitize_evidence("web-log", {"events": [{"message": "\ud800"}]})
+
+    assert sanitized["counts"] == {"input": 1, "projected": 0}
+    assert sanitized["records"] == []

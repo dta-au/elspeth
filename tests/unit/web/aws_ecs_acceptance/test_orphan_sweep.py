@@ -973,6 +973,8 @@ def test_orphan_response_items_reads_an_absent_resource_as_an_empty_collection()
     "pages",
     [
         pytest.param([{"Items": [], "Next": 7}], id="non_string_continuation_token"),
+        pytest.param([{"Items": [], "Next": ["l"]}], id="unhashable_list_continuation_token"),
+        pytest.param([{"Items": [], "Next": {"d": 1}}], id="unhashable_mapping_continuation_token"),
         pytest.param([{"Items": [], "Next": "a"}, {"Items": [], "Next": "a"}], id="repeated_continuation_token"),
     ],
 )
@@ -1030,6 +1032,19 @@ def test_transaction_search_projection_rejects_malformed_indexing_rules(indexing
 
 
 @pytest.mark.parametrize(
+    "destination",
+    [
+        pytest.param("S3", id="unrecognised_destination"),
+        pytest.param(["XRay"], id="unhashable_list_destination"),
+        pytest.param({"XRay": 1}, id="unhashable_mapping_destination"),
+    ],
+)
+def test_transaction_search_projection_rejects_a_destination_outside_the_closed_set(destination: object) -> None:
+    with pytest.raises(owner.AcceptanceCheckError, match="orphan_sweep_api"):
+        owner._transaction_search_projection(destination=destination, indexing_rules=[], spans_log_group_present=True)
+
+
+@pytest.mark.parametrize(
     "response",
     [
         pytest.param({}, id="role_absent"),
@@ -1069,6 +1084,8 @@ def test_resource_policy_count_counts_only_the_policies_this_run_owns() -> None:
     [
         pytest.param({"Destination": "S3"}, id="unrecognised_destination"),
         pytest.param({"Destination": ""}, id="empty_destination"),
+        pytest.param({"Destination": ["XRay"]}, id="unhashable_list_destination"),
+        pytest.param({"Destination": {"XRay": 1}}, id="unhashable_mapping_destination"),
     ],
 )
 def test_trace_segment_destination_rejects_an_unrecognised_destination(response: Mapping[str, object]) -> None:
@@ -1106,5 +1123,60 @@ def test_named_item_count_ignores_shapes_that_do_not_name_a_resource() -> None:
         {"logGroupName": "someone-else"},
         "not-a-mapping",
         {},
+        {"logGroupName": ["a"]},
+        {"logGroupName": {"k": 1}},
+        {"logGroupName": 7},
     ]
     assert owner._named_item_count(items, field="logGroupName", expected=frozenset({"elspeth-web"})) == 1
+    for unhashable in ({"logGroupName": ["elspeth-web"]}, {"logGroupName": {"elspeth-web": 1}}):
+        assert owner._named_item_count([unhashable], field="logGroupName", expected=frozenset({"elspeth-web"})) == 0
+
+
+def test_sampling_rule_match_count_ignores_shapes_that_do_not_name_a_rule() -> None:
+    records: list[object] = [
+        {"SamplingRule": {"RuleName": "elspeth-rule"}},
+        {"SamplingRule": {"RuleName": "someone-else"}},
+        {"SamplingRule": {"RuleName": ["u"]}},
+        {"SamplingRule": {"RuleName": {"u": 1}}},
+        {"SamplingRule": {"RuleName": 7}},
+        {"SamplingRule": {}},
+        {"SamplingRule": "not-a-mapping"},
+        "not-a-mapping",
+        {},
+    ]
+    assert owner._sampling_rule_match_count(records, expected=frozenset({"elspeth-rule"})) == 1
+    assert owner._sampling_rule_match_count([{"SamplingRule": {"RuleName": ["u"]}}], expected=frozenset({"u"})) == 0
+
+
+_EXPECTED_DIMENSIONS: list[dict[str, str]] = [{"Name": "a", "Value": "x"}, {"Name": "b", "Value": "y"}]
+
+
+def _metric(dimensions: object) -> dict[str, object]:
+    return {"Namespace": "N", "MetricName": "M", "Dimensions": dimensions}
+
+
+def test_exact_metric_count_counts_only_the_retained_series_regardless_of_dimension_order() -> None:
+    metrics: list[object] = [
+        _metric([{"Name": "b", "Value": "y"}, {"Name": "a", "Value": "x"}]),
+        _metric([{"Name": "a", "Value": "x"}, {"Name": "b", "Value": "y"}]),
+        {"Namespace": "Other", "MetricName": "M", "Dimensions": [{"Name": "a", "Value": "x"}, {"Name": "b", "Value": "y"}]},
+        {"Namespace": "N", "MetricName": "M", "Dimensions": [{"Name": "a", "Value": "x"}, {"Name": "b", "Value": "y"}], "Extra": 1},
+        _metric([{"Name": "a", "Value": "x"}]),
+    ]
+    assert owner._exact_metric_count(metrics, namespace="N", metric_name="M", expected_dimensions=_EXPECTED_DIMENSIONS) == 2
+
+
+@pytest.mark.parametrize(
+    "dimensions",
+    [
+        pytest.param(["x"], id="dimension_is_not_a_mapping"),
+        pytest.param([{"Name": "a", "Value": "x"}, {"Value": "y"}], id="dimension_without_a_name"),
+        pytest.param([{"Name": "a", "Value": "x"}, {"Name": 1, "Value": "y"}], id="dimension_name_is_not_a_string"),
+        pytest.param([{"Name": "a", "Value": ["x"]}, {"Name": "b", "Value": "y"}], id="dimension_value_is_not_a_string"),
+        pytest.param([{"Name": "a", "Value": "x", "Unit": "s"}, {"Name": "b", "Value": "y"}], id="dimension_with_an_extra_key"),
+        pytest.param({"Name": "a", "Value": "x"}, id="dimensions_is_not_a_list"),
+        pytest.param(None, id="dimensions_absent"),
+    ],
+)
+def test_exact_metric_count_reads_a_malformed_dimension_list_as_no_match(dimensions: object) -> None:
+    assert owner._exact_metric_count([_metric(dimensions)], namespace="N", metric_name="M", expected_dimensions=_EXPECTED_DIMENSIONS) == 0

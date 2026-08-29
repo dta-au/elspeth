@@ -342,7 +342,8 @@ def _safe_loc_segment(part: object) -> str:
     source_param="exc",
     suppresses=("R1", "R5"),
     invariant=(
-        "never raises on exc: probes errors() behind a sentinel getattr, admits only Mapping error entries, "
+        "never raises on exc: evaluates str(exc) and probes errors() behind a sentinel getattr inside one "
+        "contextlib.suppress(Exception), admits only Mapping error entries, "
         "redacts every loc segment that is not a declared WebSettings field name, and falls back to static "
         "ELSPETH_* message tokens; returns a static AcceptanceCheckError carrying only the exception class "
         "name and redacted field identifiers, never message text or parsed values"
@@ -364,20 +365,24 @@ def check_error_with_cause(check: str, exc: BaseException) -> AcceptanceCheckErr
     ``llm_profiles`` alias) are redacted rather than emitted verbatim.
     """
     fields: tuple[str, ...] = ()
-    errors = getattr(exc, "errors", None)
-    if callable(errors):
-        with contextlib.suppress(Exception):
-            fields = tuple(
-                dict.fromkeys(
-                    location
-                    for error in errors()
-                    if isinstance(error, Mapping)
-                    for location in (".".join(_safe_loc_segment(part) for part in error.get("loc", ())),)
-                    if location
-                )
-            )
-    if not fields:
+    with contextlib.suppress(Exception):
+        # str(exc) is third-party code too; a __str__ that raises leaves fields
+        # empty, and an errors() that raises keeps the token scan's result.
         fields = tuple(dict.fromkeys(_CAUSE_FIELD_TOKEN.findall(str(exc))))
+        errors = getattr(exc, "errors", None)
+        if callable(errors):
+            fields = (
+                tuple(
+                    dict.fromkeys(
+                        location
+                        for error in errors()
+                        if isinstance(error, Mapping)
+                        for location in (".".join(_safe_loc_segment(part) for part in error.get("loc", ())),)
+                        if location
+                    )
+                )
+                or fields
+            )
     return AcceptanceCheckError(
         check,
         cause_class=type(exc).__name__,

@@ -633,15 +633,33 @@ def test_capture_rejects_the_pre_rewrite_authored_path_sink_node_id(tmp_path: Pa
 
 
 @pytest.mark.parametrize(
-    "data_dir",
-    [None, "", "var/lib/elspeth", "/var/lib/elspeth/", "/var/lib/../elspeth", "/var/./lib/elspeth"],
+    ("variable", "value", "match"),
+    [
+        ("ELSPETH_ACCEPTANCE_REGISTER", "", "ELSPETH_ACCEPTANCE_REGISTER"),
+        ("ELSPETH_ACCEPTANCE_REGISTER", "2", "ELSPETH_ACCEPTANCE_REGISTER"),
+        ("ELSPETH_ACCEPTANCE_REGISTER", "true", "ELSPETH_ACCEPTANCE_REGISTER"),
+        ("ELSPETH_ACCEPTANCE_REGISTER", "yes", "ELSPETH_ACCEPTANCE_REGISTER"),
+        ("ELSPETH_WEB__DEFAULT_LLM_PROFILE", None, "tutorial profile alias"),
+        ("ELSPETH_WEB__DEFAULT_LLM_PROFILE", "", "tutorial profile alias"),
+        ("ELSPETH_WEB__DEFAULT_LLM_PROFILE", "  ", "tutorial profile alias"),
+        ("ELSPETH_WEB__DEFAULT_LLM_PROFILE", " tutorial", "tutorial profile alias"),
+        ("ELSPETH_WEB__DEFAULT_LLM_PROFILE", "tutorial ", "tutorial profile alias"),
+        ("ELSPETH_WEB__DATA_DIR", None, "ELSPETH_WEB__DATA_DIR"),
+        ("ELSPETH_WEB__DATA_DIR", "", "ELSPETH_WEB__DATA_DIR"),
+        ("ELSPETH_WEB__DATA_DIR", "var/lib/elspeth", "ELSPETH_WEB__DATA_DIR"),
+        ("ELSPETH_WEB__DATA_DIR", "/var/lib/elspeth/", "ELSPETH_WEB__DATA_DIR"),
+        ("ELSPETH_WEB__DATA_DIR", "/var/lib/../elspeth", "ELSPETH_WEB__DATA_DIR"),
+        ("ELSPETH_WEB__DATA_DIR", "/var/./lib/elspeth", "ELSPETH_WEB__DATA_DIR"),
+    ],
 )
-def test_capture_rejects_missing_or_noncanonical_server_data_dir_before_any_request(tmp_path: Path, data_dir: str | None) -> None:
+def test_capture_rejects_malformed_operator_environment_before_any_request(
+    tmp_path: Path, variable: str, value: str | None, match: str
+) -> None:
     env = dict(_auth_env())
-    if data_dir is None:
-        del env["ELSPETH_WEB__DATA_DIR"]
+    if value is None:
+        env.pop(variable, None)
     else:
-        env["ELSPETH_WEB__DATA_DIR"] = data_dir
+        env[variable] = value
     calls = 0
 
     def handler(_request: httpx.Request) -> httpx.Response:
@@ -649,7 +667,7 @@ def test_capture_rejects_missing_or_noncanonical_server_data_dir_before_any_requ
         calls += 1
         return httpx.Response(200, json={})
 
-    with pytest.raises(acceptance.AcceptanceInputError, match="ELSPETH_WEB__DATA_DIR"):
+    with pytest.raises(acceptance.AcceptanceInputError, match=match):
         acceptance.capture(
             env,
             state_file=tmp_path / "state.json",
@@ -1171,28 +1189,6 @@ def test_server_data_dir_rejects_a_noncanonical_deployment_data_dir(data_dir: st
         capture_module._server_data_dir(env)
 
     assert capture_module._server_data_dir({"ELSPETH_WEB__DATA_DIR": "/var/lib/elspeth"}) == "/var/lib/elspeth"
-
-
-@pytest.mark.parametrize("register", ["", "2", "true", "yes"])
-def test_capture_rejects_a_noncontractual_register_flag_before_any_request(tmp_path: Path, register: str) -> None:
-    calls = 0
-
-    def handler(_request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        return httpx.Response(200, json={})
-
-    with pytest.raises(acceptance.AcceptanceInputError, match="ELSPETH_ACCEPTANCE_REGISTER"):
-        acceptance.capture(
-            _auth_env(ELSPETH_ACCEPTANCE_REGISTER=register),
-            state_file=tmp_path / "state.json",
-            transport=httpx.MockTransport(handler),
-            now=lambda: datetime(2026, 7, 14, 4, 0, tzinfo=UTC),
-            sleep=lambda _seconds: None,
-        )
-
-    assert calls == 0
-    assert not (tmp_path / "state.json").exists()
 
 
 _CLEAN_RUN: dict[str, object] = {

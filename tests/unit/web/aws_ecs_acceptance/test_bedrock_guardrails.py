@@ -302,11 +302,28 @@ def _guardrail_env_without(name: str) -> dict[str, str]:
         (_guardrail_env(ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS="0"), "guardrails_gate"),
         (_guardrail_env(ELSPETH_LIVE_BEDROCK_PROMPT_EXPECTED_VERSION="DRAFT"), "guardrails_input"),
         (_guardrail_env(ELSPETH_LIVE_BEDROCK_CONTENT_BLOCKED_TEXT=""), "guardrails_input"),
+        (
+            {
+                **_guardrail_env_without("ELSPETH_LIVE_BEDROCK_PROMPT_PROFILE_ALIAS"),
+                "ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES": "[" * 60000,
+            },
+            "guardrails_live_inputs_missing",
+        ),
     ],
 )
 def test_guardrail_live_inputs_rejects_absent_gate_and_malformed_operator_inputs(env: dict[str, str], check: str) -> None:
     with pytest.raises(acceptance.AcceptanceCheckError, match=check):
         bedrock._guardrail_live_inputs(env=env)
+
+
+def test_guardrail_config_defaults_yield_no_default_for_too_deeply_nested_rendered_config() -> None:
+    """A rendered config under the 64 KiB cap that exhausts json's recursion
+    budget is malformed input, not a crash: no alias and no version."""
+    env = {
+        "ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES": "[" * 60000,
+        "ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES": "[]",
+    }
+    assert bedrock._guardrail_config_defaults(env, "aws_bedrock_prompt_shield") == (None, None)
 
 
 def _web_policy_evidence() -> WebPluginPolicyEvidence:

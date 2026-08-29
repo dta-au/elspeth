@@ -792,6 +792,47 @@ def test_connection_budget_receipt_rejects_short_point_series() -> None:
         receipt_contracts._validate_connection_budget_receipt(payload)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("window_start", 1, id="non-str-window_start"),
+        pytest.param("window_end", "not-a-time", id="unparseable-window_end"),
+        pytest.param("points", None, id="non-str-point-timestamp"),
+    ],
+)
+def test_connection_budget_receipt_reports_malformed_timestamp_as_receipt_schema(field: str, value: object) -> None:
+    payload = _connection_budget_details()
+    if field == "points":
+        points = payload["points"]
+        assert isinstance(points, list)
+        points[0]["timestamp"] = value
+    else:
+        payload[field] = value
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
+        receipt_contracts._validate_connection_budget_receipt(payload)
+
+
+@pytest.mark.parametrize(
+    "expires_at",
+    [
+        pytest.param(7, id="non-str-expires_at"),
+        pytest.param("2026-07-14 01:00:00", id="unparseable-expires_at"),
+    ],
+)
+def test_compatibility_receipt_reports_malformed_expires_at_as_receipt_schema(expires_at: object) -> None:
+    payload = _compatibility_receipt("A")
+    payload["expires_at"] = expires_at
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
+        receipt_contracts._validate_compatibility_receipt(
+            payload,
+            scenario_id="A",
+            candidate_sha="c" * 40,
+            subject_id="a" * 64,
+        )
+
+
 @pytest.mark.parametrize("mutation", ["missing_projection", "non_dict_projection"])
 def test_terraform_receipt_rejects_open_or_non_dict_projection(mutation: str) -> None:
     """Trust-boundary honesty test for ``_validate_terraform_receipt``."""

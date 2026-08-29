@@ -49,8 +49,12 @@ _GET_INVOCABLE_CODES = frozenset({"InvalidJobIdException"})
     source_param="error",
     suppresses=("R1", "R5"),
     invariant=(
-        "returns None unless Error.Code is a non-empty str; the caller (_probe_invocable) treats None as "
-        "not-invocable and raises AcceptanceCheckError, so a malformed provider error never proves an action"
+        "returns None unless Error.Code is a non-empty str; relies on botocore constructing ClientError from "
+        "the mapping it stores as .response (ClientError.__init__ calls error_response.get('Error', {}), so a "
+        "non-mapping response fails at construction), which is why .response.get('Error') cannot raise for any "
+        "object the caller's except ClientError delivers; the non-Mapping Error branch is reachable only by "
+        "post-construction mutation; the caller (_probe_invocable) treats None as not-invocable and raises "
+        "AcceptanceCheckError, so a malformed provider error never proves an action"
     ),
     non_raising=True,
 )
