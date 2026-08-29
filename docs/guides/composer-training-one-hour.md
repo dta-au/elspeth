@@ -2,6 +2,10 @@
 
 **Status:** DRAFT v1 (2026-08-30). Written against branch HEAD `39ce17e2c`.
 **Format:** small-group session (4–8 people), one trainer, one hour, hands-on.
+**Slides:** [`composer-training-one-hour-slides.html`](composer-training-one-hour-slides.html)
+— a self-contained deck, one slide per numbered slide below, with these
+speaker notes built in (open in a browser; `N` toggles notes, `P` prints one
+slide per page).
 **Purpose of this document:** a slide-by-slide, minute-by-minute plan that can
 be turned directly into a deck and a spoken presentation. Every slide has
 (a) the bullets that go on the slide, (b) speaker notes, and (c) where
