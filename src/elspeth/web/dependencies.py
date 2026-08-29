@@ -1,7 +1,7 @@
 """FastAPI dependency injection providers.
 
 Service construction order follows
-docs/superpowers/specs/2026-03-28-web-ux-seam-contracts.md.
+docs/specs/2026-03-28-web-ux-seam-contracts.md.
 ProgressBroadcaster and event-loop reference are created in the lifespan()
 async context manager (not in the synchronous create_app()), per the seam
 contract for async service wiring.

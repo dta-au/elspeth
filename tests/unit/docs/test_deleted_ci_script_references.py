@@ -14,8 +14,8 @@ SUPPORTED_TIER_MODEL_GATE = (
 )
 HISTORICAL_DOC_PREFIXES = (
     "docs-archive/",
-    "docs/superpowers/plans/",
-    "docs/superpowers/specs/",
+    "docs/plans/",
+    "docs/specs/",
 )
 HISTORICAL_DOC_PATHS = ("CHANGELOG.md",)
 SOURCE_PREFIXES_OUT_OF_SCOPE = ("src/elspeth/web/",)

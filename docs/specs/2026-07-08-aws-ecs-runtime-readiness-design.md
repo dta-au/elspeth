@@ -615,7 +615,7 @@ Security and boundary checks:
 
 Whole-program closeout is a required testing stage, not an optional follow-up.
 After implementation plans 01–11, 13–14, and 15A–15C have landed in one integrated tree, execute
-`docs/superpowers/plans/aws/2026-07-08-aws-ecs-12-integration-closeout.md` in full.
+`docs/plans/aws/2026-07-08-aws-ecs-12-integration-closeout.md` in full.
 Plan 12 owns the exact 0.7.1 version boundary, tracker-completion verification,
 the unscoped pytest run, CI-aligned Ruff and strict-mypy checks, repository
 contract guards, Wardline scan, lean ECS Docker build/runtime verification,

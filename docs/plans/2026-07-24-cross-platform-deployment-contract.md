@@ -13,7 +13,7 @@
 ## Approved Design
 
 Implement against:
-`docs/superpowers/specs/2026-07-24-cross-platform-deployment-contract-design.md`.
+`docs/specs/2026-07-24-cross-platform-deployment-contract-design.md`.
 
 Do not add PostgreSQL server packages or a second process to the ELSPETH image.
 Do not add a static AWS task definition; AWS deployments must continue cloning

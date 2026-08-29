@@ -110,7 +110,7 @@ class GatewayConfig(LLMConfig):
     """Configuration for the ELSPETH LLM Gateway provider.
 
     The gateway fronts every real upstream agency behind one stable HTTP
-    contract (see ``docs/superpowers/specs/2026-07-30-elspeth-llm-gateway-
+    contract (see ``docs/specs/2026-07-30-elspeth-llm-gateway-
     integration-design.md``). ``model`` here is a *logical* alias the
     gateway resolves server-side — it is not a raw upstream model id, so
     unlike OpenRouter there is no authoritative local catalog to validate

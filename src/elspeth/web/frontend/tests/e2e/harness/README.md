@@ -5,8 +5,8 @@ end-to-end against **staging** (`elspeth.example.gov.au`), resets between each
 run, grades every run on four dimensions, and reports how many worked plus a
 classified failure table.
 
-Design: `docs/superpowers/specs/2026-06-06-tutorial-reliability-harness-design.md`
-Plan: `docs/superpowers/plans/2026-06-06-tutorial-reliability-harness.md`
+Design: `docs/specs/2026-06-06-tutorial-reliability-harness-design.md`
+Plan: `docs/plans/2026-06-06-tutorial-reliability-harness.md`
 
 ## What's in this directory
 

@@ -1,6 +1,6 @@
 # Worker Affinity Proposal — Blast-Radius & Risk Assessment (DRAFT)
 
-**Subject:** `docs/superpowers/specs/2026-08-22-worker-affinity-proposal.md` (6b0eb6afb)
+**Subject:** `docs/specs/2026-08-22-worker-affinity-proposal.md` (6b0eb6afb)
 **Assessed:** 2026-08-22, read-only, against the ASSUMED-LANDED unified-lineage substrate
 (master plan + WS1a/WS1b/protocols/WS2–WS6 sibling plans, per the maintainer's binding
 assumption) plus the already-landed WS1a/WS1b-Phase-A code on `feature/unified-lineage`.

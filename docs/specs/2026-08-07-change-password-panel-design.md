@@ -26,7 +26,7 @@ backstop for deployments without an identity provider — small single-task
 installations.
 
 That framing carries one **load-bearing precondition**:
-`docs/superpowers/specs/2026-07-08-aws-ecs-runtime-readiness-design.md:338-358`
+`docs/specs/2026-07-08-aws-ecs-runtime-readiness-design.md:338-358`
 records that local auth on EFS is safe *only* under a strict single-task,
 single-process posture, because SQLite's byte-range locking diverges on
 NFS-class filesystems. The mitigations it names hold today — `doctor.py`

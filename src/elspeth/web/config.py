@@ -287,7 +287,7 @@ class WebSettings(BaseModel):
     # defaults like gpt-5.5 that reject non-default temperature values.
     # Sent verbatim when set; provider rejection is the operator's config
     # error and is validated at boot. See
-    # docs/superpowers/specs/2026-06-03-composer-operator-set-sampling-config-design.md.
+    # docs/specs/2026-06-03-composer-operator-set-sampling-config-design.md.
     composer_temperature: float | None = Field(default=None, ge=0, le=2)
     composer_seed: int | None = None
     # Tests/offline development can disable the real provider boot probe.

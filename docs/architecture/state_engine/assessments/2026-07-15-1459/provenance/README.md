@@ -42,7 +42,7 @@ At documentation-write time, the worktree already contained user-owned changes:
 
 - modified `docs/README.md`;
 - untracked `docs/architecture/dag/`;
-- untracked `docs/superpowers/plans/2026-07-15-dag-information-area.md`.
+- untracked `docs/plans/2026-07-15-dag-information-area.md`.
 
 This task used those files as a structural example but did not modify them. All
 new writes are confined to `docs/architecture/state_engine/`.

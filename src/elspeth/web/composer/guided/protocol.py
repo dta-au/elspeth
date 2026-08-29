@@ -1,6 +1,6 @@
 """Guided-mode protocol: turn types, payloads, responses, legal-turn matrix.
 
-See docs/superpowers/specs/2026-05-11-composer-guided-mode-design.md §4.
+See docs/specs/2026-05-11-composer-guided-mode-design.md §4.
 """
 
 from __future__ import annotations

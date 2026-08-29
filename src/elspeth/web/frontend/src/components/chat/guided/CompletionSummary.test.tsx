@@ -16,7 +16,7 @@
 // Source of truth:
 //   - types/guided.ts:54-58 (TerminalState wire shape)
 //   - stores/sessionStore.ts:116 + 572-583 (exitToFreeform parameterless)
-//   - docs/superpowers/plans/2026-05-11-composer-guided-mode.md:4445
+//   - docs/plans/2026-05-11-composer-guided-mode.md:4445
 // ============================================================================
 
 import { readFileSync } from "node:fs";

@@ -22,7 +22,7 @@ v3 evidence — that requires a separate rerun-mode driver fed from the
 README's "Audit-trail evidence outside this folder" run-id table.
 Tracked in ``elspeth-obs-e87152484a``.
 
-Phase A.5 of ``docs/superpowers/plans/2026-05-06-eval-per-row-output-archival.md``.
+Phase A.5 of ``docs/plans/2026-05-06-eval-per-row-output-archival.md``.
 Issue: elspeth-77d2641032.
 
 Usage::

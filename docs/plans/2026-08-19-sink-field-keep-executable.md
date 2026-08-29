@@ -26,7 +26,7 @@ request the planner answers (composer invariant 1).
 `freeze_guided_str_sequence`), StrEnum wire vocabularies, React/TS with hand-mirrored
 wire types, pytest / vitest / Playwright staging.
 
-**Spec:** `docs/superpowers/plans/2026-08-19-invert-guided-sink-field-keep.md` (the
+**Spec:** `docs/plans/2026-08-19-invert-guided-sink-field-keep.md` (the
 design plan: decisions D1–D7, risk register + comparison, blast radius). This plan
 refines D4's wire encoding: keep-mode is carried by `control_signal`, not a new
 response key. All D1–D7 semantics are otherwise unchanged.

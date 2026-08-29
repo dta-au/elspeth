@@ -118,7 +118,7 @@ where grep returns docstring false positives), **execution paths / call
 trees** (no grep equivalent), and **definition lookup in large files**. It is
 *not* advertised for semantic search, dead-code candidates, HTTP-route
 inventories, or test-caller lists until the defects recorded in
-`docs/superpowers/plans/2026-08-29-loomweave-salvage-worklist.md` are fixed
+`docs/plans/2026-08-29-loomweave-salvage-worklist.md` are fixed
 — on those questions `git grep` measured as good or better, and a tool that
 is right on three questions and wrong on four teaches agents to distrust all
 seven.

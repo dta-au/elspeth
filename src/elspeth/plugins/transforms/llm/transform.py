@@ -1533,7 +1533,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
 
             # Output schema config with prefixed fields for DAG contract propagation.
             # INVARIANT: guaranteed_fields must be a superset of declared_output_fields.
-            # See: docs/superpowers/specs/2026-03-20-output-schema-contract-enforcement-design.md
+            # See: docs/specs/2026-03-20-output-schema-contract-enforcement-design.md
             self._output_schema_config = _build_llm_output_schema_config(schema_config, prefixed_guaranteed)
 
             # Pydantic output schema with prefixed LLM fields
@@ -1582,7 +1582,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
 
             # Output schema config with LLM output fields for DAG contract propagation.
             # INVARIANT: guaranteed_fields must be a superset of declared_output_fields.
-            # See: docs/superpowers/specs/2026-03-20-output-schema-contract-enforcement-design.md
+            # See: docs/specs/2026-03-20-output-schema-contract-enforcement-design.md
             self._output_schema_config = _build_llm_output_schema_config(schema_config, guaranteed)
 
             # Pydantic output schema with unprefixed LLM fields (structured

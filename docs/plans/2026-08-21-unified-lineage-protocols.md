@@ -20,7 +20,7 @@ by section id from sibling plans.
 harness (`run_scenario_case`, `StableRunProjection`), git on the shared `release/0.7.2`
 checkout.
 
-**Spec:** docs/superpowers/specs/2026-08-21-barrier-scopes-full-nesting-spec.md
+**Spec:** docs/specs/2026-08-21-barrier-scopes-full-nesting-spec.md
 (rev 3.2 — rulings 1–28 final; §11 is the frozen-oracle authority). Scout inputs (the
 consumer-roster, fixture-oracle and test-harness inventories under
 `2026-08-21-unified-lineage-inputs/`) were retired from the tree once the WS1
@@ -53,7 +53,7 @@ flip landed; see git history.
 - Do NOT edit or stage `src/elspeth/web/composer/state.py` or
   `tests/unit/web/composer/test_state.py` — the maintainer is committing them.
 - Read docs/agents/recent-code-hints.md before writing code.
-- Standing procedures: docs/superpowers/plans/2026-08-21-unified-lineage-protocols.md
+- Standing procedures: docs/plans/2026-08-21-unified-lineage-protocols.md
   §S1–§S5 govern fixture freezing, slice gates, casualty retirement, judge-bundle
   sequencing, and the WS1 STOP rule. This plan is the source of record for those
   procedures; every sibling campaign plan carries this same citation line.
@@ -876,14 +876,14 @@ exist in the corpus or `examples/` — the whole worklist is below.
 ### Task 5: Verify the standing-procedures cross-references (verification only)
 
 **Files:** none. Every sibling campaign plan already carries the citation line in its
-Global Constraints ("Standing procedures: docs/superpowers/plans/2026-08-21-unified-lineage-protocols.md
+Global Constraints ("Standing procedures: docs/plans/2026-08-21-unified-lineage-protocols.md
 §S1–§S5 govern fixture freezing, slice gates, casualty retirement, judge-bundle
 sequencing, and the WS1 STOP rule") — added in the 2026-08-22 cross-plan review round.
 This task authors nothing; it verifies the wiring held.
 
 - [ ] **Step 1: Verify every campaign plan references this plan**
 
-Run: `grep -L "unified-lineage-protocols.md" docs/superpowers/plans/2026-08-21-unified-lineage-*.md`
+Run: `grep -L "unified-lineage-protocols.md" docs/plans/2026-08-21-unified-lineage-*.md`
 Expected: EMPTY output (this file cites itself as the source of record, so even it
 matches). Any listed file is a sibling plan whose citation line regressed — that is a
 defect to surface to the maintainer, not something this task quietly re-authors.

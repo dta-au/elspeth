@@ -9,7 +9,7 @@ same file no longer invalidates the entry's HMAC signature.
 The hash MUST be byte-reproducible at justify-write time and match-verify time.
 Both call sites import :func:`compute_scope_fingerprint` from here — there is
 deliberately only one definition. See the design doc
-``docs/superpowers/specs/2026-05-31-judge-scope-fingerprint-design.md`` §3.1 for
+``docs/specs/2026-05-31-judge-scope-fingerprint-design.md`` §3.1 for
 the normative determinism rules. Runtime-visible docstrings are fingerprinted
 because Python exposes them through ``__doc__``.
 """

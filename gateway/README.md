@@ -4,7 +4,7 @@ A strict OpenAI Chat Completions-subset gateway that translates canonical
 chat requests into an agency's own custom `invoke` API, acquires OAuth2
 client-credentials tokens on the agency's behalf, and never logs message
 content, credentials, or raw upstream bodies. See
-`docs/superpowers/specs/2026-07-30-llm-compatibility-gateway-runtime-design.md`
+`docs/specs/2026-07-30-llm-compatibility-gateway-runtime-design.md`
 in the main ELSPETH repository for the full design.
 
 This package (`gateway/`) has no dependency on the rest of ELSPETH: it

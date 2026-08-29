@@ -115,7 +115,7 @@ gate that catches it lives in a test file you did not run.
   `source_file_hash` check): a green local suite and a green pre-commit hook
   prove nothing about them. Run the CI command yourself; the commands are
   given under each gate.
-- Every whole-tree gate scans `.claude/skills/**/*.py` and `scripts/` as
+- Every whole-tree gate scans `.agents/skills/**/*.py` and `scripts/` as
   production code. Only `.claude/worktrees/` is excluded. A helper script
   under those paths obeys the same rules as `src/`.
 - Whole-tree measurements are only evidence when the tree was frozen for the

@@ -4,7 +4,7 @@ This module is the *oracle*: given sanitized evidence exported from a single
 deployed revision, it decides whether the two-LLM colour hybrid pipeline
 actually ran end to end against a **real** provider and produced a graph and
 business output that satisfy the design contract
-(``docs/superpowers/specs/2026-07-13-two-llm-colour-hybrid-pipeline-design.md``,
+(``docs/specs/2026-07-13-two-llm-colour-hybrid-pipeline-design.md``,
 sections 6.x / 8.5).
 
 It verifies, for ONE deployed revision:

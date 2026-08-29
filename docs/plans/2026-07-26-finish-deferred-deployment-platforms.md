@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12, FastAPI, SQLAlchemy, PostgreSQL, SQLite, pytest/testcontainers, Docker, Kustomize/kubectl, kind, Bicep, YAML/JSON Schema, GitHub Actions.
 
-**Design spec:** `docs/superpowers/specs/2026-07-26-finish-deferred-deployment-platforms-design.md`
+**Design spec:** `docs/specs/2026-07-26-finish-deferred-deployment-platforms-design.md`
 
 ---
 
@@ -61,9 +61,9 @@ Recheck these official upstream values on the implementation date and update bot
 
 **Files:**
 
-- Read: `docs/superpowers/specs/2026-07-26-finish-deferred-deployment-platforms-design.md`
-- Read: `docs/superpowers/plans/2026-07-24-cross-platform-deployment-contract.md`
-- Read: `docs/superpowers/specs/2026-07-24-aws-ecs-acceptance-refactor-design.md`
+- Read: `docs/specs/2026-07-26-finish-deferred-deployment-platforms-design.md`
+- Read: `docs/plans/2026-07-24-cross-platform-deployment-contract.md`
+- Read: `docs/specs/2026-07-24-aws-ecs-acceptance-refactor-design.md`
 - Read: `docs/reference/deployment-platforms.md`
 - Read: `tests/unit/architecture/test_aws_ecs_acceptance_dependencies.py`
 - Inspect only: commit `773fbd3bf`
@@ -73,8 +73,8 @@ Recheck these official upstream values on the implementation date and update bot
 In the current planning checkout, review and commit exactly these two files before creating the worktree:
 
 ```text
-docs/superpowers/specs/2026-07-26-finish-deferred-deployment-platforms-design.md
-docs/superpowers/plans/2026-07-26-finish-deferred-deployment-platforms.md
+docs/specs/2026-07-26-finish-deferred-deployment-platforms-design.md
+docs/plans/2026-07-26-finish-deferred-deployment-platforms.md
 ```
 
 Do not include source, tests, manifests, generated evidence, or unrelated documentation in that commit. Record the resulting commit as the implementation base:
@@ -108,8 +108,8 @@ git worktree add \
   "$PLAN_BASE_SHA"
 cd .worktrees/finish-deferred-deployment-platforms
 test "$(git rev-parse HEAD^{commit})" = "$PLAN_BASE_SHA"
-test -f docs/superpowers/specs/2026-07-26-finish-deferred-deployment-platforms-design.md
-test -f docs/superpowers/plans/2026-07-26-finish-deferred-deployment-platforms.md
+test -f docs/specs/2026-07-26-finish-deferred-deployment-platforms-design.md
+test -f docs/plans/2026-07-26-finish-deferred-deployment-platforms.md
 test -z "$(git status --porcelain)"
 ```
 
