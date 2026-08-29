@@ -211,43 +211,110 @@ export function versionOperationIdentifier(
 }
 
 /**
- * Derive the history label for a version row.
+ * The lineage row a revert-shaped version points at, or null.
  *
- * Priority: applied tool-call stamp, then revert lineage, then the v1 seed,
- * then a generic "Edited". The applied join runs first because
  * derived_from_state_id is generic lineage, not a revert marker: every
  * non-revert writer derives from the adjacent session head, verified under
  * the write lock (proposal settlement additionally hard-requires base ==
  * current head via its Stale check), so only the revert copy paths point
  * strictly older than the adjacent predecessor. That writer-set invariant —
  * not anything on the wire — is what makes the strictly-older heuristic
- * safe; do not weaken the applied-join-first ordering without re-auditing
- * the derived_from_state_id writers in sessions/service.py. An unresolvable
- * target (outside the paginated window) falls through rather than guessing.
+ * safe. An unresolvable target (outside the paginated window) yields null
+ * rather than a guess.
+ */
+function revertLineageTarget(
+  version: CompositionStateVersion,
+  allVersions: CompositionStateVersion[],
+): CompositionStateVersion | null {
+  const derivedFrom = version.derived_from_state_id;
+  if (!derivedFrom) {
+    return null;
+  }
+  const target = allVersions.find((candidate) => candidate.id === derivedFrom);
+  if (target && target.version < version.version - 1) {
+    return target;
+  }
+  return null;
+}
+
+/** The structural fact deriveVersionLabel's copy stands for. */
+export type VersionLabelKind = "applied" | "revert" | "seed" | "edited";
+
+/**
+ * The structural fact PLUS the row it was derived from, so the copy layer
+ * never has to re-derive (and re-null-check) what the discriminant already
+ * proved. `versionLabelKind` projects this to the bare kind; the visible
+ * label switches over it.
+ */
+type VersionLabelFacts =
+  | { readonly kind: "applied"; readonly toolName: string }
+  | { readonly kind: "revert"; readonly target: CompositionStateVersion }
+  | { readonly kind: "seed" }
+  | { readonly kind: "edited" };
+
+/**
+ * Priority: applied tool-call stamp, then revert lineage, then the v1 seed,
+ * then a generic edit. The applied join runs FIRST because revert-shaped
+ * lineage is ambiguous on its own (a wire_review commit may derive from the
+ * grandparent); do not weaken the applied-join-first ordering without
+ * re-auditing the derived_from_state_id writers in sessions/service.py.
+ */
+function versionLabelFacts(
+  version: CompositionStateVersion,
+  allVersions: CompositionStateVersion[],
+  messages: ChatMessage[],
+): VersionLabelFacts {
+  const toolName = appliedToolCallName(version, messages);
+  if (toolName !== null) {
+    return { kind: "applied", toolName };
+  }
+  const target = revertLineageTarget(version, allVersions);
+  if (target !== null) {
+    return { kind: "revert", target };
+  }
+  return version.version === 1 ? { kind: "seed" } : { kind: "edited" };
+}
+
+/**
+ * The structural fact deriveVersionLabel's copy stands for. Grouping in the
+ * history tree keys on this, never on the visible string
+ * (elspeth-c8a402a9a4): a copy rewrite must not be able to turn grouping
+ * off, and a label the register batch rephrases must not silently change
+ * which rows collapse.
+ */
+export function versionLabelKind(
+  version: CompositionStateVersion,
+  allVersions: CompositionStateVersion[],
+  messages: ChatMessage[],
+): VersionLabelKind {
+  return versionLabelFacts(version, allVersions, messages).kind;
+}
+
+/**
+ * Derive the history label for a version row — the audience-facing copy for
+ * the structural kind above. Every arm is reachable and carries the row it
+ * needs, so no branch guesses at data the discriminant already resolved.
  */
 export function deriveVersionLabel(
   version: CompositionStateVersion,
   allVersions: CompositionStateVersion[],
   messages: ChatMessage[],
 ): string {
-  const appliedName = appliedToolCallName(version, messages);
-  if (appliedName !== null) {
-    const sentence = TOOL_CALL_DESCRIPTIONS[appliedName];
-    return sentence !== undefined ? `Applied: ${sentence}` : `Applied: ${appliedName}`;
-  }
-  const derivedFrom = version.derived_from_state_id;
-  if (derivedFrom) {
-    const target = allVersions.find(
-      (candidate) => candidate.id === derivedFrom,
-    );
-    if (target && target.version < version.version - 1) {
-      return `Reverted to v${target.version}`;
+  const facts = versionLabelFacts(version, allVersions, messages);
+  switch (facts.kind) {
+    case "applied": {
+      const sentence = TOOL_CALL_DESCRIPTIONS[facts.toolName];
+      return sentence !== undefined
+        ? `Applied: ${sentence}`
+        : `Applied: ${facts.toolName}`;
     }
+    case "revert":
+      return `Reverted to v${facts.target.version}`;
+    case "seed":
+      return "Session created";
+    case "edited":
+      return "Edited";
   }
-  if (version.version === 1) {
-    return "Session created";
-  }
-  return "Edited";
 }
 
 /**

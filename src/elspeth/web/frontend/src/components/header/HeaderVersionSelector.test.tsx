@@ -2,9 +2,19 @@ import { readFileSync } from "node:fs";
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { HeaderVersionSelector } from "./HeaderVersionSelector";
+import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
-import type { CompositionStateVersion, NodeSpec } from "@/types/index";
+import { makeVersionHistory } from "@/test/composerFixtures";
+import { resetStore } from "@/test/store-helpers";
+import type { ChatMessage, CompositionStateVersion, NodeSpec } from "@/types/index";
+
+// The selector reads show_advanced (Wave 2 Task 7): the flag flattens the
+// history tree. The store is a module singleton, so reset it for every test
+// in the file — including the sizing describe below, which renders the same
+// component.
+beforeEach(() => resetStore(usePreferencesStore));
 
 // Wire-shaped version rows: GET /state/versions delivers full
 // CompositionStateResponse rows (nodes/edges/outputs/sources/metadata),
@@ -111,7 +121,7 @@ describe("HeaderVersionSelector", () => {
       screen.getByRole("button", { name: /composition history/i }),
     );
     fireEvent.click(
-      screen.getByRole("option", { name: /^version 2 — edited$/i }),
+      screen.getByRole("treeitem", { name: /^version 2 — edited$/i }),
     );
     fireEvent.click(screen.getByRole("button", { name: /revert to version 2/i }));
     fireEvent.click(screen.getByRole("button", { name: /^revert$/i }));
@@ -129,10 +139,10 @@ describe("HeaderVersionSelector", () => {
       screen.getByRole("button", { name: /composition history/i }),
     );
 
-    const option = screen.getByRole("option", {
+    const item = screen.getByRole("treeitem", {
       name: /^version 2 — edited$/i,
     });
-    expect(within(option).getByText("2 nodes")).toBeInTheDocument();
+    expect(within(item).getByText("2 nodes")).toBeInTheDocument();
   });
 
   // The plural case above has an oracle; this is the singular one it was
@@ -145,11 +155,11 @@ describe("HeaderVersionSelector", () => {
       screen.getByRole("button", { name: /composition history/i }),
     );
 
-    const option = screen.getByRole("option", {
+    const item = screen.getByRole("treeitem", {
       name: /^version 1 — session created$/i,
     });
-    expect(within(option).getByText("1 node")).toBeInTheDocument();
-    expect(within(option).queryByText("1 nodes")).not.toBeInTheDocument();
+    expect(within(item).getByText("1 node")).toBeInTheDocument();
+    expect(within(item).queryByText("1 nodes")).not.toBeInTheDocument();
   });
 
   it("labels version 1 as the session seed", () => {
@@ -161,11 +171,11 @@ describe("HeaderVersionSelector", () => {
     );
 
     expect(
-      screen.getByRole("option", { name: /^version 1 — session created$/i }),
+      screen.getByRole("treeitem", { name: /^version 1 — session created$/i }),
     ).toBeInTheDocument();
   });
 
-  it("labels a version from its applied tool-call stamp and joins it into the option name", () => {
+  it("labels a version from its applied tool-call stamp and joins it into the tree item name", () => {
     useSessionStore.setState({
       stateVersions: defaultVersions,
       messages: [
@@ -193,11 +203,11 @@ describe("HeaderVersionSelector", () => {
       screen.getByRole("button", { name: /composition history/i }),
     );
 
-    const option = screen.getByRole("option", {
+    const item = screen.getByRole("treeitem", {
       name: /^version 2 — applied: adds or replaces a connection between two nodes in the pipeline\.$/i,
     });
     expect(
-      within(option).getByText(
+      within(item).getByText(
         "Applied: Adds or replaces a connection between two nodes in the pipeline.",
       ),
     ).toBeInTheDocument();
@@ -224,15 +234,15 @@ describe("HeaderVersionSelector", () => {
     );
 
     expect(
-      screen.queryByRole("option", { name: /^version 2/i }),
+      screen.queryByRole("treeitem", { name: /^version 2/i }),
     ).not.toBeInTheDocument();
     // Classification runs against the FULL fetched list: v3 is judged
     // relative to its true predecessor v2 even though v2 is hidden.
     expect(
-      screen.getByRole("option", { name: /^version 3 \(current\) — edited$/i }),
+      screen.getByRole("treeitem", { name: /^version 3 \(current\) — edited$/i }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("option", { name: /^version 1 — session created$/i }),
+      screen.getByRole("treeitem", { name: /^version 1 — session created$/i }),
     ).toBeInTheDocument();
   });
 
@@ -257,7 +267,7 @@ describe("HeaderVersionSelector", () => {
       screen.getByRole("button", { name: /composition history/i }),
     );
 
-    const current = screen.getByRole("option", {
+    const current = screen.getByRole("treeitem", {
       name: /^version 3 \(current\) — no visible change$/i,
     });
     expect(current.className).toContain("version-selector-item--snapshot");
@@ -273,7 +283,7 @@ describe("HeaderVersionSelector", () => {
     );
     // v2 differs from v1 and stays visible.
     expect(
-      screen.getByRole("option", { name: /^version 2 — edited$/i }),
+      screen.getByRole("treeitem", { name: /^version 2 — edited$/i }),
     ).toBeInTheDocument();
   });
 
@@ -296,7 +306,7 @@ describe("HeaderVersionSelector", () => {
     );
 
     expect(
-      screen.getByRole("option", { name: /^version 2 — edited$/i }),
+      screen.getByRole("treeitem", { name: /^version 2 — edited$/i }),
     ).toBeInTheDocument();
   });
 
@@ -320,7 +330,7 @@ describe("HeaderVersionSelector", () => {
       screen.getByRole("button", { name: /composition history/i }),
     );
     fireEvent.click(
-      screen.getByRole("option", { name: /^version 1 — session created$/i }),
+      screen.getByRole("treeitem", { name: /^version 1 — session created$/i }),
     );
     fireEvent.click(
       screen.getByRole("button", { name: /revert to version 1/i }),
@@ -332,7 +342,7 @@ describe("HeaderVersionSelector", () => {
 
   // elspeth-83eb51334f: focus leaving the selector subtree closes the
   // dropdown — a keyboard user must not be able to Tab away while the
-  // listbox stays visually open.
+  // tree stays visually open.
   it("closes the dropdown when focus moves outside the selector", () => {
     render(
       <div>
@@ -344,12 +354,12 @@ describe("HeaderVersionSelector", () => {
     fireEvent.click(
       screen.getByRole("button", { name: /composition history/i }),
     );
-    const list = screen.getByRole("listbox", { name: /composition history/i });
+    const list = screen.getByRole("tree", { name: /composition history/i });
     const outside = screen.getByRole("button", { name: /^outside$/i });
     fireEvent.blur(list, { relatedTarget: outside });
 
     expect(
-      screen.queryByRole("listbox", { name: /composition history/i }),
+      screen.queryByRole("tree", { name: /composition history/i }),
     ).not.toBeInTheDocument();
   });
 
@@ -360,12 +370,155 @@ describe("HeaderVersionSelector", () => {
       name: /composition history/i,
     });
     fireEvent.click(trigger);
-    const list = screen.getByRole("listbox", { name: /composition history/i });
+    const list = screen.getByRole("tree", { name: /composition history/i });
     fireEvent.blur(list, { relatedTarget: trigger });
 
     expect(
-      screen.getByRole("listbox", { name: /composition history/i }),
+      screen.getByRole("tree", { name: /composition history/i }),
     ).toBeInTheDocument();
+  });
+
+  // Consecutive "Edited" rows are indistinguishable to a reader, so they
+  // collapse into one expandable node. Grouping is PRESENTATION ONLY: every
+  // version stays reachable and revertable, and the Revert target is keyed
+  // by version NUMBER so expanding a group can never re-aim a destructive,
+  // audit-visible action at a different version.
+  describe("grouping (elspeth-c8a402a9a4)", () => {
+    /** An assistant turn whose settled set_pipeline call stamps `version`. */
+    function appliedSetPipelineMessage(version: number): ChatMessage {
+      return {
+        id: `msg-${version}`,
+        session_id: "sess-1",
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            id: `call-${version}`,
+            type: "function",
+            function: { name: "set_pipeline", arguments: "{}" },
+            outcome: "applied",
+            applied_state_version: version,
+          },
+        ],
+        created_at: "2026-08-29T04:00:00Z",
+      } as ChatMessage;
+    }
+
+    beforeEach(() => {
+      useSessionStore.setState({
+        compositionState: {
+          version: 19,
+          sources: {},
+          nodes: [],
+          edges: [],
+          outputs: [],
+        } as never,
+        stateVersions: makeVersionHistory(),
+        messages: [appliedSetPipelineMessage(14)],
+      } as never);
+    });
+
+    it("renders 4 top-level items by default and every version via expansion", async () => {
+      const user = userEvent.setup();
+      render(<HeaderVersionSelector />);
+      await user.click(screen.getByRole("button", { name: /Composition history/ }));
+      // v19 (current), v15–v18 group, v14 (applied), v11–v13 group — from the
+      // helper's unit test.
+      expect(screen.getAllByRole("treeitem")).toHaveLength(4);
+      const group = screen.getByRole("treeitem", {
+        name: /Versions 15 to 18 — 4 edits/,
+      });
+      expect(group).toHaveAttribute("aria-expanded", "false");
+      await user.click(group);
+      expect(group).toHaveAttribute("aria-expanded", "true");
+      expect(
+        screen.getByRole("treeitem", { name: /^Version 17 / }),
+      ).toBeInTheDocument();
+      expect(screen.getAllByRole("treeitem")).toHaveLength(8); // 4 top-level + 4 members
+      // A member <li> is nested INSIDE its group's <li>, so its click bubbles
+      // to the group's toggle handler. Selecting a member must not collapse
+      // the group out from under the user's pointer.
+      await user.click(screen.getByRole("treeitem", { name: /^Version 17 / }));
+      expect(group).toHaveAttribute("aria-expanded", "true");
+    });
+
+    it("keeps the Revert target on the version the user selected across a group expansion", async () => {
+      const user = userEvent.setup();
+      const revertToVersion = vi.fn();
+      useSessionStore.setState({ revertToVersion } as never);
+      render(<HeaderVersionSelector />);
+      await user.click(screen.getByRole("button", { name: /Composition history/ }));
+      await user.click(screen.getByRole("treeitem", { name: /^Version 14 / }));
+      expect(
+        screen.getByRole("button", { name: "Revert to version 14" }),
+      ).toBeInTheDocument();
+      await user.click(
+        screen.getByRole("treeitem", { name: /Versions 15 to 18/ }),
+      );
+      // Rows changed under the selection; the target did not.
+      expect(
+        screen.getByRole("button", { name: "Revert to version 14" }),
+      ).toBeInTheDocument();
+      await user.click(
+        screen.getByRole("button", { name: "Revert to version 14" }),
+      );
+      await user.click(
+        within(
+          screen.getByRole("alertdialog", { name: "Revert pipeline" }),
+        ).getByRole("button", { name: "Revert" }),
+      );
+      expect(revertToVersion).toHaveBeenCalledWith("state-14");
+    });
+
+    it("keyboard path: arrow to the group, Right expands, arrow into a member, Enter arms revert", async () => {
+      const user = userEvent.setup();
+      render(<HeaderVersionSelector />);
+      await user.click(screen.getByRole("button", { name: /Composition history/ }));
+      await user.keyboard("{ArrowDown}{ArrowRight}"); // focus v15–v18, expand
+      await user.keyboard("{ArrowDown}{Enter}"); // focus v18, arm revert
+      expect(
+        screen.getByRole("alertdialog", { name: "Revert pipeline" }),
+      ).toBeInTheDocument();
+      expect(screen.getByRole("alertdialog")).toHaveTextContent("version 18");
+    });
+
+    // WAI-ARIA tree pattern: a member must be able to walk back OUT to its
+    // parent. Without it an expanded group is a one-way door — the only exit
+    // is ArrowUp past every sibling — and a subsequent collapse would strand
+    // the roving cursor on a row that no longer exists.
+    it("keyboard path: ArrowLeft on a member returns focus to its group, then collapses it", async () => {
+      const user = userEvent.setup();
+      render(<HeaderVersionSelector />);
+      await user.click(screen.getByRole("button", { name: /Composition history/ }));
+      await user.keyboard("{ArrowDown}{ArrowRight}"); // focus v15–v18, expand
+      const tree = screen.getByRole("tree", { name: /composition history/i });
+      const group = screen.getByRole("treeitem", {
+        name: /Versions 15 to 18/,
+      });
+      await user.keyboard("{ArrowDown}"); // into the first member, v18
+      expect(tree).toHaveAttribute(
+        "aria-activedescendant",
+        screen.getByRole("treeitem", { name: /^Version 18 / }).id,
+      );
+
+      await user.keyboard("{ArrowLeft}"); // back out to the parent group
+      expect(tree).toHaveAttribute("aria-activedescendant", group.id);
+      expect(group).toHaveAttribute("aria-expanded", "true");
+
+      await user.keyboard("{ArrowLeft}"); // now collapse it
+      expect(group).toHaveAttribute("aria-expanded", "false");
+      expect(screen.getAllByRole("treeitem")).toHaveLength(4);
+      // The cursor is on the group, not stranded where the members were.
+      expect(tree).toHaveAttribute("aria-activedescendant", group.id);
+    });
+
+    it("renders every version flat with show_advanced on", async () => {
+      usePreferencesStore.setState({ showAdvanced: true });
+      const user = userEvent.setup();
+      render(<HeaderVersionSelector />);
+      await user.click(screen.getByRole("button", { name: /Composition history/ }));
+      expect(screen.getAllByRole("treeitem")).toHaveLength(9);
+    });
   });
 });
 

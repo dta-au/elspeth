@@ -10,10 +10,16 @@ import {
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Button } from "@/components/ui";
 import {
+  buildVersionRows,
+  type VersionListRow,
+} from "@/components/header/versionGrouping";
+import {
   deriveVersionLabel,
+  versionLabelKind,
   versionOperationIdentifier,
   isSnapshotOnly,
 } from "@/components/header/versionLabels";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { CompositionStateVersion } from "@/types/index";
 import { plural } from "@/utils/plural";
@@ -27,13 +33,26 @@ export function HeaderVersionSelector(): JSX.Element | null {
   const isLoadingVersions = useSessionStore((s) => s.isLoadingVersions);
   const loadStateVersions = useSessionStore((s) => s.loadStateVersions);
   const revertToVersion = useSessionStore((s) => s.revertToVersion);
+  const showAdvanced = useShowAdvanced();
 
   const [isOpen, setIsOpen] = useState(false);
+  // Roving cursor over the FLATTENED tree order (a group, then its members
+  // when expanded) — not over sortedVersions, which stops being the visual
+  // order the moment a group forms.
   const [focusedIndex, setFocusedIndex] = useState(-1);
-  const [selectedIndex, setSelectedIndex] = useState(0);
+  // Selection is keyed by version NUMBER, never by list index: expanding or
+  // collapsing a group changes the row count, and an index-addressed
+  // selection would silently re-aim Revert — a destructive, audit-visible
+  // action — at whatever row slid into that slot (elspeth-c8a402a9a4).
+  const [selectedVersionNumber, setSelectedVersionNumber] = useState<
+    number | null
+  >(null);
+  const [expandedGroups, setExpandedGroups] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
   const [revertTarget, setRevertTarget] =
     useState<CompositionStateVersion | null>(null);
-  const listboxId = useId();
+  const treeId = useId();
   const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
@@ -78,17 +97,87 @@ export function HeaderVersionSelector(): JSX.Element | null {
       .forEach((version) => sortedVersions.push(version));
   }
 
+  // Grouping keys on the STRUCTURAL kind, never on the visible copy: a
+  // register rewrite of the word "Edited" must not be able to turn grouping
+  // off. Snapshot-only rows report their own kind so they can never be
+  // folded into an "edited" run.
+  const kindFor = (version: CompositionStateVersion) =>
+    isSnapshotOnly(version, findPredecessor(version))
+      ? ("snapshot" as const)
+      : versionLabelKind(version, stateVersions, messages);
+  const rows = buildVersionRows(
+    sortedVersions,
+    kindFor,
+    currentVersion,
+    showAdvanced,
+    expandedGroups,
+  );
+
+  // ONE traversal builds both the flattened focus order and the per-row
+  // render indices, so document order and `focusOrder` cannot drift apart —
+  // which is what makes the [role='treeitem'] scroll-into-view arithmetic
+  // and aria-activedescendant valid.
+  const focusOrder: Array<{
+    row: VersionListRow;
+    member?: CompositionStateVersion;
+    /** Focus index of the owning group row — members only. ArrowLeft on a
+     *  member moves focus to its parent, per the WAI-ARIA tree pattern. */
+    parentIndex?: number;
+  }> = [];
+  const renderEntries: Array<{
+    row: VersionListRow;
+    index: number;
+    memberIndices: number[];
+  }> = [];
+  for (const row of rows) {
+    const index = focusOrder.length;
+    focusOrder.push({ row });
+    const memberIndices: number[] = [];
+    if (row.kind === "group" && row.expanded) {
+      for (const member of row.versions) {
+        memberIndices.push(focusOrder.length);
+        focusOrder.push({ row, member, parentIndex: index });
+      }
+    }
+    renderEntries.push({ row, index, memberIndices });
+  }
+
+  const focusedVersion = (index: number): CompositionStateVersion | null => {
+    const entry = focusOrder[index];
+    if (entry === undefined) {
+      return null;
+    }
+    if (entry.member !== undefined) {
+      return entry.member;
+    }
+    return entry.row.kind === "version" ? entry.row.version : null;
+  };
+
+  const selectedVersion =
+    selectedVersionNumber === null
+      ? null
+      : (sortedVersions.find(
+          (version) => version.version === selectedVersionNumber,
+        ) ?? null);
+  const canRevertSelected =
+    selectedVersion !== null && selectedVersion.version !== currentVersion;
+  // Scalars, not the freshly-built arrays, so the effects below have stable
+  // dependencies.
+  const focusCount = focusOrder.length;
+  const selectionIsStale =
+    selectedVersionNumber !== null && selectedVersion === null;
+
   const toggle = useCallback(() => {
     setIsOpen((prev) => {
       const next = !prev;
       if (next) {
         void loadStateVersions();
         setFocusedIndex(0);
-        setSelectedIndex(0);
+        setSelectedVersionNumber(currentVersion);
       }
       return next;
     });
-  }, [loadStateVersions]);
+  }, [loadStateVersions, currentVersion]);
 
   const close = useCallback(() => {
     setIsOpen(false);
@@ -98,7 +187,7 @@ export function HeaderVersionSelector(): JSX.Element | null {
 
   // Focus leaving the selector subtree closes the dropdown
   // (elspeth-83eb51334f): a keyboard user could previously Tab past the
-  // trigger while the listbox stayed visually open. Mirrors UserMenu: only
+  // trigger while the tree stayed visually open. Mirrors UserMenu: only
   // a real relatedTarget outside the container closes; null relatedTargets
   // are left to the click-outside handler so in-dropdown clicks are never
   // swallowed. No focus-return — focus is already moving somewhere else
@@ -140,15 +229,26 @@ export function HeaderVersionSelector(): JSX.Element | null {
 
   useEffect(() => {
     if (!isOpen || focusedIndex < 0) return;
-    const items = listRef.current?.querySelectorAll("[role='option']");
+    const items = listRef.current?.querySelectorAll("[role='treeitem']");
     items?.[focusedIndex]?.scrollIntoView?.({ block: "nearest" });
   }, [isOpen, focusedIndex]);
 
+  // Collapsing a group (or a shorter fetched window) can leave the roving
+  // cursor past the end of the tree.
   useEffect(() => {
-    if (selectedIndex < sortedVersions.length) return;
-    setSelectedIndex(0);
-    setFocusedIndex(sortedVersions.length > 0 ? 0 : -1);
-  }, [selectedIndex, sortedVersions.length]);
+    if (focusedIndex >= focusCount) {
+      setFocusedIndex(focusCount > 0 ? 0 : -1);
+    }
+  }, [focusedIndex, focusCount]);
+
+  // A selected version that is no longer in the list (a refetch dropped it)
+  // falls back to the current version rather than to whatever now occupies
+  // its former position.
+  useEffect(() => {
+    if (selectionIsStale) {
+      setSelectedVersionNumber(currentVersion);
+    }
+  }, [selectionIsStale, currentVersion]);
 
   if (!activeSessionId || currentVersion === null) {
     return null;
@@ -163,41 +263,82 @@ export function HeaderVersionSelector(): JSX.Element | null {
     }
   }
 
+  function toggleGroup(id: string) {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }
+
   function handleListKeyDown(e: KeyboardEvent<HTMLUListElement>) {
-    const count = sortedVersions.length;
+    const count = focusOrder.length;
     if (e.key === "Escape") {
       e.preventDefault();
       close();
       return;
     }
+    // Arrow up/down move the CURSOR only. Selection no longer follows focus:
+    // an explicit Enter/Space (or click) on a version item is what re-aims
+    // Revert, so walking past a row can never change the target.
     if (e.key === "ArrowDown") {
       e.preventDefault();
       if (count > 0) {
-        setFocusedIndex((prev) => {
-          const next = (prev + 1) % count;
-          setSelectedIndex(next);
-          return next;
-        });
+        setFocusedIndex((prev) => (prev + 1) % count);
       }
       return;
     }
     if (e.key === "ArrowUp") {
       e.preventDefault();
       if (count > 0) {
-        setFocusedIndex((prev) => {
-          const next = (prev - 1 + count) % count;
-          setSelectedIndex(next);
-          return next;
-        });
+        setFocusedIndex((prev) => (prev - 1 + count) % count);
       }
       return;
     }
-    if ((e.key === "Enter" || e.key === " ") && focusedIndex >= 0) {
+    const entry = focusOrder[focusedIndex];
+    if (entry === undefined) {
+      return;
+    }
+    // WAI-ARIA tree pattern: ArrowLeft on a node that is not itself an
+    // expanded parent moves focus to its parent. Without this a member is a
+    // dead end — the only way back out of an expanded group is ArrowUp past
+    // every sibling.
+    if (e.key === "ArrowLeft" && entry.parentIndex !== undefined) {
       e.preventDefault();
-      setSelectedIndex(focusedIndex);
-      const focusedVersion = sortedVersions[focusedIndex];
-      if (focusedVersion && focusedVersion.version !== currentVersion) {
-        setRevertTarget(focusedVersion);
+      setFocusedIndex(entry.parentIndex);
+      return;
+    }
+    if (entry.member === undefined && entry.row.kind === "group") {
+      const group = entry.row;
+      if (e.key === "ArrowRight" && !group.expanded) {
+        e.preventDefault();
+        toggleGroup(group.id);
+        return;
+      }
+      if (e.key === "ArrowLeft" && group.expanded) {
+        e.preventDefault();
+        toggleGroup(group.id);
+        return;
+      }
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        toggleGroup(group.id);
+      }
+      return;
+    }
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      const version = focusedVersion(focusedIndex);
+      if (version === null) {
+        return;
+      }
+      setSelectedVersionNumber(version.version);
+      if (version.version !== currentVersion) {
+        setRevertTarget(version);
       }
     }
   }
@@ -209,9 +350,88 @@ export function HeaderVersionSelector(): JSX.Element | null {
     close();
   }
 
-  const selectedVersion = sortedVersions[selectedIndex] ?? null;
-  const canRevertSelected =
-    !!selectedVersion && selectedVersion.version !== currentVersion;
+  const activeEntry = focusOrder[focusedIndex];
+  const activeDescendantId = ((): string | undefined => {
+    if (activeEntry === undefined) {
+      return undefined;
+    }
+    if (activeEntry.member !== undefined) {
+      return `${treeId}-option-${activeEntry.member.version}`;
+    }
+    return activeEntry.row.kind === "group"
+      ? `${treeId}-group-${activeEntry.row.id}`
+      : `${treeId}-option-${activeEntry.row.version.version}`;
+  })();
+
+  /** One version row — identical markup at the top level and nested inside
+   *  an expanded group; `index` is its slot in the flattened focus order. */
+  function renderVersionItem(
+    version: CompositionStateVersion,
+    index: number,
+  ): JSX.Element {
+    const isCurrent = version.version === currentVersion;
+    const isFocused = focusedIndex === index;
+    const nodeCount = version.nodes?.length ?? version.node_count ?? 0;
+    // Only the current row can reach here snapshot-only — the filter above
+    // hides every other one.
+    const snapshotOnly = isSnapshotOnly(version, findPredecessor(version));
+    // "no VISIBLE change", not "no pipeline change": isSnapshotOnly
+    // compares the redacted wire projection, so the strongest honest claim
+    // is about what this surface can see. Do not strengthen the wording
+    // without a backend content hash.
+    const operationLabel = snapshotOnly
+      ? "no visible change"
+      : deriveVersionLabel(version, stateVersions, messages);
+    const operationTitle = snapshotOnly
+      ? undefined
+      : (versionOperationIdentifier(version, messages) ?? undefined);
+    return (
+      <li
+        key={version.version}
+        id={`${treeId}-option-${version.version}`}
+        role="treeitem"
+        aria-selected={selectedVersionNumber === version.version}
+        aria-label={`Version ${version.version}${
+          isCurrent ? " (current)" : ""
+        } — ${operationLabel}`}
+        className={`version-selector-item${
+          isFocused ? " version-selector-item--focused" : ""
+        }${isCurrent ? " version-selector-item--current" : ""}${
+          snapshotOnly ? " version-selector-item--snapshot" : ""
+        }`}
+        onClick={(e) => {
+          // A member <li> is nested INSIDE its group's <li>, so without this
+          // the click would also reach the group's toggle and collapse the
+          // row the user just selected. A no-op for top-level rows.
+          e.stopPropagation();
+          setFocusedIndex(index);
+          setSelectedVersionNumber(version.version);
+        }}
+        onMouseEnter={() => setFocusedIndex(index)}
+      >
+        <span className="version-selector-item-info">
+          <span className="version-selector-item-label">
+            v{version.version}
+            {isCurrent && (
+              <span className="version-selector-item-tag">(current)</span>
+            )}
+          </span>
+          <span className="version-selector-item-meta">
+            {plural(nodeCount, "node")}
+          </span>
+          <span
+            className="version-selector-item-meta version-selector-item-op"
+            title={operationTitle}
+          >
+            {operationLabel}
+          </span>
+          <span className="version-selector-item-meta">
+            {relativeTime(version.created_at)}
+          </span>
+        </span>
+      </li>
+    );
+  }
 
   return (
     <div
@@ -222,9 +442,9 @@ export function HeaderVersionSelector(): JSX.Element | null {
       <Button
         compact
         ref={triggerRef}
-        aria-haspopup="listbox"
+        aria-haspopup="tree"
         aria-expanded={isOpen}
-        aria-controls={listboxId}
+        aria-controls={treeId}
         aria-label={`Composition history (currently v${currentVersion})`}
         onClick={toggle}
         onKeyDown={handleTriggerKeyDown}
@@ -244,14 +464,10 @@ export function HeaderVersionSelector(): JSX.Element | null {
         <div className="version-selector-dropdown">
           <ul
             ref={listRef}
-            id={listboxId}
-            role="listbox"
+            id={treeId}
+            role="tree"
             aria-label="Composition history"
-            aria-activedescendant={
-              focusedIndex >= 0 && sortedVersions[focusedIndex]
-                ? `${listboxId}-option-${sortedVersions[focusedIndex].version}`
-                : undefined
-            }
+            aria-activedescendant={activeDescendantId}
             onKeyDown={handleListKeyDown}
             tabIndex={0}
             className="version-selector-list"
@@ -259,69 +475,53 @@ export function HeaderVersionSelector(): JSX.Element | null {
             {isLoadingVersions && sortedVersions.length === 0 && (
               <li className="version-selector-loading">Loading versions...</li>
             )}
-            {sortedVersions.map((version, index) => {
-              const isCurrent = version.version === currentVersion;
+            {renderEntries.map(({ row, index, memberIndices }) => {
+              if (row.kind === "version") {
+                return renderVersionItem(row.version, index);
+              }
+              const numbers = row.versions.map((member) => member.version);
+              const low = Math.min(...numbers);
+              const high = Math.max(...numbers);
               const isFocused = focusedIndex === index;
-              const nodeCount =
-                version.nodes?.length ?? version.node_count ?? 0;
-              // Only the current row can reach here snapshot-only — the
-              // filter above hides every other one.
-              const snapshotOnly = isSnapshotOnly(
-                version,
-                findPredecessor(version),
-              );
-              // "no VISIBLE change", not "no pipeline change": isSnapshotOnly
-              // compares the redacted wire projection, so the strongest
-              // honest claim is about what this surface can see. Do not
-              // strengthen the wording without a backend content hash.
-              const operationLabel = snapshotOnly
-                ? "no visible change"
-                : deriveVersionLabel(version, stateVersions, messages);
-              const operationTitle = snapshotOnly
-                ? undefined
-                : (versionOperationIdentifier(version, messages) ?? undefined);
+              const editsLabel = plural(row.versions.length, "edit");
               return (
                 <li
-                  key={version.version}
-                  id={`${listboxId}-option-${version.version}`}
-                  role="option"
-                  aria-selected={selectedIndex === index}
-                  aria-label={`Version ${version.version}${
-                    isCurrent ? " (current)" : ""
-                  } — ${operationLabel}`}
-                  className={`version-selector-item${
+                  key={row.id}
+                  id={`${treeId}-group-${row.id}`}
+                  role="treeitem"
+                  aria-expanded={row.expanded}
+                  // A group is never a revert target — it stands for a run of
+                  // versions, and Revert acts on exactly one.
+                  aria-selected={false}
+                  aria-label={`Versions ${low} to ${high} — ${editsLabel}`}
+                  className={`version-selector-item version-selector-group${
                     isFocused ? " version-selector-item--focused" : ""
-                  }${isCurrent ? " version-selector-item--current" : ""}${
-                    snapshotOnly ? " version-selector-item--snapshot" : ""
                   }`}
                   onClick={() => {
                     setFocusedIndex(index);
-                    setSelectedIndex(index);
+                    toggleGroup(row.id);
                   }}
                   onMouseEnter={() => setFocusedIndex(index)}
                 >
                   <span className="version-selector-item-info">
                     <span className="version-selector-item-label">
-                      v{version.version}
-                      {isCurrent && (
-                        <span className="version-selector-item-tag">
-                          (current)
-                        </span>
-                      )}
+                      v{low}–v{high}
                     </span>
                     <span className="version-selector-item-meta">
-                      {plural(nodeCount, "node")}
-                    </span>
-                    <span
-                      className="version-selector-item-meta version-selector-item-op"
-                      title={operationTitle}
-                    >
-                      {operationLabel}
+                      {editsLabel}
                     </span>
                     <span className="version-selector-item-meta">
-                      {relativeTime(version.created_at)}
+                      {relativeTime(row.versions[0].created_at)}
                     </span>
+                    <span aria-hidden="true">{row.expanded ? "▾" : "▸"}</span>
                   </span>
+                  {row.expanded && (
+                    <ul role="group" className="version-selector-group-members">
+                      {row.versions.map((member, ordinal) =>
+                        renderVersionItem(member, memberIndices[ordinal]),
+                      )}
+                    </ul>
+                  )}
                 </li>
               );
             })}

@@ -9,6 +9,7 @@ import {
   appliedToolCallName,
   deriveVersionLabel,
   versionOperationIdentifier,
+  versionLabelKind,
   isSnapshotOnly,
 } from "./versionLabels";
 
@@ -228,6 +229,71 @@ describe("deriveVersionLabel", () => {
   it("labels version 1 as the session seed", () => {
     const v1 = makeVersion({ id: "st-1", version: 1 });
     expect(deriveVersionLabel(v1, [v1], [])).toBe("Session created");
+  });
+});
+
+// The structural discriminant the history tree groups on (elspeth-c8a402a9a4).
+// Grouping must key on THIS, not on deriveVersionLabel's string: Wave 3's
+// register batch rewrites the word "Edited", and a copy edit must not be able
+// to turn grouping off (or silently regroup the list).
+describe("versionLabelKind", () => {
+  it("reports 'applied' for a version carrying an applied tool-call stamp", () => {
+    const version = makeVersion({ id: "st-3", version: 3 });
+    const messages = [
+      makeMessage([
+        {
+          function: { name: "upsert_edge", arguments: "{}" },
+          outcome: "applied",
+          applied_state_version: 3,
+        },
+      ]),
+    ];
+    expect(versionLabelKind(version, [version], messages)).toBe("applied");
+  });
+
+  it("reports 'revert' when lineage points strictly older than the adjacent predecessor", () => {
+    const v2 = makeVersion({ id: "st-2", version: 2 });
+    const v3 = makeVersion({ id: "st-3", version: 3 });
+    const v4 = makeVersion({
+      id: "st-4",
+      version: 4,
+      derived_from_state_id: "st-2",
+    });
+    expect(versionLabelKind(v4, [v2, v3, v4], [])).toBe("revert");
+  });
+
+  it("reports 'seed' for version 1", () => {
+    const v1 = makeVersion({ id: "st-1", version: 1 });
+    expect(versionLabelKind(v1, [v1], [])).toBe("seed");
+  });
+
+  it("reports 'edited' for an ordinary persist deriving from the previous row", () => {
+    const v2 = makeVersion({ id: "st-2", version: 2 });
+    const v3 = makeVersion({
+      id: "st-3",
+      version: 3,
+      derived_from_state_id: "st-2",
+    });
+    expect(versionLabelKind(v3, [v2, v3], [])).toBe("edited");
+  });
+
+  it("keeps the same priority as the label: an applied stamp beats revert-shaped lineage", () => {
+    const v2 = makeVersion({ id: "st-2", version: 2 });
+    const v5 = makeVersion({
+      id: "st-5",
+      version: 5,
+      derived_from_state_id: "st-2",
+    });
+    const messages = [
+      makeMessage([
+        {
+          function: { name: "patch_node_options", arguments: "{}" },
+          outcome: "applied",
+          applied_state_version: 5,
+        },
+      ]),
+    ];
+    expect(versionLabelKind(v5, [v2, v5], messages)).toBe("applied");
   });
 });
 

@@ -1,5 +1,6 @@
 import type {
   CompositionState,
+  CompositionStateVersion,
   ValidationError,
   ValidationReadiness,
   ValidationResult,
@@ -175,4 +176,16 @@ export function makeAbortablePromise<T>(
       reject_with_abort();
     });
   });
+}
+
+/** Nine bare version rows shaped like the live v19 session (4 edited, one
+ *  applied at v14, 3 edited below it) — no content payloads, so isSnapshotOnly
+ *  honestly declines to hide any of them (versionLabels.ts contract). */
+export function makeVersionHistory(): CompositionStateVersion[] {
+  return [19, 18, 17, 16, 15, 14, 13, 12, 11].map((version) => ({
+    id: `state-${version}`,
+    version,
+    created_at: `2026-08-29T0${version - 10}:00:00Z`,
+    node_count: version >= 15 ? 11 : 5,
+  }));
 }

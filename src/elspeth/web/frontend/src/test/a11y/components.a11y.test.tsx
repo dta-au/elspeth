@@ -347,7 +347,10 @@ import type {
   WireStageData,
 } from "@/types/guided";
 import type { InterpretationEvent } from "@/types/interpretation";
-import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import {
+  compositionStateAuthorityFields,
+  makeVersionHistory,
+} from "@/test/composerFixtures";
 
 // --- Shared store reset ----------------------------------------------------
 
@@ -715,6 +718,35 @@ describe("HeaderSessionSwitcher", () => {
 describe("HeaderVersionSelector", () => {
   it("has no axe violations", async () => {
     const { container } = render(<HeaderVersionSelector />);
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  // The case above renders only the closed trigger — it audits none of the
+  // dropdown. Seed a history that GROUPS (elspeth-c8a402a9a4) and open it, so
+  // axe actually sees ul[role=tree] > li[role=treeitem] > ul[role=group] >
+  // li[role=treeitem] — the WAI-ARIA tree pattern this widget adopted when it
+  // stopped being a listbox (a collapsible group cannot be an `option`).
+  it("has no axe violations with the history tree open and a group expanded", async () => {
+    useSessionStore.setState({
+      compositionState: {
+        version: 19,
+        sources: {},
+        nodes: [],
+        edges: [],
+        outputs: [],
+      } as never,
+      stateVersions: makeVersionHistory(),
+      isLoadingVersions: false,
+    } as never);
+    const { container } = render(<HeaderVersionSelector />);
+    await userEvent.click(
+      screen.getByRole("button", { name: /Composition history/ }),
+    );
+    const group = screen.getByRole("treeitem", { name: /Versions 11 to 18/ });
+    await userEvent.click(group);
+    // Guard against auditing a collapsed (or empty) tree by accident.
+    expect(group).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getAllByRole("treeitem").length).toBeGreaterThan(2);
     expect(await axe(container)).toHaveNoViolations();
   });
 });
