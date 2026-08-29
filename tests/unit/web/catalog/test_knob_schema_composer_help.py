@@ -11,6 +11,7 @@ prove the help text still describes something the runtime accepts.
 from __future__ import annotations
 
 import json
+import types
 
 import pytest
 from pydantic import BaseModel, Field
@@ -257,3 +258,72 @@ def test_malformed_composer_required_when_crashes_at_lowering(value: object) -> 
 
     with pytest.raises(TypeError, match="composer_required_when"):
         lower_model_to_knob_schema(model_cls, plugin_kind="sink", plugin_name="fixture")
+
+
+def _extras_model(extra: object) -> type[BaseModel]:
+    """A one-field model declaring ``extra`` as its ``json_schema_extra``."""
+    return type(
+        "ComposerExtrasModel",
+        (BaseModel,),
+        {
+            "__annotations__": {"knob": str},
+            "knob": Field(default="x", json_schema_extra=extra),
+        },
+    )
+
+
+class TestComposerExtrasAreReadNotSilentlySkipped:
+    """``_composer_extras`` gates four readers whose SILENT branch is permissive.
+
+    ``lower_model_to_knob_schema`` names what ``composer_hidden`` protects:
+    audit-anchor fields the runtime writes, which "must not appear as
+    user-editable knobs because a user-set value would falsify the audit
+    trail". A reader that fails to recognise the extras mapping does not
+    abstain conservatively — it answers "not hidden" and offers the anchor as
+    a knob, and no existing test notices, because the lowered output looks
+    exactly like a model that declared nothing.
+
+    So every branch that cannot READ the declaration must fail closed. Absence
+    and pydantic's callable-mutator form stay the honest no-op; a mapping is
+    read whether plain or frozen; anything else raises at catalog load.
+    """
+
+    def test_frozen_and_plain_declarations_lower_identically(self) -> None:
+        """``MappingProxyType`` is ``deep_freeze``'s mapping form — read it, don't skip it."""
+        plain = {"composer_tier": "advanced", "composer_description": "web wording"}
+        frozen = types.MappingProxyType(dict(plain))
+
+        from_plain = _lower(_extras_model(plain))
+        from_frozen = _lower(_extras_model(frozen))
+
+        assert from_plain == from_frozen
+        assert from_frozen["knob"]["tier"] == "advanced"
+        assert from_frozen["knob"]["description"] == "web wording"
+
+    def test_frozen_composer_hidden_still_hides_the_audit_anchor(self) -> None:
+        hidden = types.MappingProxyType({"composer_hidden": True})
+        assert _lower(_extras_model(hidden)) == {}
+        # The untouched arm: an explicit False is still offered as a knob, so
+        # recognising the frozen form did not turn the gate into "hide on any
+        # declaration".
+        shown = types.MappingProxyType({"composer_hidden": False})
+        assert set(_lower(_extras_model(shown))) == {"knob"}
+
+    def test_callable_and_absent_extras_stay_the_no_op(self) -> None:
+        """Pydantic types ``json_schema_extra`` as mapping | callable | None."""
+
+        def mutate(schema: dict[str, object]) -> None:  # pragma: no cover - never invoked here
+            schema["x"] = 1
+
+        assert set(_lower(_extras_model(mutate))) == {"knob"}
+        assert set(_lower(_extras_model(None))) == {"knob"}
+
+    @pytest.mark.parametrize("extra", [["composer_hidden"], "composer_hidden", 7])
+    def test_non_mapping_extras_crash_at_lowering(self, extra: object) -> None:
+        with pytest.raises(TypeError, match="json_schema_extra must be a mapping"):
+            _lower(_extras_model(extra))
+
+    def test_non_bool_composer_hidden_crashes_rather_than_offering_the_knob(self) -> None:
+        """Fail closed: an unreadable hidden flag must not degrade to 'not hidden'."""
+        with pytest.raises(TypeError, match="composer_hidden"):
+            _lower(_extras_model({"composer_hidden": "true"}))

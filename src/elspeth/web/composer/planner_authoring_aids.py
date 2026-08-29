@@ -835,6 +835,18 @@ def _selected_control_profile(catalog: PolicyCatalogView, capability: PluginCapa
     user-configurable controls) is returned with ``alias=None`` — a required
     control must still appear in the worked exemplar, or the exemplar teaches
     a topology this deployment's coverage validator rejects.
+
+    The usable-alias read is membership-then-index rather than a defaulted
+    lookup because ``build_plugin_snapshot`` is the control that decides which
+    plugins appear at all: it records a ``usable_profile_aliases`` pair only
+    for a plugin whose ``web_config_authority`` is
+    ``WebConfigAuthority.OPERATOR_PROFILED``, so absence is the positive fact
+    "this control is direct-config, not operator-profiled" and ``()`` is the
+    RESTRICTIVE answer to it — the same reading, on the same field, that
+    ``PolicyCatalogView._usable_profile_aliases`` documents in full. Never
+    widen that branch beyond ``()``: crediting a control with aliases the
+    snapshot did not grant it would hand an unprofiled plugin the operator's
+    private binding.
     """
     snapshot = catalog.snapshot
     if dict(snapshot.control_modes).get(capability, ControlMode.RECOMMEND) is not ControlMode.REQUIRED:
@@ -844,7 +856,8 @@ def _selected_control_profile(catalog: PolicyCatalogView, capability: PluginCapa
         return None
     alias = dict(snapshot.selected_profile_aliases).get(plugin_id)
     if alias is None:
-        aliases = dict(snapshot.usable_profile_aliases).get(plugin_id, ())
+        usable_by_plugin = dict(snapshot.usable_profile_aliases)
+        aliases = usable_by_plugin[plugin_id] if plugin_id in usable_by_plugin else ()
         alias = aliases[0] if aliases else None
     return plugin_id.name, alias
 
