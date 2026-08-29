@@ -45,12 +45,6 @@
       "command": "/home/john/.local/share/uv/tools/loomweave/bin/loomweave",
       "env": {},
       "type": "stdio"
-    },
-    "warpline": {
-      "args": [],
-      "command": "/home/john/.local/bin/warpline-mcp",
-      "env": {},
-      "type": "stdio"
     }
   }
 }

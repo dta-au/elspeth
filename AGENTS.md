@@ -366,28 +366,6 @@ does Y".
 Full reference: `loomweave-workflow` skill, `loomweave --help`, MCP schemas.
 <!-- /loomweave:instructions -->
 
-<!-- warpline:instructions:v1.2.0 -->
-## Warpline (temporal change-impact)
-
-`warpline` is the Weft federation's temporal / change-impact authority — "if I
-touch X, what breaks, and what must I re-verify?". Prefer the MCP tools
-(`mcp__warpline__*`); fall back to the `warpline` CLI. Endorsed names and short
-shims return identical schema+data.
-
-- `warpline_change_list` / `changed` — changed entities for a rev range; call first.
-- `warpline_impact_radius_get` / `blast_radius` — downstream affected set.
-- `warpline_reverify_worklist_get` / `reverify` — worklist to recheck before done.
-- `warpline_entity_timeline_get` / `timeline`, `warpline_entity_churn_count_get` /
-  `churn`, `warpline_edge_snapshot_capture` / `capture_snapshot` (only mutating
-  tool; writes `.weft/warpline/` only).
-
-Enrich-only and local-only: every response is `meta.local_only: true`,
-`peer_side_effects: []`. `enrichment` is a CLOSED vocab
-(`present|absent|unavailable`); sibling absence is explicit, never an implied
-clean/allowed state. warpline facts are advisory and never gate. See the
-`warpline-workflow` skill for the full loop.
-<!-- /warpline:instructions -->
-
 ## Judge-signature stage (tier-model allowlist signing)
 
 The trust-tier CI failure is a deliberate fail-closed state: it prevents

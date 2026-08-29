@@ -64,6 +64,7 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [042](042-group-settlement-observability.md) | Group Settlement Vocabulary and Observability — One Closed Reason Set for Coalesce/Scope Settlement, One Lineage Read Authority | 2026-08-25 | **Accepted** |
 | [043](043-retire-wardline.md) | Retire Wardline — elspeth-lints Is the Sole Trust-Boundary Gate | 2026-08-29 | **Accepted** |
 | [044](044-retire-legis.md) | Retire Legis — the elspeth-judge Seam Is the Governance Layer | 2026-08-29 | **Accepted** |
+| [045](045-retire-warpline.md) | Retire Warpline — Loomweave and git Answer the Change-Impact Question | 2026-08-29 | **Accepted** |
 
 ## Status Definitions
 

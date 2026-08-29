@@ -47,7 +47,7 @@ def test_post_edit_hooks_do_not_mutate_python_files() -> None:
 
 def test_repository_hooks_bind_to_claude_project_dir() -> None:
     commands = _hook_commands(_settings())
-    repository_commands = [command for command in commands if "loomweave" in command or "warpline" in command]
+    repository_commands = [command for command in commands if "loomweave" in command]
 
     assert repository_commands
     assert all("${CLAUDE_PROJECT_DIR}" in command for command in repository_commands)
@@ -123,6 +123,31 @@ def test_legis_is_not_wired_into_the_project() -> None:
     assert not any("legis" in command for command in _hook_commands(_settings()))
 
     for path in LEGIS_SURFACES:
+        assert not path.exists(), path
+
+
+WARPLINE_SURFACES = (
+    REPO_ROOT / ".agents" / "skills" / "warpline-workflow",
+    REPO_ROOT / ".claude" / "skills" / "warpline-workflow",
+)
+
+
+def test_warpline_is_not_wired_into_the_project() -> None:
+    """Warpline was retired 2026-08-29 (ADR-045): its only ingestion path was a
+    per-clone post-commit hook, so worktree-authored commits and merges — how
+    this project lands work — were never recorded and its answers were
+    confidently incomplete. Pin the absence of every installer-written surface.
+    """
+    agents_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    assert "warpline:instructions" not in agents_text
+    assert "mcp__warpline__" not in agents_text
+
+    mcp_servers = json.loads((REPO_ROOT / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+    assert "warpline" not in mcp_servers
+
+    assert not any("warpline" in command for command in _hook_commands(_settings()))
+
+    for path in WARPLINE_SURFACES:
         assert not path.exists(), path
 
 

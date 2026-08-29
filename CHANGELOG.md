@@ -24,6 +24,14 @@ All notable changes to ELSPETH are documented here.
   judge wall, HMAC-signed verdicts bound to fingerprint + AST path, operator
   escalation, append-only trail) is already a first-party mechanism of the
   elspeth-judge / `sign-bundle` seam. Rationale in ADR-044.
+- **Warpline change-impact layer** — the `.mcp.json` server, SessionStart
+  hook, `AGENTS.md` installer block and `warpline-workflow` skill copies.
+  Its only ingestion path was a per-clone `post-commit` hook, so the
+  worktree-authored commits and `--no-ff` merges that land this project's
+  work were never recorded: a live probe saw 3 of 14 changed files, an
+  empty impact radius 2,178 commits behind its last snapshot, and a
+  re-verify worklist naming no tests. Loomweave answers the caller
+  question; git answers the rest. Rationale in ADR-045.
 - **Composer pipeline recipes** — the `list_recipes` and
   `apply_pipeline_recipe` tools, the five bundled recipe templates, and the
   slot-schema contracts behind them. The server-side prose-to-recipe matcher
