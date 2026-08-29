@@ -196,7 +196,7 @@ describe("deriveVersionLabel", () => {
     expect(deriveVersionLabel(v3, [v2, v3], [])).toBe("Edited");
   });
 
-  it("prefers the applied stamp over revert-shaped lineage (wire_review commits may derive from the grandparent)", () => {
+  it("prefers the applied stamp — a direct server-authenticated statement — over revert-shaped lineage, which is only inferred", () => {
     const v2 = makeVersion({ id: "st-2", version: 2 });
     const v5 = makeVersion({
       id: "st-5",
