@@ -397,10 +397,9 @@ def _require_execution_ready(payload: object, *, check: str) -> None:
         "coerces or defaults an operator environment value"
     ),
     test_ref=(
-        "tests/unit/web/aws_ecs_acceptance/test_http_capture.py::"
-        "test_capture_rejects_missing_or_noncanonical_server_data_dir_before_any_request"
+        "tests/unit/web/aws_ecs_acceptance/test_http_capture.py::test_capture_rejects_malformed_operator_environment_before_any_request"
     ),
-    test_fingerprint="a35dfb625c84ce74cf0904e8a04b7b36514aee0d86bce12ea7f44c41e12847ab",
+    test_fingerprint="00adea724d32375303255e369236ccd1d8f32f80635f4c13b9d4dd46d00253b0",
 )
 def capture(
     env: Mapping[str, str],

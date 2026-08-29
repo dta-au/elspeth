@@ -426,6 +426,63 @@ def test_verify_s3_provider_and_integrity_failures_are_static_and_still_delete(f
     assert ("cleanup-close" in events) is (failure != "sink")
 
 
+def test_verify_s3_republishes_the_source_validation_check_id_and_still_deletes() -> None:
+    events: list[str] = []
+    sink_count = 0
+    target: dict[str, ArtifactDescriptor] = {}
+
+    class Sink(_EffectS3SinkBase):
+        def __init__(self, index: int) -> None:
+            super().__init__(index=index, events=events, target=target)
+
+        def close(self) -> None:
+            events.append(f"sink-{self.index}-close")
+
+    def sink_factory(_config: dict[str, object]) -> Sink:
+        nonlocal sink_count
+        sink_count += 1
+        return Sink(sink_count)
+
+    class Source:
+        def load(self, ctx: object) -> list[object]:
+            events.append("source-load")
+            # The shipped AWSS3Source reports a schema-rejected row through
+            # the context; the harness context turns that into its own
+            # check-id carrier before any row is materialized.
+            ctx.record_validation_error(  # type: ignore[attr-defined]
+                row={"id": "raw rejected row sentinel"},
+                error="raw validation message sentinel",
+            )
+            pytest.fail("record_validation_error must raise")
+
+        def close(self) -> None:
+            events.append("source-close")
+
+    with pytest.raises(AcceptanceCheckError) as raised:
+        s3.verify_s3(
+            _s3_env(),
+            sink_factory=sink_factory,
+            source_factory=lambda _config: Source(),
+            s3_client_factory=lambda _region, _endpoint: _S3CleanupClient(events),
+        )
+
+    assert raised.value.check == "s3_source_rows"
+    assert "sentinel" not in str(raised.value)
+    assert sink_count == 1
+    assert events == [
+        "sink-1-inspect",
+        "sink-1-prepare",
+        "sink-1-reconcile",
+        "sink-1-commit",
+        "source-load",
+        "source-close",
+        "sink-1-close",
+        "delete",
+        "head",
+        "cleanup-close",
+    ]
+
+
 def test_verify_s3_cleanup_continues_after_resource_close_failure_and_fails_closed() -> None:
     events: list[str] = []
     target: dict[str, ArtifactDescriptor] = {}
