@@ -495,9 +495,44 @@ def test_scenario_inventory_v9_rejects_invalid_gateway_identity_shape(
         )
 
 
-def test_orphan_inventory_admission_rejects_a_foreign_document_shape() -> None:
+def _orphan_inventory_with_unhashable_member(field: str) -> Callable[[dict[str, object]], None]:
+    def mutate(orphan: dict[str, object]) -> None:
+        orphan[field] = [{}]
+
+    return mutate
+
+
+def _orphan_inventory_with_unhashable_target_id(orphan: dict[str, object]) -> None:
+    orphan["event_rules"] = [{"event_bus_name": "default", "rule_name": "deployments", "target_ids": [{}]}]
+
+
+def _orphan_inventory_with_unhashable_guardrail_version(orphan: dict[str, object]) -> None:
+    orphan["bedrock_guardrails"] = [{"identifier": "guardrail", "versions": [{}]}]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(None, id="foreign-document-shape"),
+        pytest.param(_orphan_inventory_with_unhashable_member("secret_ids"), id="secret_ids-unhashable-member"),
+        pytest.param(_orphan_inventory_with_unhashable_member("xray_retained_trace_ids"), id="xray_retained_trace_ids-unhashable-member"),
+        pytest.param(_orphan_inventory_with_unhashable_target_id, id="event-rule-target_ids-unhashable-member"),
+        pytest.param(_orphan_inventory_with_unhashable_guardrail_version, id="guardrail-versions-unhashable-member"),
+    ],
+)
+def test_orphan_inventory_admission_rejects_a_foreign_document_shape(mutate: Callable[[dict[str, object]], None] | None) -> None:
+    # A non-str list member must be refused by the element shape test before the dedupe hashes it: a dict member
+    # once escaped as TypeError, which the CLI's last-resort handler reported as acceptance_internal.
+    if mutate is None:
+        payload: dict[str, object] = {"tag_key": "ACCEPTANCE_RUN_ID"}
+    else:
+        orphan = _scenario_inventory("4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48", "A", "b" * 64, "tf-binding.json")["orphan_sweep"]
+        assert isinstance(orphan, dict)
+        mutate(orphan)
+        payload = orphan
+
     with pytest.raises(acceptance.AcceptanceCheckError, match="scenario_inventory_schema"):
-        scenario_inventory._validate_orphan_inventory({"tag_key": "ACCEPTANCE_RUN_ID"})
+        scenario_inventory._validate_orphan_inventory(payload)
 
 
 def test_tf_binding_receipt_admission_rejects_a_foreign_document_shape(tmp_path: Path) -> None:

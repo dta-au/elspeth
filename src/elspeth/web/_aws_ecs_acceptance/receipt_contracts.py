@@ -27,7 +27,6 @@ from .contracts import (
     MAX_EXEC_STREAM_BYTES,
     AcceptanceCheckError,
     SanitizedResourceIdentity,
-    _control_timestamp,
     _parse_utc_z_timestamp,
     _sha256,
 )
@@ -770,6 +769,15 @@ def _receipt_nonnegative_integer(value: object) -> int:
     return value
 
 
+def _receipt_timestamp(value: object) -> datetime:
+    if type(value) is not str:
+        raise AcceptanceCheckError("receipt_store_schema")
+    try:
+        return _parse_utc_z_timestamp(value)
+    except ValueError:
+        raise AcceptanceCheckError("receipt_store_schema") from None
+
+
 @trust_boundary(
     tier=3,
     source=(
@@ -822,8 +830,8 @@ def _validate_connection_budget_receipt(
     ):
         raise AcceptanceCheckError("receipt_store_binding")
     points = payload["points"]
-    window_start = _control_timestamp(payload["window_start"])
-    window_end = _control_timestamp(payload["window_end"])
+    window_start = _receipt_timestamp(payload["window_start"])
+    window_end = _receipt_timestamp(payload["window_end"])
     if (
         payload["period_seconds"] != 60
         or payload["expected_points"] != 10
@@ -840,7 +848,7 @@ def _validate_connection_budget_receipt(
     for point in points:
         if not isinstance(point, dict) or set(point) != {"timestamp", "count"}:
             raise AcceptanceCheckError("receipt_store_schema")
-        observed_timestamps.append(_control_timestamp(point["timestamp"]))
+        observed_timestamps.append(_receipt_timestamp(point["timestamp"]))
         counts.append(_receipt_number(point["count"]))
     if observed_timestamps != expected_timestamps or len(set(observed_timestamps)) != len(observed_timestamps):
         raise AcceptanceCheckError("receipt_store_schema")
@@ -1055,7 +1063,7 @@ def _validate_compatibility_receipt(
     expected_schema_facts = _expected_schema_facts(scenario_id)
     if payload["schema_facts"] != expected_schema_facts:
         raise AcceptanceCheckError("receipt_store_binding")
-    _control_timestamp(payload["expires_at"])
+    _receipt_timestamp(payload["expires_at"])
     return payload
 
 

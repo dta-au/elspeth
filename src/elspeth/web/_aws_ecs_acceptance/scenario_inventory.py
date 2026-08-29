@@ -184,7 +184,7 @@ def _validate_gateway_profiles(values: Mapping[str, object]) -> None:
         "tag_key that is not ACCEPTANCE_RUN_ID"
     ),
     test_ref="tests/unit/web/aws_ecs_acceptance/test_manifest_schema_inventory.py::test_orphan_inventory_admission_rejects_a_foreign_document_shape",
-    test_fingerprint="b60ef83499a6ce3ebd2cca014fd3f00b9f07edc6994254f379743c3505c027f7",
+    test_fingerprint="5403e3a4753af9dcff1868b1d91552ae17653718330fbff34dcc91cf6299eef6",
 )
 def _validate_orphan_inventory(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict) or set(payload) != _ORPHAN_INVENTORY_FIELDS:
@@ -209,7 +209,6 @@ def _validate_orphan_inventory(payload: object) -> dict[str, object]:
         if (
             not isinstance(values, list)
             or len(values) > 1024
-            or len(values) != len(set(values))
             or any(
                 type(value) is not str
                 or not value
@@ -217,6 +216,7 @@ def _validate_orphan_inventory(payload: object) -> dict[str, object]:
                 or any(ord(character) < 32 or ord(character) == 127 for character in value)
                 for value in values
             )
+            or len(values) != len(set(values))
         ):
             raise AcceptanceCheckError("scenario_inventory_schema")
     if payload["tag_key"] != "ACCEPTANCE_RUN_ID":
@@ -278,8 +278,8 @@ def _validate_orphan_inventory(payload: object) -> dict[str, object]:
     if (
         not isinstance(trace_ids, list)
         or len(trace_ids) > 1024
-        or len(trace_ids) != len(set(trace_ids))
         or any(type(trace_id) is not str or re.fullmatch(r"1-[0-9a-f]{8}-[0-9a-f]{24}", trace_id) is None for trace_id in trace_ids)
+        or len(trace_ids) != len(set(trace_ids))
         or payload["expected_retained_metric_series"] != len(metric_queries)
         or payload["expected_retained_trace_ids"] != len(trace_ids)
     ):
@@ -308,8 +308,8 @@ def _validate_orphan_inventory(payload: object) -> dict[str, object]:
             or identity in seen_rules
             or not isinstance(target_ids, list)
             or len(target_ids) > 100
-            or len(target_ids) != len(set(target_ids))
             or any(type(target) is not str or not target or len(target) > 64 for target in target_ids)
+            or len(target_ids) != len(set(target_ids))
         ):
             raise AcceptanceCheckError("scenario_inventory_schema")
         seen_rules.add(identity)
@@ -329,8 +329,8 @@ def _validate_orphan_inventory(payload: object) -> dict[str, object]:
             or identifier in seen_guardrails
             or not isinstance(versions, list)
             or len(versions) > 1000
-            or len(versions) != len(set(versions))
             or any(type(version) is not str or re.fullmatch(r"[0-9]{1,8}", version) is None for version in versions)
+            or len(versions) != len(set(versions))
         ):
             raise AcceptanceCheckError("scenario_inventory_schema")
         seen_guardrails.add(identifier)
