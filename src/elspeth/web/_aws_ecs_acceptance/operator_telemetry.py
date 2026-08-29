@@ -209,6 +209,30 @@ class AWSOperatorTelemetryQueries:
         except Exception:
             raise OperatorTelemetryAcceptanceError("CloudWatch query failed") from None
         self._assert_forbidden_absent(raw)
+        return self._sentinel_observed(
+            raw,
+            sentinel_value=sentinel_value,
+            start_time=self._start_time,
+            end_time=self._end_time,
+        )
+
+    @staticmethod
+    @trust_boundary(
+        tier=3,
+        source="AWS CloudWatch GetMetricData response for the operator acceptance sentinel metric",
+        source_param="raw",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "raises OperatorTelemetryAcceptanceError on a paginated or malformed response, on anything other than "
+            "the single Complete 'acceptance' series, and on a datapoint whose value is not a finite number or "
+            "whose timestamp is not an aware datetime inside the query window; never coerces external values"
+        ),
+        test_ref=(
+            "tests/unit/web/aws_ecs_acceptance/test_operator_telemetry.py::test_metric_boundary_rejects_malformed_cloudwatch_projections"
+        ),
+        test_fingerprint="3cba7ffdb9e446e2c190cef0ce312233ec34f5145fa36126bcc22e7a5087470b",
+    )
+    def _sentinel_observed(raw: object, *, sentinel_value: int, start_time: datetime, end_time: datetime) -> bool:
         try:
             if not isinstance(raw, Mapping) or raw.get("NextToken") is not None:
                 raise ValueError
@@ -233,15 +257,13 @@ class AWSOperatorTelemetryQueries:
                     or not math.isfinite(float(value))
                     or not isinstance(timestamp, datetime)
                     or timestamp.tzinfo is None
-                    or not self._start_time <= timestamp <= self._end_time
+                    or not start_time <= timestamp <= end_time
                 ):
                     raise ValueError
                 matched = matched or float(value) == float(sentinel_value)
-            if not matched:
-                return False
         except (TypeError, ValueError):
             raise OperatorTelemetryAcceptanceError("CloudWatch projection was invalid") from None
-        return True
+        return matched
 
     @staticmethod
     @trust_boundary(
@@ -436,6 +458,20 @@ class OperatorTelemetryOutageEvidence:
     cloud_receipt: bool
 
 
+@trust_boundary(
+    tier=3,
+    source="Landscape run-lifecycle start read back from the Landscape database through the injectable started_at_reader seam",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises OperatorTelemetryAcceptanceError on a value that is not a timezone-aware datetime, or that cannot "
+        "be normalised to UTC; never substitutes a default start for a run whose start is unavailable"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_operator_telemetry.py::test_landscape_started_at_boundary_rejects_unusable_run_starts"
+    ),
+    test_fingerprint="bc6df6a860dd57d949096628b257ba2842c74f8d9a0cdfaa0101e592aeb5c4d8",
+)
 def _durable_landscape_started_at(value: object) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise OperatorTelemetryAcceptanceError("Landscape run start is unavailable")
@@ -694,8 +730,8 @@ def _operator_receipt(
     resource: SanitizedResourceIdentity,
     collector_degraded: bool,
 ) -> dict[str, object]:
-    positive = isinstance(evidence, OperatorTelemetryEvidence)
-    trace_terminal_agrees = evidence.landscape_status_agrees if isinstance(evidence, OperatorTelemetryEvidence) else None
+    positive = type(evidence) is OperatorTelemetryEvidence
+    trace_terminal_agrees = evidence.landscape_status_agrees if type(evidence) is OperatorTelemetryEvidence else None
     return {
         "phase": phase,
         "metric_name": _METRIC_NAME,
@@ -712,8 +748,8 @@ def _operator_receipt(
         "trace_terminal_agrees": trace_terminal_agrees,
         "collector_degraded": collector_degraded,
         "cloud_receipt": positive,
-        "retained_metric_query": deep_thaw(evidence.retained_metric_query) if isinstance(evidence, OperatorTelemetryEvidence) else None,
-        "retained_trace_id": evidence.retained_trace_id if isinstance(evidence, OperatorTelemetryEvidence) else None,
+        "retained_metric_query": deep_thaw(evidence.retained_metric_query) if type(evidence) is OperatorTelemetryEvidence else None,
+        "retained_trace_id": evidence.retained_trace_id if type(evidence) is OperatorTelemetryEvidence else None,
     }
 
 
@@ -894,11 +930,13 @@ def verify_operator_telemetry_live(
     dimensions = operator_metric_dimensions(settings)
     resource = _operator_resource_identity(settings)
     region = _resolve_aws_region(env, check="operator_telemetry_input")
+    if any(name not in env for name in ("ELSPETH_ACCEPTANCE_RUN_ID", "ELSPETH_ACCEPTANCE_SCENARIO_ID")):
+        raise OperatorTelemetryAcceptanceError("operator telemetry acceptance binding is invalid")
     try:
-        acceptance_run_id = _canonical_uuid(env.get("ELSPETH_ACCEPTANCE_RUN_ID", ""), label="acceptance run ID")
+        acceptance_run_id = _canonical_uuid(env["ELSPETH_ACCEPTANCE_RUN_ID"], label="acceptance run ID")
     except AcceptanceInputError:
         raise OperatorTelemetryAcceptanceError("operator telemetry acceptance binding is invalid") from None
-    scenario_id = env.get("ELSPETH_ACCEPTANCE_SCENARIO_ID", "")
+    scenario_id = env["ELSPETH_ACCEPTANCE_SCENARIO_ID"]
     if scenario_id not in {"A", "B"}:
         raise OperatorTelemetryAcceptanceError("operator telemetry acceptance binding is invalid")
     acceptance_namespace = f"{acceptance_run_id}-{scenario_id.lower()}"
@@ -1001,6 +1039,58 @@ def _read_postgres_max_connections(settings: Any) -> int:
     return maximum
 
 
+@trust_boundary(
+    tier=3,
+    source="AWS CloudWatch GetMetricData response for the AWS/RDS DatabaseConnections high-water series",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('connection_budget_cloudwatch') on a paginated or malformed response, on "
+        "anything other than the single 'connections' series in a Complete or PartialData state, and on a "
+        "datapoint whose timestamp is not aware or whose value is a bool, non-finite, or negative; returns only "
+        "UTC-normalised timestamps and finite non-negative counts"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_operator_telemetry.py::test_connection_budget_series_rejects_malformed_cloudwatch_projections"
+    ),
+    test_fingerprint="4238c38a90bd18a9402d1883e5123f3d6da588b16105fc57346e6d815d9361f5",
+)
+def _connection_budget_series(response: object) -> tuple[tuple[datetime, ...], tuple[float, ...], bool]:
+    """Admit one DatabaseConnections page as owned timestamps, counts, and completeness."""
+
+    try:
+        if not isinstance(response, Mapping) or response.get("NextToken") is not None:
+            raise ValueError
+        results = response.get("MetricDataResults")
+        if not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], Mapping):
+            raise ValueError
+        result = results[0]
+        timestamps = result.get("Timestamps")
+        values = result.get("Values")
+        status_code = result.get("StatusCode")
+        if result.get("Id") != "connections" or status_code not in {"Complete", "PartialData"}:
+            raise ValueError
+        if not isinstance(timestamps, list) or not isinstance(values, list) or len(timestamps) != len(values):
+            raise ValueError
+        admitted_timestamps: list[datetime] = []
+        admitted_counts: list[float] = []
+        for timestamp, value in zip(timestamps, values, strict=True):
+            if (
+                not isinstance(timestamp, datetime)
+                or timestamp.tzinfo is None
+                or isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0
+            ):
+                raise ValueError
+            admitted_timestamps.append(timestamp.astimezone(UTC))
+            admitted_counts.append(float(value))
+    except (TypeError, ValueError):
+        raise AcceptanceCheckError("connection_budget_cloudwatch") from None
+    return tuple(admitted_timestamps), tuple(admitted_counts), status_code == "PartialData"
+
+
 def verify_connection_budget_live(
     env: Mapping[str, str],
     *,
@@ -1030,8 +1120,10 @@ def verify_connection_budget_live(
         or not 1 <= attempts <= 20
     ):
         raise AcceptanceCheckError("connection_budget_input")
+    if "ELSPETH_ACCEPTANCE_RUN_ID" not in env:
+        raise AcceptanceCheckError("connection_budget_input")
     try:
-        acceptance_run_id = _canonical_uuid(env.get("ELSPETH_ACCEPTANCE_RUN_ID", ""), label="acceptance run ID")
+        acceptance_run_id = _canonical_uuid(env["ELSPETH_ACCEPTANCE_RUN_ID"], label="acceptance run ID")
     except AcceptanceInputError:
         raise AcceptanceCheckError("connection_budget_input") from None
     try:
@@ -1094,34 +1186,12 @@ def verify_connection_budget_live(
                 )
             except Exception:
                 raise AcceptanceCheckError("connection_budget_cloudwatch") from None
-            if not isinstance(response, Mapping) or response.get("NextToken") is not None:
-                raise AcceptanceCheckError("connection_budget_cloudwatch")
-            results = response.get("MetricDataResults")
-            if not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], Mapping):
-                raise AcceptanceCheckError("connection_budget_cloudwatch")
-            result = results[0]
-            timestamps = result.get("Timestamps")
-            values = result.get("Values")
-            if result.get("Id") != "connections" or result.get("StatusCode") not in {"Complete", "PartialData"}:
-                raise AcceptanceCheckError("connection_budget_cloudwatch")
-            if not isinstance(timestamps, list) or not isinstance(values, list) or len(timestamps) != len(values):
-                raise AcceptanceCheckError("connection_budget_cloudwatch")
-            candidate_points: list[dict[str, object]] = []
-            candidate_timestamps: list[datetime] = []
-            for timestamp, value in zip(timestamps, values, strict=True):
-                if (
-                    not isinstance(timestamp, datetime)
-                    or timestamp.tzinfo is None
-                    or isinstance(value, bool)
-                    or not isinstance(value, (int, float))
-                    or not math.isfinite(float(value))
-                    or float(value) < 0
-                ):
-                    raise AcceptanceCheckError("connection_budget_cloudwatch")
-                normalized_timestamp = timestamp.astimezone(UTC)
-                candidate_timestamps.append(normalized_timestamp)
-                candidate_points.append({"timestamp": _utc_timestamp(normalized_timestamp), "count": float(value)})
-            if result.get("StatusCode") == "PartialData":
+            candidate_timestamps, candidate_counts, partial_data = _connection_budget_series(response)
+            candidate_points: list[dict[str, object]] = [
+                {"timestamp": _utc_timestamp(timestamp), "count": count}
+                for timestamp, count in zip(candidate_timestamps, candidate_counts, strict=True)
+            ]
+            if partial_data:
                 if attempt + 1 < attempts:
                     sleep(30.0)
                     continue

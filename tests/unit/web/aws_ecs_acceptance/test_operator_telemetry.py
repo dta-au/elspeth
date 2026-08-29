@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 from dataclasses import fields
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1178,3 +1178,181 @@ def test_connection_budget_rejects_high_water_or_an_approved_budget_without_safe
             now=lambda: datetime(2026, 7, 14, 1, 11, tzinfo=UTC),
             attempts=1,
         )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param("not-a-mapping", id="non_mapping_response"),
+        pytest.param({"MetricDataResults": [], "NextToken": "more"}, id="paginated_response"),
+        pytest.param({"MetricDataResults": "not-a-list"}, id="non_list_results"),
+        pytest.param({"MetricDataResults": [{"Id": "acceptance", "StatusCode": "Complete"}] * 2}, id="more_than_one_series"),
+        pytest.param(
+            {"MetricDataResults": [{"Id": "other", "StatusCode": "Complete", "Values": [], "Timestamps": []}]},
+            id="foreign_series_id",
+        ),
+        pytest.param(
+            {"MetricDataResults": [{"Id": "acceptance", "StatusCode": "PartialData", "Values": [], "Timestamps": []}]},
+            id="incomplete_series",
+        ),
+        pytest.param(
+            {"MetricDataResults": [{"Id": "acceptance", "StatusCode": "Complete", "Values": [1.0], "Timestamps": []}]},
+            id="value_timestamp_length_disagreement",
+        ),
+        pytest.param(
+            {
+                "MetricDataResults": [
+                    {
+                        "Id": "acceptance",
+                        "StatusCode": "Complete",
+                        "Values": [1.0],
+                        "Timestamps": [datetime(2026, 7, 14, 1, 1)],  # noqa: DTZ001 - intentional naive value to test rejection
+                    }
+                ]
+            },
+            id="naive_timestamp",
+        ),
+        pytest.param(
+            {
+                "MetricDataResults": [
+                    {
+                        "Id": "acceptance",
+                        "StatusCode": "Complete",
+                        "Values": [1.0],
+                        "Timestamps": [datetime(2030, 1, 1, tzinfo=UTC)],
+                    }
+                ]
+            },
+            id="timestamp_outside_query_window",
+        ),
+    ],
+)
+def test_metric_boundary_rejects_malformed_cloudwatch_projections(raw: object) -> None:
+    with pytest.raises(operator_telemetry.OperatorTelemetryAcceptanceError, match="CloudWatch projection"):
+        operator_telemetry.AWSOperatorTelemetryQueries._sentinel_observed(
+            raw=raw,
+            sentinel_value=1,
+            start_time=datetime(2026, 7, 14, 1, 0, tzinfo=UTC),
+            end_time=datetime(2026, 7, 14, 1, 10, tzinfo=UTC),
+        )
+
+
+def test_metric_boundary_admits_the_sentinel_only_on_an_in_window_match() -> None:
+    def response(value: float) -> dict[str, object]:
+        return {
+            "MetricDataResults": [
+                {
+                    "Id": "acceptance",
+                    "StatusCode": "Complete",
+                    "Values": [value],
+                    "Timestamps": [datetime(2026, 7, 14, 1, 5, tzinfo=UTC)],
+                }
+            ]
+        }
+
+    window = {
+        "sentinel_value": 7,
+        "start_time": datetime(2026, 7, 14, 1, 0, tzinfo=UTC),
+        "end_time": datetime(2026, 7, 14, 1, 10, tzinfo=UTC),
+    }
+    assert operator_telemetry.AWSOperatorTelemetryQueries._sentinel_observed(response(7.0), **window) is True
+    assert operator_telemetry.AWSOperatorTelemetryQueries._sentinel_observed(response(8.0), **window) is False
+    assert operator_telemetry.AWSOperatorTelemetryQueries._sentinel_observed({"MetricDataResults": []}, **window) is False
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(None, id="absent_run_start"),
+        pytest.param("2026-07-14T01:01:00Z", id="unparsed_timestamp_string"),
+        pytest.param(1_752_454_860.0, id="epoch_float"),
+        pytest.param(datetime(2026, 7, 14, 1, 1), id="naive_datetime"),  # noqa: DTZ001 - intentional naive value to test rejection
+    ],
+)
+def test_landscape_started_at_boundary_rejects_unusable_run_starts(value: object) -> None:
+    with pytest.raises(operator_telemetry.OperatorTelemetryAcceptanceError, match="Landscape run start is unavailable"):
+        operator_telemetry._durable_landscape_started_at(value=value)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param("not-a-mapping", id="non_mapping_response"),
+        pytest.param({"MetricDataResults": [], "NextToken": "more"}, id="paginated_response"),
+        pytest.param({"MetricDataResults": []}, id="no_series"),
+        pytest.param({"MetricDataResults": [{"Id": "connections", "StatusCode": "Complete"}] * 2}, id="more_than_one_series"),
+        pytest.param(
+            {"MetricDataResults": [{"Id": "other", "StatusCode": "Complete", "Timestamps": [], "Values": []}]},
+            id="foreign_series_id",
+        ),
+        pytest.param(
+            {"MetricDataResults": [{"Id": "connections", "StatusCode": "InternalError", "Timestamps": [], "Values": []}]},
+            id="unusable_status_code",
+        ),
+        pytest.param(
+            {"MetricDataResults": [{"Id": "connections", "StatusCode": "Complete", "Timestamps": [], "Values": [1.0]}]},
+            id="value_timestamp_length_disagreement",
+        ),
+        pytest.param(
+            {
+                "MetricDataResults": [
+                    {
+                        "Id": "connections",
+                        "StatusCode": "Complete",
+                        "Timestamps": [datetime(2026, 7, 14, 1, 0)],  # noqa: DTZ001 - intentional naive value to test rejection
+                        "Values": [1.0],
+                    }
+                ]
+            },
+            id="naive_timestamp",
+        ),
+        pytest.param(
+            {
+                "MetricDataResults": [
+                    {
+                        "Id": "connections",
+                        "StatusCode": "Complete",
+                        "Timestamps": [datetime(2026, 7, 14, 1, 0, tzinfo=UTC)],
+                        "Values": [True],
+                    }
+                ]
+            },
+            id="bool_masquerading_as_a_count",
+        ),
+        pytest.param(
+            {
+                "MetricDataResults": [
+                    {
+                        "Id": "connections",
+                        "StatusCode": "Complete",
+                        "Timestamps": [datetime(2026, 7, 14, 1, 0, tzinfo=UTC)],
+                        "Values": [-1.0],
+                    }
+                ]
+            },
+            id="negative_count",
+        ),
+    ],
+)
+def test_connection_budget_series_rejects_malformed_cloudwatch_projections(response: object) -> None:
+    with pytest.raises(operator_telemetry.AcceptanceCheckError, match="connection_budget_cloudwatch"):
+        operator_telemetry._connection_budget_series(response=response)
+
+
+def test_connection_budget_series_reports_partial_data_and_normalises_to_utc() -> None:
+    timestamps, counts, partial = operator_telemetry._connection_budget_series(
+        {
+            "MetricDataResults": [
+                {
+                    "Id": "connections",
+                    "StatusCode": "PartialData",
+                    "Timestamps": [datetime(2026, 7, 14, 11, 0, tzinfo=timezone(timedelta(hours=10)))],
+                    "Values": [3],
+                }
+            ]
+        }
+    )
+
+    assert timestamps == (datetime(2026, 7, 14, 1, 0, tzinfo=UTC),)
+    assert counts == (3.0,)
+    assert partial is True
