@@ -378,6 +378,12 @@ async function installCollectorRoutes(page: Page, state: FixtureState): Promise<
           default_mode: "guided",
           banner_dismissed_at: null,
           tutorial_completed_at: null,
+          // The wire contract carries this and the wire-stage assertions below
+          // depend on it: with show_advanced false every per-row "Technical
+          // details" disclosure starts CLOSED, which is what the expand loop
+          // relies on (elspeth-ca456d9d8d). State the precondition here rather
+          // than inheriting it from the store's default.
+          show_advanced: false,
           updated_at: null,
         },
       });
