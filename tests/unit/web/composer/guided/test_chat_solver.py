@@ -1111,6 +1111,8 @@ async def test_step_1_shape_rejected_resolve_source_is_repaired_within_one_tool_
             )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
+    telemetry: list[dict[str, Any]] = []
+    monkeypatch.setattr(chat_solver, "record_guided_shape_repair", lambda **kw: telemetry.append(kw))
     monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_acompletion)
     recorder = BufferingRecorder()
     outcome = await maybe_resolve_step_1_source_chat(
@@ -1143,6 +1145,7 @@ async def test_step_1_shape_rejected_resolve_source_is_repaired_within_one_tool_
         ComposerLLMCallStatus.MALFORMED_RESPONSE,
         ComposerLLMCallStatus.SUCCESS,
     ]
+    assert telemetry == [{"step": "step_1_source", "tool": "resolve_source", "outcome": "repaired", "attempt_index": 1}]
 
 
 @pytest.mark.asyncio
@@ -1158,6 +1161,8 @@ async def test_step_1_shape_repair_is_bounded_by_max_attempts(monkeypatch: pytes
         )
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
+    telemetry: list[dict[str, Any]] = []
+    monkeypatch.setattr(chat_solver, "record_guided_shape_repair", lambda **kw: telemetry.append(kw))
     monkeypatch.setattr(chat_solver, "_litellm_acompletion", always_shape_invalid)
     with pytest.raises(chat_solver.GuidedToolArgumentShapeError):
         await maybe_resolve_step_1_source_chat(
@@ -1172,6 +1177,7 @@ async def test_step_1_shape_repair_is_bounded_by_max_attempts(monkeypatch: pytes
         )
 
     assert len(calls) == 2
+    assert telemetry == [{"step": "step_1_source", "tool": "resolve_source", "outcome": "exhausted", "attempt_index": 1}]
 
 
 @pytest.mark.asyncio

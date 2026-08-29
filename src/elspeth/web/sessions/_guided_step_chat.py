@@ -653,6 +653,11 @@ async def resolve_step_1_source_chat_with_auto_drop(
         # "unavailable" mislabels a model-output defect as provider weather
         # (observed live: session f9836d91, 2026-07-23). The message is
         # value-free by construction, so it is journal-safe verbatim.
+        # Since elspeth-79e66ff613 stage 2 this branch fires only at repair
+        # EXHAUSTION: the solver threads the rejection back for one in-Send
+        # resend first, so a single stochastic omission no longer reaches
+        # the user (composer.guided_shape_repair outcome=exhausted coincides
+        # 1:1 with these events).
         latency_ms = int((time.perf_counter() - started) * 1000)
         slog.error(
             "guided.step_1_source_chat_model_shape_rejected",
@@ -895,8 +900,10 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     # A malformed discovery-tool dispatch deep in the sink loop raises a
     # GuidedSolverResponseShapeError; the shared tool classification absorbs it.
     except GuidedToolArgumentShapeError as exc:
-        # Mirror of the step-1 branch; see the comment there. Must precede
-        # the transient set (GuidedToolArgumentShapeError is a ValueError).
+        # Mirror of the step-1 branch; see the comment there (both steps now
+        # self-repair in-Send, so this too fires only at repair exhaustion).
+        # Must precede the transient set (GuidedToolArgumentShapeError is a
+        # ValueError).
         latency_ms = int((time.perf_counter() - started) * 1000)
         slog.error(
             "guided.step_2_sink_chat_model_shape_rejected",

@@ -66,6 +66,7 @@ from elspeth.web.composer.guided.resolved import (
     freeze_guided_json_mapping,
     freeze_guided_str_sequence,
 )
+from elspeth.web.composer.guided.shape_repair_telemetry import record_guided_shape_repair
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent
 from elspeth.web.composer.guided_blob_refs import reviewed_schema_declared_field_names, reviewed_source_is_blob_bound
 from elspeth.web.composer.llm_response_parsing import (
@@ -2572,6 +2573,7 @@ async def maybe_resolve_step_1_source_chat(
     # whole Send. The thread is re-appended after the rebuilt user message on
     # the retry attempt.
     deferred_repair_thread: list[dict[str, Any]] = []
+    shape_repair_used = False
     deferred_repair_used = False
     max_attempts = 2
     for attempt_index in range(max_attempts):
@@ -2804,11 +2806,41 @@ async def maybe_resolve_step_1_source_chat(
                     # the finally-block recorder. At exhaustion the
                     # pre-repair behavior applies (paired retain salvage,
                     # else raise).
-                    if attempt_index + 1 < max_attempts:
-                        rejected_source_call = source_calls[0] if source_calls else terminal_calls[0]
-                        shape_repair_results: list[dict[str, Any]] = []
-                        for tool_call in tool_calls:
-                            if tool_call is rejected_source_call:
+                    rejected_source_call = source_calls[0] if source_calls else terminal_calls[0]
+                    admitted_shape_repair = (
+                        _admit_deferred_intent_repair_thread(
+                            message,
+                            tool_calls,
+                            rejected_calls=(rejected_source_call,),
+                        )
+                        if attempt_index + 1 < max_attempts
+                        else None
+                    )
+                    if admitted_shape_repair is not None:
+                        # Thread built from the ADMITTED carrier only (ADR-032:
+                        # the provider turn was parsed at the boundary above;
+                        # an inadmissible turn — e.g. a missing call id —
+                        # refuses repair and falls through to the pre-repair
+                        # raise rather than crashing mid-repair).
+                        shape_repair_thread: list[dict[str, Any]] = [
+                            {
+                                "role": "assistant",
+                                "content": admitted_shape_repair.assistant_content,
+                                "tool_calls": [
+                                    {
+                                        "id": admitted_call.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": admitted_call.function.name,
+                                            "arguments": admitted_call.function.arguments,
+                                        },
+                                    }
+                                    for admitted_call in admitted_shape_repair.calls
+                                ],
+                            }
+                        ]
+                        for admitted_call in admitted_shape_repair.calls:
+                            if admitted_call.is_rejected:
                                 content = (
                                     f"resolve_source rejected: the arguments were malformed: {exc} "
                                     "Resend the complete resolve_source call with every required key."
@@ -2818,15 +2850,16 @@ async def maybe_resolve_step_1_source_chat(
                                     "Not applied: the grouped resolve_source call was rejected. "
                                     "After correcting it, resend ALL calls together in one reply."
                                 )
-                            shape_repair_results.append({"role": "tool", "tool_call_id": tool_call.id, "content": content})
-                        deferred_repair_thread = [
-                            _assistant_tool_calls_message(message, tool_calls),
-                            *shape_repair_results,
-                        ]
+                            shape_repair_thread.append({"role": "tool", "tool_call_id": admitted_call.id, "content": content})
+                        deferred_repair_thread = shape_repair_thread
+                        shape_repair_used = True
                         status = ComposerLLMCallStatus.MALFORMED_RESPONSE
                         error_class = type(exc).__name__
                         error_message = "malformed_response"
                         continue
+                    record_guided_shape_repair(
+                        step="step_1_source", tool="resolve_source", outcome="exhausted", attempt_index=attempt_index
+                    )
                     if deferred_actions:
                         # Same retention rule for a shape-invalid source half.
                         status = ComposerLLMCallStatus.SUCCESS
@@ -2836,6 +2869,8 @@ async def maybe_resolve_step_1_source_chat(
                         )
                     raise
                 status = ComposerLLMCallStatus.SUCCESS
+                if shape_repair_used:
+                    record_guided_shape_repair(step="step_1_source", tool="resolve_source", outcome="repaired", attempt_index=attempt_index)
                 return Step1SourceResolvedOutcome(resolution=result, deferred_actions=deferred_actions)
             # No resolve_source call: the model judged the message doesn't carry
             # enough detail to act (or it's a plain question) and answered in
