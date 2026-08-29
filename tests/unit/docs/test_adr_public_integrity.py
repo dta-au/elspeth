@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 REPOSITORY_ROOT = Path(__file__).parents[3]
 ADR_DIRECTORY = REPOSITORY_ROOT / "docs/architecture/adr"
 
@@ -40,25 +42,59 @@ AUDITED_ADRS = frozenset(
     }
 )
 
-_AUTHORITY_FIELD = re.compile(r"^\*\*(?:Deciders|Decision Makers):\*\*\s*(?P<value>.+)$", re.MULTILINE)
-_NON_AUTHORITY_ACTOR = re.compile(
-    r"\b(?:architecture (?:review )?board|architecture team|core maintainers|code reviewers|"
-    r"claude(?: opus| fable \d+)?|codex|SME agent|reviewer panel|review panel|panel-reviewed)\b",
+_AUTHORITY_FIELD = re.compile(
+    r"^\*\*(?:Amendment )?(?:Deciders|Decision Makers):\*\*\s*(?P<value>.+)$",
+    re.MULTILINE,
+)
+_STATUS_FIELD = re.compile(r"^\*\*Status:\*\*\s*(?P<value>.+)$", re.MULTILINE)
+_ACCOUNTABLE_AUTHORITIES = frozenset({"ELSPETH maintainer", "ELSPETH maintainers"})
+_PRIVATE_HOME = re.compile(r"/(?:home|Users)/(?!user(?:/|\b))[^/\s`),]+(?:/[^\s`),]*)?")
+_TMP_PATH = re.compile(r"/tmp(?:/[^\s`),]*)?")
+_PROVENANCE_CONTEXT = re.compile(
+    r"\b(?:accountable|authority|deciders?|decision makers?|evidence|provenance|review|plan|reference|source|"
+    r"artefacts?|artifacts?|policy)\b",
     re.IGNORECASE,
 )
-_PRIVATE_HOME = re.compile(r"/(?:home|Users)/(?!user(?:/|\b))[^/\s`]+/")
-_EPHEMERAL_EVIDENCE = re.compile(
-    r"^(?=.*\b(?:evidence|provenance|review|plan|artefacts?|artifacts?)\b).*?/tmp/",
-    re.IGNORECASE | re.MULTILINE,
-)
-_OPAQUE_MEMORY_AUTHORITY = re.compile(
-    r"MEMORY\.md::|project memory|(?:project|feedback)_[a-z0-9_]+",
+_PROVENANCE_REJECTION = re.compile(
+    r"\b(?:do not|must not|never|reject(?:ed)?|forbid(?:den)?|not (?:a )?(?:durable|valid|acceptable|public))\b",
     re.IGNORECASE,
 )
+_OPAQUE_MEMORY_REFERENCE = re.compile(r"MEMORY\.md::|project memory", re.IGNORECASE)
+_MEMORY_KEY = re.compile(r"\b(?P<key>(?:project|feedback)_[a-z0-9_]+)\b", re.IGNORECASE)
+_TECHNICAL_MEMORY_FIELDS = frozenset({"project_id", "feedback_channel"})
 
 
 def _active_adrs() -> tuple[Path, ...]:
     return tuple(sorted(path for path in ADR_DIRECTORY.glob("[0-9][0-9][0-9]-*.md") if path.name != "000-template.md"))
+
+
+def _top_level_metadata(text: str, pattern: re.Pattern[str]) -> str | None:
+    preamble = text.split("\n## ", maxsplit=1)[0]
+    match = pattern.search(preamble)
+    return match.group("value").strip() if match else None
+
+
+def _public_provenance_violations(text: str) -> tuple[str, ...]:
+    violations: list[str] = []
+
+    for paragraph in re.split(r"\n\s*\n", text):
+        if _PRIVATE_HOME.search(paragraph):
+            violations.append("private absolute path")
+
+        rejects_provenance = bool(_PROVENANCE_REJECTION.search(paragraph))
+        has_provenance_context = bool(_PROVENANCE_CONTEXT.search(paragraph))
+        if _TMP_PATH.search(paragraph) and has_provenance_context and not rejects_provenance:
+            violations.append("ephemeral evidence path")
+
+        if _OPAQUE_MEMORY_REFERENCE.search(paragraph):
+            violations.append("opaque project-memory authority")
+
+        if has_provenance_context:
+            memory_keys = (match.group("key").lower() for match in _MEMORY_KEY.finditer(paragraph))
+            if any(key not in _TECHNICAL_MEMORY_FIELDS for key in memory_keys):
+                violations.append("opaque project-memory authority")
+
+    return tuple(dict.fromkeys(violations))
 
 
 def test_audited_adrs_name_the_maintainer_as_accountable_authority() -> None:
@@ -79,20 +115,37 @@ def test_accepted_index_state_is_reflected_in_adr_status() -> None:
         "005-adr-declarative-dag-wiring.md",
     ):
         text = (ADR_DIRECTORY / filename).read_text(encoding="utf-8")
-        assert "**Status:** Accepted" in text, filename
+        assert _top_level_metadata(text, _STATUS_FIELD) == "Accepted", filename
 
 
-def test_active_adr_authority_metadata_does_not_delegate_to_tools_or_panels() -> None:
+@pytest.mark.parametrize(
+    "field",
+    ("Deciders", "Decision Makers", "Amendment Deciders", "Amendment Decision Makers"),
+)
+def test_authority_field_variants_use_the_exact_positive_allowlist(field: str) -> None:
+    match = _AUTHORITY_FIELD.fullmatch(f"**{field}:** ELSPETH maintainers")
+
+    assert match is not None
+    assert match.group("value") in _ACCOUNTABLE_AUTHORITIES
+
+
+def test_top_level_status_parser_does_not_accept_an_amendment_status() -> None:
+    text = "# ADR\n\n**Status:** Proposed\n\n## Amendment\n\n**Status:** Accepted\n"
+
+    assert _top_level_metadata(text, _STATUS_FIELD) == "Proposed"
+
+
+def test_active_adr_authority_metadata_names_an_accountable_maintainer() -> None:
     failures: list[str] = []
 
     for path in _active_adrs():
         text = path.read_text(encoding="utf-8")
-        for match in _AUTHORITY_FIELD.finditer(text):
-            authority = match.group("value").strip()
-            if _NON_AUTHORITY_ACTOR.search(authority):
+        authorities = tuple(match.group("value").strip() for match in _AUTHORITY_FIELD.finditer(text))
+        for authority in authorities:
+            if authority not in _ACCOUNTABLE_AUTHORITIES:
                 failures.append(f"{path.name}: {authority}")
 
-    assert not failures, "ADR authority metadata names a tool, agent, panel, or fictional body:\n" + "\n".join(failures)
+    assert not failures, "ADR authority metadata must name an accountable ELSPETH maintainer:\n" + "\n".join(failures)
 
 
 def test_active_adrs_do_not_use_private_or_ephemeral_provenance() -> None:
@@ -100,11 +153,23 @@ def test_active_adrs_do_not_use_private_or_ephemeral_provenance() -> None:
 
     for path in _active_adrs():
         text = path.read_text(encoding="utf-8")
-        if _PRIVATE_HOME.search(text):
-            failures.append(f"{path.name}: private absolute path")
-        if _EPHEMERAL_EVIDENCE.search(text):
-            failures.append(f"{path.name}: ephemeral evidence path")
-        if _OPAQUE_MEMORY_AUTHORITY.search(text):
-            failures.append(f"{path.name}: opaque project-memory authority")
+        failures.extend(f"{path.name}: {violation}" for violation in _public_provenance_violations(text))
 
     assert not failures, "Active ADRs contain non-public provenance:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("**Review evidence:**\n  `/tmp/review.json`", True),
+        ("**Reference:** `/home/john`", True),
+        ("**Reference:** `/Users/alice`", True),
+        ("**Decision evidence:** `project_db_migration_policy`", True),
+        ("Runtime uses `/tmp/cache` for spill files.", False),
+        ("The `project_id` field identifies the project.", False),
+        ("The `feedback_channel` field routes messages.", False),
+        ("References to `/tmp/review.json` are rejected as evidence.", False),
+    ],
+)
+def test_public_provenance_boundary_cases(text: str, expected: bool) -> None:
+    assert bool(_public_provenance_violations(text)) is expected

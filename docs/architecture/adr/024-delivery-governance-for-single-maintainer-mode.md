@@ -47,7 +47,8 @@ regularly participates in release-critical delivery.
 
 In single-maintainer mode:
 
-- human approval requirements must not be satisfied through self-review;
+- the required human approval count is zero while no independent maintainer is
+  routinely available; self-review cannot satisfy an approval requirement;
 - default-branch and release-critical merges must be protected by mandatory automated gates;
 - required evidence comes from CI, policy lints, CodeQL, redaction governance, artifact provenance, signatures, and smoke tests;
 - release images must be tied to commits that have passed the required CI gate;
@@ -231,8 +232,8 @@ prevents a concrete failure should be removed. If removing a practice is a
 marginal call or may discard a real safeguard, the tradeoff must be surfaced to
 the maintainer before removal.
 
-When a second maintainer regularly participates in release-critical delivery,
-ELSPETH will make a separate step-up decision for **two-maintainer mode**, including:
+When a second independent maintainer regularly participates in release-critical delivery,
+ELSPETH automatically enters **two-maintainer mode** and enables:
 
 - one required approving review;
 - stale-review dismissal on new commits;

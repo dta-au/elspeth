@@ -185,7 +185,9 @@ After all violations are fixed:
 **Rejected because:** The systems analysis showed this IS the symptomatic
 solution driving the Shifting the Burden loop. Each additional violation
 increases the eventual restructuring cost, so deferral would make the same
-correction harder without adding product value.
+correction harder without adding product value. At the 2026-02-22 decision
+point, ELSPETH had no external users, so the maintainer assessed a breaking
+restructuring as lower-cost then than after external adoption.
 
 ## Related Decisions
 
@@ -196,7 +198,7 @@ correction harder without adding product value.
 
 ## References
 
-- Decision and implementation history: commit `fc189fe9d`
+- Analysis and decision evidence: commit `fc189fe9d`
 - Senge, Peter M. *The Fifth Discipline* (1990) — "Shifting the Burden" archetype (Chapter 6)
 - Meadows, Donella. *Thinking in Systems* (2008) — leverage point hierarchy (Chapter 6)
 - Git blame evidence: All 10 violations trace to RC2 initial commit `f4f348de` (2026-02-02) or within days of it

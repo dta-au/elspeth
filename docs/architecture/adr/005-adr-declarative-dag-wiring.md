@@ -1,7 +1,7 @@
 # ADR: Declarative DAG Wiring — Explicit Input/Output Connections on All Nodes
 
 **Status:** Accepted
-**Implementation:** commits `00d3c6bae` and `074e15e87`
+**Decision history:** commits `00d3c6bae` and `074e15e87`
 **Date:** 2026-02-09
 **Decision Makers:** ELSPETH maintainer
 **Depends On:** ADR-004 explicit sink routing and the completed processor refactoring

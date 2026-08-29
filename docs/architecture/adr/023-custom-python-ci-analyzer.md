@@ -24,7 +24,9 @@ identified that the 14 scripts should consolidate into a single
 findings-parity contract. **That consolidation has since landed**. The last
 script outside the package was ported as
 `contract_invariants.adapter_method_budget` and deleted
-(`elspeth-3575a7f15d`, commit `7882a127d`); no `enforce_*.py` scripts remain.
+(commit `7882a127d`); no `enforce_*.py` scripts remain. The associated Filigree
+issue, `elspeth-3575a7f15d`, remained `in_progress` at the 2026-08-29 checked
+cutoff.
 
 This ADR records the prior, more fundamental question: **should ELSPETH be writing this enforcement in custom Python at all, or porting the rules to an off-the-shelf static analyzer?**
 
@@ -66,11 +68,16 @@ The four candidates considered were CodeQL (already in the toolchain via `.githu
 
 ### D2. CodeQL stays in the toolchain as a complement, not as a replacement
 
-**Decision:** `.github/workflows/codeql.yaml` continues to run on its configured
-schedule. CodeQL covers CWE-tagged vulnerability patterns and inter-procedural
-taint analysis that the upstream Python pack models. CodeQL findings appear in
-GitHub Code Scanning; `elspeth-lints` findings are currently retained as CI
-SARIF artifacts.
+**Decision (accepted 2026-05-19):** `.github/workflows/codeql.yaml` continues to
+run on its configured schedule. CodeQL covers CWE-tagged vulnerability patterns
+and inter-procedural taint analysis that the upstream Python pack models.
+CodeQL and `elspeth-lints` findings surface in GitHub Code Scanning, with the
+sources distinguished by SARIF category.
+
+**Current implementation note (2026-08-29):** CodeQL uploads separately to
+GitHub Code Scanning. `elspeth-lints` emits SARIF, but CI currently retains it
+only as a workflow artifact. The accepted publication commitment is not yet
+implemented; D6 records the same divergence explicitly.
 
 **Why complement rather than choose:** the current responsibilities are
 distinct enough that retiring either would lose useful coverage. Custom Python
@@ -93,7 +100,9 @@ covers ELSPETH-specific invariants; CodeQL covers general Python vulnerability p
 * New CodeQL queries land under a new path (e.g. `.github/codeql/custom-queries/`) and feed into the existing `codeql.yaml` workflow alongside the standard query suite
 * They do NOT replace any rule already in `elspeth-lints`; they cover net-new invariants that custom Python can't reach
 * The mixed-toolchain world is acknowledged and accepted at that point. Both
-  analyzers emit SARIF; their publication destinations and rule taxonomies stay explicit
+  analyzers emit SARIF; both surface in the Security tab, and their SARIF
+  categories and rule taxonomies stay explicit. The current implementation
+  divergence is recorded in D2 and D6.
 * A new ADR documenting the introduction of taint queries supersedes the relevant section of this one if a different toolchain choice is made then
 
 ### D5. The `elspeth-lints` package is workspace-only, not PyPI-published
@@ -102,12 +111,15 @@ covers ELSPETH-specific invariants; CodeQL covers general Python vulnerability p
 
 **Why workspace-only:** publishing implies semver discipline, breaking-change shims, dependency management for external consumers, and documentation overhead none of which is justified before ELSPETH itself has shipped. The package boundary exists to enforce internal modularity (rule registry, shared CLI surface, fixture harness), not to deliver an external product. If post-release we identify other projects that want to adopt some of the rule machinery, a future ADR will document the publishing decision then.
 
-### D6. CodeQL and `elspeth-lints` both emit SARIF
+### D6. CodeQL and `elspeth-lints` findings coexist via SARIF category
 
-**Decision:** Both analyzers emit SARIF. CodeQL uploads to GitHub Code Scanning;
-the current CI retains `elspeth-lints` SARIF as the `elspeth-lints-sarif`
-workflow artifact. If `elspeth-lints` is uploaded to Code Scanning later, it
-must use a distinct category so the finding sources remain distinguishable.
+**Decision (accepted 2026-05-19):** Both analyzers upload SARIF to GitHub Code
+Scanning. `elspeth-lints` uses a distinct category so the finding sources remain
+distinguishable.
+
+**Current implementation note (2026-08-29):** This commitment is not yet
+implemented. CodeQL uploads separately to GitHub Code Scanning; CI retains
+`elspeth-lints` SARIF as the `elspeth-lints-sarif` workflow artifact only.
 
 ## Revisit Triggers
 
@@ -136,18 +148,21 @@ Re-open this ADR if one of these conditions becomes true:
 The consolidation work (rule registry, SARIF emission, parity harness,
 per-category ports, meta-CI gate, ADR-name rename, pre-commit incremental split,
 CI-graph collapse, and rule-taxonomy rationale) has landed, with the final
-residual closed at `elspeth-3575a7f15d` (2026-08-06). The taint-analysis future
-direction (D4) has no committed timeline; when it begins, a new ADR will record
-the chosen toolchain for those specific rules.
+port landing in commit `7882a127d`. The associated Filigree issue
+`elspeth-3575a7f15d` remained `in_progress` at the 2026-08-29 checked cutoff.
+The taint-analysis future direction (D4) has no committed timeline; when it
+begins, a new ADR will record the chosen toolchain for those specific rules.
 
 ### Operator actions
 
-None at ADR-acceptance time. The consolidation work has since landed in full; the final port closed at `elspeth-3575a7f15d` (2026-08-06).
+None at ADR-acceptance time. The consolidation work has since landed in full;
+the final port landed in commit `7882a127d`, while its associated Filigree issue
+remained `in_progress` at the 2026-08-29 checked cutoff.
 
 ## References
 
-* **Consolidation residual (closed 2026-08-06):** filigree
-  `elspeth-3575a7f15d` and commit `7882a127d`.
+* **Consolidation residual:** the port landed in commit `7882a127d`; Filigree
+  `elspeth-3575a7f15d` remained `in_progress` at the 2026-08-29 checked cutoff.
 * **Rule-taxonomy rationale:** [elspeth-lints rationale](../../elspeth-lints/rationale.md).
 * **Current SARIF publication:** [CI workflow](../../../.github/workflows/ci.yaml).
 * **CodeQL workflow:** [.github/workflows/codeql.yaml](../../../.github/workflows/codeql.yaml)

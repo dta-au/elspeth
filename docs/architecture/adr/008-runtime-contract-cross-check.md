@@ -20,6 +20,12 @@
 > Normative in this ADR: §Explicit scope boundary (each new declaration still requires its own ADR).
 > Superseded: the direct-call executor integration pattern — replaced by ADR-010 §Decision 3's `run_runtime_checks` dispatcher. Cross-check scope "per-row in executor" remains correct; the mechanism is now registry-driven.
 
+> **Current implementation note (2026-08-29).** The accepted decision below
+> records the original median/P99 non-functional requirement. Commit
+> `2db281c12` changed the executable benchmark to assert median ≤ 25 µs and a
+> Tukey upper fence (`q3 + 3×IQR`) ≤ 50 µs. This note reports current
+> enforcement without rewriting the criterion accepted in this ADR.
+
 ## Context
 
 ADR-007 establishes opt-in propagation declared via `BaseTransform.passes_through_input`. Static DAG analysis now trusts that declaration — the validator walks through annotated transforms and propagates predecessor guarantees downstream, mirroring runtime behaviour.
@@ -38,7 +44,7 @@ This is the bug-class the original v2 plan was reaching for but left implicit: "
 Add a per-row runtime cross-check to `TransformExecutor.execute_transform`:
 
 1. After `transform.process()` returns a successful `TransformResult`, if `transform.passes_through_input` is True, compute `input_fields = frozenset(input_row.contract.fields)` for every emitted row.
-2. Compute `runtime_observed = frozenset(emitted_row.contract.fields) & frozenset(emitted_row.keys())` — the **intersection** of the emitted row's contract-set and its payload-set. `PipelineRow.__init__` accepts any `dict` and any `SchemaContract` as independent references and does not enforce `data.keys() ⊆ contract.fields`, so a field is "kept" at runtime iff the row simultaneously declares it in its contract AND carries it in its payload. Reading either side alone creates a one-sided blind spot: a buggy plugin can shrink the contract while keeping the payload (caught by the contract side), or shrink the payload while reusing the input contract (caught by the payload side). Using the intersection catches both vectors. The payload-side cost is `frozenset(emitted_row.keys())`, which reads the frozen `MappingProxyType` directly — no `deep_thaw` — so the NFR gate (median ≤ 25 µs and `q3 + 3×IQR ≤ 50 µs` on a 200-field row) remains comfortable.
+2. Compute `runtime_observed = frozenset(emitted_row.contract.fields) & frozenset(emitted_row.keys())` — the **intersection** of the emitted row's contract-set and its payload-set. `PipelineRow.__init__` accepts any `dict` and any `SchemaContract` as independent references and does not enforce `data.keys() ⊆ contract.fields`, so a field is "kept" at runtime iff the row simultaneously declares it in its contract AND carries it in its payload. Reading either side alone creates a one-sided blind spot: a buggy plugin can shrink the contract while keeping the payload (caught by the contract side), or shrink the payload while reusing the input contract (caught by the payload side). Using the intersection catches both vectors. The payload-side cost is `frozenset(emitted_row.keys())`, which reads the frozen `MappingProxyType` directly — no `deep_thaw` — so the NFR gate (median ≤ 25 µs / P99 ≤ 50 µs on a 200-field row) remains comfortable.
 3. If `divergence_set = input_fields - runtime_observed` is non-empty, raise `PassThroughContractViolation` with the full set of audit fields (transform, node_id, run_id, row_id, token_id, static_contract, runtime_observed, divergence_set, message).
 4. Before raising, increment `pass_through_cross_check_violations_total{transform=...}` — a telemetry counter acquired at `TransformExecutor.__init__`. This is the operational signal SRE sees even when Landscape recording itself fails.
 
@@ -126,7 +132,7 @@ Future ADRs may extend the pattern. This ADR establishes the architectural templ
 ### Negative Consequences
 
 - Per-row overhead on the executor hot path. Bounded by the benchmark gate:
-  median ≤ 25 µs and `q3 + 3×IQR ≤ 50 µs` on a 200-field input row
+  median ≤ 25 µs and P99 ≤ 50 µs on a 200-field input row
   (`tests/performance/benchmarks/test_cross_check_overhead.py`). Only annotated
   transforms run the cross-check.
 - `TIER_1_ERRORS` membership change affects ~40+ `isinstance()` call sites. Verified non-load-bearing by the §Verification grep step: no caller hardcodes the tuple length; all use `isinstance(exc, TIER_1_ERRORS)` which accepts the expanded tuple transparently.

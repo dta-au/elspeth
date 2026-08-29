@@ -37,7 +37,7 @@ The pattern is **established** by Phase 18 (5b)'s `interpretation_events_table` 
 
 **Precedent citation.** The "one new table per event family, closed-enum CHECK on `event_type`, append-only via `BEFORE UPDATE` / `BEFORE DELETE` triggers" pattern is established by Phase 18 (5b). The verifiable artifacts are:
 
-* **Implementation history:** commits `84560da953` and `48b13689da`.
+* **Schema implementation history:** commits `2e390fc0b` and `93c374d63`.
 * **Live schema:** `src/elspeth/web/sessions/models.py:460` (the `interpretation_events_table` definition itself, alongside `proposal_events_table` at line 423).
 * **Live schema:** `src/elspeth/web/sessions/models.py` defines the
   `composer_completion_events_table` alongside the precedent table.
@@ -48,7 +48,7 @@ Phase 6 follows the precedent with one deliberate sharpening: where `interpretat
 
 * This is a schema-change cohort. Sessions DBs at an earlier
   `SESSION_SCHEMA_EPOCH` must be recreated on deployment. The validator
-  (`web/sessions/schema.py:_assert_schema_sentinels`) enforces this by
+  (`src/elspeth/web/sessions/schema.py:_assert_schema_sentinels`) enforces this by
   refusing to start against a stale DB.
 * `SESSION_SCHEMA_EPOCH` bumps from `3` to `4`. Operator runbook (Task 12 / `docs/guides/sharing-pipelines.md`) documents the DB-delete requirement.
 
@@ -180,6 +180,6 @@ The signing key is per-deployment, MUST be ≥32 bytes (HMAC-SHA256's digest siz
 
 ## References
 
-* Phase 6A/6B and interpretation-events implementation history: commits
-  `84560da953` and `48b13689da`
+* Sessions schema and interpretation-events implementation history: commits
+  `2e390fc0b` and `93c374d63`
 * Runbook: [docs/guides/sharing-pipelines.md](../../guides/sharing-pipelines.md)
