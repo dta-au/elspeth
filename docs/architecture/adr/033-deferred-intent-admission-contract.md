@@ -148,10 +148,10 @@ fail-closed at wire confirmation.**
 `_constraint_subject_key` in `deferred_intents.py` resolves a plugin-name
 subject to a stable identity exactly when exactly one reviewed or
 pending-intent component of that kind bears the plugin name. This
-aliasing is retained. It was adversarially verified sound because it is
-the **same resolution rule coverage applies**: at planning time,
-`_DeferredCoverageContext.resolve` in `planning.py` returns ambiguous for
-two or more matches and `constraint_holds` then fails, so a set fused
+aliasing is retained. It was adversarially verified sound because the **same
+resolution rule applies during coverage**: `_DeferredCoverageContext.resolve`
+in `deferred_intents.py` returns ambiguous for two or more matches and
+`constraint_holds` then fails, so a set fused
 at admission under a unique match is genuinely unsatisfiable at
 coverage. The codebase already declines this aliasing for transforms, keeping
 future-transform identities existential; the aliasing applies to sources and
