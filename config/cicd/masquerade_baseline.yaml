@@ -344,15 +344,6 @@ entries:
     via getattr_static, which silently rejected valid forwarding exporters and vanished
     their delivery accounting). Do not re-litigate; do not "harden" back into a Protocol
     check.'
-- path: src/elspeth/web/_aws_ecs_acceptance/contracts.py
-  qualname: check_error_with_cause
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 84ac0f70ebc0855548cd5a90b32fe69ce8d3f27fefe2f9007296d6d9166401e9
-  classification: external-parse
-  justification: Parses the optional Pydantic-style errors() capability from an external
-    exception, filters results to mappings, and projects only safe locations.
 - path: src/elspeth/web/composer/guided/chat_solver.py
   qualname: _admit_deferred_intent_repair_thread
   kind: getattr
