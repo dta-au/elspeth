@@ -698,3 +698,133 @@ def test_compatibility_schema_facts_track_current_epochs() -> None:
     assert facts_a["structural_changes"] == "initial_create"
     assert facts_a["semantics_only_changes"] == "none"
     assert facts_a["archive_export_decision"] == "not_applicable"
+
+
+def _bedrock_receipt_details() -> dict[str, object]:
+    return {
+        "returned_model_sha256": "a" * 64,
+        "provider_request_id_sha256": "b" * 64,
+        "prompt_tokens_present": True,
+        "completion_tokens_present": True,
+        "cache_tokens_present": True,
+        "cost": 0.5,
+        "cost_source": "provider_reported",
+    }
+
+
+def test_bedrock_receipt_details_reject_bool_cost_as_a_number() -> None:
+    """Trust-boundary honesty test for ``_validate_bedrock_receipt_details``."""
+    details = _bedrock_receipt_details()
+    details["cost"] = True
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="exec_receipt_schema"):
+        receipt_contracts._validate_bedrock_receipt_details(details)
+
+
+def test_guardrail_receipt_details_reject_non_list_controls() -> None:
+    """Trust-boundary honesty test for ``_validate_guardrail_receipt_details``."""
+    details = _guardrail_receipt_details()
+    controls = details["controls"]
+    assert isinstance(controls, list)
+    details["controls"] = tuple(controls)
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="exec_receipt_schema"):
+        receipt_contracts._validate_guardrail_receipt_details(details)
+
+
+def test_operator_receipt_details_reject_bool_observed_at() -> None:
+    """Trust-boundary honesty test for ``_validate_operator_receipt_details``."""
+    details = _operator_receipt_details()
+    details["observed_at"] = True
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="exec_receipt_schema"):
+        receipt_contracts._validate_operator_receipt_details(details)
+
+
+@pytest.mark.parametrize("payload", [["not", "a", "mapping"], {"version": 1, "check": "verify-s3"}])
+def test_exec_receipt_schema_rejects_non_dict_and_open_envelopes(payload: object) -> None:
+    """Trust-boundary honesty test for ``_validate_exec_receipt_schema``."""
+    with pytest.raises(acceptance.AcceptanceCheckError, match="exec_receipt_schema"):
+        receipt_contracts._validate_exec_receipt_schema(payload)
+
+
+def test_receipt_value_visit_rejects_forbidden_key() -> None:
+    """Trust-boundary honesty test for ``_visit_receipt_value``."""
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
+        receipt_contracts._visit_receipt_value({"credential": "opaque"}, depth=0, remaining=4096)
+
+
+def test_receipt_value_visit_spends_one_shared_node_budget_across_siblings() -> None:
+    """Regression: the node budget is a whole-document cap, not a per-branch one.
+
+    Each sibling subtree must consume from the same 4096-node budget, so a
+    document that is wide rather than deep is still rejected. A per-branch
+    reset would admit documents the bounded-document contract forbids.
+    """
+    wide = {f"key{index}": [1, 2, 3] for index in range(64)}
+    remaining = receipt_contracts._visit_receipt_value(wide, depth=0, remaining=4096)
+
+    assert remaining == 4096 - (1 + 64 * (1 + 3))
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
+        receipt_contracts._visit_receipt_value(wide, depth=0, remaining=64)
+
+
+def test_bounded_receipt_document_rejects_non_dict_payload() -> None:
+    """Trust-boundary honesty test for ``_validate_bounded_receipt_document``."""
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
+        receipt_contracts._validate_bounded_receipt_document(["not", "a", "document"])
+
+
+def test_receipt_number_rejects_bool_as_a_number() -> None:
+    """Trust-boundary honesty test for ``_receipt_number``."""
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
+        receipt_contracts._receipt_number(True)
+
+
+def test_connection_budget_receipt_rejects_short_point_series() -> None:
+    """Trust-boundary honesty test for ``_validate_connection_budget_receipt``."""
+    payload = _connection_budget_details()
+    points = payload["points"]
+    assert isinstance(points, list)
+    payload["points"] = points[:-1]
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
+        receipt_contracts._validate_connection_budget_receipt(payload)
+
+
+@pytest.mark.parametrize("mutation", ["missing_projection", "non_dict_projection"])
+def test_terraform_receipt_rejects_open_or_non_dict_projection(mutation: str) -> None:
+    """Trust-boundary honesty test for ``_validate_terraform_receipt``."""
+    payload = _terraform_plan_receipt("a" * 64)
+    if mutation == "missing_projection":
+        del payload["projection"]
+    else:
+        payload["projection"] = ["resource_change_count"]
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
+        receipt_contracts._validate_terraform_receipt(
+            payload,
+            kind="terraform-plan",
+            subject_sha256=hashlib.sha256(("a" * 64).encode()).hexdigest(),
+            subject_id=None,
+        )
+
+
+def test_event_canary_receipt_rejects_undelivered_or_unremoved_canary() -> None:
+    """Trust-boundary honesty test for ``_validate_event_canary_receipt``."""
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
+        receipt_contracts._validate_event_canary_receipt({"schema": "elspeth.aws-ecs-event-canary.v1", "delivered": True, "removed": False})
+
+
+def test_compatibility_receipt_rejects_open_field_set() -> None:
+    """Trust-boundary honesty test for ``_validate_compatibility_receipt``."""
+    payload = _compatibility_receipt("A")
+    payload["unreviewed"] = True
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
+        receipt_contracts._validate_compatibility_receipt(
+            payload,
+            scenario_id="A",
+            candidate_sha="c" * 40,
+            subject_id="a" * 64,
+        )

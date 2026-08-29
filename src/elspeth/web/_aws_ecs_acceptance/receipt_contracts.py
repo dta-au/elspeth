@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
@@ -192,6 +193,19 @@ def _validate_s3_receipt_details(details: Mapping[str, object]) -> None:
         raise AcceptanceCheckError("exec_receipt_schema")
 
 
+@trust_boundary(
+    tier=3,
+    source="the verify-bedrock details object decoded from an in-task receipt sentinel or a stored receipt document",
+    source_param="details",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('exec_receipt_schema') before use on any details object whose key set is not "
+        "exactly the bedrock detail fields, whose sha256 or token-presence fields are the wrong type, or whose cost "
+        "is a bool, non-finite, negative, or disagrees with cost_source"
+    ),
+    test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_bedrock_receipt_details_reject_bool_cost_as_a_number"),
+    test_fingerprint="40b556adc5a860e8805cd5f62ac707743d12b05fb48426c697419d7e06a878ab",
+)
 def _validate_bedrock_receipt_details(details: Mapping[str, object]) -> None:
     if set(details) != _BEDROCK_DETAIL_FIELDS:
         raise AcceptanceCheckError("exec_receipt_schema")
@@ -224,6 +238,19 @@ def _validate_textract_receipt_details(details: Mapping[str, object]) -> None:
         raise AcceptanceCheckError("exec_receipt_schema")
 
 
+@trust_boundary(
+    tier=3,
+    source="the verify-bedrock-guardrails details object decoded from an in-task receipt sentinel or a stored receipt document",
+    source_param="details",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('exec_receipt_schema') before use on any details object that is not exactly two "
+        "guardrail controls in the expected plugin order with closed control fields, or whose plugin_policy is not the "
+        "closed tutorial-blocked policy record whose selected controls match the validated aliases"
+    ),
+    test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_guardrail_receipt_details_reject_non_list_controls"),
+    test_fingerprint="b78d040389e935cceade742fa60f012bb387e9b799e53805da7002ab50c2b482",
+)
 def _validate_guardrail_receipt_details(details: Mapping[str, object]) -> None:
     if set(details) != _GUARDRAIL_DETAIL_FIELDS:
         raise AcceptanceCheckError("exec_receipt_schema")
@@ -308,6 +335,19 @@ def _validate_guardrail_receipt_details(details: Mapping[str, object]) -> None:
             raise AcceptanceCheckError("exec_receipt_schema")
 
 
+@trust_boundary(
+    tier=3,
+    source="the verify-operator-telemetry details object decoded from an in-task receipt sentinel or a stored receipt document",
+    source_param="details",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('exec_receipt_schema') before use on any details object whose key set is not the "
+        "closed operator detail fields, whose phase, metric name, trace names, observed_at, resource identity, or "
+        "sentinel hash is wrong, or whose retained metric query and trace id do not match the phase exactly"
+    ),
+    test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_operator_receipt_details_reject_bool_observed_at"),
+    test_fingerprint="45f77a1f40cdd84defd7bbf6c1639965f6931d29c6c20fa8289d3391336af10f",
+)
 def _validate_operator_receipt_details(details: Mapping[str, object]) -> None:
     if set(details) != _OPERATOR_DETAIL_FIELDS:
         raise AcceptanceCheckError("exec_receipt_schema")
@@ -407,6 +447,23 @@ def _validate_operator_receipt_details(details: Mapping[str, object]) -> None:
         raise AcceptanceCheckError("exec_receipt_schema")
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "one closed exec receipt envelope: the base64 payload decoded from Session Manager output by "
+        "extract_exec_receipt, or a stored receipt document read back from the receipt store by manifest and "
+        "_validate_stored_receipt"
+    ),
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('exec_receipt_schema' or 'exec_receipt') before use on any payload that is not a "
+        "dict with exactly the exec receipt fields, a version-1 ok envelope, a known check name, a git candidate sha, "
+        "a sha256 task-arn hash, a well-formed scenario id, and a details dict its per-check validator accepts"
+    ),
+    test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_exec_receipt_schema_rejects_non_dict_and_open_envelopes"),
+    test_fingerprint="a8fa36aef0fcf1ef09016ec8f411c61ec7a87eb34956a19f67c70b19a1e82488",
+)
 def _validate_exec_receipt_schema(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict) or set(payload) != _EXEC_RECEIPT_FIELDS:
         raise AcceptanceCheckError("exec_receipt_schema")
@@ -449,6 +506,19 @@ def _validate_exec_receipt_schema(payload: object) -> dict[str, object]:
     return payload
 
 
+@trust_boundary(
+    tier=3,
+    source="the container process environment, and the ECS task-local v4 metadata document its ECS_CONTAINER_METADATA_URI_V4 names",
+    source_param="env",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('exec_receipt_binding') before use when the environment already carries a "
+        "caller-supplied task ARN, when ECS_CONTAINER_METADATA_URI_V4 is not the exact link-local v4 metadata origin, "
+        "or when the metadata response is not a 200 under 64 KiB whose TaskARN is a well-formed ECS task ARN"
+    ),
+    test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_exec_receipt_binding_rejects_non_ecs_metadata_origins"),
+    test_fingerprint="24aac39d889e633e8990f3d3d19867d1d0550b732a35226deedc93a4d0fc5dd1",
+)
 def resolve_exec_receipt_env(
     env: Mapping[str, str],
     *,
@@ -488,17 +558,17 @@ def resolve_exec_receipt_env(
             if response.status_code != 200 or len(content) > 64 * 1024:
                 raise AcceptanceCheckError("exec_receipt_binding")
         payload = json.loads(content)
+        task_arn = payload.get("TaskARN") if isinstance(payload, Mapping) else None
+        if (
+            type(task_arn) is not str
+            or len(task_arn) > 2048
+            or re.fullmatch(r"arn:aws(?:-us-gov|-cn)?:ecs:[a-z0-9-]+:[0-9]{12}:task/[A-Za-z0-9/_-]+", task_arn) is None
+        ):
+            raise AcceptanceCheckError("exec_receipt_binding")
     except AcceptanceCheckError:
         raise
     except (httpx.HTTPError, json.JSONDecodeError, UnicodeDecodeError):
         raise AcceptanceCheckError("exec_receipt_binding") from None
-    task_arn = payload.get("TaskARN") if isinstance(payload, Mapping) else None
-    if (
-        type(task_arn) is not str
-        or len(task_arn) > 2048
-        or re.fullmatch(r"arn:aws(?:-us-gov|-cn)?:ecs:[a-z0-9-]+:[0-9]{12}:task/[A-Za-z0-9/_-]+", task_arn) is None
-    ):
-        raise AcceptanceCheckError("exec_receipt_binding")
     resolved["ELSPETH_ACCEPTANCE_TASK_ARN"] = task_arn
     return resolved
 
@@ -506,9 +576,13 @@ def resolve_exec_receipt_env(
 def encode_exec_receipt(check: str, details: Mapping[str, object], env: Mapping[str, str]) -> str:
     """Encode one closed in-task receipt without exposing its task ARN."""
 
-    candidate_sha = env.get("ELSPETH_ACCEPTANCE_CANDIDATE_SHA", "")
-    task_arn = env.get("ELSPETH_ACCEPTANCE_TASK_ARN", "")
-    scenario_id = env.get("ELSPETH_ACCEPTANCE_SCENARIO_ID", "")
+    if any(
+        name not in env for name in ("ELSPETH_ACCEPTANCE_CANDIDATE_SHA", "ELSPETH_ACCEPTANCE_TASK_ARN", "ELSPETH_ACCEPTANCE_SCENARIO_ID")
+    ):
+        raise AcceptanceCheckError("exec_receipt_binding")
+    candidate_sha = env["ELSPETH_ACCEPTANCE_CANDIDATE_SHA"]
+    task_arn = env["ELSPETH_ACCEPTANCE_TASK_ARN"]
+    scenario_id = env["ELSPETH_ACCEPTANCE_SCENARIO_ID"]
     if _GIT_SHA_PATTERN.fullmatch(candidate_sha) is None:
         raise AcceptanceCheckError("exec_receipt_binding")
     if not task_arn.startswith("arn:aws") or len(task_arn) > 2048 or any(ord(char) < 32 or ord(char) == 127 for char in task_arn):
@@ -603,43 +677,87 @@ _FORBIDDEN_RECEIPT_KEYS = frozenset(
 )
 
 
+@trust_boundary(
+    tier=3,
+    source="one node of an untrusted receipt document read back from the acceptance receipt store",
+    source_param="value",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('receipt_store_schema') before use on any container over its size limit, any key "
+        "that is not a bounded safe identifier or that names forbidden or raw content, any control-character or "
+        "oversized string, and any non-JSON or non-finite scalar; the same error also rejects a node that exhausts "
+        "the caller's whole-document node budget or exceeds the depth limit"
+    ),
+    test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_receipt_value_visit_rejects_forbidden_key"),
+    test_fingerprint="a173e99eda87d962aa77fa64ae6e9de976ffbfc7d3e3678c282f697aaa95ded4",
+)
+def _visit_receipt_value(value: object, *, depth: int, remaining: int) -> int:
+    """Admit one receipt node and return the node budget left after it.
+
+    The budget is threaded, not reset: every recursive call consumes from and
+    returns the caller's remaining count, so the 4096 cap stays a whole-document
+    node cap rather than a per-branch one.
+    """
+
+    remaining -= 1
+    if remaining < 0 or depth > 8:
+        raise AcceptanceCheckError("receipt_store_schema")
+    if isinstance(value, dict):
+        if len(value) > 256:
+            raise AcceptanceCheckError("receipt_store_schema")
+        for key, child in value.items():
+            if (
+                type(key) is not str
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", key) is None
+                or key.lower() in _FORBIDDEN_RECEIPT_KEYS
+                or key.lower().endswith("_raw")
+            ):
+                raise AcceptanceCheckError("receipt_store_schema")
+            remaining = _visit_receipt_value(child, depth=depth + 1, remaining=remaining)
+    elif isinstance(value, list):
+        if len(value) > 1024:
+            raise AcceptanceCheckError("receipt_store_schema")
+        for child in value:
+            remaining = _visit_receipt_value(child, depth=depth + 1, remaining=remaining)
+    elif isinstance(value, str):
+        if len(value) > 16 * 1024 or any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise AcceptanceCheckError("receipt_store_schema")
+    elif (value is not None and not isinstance(value, (bool, int, float))) or (isinstance(value, float) and not math.isfinite(value)):
+        raise AcceptanceCheckError("receipt_store_schema")
+    return remaining
+
+
+@trust_boundary(
+    tier=3,
+    source="a whole receipt document read back from the acceptance receipt store or the orphan-sweep inventory",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('receipt_store_schema') before use when the payload is not a dict, or when any "
+        "node beneath it fails the bounded-document admission the traversal enforces"
+    ),
+    test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_bounded_receipt_document_rejects_non_dict_payload"),
+    test_fingerprint="5687a5689ddad1424f50bcdbcc173c5f46a4cfcc2be82ae1dba3b8b7ff39c470",
+)
 def _validate_bounded_receipt_document(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise AcceptanceCheckError("receipt_store_schema")
-    remaining = 4096
-
-    def visit(value: object, depth: int) -> None:
-        nonlocal remaining
-        remaining -= 1
-        if remaining < 0 or depth > 8:
-            raise AcceptanceCheckError("receipt_store_schema")
-        if isinstance(value, dict):
-            if len(value) > 256:
-                raise AcceptanceCheckError("receipt_store_schema")
-            for key, child in value.items():
-                if (
-                    type(key) is not str
-                    or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", key) is None
-                    or key.lower() in _FORBIDDEN_RECEIPT_KEYS
-                    or key.lower().endswith("_raw")
-                ):
-                    raise AcceptanceCheckError("receipt_store_schema")
-                visit(child, depth + 1)
-        elif isinstance(value, list):
-            if len(value) > 1024:
-                raise AcceptanceCheckError("receipt_store_schema")
-            for child in value:
-                visit(child, depth + 1)
-        elif isinstance(value, str):
-            if len(value) > 16 * 1024 or any(ord(character) < 32 or ord(character) == 127 for character in value):
-                raise AcceptanceCheckError("receipt_store_schema")
-        elif (value is not None and not isinstance(value, (bool, int, float))) or (isinstance(value, float) and not math.isfinite(value)):
-            raise AcceptanceCheckError("receipt_store_schema")
-
-    visit(payload, 0)
+    _visit_receipt_value(payload, depth=0, remaining=4096)
     return payload
 
 
+@trust_boundary(
+    tier=3,
+    source="one numeric field of an untrusted connection-budget receipt read back from the acceptance receipt store",
+    source_param="value",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('receipt_store_schema') before use on a bool, a non-real value, a non-finite "
+        "float, or a negative number; returns an owned float otherwise"
+    ),
+    test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_receipt_number_rejects_bool_as_a_number"),
+    test_fingerprint="72ff8815d1351ec4322f0a795e2a9716a86f9fd42e370c407d36deb103231434",
+)
 def _receipt_number(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0:
         raise AcceptanceCheckError("receipt_store_schema")
@@ -652,6 +770,23 @@ def _receipt_nonnegative_integer(value: object) -> int:
     return value
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "an untrusted RDS connection-budget receipt: the verify-connection-budget details decoded from a receipt "
+        "sentinel, or the stored receipt document"
+    ),
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('receipt_store_schema' or 'receipt_store_binding') before use unless the payload "
+        "is a dict with exactly the v3 budget fields, sha256 run and cluster identities matching the expected "
+        "bindings, a minute-aligned ten-point window whose observed timestamps are exactly the expected ones, and a "
+        "high-water reading that is the maximum observed count and within the approved budget and safety margin"
+    ),
+    test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_connection_budget_receipt_rejects_short_point_series"),
+    test_fingerprint="210a5bd14ed97aa09a5a04d82fc3044f068db3dfbbb2f1094003770f6976993e",
+)
 def _validate_connection_budget_receipt(
     payload: object,
     *,
@@ -724,6 +859,20 @@ def _validate_connection_budget_receipt(
     return payload
 
 
+@trust_boundary(
+    tier=3,
+    source="an untrusted sanitized Terraform plan-evidence receipt read back from the acceptance receipt store",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('receipt_store_schema' or 'receipt_store_binding') before use unless the payload "
+        "is a dict with exactly the sanitized-evidence fields, the plan sha256 hashes to the subject the caller "
+        "demanded, and the projection is the closed counter set whose bounded counts, delete and replace flags, and "
+        "no-op expectation for the requested kind all agree"
+    ),
+    test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_terraform_receipt_rejects_open_or_non_dict_projection"),
+    test_fingerprint="ce35e1e56a32200c82bdc388f378538e1c8ba4c2c45ffab0c68377f6c0b3df29",
+)
 def _validate_terraform_receipt(
     payload: object,
     *,
@@ -777,6 +926,20 @@ def _validate_terraform_receipt(
     return payload
 
 
+@trust_boundary(
+    tier=3,
+    source="an untrusted deployment-event canary receipt read back from the acceptance receipt store",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('receipt_store_schema') before use unless the payload is a dict equal to the one "
+        "canary document that attests both delivery and removal"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_event_canary_receipt_rejects_undelivered_or_unremoved_canary"
+    ),
+    test_fingerprint="450388d1e545caaaf1c6aab6aef378bcf6afecd1b08e19c187a5a7d15be00d7d",
+)
 def _validate_event_canary_receipt(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict) or payload != {
         "schema": "elspeth.aws-ecs-event-canary.v1",
@@ -787,6 +950,20 @@ def _validate_event_canary_receipt(payload: object) -> dict[str, object]:
     return payload
 
 
+@trust_boundary(
+    tier=3,
+    source="an untrusted forward/backward compatibility receipt read back from the acceptance receipt store",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('receipt_store_schema' or 'receipt_store_binding') before use unless the payload "
+        "is a dict with exactly the v2 compatibility fields bound to the caller's record hash, scenario, and candidate "
+        "sha, carries the rollback identity the scenario demands and no other, and attests exactly the truthful "
+        "release and schema-epoch facts this build derives"
+    ),
+    test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_compatibility_receipt_rejects_open_field_set"),
+    test_fingerprint="c88526cfd7860bc509d5e173514fcc2858128e9131c7b47aa1ebe69be348323d",
+)
 def _validate_compatibility_receipt(
     payload: object,
     *,
