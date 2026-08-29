@@ -30,8 +30,26 @@ last ran.
 
 ### Approved tooling
 
-Three tools carry standing agent instructions in `AGENTS.md`: one
-first-party, two third-party.
+Beneath everything sits the baseline Python toolchain, and above it three
+tools carry standing agent instructions in `AGENTS.md`: one first-party,
+two third-party.
+
+**Baseline toolchain — ruff and mypy** (with `uv`, `pytest`, and
+`pre-commit` as their carriers). Both are pinned as dev dependencies in
+`pyproject.toml` (`ruff==0.15.4`, `mypy>=1.20,<2`) and configured there
+only: `[tool.ruff]` (target `py313`, line length 140, `src`/`tests`/
+`elspeth-lints/src` roots, lint-rule test fixtures excluded so ruff cannot
+"fix" a deliberately malformed fixture) and `[tool.mypy]` (`strict = true`,
+`warn_unreachable`, `warn_unused_ignores`, the pydantic plugin, fixtures and
+`examples/` excluded). They run in three places that must agree: the
+`ruff` / `ruff-format --check` / `mypy` pre-commit hooks on changed files
+(check-only — hooks never rewrite files), CI's lint job
+(`ruff check` and `ruff format --check` over `src/ tests/ scripts/ examples/
+elspeth-lints/src/`; `mypy src/ elspeth-lints/src/`), and by hand from the
+venv. They are the generic layer: anything ELSPETH-specific that ruff or
+mypy cannot express is an elspeth-lints rule, not a ruff plugin, a mypy
+plugin, or another tool. Adding a third-party linter, formatter, or type
+checker alongside them is covered by the exclusion rule below.
 
 **elspeth-lints** (first-party) — the project's own static-analysis and gate
 platform, an internal monorepo package at `elspeth-lints/` (not a PyPI
