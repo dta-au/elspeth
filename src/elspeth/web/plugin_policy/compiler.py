@@ -49,8 +49,12 @@ class PluginRegistry(Protocol):
     def get_sinks(self) -> Sequence[type]: ...
 
 
+def _policy_error(reason: str) -> ValueError:
+    return ValueError(f"web plugin policy invalid: {reason}")
+
+
 def _fail(reason: str) -> NoReturn:
-    raise ValueError(f"web plugin policy invalid: {reason}")
+    raise _policy_error(reason)
 
 
 def _admit_registry_category(
@@ -80,8 +84,8 @@ def _parse_unique(raw_values: Iterable[str]) -> tuple[PluginId, ...]:
     for raw in raw_values:
         try:
             plugin_id = PluginId.parse(raw)
-        except ValueError:
-            _fail("invalid_plugin_id")
+        except ValueError as exc:
+            raise _policy_error("invalid_plugin_id") from exc
         if plugin_id in seen:
             _fail("duplicate_plugin_id")
         seen.add(plugin_id)
@@ -92,9 +96,14 @@ def _parse_unique(raw_values: Iterable[str]) -> tuple[PluginId, ...]:
 def _validate_identity(plugin_cls: type[_PluginClass]) -> tuple[str, str]:
     version = plugin_cls.plugin_version
     source_hash = plugin_cls.source_file_hash
-    if not isinstance(version, str) or version == "0.0.0" or _VERSION.fullmatch(version) is None:
+    # Exact-type admission: ``plugin_version``/``source_file_hash`` are declared
+    # ``str`` / ``str | None`` on the plugin base classes, so a registry entry
+    # carrying anything else is a plugin-contract violation this gate refuses
+    # rather than coerces. Exact ``type(...) is str`` also refuses a ``str``
+    # subclass whose ``fullmatch`` input could differ from its own value.
+    if type(version) is not str or version == "0.0.0" or _VERSION.fullmatch(version) is None:
         _fail("invalid_plugin_version")
-    if not isinstance(source_hash, str) or _SOURCE_HASH.fullmatch(source_hash) is None:
+    if type(source_hash) is not str or _SOURCE_HASH.fullmatch(source_hash) is None:
         _fail("invalid_plugin_source_hash")
     return version, source_hash
 
@@ -120,7 +129,11 @@ def compile_web_plugin_policy(*, registry: PluginRegistry, settings: RuntimeWebP
         if not plugin_cls.check_web_local_requirements():
             _fail("plugin_unavailable")
         declarations = plugin_cls.policy_capabilities
-        if not isinstance(declarations, frozenset) or any(not isinstance(item, CapabilityDeclaration) for item in declarations):
+        # ``policy_capabilities`` is declared ``frozenset[CapabilityDeclaration]``
+        # on every plugin base class and ``CapabilityDeclaration`` is a frozen
+        # owned dataclass with no subclasses, so exact types are the whole
+        # admitted set — a look-alike declaration never reaches ``implementations``.
+        if type(declarations) is not frozenset or any(type(item) is not CapabilityDeclaration for item in declarations):
             _fail("invalid_capability_declaration")
         for declaration in declarations:
             implementations[declaration.capability].add(plugin_id)

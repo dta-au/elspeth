@@ -185,6 +185,42 @@ def test_llm_public_schema_rejects_malformed_defs_shape() -> None:
             available_aliases=("tutorial",),
         )
 
+    # A discriminator that names a $defs entry the schema does not carry is the
+    # same deviation and raises identically: the ABSENT-key read is not a softer
+    # path into the exposure decision.
+    dangling_ref = PluginSchemaInfo(
+        name="llm",
+        plugin_type="transform",
+        description="test schema",
+        json_schema={
+            "type": "object",
+            "properties": {},
+            "discriminator": {"propertyName": "provider", "mapping": {"bedrock": "#/$defs/BedrockConfig"}},
+        },
+        knob_schema={"fields": []},
+        web_config_authority=WebConfigAuthority.OPERATOR_PROFILED,
+    )
+    with pytest.raises(ValueError, match="malformed_profile_schema"):
+        profiles.public_schema(PluginId("transform", "llm"), full_schema=dangling_ref, available_aliases=("tutorial",))
+
+    # With NEITHER $defs nor discriminator there is no variant to read, and the
+    # projection collapses to the operator-approved alias alone. That is the
+    # closed direction: an absent key can only ever narrow this public schema,
+    # never admit a provider field the union never declared.
+    empty = PluginSchemaInfo(
+        name="llm",
+        plugin_type="transform",
+        description="test schema",
+        json_schema={"type": "object"},
+        knob_schema={"fields": []},
+        web_config_authority=WebConfigAuthority.OPERATOR_PROFILED,
+    )
+    projected = profiles.public_schema(PluginId("transform", "llm"), full_schema=empty, available_aliases=("tutorial",))
+    assert set(projected.json_schema["properties"]) == {"profile"}
+    assert projected.json_schema["required"] == ["profile"]
+    assert projected.json_schema["additionalProperties"] is False
+    assert "$defs" not in projected.json_schema
+
 
 def test_runtime_conversion_is_frozen_and_canonical() -> None:
     settings = _settings(
@@ -488,6 +524,19 @@ def test_textract_public_schema_rejects_non_mapping_properties() -> None:
     with pytest.raises(ValueError, match="malformed_profile_schema"):
         registry.public_schema(plugin_id, full_schema=malformed, available_aliases=("acceptance-docs",))
 
+    # An ABSENT "properties" is refused identically: the profiled-author option
+    # set is read by name, so an absent key narrows nothing and admits nothing.
+    absent = PluginSchemaInfo(
+        name="aws_textract_document_analysis",
+        plugin_type="transform",
+        description="test schema",
+        json_schema={"type": "object"},
+        knob_schema={"fields": []},
+        web_config_authority=WebConfigAuthority.OPERATOR_PROFILED,
+    )
+    with pytest.raises(ValueError, match="malformed_profile_schema"):
+        registry.public_schema(plugin_id, full_schema=absent, available_aliases=("acceptance-docs",))
+
 
 def test_s3_source_profile_constrains_bucket_prefix_region_and_auth() -> None:
     settings = _settings(
@@ -639,6 +688,20 @@ def test_s3_public_schema_rejects_non_mapping_properties() -> None:
 
     with pytest.raises(ValueError, match="malformed_profile_schema"):
         registry.public_schema(PluginId("source", "aws_s3"), full_schema=malformed, available_aliases=("demo-input",))
+
+    # An ABSENT "properties" is the same rejection, not a softer path: the
+    # profiled-author option set is read by name, so a schema that carries none
+    # of those names cannot be projected and is refused rather than narrowed.
+    absent = PluginSchemaInfo(
+        name="aws_s3",
+        plugin_type="source",
+        description="test schema",
+        json_schema={"type": "object"},
+        knob_schema={"fields": []},
+        web_config_authority=WebConfigAuthority.OPERATOR_PROFILED,
+    )
+    with pytest.raises(ValueError, match="malformed_profile_schema"):
+        registry.public_schema(PluginId("source", "aws_s3"), full_schema=absent, available_aliases=("demo-input",))
 
 
 @pytest.mark.parametrize("key", ["/secret.csv", "C:/secret.csv", "s3://other-bucket/secret.csv", "records/../secret.csv"])
@@ -1095,6 +1158,21 @@ def test_bedrock_public_schema_rejects_non_mapping_properties() -> None:
 
     with pytest.raises(ValueError, match="malformed_profile_schema"):
         registry.public_schema(plugin_id, full_schema=malformed, available_aliases=("prompt-default",))
+
+    # An ABSENT "properties" reaches the same rejection rather than emitting the
+    # internally-inconsistent schema this test exists to prevent: 'fields' and
+    # 'schema' are always required, so a schema that declares neither cannot be
+    # projected into a satisfiable public one.
+    absent = PluginSchemaInfo(
+        name="aws_bedrock_prompt_shield",
+        plugin_type="transform",
+        description="test schema",
+        json_schema={"type": "object"},
+        knob_schema={"fields": []},
+        web_config_authority=WebConfigAuthority.OPERATOR_PROFILED,
+    )
+    with pytest.raises(ValueError, match="malformed_profile_schema"):
+        registry.public_schema(plugin_id, full_schema=absent, available_aliases=("prompt-default",))
 
 
 def test_bedrock_profile_resolver_returns_only_an_authorized_exact_approved_binding() -> None:

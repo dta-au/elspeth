@@ -8,6 +8,40 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — the tier-model boundary walk loses `source_param` derivation
+  through a BRANCHED assignment, not through `tuple(...)`.** Measured on B54
+  with the rule's own `scan_file`. A name assigned in an `if`/`elif` (even when
+  every branch's RHS mentions the boundary parameter) is NOT derived afterwards,
+  so every `.get()`/`isinstance` on it, on its loop targets, and on anything
+  further downstream re-appears as R1/R5 despite the decorator. The SAME
+  expression written as one assignment keeps the trail — including through
+  `tuple(x.values())`, later `tuple(view.values())` hops, plain `for` targets,
+  and generator-expression targets:
+
+  ```python
+  # trail LOST for `definitions` and everything read off it
+  if isinstance(queries, Mapping):
+      definitions = tuple(queries.values())
+  elif isinstance(queries, Sequence) and not isinstance(queries, (str, bytes)):
+      definitions = tuple(queries)
+  else:
+      return _unprovable()
+
+  # trail KEPT — guard first, then ONE assignment
+  if not isinstance(queries, (Mapping, Sequence)) or isinstance(queries, (str, bytes)):
+      return _unprovable()
+  definitions = tuple(queries.values()) if isinstance(queries, Mapping) else tuple(queries)
+  ```
+
+  So when a boundary-decorated function still reports findings, hoist the
+  refusal into a guard and collapse the binding to one expression before
+  reaching for a rationale. Confirm from the `R_TB_SUPPRESSED` lines in the
+  after-corpus, never by reading the decorator. Two other trail-losers
+  re-confirmed here: a value bound from a helper call (`_stable_source_items(state)`,
+  `_upstream_producers(node, graph)`) is never rooted at any `source_param`, so
+  a Tier-3 parse that must be suppressed has to live in a function that takes
+  the untrusted mapping AS its `source_param` (B54 extracted
+  `coverage._declared_scan_scopes(options)` for exactly that).
 - **2026-08-29 — the `deep_freeze` trap is NOT limited to composition state:
   `ToolResult.data` is frozen too, and tracing a value's PRODUCERS is not a
   valid check.** B43b shipped a real regression this way, caught only by

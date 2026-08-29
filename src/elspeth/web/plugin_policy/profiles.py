@@ -31,7 +31,7 @@ from elspeth.contracts.aws_textract import (
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.core.llm_profiles import (
     LLM_PROFILE_PRIVATE_FIELDS,
@@ -252,17 +252,20 @@ class _LLMProfileResolver:
         tier=3,
         source="PluginSchemaInfo.json_schema for an LLM plugin: a pydantic-discriminated-union JSON Schema whose $defs/discriminator/properties shape is generated from plugin-author-owned provider config models",
         source_param="full_schema",
-        suppresses=("R5",),
+        suppresses=("R1", "R5"),
         invariant=(
             "raises ValueError('malformed_profile_schema') when $defs, discriminator, discriminator['mapping'], a "
             "mapped provider definition, its properties, or its required list deviates from the pydantic-generated "
             "discriminated-union shape (dict / list[str]) — the section that decides public-vs-LLM_PROFILE_PRIVATE_FIELDS "
             "exposure never silently narrows there. The downstream $ref-closure walk that assembles public $defs, and "
             "the source knob-field projection, are unchanged pre-existing best-effort behaviour and are not covered "
-            "by this invariant."
+            "by this invariant. An ABSENT key is not a softer path into the exposure decision: a discriminator "
+            "naming a $defs entry the schema does not carry raises, and with neither $defs nor discriminator the "
+            "projection collapses to the operator-approved 'profile' alias alone — an absent key can only narrow "
+            "this public schema, never admit a provider field the union did not declare."
         ),
         test_ref="tests/unit/web/plugin_policy/test_profiles.py::test_llm_public_schema_rejects_malformed_defs_shape",
-        test_fingerprint="f928c6402915f48bb128fb96c52cdfeb92158270a966f155555f0d4d163013c7",
+        test_fingerprint="607c1d68c9a2b0168d5172e35bb81bd5b514e0cb59ae4bcd945f5068ced0c577",
     )
     def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
         from elspeth.web.catalog.schemas import PluginSchemaInfo
@@ -293,11 +296,20 @@ class _LLMProfileResolver:
                     continue
                 if not isinstance(property_schema, dict):
                     raise ValueError("malformed_profile_schema")
-                safe_properties.setdefault(name, deepcopy(property_schema))
+                # First variant wins: the union's variants share these public
+                # property names and the projection publishes one shape for each.
+                if name not in safe_properties:
+                    safe_properties[name] = deepcopy(property_schema)
         required_by_variant: list[set[str]] = []
         for definition in provider_definitions:
-            required_names = definition.get("required", ())
-            if not isinstance(required_names, list) or any(not isinstance(name, str) for name in required_names):
+            # An absent "required" is itself a shape deviation, not "nothing is
+            # required": every pydantic-generated variant of a discriminated
+            # union carries one, so its absence means the schema did not come
+            # from the declared source and the exposure decision below cannot be
+            # made from it. ``list``/``str`` are exact because the schema is
+            # json/pydantic-generated, never a subclass or a frozen container.
+            required_names = definition["required"] if "required" in definition else None
+            if type(required_names) is not list or any(type(name) is not str for name in required_names):
                 raise ValueError("malformed_profile_schema")
             required_by_variant.append(set(required_names))
         required_in_all_variants = set.intersection(*required_by_variant) if required_by_variant else set()
@@ -341,8 +353,8 @@ class _LLMProfileResolver:
             raw_fields = full_schema.knob_schema.get("fields", ())
             first_raw_field: dict[str, dict[str, Any]] = {}
             for field in raw_fields:
-                if isinstance(field, dict) and isinstance(field.get("name"), str):
-                    first_raw_field.setdefault(field["name"], field)
+                if isinstance(field, dict) and isinstance(field.get("name"), str) and field["name"] not in first_raw_field:
+                    first_raw_field[field["name"]] = field
             fields: list[dict[str, Any]] = [
                 {
                     "name": "profile",
@@ -361,7 +373,8 @@ class _LLMProfileResolver:
                     field = deepcopy(first_raw_field[name])
                 except KeyError as exc:
                     raise ValueError(f"source profile field {name!r} has no canonical knob projection") from exc
-                field.pop("visible_when", None)
+                if "visible_when" in field:
+                    del field["visible_when"]
                 fields.append(field)
         else:
             # Keep the established transform policy-view projection
@@ -370,12 +383,14 @@ class _LLMProfileResolver:
             fields = [
                 {
                     "name": name,
-                    "type": "string" if name == "profile" else str(schema.get("type", "object")),
+                    "type": "string" if name == "profile" else str(schema["type"] if "type" in schema else "object"),
                     "required": name in public_json_schema["required"],
                     # The composer-surface help text substitutes the CLI/YAML
                     # description on web knobs (mirrors
-                    # web/catalog/knob_schema._composer_description).
-                    "description": schema.get("composer_description") or schema.get("description"),
+                    # web/catalog/knob_schema._composer_description); a present
+                    # but empty composer_description falls through to description.
+                    "description": (schema["composer_description"] if "composer_description" in schema else None)
+                    or (schema["description"] if "description" in schema else None),
                     **({"choices": list(available_aliases)} if name == "profile" else {}),
                 }
                 for name, schema in safe_properties.items()
@@ -408,7 +423,12 @@ class _LLMProfileResolver:
         # lowered config's one-hour default would monopolise a worker. The
         # operator-profile layer supplies the web-safe default so typed
         # multi-query nodes stay both committable and run-safe.
-        if executable.get("queries") is not None and "pool_size" not in executable and "max_capacity_retry_seconds" not in executable:
+        if (
+            "queries" in executable
+            and executable["queries"] is not None
+            and "pool_size" not in executable
+            and "max_capacity_retry_seconds" not in executable
+        ):
             from elspeth.web.provider_config_policy import WEB_LLM_SEQUENTIAL_MULTI_QUERY_MAX_RETRY_SECONDS
 
             executable["max_capacity_retry_seconds"] = WEB_LLM_SEQUENTIAL_MULTI_QUERY_MAX_RETRY_SECONDS
@@ -504,14 +524,15 @@ class _BedrockGuardrailProfileResolver:
         tier=3,
         source="PluginSchemaInfo.json_schema for a Bedrock Guardrail plugin: a plugin-author-owned JSON Schema whose properties shape is generated from the plugin's config model",
         source_param="full_schema",
-        suppresses=("R5",),
+        suppresses=("R1", "R5"),
         invariant=(
             "raises ValueError('malformed_profile_schema') if full_schema.json_schema['properties'] is not a mapping, "
             "or if the always-required 'fields'/'schema' properties are present but not mappings — never emits a "
-            "'required' list naming a property absent from 'properties', which would be an unsatisfiable schema"
+            "'required' list naming a property absent from 'properties', which would be an unsatisfiable schema. "
+            "An ABSENT 'properties' reaches that same rejection, because 'fields'/'schema' are always required"
         ),
         test_ref="tests/unit/web/plugin_policy/test_profiles.py::test_bedrock_public_schema_rejects_non_mapping_properties",
-        test_fingerprint="82d3df90d265a3917b84b2d81fee12f51901c7a4d02e3e520f18802acdefdf02",
+        test_fingerprint="629473a1e9f8d1697fa7861f5ca3f2e71a679a85875e2e4be6d1dde2f2b1033b",
     )
     def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
         from elspeth.web.catalog.schemas import PluginSchemaInfo
@@ -559,11 +580,13 @@ class _BedrockGuardrailProfileResolver:
         fields = [
             {
                 "name": name,
-                "type": "string" if name == "profile" else str(schema.get("type", "object")),
+                "type": "string" if name == "profile" else str(schema["type"] if "type" in schema else "object"),
                 "required": name in required,
                 # Mirrors the LLM profile lowering above: composer-surface help
-                # text substitutes the CLI/YAML description on web knobs.
-                "description": schema.get("composer_description") or schema.get("description"),
+                # text substitutes the CLI/YAML description on web knobs, and a
+                # present but empty composer_description falls through.
+                "description": (schema["composer_description"] if "composer_description" in schema else None)
+                or (schema["description"] if "description" in schema else None),
                 **({"choices": list(available_aliases)} if name == "profile" else {}),
             }
             for name, schema in safe_properties.items()
@@ -636,8 +659,7 @@ class _BedrockGuardrailProfileResolver:
         return tuple(result)
 
     def check_local_requirements(self, alias: str) -> LocalRequirementResult:
-        profile = self._profiles.get(alias)
-        if profile is None or not profile.check_local_requirements().available:
+        if alias not in self._profiles or not self._profiles[alias].check_local_requirements().available:
             return LocalRequirementResult(available=False, reason=ProfileUnavailableReason.LOCAL_REQUIREMENT_MISSING)
         return LocalRequirementResult(available=True)
 
@@ -667,14 +689,18 @@ class _S3SourceProfileResolver:
         tier=3,
         source="PluginSchemaInfo.json_schema for the aws_s3 source plugin: a plugin-author-owned JSON Schema whose properties shape is generated from the plugin's config model",
         source_param="full_schema",
-        suppresses=("R5",),
+        suppresses=("R1", "R5"),
         invariant=(
             "raises ValueError('malformed_profile_schema') if full_schema.json_schema['properties'] is not a "
             "mapping or if any S3_PROFILED_AUTHOR_OPTION_NAMES entry is present but not a mapping; never silently "
-            "narrows the profiled-author-visible option set"
+            "narrows the profiled-author-visible option set. An ABSENT key is not a softer path into that set: "
+            "'properties' absent reaches the same rejection because every profiled-author option is read by name, "
+            "an absent knob 'fields' list reaches it through the canonical-projection lookup, an absent 'required' "
+            "carries JSON Schema's own 'nothing is required', and an absent '$defs' is reachable only for a schema "
+            "carrying no $ref, since the declared pydantic-generated source never emits one without the other"
         ),
         test_ref="tests/unit/web/plugin_policy/test_profiles.py::test_s3_public_schema_rejects_non_mapping_properties",
-        test_fingerprint="6f9badc98dd0792eff53aec2be28faf9c37559b33a1eb53e57971e0db540a54b",
+        test_fingerprint="5d4be073e45335f7ec4883ab4c3e6d0ead594be3879bde781f6428b97760a761",
     )
     def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
         from elspeth.web.catalog.schemas import PluginSchemaInfo
@@ -780,7 +806,7 @@ class _S3SourceProfileResolver:
             raise ValueError("private_profile_option")
         if set(safe_options) - set(S3_PROFILED_AUTHOR_OPTION_NAMES):
             raise ValueError("private_profile_option")
-        relative_key = safe_options.get("key")
+        relative_key = safe_options["key"] if "key" in safe_options else None
         if type(relative_key) is not str:
             raise ValueError("unsafe_s3_object_key")
         try:
@@ -856,14 +882,19 @@ class _TextractProfileResolver:
         tier=3,
         source="PluginSchemaInfo.json_schema for the aws_textract_document_analysis transform plugin: a plugin-author-owned JSON Schema whose properties shape is generated from the plugin's config model",
         source_param="full_schema",
-        suppresses=("R5",),
+        suppresses=("R1", "R5"),
         invariant=(
             "raises ValueError('malformed_profile_schema') if full_schema.json_schema['properties'] is not a "
             "mapping or if any TEXTRACT_PROFILED_AUTHOR_OPTION_NAMES entry is present but not a mapping; never "
-            "silently narrows the profiled-author-visible option set"
+            "silently narrows the profiled-author-visible option set. An ABSENT key is not a softer path into that "
+            "set: 'properties' absent reaches the same rejection because every profiled-author option is read by "
+            "name, an absent knob 'fields' list reaches it through the canonical-projection lookup, an absent "
+            "'required' carries JSON Schema's own 'nothing is required', and an absent '$defs' is reachable only "
+            "for a schema carrying no $ref, since the declared pydantic-generated source never emits one without "
+            "the other"
         ),
         test_ref="tests/unit/web/plugin_policy/test_profiles.py::test_textract_public_schema_rejects_non_mapping_properties",
-        test_fingerprint="dc39b7f294827d1d0246039a501cc9ba37632d557507d59bd08d95b2756ed9da",
+        test_fingerprint="9f2da2dcb0d7727bcaa893abb5aba4663bfd75f5e4661d1b60756bddfa050b94",
     )
     def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
         from elspeth.web.catalog.schemas import PluginSchemaInfo
@@ -1019,6 +1050,16 @@ class _TextractProfileResolver:
         return usable_aliases[0] if len(usable_aliases) == 1 else None
 
 
+@observation_boundary(
+    tier=3,
+    source="a node of a plugin-author-owned JSON Schema (PluginSchemaInfo.json_schema) being walked for $defs references",
+    source_param="value",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns only the '#/$defs/<name>' references it can prove present; any non-mapping, non-list, or "
+        "non-string $ref contributes nothing and is never coerced. Never raises on a malformed schema node"
+    ),
+)
 def _schema_refs(value: object) -> set[str]:
     refs: set[str] = set()
     if isinstance(value, dict):
@@ -1057,7 +1098,7 @@ class OperatorProfileRegistry:
             if plugin_profiles:
                 self._resolvers[PluginId("transform", plugin_name)] = _BedrockGuardrailProfileResolver(
                     plugin_profiles,
-                    default_alias=defaults.get(plugin_name),
+                    default_alias=defaults[plugin_name] if plugin_name in defaults else None,
                 )
         if (
             settings.aws_s3_source_profiles
@@ -1088,10 +1129,9 @@ class OperatorProfileRegistry:
         *,
         available_aliases: tuple[str, ...],
     ) -> PluginSchemaInfo:
-        resolver = self._resolvers.get(plugin_id)
-        if resolver is None:
+        if plugin_id not in self._resolvers:
             return full_schema
-        return resolver.public_schema(full_schema, available_aliases)
+        return self._resolvers[plugin_id].public_schema(full_schema, available_aliases)
 
     def public_summary(
         self,
@@ -1105,9 +1145,9 @@ class OperatorProfileRegistry:
         from elspeth.web.catalog.schema_parse import SchemaObject
         from elspeth.web.catalog.schemas import ConfigFieldSummary
 
-        resolver = self._resolvers.get(plugin_id)
-        if resolver is None:
+        if plugin_id not in self._resolvers:
             return full_summary
+        resolver = self._resolvers[plugin_id]
         public_schema = resolver.public_schema(full_schema, available_aliases)
         parsed = SchemaObject.model_validate(public_schema.json_schema)
         required = set(parsed.required)
@@ -1130,7 +1170,10 @@ class OperatorProfileRegistry:
             "composer_hints": public_schema.composer_hints,
             "secret_requirements": public_schema.secret_requirements,
         }
-        if isinstance(resolver, _S3SourceProfileResolver):
+        # Exact-type dispatch over the three module-private resolver classes:
+        # each arm publishes the guidance for ONE operator-profile contract, so a
+        # future subclass must declare its own arm rather than silently inherit.
+        if type(resolver) is _S3SourceProfileResolver:
             example_alias = available_aliases[0] if available_aliases else "operator-approved-profile"
             updates["usage_when_to_use"] = (
                 "Use in Web Composer when an operator-approved S3 source profile is available and the workflow "
@@ -1152,7 +1195,7 @@ class OperatorProfileRegistry:
                 "      schema: {mode: observed}\n"
                 "      on_validation_failure: discard"
             )
-        elif isinstance(resolver, _TextractProfileResolver):
+        elif type(resolver) is _TextractProfileResolver:
             example_alias = available_aliases[0] if available_aliases else "operator-approved-profile"
             updates["example_use"] = (
                 "transform:\n"
@@ -1172,8 +1215,8 @@ class OperatorProfileRegistry:
         full_assistance: PluginAssistance,
     ) -> PluginAssistance:
         """Project plugin guidance through the same operator-profile authority."""
-        resolver = self._resolvers.get(plugin_id)
-        if isinstance(resolver, _S3SourceProfileResolver):
+        resolver = self._resolvers[plugin_id] if plugin_id in self._resolvers else None
+        if type(resolver) is _S3SourceProfileResolver:
             return PluginAssistance(
                 plugin_name=full_assistance.plugin_name,
                 issue_code=full_assistance.issue_code,
@@ -1184,7 +1227,7 @@ class OperatorProfileRegistry:
                     "Use a different approved profile when the object belongs to a different operator-managed location.",
                 ),
             )
-        if isinstance(resolver, _TextractProfileResolver):
+        if type(resolver) is _TextractProfileResolver:
             return PluginAssistance(
                 plugin_name=full_assistance.plugin_name,
                 issue_code=full_assistance.issue_code,
@@ -1204,11 +1247,9 @@ class OperatorProfileRegistry:
         alias: str,
         safe_options: dict[str, object],
     ) -> LoweredPluginConfig:
-        try:
-            resolver = self._resolvers[plugin_id]
-        except KeyError:
-            raise ValueError("plugin_has_no_operator_profile") from None
-        return resolver.lower_options(alias, safe_options)
+        if plugin_id not in self._resolvers:
+            raise ValueError("plugin_has_no_operator_profile")
+        return self._resolvers[plugin_id].lower_options(alias, safe_options)
 
     def profile_availability(
         self,
@@ -1217,26 +1258,20 @@ class OperatorProfileRegistry:
         principal: str,
         inventory: ProfileCredentialInventory,
     ) -> tuple[ProfileAvailability, ...]:
-        try:
-            resolver = self._resolvers[plugin_id]
-        except KeyError:
+        if plugin_id not in self._resolvers:
             return ()
-        return resolver.profile_availability(principal, inventory)
+        return self._resolvers[plugin_id].profile_availability(principal, inventory)
 
     def check_local_requirements(self, plugin_id: PluginId, alias: str) -> LocalRequirementResult:
-        try:
-            resolver = self._resolvers[plugin_id]
-        except KeyError:
+        if plugin_id not in self._resolvers:
             return LocalRequirementResult(available=False, reason=ProfileUnavailableReason.LOCAL_REQUIREMENT_MISSING)
-        return resolver.check_local_requirements(alias)
+        return self._resolvers[plugin_id].check_local_requirements(alias)
 
     def selected_profile_alias(self, plugin_id: PluginId, *, usable_aliases: tuple[str, ...]) -> str | None:
         """The designated default among ``usable_aliases``, or None if none is."""
-        try:
-            resolver = self._resolvers[plugin_id]
-        except KeyError:
+        if plugin_id not in self._resolvers:
             return None
-        return resolver.selected_alias(usable_aliases)
+        return self._resolvers[plugin_id].selected_alias(usable_aliases)
 
     def approved_bedrock_guardrail_profile(
         self,
@@ -1248,7 +1283,7 @@ class OperatorProfileRegistry:
 
         if plugin_id not in self._policy.authorized:
             raise ValueError("profile_unavailable")
-        resolver = self._resolvers.get(plugin_id)
-        if not isinstance(resolver, _BedrockGuardrailProfileResolver):
+        resolver = self._resolvers[plugin_id] if plugin_id in self._resolvers else None
+        if type(resolver) is not _BedrockGuardrailProfileResolver:
             raise ValueError("profile_unavailable")
         return resolver.approved_profile(alias)
