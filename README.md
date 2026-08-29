@@ -24,7 +24,9 @@ Composer-authored pipelines use the same validation and execution setup as
 YAML-authored pipelines; the longer-term compiler direction is to seal both
 inputs into one compiled artifact that the executor runs directly.
 
-**Short walkthrough:** [Watch the Elspeth demo video](docs/video/elspeth.mp4)
+**Short walkthrough:** the Elspeth demo video is attached to the project's
+[GitHub Releases](https://github.com/dta-au/elspeth/releases); it is no longer
+stored in the repository.
 
 The video gives a quick view of what Elspeth is and what it does: the Web
 Composer building and validating a pipeline over the same runtime, validation,
