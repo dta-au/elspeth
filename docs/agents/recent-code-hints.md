@@ -77,6 +77,37 @@ is a working document under the normal delivery posture.
      "tool_calls")`, so a row read back from the DB is `mappingproxy` at BOTH
      the envelope and the `invocation` level; `type(x) is dict` is permanently
      False and would re-disable the branch. Mutation-verified both ways.
+- **2026-08-29 — three honest shapes for the secure-file and provider-error
+  findings in the acceptance harness (B28, measured on
+  `web/_aws_ecs_acceptance/{secure_documents,receipt_store,textract}.py`,
+  21 → 2 with no sidecar restatement).**
+  1. **A non-raising `@trust_boundary` on a provider-error PROJECTION whose
+     `None` the caller fails closed on.** `textract.py::_client_error_code`
+     reads `error.response.get("Error")` off a botocore `ClientError`; the
+     tier_model walk keeps the `<source_param>.<attr>.get()` chain, so
+     `suppresses=("R1","R5")` under `source_param="error"` cleared all three
+     sites. `non_raising=True` is honest ONLY because `_probe_invocable`
+     treats `None` as not-invocable and raises — an accept-gate consumer would
+     make the same declaration a silent skip (W3-1 polarity rule).
+  2. **`FileNotFoundError` swallows in a secure writer have stdlib forms that
+     say what they mean.** The create pre-check `try: path.lstat() /
+     except FileNotFoundError: pass / else: raise exists` is
+     `if os.path.lexists(path): raise exists` (outcome-identical: any other
+     lstat errno fails `mkstemp`/`os.link` one step later under the same
+     `write_check`); the `finally` temp-file cleanup is
+     `Path(tmp).unlink(missing_ok=True)`; and an open-or-create lock is a
+     handler that RETURNS the freshly published descriptor
+     (`_open_receipt_manifest_lock` → `_publish_receipt_manifest_lock`). What
+     stays is the EINTR retry in `_flock_retry_interrupted` — unbounded by
+     design, rationalised, not shaped.
+  3. **Parse, THEN bind.** `receipt_store` compared nine `document.get(k)`
+     values against the manifest BEFORE `_validate_stored_receipt` had
+     enforced `set(payload) == fields`. Running the schema parse first (the
+     order every other receipt kind already used) makes every downstream read
+     membership-form on a validated document; the only observable change is
+     that a document failing both now reports `receipt_store_schema`, and no
+     document that was rejected is accepted. `json.loads` output on a path
+     with no frozen owner between it and the read is `type(x) is not dict`.
 - **2026-08-29 — widening a `@trust_boundary`'s `suppresses=` ROTATES its
   `test_fingerprint`, and `trust_boundary.tests` is a CI-ONLY gate that no
   pre-commit hook runs.** Measured in B60 on

@@ -65,7 +65,7 @@ def _read_protected_document(path: Path, *, check: str) -> dict[str, object]:
         decoded = json.loads(content)
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise AcceptanceCheckError(check) from None
-    if not isinstance(decoded, dict):
+    if type(decoded) is not dict:
         raise AcceptanceCheckError(check)
     return decoded
 
@@ -77,9 +77,14 @@ def _open_receipt_manifest_lock(lock_path: Path, *, check: str) -> int:
     try:
         return os.open(lock_path, flags)
     except FileNotFoundError:
-        pass
+        return _publish_receipt_manifest_lock(lock_path, flags, check=check)
     except OSError:
         raise AcceptanceCheckError(check) from None
+
+
+def _publish_receipt_manifest_lock(lock_path: Path, flags: int, *, check: str) -> int:
+    """Link a fresh exact-0600 lock into place, or open the one that won the race."""
+
     temporary_path: str | None = None
     temporary_descriptor: int | None = None
     try:
@@ -106,8 +111,7 @@ def _open_receipt_manifest_lock(lock_path: Path, *, check: str) -> int:
         if temporary_descriptor is not None:
             os.close(temporary_descriptor)
         if temporary_path is not None:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary_path)
+            Path(temporary_path).unlink(missing_ok=True)
 
 
 def _flock_retry_interrupted(descriptor: int, operation: int) -> None:
@@ -193,13 +197,7 @@ def _write_protected_document(
     if len(content) > MAX_CONTROL_DOCUMENT_BYTES:
         raise AcceptanceCheckError(write_check)
     if create:
-        try:
-            path.lstat()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            raise AcceptanceCheckError(write_check) from None
-        else:
+        if os.path.lexists(path):
             raise AcceptanceCheckError(exists_check)
     else:
         _read_protected_document(path, check=write_check)
@@ -233,5 +231,4 @@ def _write_protected_document(
         raise AcceptanceCheckError(write_check) from None
     finally:
         if temporary_path is not None:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary_path)
+            Path(temporary_path).unlink(missing_ok=True)

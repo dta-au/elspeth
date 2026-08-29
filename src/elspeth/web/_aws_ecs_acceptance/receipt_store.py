@@ -47,6 +47,37 @@ def receipt_store(
         )
 
 
+def _require_compatibility_receipt_binding(
+    document: dict[str, object],
+    *,
+    manifest: dict[str, object],
+    scenario_id: str,
+    now: Callable[[], datetime],
+) -> None:
+    """Bind one schema-validated compatibility receipt to the resolved scenario, image, and clock."""
+
+    inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
+    values = cast(dict[str, object], inventory["values"])
+    ecr = cast(dict[str, object], manifest["ecr"])
+    previous = values["PREVIOUS_TASK_DEFINITION"] if scenario_id == "B" else ""
+    rollback_doctor = values["ROLLBACK_DOCTOR_TASK_DEFINITION"] if scenario_id == "B" else ""
+    baseline_tag = ecr["baseline_tag"] if scenario_id == "B" else ""
+    baseline_match = re.search(r"baseline-([0-9a-f]{40})$", cast(str, baseline_tag)) if baseline_tag else None
+    previous_source_sha = baseline_match.group(1) if baseline_match is not None else None
+    if (
+        document["acceptance_run_id_sha256"] != _sha256(cast(str, manifest["acceptance_run_id"]).encode())
+        or document["candidate_image_digest"] != ecr["candidate_digest"]
+        or document["candidate_task_definition_sha256"] != _sha256(cast(str, values["CANDIDATE_TASK_DEFINITION"]).encode())
+        or document["candidate_doctor_task_definition_sha256"] != _sha256(cast(str, values["DOCTOR_TASK_DEFINITION"]).encode())
+        or document["previous_source_sha"] != previous_source_sha
+        or document["previous_image_digest"] != (ecr["baseline_digest"] if scenario_id == "B" else None)
+        or document["previous_task_definition_sha256"] != (_sha256(cast(str, previous).encode()) if previous else None)
+        or document["rollback_doctor_task_definition_sha256"] != (_sha256(cast(str, rollback_doctor).encode()) if rollback_doctor else None)
+        or _control_timestamp(document["expires_at"]) <= now()
+    ):
+        raise AcceptanceCheckError("receipt_store_binding")
+
+
 def _receipt_store_locked(
     manifest_path: Path,
     *,
@@ -84,7 +115,7 @@ def _receipt_store_locked(
             decoded = json.loads(receipt_bytes)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise AcceptanceCheckError("receipt_store_schema") from None
-        if not isinstance(decoded, dict):
+        if type(decoded) is not dict:
             raise AcceptanceCheckError("receipt_store_schema")
         document = decoded
     subject_sha256 = _sha256(subject_id.encode("utf-8"))
@@ -106,28 +137,6 @@ def _receipt_store_locked(
         values = cast(dict[str, object], inventory["values"])
         binding = cast(str, values["ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256"])
         expected_plugin_policy_binding_sha256 = binding
-    if kind == "compatibility-record":
-        inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
-        values = cast(dict[str, object], inventory["values"])
-        ecr = cast(dict[str, object], manifest["ecr"])
-        previous = values["PREVIOUS_TASK_DEFINITION"] if scenario_id == "B" else ""
-        rollback_doctor = values["ROLLBACK_DOCTOR_TASK_DEFINITION"] if scenario_id == "B" else ""
-        baseline_tag = ecr["baseline_tag"] if scenario_id == "B" else ""
-        baseline_match = re.search(r"baseline-([0-9a-f]{40})$", cast(str, baseline_tag)) if baseline_tag else None
-        previous_source_sha = baseline_match.group(1) if baseline_match is not None else None
-        if (
-            document.get("acceptance_run_id_sha256") != _sha256(cast(str, manifest["acceptance_run_id"]).encode())
-            or document.get("candidate_image_digest") != ecr["candidate_digest"]
-            or document.get("candidate_task_definition_sha256") != _sha256(cast(str, values["CANDIDATE_TASK_DEFINITION"]).encode())
-            or document.get("candidate_doctor_task_definition_sha256") != _sha256(cast(str, values["DOCTOR_TASK_DEFINITION"]).encode())
-            or document.get("previous_source_sha") != previous_source_sha
-            or document.get("previous_image_digest") != (ecr["baseline_digest"] if scenario_id == "B" else None)
-            or document.get("previous_task_definition_sha256") != (_sha256(cast(str, previous).encode()) if previous else None)
-            or document.get("rollback_doctor_task_definition_sha256")
-            != (_sha256(cast(str, rollback_doctor).encode()) if rollback_doctor else None)
-            or _control_timestamp(document.get("expires_at")) <= now()
-        ):
-            raise AcceptanceCheckError("receipt_store_binding")
     document = _validate_stored_receipt(
         document,
         kind=kind,
@@ -139,6 +148,8 @@ def _receipt_store_locked(
         expected_acceptance_run_id_sha256=expected_acceptance_run_id_sha256,
         expected_cluster_id_sha256=expected_cluster_id_sha256,
     )
+    if kind == "compatibility-record":
+        _require_compatibility_receipt_binding(document, manifest=manifest, scenario_id=scenario_id, now=now)
     canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
     receipt_sha256 = _sha256(canonical)
     receipt_directory = manifest_path.parent / f"{manifest_path.name}.receipts"
