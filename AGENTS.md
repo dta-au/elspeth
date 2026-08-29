@@ -395,8 +395,9 @@ The block above is installer-written. ELSPETH's own guidance
   historical calls failed on that.
 - **Zero callers is not "no callers".** Read `traversal_complete`,
   `scope_excludes`, and `unresolved_candidates` before concluding; class
-  instantiations and calls from large test files may sit there as
-  `why: dynamic`. Confirm a negative with `git grep`.
+  instantiations (never resolved to a call edge) and calls from files analyzed
+  by a venv-less hook run may sit there as `why: dynamic`. Confirm a negative
+  with `git grep`.
 - Check `project_status_get` staleness first; a re-analyze is triggered by
   the git hooks on the main checkout, not by worktree commits. Any list over
   ~100 rows overflows the MCP result cap — page with the cursor.
