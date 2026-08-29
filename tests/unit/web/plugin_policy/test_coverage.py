@@ -1684,6 +1684,14 @@ def test_declared_scan_scopes_renders_a_frozen_authored_list_and_fails_soft() ->
     assert type(node.options["fields"]) is tuple
     assert _declared_scan_scopes(node.options) == frozenset({"prompt", "context"})
 
+    # A non-string ENTRY is dropped, never stringified: this set is echoed
+    # verbatim into an author-facing rejection, so rendering str(7) would state
+    # that the control scans a field named "7" — not a field name, and not
+    # something the author wrote. Under-reporting a malformed scope is the safe
+    # direction; the rejection itself stands either way.
+    mixed = _node("s", "azure_prompt_shield", "raw", "out", options={"fields": ["prompt", 7, None, "context"]})
+    assert _declared_scan_scopes(mixed.options) == frozenset({"prompt", "context"})
+
     # A string scope is one name; every other shape, and an absent key, render
     # as nothing rather than raising — this walk must not abort a rejection
     # message it exists to enrich.

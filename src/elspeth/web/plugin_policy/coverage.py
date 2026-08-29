@@ -174,7 +174,8 @@ def node_has_blocking_control(
     suppresses=("R1", "R5"),
     invariant=(
         "returns False (not credited) for any 'fields' scope value other than the literal string 'all' or a "
-        "well-formed sequence of non-empty strings; never raises on a malformed scope"
+        "well-formed sequence of non-empty strings; never raises on a malformed scope. An ABSENT 'fields' key "
+        "reads as None and takes that same not-credited path — the absent case is never a credit"
     ),
 )
 def _control_covers_fields(node: NodeSpec, protected_fields: frozenset[str]) -> bool:
@@ -213,7 +214,10 @@ def _control_covers_fields(node: NodeSpec, protected_fields: frozenset[str]) -> 
     suppresses=("R1", "R5"),
     invariant=(
         "returns a _ProtectedFields with provable=False whenever 'queries' or any query definition, its "
-        "input_fields mapping, or a row-field name deviates from the expected shape; never raises on malformed queries"
+        "input_fields mapping, or a row-field name deviates from the expected shape; never raises on malformed "
+        "queries. ABSENT keys are the plugin defaults, not a softening: an absent 'queries' is a single-query "
+        "node (LLMConfig.queries), an absent 'prompt_template' is an unparseable template and therefore already "
+        "unprovable, and an absent per-query 'template' means that query renders the node-level one"
     ),
 )
 def _llm_input_fields(node: NodeSpec) -> _ProtectedFields:
@@ -294,7 +298,10 @@ def _llm_output_fields(node: NodeSpec) -> frozenset[str]:
     suppresses=("R1", "R5"),
     invariant=(
         "returns an empty frozenset whenever response_field, or 'queries' (its keys, entries, or a query's "
-        "'name'), deviates from the expected shape; never raises on malformed options"
+        "'name'), deviates from the expected shape; never raises on malformed options. The 'llm_response' default "
+        "for an absent response_field is the plugin's own declared default (LLMConfig.response_field, "
+        "plugins/transforms/llm/base.py and plugins/sources/llm/config.py), so it names the field the node will "
+        "actually write rather than assuming one; an absent 'queries' is a single-query node"
     ),
 )
 def _llm_output_fields_from_options(options: Mapping[str, object]) -> frozenset[str]:
@@ -329,7 +336,11 @@ def _llm_output_fields_from_options(options: Mapping[str, object]) -> frozenset[
     source="SourceSpec carrying web-authored/deserialized LLM source options (untrusted response_field value)",
     source_param="source",
     suppresses=("R1", "R5"),
-    invariant="returns None whenever source.options or its response_field deviates from the expected shape; never raises on malformed options",
+    invariant=(
+        "returns None whenever source.options or its response_field deviates from the expected shape; never raises "
+        "on malformed options. An absent response_field takes the plugin's own declared default 'llm_response' "
+        "(plugins/sources/llm/config.py), the field the source will actually write"
+    ),
 )
 def _llm_source_output_fields(source: SourceSpec) -> frozenset[str] | None:
     """Return the one generated field, or ``None`` when options are malformed."""
@@ -576,24 +587,35 @@ def _upstream_control_scan_scopes(
     source_param="options",
     suppresses=("R1", "R5"),
     invariant=(
-        "returns an empty frozenset whenever 'fields' is absent or is neither a string nor a non-string "
-        "sequence; never raises on a malformed scope. DIAGNOSIS ONLY — never a credit decision"
+        "returns only the field names the scope literally contains as strings; a non-string entry contributes "
+        "nothing and is never rendered into a name. Returns an empty frozenset whenever 'fields' is absent or is "
+        "neither a string nor a non-string sequence; never raises on a malformed scope. DIAGNOSIS ONLY — never a "
+        "credit decision"
     ),
 )
 def _declared_scan_scopes(options: Mapping[str, object]) -> frozenset[str]:
-    """Return what a control's ``fields`` scope literally names, for a message.
+    """Return the field names a control's ``fields`` scope literally states.
 
     DIAGNOSIS ONLY, and deliberately weaker than ``_control_covers_fields``:
     that function decides credit and refuses a malformed scope outright, while
-    this one renders whatever the author wrote so the rejection message can name
-    it. ``Sequence`` (not ``list``) is required because ``NodeSpec.__post_init__``
+    this one reports what the author wrote so the rejection message can name it.
+    Weaker on ADMISSION, never on honesty — a non-string entry is DROPPED rather
+    than stringified. The set is echoed verbatim into an author-facing rejection
+    that ``web/composer/required_controls.py`` also renders into a proposal
+    message, so ``str(7)`` there would state that the control scans a field
+    named ``7``, which is not a field name and not something the author wrote.
+    Dropping instead means the message under-reports a malformed scope, which is
+    the safe direction: the rejection stands either way, and only its explanatory
+    field list is affected.
+
+    ``Sequence`` (not ``list``) is required because ``NodeSpec.__post_init__``
     deep-freezes ``options``, so an authored list arrives here as a ``tuple``.
     """
     configured = options["fields"] if "fields" in options else None
     if isinstance(configured, str):
         return frozenset({configured})
     if isinstance(configured, Sequence) and not isinstance(configured, (str, bytes)):
-        return frozenset(str(field) for field in configured)
+        return frozenset(field for field in configured if isinstance(field, str))
     return frozenset()
 
 
@@ -636,7 +658,10 @@ def _node_input_streams(node: NodeSpec) -> tuple[str, ...]:
     suppresses=("R1", "R5"),
     invariant=(
         "returns None whenever node.options['mapping'] or node.options['select_only'], or a mapping entry's "
-        "source/target, deviates from the expected shape; never raises on a malformed mapper config"
+        "source/target, deviates from the expected shape; never raises on a malformed mapper config. The absent-key "
+        "defaults are the plugin's own (FieldMapperConfig.mapping default_factory=dict, select_only default False), "
+        "so an absent key models what the mapper will actually do — an empty mapping renames nothing and passes "
+        "every protected field through unchanged"
     ),
 )
 def _translate_protected_fields_through_mapper(
@@ -719,8 +744,9 @@ def _translate_protected_fields_through_mapper(
     source_param="node",
     suppresses=("R1", "R5"),
     invariant=(
-        "returns None whenever node.options['operations'] or an operation's 'target' deviates from the expected "
-        "shape; never raises on a malformed operations list"
+        "returns None whenever node.options['operations'], including an ABSENT one, or an operation's 'target' "
+        "deviates from the expected shape; never raises on a malformed operations list. Absent reads as None and "
+        "takes the same fail-closed path as malformed: an unproven write set means coverage cannot be credited"
     ),
 )
 def _deterministic_written_fields(node: NodeSpec) -> frozenset[str] | None:
