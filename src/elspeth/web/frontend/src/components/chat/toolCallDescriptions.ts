@@ -41,6 +41,17 @@ const READ_ONLY_TOOL_CALL_DESCRIPTIONS: Record<string, string> = {
   explain_validation_error:
     "Looks up a plain-language explanation for a validation error code.",
   generate_yaml: "Renders the current pipeline as a YAML document.",
+  get_blob_content: "Reads the content of an uploaded file for inspection.",
+  get_blob_metadata: "Looks up an uploaded file's name, size, and status.",
+  inspect_source:
+    "Reads structural facts about an uploaded file — headers and sample rows — to plan the source.",
+  list_blobs: "Lists the files uploaded or created in this session.",
+  list_composer_blobs:
+    "Lists the ready files available for audited inline authoring.",
+  list_secret_refs:
+    "Lists the credential references available to this session — names only, never values.",
+  validate_secret_ref:
+    "Checks that a credential reference exists and is accessible.",
 };
 
 const MUTATING_TOOL_CALL_DESCRIPTIONS: Record<string, string> = {
@@ -70,6 +81,17 @@ const MUTATING_TOOL_CALL_DESCRIPTIONS: Record<string, string> = {
   save_session: "Saves the current composer session so it can be resumed later.",
   load_session: "Resumes a previously-saved composer session.",
   delete_session: "Removes a saved composer session.",
+  create_blob: "Creates a new file from inline content for the pipeline to use.",
+  delete_blob: "Deletes an uploaded file and its storage.",
+  update_blob: "Replaces the content of an uploaded file.",
+  set_source_from_blob: "Wires an uploaded file as the pipeline's data source.",
+  set_source_from_blobs:
+    "Wires one or more uploaded files as a one-row-per-file data source.",
+  splice_transform: "Inserts a transform between two connected steps.",
+  wire_blob_inline_ref:
+    "Pins an uploaded file's content into a configuration field by hash.",
+  wire_secret_ref:
+    "Places a credential reference in the pipeline configuration, resolved at run time.",
 };
 
 export const TOOL_CALL_DESCRIPTIONS: Record<string, string> = {

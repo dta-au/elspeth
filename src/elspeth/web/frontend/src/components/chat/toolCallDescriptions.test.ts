@@ -37,6 +37,13 @@ describe("read-only / mutating membership", () => {
     "preview_pipeline",
     "explain_validation_error",
     "generate_yaml",
+    "get_blob_content",
+    "get_blob_metadata",
+    "inspect_source",
+    "list_blobs",
+    "list_composer_blobs",
+    "list_secret_refs",
+    "validate_secret_ref",
   ] as const;
 
   it("pins the exact read-only membership", () => {
