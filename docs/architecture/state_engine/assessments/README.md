@@ -27,3 +27,16 @@ receipts, or approval chains.
   records divergence without replacing the original result.
 - Keep packages small: assessment result, evidence, and technical review are
   normally sufficient.
+
+## Errata
+
+- 2026-08-30 — machine-local provenance was scrubbed from every package for
+  public release: `baseline.repository_root` is now `.`, the
+  `worktree_status_at_evidence_capture` dumps are emptied, and absolute
+  capture-host paths (Python executable, `PYTHONPATH`, sibling worktrees,
+  prose in `evidence.md`) are repository-relative or `~/`-relative. Commits,
+  trees, evidence artifacts, and their digests are unchanged; the
+  `parent_assessment` digests of 2026-08-12 04:25 and 05:49 were re-pinned to
+  the scrubbed parent manifests. The retained `EV-00x.stdout` artifacts of the
+  two 2026-07-18 packages still carry a pytest warning that names the capture
+  host's venv path; they are digest-frozen evidence and were not edited.

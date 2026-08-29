@@ -15,33 +15,22 @@
   "mode": "current",
   "commit": "2b4b04a8a852a839b7b395b0bcdfceb95676606b",
   "tree": "a12309c2c95c363e5fabaa8c6334027507dd3012",
-  "repository_root": "/home/john/elspeth/.claude/worktrees/state-engine-v3-assessment",
+  "repository_root": ".",
   "remote": "https://github.com/johnm-dta/elspeth.git",
   "branch": "codex/state-engine-v3-assessment",
-  "worktree_status_at_evidence_capture": [
-   "# branch.oid 2b4b04a8a852a839b7b395b0bcdfceb95676606b",
-   "# branch.head codex/state-engine-v3-assessment",
-   "1 .M N... 100644 100644 100644 32638fa4b19b9eb3bfde2fbb8b2a127eace84b50 32638fa4b19b9eb3bfde2fbb8b2a127eace84b50 docs/architecture/state_engine/README.md",
-   "1 .M N... 100644 100644 100644 1669438d23ce6682f1b639a78e71c16d009d6e58 1669438d23ce6682f1b639a78e71c16d009d6e58 docs/architecture/state_engine/architecture.md",
-   "1 .M N... 100644 100644 100644 ccd6e3e7528cba7c288f2a441f44c491c2867aca ccd6e3e7528cba7c288f2a441f44c491c2867aca docs/architecture/state_engine/assessment-program.md",
-   "1 .M N... 100644 100644 100644 a957df7d573d09f7ca7b7e9853f365d37ec7f653 a957df7d573d09f7ca7b7e9853f365d37ec7f653 docs/architecture/state_engine/assessments/README.md",
-   "1 .M N... 100644 100644 100644 b2a72110a9fbf0189b132fc1f47a548a22386c0b b2a72110a9fbf0189b132fc1f47a548a22386c0b docs/architecture/state_engine/completeness-criteria.md",
-   "1 .M N... 100644 100644 100644 d1a93d7f321fde38fc39c7c7bce4441366554e2c d1a93d7f321fde38fc39c7c7bce4441366554e2c docs/architecture/state_engine/proof-catalog/README.md",
-   "1 .M N... 100644 100644 100644 200f9fc42b54de609e63bc0128dec143a3758319 200f9fc42b54de609e63bc0128dec143a3758319 docs/architecture/state_engine/proof-matrix.md",
-   "? docs/architecture/state_engine/assessments/2026-08-15-0537/"
-  ],
+  "worktree_status_at_evidence_capture": [],
   "submodules": [],
   "worktrees_at_capture": [
-   "/home/john/elspeth b601e58fd [release/0.7.2]",
-   "/home/john/elspeth/.claude/worktrees/ac-masquerade-bounded 9593ab058 [codex/ac-masquerade-bounded]",
-   "/home/john/elspeth/.claude/worktrees/ac-masquerade-flow-alt 5bb4703b3 [codex/ac-masquerade-flow-alt]",
-   "/home/john/elspeth/.claude/worktrees/ac-masquerade-targets f8f9d60fd [codex/ac-masquerade-targets]",
-   "/home/john/elspeth/.claude/worktrees/composer-compact-proposal-nodes 58c1bf2b2 [codex/composer-compact-proposal-nodes]",
-   "/home/john/elspeth/.claude/worktrees/composer-efficiency-harness 4f508d57c [codex/composer-efficiency-harness]",
-   "/home/john/elspeth/.claude/worktrees/composer-planner-audit 3c3611e04 [codex/composer-planner-audit-followup]",
-   "/home/john/elspeth/.claude/worktrees/composer-projection-review 8e164cea2 [codex/composer-projection-review]",
-   "/home/john/elspeth/.claude/worktrees/deploy-9593ab058 9593ab058 (detached HEAD)",
-   "/home/john/elspeth/.claude/worktrees/state-engine-v3-assessment 2b4b04a8a [codex/state-engine-v3-assessment]",
+   "~/elspeth b601e58fd [release/0.7.2]",
+   "~/elspeth/.claude/worktrees/ac-masquerade-bounded 9593ab058 [codex/ac-masquerade-bounded]",
+   "~/elspeth/.claude/worktrees/ac-masquerade-flow-alt 5bb4703b3 [codex/ac-masquerade-flow-alt]",
+   "~/elspeth/.claude/worktrees/ac-masquerade-targets f8f9d60fd [codex/ac-masquerade-targets]",
+   "~/elspeth/.claude/worktrees/composer-compact-proposal-nodes 58c1bf2b2 [codex/composer-compact-proposal-nodes]",
+   "~/elspeth/.claude/worktrees/composer-efficiency-harness 4f508d57c [codex/composer-efficiency-harness]",
+   "~/elspeth/.claude/worktrees/composer-planner-audit 3c3611e04 [codex/composer-planner-audit-followup]",
+   "~/elspeth/.claude/worktrees/composer-projection-review 8e164cea2 [codex/composer-projection-review]",
+   "~/elspeth/.claude/worktrees/deploy-9593ab058 9593ab058 (detached HEAD)",
+   "~/elspeth/.claude/worktrees/state-engine-v3-assessment 2b4b04a8a [codex/state-engine-v3-assessment]",
    "/tmp/elspeth-dag-baseline.DmGWjr e48839034 (detached HEAD)"
   ],
   "publication_paths": [
@@ -81,7 +70,7 @@
   "locale": "LANG=C.UTF-8; LC_ALL=C.UTF-8",
   "kernel": "Linux 6.8.0-136-generic x86_64",
   "python": "3.13.1",
-  "python_executable": "/home/john/elspeth/.claude/worktrees/state-engine-v3-assessment/.venv/bin/python",
+  "python_executable": ".venv/bin/python",
   "python_build": "Dec 19 2024 14:32:25",
   "pytest": "9.0.3",
   "uv": "0.10.2",
@@ -112,12 +101,12 @@
    "kind": "pytest",
    "runner": "local",
    "provenance": {
-    "python_executable": "/home/john/elspeth/.claude/worktrees/state-engine-v3-assessment/.venv/bin/python",
+    "python_executable": ".venv/bin/python",
     "platform": "Linux 6.8.0-136-generic x86_64"
    },
    "reproducibility_class": "deterministic",
    "argv": [
-    "/home/john/elspeth/.claude/worktrees/state-engine-v3-assessment/.venv/bin/python",
+    ".venv/bin/python",
     "-m",
     "pytest",
     "-q",
@@ -848,7 +837,7 @@
    "timeout_seconds": 14400,
    "safe_environment": {
     "PYTHONHASHSEED": "0",
-    "PYTHONPATH": "/home/john/elspeth/.claude/worktrees/state-engine-v3-assessment/src",
+    "PYTHONPATH": "src",
     "TZ": "Australia/Canberra",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8"
@@ -5559,12 +5548,12 @@
    "kind": "pytest",
    "runner": "local",
    "provenance": {
-    "python_executable": "/home/john/elspeth/.claude/worktrees/state-engine-v3-assessment/.venv/bin/python",
+    "python_executable": ".venv/bin/python",
     "platform": "Linux 6.8.0-136-generic x86_64"
    },
    "reproducibility_class": "deterministic",
    "argv": [
-    "/home/john/elspeth/.claude/worktrees/state-engine-v3-assessment/.venv/bin/python",
+    ".venv/bin/python",
     "-m",
     "pytest",
     "-q",
@@ -5613,7 +5602,7 @@
    "timeout_seconds": 7200,
    "safe_environment": {
     "PYTHONHASHSEED": "0",
-    "PYTHONPATH": "/home/john/elspeth/.claude/worktrees/state-engine-v3-assessment/src",
+    "PYTHONPATH": "src",
     "TZ": "Australia/Canberra",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8"
@@ -6054,12 +6043,12 @@
    "kind": "pytest",
    "runner": "local",
    "provenance": {
-    "python_executable": "/home/john/elspeth/.claude/worktrees/state-engine-v3-assessment/.venv/bin/python",
+    "python_executable": ".venv/bin/python",
     "platform": "Linux 6.8.0-136-generic x86_64"
    },
    "reproducibility_class": "deterministic",
    "argv": [
-    "/home/john/elspeth/.claude/worktrees/state-engine-v3-assessment/.venv/bin/python",
+    ".venv/bin/python",
     "-m",
     "pytest",
     "-q",
@@ -6081,7 +6070,7 @@
    "timeout_seconds": 3600,
    "safe_environment": {
     "PYTHONHASHSEED": "0",
-    "PYTHONPATH": "/home/john/elspeth/.claude/worktrees/state-engine-v3-assessment/src",
+    "PYTHONPATH": "src",
     "TZ": "Australia/Canberra",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8"
