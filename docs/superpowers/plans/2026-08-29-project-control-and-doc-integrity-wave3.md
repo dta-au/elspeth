@@ -487,12 +487,15 @@ After Tasks 0–4 and their task-level reviews are complete, copy this plan into
 the archive and remove it from the active tree. Its committed history remains
 the public execution record; it does not remain as a completed plan in live
 docs. Record its committed revision separately in the manifest and add its
-digest as the 36th payload. This operation is idempotent: accept an existing
-plan payload only if its digest matches, write the replacement manifest in a
-sibling temporary file, validate it, and atomically rename it into place.
-Verify exactly 36 payloads plus one manifest, including the final 36-path/digest
-set, both in the durable archive and after the tracked deletion. Verify `git
-log --all --full-history -- <plan-path>` shows both addition and deletion.
+digest as the 36th payload. This operation is idempotent: write the plan payload
+to a sibling temporary file, verify its digest, and atomically rename it into
+place; accept an existing final payload only if its digest matches. Write the
+replacement manifest through the same temporary-file, validation, and atomic-
+rename sequence. Delete the tracked plan only after both archive publications
+are durable. Verify exactly 36 payloads plus one manifest, including the final
+36-path/digest set, both in the durable archive and after the tracked deletion.
+Verify `git log --all --full-history -- <plan-path>` shows both addition and
+deletion.
 
 Commit:
 
@@ -568,29 +571,33 @@ Before claiming completion, verify:
   Appendix A allowlist exactly: 5 additions, 32 modifications, and 35 deletions
   (72 paths total). Aggregate counts alone are insufficient. The retained
   Composer-assistant and universal Web-plugin-policy designs are unchanged;
-- after Task 5 removes the self-matching plan, guarded tracked-tree `git grep`
-  checks find no occurrence of the three retired DAG assessment directory
-  stamps, either retired bootstrap-plan path, or any of the nine retired
-  low-risk basenames;
+- after Task 5 removes the self-matching plan, a guarded tracked-Markdown link
+  check finds no inline or reference-style link target containing the three
+  retired DAG assessment directory stamps, either retired bootstrap-plan path,
+  or any of the nine retired low-risk basenames. Plain-text historical
+  provenance mentions are permitted when they are not presented as live links;
 - the working branch is merged into `feature/unified-lineage` with `--no-ff`;
 - the merge commit has two parents;
+- capture `WORK_TIP` immediately before integration and prove the merge parents
+  exactly: `HEAD^1` equals `TARGET_PREMERGE` and `HEAD^2` equals `WORK_TIP`;
 - `HEAD^1..HEAD` matches the same literal Appendix A allowlist;
 - the focused, repository-documentation, and CI-equivalent checks pass again on
   the integrated target;
 - the working tip is an ancestor of the integrated target;
 - the unrelated primary file has the same checksum before and after; and
-- the durable archive is reverified before the worktree is removed and the
-  work branch is deleted with `git branch -d`. After cleanup, verify the
-  archive and its digests again, confirm the worktree and branch are absent,
-  confirm the integrated target HEAD, and confirm the protected primary-file
-  checksum. On any failure, retain both.
+- record `WORK_TIP`, then complete all material archive, target, diff, ancestry,
+  test, and protected-checksum checks before cleanup. Remove the worktree first,
+  reverify the archive, integrated target, checksum, and recorded work tip while
+  the branch still exists, and delete the branch with `git branch -d` only as
+  the last cleanup action. If a post-worktree check fails, recreate the
+  worktree from `WORK_TIP`; do not delete the branch.
 
-The final no-inbound-reference check iterates the exact removed directory,
-path, and basename strings and fails on any tracked match:
+The final no-inbound-reference check inspects Markdown link targets, not
+historical prose, for the exact removed directory, path, and basename strings:
 
 ```bash
 for retired in 2026-07-15-1415 2026-07-17-1739 2026-07-18-0319 2026-07-15-dag-information-area.md 2026-07-17-dag-scenario-corpus.md 2026-07-12-guided-completion-layout-favicon-design.md 2026-07-24-out-of-box-example-packaging-design.md 2026-07-26-dag-corpus-wave-a-design.md 2026-07-28-aws-rds-immutable-trust-root-design.md 2026-08-01-execution-validation-pipeline-refactor-design.md 2026-08-01-llm-source-design.md 2026-08-26-blob-json-expand-design.md 2026-08-26-reference-join-design.md touched-file-residue-ledger.md; do
-  if git grep -n -F -- "$retired" -- .; then exit 1; fi
+  if git grep -n -E "(\\]\\([^)]*|^\\[[^]]+\\]:[[:space:]]*.*)${retired}" -- '*.md'; then exit 1; fi
 done
 ```
 
