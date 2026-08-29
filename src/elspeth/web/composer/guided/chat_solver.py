@@ -2777,7 +2777,56 @@ async def maybe_resolve_step_1_source_chat(
                     )
                 try:
                     result = _parse_step_1_source_tool_arguments(arguments, plugin_hint=plugin_hint)
-                except (GuidedToolArgumentShapeError, AssistantScaffoldLeakError):
+                except AssistantScaffoldLeakError:
+                    # Quality guard, deliberately unrepaired (step-2 parity:
+                    # its scaffold-leak arm raises too) — a leaked internal
+                    # transcript is not a resend-able omission.
+                    if deferred_actions:
+                        # Same retention rule for a shape-invalid source half.
+                        status = ComposerLLMCallStatus.SUCCESS
+                        return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                            actions=deferred_actions,
+                            resolution_error_class="PairedResolutionShapeRejected",
+                        )
+                    raise
+                except GuidedToolArgumentShapeError as exc:
+                    # Bounded shape self-repair (elspeth-79e66ff613 stage 2 —
+                    # the step-1 arm of step-2's resolve_sink repair): on an
+                    # UNHINTED first turn the parser has no server-owned
+                    # default for an omitted ``plugin``, and terminalizing the
+                    # Send turned a resend-able omission into the session's
+                    # first user-facing error. Thread the rejection back as
+                    # the tool result and let the model resend within the
+                    # same Send. The repair copy echoes the validator's
+                    # rejection — never a chosen value (composer invariant 1);
+                    # bounded by the shared attempt cap, and the rejected
+                    # attempt keeps its own MALFORMED_RESPONSE audit row via
+                    # the finally-block recorder. At exhaustion the
+                    # pre-repair behavior applies (paired retain salvage,
+                    # else raise).
+                    if attempt_index + 1 < max_attempts:
+                        rejected_source_call = source_calls[0] if source_calls else terminal_calls[0]
+                        shape_repair_results: list[dict[str, Any]] = []
+                        for tool_call in tool_calls:
+                            if tool_call is rejected_source_call:
+                                content = (
+                                    f"resolve_source rejected: the arguments were malformed: {exc} "
+                                    "Resend the complete resolve_source call with every required key."
+                                )
+                            else:
+                                content = (
+                                    "Not applied: the grouped resolve_source call was rejected. "
+                                    "After correcting it, resend ALL calls together in one reply."
+                                )
+                            shape_repair_results.append({"role": "tool", "tool_call_id": tool_call.id, "content": content})
+                        deferred_repair_thread = [
+                            _assistant_tool_calls_message(message, tool_calls),
+                            *shape_repair_results,
+                        ]
+                        status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+                        error_class = type(exc).__name__
+                        error_message = "malformed_response"
+                        continue
                     if deferred_actions:
                         # Same retention rule for a shape-invalid source half.
                         status = ComposerLLMCallStatus.SUCCESS
