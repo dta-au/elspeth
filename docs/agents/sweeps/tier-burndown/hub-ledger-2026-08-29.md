@@ -68,3 +68,35 @@
   dispatch.
 - Still owed before the re-stage (NOT a Wave-3 gate): elspeth-23ee8e3440 (stage_status --lanes /
   --continue-on-block) and the operator's check-judge-quality re-run for the f0e38838d rotation.
+
+## WAVE 3 CLOSED (2026-08-29, hub; tip e94fe3250)
+- All 7 buckets + hygiene lane merged --no-ff over 25cce9cdb..771e36a89; wording lane merged e94fe3250.
+  Corpus (findings-only, allowlist-disabled, hub-measured at every merge): 2873 → 2535 = **338 removed**
+  (B56 127, hyg 1, B54 113, B58 11, B59 14, B60 23, B57 22, B61 27); ~119 rationalised across sidecars
+  B{54,56,57,59,60,61}.rationales.json. Full suite GREEN @771e36a89: 43485/66/1x, 0 failed (18:16, -n 16).
+- Two-lens audit (comments 8814/8815 lens B, 8816 lens A; wording fixes merged via tier/w3wording):
+  ZERO fail-open regressions, ZERO deleted real gates, composer invariants clean, all 10 B54 widenings
+  honestly pinned (fingerprints match the rule's own resolver). Every surviving finding was PROSE
+  (false mechanism, true conclusion) and is now rewritten to measured ground — see the w3wording merge.
+- Real defects found+fixed inside the wave: B59's tool-outcome projection read the audit envelope at the
+  wrong level (applied mutations rendered as lookups; eval parity copy carried the identical bug — both
+  fixed, producer-minted tests); B60's fork blob-custody absent-`options` fail-open; hyg3's reachable
+  redaction nested-frozen normalisation miss; B54's catalog_items unguarded index; eval classifier
+  lockstep drift (lens-B F1, 060d95649).
+- RE-STAGE additions from Wave 3 (all measured, per-lane comments have the entries):
+  * stale_delete: B56 ×3 (already stale at base), B58 ×1 (engine.py fp=d823ee01639278b7, cleared by fix),
+    B59 ×6, B60 ×9 (incl. `_reattach_guided_blob_refs` ×4 — zero live findings, pure dead weight),
+    B61 ×5, B57 ×16. Zero binding rulings were disturbed anywhere in the wave.
+  * OPERATOR (lens-A F3): the Wave-2 B43-era `_validate_schema_form_payload` @trust_boundary invariant
+    carries half-false "arrive deep-frozen" prose and MAY be signed — never hand-edit; at re-stage, read
+    the prose against live code and route per the sidecar-WINS/drift_repair rules.
+  * Commit 4f11a28a3 (B61)'s message contains an impossible deep_freeze claim; no sidecar entry carries
+    it. Correction text is in epic comment 8817 — treat the sidecar + this ledger as authoritative over
+    that commit message.
+  * BEFORE the next stage_scan: land elspeth-0bd4fb6042 (P2 — tier_model rule's _R5_NAMED_BOUNDARY_CONTEXTS
+    dead entries + staleness reporting; deleting them surfaces ~3 currently-exempt findings honestly).
+- Follow-up tickets filed this wave-end: elspeth-0bd4fb6042 (P2 lints map), elspeth-3b6708ef3d (P3
+  blobs_inline far-away-thaw), elspeth-b5d005a913 (P3 service.py accept-gates → reject).
+- Wave 4 (B26–28, web/_aws_ecs_acceptance, ~434 findings) remains PAUSED on John's module-level
+  @trust_boundary decision (plan doc note); the wave-3 evidence for that call: boundary-per-payload-type
+  removed 113/121 in plugin_policy (B54) and the acceptance harness is Tier-3-by-construction throughout.
