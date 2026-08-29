@@ -18,13 +18,13 @@ import contextlib
 import hashlib
 import json
 import threading
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import Callable, Coroutine, Iterator, Mapping
 from concurrent.futures import Future
 from dataclasses import replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 from uuid import UUID, uuid4
@@ -37,6 +37,7 @@ from elspeth.contracts import CallType, NodeStateStatus, NodeType
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import CreationModality, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.run_result import RunResult
@@ -91,7 +92,7 @@ from elspeth.web.execution.schemas import (
     ValidationResult,
 )
 from elspeth.web.execution.secret_guard import ExecutionSecretApprovalRequired
-from elspeth.web.execution.service import _MAX_FRAME_PATH_PARTS, ExecutionServiceImpl
+from elspeth.web.execution.service import _MAX_FRAME_PATH_PARTS, ExecutionServiceImpl, _discover_blob_rows_sources
 from elspeth.web.execution.validation import validate_pipeline as _real_validate_pipeline
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY
 from elspeth.web.plugin_policy.models import (
@@ -4356,6 +4357,66 @@ def _blob_rows_record_for_entry(entry: dict[str, Any], *, session_id: UUID, **ov
     }
     values.update(overrides)
     return _blob_record_stub(**values)
+
+
+class TestBlobRowsDiscoveryReadsFrozenConfig:
+    """``_discover_blob_rows_sources`` decides whether ADMISSION runs at all.
+
+    Its answer gates the whole ``blob_rows`` admission block — session
+    ownership, ``ready`` status, payload-hash and metadata-divergence checks.
+    A source block it fails to recognise is therefore not a conservative
+    abstention; it is a silent skip of every one of those controls, and one
+    that no existing test would catch, because a skipped block asserts
+    nothing.
+
+    ``FrozenRunSettings.__post_init__`` deep-freezes ``executable_config``,
+    which renders every nested source block as a ``mappingproxy``. These pins
+    are built through that real producer (never ``deep_freeze`` on a literal,
+    which would keep passing if the producer stopped freezing) and assert the
+    frozen and thawed forms of the SAME config yield the SAME discovery — so
+    the pin survives any future improvement rather than encoding today's bug.
+    """
+
+    @staticmethod
+    def _frozen_and_thawed(config: dict[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        settings = FrozenRunSettings(
+            plugin_snapshot=PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service()),
+            executable_config=config,
+            audit_safe_config={},
+        )
+        frozen = settings.executable_config
+        # The producer really did freeze: without this the pin degrades to
+        # comparing two thawed mappings and proves nothing.
+        assert type(frozen) is MappingProxyType
+        return frozen, cast(Mapping[str, Any], deep_thaw(frozen))
+
+    @pytest.mark.parametrize("singular", [False, True])
+    def test_declared_blob_rows_source_is_discovered_frozen_and_thawed(self, singular: bool) -> None:
+        entry = _blob_rows_entry(b"page", blob_id=uuid4())
+        config = json.loads(_blob_rows_pipeline_yaml([entry], singular=singular))
+        frozen, thawed = self._frozen_and_thawed(config)
+
+        from_frozen = _discover_blob_rows_sources(frozen)
+        from_thawed = _discover_blob_rows_sources(thawed)
+
+        expected_label = "source" if singular else "source:documents"
+        assert [label for label, _options in from_frozen] == [expected_label]
+        assert [label for label, _options in from_thawed] == [expected_label]
+        assert [(label, deep_thaw(options)) for label, options in from_frozen] == from_thawed
+
+    @pytest.mark.parametrize("singular", [False, True])
+    def test_config_without_blob_rows_discovers_nothing_frozen_or_thawed(self, singular: bool) -> None:
+        """The untouched arm: recognising the frozen form must not invent sources."""
+        source_block = {"plugin": "csv", "on_success": "rows", "options": {"path": "in.csv"}}
+        config: dict[str, Any] = {"sinks": {"primary": {"plugin": "json", "options": {"path": "out.jsonl"}}}}
+        if singular:
+            config["source"] = source_block
+        else:
+            config["sources"] = {"documents": source_block}
+        frozen, thawed = self._frozen_and_thawed(config)
+
+        assert _discover_blob_rows_sources(frozen) == []
+        assert _discover_blob_rows_sources(thawed) == []
 
 
 @pytest.mark.usefixtures("mock_pipeline_config_assembly")

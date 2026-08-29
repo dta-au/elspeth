@@ -8,13 +8,18 @@ so the assertions here are load-bearing for the bulk-promotion wave.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Annotated, Any
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import stable_hash
+from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
 from elspeth.web.composer.redaction import (
     MANIFEST,
     REDACTED_BLOB_SOURCE_PATH,
@@ -1047,6 +1052,86 @@ def test_normalize_set_pipeline_redacted_arguments_membership_shapes() -> None:
     normalized = normalize_set_pipeline_redacted_arguments(null_blob)
     assert normalized == {"source": {"plugin": "csv"}, "nodes": []}
     assert null_blob["source"] == {"plugin": "csv", "inline_blob": None}
+
+
+def _frozen_set_pipeline_arguments(source_block: dict[str, Any]) -> Mapping[str, Any]:
+    """Return a set_pipeline-shaped mapping frozen by a real freezing producer.
+
+    ``PipelineProposal.__post_init__`` deep-freezes ``pipeline``, so the
+    mapping and every nested block come back as ``mappingproxy``. Building the
+    frozen form here rather than calling ``deep_freeze`` on a literal is what
+    makes the pins below fail if that authority ever stops freezing — a
+    literal would stay green and prove nothing.
+
+    It is the NEAREST real producer rather than the owner of this exact value:
+    nothing in the tree freezes the *redacted* projection, which reaches the
+    normaliser through ``json.loads`` / ``redact_tool_call_arguments``. What
+    the proposal contributes is a genuinely frozen set_pipeline-shaped
+    mapping, which is the input class under test.
+    """
+    proposal = PipelineProposal.create(
+        pipeline={"source": source_block, "nodes": []},
+        base=AbsentBase(),
+        reviewed_facts={},
+        surface=PlannerSurface.GUIDED_FULL,
+        repair_count=0,
+        skill_hash=stable_hash("planner-skill"),
+        covered_deferred_intent_ids=(),
+        supersedes_draft_hash=None,
+    )
+    frozen = proposal.pipeline
+    assert type(frozen) is MappingProxyType
+    assert type(frozen["source"]) is MappingProxyType
+    return frozen
+
+
+def test_normalize_set_pipeline_redacted_arguments_reads_the_frozen_authority_form() -> None:
+    """Frozen and thawed spellings of one proposal must normalise identically.
+
+    ``normalize_set_pipeline_redacted_arguments`` answers "nothing to
+    normalise" by returning its argument unchanged, so a mapping it fails to
+    RECOGNISE is indistinguishable from one that needed no work — the two
+    spellings of "no inline blob" then persist as different redacted authority
+    projections. ``_create_composition_proposal`` compares that projection to
+    the manifest's and raises ``AuditIntegrityError`` on a mismatch, and
+    ``ComposerToolInvocation`` banks ``semantic_arguments_hash =
+    stored_authority_hash`` whenever the normaliser returned its input
+    identically — so an unrecognised frozen mapping is banked under a hash for
+    a projection that was never produced.
+    """
+    null_blob_source: dict[str, Any] = {"plugin": "csv", "inline_blob": None}
+    frozen = _frozen_set_pipeline_arguments(null_blob_source)
+    thawed = deep_thaw(frozen)
+
+    from_frozen = normalize_set_pipeline_redacted_arguments(frozen)
+    from_thawed = normalize_set_pipeline_redacted_arguments(thawed)
+
+    # Normalise-then-thaw and thaw-then-normalise must commute: the frozen and
+    # thawed spellings of one authority carry the same redacted projection.
+    # (The frozen result keeps its frozen carriers — ``nodes`` stays a tuple —
+    # so the comparison is on thawed content, not container identity.)
+    assert from_thawed == {"source": {"plugin": "csv"}, "nodes": []}
+    assert deep_thaw(from_frozen) == from_thawed
+    # The nested arm is the reachable one: a shallow thaw of the authority
+    # leaves a real outer dict whose ``source`` is still frozen, which passes
+    # ComposerToolInvocation's outer exact-dict reject-gate untouched.
+    shallow = dict(frozen)
+    assert type(shallow["source"]) is MappingProxyType
+    assert deep_thaw(normalize_set_pipeline_redacted_arguments(shallow)) == from_thawed
+
+
+def test_normalize_set_pipeline_redacted_arguments_leaves_a_frozen_redacted_blob_alone() -> None:
+    """The untouched arm: recognising the frozen form must not drop a real blob."""
+    redacted_source: dict[str, Any] = {"plugin": "csv", "inline_blob": "<redacted>"}
+    frozen = _frozen_set_pipeline_arguments(redacted_source)
+
+    assert normalize_set_pipeline_redacted_arguments(frozen) is frozen
+    shallow = dict(frozen)
+    assert normalize_set_pipeline_redacted_arguments(shallow) is shallow
+    assert normalize_set_pipeline_redacted_arguments(deep_thaw(frozen)) == {
+        "source": {"plugin": "csv", "inline_blob": "<redacted>"},
+        "nodes": [],
+    }
 
 
 def _sentinel_projection_meta(real_path: str, sentinel: str, entries: object) -> dict[str, Any]:
