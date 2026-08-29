@@ -8,7 +8,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -47,6 +47,9 @@ from elspeth.web.composer.guided.state_machine import (
     DeferredStageIntent,
     GuidedProposalRef,
     GuidedSession,
+    TerminalKind,
+    TerminalReason,
+    TerminalState,
     TurnRecord,
     guided_reviewed_anchor_hash,
 )
@@ -74,6 +77,7 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationSettlementConflictError,
     GuidedOperationTakenOver,
     GuidedOriginatingUserMessageDraft,
+    GuidedPendingProposalInvalidation,
     GuidedReplayPolicyFinding,
     GuidedReplayTurn,
     GuidedResponseDescriptor,
@@ -2843,3 +2847,80 @@ async def test_opted_out_interpretation_resolves_and_binds_derived_result_in_sam
         events = conn.execute(select(interpretation_events_table)).all()
     assert operation.result_state_id == str(settlement.result_state.id)
     assert len(events) == 2  # one durable opt-out marker and one resolved surface
+
+
+def _pending_proposal_invalidation() -> GuidedPendingProposalInvalidation:
+    return GuidedPendingProposalInvalidation(
+        proposal_id=uuid4(),
+        draft_hash="a" * 64,
+        reviewed_facts={},
+        reason="guided_exit",
+    )
+
+
+def _terminal_exit_command(composer_meta: Mapping[str, Any]) -> GuidedStateOperationCommand:
+    """Build the terminal-exit invalidation command over an arbitrary composer_meta."""
+
+    return GuidedStateOperationCommand(
+        fence=GuidedOperationFence(session_id=uuid4(), operation_id="op", lease_token="lease", attempt=1),
+        expected_current_state_id=None,
+        expected_current_state_version=None,
+        expected_current_content_hash=None,
+        state_id=uuid4(),
+        state=CompositionStateData(is_valid=False, composer_meta=composer_meta),
+        provenance="convergence_persist",
+        actor="worker",
+        response=GuidedResponseDescriptor(kind="guided_respond", next_turn=None, assistant_turn_seq=None),
+        invalidated_pending_proposal=_pending_proposal_invalidation(),
+    )
+
+
+def test_terminal_exit_checkpoint_authorizes_pending_proposal_invalidation() -> None:
+    """The terminal walk reads the FROZEN composer_meta CompositionStateData produces.
+
+    ``CompositionStateData.__post_init__`` calls ``freeze_fields`` on
+    ``composer_meta``, so both the mapping and its nested ``guided_session``
+    reach ``_validate_deferred_intent_sidebands`` as ``mappingproxy``. Built
+    through the real producers (``TerminalState`` -> ``GuidedSession.to_dict``
+    -> ``CompositionStateData``) so the pin cannot pass on a dict literal that
+    the freeze no longer touches.
+    """
+
+    terminal = TerminalState(
+        kind=TerminalKind.EXITED_TO_FREEFORM,
+        reason=TerminalReason.USER_PRESSED_EXIT,
+        pipeline_yaml=None,
+    )
+    exited = replace(GuidedSession.initial(), terminal=terminal)
+
+    command = _terminal_exit_command({"guided_session": exited.to_dict()})
+
+    # The accept arm only holds if the guard recognises the frozen form; a
+    # bare ``type(x) is dict`` here would reject the real producer's output.
+    assert type(command.state.composer_meta) is MappingProxyType
+    assert type(command.state.composer_meta["guided_session"]) is MappingProxyType
+    assert command.invalidated_pending_proposal is not None
+
+
+@pytest.mark.parametrize(
+    ("label", "composer_meta"),
+    [
+        ("no_terminal", {"guided_session": GuidedSession.initial().to_dict()}),
+        ("no_guided_session", {"other": "meta"}),
+    ],
+)
+def test_pending_proposal_invalidation_requires_a_terminal_or_deferred_action(
+    label: str,
+    composer_meta: Mapping[str, Any],
+) -> None:
+    """The reject arm: no terminal checkpoint and no deferred action fails closed."""
+
+    with pytest.raises(AuditIntegrityError, match="requires a deferred intent action or a terminal exit checkpoint"):
+        _terminal_exit_command(composer_meta)
+
+
+def test_pending_proposal_invalidation_rejects_a_non_mapping_guided_session() -> None:
+    """A malformed guided_session raises precisely rather than reading as absent."""
+
+    with pytest.raises(AuditIntegrityError, match="Guided session composer metadata must be an exact mapping"):
+        _terminal_exit_command({"guided_session": ["not", "a", "mapping"]})
