@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "ChromaDB collection name",
@@ -16,7 +17,8 @@
         "label": "Collection",
         "name": "collection",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Connection mode",
@@ -28,7 +30,8 @@
         "label": "Mode",
         "name": "mode",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -37,7 +40,8 @@
         "label": "Persist Directory",
         "name": "persist_directory",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -46,7 +50,8 @@
         "label": "Host",
         "name": "host",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 8000,
@@ -55,7 +60,8 @@
         "label": "Port",
         "name": "port",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": true,
@@ -64,7 +70,8 @@
         "label": "SSL",
         "name": "ssl",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "cosine",
@@ -78,7 +85,8 @@
         "label": "Distance Function",
         "name": "distance_function",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Maps row fields to ChromaDB document/id/metadata",
@@ -86,7 +94,8 @@
         "label": "Field Mapping",
         "name": "field_mapping",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "overwrite",
@@ -100,7 +109,8 @@
         "label": "On Duplicate",
         "name": "on_duplicate",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

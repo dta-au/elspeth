@@ -286,7 +286,7 @@ def _lower_nested_field(name: str, info: FieldInfo, *, depth: int) -> KnobField:
             return field
 
     # Scalars, enums, string-lists, and dict[str, scalar] reuse the flat lowering.
-    return _lower_field(name, info, plugin_kind="", plugin_name="", composer_tier_default="common")
+    return _lower_field(name, info, plugin_kind="", plugin_name="")
 
 
 def _lower_nested_model(model_cls: type[BaseModel], *, depth: int) -> KnobSchema:
@@ -305,9 +305,8 @@ def _lower_field(
     *,
     plugin_kind: str,
     plugin_name: str,
-    composer_tier_default: str,
 ) -> KnobField:
-    del plugin_kind, plugin_name, composer_tier_default
+    del plugin_kind, plugin_name
 
     # Dual-form nested-model union (LLMConfig.queries): expose the typed query
     # structure instead of collapsing the list|dict union to an opaque json-value.
@@ -397,14 +396,22 @@ def _composer_extras(info: FieldInfo) -> Mapping[str, Any] | None:
 
 
 def _attach_tier(field: KnobField, info: FieldInfo) -> None:
+    """Attach the composer tier; absent or malformed metadata lowers to "common".
+
+    Plugins opt knobs OUT of the default view with
+    ``json_schema_extra={"composer_tier": "advanced"}``; ``"essential"`` is
+    reserved for the knobs a guided step asks about by name. Every wire field
+    carries a tier so the form never has to guess (elspeth-9cca900d41).
+    An unrecognised tier string lowers to "common" rather than raising:
+    tier is presentational, not audit-bearing.
+    """
+    tier: FieldTier = "common"
     extra = _composer_extras(info)
-    if extra is None:
-        return
-    if "composer_tier" not in extra:
-        return
-    tier = extra["composer_tier"]
-    if tier in ("essential", "common", "advanced"):
-        field["tier"] = cast(FieldTier, tier)
+    if extra is not None and "composer_tier" in extra:
+        declared = extra["composer_tier"]
+        if declared in ("essential", "common", "advanced"):
+            tier = cast(FieldTier, declared)
+    field["tier"] = tier
 
 
 def _attach_required_when(field: KnobField, info: FieldInfo) -> None:
@@ -445,7 +452,6 @@ def lower_model_to_knob_schema(
     *,
     plugin_kind: str,
     plugin_name: str,
-    composer_tier_default: str = "common",
 ) -> KnobSchema:
     """Lower a single-model Pydantic config class to ``KnobSchema``.
 
@@ -466,7 +472,6 @@ def lower_model_to_knob_schema(
                 info,
                 plugin_kind=plugin_kind,
                 plugin_name=plugin_name,
-                composer_tier_default=composer_tier_default,
             )
         )
     return {"fields": fields}
@@ -539,7 +544,6 @@ def lower_discriminated_to_knob_schema(
     *,
     plugin_kind: str,
     plugin_name: str,
-    composer_tier_default: str = "common",
 ) -> KnobSchema:
     """Lower a discriminated-union plugin to a flat visible_when schema."""
     try:
@@ -570,6 +574,7 @@ def lower_discriminated_to_knob_schema(
             "enum": list(variants.keys()),
             "required": True,
             "nullable": False,
+            "tier": "common",
         }
     ]
     for variant_value, variant_cls in variants.items():
@@ -583,7 +588,6 @@ def lower_discriminated_to_knob_schema(
                 info,
                 plugin_kind=plugin_kind,
                 plugin_name=plugin_name,
-                composer_tier_default=composer_tier_default,
             )
             inner_field["visible_when"] = {"field": discriminator, "equals": variant_value}
             fields.append(inner_field)

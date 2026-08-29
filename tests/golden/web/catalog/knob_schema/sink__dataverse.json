@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Dataverse environment URL (e.g., https://myorg.crm.dynamics.com)",
@@ -16,7 +17,8 @@
         "label": "Environment URL",
         "name": "environment_url",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Authentication configuration",
@@ -24,7 +26,8 @@
         "label": "Auth",
         "name": "auth",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "v9.2",
@@ -33,7 +36,8 @@
         "label": "API Version",
         "name": "api_version",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Target Dataverse EntitySetName used in the OData collection path",
@@ -41,7 +45,8 @@
         "label": "Entity",
         "name": "entity",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "upsert",
@@ -53,7 +58,8 @@
         "label": "Mode",
         "name": "mode",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Pipeline field \u2192 Dataverse column mapping",
@@ -61,7 +67,8 @@
         "label": "Field Mapping",
         "name": "field_mapping",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Business key field for upsert (PATCH with alternate key)",
@@ -69,7 +76,8 @@
         "label": "Alternate Key",
         "name": "alternate_key",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -78,7 +86,8 @@
         "label": "Lookups",
         "name": "lookups",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -88,7 +97,8 @@
         "label": "Additional Domains",
         "name": "additional_domains",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

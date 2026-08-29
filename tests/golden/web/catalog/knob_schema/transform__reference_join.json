@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -18,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "The reference table as raw text. Written by the settings loader from 'reference_file' on the CLI, or by inline_content blob substitution on the web. Authoring it directly inline is legal but usually means a file was intended.",
@@ -26,7 +28,8 @@
         "label": "Reference Content",
         "name": "reference_content",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -35,7 +38,8 @@
         "label": "Reference Source",
         "name": "reference_source",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "How to parse reference_content. Never inferred \u2014 a blob carries no reliable type.",
@@ -47,7 +51,8 @@
         "label": "Reference Format",
         "name": "reference_format",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Input field whose value is matched against the reference table key.",
@@ -55,7 +60,8 @@
         "label": "Key Field",
         "name": "key_field",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Name of the key WITHIN each reference entry (a CSV header, or a JSON object member). Deliberately not named '*_field': it names a column of the reference table, not of the row.",
@@ -63,7 +69,8 @@
         "label": "Reference Key Name",
         "name": "reference_key_name",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Map of output field name to an expression over the matched entry, bound as 'ref' (for example \"ref['description']\" or \"ref['tax']['rate']\").",
@@ -71,7 +78,8 @@
         "label": "Output",
         "name": "output",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "fail",
@@ -85,7 +93,8 @@
         "label": "On Miss",
         "name": "on_miss",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Per-output-field fallback values used when on_miss is 'default'.",
@@ -93,7 +102,8 @@
         "label": "Default Values",
         "name": "default_values",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

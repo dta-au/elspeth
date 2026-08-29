@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -18,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Mapping of field names to maximum lengths",
@@ -26,7 +28,8 @@
         "label": "Fields",
         "name": "fields",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "",
@@ -35,7 +38,8 @@
         "label": "Suffix",
         "name": "suffix",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": false,
@@ -44,7 +48,8 @@
         "label": "Strict",
         "name": "strict",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

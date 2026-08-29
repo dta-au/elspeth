@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "S3 bucket name or access-point identifier",
@@ -16,7 +17,8 @@
         "label": "Bucket",
         "name": "bucket",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "S3 object key",
@@ -24,7 +26,8 @@
         "label": "Key",
         "name": "key",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "csv",
@@ -38,7 +41,8 @@
         "label": "Format",
         "name": "format",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "CSV parsing options",
@@ -46,7 +50,8 @@
         "label": "CSV Options",
         "name": "csv_options",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "JSON and JSONL parsing options",
@@ -54,7 +59,8 @@
         "label": "JSON Options",
         "name": "json_options",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -64,7 +70,8 @@
         "label": "Columns",
         "name": "columns",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -73,7 +80,8 @@
         "label": "Field Mapping",
         "name": "field_mapping",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Quarantine sink name or explicit discard",
@@ -81,7 +89,8 @@
         "label": "On Validation Failure",
         "name": "on_validation_failure",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -90,7 +99,8 @@
         "label": "Region Name",
         "name": "region_name",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -99,7 +109,8 @@
         "label": "Endpoint URL",
         "name": "endpoint_url",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 268435456,
@@ -108,7 +119,8 @@
         "label": "Max Object Bytes",
         "name": "max_object_bytes",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 1000000,
@@ -117,7 +129,8 @@
         "label": "Max Record Chars",
         "name": "max_record_chars",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

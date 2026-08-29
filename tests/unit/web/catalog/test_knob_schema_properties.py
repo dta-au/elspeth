@@ -138,3 +138,18 @@ def test_rich_shapes_lower_to_fallback_knobs_without_raising() -> None:
     assert fields_by_name["array"]["kind"] == "json-array"
     assert fields_by_name["union_value"]["kind"] == "json-value"
     assert fields_by_name["mapping"]["kind"] == "json-object"
+
+
+def test_every_lowered_field_carries_a_tier_defaulting_to_common() -> None:
+    from pydantic import BaseModel, Field
+
+    from elspeth.web.catalog.knob_schema import lower_model_to_knob_schema
+
+    class Model(BaseModel):
+        plain: str = Field("x", description="plain")
+        tuned: int = Field(1, description="tuned", json_schema_extra={"composer_tier": "advanced"})
+
+    schema = lower_model_to_knob_schema(Model, plugin_kind="transform", plugin_name="example")
+    by_name = {field["name"]: field for field in schema["fields"]}
+    assert by_name["plain"]["tier"] == "common"
+    assert by_name["tuned"]["tier"] == "advanced"

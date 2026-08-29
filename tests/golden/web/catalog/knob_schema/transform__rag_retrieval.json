@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -18,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Prefix used for fields emitted by retrieval, such as contexts and scores.",
@@ -26,7 +28,8 @@
         "label": "Output Prefix",
         "name": "output_prefix",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Input row field containing the retrieval query text.",
@@ -34,7 +37,8 @@
         "label": "Query Field",
         "name": "query_field",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -43,7 +47,8 @@
         "label": "Query Template",
         "name": "query_template",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -52,7 +57,8 @@
         "label": "Query Pattern",
         "name": "query_pattern",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Retrieval provider name registered in the RAG provider catalog.",
@@ -64,7 +70,8 @@
         "label": "Provider",
         "name": "provider",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Provider-specific retrieval configuration passed to the selected provider.",
@@ -72,7 +79,8 @@
         "label": "Provider",
         "name": "provider_config",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": 5,
@@ -81,7 +89,8 @@
         "label": "Top K",
         "name": "top_k",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 0.0,
@@ -90,7 +99,8 @@
         "label": "Min Score",
         "name": "min_score",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "quarantine",
@@ -103,7 +113,8 @@
         "label": "On No Results",
         "name": "on_no_results",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "numbered",
@@ -117,7 +128,8 @@
         "label": "Context Format",
         "name": "context_format",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "\n---\n",
@@ -126,7 +138,8 @@
         "label": "Context Separator",
         "name": "context_separator",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -135,7 +148,8 @@
         "label": "Max Context Length",
         "name": "max_context_length",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

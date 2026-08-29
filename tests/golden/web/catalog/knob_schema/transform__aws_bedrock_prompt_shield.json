@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -18,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Operator-installed Bedrock Guardrail identifier or ARN.",
@@ -26,7 +28,8 @@
         "label": "Guardrail Identifier",
         "name": "guardrail_identifier",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Published Bedrock Guardrail version used for evaluation.",
@@ -34,7 +37,8 @@
         "label": "Guardrail Version",
         "name": "guardrail_version",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "AWS region containing the Guardrail.",
@@ -42,7 +46,8 @@
         "label": "Region",
         "name": "region",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Input row fields whose text is evaluated by the Guardrail.",
@@ -51,7 +56,8 @@
         "label": "Fields",
         "name": "fields",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       }
     ]
   },

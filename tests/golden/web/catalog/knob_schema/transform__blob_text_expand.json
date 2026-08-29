@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -18,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "blob_ref",
@@ -27,7 +29,8 @@
         "label": "Blob Ref Field",
         "name": "blob_ref_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "line",
@@ -36,7 +39,8 @@
         "label": "Output Field",
         "name": "output_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": true,
@@ -45,7 +49,8 @@
         "label": "Include Index",
         "name": "include_index",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "line_index",
@@ -54,7 +59,8 @@
         "label": "Index Field",
         "name": "index_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -63,7 +69,8 @@
         "label": "Delimiter",
         "name": "delimiter",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "utf-8",
@@ -72,7 +79,8 @@
         "label": "Encoding",
         "name": "encoding",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": false,
@@ -81,7 +89,8 @@
         "label": "Skip Blank Lines",
         "name": "skip_blank_lines",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 100000,
@@ -90,7 +99,8 @@
         "label": "Max Output Rows",
         "name": "max_output_rows",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 104857600,
@@ -99,7 +109,8 @@
         "label": "Max Blob Bytes",
         "name": "max_blob_bytes",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

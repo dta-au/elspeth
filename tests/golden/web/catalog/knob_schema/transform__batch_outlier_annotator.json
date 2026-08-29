@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -18,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Name of the numeric field to annotate",
@@ -26,7 +28,8 @@
         "label": "Value Field",
         "name": "value_field",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "outlier",
@@ -35,7 +38,8 @@
         "label": "Output Prefix",
         "name": "output_prefix",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 3.0,
@@ -44,7 +48,8 @@
         "label": "Z Threshold",
         "name": "z_threshold",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 3.5,
@@ -53,7 +58,8 @@
         "label": "Robust Z Threshold",
         "name": "robust_z_threshold",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Sink name for non-conformant rows, or 'discard' for explicit drop",
@@ -16,7 +17,8 @@
         "label": "On Validation Failure",
         "name": "on_validation_failure",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Authoritative blob references, in authoring order (becomes source-row order).",
@@ -24,7 +26,8 @@
         "label": "Blobs",
         "name": "blobs",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       }
     ]
   },

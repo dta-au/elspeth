@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "On the web surface this field takes one of exactly two values: the sentinel \"blob:<uuid>\" naming a file uploaded to this session \u2014 normally prefilled for you, so leave it as it is \u2014 or a plain path that resolves inside this session's own subtree (a source reads from <data_dir>/blobs/<session_id>/; an output writes to <data_dir>/outputs/<session_id>/ or <data_dir>/blobs/<session_id>/). Every other path is rejected, including another session's subtree, a shared or deployment-level directory, and any absolute path outside those trees. Hand-authored YAML runs are not confined this way.",
@@ -16,7 +17,8 @@
         "label": "Path",
         "name": "path",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -34,7 +36,8 @@
         "required_when": {
           "equals": "write",
           "field": "mode"
-        }
+        },
+        "tier": "common"
       },
       {
         "default": null,
@@ -43,7 +46,8 @@
         "label": "Headers",
         "name": "headers",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -56,7 +60,8 @@
         "label": "Format",
         "name": "format",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -65,7 +70,8 @@
         "label": "Indent",
         "name": "indent",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "utf-8",
@@ -74,7 +80,8 @@
         "label": "Encoding",
         "name": "encoding",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "write",
@@ -87,7 +94,8 @@
         "label": "Mode",
         "name": "mode",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

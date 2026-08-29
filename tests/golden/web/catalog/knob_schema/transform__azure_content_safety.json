@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -18,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Azure Content Safety endpoint URL",
@@ -26,7 +28,8 @@
         "label": "Endpoint",
         "name": "endpoint",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Azure Content Safety API key",
@@ -34,7 +37,8 @@
         "label": "API Key",
         "name": "api_key",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Field name(s) to analyze, or 'all' for all string fields",
@@ -42,7 +46,8 @@
         "label": "Fields",
         "name": "fields",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": 3600,
@@ -51,7 +56,8 @@
         "label": "Max Capacity Retry Seconds",
         "name": "max_capacity_retry_seconds",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 3600,
@@ -60,7 +66,8 @@
         "label": "Batch Wait Timeout Seconds",
         "name": "batch_wait_timeout_seconds",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Per-category severity thresholds (0-6)",
@@ -68,7 +75,8 @@
         "label": "Thresholds",
         "name": "thresholds",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       }
     ]
   },

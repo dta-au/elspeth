@@ -315,7 +315,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Static Jinja2 prompt template",
@@ -323,7 +324,8 @@
         "label": "Prompt Template",
         "name": "prompt_template",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -332,7 +334,8 @@
         "label": "System Prompt",
         "name": "system_prompt",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 0.0,
@@ -341,7 +344,8 @@
         "label": "Temperature",
         "name": "temperature",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "llm_response",
@@ -350,7 +354,8 @@
         "label": "Response Field",
         "name": "response_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "standard",
@@ -363,7 +368,8 @@
         "label": "Response Format",
         "name": "response_format",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -372,7 +378,8 @@
         "label": "Output Fields",
         "name": "output_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Sink name for non-conformant output, or 'discard' for explicit drop",
@@ -380,7 +387,8 @@
         "label": "On Validation Failure",
         "name": "on_validation_failure",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -389,7 +397,8 @@
         "label": "Lookup",
         "name": "lookup",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

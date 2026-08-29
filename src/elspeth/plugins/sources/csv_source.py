@@ -40,9 +40,22 @@ class CSVSourceConfig(TabularSourceDataConfig):
     - columns, field_mapping (field normalization is mandatory)
     """
 
-    delimiter: str = Field(default=",", description="Single-character delimiter used to split CSV fields.")
-    encoding: str = Field(default="utf-8", description="Text encoding used to decode the CSV file.")
-    skip_rows: int = Field(default=0, ge=0, description="Number of leading physical rows to skip before reading headers or data.")
+    delimiter: str = Field(
+        default=",",
+        description="Single-character delimiter used to split CSV fields.",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    encoding: str = Field(
+        default="utf-8",
+        description="Text encoding used to decode the CSV file.",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    skip_rows: int = Field(
+        default=0,
+        ge=0,
+        description="Number of leading physical rows to skip before reading headers or data.",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
 
     @field_validator("delimiter")
     @classmethod

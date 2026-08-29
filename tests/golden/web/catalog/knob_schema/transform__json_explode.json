@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Name of the array field to explode",
@@ -16,7 +17,8 @@
         "label": "Array Field",
         "name": "array_field",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "item",
@@ -25,7 +27,8 @@
         "label": "Output Field",
         "name": "output_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": true,
@@ -34,7 +37,8 @@
         "label": "Include Index",
         "name": "include_index",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

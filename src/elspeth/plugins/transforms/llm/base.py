@@ -111,8 +111,19 @@ class LLMConfig(TransformDataConfig):
     )
     prompt_template: str = Field(..., description="Jinja2 prompt template")
     system_prompt: str | None = Field(None, description="Optional system prompt")
-    temperature: float = Field(0.0, ge=0.0, le=2.0, description="Sampling temperature")
-    max_tokens: int | None = Field(None, gt=0, description="Maximum tokens in response")
+    temperature: float = Field(
+        0.0,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    max_tokens: int | None = Field(
+        None,
+        gt=0,
+        description="Maximum tokens in response",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
     response_field: str = Field("llm_response", description="Field name for LLM response in output")
 
     # Single-prompt structured output. These are the top-level lift of the
@@ -130,6 +141,7 @@ class LLMConfig(TransformDataConfig):
             "Single-prompt response format mode (standard JSON object vs. enforced json_schema). "
             "Multi-query mode declares response_format per query instead."
         ),
+        json_schema_extra={"composer_tier": "advanced"},
     )
     output_fields: list[OutputFieldConfig] | None = Field(
         None,
@@ -138,6 +150,7 @@ class LLMConfig(TransformDataConfig):
             "Typed structured-output field definitions for single-prompt mode (None = unstructured "
             "response). Multi-query mode declares output_fields per query instead."
         ),
+        json_schema_extra={"composer_tier": "advanced"},
     )
 
     # Image inputs (docs/superpowers/specs/2026-08-25-llm-image-input-design.md §4):
@@ -150,13 +163,31 @@ class LLMConfig(TransformDataConfig):
     # not a silent no-op alias for omitting the key entirely (fail-fast, per
     # AWSTextractInlineAnalysisConfig's "at least one output target" precedent).
     image_inputs: list[ImageInputConfig] | None = Field(
-        None, min_length=1, description="Row columns to resolve as image message parts (absent = text-only)"
+        None,
+        min_length=1,
+        description="Row columns to resolve as image message parts (absent = text-only)",
+        json_schema_extra={"composer_tier": "advanced"},
     )
-    max_image_bytes: int = Field(5_242_880, gt=0, le=20_971_520, description="Per-image byte cap (hard upper bound 20 MiB)")
-    max_images_per_call: int = Field(20, gt=0, description="Maximum resolved images per LLM call")
+    max_image_bytes: int = Field(
+        5_242_880,
+        gt=0,
+        le=20_971_520,
+        description="Per-image byte cap (hard upper bound 20 MiB)",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    max_images_per_call: int = Field(
+        20,
+        gt=0,
+        description="Maximum resolved images per LLM call",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
 
     # File-based content with source paths for audit trail
-    lookup: dict[str, Any] | None = Field(None, description="Lookup data loaded from YAML file")
+    lookup: dict[str, Any] | None = Field(
+        None,
+        description="Lookup data loaded from YAML file",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
     prompt_template_source: str | None = Field(None, description="Prompt template file path for audit (None if inline)")
     lookup_source: str | None = Field(None, description="Lookup file path for audit (None if no lookup)")
     system_prompt_source: str | None = Field(None, description="System prompt file path for audit (None if inline)")
@@ -179,12 +210,42 @@ class LLMConfig(TransformDataConfig):
     )
 
     # Pool configuration fields (flat - assembled into PoolConfig by pool_config property)
-    pool_size: int = Field(1, ge=1, description="Number of concurrent requests (1 = sequential)")
-    min_dispatch_delay_ms: int = Field(0, ge=0, description="Minimum dispatch delay in milliseconds")
-    max_dispatch_delay_ms: int = Field(5000, ge=0, description="Maximum dispatch delay in milliseconds")
-    backoff_multiplier: float = Field(2.0, gt=1.0, description="Backoff multiplier on capacity error")
-    recovery_step_ms: int = Field(50, ge=0, description="Recovery step in milliseconds")
-    max_capacity_retry_seconds: int = Field(3600, gt=0, description="Max seconds to retry capacity errors")
+    pool_size: int = Field(
+        1,
+        ge=1,
+        description="Number of concurrent requests (1 = sequential)",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    min_dispatch_delay_ms: int = Field(
+        0,
+        ge=0,
+        description="Minimum dispatch delay in milliseconds",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    max_dispatch_delay_ms: int = Field(
+        5000,
+        ge=0,
+        description="Maximum dispatch delay in milliseconds",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    backoff_multiplier: float = Field(
+        2.0,
+        gt=1.0,
+        description="Backoff multiplier on capacity error",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    recovery_step_ms: int = Field(
+        50,
+        ge=0,
+        description="Recovery step in milliseconds",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    max_capacity_retry_seconds: int = Field(
+        3600,
+        gt=0,
+        description="Max seconds to retry capacity errors",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
 
     @property
     def pool_config(self) -> PoolConfig | None:

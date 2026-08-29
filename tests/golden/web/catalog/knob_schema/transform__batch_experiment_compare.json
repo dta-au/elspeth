@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -18,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Name of the field containing prompt/treatment variant labels",
@@ -26,7 +28,8 @@
         "label": "Variant Field",
         "name": "variant_field",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Name of the numeric outcome field to compare",
@@ -34,7 +37,8 @@
         "label": "Score Field",
         "name": "score_field",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -43,7 +47,8 @@
         "label": "Baseline Variant",
         "name": "baseline_variant",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

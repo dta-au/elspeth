@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -18,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "AWS region providing the Amazon Textract endpoint.",
@@ -26,7 +28,8 @@
         "label": "Region",
         "name": "region",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "default_chain",
@@ -39,7 +42,8 @@
         "label": "Auth Mode",
         "name": "auth_mode",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -48,7 +52,8 @@
         "label": "Aws Access Key ID",
         "name": "aws_access_key_id",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -57,7 +62,8 @@
         "label": "Aws Secret Access Key",
         "name": "aws_secret_access_key",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -66,7 +72,8 @@
         "label": "Aws Session Token",
         "name": "aws_session_token",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "blob_ref",
@@ -75,7 +82,8 @@
         "label": "Blob Ref Field",
         "name": "blob_ref_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Declared document format (jpeg, png, or pdf) for every row; runtime verifies the exact byte signature.",
@@ -88,7 +96,8 @@
         "label": "Document Format",
         "name": "document_format",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Unique Textract analysis features selected from TABLES, FORMS, QUERIES, SIGNATURES, and LAYOUT.",
@@ -96,7 +105,8 @@
         "label": "Feature Types",
         "name": "feature_types",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Single-page Textract query definitions; configured together with the QUERIES feature.",
@@ -104,7 +114,8 @@
         "label": "Queries",
         "name": "queries",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -113,7 +124,8 @@
         "label": "Text Field",
         "name": "text_field",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -122,7 +134,8 @@
         "label": "Page Count Field",
         "name": "page_count_field",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -131,7 +144,8 @@
         "label": "Metadata Field",
         "name": "metadata_field",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Optional mappings from normalized document facets to output row fields.",
@@ -139,7 +153,8 @@
         "label": "Extract",
         "name": "extract",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -148,7 +163,8 @@
         "label": "Result Field",
         "name": "result_field",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 5242880,
@@ -157,7 +173,8 @@
         "label": "Max Document Bytes",
         "name": "max_document_bytes",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 100000,
@@ -166,7 +183,8 @@
         "label": "Max Blocks",
         "name": "max_blocks",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 50000000,
@@ -175,7 +193,8 @@
         "label": "Max Result Bytes",
         "name": "max_result_bytes",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 120.0,
@@ -184,7 +203,8 @@
         "label": "Request Timeout Seconds",
         "name": "request_timeout_seconds",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 420.0,
@@ -193,7 +213,8 @@
         "label": "Batch Wait Timeout Seconds",
         "name": "batch_wait_timeout_seconds",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

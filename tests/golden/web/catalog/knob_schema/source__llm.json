@@ -12,7 +12,8 @@
         "label": "provider",
         "name": "provider",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
@@ -22,6 +23,7 @@
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -35,6 +37,7 @@
         "name": "model",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -47,6 +50,7 @@
         "name": "prompt_template",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -60,6 +64,7 @@
         "name": "system_prompt",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -73,6 +78,7 @@
         "name": "temperature",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -86,6 +92,7 @@
         "name": "max_tokens",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -99,6 +106,7 @@
         "name": "response_field",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -116,6 +124,7 @@
         "name": "response_format",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -129,6 +138,7 @@
         "name": "output_fields",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -141,6 +151,7 @@
         "name": "on_validation_failure",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -154,6 +165,7 @@
         "name": "lookup",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -167,6 +179,7 @@
         "name": "prompt_template_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -180,6 +193,7 @@
         "name": "lookup_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -193,6 +207,7 @@
         "name": "system_prompt_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -205,6 +220,7 @@
         "name": "deployment_name",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -217,6 +233,7 @@
         "name": "endpoint",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -229,6 +246,7 @@
         "name": "api_key",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -242,6 +260,7 @@
         "name": "api_version",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -255,6 +274,7 @@
         "name": "tracing",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -268,6 +288,7 @@
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -280,6 +301,7 @@
         "name": "model",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -292,6 +314,7 @@
         "name": "prompt_template",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -305,6 +328,7 @@
         "name": "system_prompt",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -318,6 +342,7 @@
         "name": "temperature",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -331,6 +356,7 @@
         "name": "max_tokens",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -344,6 +370,7 @@
         "name": "response_field",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -361,6 +388,7 @@
         "name": "response_format",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -374,6 +402,7 @@
         "name": "output_fields",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -386,6 +415,7 @@
         "name": "on_validation_failure",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -399,6 +429,7 @@
         "name": "lookup",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -412,6 +443,7 @@
         "name": "prompt_template_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -425,6 +457,7 @@
         "name": "lookup_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -438,6 +471,7 @@
         "name": "system_prompt_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -450,6 +484,7 @@
         "name": "api_key",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -463,6 +498,7 @@
         "name": "base_url",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -476,6 +512,7 @@
         "name": "timeout_seconds",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -489,6 +526,7 @@
         "name": "tracing",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -502,6 +540,7 @@
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -514,6 +553,7 @@
         "name": "model",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -526,6 +566,7 @@
         "name": "prompt_template",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -539,6 +580,7 @@
         "name": "system_prompt",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -552,6 +594,7 @@
         "name": "temperature",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -565,6 +608,7 @@
         "name": "max_tokens",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -578,6 +622,7 @@
         "name": "response_field",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -595,6 +640,7 @@
         "name": "response_format",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -608,6 +654,7 @@
         "name": "output_fields",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -620,6 +667,7 @@
         "name": "on_validation_failure",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -633,6 +681,7 @@
         "name": "lookup",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -646,6 +695,7 @@
         "name": "prompt_template_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -659,6 +709,7 @@
         "name": "lookup_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -672,6 +723,7 @@
         "name": "system_prompt_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -685,6 +737,7 @@
         "name": "region_name",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -698,6 +751,7 @@
         "name": "tracing",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -711,6 +765,7 @@
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -723,6 +778,7 @@
         "name": "model",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -735,6 +791,7 @@
         "name": "prompt_template",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -748,6 +805,7 @@
         "name": "system_prompt",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -761,6 +819,7 @@
         "name": "temperature",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -774,6 +833,7 @@
         "name": "max_tokens",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -787,6 +847,7 @@
         "name": "response_field",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -804,6 +865,7 @@
         "name": "response_format",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -817,6 +879,7 @@
         "name": "output_fields",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -829,6 +892,7 @@
         "name": "on_validation_failure",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -842,6 +906,7 @@
         "name": "lookup",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -855,6 +920,7 @@
         "name": "prompt_template_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -868,6 +934,7 @@
         "name": "lookup_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -881,6 +948,7 @@
         "name": "system_prompt_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -893,6 +961,7 @@
         "name": "endpoint",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -905,6 +974,7 @@
         "name": "api_key",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -918,6 +988,7 @@
         "name": "contract_major",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -931,6 +1002,7 @@
         "name": "required_capabilities",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -944,6 +1016,7 @@
         "name": "timeout_seconds",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -957,6 +1030,7 @@
         "name": "tracing",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"

@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -18,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Input row field containing the absolute HTTP(S) URL to fetch.",
@@ -26,7 +28,8 @@
         "label": "URL Field",
         "name": "url_field",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "blob_ref",
@@ -35,7 +38,8 @@
         "label": "Blob Ref Field",
         "name": "blob_ref_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "blob_content_type",
@@ -44,7 +48,8 @@
         "label": "Content Type Field",
         "name": "content_type_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "blob_size_bytes",
@@ -53,7 +58,8 @@
         "label": "Size Bytes Field",
         "name": "size_bytes_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "blob_sha256",
@@ -62,7 +68,8 @@
         "label": "Sha256 Field",
         "name": "sha256_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "fetch_status",
@@ -71,7 +78,8 @@
         "label": "Fetch Status Field",
         "name": "fetch_status_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "fetch_url_final",
@@ -80,7 +88,8 @@
         "label": "Fetch URL Final Field",
         "name": "fetch_url_final_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "fetch_url_final_ip",
@@ -89,7 +98,8 @@
         "label": "Fetch URL Final Ip Field",
         "name": "fetch_url_final_ip_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": [
@@ -110,7 +120,8 @@
         "label": "Allowed Content Types",
         "name": "allowed_content_types",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "HTTP fetching policy, timeout, contact, and host allowlist settings.",
@@ -118,7 +129,8 @@
         "label": "HTTP",
         "name": "http",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       }
     ]
   },

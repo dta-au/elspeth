@@ -363,6 +363,7 @@
             "type": "null"
           }
         ],
+        "composer_tier": "advanced",
         "default": null,
         "description": "Row columns to resolve as image message parts (absent = text-only)",
         "title": "Image Inputs"
@@ -377,11 +378,13 @@
             "type": "null"
           }
         ],
+        "composer_tier": "advanced",
         "default": null,
         "description": "Lookup data loaded from YAML file",
         "title": "Lookup"
       },
       "max_image_bytes": {
+        "composer_tier": "advanced",
         "default": 5242880,
         "description": "Per-image byte cap (hard upper bound 20 MiB)",
         "exclusiveMinimum": 0,
@@ -390,6 +393,7 @@
         "type": "integer"
       },
       "max_images_per_call": {
+        "composer_tier": "advanced",
         "default": 20,
         "description": "Maximum resolved images per LLM call",
         "exclusiveMinimum": 0,
@@ -409,6 +413,7 @@
             "type": "null"
           }
         ],
+        "composer_tier": "advanced",
         "default": null,
         "description": "Typed structured-output field definitions for single-prompt mode (None = unstructured response). Multi-query mode declares output_fields per query instead.",
         "title": "Output Fields"
@@ -471,6 +476,7 @@
       },
       "response_format": {
         "$ref": "#/$defs/ResponseFormat",
+        "composer_tier": "advanced",
         "default": "standard",
         "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
         "title": "Response Format"
@@ -496,6 +502,7 @@
         "title": "System Prompt"
       },
       "temperature": {
+        "composer_tier": "advanced",
         "default": 0.0,
         "description": "Sampling temperature",
         "maximum": 2.0,

@@ -96,13 +96,13 @@ def test_tier_annotation_emitted_when_set():
     assert f["tier"] == "advanced"
 
 
-def test_tier_absent_when_unannotated():
+def test_tier_defaults_to_common_when_unannotated():
     class Opts(BaseModel):
         debug: Annotated[bool, Field(title="Debug", description="Verbose output")] = False
 
     ks = lower_model_to_knob_schema(Opts, plugin_kind="source", plugin_name="test")
     f = ks["fields"][0]
-    assert "tier" not in f
+    assert f["tier"] == "common"
 
 
 def test_string_list_kind_for_list_of_str():

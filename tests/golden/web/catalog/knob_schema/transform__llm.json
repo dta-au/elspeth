@@ -12,7 +12,8 @@
         "label": "provider",
         "name": "provider",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
@@ -22,6 +23,7 @@
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -36,6 +38,7 @@
         "name": "required_input_fields",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -49,6 +52,7 @@
         "name": "model",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -66,7 +70,8 @@
               "label": "name",
               "name": "name",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "description": "Mapping of template variable name to row column name.",
@@ -74,7 +79,8 @@
               "label": "input_fields",
               "name": "input_fields",
               "nullable": false,
-              "required": true
+              "required": true,
+              "tier": "common"
             },
             {
               "default": "standard",
@@ -87,7 +93,8 @@
               "label": "response_format",
               "name": "response_format",
               "nullable": false,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "default": null,
@@ -100,7 +107,8 @@
                     "label": "Suffix",
                     "name": "suffix",
                     "nullable": false,
-                    "required": true
+                    "required": true,
+                    "tier": "common"
                   },
                   {
                     "description": "Data type for schema enforcement",
@@ -115,7 +123,8 @@
                     "label": "Type",
                     "name": "type",
                     "nullable": false,
-                    "required": true
+                    "required": true,
+                    "tier": "common"
                   },
                   {
                     "default": null,
@@ -125,7 +134,8 @@
                     "label": "Values",
                     "name": "values",
                     "nullable": true,
-                    "required": false
+                    "required": false,
+                    "tier": "common"
                   }
                 ]
               },
@@ -133,7 +143,8 @@
               "label": "output_fields",
               "name": "output_fields",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "default": null,
@@ -142,7 +153,8 @@
               "label": "template",
               "name": "template",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "default": null,
@@ -151,7 +163,8 @@
               "label": "max_tokens",
               "name": "max_tokens",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             }
           ]
         },
@@ -160,6 +173,7 @@
         "name": "queries",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -172,6 +186,7 @@
         "name": "prompt_template",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -185,6 +200,7 @@
         "name": "system_prompt",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -198,6 +214,7 @@
         "name": "temperature",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -211,6 +228,7 @@
         "name": "max_tokens",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -224,6 +242,7 @@
         "name": "response_field",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -241,6 +260,7 @@
         "name": "response_format",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -254,6 +274,7 @@
         "name": "output_fields",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -267,6 +288,7 @@
         "name": "image_inputs",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -280,6 +302,7 @@
         "name": "max_image_bytes",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -293,6 +316,7 @@
         "name": "max_images_per_call",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -306,6 +330,7 @@
         "name": "lookup",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -319,6 +344,7 @@
         "name": "prompt_template_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -332,6 +358,7 @@
         "name": "lookup_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -345,6 +372,7 @@
         "name": "system_prompt_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -358,6 +386,7 @@
         "name": "pool_size",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -371,6 +400,7 @@
         "name": "min_dispatch_delay_ms",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -384,6 +414,7 @@
         "name": "max_dispatch_delay_ms",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -397,6 +428,7 @@
         "name": "backoff_multiplier",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -410,6 +442,7 @@
         "name": "recovery_step_ms",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -423,6 +456,7 @@
         "name": "max_capacity_retry_seconds",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -435,6 +469,7 @@
         "name": "deployment_name",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -447,6 +482,7 @@
         "name": "endpoint",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -459,6 +495,7 @@
         "name": "api_key",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -472,6 +509,7 @@
         "name": "api_version",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -485,6 +523,7 @@
         "name": "tracing",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "azure",
           "field": "provider"
@@ -498,6 +537,7 @@
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -512,6 +552,7 @@
         "name": "required_input_fields",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -524,6 +565,7 @@
         "name": "model",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -541,7 +583,8 @@
               "label": "name",
               "name": "name",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "description": "Mapping of template variable name to row column name.",
@@ -549,7 +592,8 @@
               "label": "input_fields",
               "name": "input_fields",
               "nullable": false,
-              "required": true
+              "required": true,
+              "tier": "common"
             },
             {
               "default": "standard",
@@ -562,7 +606,8 @@
               "label": "response_format",
               "name": "response_format",
               "nullable": false,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "default": null,
@@ -575,7 +620,8 @@
                     "label": "Suffix",
                     "name": "suffix",
                     "nullable": false,
-                    "required": true
+                    "required": true,
+                    "tier": "common"
                   },
                   {
                     "description": "Data type for schema enforcement",
@@ -590,7 +636,8 @@
                     "label": "Type",
                     "name": "type",
                     "nullable": false,
-                    "required": true
+                    "required": true,
+                    "tier": "common"
                   },
                   {
                     "default": null,
@@ -600,7 +647,8 @@
                     "label": "Values",
                     "name": "values",
                     "nullable": true,
-                    "required": false
+                    "required": false,
+                    "tier": "common"
                   }
                 ]
               },
@@ -608,7 +656,8 @@
               "label": "output_fields",
               "name": "output_fields",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "default": null,
@@ -617,7 +666,8 @@
               "label": "template",
               "name": "template",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "default": null,
@@ -626,7 +676,8 @@
               "label": "max_tokens",
               "name": "max_tokens",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             }
           ]
         },
@@ -635,6 +686,7 @@
         "name": "queries",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -647,6 +699,7 @@
         "name": "prompt_template",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -660,6 +713,7 @@
         "name": "system_prompt",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -673,6 +727,7 @@
         "name": "temperature",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -686,6 +741,7 @@
         "name": "max_tokens",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -699,6 +755,7 @@
         "name": "response_field",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -716,6 +773,7 @@
         "name": "response_format",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -729,6 +787,7 @@
         "name": "output_fields",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -742,6 +801,7 @@
         "name": "image_inputs",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -755,6 +815,7 @@
         "name": "max_image_bytes",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -768,6 +829,7 @@
         "name": "max_images_per_call",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -781,6 +843,7 @@
         "name": "lookup",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -794,6 +857,7 @@
         "name": "prompt_template_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -807,6 +871,7 @@
         "name": "lookup_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -820,6 +885,7 @@
         "name": "system_prompt_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -833,6 +899,7 @@
         "name": "pool_size",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -846,6 +913,7 @@
         "name": "min_dispatch_delay_ms",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -859,6 +927,7 @@
         "name": "max_dispatch_delay_ms",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -872,6 +941,7 @@
         "name": "backoff_multiplier",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -885,6 +955,7 @@
         "name": "recovery_step_ms",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -898,6 +969,7 @@
         "name": "max_capacity_retry_seconds",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -910,6 +982,7 @@
         "name": "api_key",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -923,6 +996,7 @@
         "name": "base_url",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -936,6 +1010,7 @@
         "name": "timeout_seconds",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -949,6 +1024,7 @@
         "name": "tracing",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "openrouter",
           "field": "provider"
@@ -962,6 +1038,7 @@
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -976,6 +1053,7 @@
         "name": "required_input_fields",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -988,6 +1066,7 @@
         "name": "model",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1005,7 +1084,8 @@
               "label": "name",
               "name": "name",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "description": "Mapping of template variable name to row column name.",
@@ -1013,7 +1093,8 @@
               "label": "input_fields",
               "name": "input_fields",
               "nullable": false,
-              "required": true
+              "required": true,
+              "tier": "common"
             },
             {
               "default": "standard",
@@ -1026,7 +1107,8 @@
               "label": "response_format",
               "name": "response_format",
               "nullable": false,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "default": null,
@@ -1039,7 +1121,8 @@
                     "label": "Suffix",
                     "name": "suffix",
                     "nullable": false,
-                    "required": true
+                    "required": true,
+                    "tier": "common"
                   },
                   {
                     "description": "Data type for schema enforcement",
@@ -1054,7 +1137,8 @@
                     "label": "Type",
                     "name": "type",
                     "nullable": false,
-                    "required": true
+                    "required": true,
+                    "tier": "common"
                   },
                   {
                     "default": null,
@@ -1064,7 +1148,8 @@
                     "label": "Values",
                     "name": "values",
                     "nullable": true,
-                    "required": false
+                    "required": false,
+                    "tier": "common"
                   }
                 ]
               },
@@ -1072,7 +1157,8 @@
               "label": "output_fields",
               "name": "output_fields",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "default": null,
@@ -1081,7 +1167,8 @@
               "label": "template",
               "name": "template",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "default": null,
@@ -1090,7 +1177,8 @@
               "label": "max_tokens",
               "name": "max_tokens",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             }
           ]
         },
@@ -1099,6 +1187,7 @@
         "name": "queries",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1111,6 +1200,7 @@
         "name": "prompt_template",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1124,6 +1214,7 @@
         "name": "system_prompt",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1137,6 +1228,7 @@
         "name": "temperature",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1150,6 +1242,7 @@
         "name": "max_tokens",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1163,6 +1256,7 @@
         "name": "response_field",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1180,6 +1274,7 @@
         "name": "response_format",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1193,6 +1288,7 @@
         "name": "output_fields",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1206,6 +1302,7 @@
         "name": "image_inputs",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1219,6 +1316,7 @@
         "name": "max_image_bytes",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1232,6 +1330,7 @@
         "name": "max_images_per_call",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1245,6 +1344,7 @@
         "name": "lookup",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1258,6 +1358,7 @@
         "name": "prompt_template_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1271,6 +1372,7 @@
         "name": "lookup_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1284,6 +1386,7 @@
         "name": "system_prompt_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1297,6 +1400,7 @@
         "name": "pool_size",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1310,6 +1414,7 @@
         "name": "min_dispatch_delay_ms",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1323,6 +1428,7 @@
         "name": "max_dispatch_delay_ms",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1336,6 +1442,7 @@
         "name": "backoff_multiplier",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1349,6 +1456,7 @@
         "name": "recovery_step_ms",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1362,6 +1470,7 @@
         "name": "max_capacity_retry_seconds",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1375,6 +1484,7 @@
         "name": "region_name",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1388,6 +1498,7 @@
         "name": "tracing",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "bedrock",
           "field": "provider"
@@ -1401,6 +1512,7 @@
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1415,6 +1527,7 @@
         "name": "required_input_fields",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1427,6 +1540,7 @@
         "name": "model",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1444,7 +1558,8 @@
               "label": "name",
               "name": "name",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "description": "Mapping of template variable name to row column name.",
@@ -1452,7 +1567,8 @@
               "label": "input_fields",
               "name": "input_fields",
               "nullable": false,
-              "required": true
+              "required": true,
+              "tier": "common"
             },
             {
               "default": "standard",
@@ -1465,7 +1581,8 @@
               "label": "response_format",
               "name": "response_format",
               "nullable": false,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "default": null,
@@ -1478,7 +1595,8 @@
                     "label": "Suffix",
                     "name": "suffix",
                     "nullable": false,
-                    "required": true
+                    "required": true,
+                    "tier": "common"
                   },
                   {
                     "description": "Data type for schema enforcement",
@@ -1493,7 +1611,8 @@
                     "label": "Type",
                     "name": "type",
                     "nullable": false,
-                    "required": true
+                    "required": true,
+                    "tier": "common"
                   },
                   {
                     "default": null,
@@ -1503,7 +1622,8 @@
                     "label": "Values",
                     "name": "values",
                     "nullable": true,
-                    "required": false
+                    "required": false,
+                    "tier": "common"
                   }
                 ]
               },
@@ -1511,7 +1631,8 @@
               "label": "output_fields",
               "name": "output_fields",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "default": null,
@@ -1520,7 +1641,8 @@
               "label": "template",
               "name": "template",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             },
             {
               "default": null,
@@ -1529,7 +1651,8 @@
               "label": "max_tokens",
               "name": "max_tokens",
               "nullable": true,
-              "required": false
+              "required": false,
+              "tier": "common"
             }
           ]
         },
@@ -1538,6 +1661,7 @@
         "name": "queries",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1550,6 +1674,7 @@
         "name": "prompt_template",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1563,6 +1688,7 @@
         "name": "system_prompt",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1576,6 +1702,7 @@
         "name": "temperature",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1589,6 +1716,7 @@
         "name": "max_tokens",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1602,6 +1730,7 @@
         "name": "response_field",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1619,6 +1748,7 @@
         "name": "response_format",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1632,6 +1762,7 @@
         "name": "output_fields",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1645,6 +1776,7 @@
         "name": "image_inputs",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1658,6 +1790,7 @@
         "name": "max_image_bytes",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1671,6 +1804,7 @@
         "name": "max_images_per_call",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1684,6 +1818,7 @@
         "name": "lookup",
         "nullable": true,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1697,6 +1832,7 @@
         "name": "prompt_template_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1710,6 +1846,7 @@
         "name": "lookup_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1723,6 +1860,7 @@
         "name": "system_prompt_source",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1736,6 +1874,7 @@
         "name": "pool_size",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1749,6 +1888,7 @@
         "name": "min_dispatch_delay_ms",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1762,6 +1902,7 @@
         "name": "max_dispatch_delay_ms",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1775,6 +1916,7 @@
         "name": "backoff_multiplier",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1788,6 +1930,7 @@
         "name": "recovery_step_ms",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1801,6 +1944,7 @@
         "name": "max_capacity_retry_seconds",
         "nullable": false,
         "required": false,
+        "tier": "advanced",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1813,6 +1957,7 @@
         "name": "endpoint",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1825,6 +1970,7 @@
         "name": "api_key",
         "nullable": false,
         "required": true,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1838,6 +1984,7 @@
         "name": "contract_major",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1851,6 +1998,7 @@
         "name": "required_capabilities",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1864,6 +2012,7 @@
         "name": "timeout_seconds",
         "nullable": false,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"
@@ -1877,6 +2026,7 @@
         "name": "tracing",
         "nullable": true,
         "required": false,
+        "tier": "common",
         "visible_when": {
           "equals": "gateway",
           "field": "provider"

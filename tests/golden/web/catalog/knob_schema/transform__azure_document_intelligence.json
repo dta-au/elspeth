@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -18,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Azure Document Intelligence resource endpoint URL (HTTPS, Azure host only).",
@@ -26,7 +28,8 @@
         "label": "Endpoint",
         "name": "endpoint",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Document Intelligence API key (Ocp-Apim-Subscription-Key).",
@@ -34,7 +37,8 @@
         "label": "API Key",
         "name": "api_key",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "2024-11-30",
@@ -43,7 +47,8 @@
         "label": "API Version",
         "name": "api_version",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Prebuilt or custom model id, e.g. prebuilt-layout, prebuilt-invoice.",
@@ -51,7 +56,8 @@
         "label": "Model ID",
         "name": "model_id",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "How the document reference is read: 'url' or 'base64'.",
@@ -59,7 +65,8 @@
         "label": "Source Mode",
         "name": "source_mode",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Row field holding the document URL (url mode) or base64 string (base64 mode).",
@@ -67,7 +74,8 @@
         "label": "Source Field",
         "name": "source_field",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": 8000000,
@@ -76,7 +84,8 @@
         "label": "Max Base64 Chars",
         "name": "max_base64_chars",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -85,7 +94,8 @@
         "label": "Content Field",
         "name": "content_field",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "text",
@@ -94,7 +104,8 @@
         "label": "Output Content Format",
         "name": "output_content_format",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Facet -> output-field-name map.",
@@ -102,7 +113,8 @@
         "label": "Extract",
         "name": "extract",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -111,7 +123,8 @@
         "label": "Page Count Field",
         "name": "page_count_field",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -120,7 +133,8 @@
         "label": "Result Field",
         "name": "result_field",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -129,7 +143,8 @@
         "label": "Pages",
         "name": "pages",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -138,7 +153,8 @@
         "label": "Locale",
         "name": "locale",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "textElements",
@@ -147,7 +163,8 @@
         "label": "String Index Type",
         "name": "string_index_type",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Add-on analysis features.",
@@ -156,7 +173,8 @@
         "label": "Features",
         "name": "features",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Additional fields to extract (requires queryFields feature).",
@@ -165,7 +183,8 @@
         "label": "Query Fields",
         "name": "query_fields",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 1.0,
@@ -174,7 +193,8 @@
         "label": "Poll Interval Seconds",
         "name": "poll_interval_seconds",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 1.5,
@@ -183,7 +203,8 @@
         "label": "Poll Backoff Multiplier",
         "name": "poll_backoff_multiplier",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 10.0,
@@ -192,7 +213,8 @@
         "label": "Poll Max Interval Seconds",
         "name": "poll_max_interval_seconds",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 300.0,
@@ -201,7 +223,8 @@
         "label": "Poll Timeout Seconds",
         "name": "poll_timeout_seconds",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 60.0,
@@ -210,7 +233,8 @@
         "label": "Request Timeout Seconds",
         "name": "request_timeout_seconds",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 50000000,
@@ -219,7 +243,8 @@
         "label": "Max Response Body Bytes",
         "name": "max_response_body_bytes",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 300,
@@ -228,7 +253,8 @@
         "label": "Max Capacity Retry Seconds",
         "name": "max_capacity_retry_seconds",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 3600,
@@ -237,7 +263,8 @@
         "label": "Batch Wait Timeout Seconds",
         "name": "batch_wait_timeout_seconds",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -18,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "blob_ref",
@@ -27,7 +29,8 @@
         "label": "PDF reference field",
         "name": "blob_ref_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "page_blob_ref",
@@ -36,7 +39,8 @@
         "label": "Page image reference field",
         "name": "page_blob_ref_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "page_number",
@@ -45,7 +49,8 @@
         "label": "Page number field",
         "name": "page_number_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "document_id",
@@ -54,7 +59,8 @@
         "label": "Document id field",
         "name": "document_id_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "page_mime_type",
@@ -63,7 +69,8 @@
         "label": "Page MIME type field",
         "name": "page_mime_type_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "page_size_bytes",
@@ -72,7 +79,8 @@
         "label": "Page size field",
         "name": "page_size_bytes_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "page_width_px",
@@ -81,7 +89,8 @@
         "label": "Page width field",
         "name": "page_width_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "page_height_px",
@@ -90,7 +99,8 @@
         "label": "Page height field",
         "name": "page_height_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": true,
@@ -99,7 +109,8 @@
         "label": "Extract page text",
         "name": "extract_text",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "page_text",
@@ -108,7 +119,8 @@
         "label": "Page text field",
         "name": "page_text_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 1048576,
@@ -117,7 +129,8 @@
         "label": "Maximum page text bytes",
         "name": "max_page_text_bytes",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 150,
@@ -126,7 +139,8 @@
         "label": "Render DPI",
         "name": "dpi",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 52428800,
@@ -135,7 +149,8 @@
         "label": "Maximum input bytes",
         "name": "max_input_bytes",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 200,
@@ -144,7 +159,8 @@
         "label": "Maximum pages",
         "name": "max_pages",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 25000000,
@@ -153,7 +169,8 @@
         "label": "Maximum page pixels",
         "name": "max_page_pixels",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 5242880,
@@ -162,7 +179,8 @@
         "label": "Maximum page bytes",
         "name": "max_page_bytes",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 120,
@@ -171,7 +189,8 @@
         "label": "Render timeout seconds",
         "name": "render_timeout_seconds",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 2147483648,
@@ -180,7 +199,8 @@
         "label": "Worker memory limit bytes",
         "name": "worker_memory_limit_bytes",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "fail_document",
@@ -193,7 +213,8 @@
         "label": "Page failure policy",
         "name": "on_page_failure",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -18,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -27,7 +29,8 @@
         "label": "Blob Ref Field",
         "name": "blob_ref_field",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "blob",
@@ -40,7 +43,8 @@
         "label": "Source",
         "name": "source",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -49,7 +53,8 @@
         "label": "Text Field",
         "name": "text_field",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": ",",
@@ -58,7 +63,8 @@
         "label": "Delimiter",
         "name": "delimiter",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "utf-8",
@@ -67,7 +73,8 @@
         "label": "Encoding",
         "name": "encoding",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 0,
@@ -76,7 +83,8 @@
         "label": "Skip Rows",
         "name": "skip_rows",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -86,7 +94,8 @@
         "label": "Columns",
         "name": "columns",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -95,7 +104,8 @@
         "label": "Field Mapping",
         "name": "field_mapping",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": true,
@@ -104,7 +114,8 @@
         "label": "Include Row Index",
         "name": "include_row_index",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "csv_row_index",
@@ -113,7 +124,8 @@
         "label": "Row Index Field",
         "name": "row_index_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 100000,
@@ -122,7 +134,8 @@
         "label": "Max Output Rows",
         "name": "max_output_rows",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 104857600,
@@ -131,7 +144,8 @@
         "label": "Max Blob Bytes",
         "name": "max_blob_bytes",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -23,7 +24,8 @@
         "label": "Auth Mode",
         "name": "auth_mode",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -32,7 +34,8 @@
         "label": "Connection String",
         "name": "connection_string",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -41,7 +44,8 @@
         "label": "Sas Token",
         "name": "sas_token",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": false,
@@ -50,7 +54,8 @@
         "label": "Use Managed Identity",
         "name": "use_managed_identity",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -59,7 +64,8 @@
         "label": "Account URL",
         "name": "account_url",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -68,7 +74,8 @@
         "label": "Tenant ID",
         "name": "tenant_id",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -77,7 +84,8 @@
         "label": "Client ID",
         "name": "client_id",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -86,7 +94,8 @@
         "label": "Client Secret",
         "name": "client_secret",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Azure Blob container name",
@@ -94,7 +103,8 @@
         "label": "Container",
         "name": "container",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Path to blob within container",
@@ -102,7 +112,8 @@
         "label": "Blob Path",
         "name": "blob_path",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "csv",
@@ -116,7 +127,8 @@
         "label": "Format",
         "name": "format",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "CSV parsing options (delimiter, has_header, encoding)",
@@ -124,7 +136,8 @@
         "label": "CSV Options",
         "name": "csv_options",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "JSON parsing options (encoding, data_key)",
@@ -132,7 +145,8 @@
         "label": "JSON Options",
         "name": "json_options",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -142,7 +156,8 @@
         "label": "Columns",
         "name": "columns",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -151,7 +166,8 @@
         "label": "Field Mapping",
         "name": "field_mapping",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Sink name for non-conformant rows, or 'discard' for explicit drop",
@@ -159,7 +175,8 @@
         "label": "On Validation Failure",
         "name": "on_validation_failure",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       }
     ]
   },

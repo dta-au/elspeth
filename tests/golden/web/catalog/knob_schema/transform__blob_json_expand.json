@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -18,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "blob",
@@ -31,7 +33,8 @@
         "label": "Source",
         "name": "source",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -40,7 +43,8 @@
         "label": "Blob Ref Field",
         "name": "blob_ref_field",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -49,7 +53,8 @@
         "label": "Content Type Field",
         "name": "content_type_field",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -58,7 +63,8 @@
         "label": "Text Field",
         "name": "text_field",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -71,7 +77,8 @@
         "label": "Format",
         "name": "format",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -80,7 +87,8 @@
         "label": "Data Key",
         "name": "data_key",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Record keys this transform emits as row fields, each typed 'any'. Required: JSON records carry no header row, so nothing else can tell downstream validation which fields the emitted rows will have.",
@@ -89,7 +97,8 @@
         "label": "Fields",
         "name": "fields",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -98,7 +107,8 @@
         "label": "Field Mapping",
         "name": "field_mapping",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "utf-8",
@@ -107,7 +117,8 @@
         "label": "Encoding",
         "name": "encoding",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": true,
@@ -116,7 +127,8 @@
         "label": "Include Record Index",
         "name": "include_record_index",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "json_record_index",
@@ -125,7 +137,8 @@
         "label": "Record Index Field",
         "name": "record_index_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 100000,
@@ -134,7 +147,8 @@
         "label": "Max Output Rows",
         "name": "max_output_rows",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 104857600,
@@ -143,7 +157,8 @@
         "label": "Max Blob Bytes",
         "name": "max_blob_bytes",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

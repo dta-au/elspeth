@@ -8,7 +8,8 @@
         "name": "schema",
         "nullable": false,
         "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Database connection URL for SQLAlchemy.",
@@ -16,7 +17,8 @@
         "label": "URL",
         "name": "url",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Database table name to write rows into.",
@@ -24,7 +26,8 @@
         "label": "Table",
         "name": "table",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "append",
@@ -37,7 +40,8 @@
         "label": "If Exists",
         "name": "if_exists",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -46,7 +50,8 @@
         "label": "Effect Ledger",
         "name": "effect_ledger",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },
