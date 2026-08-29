@@ -1,13 +1,12 @@
 """Server-side deterministic integration for the live-acceptance oracle.
 
-Plan 05 Task 5. "Server-side" here is the *deployed-invocation boundary*: the
-oracle is driven through its CLI entrypoint (:func:`la.main`) against a real
-on-disk evidence directory with real permissions, symlinks, and process exit
-codes — the shape Task 6's staging deploy uses when it runs
+"Server-side" here is the *deployed-invocation boundary*: the oracle is driven
+through its CLI entrypoint (:func:`la.main`) against a real on-disk evidence
+directory with real permissions, symlinks, and process exit codes — the shape a
+staging deployment uses when it runs
 ``live_acceptance.py verify`` on exported evidence, and the collect -> redact ->
 persist -> verify shape ``run`` uses. It deliberately does NOT spin up an
-elspeth web server or execute the engine (that is Task 3 / Task 6 territory) and
-performs no provider network call.
+elspeth web server, execute the engine, or perform a provider network call.
 
 The env-gated live test re-verifies operator-exported REAL evidence and SKIPS
 when the gate env is absent, mirroring

@@ -916,7 +916,7 @@ describe("PipelineValidationSummary", () => {
 //
 // ProposePipelineTurn is the whole-DAG review turn the guided/freeform parity
 // work lands on: a read-only graph, the components/routes summary, blockers,
-// and the accept/reject/revise controls (Plan 05 Task 5). It carries a
+// and the accept/reject/revise controls. It carries a
 // live-region status/alert whose focus moves on stale/error transitions and a
 // tutorial read-only variant. Audit every branch of that surface — the plain
 // active controls, the blocker-gated revise-required state, the stale and

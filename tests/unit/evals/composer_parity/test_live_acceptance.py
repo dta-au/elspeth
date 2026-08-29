@@ -1,11 +1,11 @@
 """Deterministic unit tests for the composer parity live-acceptance oracle.
 
-Plan 05 Task 5. Every test is offline: no provider network, no server, no live
-key. A valid sanitized evidence document is built in memory, written to a
-tmp evidence directory, and verified through the oracle's real load + verify
-path. Each negative control mutates exactly one aspect of that valid document
-and asserts the oracle REJECTS it with the intended stable code — including the
-critical fake-provider control, whose evidence *lies* in its manifest
+Every test is offline: no provider network, no server, no live key. A valid
+sanitized evidence document is built in memory, written to a tmp evidence
+directory, and verified through the oracle's real load + verify path. Each
+negative control mutates exactly one aspect of that valid document and asserts
+the oracle REJECTS it with the intended stable code — including the critical
+fake-provider control, whose evidence *lies* in its manifest
 (``provider.mode == "live"``) yet is rejected on intrinsic per-call properties.
 
 The oracle lives in ``evals/composer-parity/live_acceptance.py``; the hyphenated
@@ -71,7 +71,7 @@ def test_accept_inclusive_range_edges(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Content negative controls (plan Task 5 list)
+# Content negative controls
 # --------------------------------------------------------------------------- #
 
 

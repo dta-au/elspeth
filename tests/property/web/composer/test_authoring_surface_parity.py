@@ -1,13 +1,13 @@
-"""Generated-DAG cross-surface authoring parity (Plan 05 Task 4).
+"""Generated-DAG cross-surface authoring parity.
 
-Task 3 proved parity on nine hand-authored canonical fixtures. This module
-raises the bar to *generated* pipelines: a Hypothesis strategy assembles bounded
-policy-valid canonical DAGs by composing corpus-grounded building blocks, and
+The fixed-fixture matrix proves parity on hand-authored canonical fixtures. This
+module raises the bar to *generated* pipelines: a Hypothesis strategy assembles
+bounded policy-valid canonical DAGs from corpus-grounded building blocks, and
 every generated case is driven — independently — through the same three
 production authoring surfaces (freeform, guided-full, guided-staged) reused from
-the Task 3 real-path adapters, then compared by graph isomorphism to a single
-shared committed reference. Cross-surface parity is transitive: every surface is
-anchored to the same per-case reference committed graph, exactly as in Task 3.
+the real-path adapters, then compared by graph isomorphism to a single shared
+committed reference. Cross-surface parity is transitive: every surface is
+anchored to the same per-case reference committed graph.
 
 Why compose from corpus fragments rather than generate arbitrary node/edge
 soup
@@ -17,11 +17,10 @@ Every emitted case must not only pass the *boundary* (``SetPipelineArgumentsMode
 ``set_pipeline`` commit (``validate_composition_state`` — connection
 completeness, gate route parity, batch-aware placement, queue topology, runtime
 route destinations, semantic field contracts) on THREE independent code paths.
-Arbitrary DAG generation makes that intractable; the plan's own instruction is to
-"ground shapes in the 9-fixture corpus". So the strategy draws a compact,
-bounded ``_Spec`` and a deterministic builder assembles it from fragments each
-lifted verbatim (modulo connection renaming) from a corpus fixture that already
-commits and is isomorphism-checked in Task 3:
+Arbitrary DAG generation makes that intractable, so the strategy draws a
+compact, bounded ``_Spec`` and a deterministic builder assembles it from
+fragments lifted verbatim (modulo connection renaming) from corpus fixtures
+that already commit and pass the fixed-fixture isomorphism matrix:
 
 * source stage — one csv source, or two named csv sources fanning into one
   explicit queue (``multi_source_queue``);
@@ -36,10 +35,9 @@ commits and is isomorphism-checked in Task 3:
   coalesce (``fork_coalesce``), or two outputs with a cross-sink write-failure
   fallback (``multi_output``).
 
-LLM nodes are deliberately NOT generated: Task 4's shape list omits them, and the
-``structured_llm`` capability stays covered as a Task 3 fixed fixture — this
-avoids re-deriving the Task 1 typed-query / operator-profile machinery here while
-losing no coverage.
+LLM nodes are deliberately NOT generated: the ``structured_llm`` capability
+stays covered as a fixed fixture. This avoids re-deriving typed-query and
+operator-profile machinery here while losing no coverage.
 
 Guided-staged coverage
 ----------------------
@@ -79,7 +77,7 @@ from hypothesis import HealthCheck, Phase, given, settings
 from hypothesis import strategies as st
 from tests.helpers.composer_graphs import assert_isomorphic
 
-# The parity production stack + surface adapters live in the Task 3 parity
+# The parity production stack + surface adapters live in the integration parity
 # conftest, which is a sibling scope not inherited by this property package.
 # Importing the fixture by name makes it resolvable here — the exact pattern the
 # parity conftest itself uses to borrow the guided suite's HTTP client fixture.
@@ -150,7 +148,7 @@ class _Spec:
 def _build_case(spec: _Spec) -> dict[str, Any]:
     """Assemble a corpus-grounded ``{class, intent, canonical_arguments}`` case.
 
-    The result is shaped exactly like a Task 3 corpus fixture so it drives
+    The result is shaped exactly like a fixed corpus fixture so it drives
     unchanged through ``ParityEnv.reference_state`` and ``ParityEnv.drive``.
     Every connection name is minted uniquely; every node is a proven fragment.
     """
