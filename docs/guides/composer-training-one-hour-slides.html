@@ -1,0 +1,847 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Web Composer in One Hour — ELSPETH training deck</title>
+<!--
+  ELSPETH — Web Composer in One Hour (training deck)
+  Companion to docs/guides/composer-training-one-hour.md. Slide numbers match
+  that plan one-for-one; speaker notes are the plan's notes.
+
+  Self-contained: no external scripts. Fonts load from Google Fonts when online
+  and fall back to the system stack offline. Open in any browser.
+
+  Keys:  → / space / PageDown  next      ← / PageUp  previous
+         Home / End            first / last
+         N                     toggle speaker notes
+         T                     toggle light / dark
+         G then a number       go to slide (or edit #n in the URL)
+         P / Ctrl+P            print (one slide per page, notes beneath)
+-->
+<style>
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap");
+
+/* ── ELSPETH tokens (design/tokens, dark default) ───────────────────────── */
+:root {
+  --color-bg:#0f2d35; --color-surface:#122f37; --color-surface-elevated:#1a3d47;
+  --color-surface-nav:#0a1d2e; --color-surface-inspector:#2a2826; --color-surface-paper:#332f2c;
+  --color-text:#dff0ee; --color-text-secondary:#a8d0d0; --color-text-muted:#7a9a9a;
+  --color-border:rgba(143,200,200,.12); --color-border-strong:rgba(143,200,200,.25);
+  --color-accent:#1a7a52; --color-link:#61daff; --color-focus-ring:#ffffff;
+  --color-btn-primary-bg:#16664a; --color-btn-danger-bg:#b23835;
+  --color-success:#14b0ae; --color-error:#e85653; --color-warning:#e38444; --color-info:#61daff;
+  --color-success-bg:rgba(20,176,174,.12); --color-success-border:rgba(20,176,174,.3);
+  --color-error-bg:rgba(232,86,83,.12); --color-error-border:rgba(232,86,83,.3);
+  --color-warning-bg:rgba(227,132,68,.14); --color-warning-border:rgba(227,132,68,.3);
+  --color-info-bg:rgba(97,218,255,.1); --color-info-border:rgba(97,218,255,.25);
+  --color-bubble-user:rgba(40,130,100,.14); --color-bubble-user-border:rgba(40,130,100,.35);
+  --color-bubble-assistant:rgba(255,255,255,.05); --color-bubble-assistant-border:rgba(255,255,255,.18);
+  --c-source:#4db89a; --c-transform:#e8a030; --c-gate:#c390f9; --c-sink:#e07040; --c-aggregation:#61daff; --c-coalesce:#18c2c0;
+  --c-source-bg:#184244; --c-transform-bg:#303e34; --c-gate-bg:#2a3c52; --c-sink-bg:#2e3737; --c-aggregation-bg:#1b4753; --c-coalesce-bg:#10434a;
+  --font-sans:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
+  --font-mono:"JetBrains Mono","Fira Code","SF Mono","Cascadia Code",Menlo,Consolas,"Liberation Mono",monospace;
+  --radius-sm:4px; --radius-md:6px; --radius-lg:8px; --radius-xl:12px;
+  --tracking-wordmark:.18em;
+}
+[data-theme="light"] {
+  --color-bg:#f4f8f9; --color-surface:#ffffff; --color-surface-elevated:#ffffff;
+  --color-surface-nav:#e8edf3; --color-surface-inspector:#faf7f3; --color-surface-paper:#f0eae3;
+  --color-text:#0f2d35; --color-text-secondary:#3a5a64; --color-text-muted:#426069;
+  --color-border:rgba(15,45,53,.12); --color-border-strong:rgba(15,45,53,.25);
+  --color-accent:#156048; --color-link:#176d8a; --color-focus-ring:#0f2d35;
+  --color-btn-primary-bg:#1a7a5a; --color-btn-danger-bg:#b23835;
+  --color-success:#0d8a88; --color-error:#c93b38; --color-warning:#b86830; --color-info:#176d8a;
+  --color-success-bg:rgba(20,160,158,.1); --color-success-border:rgba(20,160,158,.35);
+  --color-error-bg:rgba(210,70,67,.1); --color-error-border:rgba(210,70,67,.35);
+  --color-warning-bg:rgba(200,115,55,.12); --color-warning-border:rgba(200,115,55,.35);
+  --color-info-bg:rgba(40,150,190,.1); --color-info-border:rgba(40,150,190,.3);
+  --color-bubble-user:rgba(40,130,100,.1); --color-bubble-user-border:rgba(40,130,100,.3);
+  --color-bubble-assistant:rgba(15,45,53,.05); --color-bubble-assistant-border:rgba(15,45,53,.15);
+  --c-source:#257963; --c-transform:#926414; --c-gate:#8356b6; --c-sink:#ad502d; --c-aggregation:#207595; --c-coalesce:#0e8090;
+  --c-source-bg:#dcebe9; --c-transform-bg:#ece9de; --c-gate-bg:#e7e5f2; --c-sink-bg:#ede4e1; --c-aggregation-bg:#dcecf1; --c-coalesce-bg:#d8eaec;
+}
+
+/* ── Stage ──────────────────────────────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--color-surface-nav);color:var(--color-text);font-family:var(--font-sans);font-size:16px;line-height:1.5;-webkit-font-smoothing:antialiased}
+#stage{position:fixed;inset:0;display:grid;place-items:center;overflow:hidden}
+#deck{position:relative;width:1280px;height:720px;transform-origin:center center;background:var(--color-bg);border:1px solid var(--color-border-strong);border-radius:var(--radius-lg);overflow:hidden}
+.slide{position:absolute;inset:0;display:none;padding:56px 72px 64px;flex-direction:column}
+.slide.active{display:flex}
+.slide > h1,.slide > h2{margin:0}
+.kicker{font-family:var(--font-mono);font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--color-text-muted);margin-bottom:10px;display:flex;gap:12px;align-items:center}
+.kicker .seg{color:var(--c-source)}
+.kicker .mode{padding:2px 8px;border:1px solid var(--color-border-strong);border-radius:var(--radius-sm);color:var(--color-text-secondary)}
+.kicker .mode.hands{border-color:var(--color-warning-border);color:var(--color-warning);background:var(--color-warning-bg)}
+h1{font-size:44px;font-weight:700;line-height:1.15;letter-spacing:-.01em;margin:0 0 20px}
+h2{font-size:32px;font-weight:600;line-height:1.2;margin:0 0 22px;letter-spacing:-.01em}
+h3{font-size:18px;font-weight:600;margin:0 0 8px;color:var(--color-text-secondary)}
+p{margin:0 0 12px}
+ul{margin:0;padding-left:0;list-style:none}
+.slide > ul > li, .col ul > li{position:relative;padding-left:22px;margin:0 0 12px;font-size:22px;line-height:1.4}
+.slide > ul > li::before, .col ul > li::before{content:"";position:absolute;left:0;top:.62em;width:10px;height:2px;background:var(--c-source)}
+.slide > ul > li li{font-size:18px;color:var(--color-text-secondary);padding-left:18px;margin:6px 0 0}
+.slide > ul > li li::before{content:"";position:absolute;left:0;top:.6em;width:6px;height:2px;background:var(--color-text-muted)}
+code,kbd{font-family:var(--font-mono);font-size:.86em;background:rgba(143,200,200,.1);border:1px solid var(--color-border);border-radius:var(--radius-sm);padding:1px 6px;color:var(--color-text)}
+kbd{background:var(--color-surface-elevated);border-color:var(--color-border-strong)}
+pre{font-family:var(--font-mono);font-size:15px;line-height:1.6;background:var(--color-surface-nav);border:1px solid var(--color-border-strong);border-left:4px solid var(--color-accent);border-radius:var(--radius-md);padding:14px 18px;margin:0 0 14px;overflow:auto;white-space:pre-wrap}
+.quote{border-left:4px solid var(--c-source);padding:8px 22px;margin:10px 0 18px;font-size:24px;line-height:1.4;color:var(--color-text)}
+.quote.big{font-size:32px;font-weight:500}
+.cite{display:block;font-family:var(--font-mono);font-size:12px;color:var(--color-text-muted);margin-top:10px;letter-spacing:.04em}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:36px;flex:1;min-height:0;align-items:start}
+.cols.w3{grid-template-columns:1fr 1fr 1fr}
+.col ul > li{font-size:19px;margin-bottom:10px}
+.card{background:var(--color-surface);border:1px solid var(--color-border-strong);border-radius:var(--radius-lg);padding:18px 20px}
+.card.paper{background:var(--color-surface-inspector)}
+.card h3{margin-top:0}
+.foot{position:absolute;left:72px;right:72px;bottom:22px;display:flex;justify-content:space-between;align-items:center;font-family:var(--font-mono);font-size:11px;letter-spacing:.06em;color:var(--color-text-muted)}
+.wordmark{font-family:var(--font-mono);font-weight:700;text-transform:uppercase;letter-spacing:var(--tracking-wordmark)}
+.num{font-family:var(--font-mono)}
+.mini{font-size:15px;color:var(--color-text-secondary)}
+.mini li{font-size:15px!important}
+
+/* type badges */
+.tb{display:inline-block;font-family:var(--font-mono);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;padding:2px 8px;border-radius:var(--radius-sm);border:1px solid;vertical-align:middle}
+.tb-source{color:var(--c-source);background:var(--c-source-bg);border-color:rgba(77,184,154,.3)}
+.tb-transform{color:var(--c-transform);background:var(--c-transform-bg);border-color:rgba(232,160,48,.3)}
+.tb-gate{color:var(--c-gate);background:var(--c-gate-bg);border-color:rgba(195,144,249,.3)}
+.tb-sink{color:var(--c-sink);background:var(--c-sink-bg);border-color:rgba(224,112,64,.3)}
+.tb-aggregation{color:var(--c-aggregation);background:var(--c-aggregation-bg);border-color:rgba(97,218,255,.3)}
+.tb-coalesce{color:var(--c-coalesce);background:var(--c-coalesce-bg);border-color:rgba(24,194,192,.3)}
+
+/* pipeline diagram */
+.pipe{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:8px 0 18px;font-family:var(--font-mono);font-size:14px}
+.node{padding:10px 14px;border-radius:var(--radius-md);border:1px solid;background:var(--color-surface);min-width:96px;text-align:center;line-height:1.25}
+.node small{display:block;font-size:10px;letter-spacing:.1em;text-transform:uppercase;opacity:.85;margin-bottom:3px}
+.node.src{border-color:var(--c-source);color:var(--c-source)} .node.tr{border-color:var(--c-transform);color:var(--c-transform)}
+.node.gt{border-color:var(--c-gate);color:var(--c-gate)} .node.sk{border-color:var(--c-sink);color:var(--c-sink)}
+.node.ag{border-color:var(--c-aggregation);color:var(--c-aggregation)} .node.co{border-color:var(--c-coalesce);color:var(--c-coalesce)}
+.node.ghost{border-style:dashed;opacity:.9}
+.arrow{color:var(--color-text-muted);font-size:20px}
+.stack{display:flex;flex-direction:column;gap:8px}
+
+/* UI mocks */
+.mock{font-size:14px;background:var(--color-surface);border:1px solid var(--color-border-strong);border-radius:var(--radius-lg);overflow:hidden}
+.mock .bar{display:flex;gap:14px;align-items:center;padding:8px 12px;background:var(--color-surface-nav);border-bottom:1px solid var(--color-border);font-size:12px}
+.mock .tabs{display:flex;gap:2px;padding:6px 10px 0;border-bottom:1px solid var(--color-border)}
+.mock .tab{padding:6px 12px;border-radius:var(--radius-sm) var(--radius-sm) 0 0;color:var(--color-text-muted)}
+.mock .tab.on{color:var(--color-text);background:var(--color-surface-elevated);border:1px solid var(--color-border);border-bottom-color:var(--color-surface-elevated)}
+.mock .body{padding:12px}
+.btn{display:inline-block;font-size:13px;font-weight:500;padding:6px 12px;border-radius:var(--radius-md);border:1px solid var(--color-border-strong);background:var(--color-surface-elevated);color:var(--color-text)}
+.btn.primary{background:var(--color-btn-primary-bg);border-color:transparent;color:#fff}
+.btn.danger{background:var(--color-btn-danger-bg);border-color:transparent;color:#fff}
+.btn.dim{opacity:.5}
+.pcard{border-left:4px solid var(--color-warning);background:var(--color-surface-elevated);border-radius:var(--radius-md);padding:12px 14px;margin:0 0 10px}
+.pcard.commit{border-left-color:var(--color-success)} .pcard.reject{border-left-color:var(--color-error)} .pcard.pending{border-left-style:dashed}
+.pcard .hd{display:flex;justify-content:space-between;align-items:center;font-weight:600;margin-bottom:6px}
+.chip{font-family:var(--font-mono);font-size:10px;letter-spacing:.06em;padding:1px 6px;border:1px solid var(--color-border-strong);border-radius:var(--radius-sm);color:var(--color-text-muted)}
+.ribbon{font-family:var(--font-mono);font-size:13px;color:var(--color-text-secondary);padding:6px 10px;border:1px solid var(--color-border);border-radius:var(--radius-sm);background:var(--color-bubble-assistant);margin-bottom:8px}
+.row{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-bottom:1px solid var(--color-border);font-size:14px}
+.row:last-child{border-bottom:0}
+.badge{font-family:var(--font-mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;padding:2px 7px;border-radius:var(--radius-sm);border:1px solid}
+.badge.block{color:var(--color-error);background:var(--color-error-bg);border-color:var(--color-error-border)}
+.badge.adv{color:var(--color-text-muted);background:transparent;border-color:var(--color-border-strong)}
+.badge.ok{color:var(--color-success);background:var(--color-success-bg);border-color:var(--color-success-border)}
+.alert{border:1px solid;border-radius:var(--radius-md);padding:10px 14px;font-size:15px;margin:0 0 10px}
+.alert.err{background:var(--color-error-bg);border-color:var(--color-error-border)}
+.alert.warn{background:var(--color-warning-bg);border-color:var(--color-warning-border)}
+.alert.info{background:var(--color-info-bg);border-color:var(--color-info-border)}
+.alert.ok{background:var(--color-success-bg);border-color:var(--color-success-border)}
+.stepper{display:flex;gap:6px;align-items:center;font-family:var(--font-mono);font-size:13px;margin:6px 0 16px}
+.stepper span{padding:5px 12px;border:1px solid var(--color-border-strong);border-radius:9999px;color:var(--color-text-secondary)}
+.stepper span.on{background:var(--color-accent);border-color:transparent;color:#fff}
+.stepper i{color:var(--color-text-muted);font-style:normal}
+table.tbl{border-collapse:collapse;width:100%;font-size:16px}
+.tbl th,.tbl td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--color-border);vertical-align:top}
+.tbl th{font-family:var(--font-mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--color-text-muted);font-weight:600}
+.tbl.sm{font-size:14px}
+.tiers{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;align-content:start}
+.tier{border-radius:var(--radius-lg);padding:16px 18px;border:1px solid var(--color-border-strong);background:var(--color-surface)}
+.tier h3{font-family:var(--font-mono);font-size:13px;letter-spacing:.1em;text-transform:uppercase}
+.tier.t3 h3{color:var(--color-warning)} .tier.t2 h3{color:var(--c-source)} .tier.t1 h3{color:var(--color-error)}
+.tier p{font-size:16px;color:var(--color-text-secondary)}
+.tier strong{color:var(--color-text)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px 28px}
+.grid2 > div{font-size:18px}
+.grid2 b{display:block;font-family:var(--font-mono);font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--color-text-muted);margin-bottom:2px}
+.section-title{justify-content:center;background:linear-gradient(135deg,var(--color-surface-nav),var(--color-bg) 60%)}
+.section-title .kicker{font-size:13px}
+.section-title h1{font-size:56px;max-width:900px}
+.section-title p{font-size:22px;color:var(--color-text-secondary);max-width:820px}
+.title-slide{justify-content:center;background:linear-gradient(160deg,var(--color-surface-nav) 0%,var(--color-bg) 55%,#0f2d35 100%)}
+.title-slide .wordmark{font-size:22px;color:var(--c-source);margin-bottom:28px}
+.title-slide h1{font-size:64px;max-width:980px}
+.title-slide .tag{font-size:26px;color:var(--color-text-secondary);max-width:820px}
+.title-slide .meta{margin-top:auto;font-family:var(--font-mono);font-size:12px;color:var(--color-text-muted);letter-spacing:.06em}
+.hr{height:1px;background:var(--color-border-strong);margin:14px 0}
+.spacer{flex:1}
+
+/* notes drawer + hud */
+#notes{position:fixed;left:0;right:0;bottom:0;max-height:38vh;overflow:auto;background:var(--color-surface-inspector);color:var(--color-text);border-top:2px solid var(--c-source);padding:14px 28px 20px;font-size:15px;line-height:1.55;display:none;z-index:20;box-shadow:0 -8px 32px rgba(0,0,0,.35)}
+#notes.open{display:block}
+#notes h4{margin:0 0 8px;font-family:var(--font-mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--color-text-muted)}
+#notes p{margin:0 0 8px;max-width:1100px}
+#hud{position:fixed;right:14px;top:10px;font-family:var(--font-mono);font-size:11px;letter-spacing:.06em;color:var(--color-text-muted);z-index:21;display:flex;gap:14px;align-items:center;background:rgba(0,0,0,.25);padding:4px 10px;border-radius:var(--radius-sm)}
+#hud button{all:unset;cursor:pointer;color:var(--color-text-secondary);padding:2px 6px;border:1px solid var(--color-border-strong);border-radius:var(--radius-sm)}
+#hud button:focus-visible{outline:2px solid var(--color-focus-ring);outline-offset:2px}
+#progress{position:fixed;left:0;bottom:0;height:3px;background:var(--c-source);z-index:22;transition:width 150ms ease}
+.notes{display:none}
+
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+
+/* print: one slide per page, notes beneath */
+@media print{
+  html,body{background:#fff;color:#000;height:auto}
+  #hud,#progress,#notes{display:none!important}
+  #stage{position:static;display:block}
+  #deck{width:auto;height:auto;transform:none!important;background:transparent;border:0;border-radius:0;overflow:visible}
+  .slide{position:static;display:flex!important;width:1280px;height:720px;margin:0 auto;page-break-after:always;break-after:page;background:var(--color-bg);border:1px solid #999;transform:scale(.72);transform-origin:top left}
+  .slide .notes{display:block;position:absolute;top:100%;left:0;right:0;margin-top:12px;padding:10px 0;font-size:16px;color:#111;background:#fff;border-top:1px solid #999}
+  .slide .notes::before{content:"Speaker notes";display:block;font-family:var(--font-mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#555;margin-bottom:6px}
+}
+</style>
+</head>
+<body>
+<div id="hud">
+  <span id="counter">1 / 37</span>
+  <button id="btnNotes" title="Toggle speaker notes (N)">Notes</button>
+  <button id="btnTheme" title="Toggle theme (T)">Theme</button>
+  <button id="btnHelp" title="Keys">?</button>
+</div>
+<div id="progress"></div>
+<div id="stage"><div id="deck">
+
+<!-- ═══════════════════════════ SEGMENT 1 — Why this exists (0–5) ═══════ -->
+
+<section class="slide title-slide" data-seg="1">
+  <div class="wordmark">ELSPETH</div>
+  <h1>Web Composer in one hour</h1>
+  <p class="tag">Build and run auditable data pipelines.</p>
+  <p class="tag" style="font-size:20px;margin-top:8px">From first principles to advanced pipelines — one hands-on session for small groups.</p>
+  <div class="meta">Companion plan: docs/guides/composer-training-one-hour.md · draft v1 · 2026-08-30</div>
+  <aside class="notes"><p>Say the tagline — it is the login page's own line — then the one-line pitch: "Validation and audit are part of the workflow, not after-the-fact diagnostics." Tell them the plan: they will build one pipeline themselves, add an LLM to it, and watch the harder shapes. Press N to keep these notes open.</p></aside>
+</section>
+
+<section class="slide" data-seg="1">
+  <div class="kicker"><span class="seg">Segment 1 · Why this exists</span><span class="mode">Talk</span></div>
+  <h2>What a pipeline is</h2>
+  <p style="font-size:22px;color:var(--color-text-secondary)">Rows come in. Each row is processed the same way. Rows go out.</p>
+  <div class="cols w3" style="flex:0 0 auto;margin:12px 0 22px">
+    <div class="card" style="border-left:4px solid var(--c-source)"><h3 style="color:var(--c-source)">Sense</h3><p>Read data in — files, APIs, or a sentence you type.</p></div>
+    <div class="card" style="border-left:4px solid var(--c-transform)"><h3 style="color:var(--c-transform)">Decide</h3><p>LLMs, rules, or gates rate, classify, or route each row.</p></div>
+    <div class="card" style="border-left:4px solid var(--c-sink)"><h3 style="color:var(--c-sink)">Act</h3><p>Write auditable outputs — every decision tied to its source.</p></div>
+  </div>
+  <div class="pipe">
+    <div class="node src"><small>Source</small>8 transactions</div><span class="arrow">→</span>
+    <div class="node gt"><small>Gate</small>amount &gt; 1000?</div><span class="arrow">→</span>
+    <div class="stack"><div class="node sk"><small>Sink</small>high_values.csv</div><div class="node sk"><small>Sink</small>normal.csv</div></div>
+  </div>
+  <aside class="notes"><p>This is the tutorial's own welcome copy, so it is the same wording participants will meet in the product. Give the concrete example on screen: 8 transactions come in; a rule sends the ones over $1000 to one file and the rest to another. That is a pipeline. Everything in the hour is a variation on it.</p></aside>
+</section>
+
+<section class="slide" data-seg="1">
+  <div class="kicker"><span class="seg">Segment 1 · Why this exists</span><span class="mode">Talk</span></div>
+  <h2>Why "auditable" is the whole point</h2>
+  <div class="quote big">Every output can be traced to its source with complete audit trail.</div>
+  <p style="font-size:20px">If ELSPETH produced an output, you can ask <strong>"why?"</strong> and get a complete answer:</p>
+  <ul>
+    <li>what source row it came from</li>
+    <li>what transforms were applied</li>
+    <li>what external calls were made</li>
+    <li>what routing decisions occurred — and why it ended up where it did</li>
+  </ul>
+  <div class="quote" style="font-size:20px">This is not optional. This is not best-effort. This is the reason ELSPETH exists.<span class="cite">docs/release/guarantees.md — The Core Promise</span></div>
+  <aside class="notes"><p>Contrast with the two things people already know: spreadsheets and scripts (no record of why), and LLM workflow builders (easy to author, weak on evidence). ELSPETH is for the cases where an auditor, a regulator, or a colleague will ask "why did it do that?" and silence is not an acceptable answer.</p></aside>
+</section>
+
+<section class="slide" data-seg="1">
+  <div class="kicker"><span class="seg">Segment 1 · Why this exists</span><span class="mode">Talk</span></div>
+  <h2>Two ways to write the same pipeline</h2>
+  <div class="cols" style="flex:0 0 auto;margin-bottom:20px">
+    <div class="card"><h3>YAML — the operator path</h3><p>Hand-edited, version-controlled, reviewed before it runs.</p></div>
+    <div class="card"><h3>Web Composer — you describe it</h3><p>An LLM builds it <em>through tools</em>; ELSPETH validates it.</p></div>
+  </div>
+  <p style="font-size:20px">Same plugins · same validator · same runner · same audit trail. "There is no separate UI-only validator."</p>
+  <div class="quote">The LLM proposes changes. ELSPETH records, validates, and gates the resulting pipeline.<span class="cite">docs/release/composer-guide.md</span></div>
+  <aside class="notes"><p>Plant the sentence you will return to all hour: the LLM is not the authority. It proposes; you review; ELSPETH validates and records. The Composer is not a second engine.</p></aside>
+</section>
+
+<!-- ═══════════════════════════ SEGMENT 2 — The shell (5–11) ═══════════ -->
+
+<section class="slide" data-seg="2">
+  <div class="kicker"><span class="seg">Segment 2 · The shell</span><span class="mode">Trainer demo</span></div>
+  <h2>The screen</h2>
+  <div class="mock" style="flex:1;display:flex;flex-direction:column">
+    <div class="bar"><span class="wordmark" style="font-size:12px">ELSPETH</span><span>Session: <b>Transactions</b> ▾</span><span style="opacity:.5">|</span><span>v2 ▾</span><span style="margin-left:auto">Account</span></div>
+    <div style="display:grid;grid-template-columns:2fr 3fr;flex:1;min-height:0">
+      <div style="border-right:1px solid var(--color-border);padding:12px;display:flex;flex-direction:column">
+        <div class="chip" style="align-self:flex-start;margin-bottom:8px">Authoring pane</div>
+        <div class="stepper" style="margin:0 0 10px"><span class="on">Source</span><i>→</i><span>Output</span><i>→</i><span>Transforms</span><i>→</i><span>Wire</span><i>→</i><span>Ready</span></div>
+        <div class="ribbon">Looked up: list_sources</div>
+        <div class="pcard"><div class="hd"><span>Proposed: set_source</span><span class="chip">audit 3f9a1c2e</span></div><div style="font-size:13px">Use the uploaded transactions CSV as the source.</div></div>
+        <div style="margin-top:auto;border:1px solid var(--color-border-strong);border-radius:var(--radius-md);padding:8px 10px;color:var(--color-text-muted);font-size:13px">Message input …</div>
+      </div>
+      <div style="display:flex;flex-direction:column;background:var(--color-surface-inspector)">
+        <div class="tabs"><span class="tab on">Graph</span><span class="tab">Spec</span><span class="tab">YAML</span><span class="tab">Run</span><span style="margin-left:auto;font-size:12px;color:var(--color-text-muted);padding:6px 10px">Plugin catalog · Focus graph</span></div>
+        <div class="body" style="flex:1;display:grid;place-items:center"><div class="pipe"><div class="node src"><small>Source</small>transactions</div><span class="arrow">→</span><div class="node gt"><small>Gate</small>amount_threshold</div><span class="arrow">→</span><div class="stack"><div class="node sk"><small>Sink</small>high_values</div><div class="node sk"><small>Sink</small>output</div></div></div></div>
+      </div>
+    </div>
+    <div class="bar" style="border-top:1px solid var(--color-border);border-bottom:0"><span>Validation: <b style="color:var(--color-success)">Passed</b></span><span>Audit: <b style="color:var(--color-success)">Ready</b></span><span style="margin-left:auto" class="btn">Save for review</span><span class="btn">Import YAML</span><span class="btn danger">Run pipeline</span></div>
+  </div>
+  <aside class="notes"><p>Point, name, move on. Header: wordmark, session switcher, version selector, Account. Left: the authoring pane — conversation or the guided stepper. Right: the pipeline artifact with four tabs (empty pipeline shows only Graph and Run). Bottom: the action bar. Clicking a status opens the Inspector (Validation / Audit / History). The divider drags; "Collapse authoring pane" gives the graph the whole width.</p><p>Demo, 2 min: Account → Composer preferences (Default mode, Theme, Detail level — leave defaults). Press ? for the shortcuts dialog: Ctrl+K palette, Ctrl+E Run pipeline, Ctrl+/ focus chat. Plugin catalog (Ctrl+Shift+P): Sources / Transforms / Sinks — "you never have to remember their names".</p></aside>
+</section>
+
+<section class="slide" data-seg="2">
+  <div class="kicker"><span class="seg">Segment 2 · The shell</span><span class="mode">Trainer demo</span></div>
+  <h2>Guided and freeform: two conversations, one planner</h2>
+  <div class="cols" style="flex:0 0 auto">
+    <div class="card"><h3>Guided</h3><div class="stepper" style="margin:4px 0 10px"><span>Source</span><i>→</i><span>Output</span><i>→</i><span>Transforms</span><i>→</i><span>Wire</span></div><p>One decision at a time. Each stage is reviewed before the next.</p></div>
+    <div class="card"><h3>Freeform</h3><p>Describe the whole pipeline at once; refine in conversation.</p><p class="mini">Switch any time: <code>Switch to guided</code> / <code>Exit to freeform</code></p></div>
+  </div>
+  <div class="quote" style="margin-top:22px">Guided and freeform differ in interaction, not in capability.<span class="cite">docs/guides/user-manual.md</span></div>
+  <ul class="mini"><li>Guided → freeform carries the graph exactly.</li><li>Turning guided <em>on</em> over freeform work for the first time starts a fresh wizard as a new version — the old draft stays in version history.</li></ul>
+  <aside class="notes"><p>Both talk to the same planner and both can author every pipeline structure. State the one asymmetry plainly so nobody is surprised later.</p></aside>
+</section>
+
+<section class="slide" data-seg="2">
+  <div class="kicker"><span class="seg">Segment 2 · The shell</span><span class="mode">Trainer demo</span></div>
+  <h2>The three kinds of thing the planner shows you</h2>
+  <div class="cols w3">
+    <div><h3>A ribbon</h3><div class="ribbon">Looked up: list_transforms</div><p class="mini">It read something. Nothing changed.</p></div>
+    <div><h3>A proposal card</h3><div class="pcard"><div class="hd"><span>Proposed: set_pipeline</span><span class="chip">audit 8c1d…</span></div><div style="font-size:13px"><b>Why:</b> route by amount<br><b>Affects:</b> source, gate, 2 sinks</div><div style="margin-top:8px"><span class="btn primary">Accept</span> <span class="btn">Reject</span></div></div></div>
+    <div><h3>A decision card</h3><div class="pcard pending"><div class="hd"><span>Transforms step · prompt</span></div><div style="font-size:13px">The LLM wrote the instruction for this step.</div><div style="margin-top:8px"><span class="btn">View prompt</span> <span class="btn primary dim">Approve</span> <span class="btn">Change…</span></div></div></div>
+  </div>
+  <div class="alert info" style="margin-top:6px">Nothing executes, and nothing is committed to the pipeline, without you clicking one of these.</div>
+  <aside class="notes"><p>This slide is the interaction model for the entire product. Say it now; they will see all three in the next ten minutes. Note the left-edge colour: amber pending, teal committed, red rejected, dashed for a decision awaiting you.</p></aside>
+</section>
+
+<section class="slide" data-seg="2">
+  <div class="kicker"><span class="seg">Segment 2 · The shell</span><span class="mode">Variant</span></div>
+  <h2>Variant: the first-run tutorial</h2>
+  <ul>
+    <li>Every new account starts on it. Five steps: welcome → guided build → run → audit story → graduation.</li>
+    <li>It is the <em>same</em> machinery as every real session — its only privilege is a frozen prompt (ADR-031).</li>
+    <li><code>Composer preferences → Reset tutorial</code> brings it back any time.</li>
+  </ul>
+  <div class="quote" style="font-size:19px">Scrape these three synthetic project-brief pages and, for each page, have an LLM write a short summary of the page. Remove the raw HTML and write the rows to a json file.<span class="cite">the frozen tutorial prompt</span></div>
+  <aside class="notes"><p>Two ways to use it. (A) Pre-work: ask participants to complete it before the session (~10 min, needs the live LLM and network); then Segment 2 can be shorter and you can reference "the assumption callout you saw". (B) Live opener: run it yourself on a reset account instead of the shell demo — it hits web scrape, LLM, auto-wired controls, run, and the audit story in one pass. Do not do both; do not promise participants a re-run — a completed tutorial wizard is not re-enterable within the same tutorial session.</p></aside>
+</section>
+
+<!-- ═══════════════════════════ SEGMENT 3 — First pipeline (11–24) ══════ -->
+
+<section class="slide section-title" data-seg="3">
+  <div class="kicker"><span class="seg">Segment 3 · 11–24 min</span><span class="mode hands">Hands-on</span></div>
+  <h1>Your first pipeline</h1>
+  <p>Input: 8 transactions (<code>id, name, amount, category</code>).<br>Rule: amount &gt; 1000 → <code>high_values.csv</code>; everything else → <code>normal.csv</code>.</p>
+  <p style="font-size:18px">Bonus outcome: afterwards, ask "why did Bob's $1500 go to high_values?" and get an answer.</p>
+  <aside class="notes"><p>Everyone builds the threshold-gate pipeline from your-first-pipeline.md Option B. Build alongside on the projector, half a step ahead.</p></aside>
+</section>
+
+<section class="slide" data-seg="3">
+  <div class="kicker"><span class="seg">Segment 3 · Your first pipeline</span><span class="mode hands">Hands-on · leave this up</span></div>
+  <h2>Steps</h2>
+  <div class="cols">
+    <div class="col"><ul>
+      <li>Session switcher → <code>+ New session</code> (or <kbd>Ctrl+N</kbd>). Stay in guided.</li>
+      <li>In the chat input: <code>Upload file</code> → choose <code>input.csv</code>.</li>
+      <li>Paste the prompt →</li>
+      <li>Watch the stepper: Source → Output → Transforms → Wire.</li>
+      <li>Read each proposal. If asked for field types: <code>id: int</code>, <code>name: str</code>, <code>amount: int</code>, <code>category: str</code>.</li>
+      <li>At <code>Review wiring</code>, clear any pending acknowledgements, then confirm wiring.</li>
+      <li>When <code>Validation: Passed</code> → <code>Run pipeline</code> → confirm the dialog.</li>
+    </ul></div>
+    <div><pre>Use the uploaded transactions CSV as the source.
+Build a pipeline that routes rows with
+amount &gt; 1000 to a high_values CSV output
+and all other rows to a normal CSV output.
+Validate it before running.</pre><p class="mini">Prompt from <code>docs/guides/your-first-pipeline.md</code>, Option B.</p></div>
+  </div>
+  <aside class="notes"><p>Circulate. Common stumbles: (1) someone types before uploading — fine, guided retains the intent; (2) a "Source data" / "Data contract" card appears — that is Segment 4's topic, tell them to read it and Acknowledge; (3) the disclosure dialog on Run — read it out: "This run leaves the composer and uses your stored credentials".</p></aside>
+</section>
+
+<section class="slide" data-seg="3">
+  <div class="kicker"><span class="seg">Segment 3 · Your first pipeline</span><span class="mode hands">Hands-on</span></div>
+  <h2>Reading a proposal card</h2>
+  <div class="cols">
+    <div class="pcard" style="align-self:start"><div class="hd"><span>Proposed: set_pipeline</span><span class="chip">audit 8c1d4b7e</span></div>
+      <div style="font-size:14px;margin-bottom:6px">Route transactions by amount into two CSV outputs.</div>
+      <div style="font-size:14px"><b>Why:</b> the request names a threshold of 1000 and two outputs.<br><b>Affects:</b> transactions (source), amount_threshold (gate), high_values, output (sinks)</div>
+      <details style="font-size:13px;margin:8px 0"><summary>View arguments (JSON)</summary></details>
+      <span class="btn primary">Accept</span> <span class="btn">Reject</span></div>
+    <div class="col"><ul>
+      <li><code>Proposed: &lt;tool&gt;</code> — what it wants to do</li>
+      <li>Summary — in your words</li>
+      <li><code>Why:</code> its reasoning · <code>Affects:</code> which components</li>
+      <li>Before/after diff, and the raw arguments if you want them</li>
+      <li><code>Accept</code> commits a new pipeline version</li>
+      <li><code>Reject</code> discards; you can ask for a revision</li>
+    </ul></div>
+  </div>
+  <aside class="notes"><p>Every accept is a version — point at the header's version selector ticking over. Reject confirm text: "The composer's proposed change will be discarded. You can ask the composer to revise the proposal afterwards."</p></aside>
+</section>
+
+<section class="slide" data-seg="3">
+  <div class="kicker"><span class="seg">Segment 3 · Your first pipeline</span><span class="mode hands">Hands-on</span></div>
+  <h2>The graph</h2>
+  <div class="cols">
+    <div><div class="pipe" style="margin-top:10px"><div class="node src"><small>Source</small>transactions</div><span class="arrow">→</span><div class="node gt"><small>Gate</small>amount_threshold</div><span class="arrow">→</span><div class="stack"><div class="node sk"><small>Sink</small>high_values</div><div class="node sk"><small>Sink</small>output</div></div></div>
+      <div class="card paper" style="font-size:14px"><b>amount_threshold config</b> <span class="tb tb-gate">gate</span><div class="hr"></div><b>Settings</b><br>Condition &nbsp; <code>row['amount'] &gt; 1000</code><br><details><summary>Connections &amp; schema</summary></details></div></div>
+    <div class="col"><ul>
+      <li><code>Graph</code> tab: one source, one gate, two sinks</li>
+      <li>Click a node → <code>&lt;id&gt; config</code>, <code>Settings</code>, <code>Connections &amp; schema</code></li>
+      <li>Node label ends with its state: "passed validation" / "has warnings" / "has validation errors" / "not yet validated"</li>
+      <li><code>Focus graph</code> (<kbd>Ctrl+Shift+G</kbd>) for full screen</li>
+    </ul></div>
+  </div>
+  <aside class="notes"><p>Six component types, six fixed colours — Source green, Transform amber, Gate purple, Sink orange, Aggregation cyan, Coalesce teal. They will see these on every screen; name them once.</p></aside>
+</section>
+
+<section class="slide" data-seg="3">
+  <div class="kicker"><span class="seg">Segment 3 · Your first pipeline</span><span class="mode hands">Hands-on</span></div>
+  <h2>The spec</h2>
+  <div class="cols">
+    <div class="card paper" style="font-size:15px;align-self:start"><b>amount_threshold</b> &nbsp;<span class="tb tb-gate">gate</span><div class="hr"></div>
+      <div class="row"><span>Reads from</span><code>gate_in</code></div>
+      <div class="row"><span>Routes</span><span><code>'true'</code> → high_values · <code>'false'</code> → output</span></div>
+      <div class="row"><span>On error</span><span>dropped (recorded in the audit trail)</span></div></div>
+    <div class="col"><ul>
+      <li><code>Spec</code> tab: <code>Sources</code> / <code>Nodes</code> / <code>Outputs</code>, each with a one-sentence description</li>
+      <li>Routing in plain English: "Reads from", "Then", "Routes", "Rows failing validation"</li>
+      <li>"dropped (recorded in the audit trail)" — even a discard is evidence</li>
+    </ul></div>
+  </div>
+  <aside class="notes"><p>The Spec tab is what a reviewer who does not read YAML reads. Point at the Routes line on the gate.</p></aside>
+</section>
+
+<section class="slide" data-seg="3">
+  <div class="kicker"><span class="seg">Segment 3 · Your first pipeline</span><span class="mode hands">Hands-on</span></div>
+  <h2>The YAML</h2>
+  <div class="cols">
+    <pre style="font-size:13px;margin:0">sources:
+  transactions:
+    plugin: csv
+    on_success: gate_in
+    options:
+      schema: {mode: fixed, fields: ['id: int', 'name: str',
+                                     'amount: int', 'category: str']}
+      on_validation_failure: discard
+gates:
+- name: amount_threshold
+  input: gate_in
+  condition: row['amount'] &gt; 1000
+  routes: {'true': high_values, 'false': output}
+sinks:
+  output:      {plugin: csv, on_write_failure: discard, options: {…}}
+  high_values: {plugin: csv, on_write_failure: discard, options: {…}}</pre>
+    <div class="col"><ul>
+      <li><code>YAML</code> tab: the same pipeline as text. <code>Copy</code> / <code>Download</code> → <code>pipeline-v&lt;n&gt;.yaml</code></li>
+      <li>Sections you will recognise: <code>sources:</code>, <code>gates:</code>, <code>sinks:</code></li>
+      <li>Banner: deployment-owned configuration — including the <code>landscape</code> audit destination — is supplied at run time and never written here</li>
+    </ul></div>
+  </div>
+  <aside class="notes"><p>Put the CLI example's settings.yaml side by side for 20 seconds — same shape. "Whatever you build here, an operator can run from the command line, and vice versa."</p></aside>
+</section>
+
+<!-- ═══════════════════════════ SEGMENT 4 — What just happened (24–28) ══ -->
+
+<section class="slide" data-seg="4">
+  <div class="kicker"><span class="seg">Segment 4 · What just happened</span><span class="mode">Talk</span></div>
+  <h2>The four things ELSPETH did that you did not</h2>
+  <div class="grid2" style="margin-top:8px">
+    <div class="card"><b>Validated</b>the proposal before it became your pipeline — wiring, route targets, schema compatibility</div>
+    <div class="card"><b>Recorded</b>a new version (<code>v2 ▾</code> in the header) — every accept is a version</div>
+    <div class="card"><b>Gated</b>the run — <code>Run pipeline</code> was disabled until <code>Validation: Passed</code></div>
+    <div class="card"><b>Wrote the audit trail</b>run configuration, every row's path, the gate result per row, output file hashes</div>
+  </div>
+  <aside class="notes"><p>Short, spoken over their finished runs. These four verbs are the product.</p></aside>
+</section>
+
+<section class="slide" data-seg="4">
+  <div class="kicker"><span class="seg">Segment 4 · What just happened</span><span class="mode">Talk</span></div>
+  <h2>The Run tab</h2>
+  <div class="cols">
+    <div class="mock"><div class="bar"><b>Run results</b><span class="badge ok" style="margin-left:6px">completed</span><span style="margin-left:auto">Runs (1)</span></div>
+      <div class="body" style="font-size:13px">
+        <div class="row"><span>Rows read / processed / rejected</span><span class="num">8 / 8 / 0</span></div>
+        <div class="row"><span>Tokens emitted / terminal / succeeded</span><span class="num">8 / 8 / 8</span></div>
+        <div class="row"><span>Routed / quarantined / discarded</span><span class="num">8 / 0 / 0</span></div>
+        <div class="row"><span>Audit closure</span><span class="badge ok">closed</span></div>
+        <div style="margin:10px 0 4px;font-weight:600">Outputs</div>
+        <div class="row"><span>csv · high_values.csv · 4 rows</span><code>sha256 9b1f…e3</code></div>
+        <div class="row"><span>csv · normal.csv · 4 rows</span><code>sha256 21c7…0a</code></div>
+      </div></div>
+    <div class="col"><ul>
+      <li>Status and <strong>accounting</strong>: rows read / processed / rejected; tokens emitted / terminal / succeeded / failed; routed / quarantined / discarded</li>
+      <li><code>Outputs</code>: every artefact with type, name, size, and a short content hash</li>
+      <li><code>Runs (n)</code> opens the history drawer</li>
+    </ul></div>
+  </div>
+  <aside class="notes"><p>Ask them to find the count 4 / 4 across the two sinks. Then: "The content hash is how you prove, later, that the file an auditor holds is the file this run wrote."</p></aside>
+</section>
+
+<section class="slide" data-seg="4">
+  <div class="kicker"><span class="seg">Segment 4 · What just happened</span><span class="mode">Talk</span></div>
+  <h2>Two vocabularies you now own</h2>
+  <p style="font-size:20px"><span class="tb tb-source">source</span> &nbsp;<span class="tb tb-transform">transform</span> &nbsp;<span class="tb tb-gate">gate</span> &nbsp;<span class="tb tb-sink">sink</span> &nbsp;<span class="tb tb-aggregation">aggregation</span> &nbsp;<span class="tb tb-coalesce">coalesce</span></p>
+  <ul>
+    <li>Structure: <strong>source</strong>, <strong>transform</strong>, <strong>gate</strong>, <strong>sink</strong> (the guided stepper says <strong>Output</strong>), <strong>edge</strong> / connection, <strong>node</strong></li>
+    <li><strong>Discard</strong> vs <strong>quarantine</strong>: <code>discard</code> drops the row but records it; a production pipeline routes failures to a quarantine sink for review instead</li>
+    <li>The word <strong>fork</strong> will mean two things later — a pipeline branch, and forking a chat message. Always say which.</li>
+  </ul>
+  <aside class="notes"><p>The tutorial's own caveat, verbatim: "This worked example sets validation failures to 'discard' … A production pipeline routes non-conformant rows to a quarantine sink for review instead of dropping them."</p></aside>
+</section>
+
+<!-- ═══════════════════════════ SEGMENT 5 — Adding an LLM (28–38) ═══════ -->
+
+<section class="slide section-title" data-seg="5">
+  <div class="kicker"><span class="seg">Segment 5 · 28–38 min</span><span class="mode hands">Hands-on</span></div>
+  <h1>Adding an LLM</h1>
+  <p>Same session. Ask the planner:</p>
+  <pre style="font-size:17px;max-width:900px">Before routing, have an LLM classify each transaction's
+category as retail, wholesale or corporate from its name
+and amount, and write the label to a new field llm_category.
+Keep the same routing.</pre>
+  <p style="font-size:18px">Accept the proposal. Then <strong>do not run yet</strong> — look at the cards.</p>
+  <aside class="notes"><p>Freeform or guided both work; in guided this is a revision of the Transforms stage. Expect a longer planner turn — narrate the "Working on..." indicator and its "Show details" while they wait.</p></aside>
+</section>
+
+<section class="slide" data-seg="5">
+  <div class="kicker"><span class="seg">Segment 5 · Adding an LLM</span><span class="mode hands">Hands-on</span></div>
+  <h2>"3 decisions the LLM made — acknowledge each"</h2>
+  <div class="cols">
+    <div class="stack">
+      <div class="pcard pending"><div class="hd"><span>Transforms step · prompt</span></div><div style="font-size:13px">The LLM wrote the instruction for this step.</div><div style="margin-top:6px"><span class="btn">View prompt</span> <span class="btn primary dim">Approve</span></div></div>
+      <div class="pcard pending"><div class="hd"><span>Transforms step · model</span></div><div style="font-size:13px">The LLM picked <code>&lt;model&gt;</code>.</div><div style="margin-top:6px"><span class="btn">Acknowledge</span> <span class="btn">Change…</span></div></div>
+      <div class="pcard pending"><div class="hd"><span>Transforms step · decision</span></div><div style="font-size:13px">How "classify" was operationalised — the category boundaries it chose.</div><div style="margin-top:6px"><span class="btn">Acknowledge</span> <span class="btn">Change…</span></div></div>
+    </div>
+    <div class="col"><ul>
+      <li><strong>· prompt</strong> — <code>Approve</code> is locked until you have opened <code>View prompt</code> once</li>
+      <li><strong>· model</strong> — reviewable, not selectable: <code>Acknowledge</code> or <code>Change…</code></li>
+      <li><strong>· decision</strong> — a judgement call it made (scale, threshold, category boundary)</li>
+      <li><strong>Source data</strong> / <strong>Data contract</strong> — what the pipeline <em>promises</em> about its input</li>
+    </ul></div>
+  </div>
+  <aside class="notes"><p>This is the heart of the product. Every authored prompt is reviewed by a human on a card. Read a prompt aloud. If the planner authored a threshold or category boundary you did not specify, a decision card appears: ELSPETH surfacing the judgement so you can Change… it. Quote the tutorial: "The LLM made an assumption here … every assumption is surfaced in the audit trail, and you can correct it by telling the composer what you meant."</p></aside>
+</section>
+
+<section class="slide" data-seg="5">
+  <div class="kicker"><span class="seg">Segment 5 · Adding an LLM</span><span class="mode hands">Hands-on</span></div>
+  <h2>The controls you did not ask for</h2>
+  <div class="pipe" style="justify-content:center;margin:14px 0 22px">
+    <div class="node src"><small>Source</small>transactions</div><span class="arrow">→</span>
+    <div class="node tr ghost"><small>Transform · auto-wired</small>prompt shield</div><span class="arrow">→</span>
+    <div class="node tr"><small>Transform</small>classify (LLM)</div><span class="arrow">→</span>
+    <div class="node tr ghost"><small>Transform · auto-wired</small>content safety</div><span class="arrow">→</span>
+    <div class="node gt"><small>Gate</small>amount_threshold</div>
+  </div>
+  <ul>
+    <li>Look at the graph: a <strong>prompt shield</strong> before the LLM and a <strong>content safety</strong> check after it — nodes you did not author</li>
+    <li>The deployment requires them on every path that carries LLM input or output. ELSPETH wired them and staged a decision card saying so</li>
+  </ul>
+  <div class="quote" style="font-size:19px">Anything fetched from outside is untrusted, and text on a page can be written to steer a model.<span class="cite">tutorial shield note</span></div>
+  <aside class="notes"><p>On a deployment where the controls are "required", an LLM node without them is rejected, not warned about; the Composer auto-wires the deployment's chosen implementation and discloses it. If your deployment has no shield authorised, use the tutorial's caveat instead: "Running an LLM over fetched content without a shield is always a high-risk decision, not a default." Either way this is the slide where "the LLM is not the authority" becomes visible on screen.</p></aside>
+</section>
+
+<section class="slide" data-seg="5">
+  <div class="kicker"><span class="seg">Segment 5 · Adding an LLM</span><span class="mode hands">Hands-on</span></div>
+  <h2>What you can and cannot set on an LLM node</h2>
+  <div class="cols">
+    <div class="card"><h3 style="color:var(--c-source)">You set</h3><ul class="mini" style="font-size:18px"><li>the prompt</li><li>the field the answer is written to</li><li>the <code>Model profile</code> — picked by name</li></ul></div>
+    <div class="card paper"><h3 style="color:var(--color-warning)">The operator sets</h3><ul class="mini" style="font-size:18px"><li>provider, credentials, endpoint</li><li>concurrency, timeouts</li><li>— all bound into the profile you pick</li></ul></div>
+  </div>
+  <div class="alert info" style="margin-top:18px">You never type an API key into a pipeline. <code>API keys &amp; secrets</code> (chat <code>More actions</code>) stores them; the pipeline carries a <em>reference</em>.</div>
+  <aside class="notes"><p>The "Composer: &lt;model&gt;" chip in the chat header is the model the planner uses — display-only, set by the deployment. The model your pipeline uses is a per-node option, reviewable on the "· model" card.</p></aside>
+</section>
+
+<section class="slide" data-seg="5">
+  <div class="kicker"><span class="seg">Segment 5 · Adding an LLM</span><span class="mode hands">Hands-on</span></div>
+  <h2>Run it</h2>
+  <ul>
+    <li>Clear the cards → <code>Validation: Passed</code> → <code>Run pipeline</code></li>
+    <li>Run tab: LLM calls appear in the accounting; outputs now carry <code>llm_category</code></li>
+    <li>Every LLM call's request and response is recorded (hashed, payload stored) — that is what makes the run <strong>replayable</strong></li>
+  </ul>
+  <div class="spacer"></div>
+  <div class="alert warn">Run disclosure: "This run leaves the composer and uses your stored credentials" — read it before confirming.</div>
+  <aside class="notes"><p>Give this two full minutes; LLM runs take longer. Use the wait to preview Segment 6: "the shapes I am about to show are built by the same planner from a sentence."</p></aside>
+</section>
+
+<!-- ═══════════════════════════ SEGMENT 6 — Advanced shapes (38–47) ═════ -->
+
+<section class="slide" data-seg="6">
+  <div class="kicker"><span class="seg">Segment 6 · Advanced shapes</span><span class="mode">Trainer demo · pre-built sessions</span></div>
+  <h2>The nine structures the planner can author</h2>
+  <div class="grid2" style="font-size:19px">
+    <div>Linear chains</div><div>Conditional gates</div>
+    <div>Multiple outputs</div><div><strong style="color:var(--c-coalesce)">Fork and coalesce</strong></div>
+    <div>Multi-source fan-in</div><div><strong style="color:var(--c-aggregation)">Batch aggregation</strong></div>
+    <div><strong style="color:var(--c-transform)">Row expansion</strong></div><div>Error routing</div>
+    <div>Structured LLM output read downstream</div><div></div>
+  </div>
+  <div class="quote" style="font-size:18px;margin-top:20px">These are the same nine canonical classes the parity corpus verifies across every authoring surface.<span class="cite">docs/guides/user-manual.md</span></div>
+  <aside class="notes"><p>Do not enumerate on stage; leave the slide up. You are going to show four. Load each from "Find a session…" — Graph, then the Spec's routing lines, then name the problem it solves. Two minutes each.</p></aside>
+</section>
+
+<section class="slide" data-seg="6">
+  <div class="kicker"><span class="seg">Segment 6 · Advanced shapes</span><span class="mode">Trainer demo</span></div>
+  <h2>Fork + coalesce: two opinions, one row</h2>
+  <div class="pipe" style="justify-content:center;margin:10px 0 20px">
+    <div class="node src"><small>Source</small>documents</div><span class="arrow">→</span>
+    <div class="node gt"><small>Gate</small>fork_to: [a, b]</div><span class="arrow">→</span>
+    <div class="stack"><div class="node tr"><small>Transform</small>reviewer A (LLM)</div><div class="node tr"><small>Transform</small>reviewer B (LLM)</div></div><span class="arrow">→</span>
+    <div class="node co"><small>Coalesce</small>require_all · nested</div><span class="arrow">→</span>
+    <div class="node sk"><small>Sink</small>reviews</div>
+  </div>
+  <ul>
+    <li>Problem: two independent LLM reviewers on the same document, merged back into one row</li>
+    <li>Spec: "Forks every row to" two branches → "Merges branches" · "Merge policy: require_all"</li>
+    <li>Rule of thumb: a coalesce <strong>merges fields</strong>; the row count goes N → 1</li>
+  </ul>
+  <aside class="notes"><p>Spec tab shows "every row continues to all branches". Mention the merge policies in one breath — require_all, best_effort (with a timeout), first — and move on.</p></aside>
+</section>
+
+<section class="slide" data-seg="6">
+  <div class="kicker"><span class="seg">Segment 6 · Advanced shapes</span><span class="mode">Trainer demo</span></div>
+  <h2>Row union: A/B without merging</h2>
+  <div class="pipe" style="justify-content:center;margin:10px 0 20px">
+    <div class="node src"><small>Source</small>cases</div><span class="arrow">→</span>
+    <div class="node gt"><small>Gate</small>fork_to: [control, treatment]</div><span class="arrow">→</span>
+    <div class="stack"><div class="node tr"><small>Transform</small>prompt A (LLM)</div><div class="node tr"><small>Transform</small>prompt B (LLM)</div></div><span class="arrow">→</span>
+    <div class="node co"><small>Row union</small>correlated pair</div><span class="arrow">→</span>
+    <div class="node ag"><small>Aggregation</small>compare (end-of-source)</div>
+  </div>
+  <ul>
+    <li>Problem: compare prompt A vs prompt B across the same rows, then judge the <em>pair</em></li>
+    <li>A row union does <strong>not</strong> merge — it releases both rows, in order, as a correlated pair (N → N); the comparison step downstream does the judging</li>
+    <li>Only end-of-source aggregation is allowed after a row union — a count trigger could split a pair</li>
+  </ul>
+  <aside class="notes"><p>Contrast with the previous slide in one sentence: coalesce when you want one combined row; row union when the rows must stay separate but travel together.</p></aside>
+</section>
+
+<section class="slide" data-seg="6">
+  <div class="kicker"><span class="seg">Segment 6 · Advanced shapes</span><span class="mode">Trainer demo</span></div>
+  <h2>Scope + collector: one document, many pages</h2>
+  <div class="pipe" style="justify-content:center;margin:10px 0 20px">
+    <div class="node src"><small>Source</small>documents</div><span class="arrow">→</span>
+    <div class="node tr"><small>Transform · opens scope</small>explode pages</div><span class="arrow">→</span>
+    <div class="node tr"><small>Transform</small>per-page LLM</div><span class="arrow">→</span>
+    <div class="node ag"><small>Collector · closes scope</small>reassemble</div><span class="arrow">→</span>
+    <div class="node sk"><small>Sink</small>documents_out</div>
+  </div>
+  <ul>
+    <li>Problem: explode a document into pages, process each, then reassemble <em>that document's</em> pages</li>
+    <li>An expander <strong>opens a scope</strong>; a <strong>collector</strong> closes it (Spec: "Scope", "Scope opened by")</li>
+    <li>Policy is required, no default: <code>require_all</code> (any lost page fails the document) or <code>best_effort</code></li>
+    <li>A collector is not an aggregation: membership comes from the engine, not from a count or timer</li>
+  </ul>
+  <aside class="notes"><p>examples/scope_collector shows the same lost page under both policies: require_all yields 2 documents, best_effort yields 3.</p></aside>
+</section>
+
+<section class="slide" data-seg="6">
+  <div class="kicker"><span class="seg">Segment 6 · Advanced shapes</span><span class="mode">Trainer demo</span></div>
+  <h2>Batch aggregation, and the combined example</h2>
+  <ul>
+    <li><strong>Aggregation</strong>: statistics over a window — <code>trigger</code> by count, timeout, or end-of-source; <code>group_by</code></li>
+    <li>The finale shape (<code>examples/document_review_panel</code>): pages exploded → two reviewers forked <em>inside</em> each page → coalesce → collector per document → run-level aggregation</li>
+    <li>Everything here is authored by the same planner from a sentence — the vocabulary is the point, not the YAML</li>
+  </ul>
+  <div class="spacer"></div>
+  <div class="alert ok">Remember four words — <strong>fork</strong>, <strong>coalesce</strong>, <strong>row union</strong>, <strong>collector</strong> — and describe the problem; the planner picks.</div>
+  <aside class="notes"><p>If time is short, drop this slide's demo and just describe it.</p></aside>
+</section>
+
+<!-- ═══════════════════════════ SEGMENT 7 — Trust and evidence (47–53) ══ -->
+
+<section class="slide" data-seg="7">
+  <div class="kicker"><span class="seg">Segment 7 · Trust and evidence</span><span class="mode">Trainer demo</span></div>
+  <h2>The Audit panel, before you run</h2>
+  <div class="cols">
+    <div class="mock"><div class="bar"><b>Audit</b><span style="margin-left:auto;font-size:11px">Checked 2 min ago · as of v3</span></div>
+      <div class="body" style="padding:0">
+        <div class="row"><span>Validation</span><span class="badge block">Blocks run</span></div>
+        <div class="row"><span>Plugin trust</span><span class="badge block">Blocks run</span></div>
+        <div class="row"><span>Provenance</span><span class="badge adv">Advisory</span></div>
+        <div class="row"><span>Retention</span><span class="badge adv">Advisory</span></div>
+        <div class="row"><span>LLM interpretations</span><span class="badge adv">Advisory</span></div>
+        <div class="row"><span>Secrets</span><span class="badge block">Blocks run</span></div>
+        <div style="padding:10px;display:flex;gap:8px"><span class="btn">Refresh</span><span class="btn">Explain</span><span class="btn">Collapse</span></div>
+      </div></div>
+    <div class="col"><ul>
+      <li><code>Audit: Ready</code> → Inspector → <code>Audit</code>. Collapsed: <code>✓ Audit ready</code>. Expanded: six rows</li>
+      <li>"Rows marked 'Blocks run' must be clear before you can run this pipeline; the rest are advisory and do not stop a run."</li>
+      <li><code>Explain</code> → <strong>"What this pipeline will record"</strong> — the audit story in prose, <em>before</em> a single row moves</li>
+    </ul></div>
+  </div>
+  <aside class="notes"><p>This is the thesis on screen: audit readiness is checked at authoring time, not discovered afterwards. Open Explain and read two sentences of it. (Which rows block vs advise is decided per row by the service; the mock shows a typical split.)</p></aside>
+</section>
+
+<section class="slide" data-seg="7">
+  <div class="kicker"><span class="seg">Segment 7 · Trust and evidence</span><span class="mode">Trainer demo</span></div>
+  <h2>When validation fails</h2>
+  <div class="alert err"><b>Validation failed</b><br><b>classify:</b> Two steps aren't connected correctly: the "transactions" step's output doesn't match what "classify" expects.<br><span class="mini">Suggestion: declare the field the LLM reads as a required input, or produce it upstream.</span> &nbsp;<span class="chip">Technical details</span></div>
+  <ul>
+    <li>Load the broken session. <code>Validation: 1 errors</code> → Inspector → headline in plain English, <code>Suggestion:</code> beneath, raw dump behind <code>Technical details</code></li>
+    <li>Click the error → jumps to the node in <code>Graph</code></li>
+    <li>Fix it by telling the planner — you see <code>Looked up: explain_validation_error</code>, then a repair proposal</li>
+  </ul>
+  <div class="alert info" style="margin-top:auto">Two gates: <code>Run pipeline</code> shows its blocker as a plain line above the button; <code>Save for review</code> is stricter still. Advisory checks never block Run.</div>
+  <aside class="notes"><p>An advisor checkpoint can allow a run while still blocking completion — so Run can be live while Save for review is greyed. Raw internal ids are never the headline; the humaniser resolves them to the step's description or plugin.</p></aside>
+</section>
+
+<section class="slide" data-seg="7">
+  <div class="kicker"><span class="seg">Segment 7 · Trust and evidence</span><span class="mode">Talk</span></div>
+  <h2>Trust tiers: what happens when data is wrong</h2>
+  <div class="tiers">
+    <div class="tier t3"><h3>Tier 3 — anything from outside</h3><p>Your CSV, an API, an LLM's reply. <strong>Zero trust.</strong> Validated at the boundary; a bad row is <strong>quarantined</strong>, the run continues.</p></div>
+    <div class="tier t2"><h3>Tier 2 — your rows, once validated</h3><p>Types are trusted downstream. A wrong type there is an <strong>upstream bug to fix</strong>, not a data-quality case to handle.</p></div>
+    <div class="tier t1"><h3>Tier 1 — ELSPETH's own audit records</h3><p>Fully trusted, so any anomaly <strong>crashes</strong>. "Silently coercing bad audit data would be evidence tampering."</p></div>
+  </div>
+  <div class="quote" style="font-size:18px;margin-top:16px">A CSV with garbage in row 500 should not crash a 10,000-row pipeline. A corrupted audit record should crash immediately.<span class="cite">README.md — Data Trust Model</span></div>
+  <aside class="notes"><p>One nuance worth saying: tiers follow the data flow, not the plugin. An LLM in the middle of your graph creates a fresh Tier-3 boundary the moment the model answers.</p></aside>
+</section>
+
+<section class="slide" data-seg="7">
+  <div class="kicker"><span class="seg">Segment 7 · Trust and evidence</span><span class="mode">Talk</span></div>
+  <h2>After the run: what survives, and for how long</h2>
+  <ul>
+    <li>Run accounting closes the books: every row reached exactly one terminal outcome, or the run says so (<code>Audit closure</code>)</li>
+    <li>Deeper questions live outside the browser: <code>elspeth explain --run latest --row 2</code> — the lineage tree for Bob's $1500</li>
+  </ul>
+  <div class="cols w3" style="flex:0 0 auto;margin:14px 0">
+    <div class="card"><h3 style="color:var(--color-success)">FULL</h3><p class="mini">Deterministic. Re-run and get identical results.</p></div>
+    <div class="card" style="border-color:var(--c-source)"><h3 style="color:var(--c-source)">REPLAY</h3><p class="mini">Any LLM step. Replay from recorded responses. <strong>Yours, by construction.</strong></p></div>
+    <div class="card"><h3 style="color:var(--color-warning)">ATTRIBUTABLE ONLY</h3><p class="mini">Payloads purged. Hashes survive; the content does not.</p></div>
+  </div>
+  <div class="quote" style="font-size:18px">Hashes survive payload deletion.<span class="cite">docs/release/guarantees.md §1.4</span></div>
+  <aside class="notes"><p>Be honest about the boundary: the web UI shows accounting, artefacts and fork/expand lineage frames; the full per-row lineage explorer is the CLI / MCP surface. The three grades are the runs table's reproducibility_grade.</p></aside>
+</section>
+
+<!-- ═══════════════════════════ SEGMENT 8 — Getting work out (53–58) ════ -->
+
+<section class="slide" data-seg="8">
+  <div class="kicker"><span class="seg">Segment 8 · Getting work out</span><span class="mode">Demo + quick try</span></div>
+  <h2>YAML out, YAML in</h2>
+  <div class="cols">
+    <div class="col"><h3>Out</h3><ul><li><code>YAML</code> tab → <code>Copy</code> / <code>Download</code> (<code>pipeline-v&lt;n&gt;.yaml</code>)</li><li>Every export writes an audit event</li><li>Palette <code>Export YAML</code> / <kbd>Ctrl+Shift+Y</kbd> open the tab</li></ul></div>
+    <div class="col"><h3>In</h3><ul><li><code>Import YAML</code> (action bar): paste or choose a file</li><li>Live <code>Parsed preview</code> + <code>Validation summary</code> before anything is sent</li><li>Bind uploaded files for session-bound sources</li><li>Import <strong>replaces</strong> the pipeline — the old one stays in version history; in guided it switches you to freeform</li></ul></div>
+  </div>
+  <aside class="notes"><p>Fast demo; invite participants to try any one thing on their own session. Import's confirm text: "Importing will replace the current pipeline with the one in this YAML. The version you have now stays in your version history, and you can revert to it afterwards."</p></aside>
+</section>
+
+<section class="slide" data-seg="8">
+  <div class="kicker"><span class="seg">Segment 8 · Getting work out</span><span class="mode">Demo</span></div>
+  <h2>Save for review</h2>
+  <ul>
+    <li><code>Save for review</code> → <strong>Share for review</strong> → a <code>Share URL</code></li>
+    <li>The reviewer must be signed in; sees a frozen snapshot: graph, YAML, and the six-row audit panel <em>as it stood when you shared</em>; cannot edit, run, or fork</li>
+    <li>Only available when validation passes and no readiness row is in error</li>
+  </ul>
+  <div class="spacer"></div>
+  <div class="quote" style="font-size:19px">Sharing a known-broken state is share-theatre.<span class="cite">docs/guides/sharing-pipelines.md</span></div>
+  <aside class="notes"><p>Links expire (30 days by default) and a re-share of the unchanged pipeline produces the same snapshot digest. A compliance reviewer can save for review without running anything.</p></aside>
+</section>
+
+<section class="slide" data-seg="8">
+  <div class="kicker"><span class="seg">Segment 8 · Getting work out</span><span class="mode">Demo</span></div>
+  <h2>Versions and forks</h2>
+  <ul>
+    <li><code>v&lt;n&gt; ▾</code> → <strong>Composition history</strong> → <code>Revert to v&lt;n&gt;</code> (confirm: "Revert pipeline")</li>
+    <li>Hover any of <em>your</em> messages → pencil <code>Edit and fork from this message</code> → edit → <code>Fork</code>: a new session branching from that point, provenance recorded</li>
+    <li>Sessions persist on their own — nothing to save; <code>Rename</code> / <code>Archive</code> from the switcher</li>
+  </ul>
+  <div class="spacer"></div>
+  <div class="alert warn">This is the <strong>message</strong> fork. The <strong>pipeline</strong> fork (Segment 6) is a gate with <code>fork_to</code>. Different things.</div>
+  <aside class="notes"><p>Ctrl/Cmd+Enter submits the fork edit. Archive confirm: 'Archive session "…"? You can restore it later.'</p></aside>
+</section>
+
+<section class="slide" data-seg="8">
+  <div class="kicker"><span class="seg">Segment 8 · Getting work out</span><span class="mode">Demo — flip it live</span></div>
+  <h2>Detail level</h2>
+  <div class="cols">
+    <div class="card paper" style="font-size:14px"><b>Detail level</b> <span class="chip">Standard (recommended)</span><div class="hr"></div><b>classify config</b> <span class="tb tb-transform">transform</span><br>Prompt &nbsp;<code>Classify this transaction…</code><br>Answer written to &nbsp;<code>llm_category</code><br>Model profile &nbsp;<code>default</code><br><details><summary>Advanced settings (12)</summary></details><div class="hr"></div><span class="badge ok">All 9 checks passed.</span></div>
+    <div class="card paper" style="font-size:14px"><b>Detail level</b> <span class="chip">Show technical detail</span><div class="hr"></div><b>classify config</b> <span class="tb tb-transform">transform</span><br>Prompt · Answer written to · Model profile<br><details open><summary>Advanced settings (12)</summary><span class="mini">temperature · schema · required_input_fields · …</span></details><details><summary>Raw options (JSON)</summary></details><div class="hr"></div><span class="mini">✓ graph_structure · ✓ route_targets · ✓ edge_contracts · … (9)</span></div>
+  </div>
+  <p style="margin-top:14px"><code>Account</code> → <code>Composer preferences</code> → <code>Detail level</code>. "The audit trail is always shown."</p>
+  <aside class="notes"><p>Flip it live on the LLM node from Segment 5. Same node, two depths. Engineers and auditors flip it on; everyone else leaves it off. It is an account preference, not per-session.</p></aside>
+</section>
+
+<!-- ═══════════════════════════ SEGMENT 9 — Recap (58–60) ═══════════════ -->
+
+<section class="slide" data-seg="9">
+  <div class="kicker"><span class="seg">Segment 9 · Recap</span><span class="mode">Talk</span></div>
+  <h2>What you can now do</h2>
+  <ul>
+    <li>Describe a pipeline → review proposals → acknowledge the LLM's decisions → validate → run → read the evidence</li>
+    <li>Four advanced words: <strong>fork + coalesce</strong>, <strong>row union</strong>, <strong>scope + collector</strong>, <strong>aggregation</strong></li>
+    <li>Six audit rows; <code>Blocks run</code> vs <code>Advisory</code>; three trust tiers</li>
+    <li>Out: YAML, review link, versions, message fork, detail level</li>
+  </ul>
+  <aside class="notes"><p>Read the outcomes back as a checklist. Ask one person to say the four advanced words.</p></aside>
+</section>
+
+<section class="slide" data-seg="9">
+  <div class="kicker"><span class="seg">Segment 9 · Recap</span><span class="mode">Talk</span></div>
+  <h2>Where next</h2>
+  <ul class="mini" style="font-size:18px">
+    <li style="font-size:18px"><code>Help &amp; documentation</code> (Account menu)</li>
+    <li style="font-size:18px"><code>docs/guides/your-first-pipeline.md</code> — the walkthrough you just did, CLI and browser</li>
+    <li style="font-size:18px"><code>docs/guides/user-manual.md</code> — Web Composer section · <code>docs/guides/troubleshooting.md</code> — "Web Composer — Guided Mode"</li>
+    <li style="font-size:18px"><code>examples/README.md</code> — "If You Want to See…" lookup table; every advanced shape has a runnable example</li>
+  </ul>
+  <div class="spacer"></div>
+  <div class="quote big">Validation and audit are part of the workflow, not after-the-fact diagnostics.<span class="cite">README.md</span></div>
+  <aside class="notes"><p>Close on the pitch, one last time. Then stop; do not run over.</p></aside>
+</section>
+
+</div></div>
+
+<div id="notes"><h4>Speaker notes</h4><div id="notesBody"></div></div>
+
+<script>
+(function(){
+  const slides=[...document.querySelectorAll('.slide')], n=slides.length;
+  const deck=document.getElementById('deck'), stage=document.getElementById('stage');
+  const counter=document.getElementById('counter'), notes=document.getElementById('notes'), notesBody=document.getElementById('notesBody'), progress=document.getElementById('progress');
+  let i=0;
+  const SEG={1:'Why this exists',2:'The shell',3:'Your first pipeline',4:'What just happened',5:'Adding an LLM',6:'Advanced shapes',7:'Trust and evidence',8:'Getting work out',9:'Recap'};
+  slides.forEach((s,k)=>{
+    if(!s.querySelector('.foot')){const f=document.createElement('div');f.className='foot';
+      f.innerHTML='<span><span class="wordmark">ELSPETH</span> · Web Composer in one hour</span><span>'+(SEG[s.dataset.seg]||'')+' · <span class="num">'+(k+1)+' / '+n+'</span></span>';s.appendChild(f);}
+  });
+  function fit(){const w=stage.clientWidth-32,h=stage.clientHeight-32;const s=Math.min(w/1280,h/720);deck.style.transform='scale('+s+')';}
+  function show(k,push){i=Math.max(0,Math.min(n-1,k));slides.forEach((s,j)=>s.classList.toggle('active',j===i));
+    counter.textContent=(i+1)+' / '+n;progress.style.width=((i+1)/n*100)+'%';
+    const a=slides[i].querySelector('.notes');notesBody.innerHTML=a?a.innerHTML:'<p>—</p>';
+    if(push!==false)history.replaceState(null,'','#'+(i+1));document.title='['+(i+1)+'/'+n+'] Web Composer in One Hour — ELSPETH';}
+  function fromHash(){const m=(location.hash||'').match(/#(\d+)/);show(m?parseInt(m[1],10)-1:0,false);}
+  let goto='';
+  addEventListener('keydown',e=>{
+    if(e.target instanceof Element&&e.target.matches('input,textarea'))return;
+    if(goto!==null&&/^\d$/.test(e.key)&&goto.startsWith('g')){goto+=e.key;return;}
+    if(goto.startsWith('g')&&e.key==='Enter'){const k=parseInt(goto.slice(1),10);if(k)show(k-1);goto='';return;}
+    goto='';
+    switch(e.key){
+      case 'ArrowRight':case ' ':case 'PageDown':case 'Enter':show(i+1);e.preventDefault();break;
+      case 'ArrowLeft':case 'PageUp':case 'Backspace':show(i-1);e.preventDefault();break;
+      case 'Home':show(0);break;case 'End':show(n-1);break;
+      case 'n':case 'N':notes.classList.toggle('open');break;
+      case 't':case 'T':toggleTheme();break;
+      case 'g':case 'G':goto='g';break;
+      case 'p':case 'P':if(!e.ctrlKey&&!e.metaKey)print();break;
+      case '?':help();break;
+    }
+  });
+  function toggleTheme(){const r=document.documentElement;const t=r.dataset.theme==='light'?'dark':'light';r.dataset.theme=t;try{localStorage.setItem('elspeth-deck-theme',t)}catch(_){}}
+  function help(){alert('→ / space  next\n← / PageUp  previous\nHome / End  first / last\nN  speaker notes\nT  light / dark\nG, digits, Enter  go to slide\nP  print (one slide per page, notes beneath)');}
+  document.getElementById('btnNotes').onclick=()=>notes.classList.toggle('open');
+  document.getElementById('btnTheme').onclick=toggleTheme;
+  document.getElementById('btnHelp').onclick=help;
+  deck.addEventListener('click',e=>{if(e.target.closest('a,button,details,summary'))return;show(e.clientX>innerWidth/2?i+1:i-1);});
+  addEventListener('resize',fit);addEventListener('hashchange',fromHash);
+  try{const t=localStorage.getItem('elspeth-deck-theme');if(t)document.documentElement.dataset.theme=t;}catch(_){}
+  fit();fromHash();
+})();
+</script>
+</body>
+</html>

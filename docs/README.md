@@ -74,6 +74,7 @@ Tutorials and operator/developer how-to material.
 
 - [Your First Pipeline](guides/your-first-pipeline.md)
 - [User Manual](guides/user-manual.md)
+- [Web Composer in One Hour — training plan (draft)](guides/composer-training-one-hour.md)
 - [Test System](guides/test-system.md)
 - [Data Trust and Error Handling](guides/data-trust-and-error-handling.md)
 - [Telemetry Guide](guides/telemetry.md)
