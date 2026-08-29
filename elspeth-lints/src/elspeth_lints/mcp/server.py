@@ -139,6 +139,15 @@ def _run_tool(ctx: _ServerContext, name: str, arguments: dict[str, Any]) -> _Too
 
 _OPERATOR_KEY_PLACEHOLDER = f"{_JUDGE_METADATA_SIGNATURE_ENV_VAR}=<operator-held-key>"
 
+# Above this many judge calls the rendered command carries
+# ``--continue-on-block``. A run this long is left unattended, and without the
+# flag one judged BLOCK ends it and the remaining actions are never attempted.
+# The flag costs nothing when nothing blocks -- exit 3 is reached only *after* a
+# BLOCK -- so the threshold is a command-noise judgement rather than a safety
+# trade-off, and there is no risk argument for lowering it to zero. Ten is the
+# point where an operator stops watching the run.
+_CONTINUE_ON_BLOCK_JUDGE_CALL_THRESHOLD = 10
+
 
 def _require_str_arg(arguments: dict[str, Any], name: str) -> str:
     value = arguments.get(name)
@@ -159,8 +168,44 @@ def _shell_join_keep_user(parts: list[str]) -> str:
     return " ".join(part if part == '"$USER"' else shlex.quote(part) for part in parts)
 
 
-def _sign_bundle_command(ctx: _ServerContext, bundle_path: Path) -> str:
-    """The paste-ready operator ``sign-bundle`` command for ``bundle_path``.
+def _judge_calling_kinds() -> frozenset[str]:
+    """The action kinds that spend a real judge call, from the fire-time authority.
+
+    ``sign_bundle_transaction`` owns this split -- it is the module that decides
+    which exit-1 is a judged BLOCK -- so the price quoted here cannot drift from
+    what the transaction actually spends. ``rotation`` and ``stale_delete`` are
+    mechanical YAML rewrites with no judge in the path.
+    """
+    from elspeth_lints.core.sign_bundle_transaction import _JUDGE_GATED_KINDS
+
+    return _JUDGE_GATED_KINDS
+
+
+def _bundle_lane_costs(bundle: Any) -> dict[str, tuple[int, int]]:
+    """Per-lane ``(action_count, judge_call_count)`` for the lanes actually staged.
+
+    The lane names come from the bundle's own actions, whose ``lane`` is derived
+    from ``kind`` by ``BundleAction.__post_init__`` -- so a rendered ``--lanes``
+    value can never be a hand-typed string that the CLI would reject.
+    """
+    judge_calling = _judge_calling_kinds()
+    costs: dict[str, list[int]] = {}
+    for action in bundle.actions:
+        counts = costs.setdefault(action.lane, [0, 0])
+        counts[0] += 1
+        if action.kind in judge_calling:
+            counts[1] += 1
+    return {lane: (actions, judge_calls) for lane, (actions, judge_calls) in costs.items()}
+
+
+def _sign_bundle_command_text(
+    ctx: _ServerContext,
+    bundle_path: Path,
+    *,
+    lanes: str | None,
+    continue_on_block: bool,
+) -> str:
+    """Render one paste-ready ``sign-bundle`` invocation at the given scope.
 
     Mirrors ``judge_signature_diagnosis._justify_command``: the operator key is
     an ``env`` placeholder (never a real value), and ``--owner "$USER"`` is left
@@ -185,9 +230,95 @@ def _sign_bundle_command(ctx: _ServerContext, bundle_path: Path) -> str:
         "codex-cli",
         "--judge-tools",
         "readonly",
-        "--dry-run",
     ]
+    if lanes is not None:
+        parts.extend(("--lanes", lanes))
+    if continue_on_block:
+        parts.append("--continue-on-block")
+    parts.append("--dry-run")
     return _shell_join_keep_user(parts)
+
+
+def _sign_bundle_command(ctx: _ServerContext, bundle_path: Path, bundle: Any) -> str:
+    """The paste-ready whole-bundle operator ``sign-bundle`` command.
+
+    Whole-bundle, so no ``--lanes``: this is the command for firing everything
+    that was staged. ``sign_bundle_plan`` renders the per-lane alternatives and
+    prices each one, so the operator can see that a cheaper scope exists rather
+    than having this surface pick for them.
+    """
+    judge_calls = sum(count for _, count in _bundle_lane_costs(bundle).values())
+    return _sign_bundle_command_text(
+        ctx,
+        bundle_path,
+        lanes=None,
+        continue_on_block=judge_calls > _CONTINUE_ON_BLOCK_JUDGE_CALL_THRESHOLD,
+    )
+
+
+def _sign_bundle_plan(ctx: _ServerContext, bundle_path: Path, bundle: Any) -> dict[str, Any]:
+    """Price the staged bundle and render a lane-scoped command for each lane.
+
+    The whole-bundle command alone hid the cost of what it was about to spend
+    (elspeth-23ee8e3440): a bundle mixing a mechanical ``resign`` lane with a
+    large un-rationaled ``new_judgment`` lane read exactly like a cheap one.
+    Every command here carries ``--dry-run``, so pasting one spends nothing;
+    ``judge_calls`` is what that scope costs once ``--dry-run`` is dropped.
+    Lanes are ordered cheapest-first so the price is what the reader sees first.
+    """
+    costs = _bundle_lane_costs(bundle)
+    judge_calls_total = sum(count for _, count in costs.values())
+    per_lane = [
+        {
+            "lane": lane,
+            "actions": actions,
+            "judge_calls": judge_calls,
+            "command": _sign_bundle_command_text(
+                ctx,
+                bundle_path,
+                lanes=lane,
+                continue_on_block=judge_calls > _CONTINUE_ON_BLOCK_JUDGE_CALL_THRESHOLD,
+            ),
+        }
+        for lane, (actions, judge_calls) in sorted(costs.items(), key=lambda item: (item[1][1], item[0]))
+    ]
+
+    notes = [
+        "Every command carries --dry-run and spends no judge call; judge_calls is what that scope costs once --dry-run is dropped.",
+    ]
+    if len(per_lane) > 1:
+        notes.append(
+            f"This bundle mixes {len(per_lane)} lanes. sign_bundle_command fires all of them "
+            f"({judge_calls_total} judge call(s)); each per_lane command fires one lane and costs "
+            "only that lane's judge calls. Unselected actions are never attempted, never judged, "
+            "and stay exactly as they are in the allowlist."
+        )
+    if judge_calls_total > _CONTINUE_ON_BLOCK_JUDGE_CALL_THRESHOLD:
+        notes.append(
+            f"--continue-on-block is rendered wherever a scope exceeds "
+            f"{_CONTINUE_ON_BLOCK_JUDGE_CALL_THRESHOLD} judge call(s): without it one judged BLOCK "
+            "ends the run and the remaining actions are never attempted. With it, blocked actions "
+            "are journalled and left fail-closed, the survivors publish coherently, and the command "
+            "exits 3 rather than 0."
+        )
+
+    justify_total = sum(1 for action in bundle.actions if action.kind == "justify")
+    missing_rationale = sum(1 for action in bundle.actions if action.kind == "justify" and not (action.draft_rationale or "").strip())
+    if missing_rationale:
+        notes.append(
+            f"{missing_rationale} of {justify_total} justify action(s) carry no draft_rationale. Each "
+            "still spends a judge call at fire time and the judge rules on a generic placeholder, so "
+            "this is an expensive, near-certain-BLOCK run: annotate them with stage_annotate (and "
+            "check them with stage_preview) before firing the new_judgment lane."
+        )
+
+    return {
+        "actions_total": len(bundle.actions),
+        "judge_calls_total": judge_calls_total,
+        "judge_calling_kinds": sorted(_judge_calling_kinds()),
+        "per_lane": per_lane,
+        "notes": notes,
+    }
 
 
 def _rekey_command(ctx: _ServerContext, bundle_path: Path, *, old_key_env: str, new_key_env: str) -> str:
@@ -306,7 +437,8 @@ def _tool_stage_status(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
         "preview_outcomes": preview_outcomes,
         "justify_missing_rationale": justify_missing_rationale,
         "has_rekey_plan": bundle.rekey is not None,
-        "sign_bundle_command": _sign_bundle_command(ctx, bundle_path),
+        "sign_bundle_command": _sign_bundle_command(ctx, bundle_path, bundle),
+        "sign_bundle_plan": _sign_bundle_plan(ctx, bundle_path, bundle),
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
@@ -486,7 +618,8 @@ def _tool_stage_scan(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
             "per_file_covered_count": target_census.per_file_covered_count,
             "uncovered_count": target_census.uncovered_count,
         },
-        "sign_bundle_command": _sign_bundle_command(ctx, path),
+        "sign_bundle_command": _sign_bundle_command(ctx, path, bundle),
+        "sign_bundle_plan": _sign_bundle_plan(ctx, path, bundle),
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
@@ -548,7 +681,8 @@ def _tool_stage_annotate(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
         "written_path": str(path),
         "annotated": len(rationales),
         "justify_missing_rationale": missing,
-        "sign_bundle_command": _sign_bundle_command(ctx, path),
+        "sign_bundle_command": _sign_bundle_command(ctx, path, new_bundle),
+        "sign_bundle_plan": _sign_bundle_plan(ctx, path, new_bundle),
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
@@ -694,7 +828,8 @@ def _tool_stage_preview(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
         "written_path": str(path),
         "previewed": previewed,
         "blocked": blocked,
-        "sign_bundle_command": _sign_bundle_command(ctx, path),
+        "sign_bundle_command": _sign_bundle_command(ctx, path, new_bundle),
+        "sign_bundle_plan": _sign_bundle_plan(ctx, path, new_bundle),
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
@@ -790,7 +925,8 @@ _TOOLS.update(
         "stage_status": _ToolSpec(
             description=(
                 "Verify the exact source binding, refuse stale bundles, then summarise per-lane/kind "
-                "counts and preview outcomes and emit the paste-ready operator command."
+                "counts and preview outcomes and emit the paste-ready operator command plus a "
+                "per-lane plan pricing each scope in judge calls."
             ),
             input_schema={
                 "type": "object",

@@ -1582,6 +1582,35 @@ is a working document under the normal delivery posture.
   walker change: shipped unanchored filters rely on substring semantics and
   require a separate audited migration.
 
+- **2026-08-29 — `sign_bundle_transaction._JUDGE_GATED_KINDS` is the ONE
+  authority for "which action kinds spend a judge call"; price off it, never
+  off a local copy** (elspeth-23ee8e3440). The MCP staging surface renders the
+  operator's paste-ready `sign-bundle` command, and that command's cost is
+  entirely a function of this set (`justify` + `drift_repair` reach
+  `_run_justify`; `rotation` and `stale_delete` are mechanical YAML rewrites).
+  Three call sites already read it, so a fourth private `frozenset({"justify",
+  "drift_repair"})` would quote a price the transaction does not actually
+  spend the moment the split moves. `mcp/server.py::_judge_calling_kinds()`
+  imports it lazily for exactly this reason. Traps:
+  - **A lane's price is not its size.** The `resign` lane holds all three
+    mechanical kinds *and* `drift_repair`, so a 366-action `resign` lane can
+    cost 0 judge calls while a same-size `new_judgment` lane costs 366. Any
+    "how expensive is this bundle" answer must count kinds, not actions.
+  - The renderer's `--lanes` values must come from the bundle's own
+    `action.lane` (derived from `kind` by `BundleAction.__post_init__`), never
+    a typed literal — that is what keeps them inside `cli._SIGN_BUNDLE_LANES`
+    without importing the argparse module into the keyless MCP surface.
+  - Every rendered command carries `--dry-run`, so pasting one spends nothing.
+    Word any cost annotation as what the scope costs *once `--dry-run` is
+    dropped*; saying the command costs N judge calls is simply false.
+  - Testing it: assert on rendered VALUES (`--lanes new_judgment`), never the
+    bare flag name — the response carries several commands and a substring
+    check cannot discriminate between them. Pair every presence assertion with
+    an absence control on the opposite bundle (single-lane vs mixed, at the
+    threshold vs one over), and build `BundleAction` fixtures by direct
+    construction: the masquerade gate scans tests, so parametrizing by
+    attribute name and resolving with `getattr` turns the whole tree red.
+
 - **2026-08-28 — in `sign-bundle`, a judged BLOCK is DURABLE STATE, not a
   return value: never use one as a generic "stop the run" mechanism**
   (elspeth-88d8b186f3). `run_sign_bundle_transaction` journals the BLOCK into

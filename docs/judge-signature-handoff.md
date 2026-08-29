@@ -114,7 +114,7 @@ present in the environment.
 | --- | --- | --- | --- |
 | `verify_signatures` | yes | no | Read-only, **always shape-only** signature diagnosis of the tier_model allowlist. The authoritative HMAC recompute is the operator CLI `diagnose`, not this tool. |
 | `stage_scan` | yes | no | Survey source tree + allowlist into an authority-free worklist bundle across four lanes — `drift_repair` / `rotation` / `stale_delete` / `new_judgment` — and report the raw empty-allowlist target census split into exact-covered, per-file-covered, and uncovered targets. Roots are recorded as absolute paths, and ambiguous non-judge target groups fail staging. Args: optional `bundle_id`, `staged_by`. |
-| `stage_status` | yes | no | Verify the exact source binding, refuse stale bundles, then summarise a staged bundle (including source identity, per-lane/kind counts, preview outcomes, and which `justify` actions still lack a draft rationale) and emit the paste-ready operator command. Arg: `bundle_id` (required). |
+| `stage_status` | yes | no | Verify the exact source binding, refuse stale bundles, then summarise a staged bundle (including source identity, per-lane/kind counts, preview outcomes, and which `justify` actions still lack a draft rationale) and emit the paste-ready operator command plus the `sign_bundle_plan` that prices it. Arg: `bundle_id` (required). |
 | `stage_annotate` | yes | no | Attach agent-authored site-specific rationales to staged `justify` actions (`draft_rationale`); the preview judge and the operator fire-time judge both receive this text. Clears any existing preview on annotated actions — a verdict rendered for a different rationale is stale evidence. Refuses stale bundles, unknown keys, and empty rationales. Args: `bundle_id`, `rationales` (map of action key → text, both required). |
 | `stage_preview` | yes | yes (read-only Codex CLI judge) | Fully verify the sign bundle before any judge call, run the sealed read-only Codex judge over each `new_judgment` action, reverify before overwrite, and record a **non-authoritative** preview verdict (`authoritative=False`). The previewed `JudgeRequest` carries the fire-time record: the annotated rationale, the rule's own definition, and duplicate-rationale evidence from the live allowlist. Stale bundles are never judged or rewritten. Arg: `bundle_id` (required). Needs installed/authenticated Codex CLI plus `[mcp]`. |
 | `stage_rekey` | yes | no | Enumerate currently-valid judge-gated entries and flag broken ones into a rekey bundle, recording env-var **names** only — never key bytes. Args: `old_key_env`, `new_key_env` (required), optional `bundle_id`, `staged_by`. |
@@ -123,6 +123,36 @@ present in the environment.
 (`exclude_judge_gated=True`), so the rotation lane serves the 17 non-judge-gated
 pre-judge entries and never the 388 judge-gated ones; an fp-shifted judge-gated
 entry routes to `drift_repair` only.
+
+### The rendered command prices its own scope
+
+Every tool that emits `sign_bundle_command` also emits `sign_bundle_plan`, and
+both are derived from what the bundle actually contains rather than from a fixed
+string. `judge_calls` counts only the kinds that reach a real judge —
+`justify` and `drift_repair`, which both route through `_run_justify`;
+`rotation` and `stale_delete` are mechanical YAML rewrites with no judge in the
+path. So a lane's price is not its size: a 366-action `resign` lane of
+rotations costs nothing, while a 2,339-action `new_judgment` lane costs 2,339
+judge calls.
+
+`sign_bundle_command` stays the whole-bundle form — fire everything that was
+staged. `sign_bundle_plan.per_lane` lists each staged lane cheapest-first with
+its action count, its judge-call count, and a `--lanes`-scoped command that
+fires only that lane; unselected actions are never attempted, never judged, and
+stay exactly as they are in the allowlist. The staging surface prices the
+options and does not choose between them.
+
+Any scope costing more than ten judge calls renders `--continue-on-block`, so
+one judged BLOCK does not end an unattended run. Ten is a command-noise
+threshold, not a safety one: the flag changes nothing when nothing blocks, since
+exit 3 is reached only after a BLOCK. `sign_bundle_plan.notes` states each
+choice inline, and flags a bundle whose `justify` actions carry no
+`draft_rationale` — that run spends a judge call per action to have the judge
+rule on a generic placeholder, which is expensive and near-certain to BLOCK.
+Annotate with `stage_annotate` and check with `stage_preview` first.
+
+Every rendered command carries `--dry-run`, so pasting one spends nothing; the
+`judge_calls` figures are what that scope costs once `--dry-run` is dropped.
 
 ## Operator commands (key-bearing shell)
 
@@ -136,8 +166,21 @@ before touching the configured active allowlist.
 
 ```
 elspeth-lints sign-bundle <bundle.json> --owner <operator-id> \
-  --judge-transport codex-cli --judge-tools readonly --dry-run
+  --judge-transport codex-cli --judge-tools readonly --dry-run \
+  [--lanes resign|new_judgment[,...]] [--continue-on-block]
 ```
+
+`--lanes` scopes the transaction to a subset of the bundle's lanes: `resign`
+(`drift_repair` + `rotation` + `stale_delete`, needing no new rationale) and/or
+`new_judgment` (`justify`, which judges the staged rationale). Unselected
+actions are never attempted, never judged, and stay exactly as they are in the
+allowlist; the coherent publish covers the selected lanes only. The selection is
+journalled, and a resume must use the same value (omitting the flag on resume
+inherits it). `--continue-on-block` journals a judged BLOCK and keeps firing
+instead of stopping, leaving each blocked entry fail-closed and exiting 3.
+Prefer the forms `stage_status` renders in `sign_bundle_plan` — they are derived
+from the bundle and carry each scope's judge-call price — over hand-writing
+either flag.
 
 This is the **only** place a judge signature is minted from a bundle. The verify
 phase first binds the CLI roots to the roots recorded in the bundle, then runs a
