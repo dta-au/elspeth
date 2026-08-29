@@ -247,6 +247,8 @@ Apply the public-integrity repair to these active ADRs:
 - `014-schema-config-mode-contract.md`
 - `015-creates-tokens-contract.md`
 - `019-two-axis-terminal-model.md`
+- `021-sources-and-sinks-uniformly-boundary.md`
+- `022-shareable-reviews.md`
 - `023-custom-python-ci-analyzer.md`
 - `024-delivery-governance-for-single-maintainer-mode.md`
 - `025-multi-source-ingestion.md`
@@ -261,7 +263,7 @@ Apply the public-integrity repair to these active ADRs:
 Update `docs/architecture/adr/000-template.md` and add
 `tests/unit/docs/test_adr_public_integrity.py`.
 
-Rules for the repair apply to this audited 25-ADR cohort:
+Rules for the repair apply to this audited 27-ADR cohort:
 
 - the accountable decision authority is `ELSPETH maintainer`;
 - agent, model, panel, or tool activity may be retained only as clearly
@@ -280,7 +282,7 @@ Rules for the repair apply to this audited 25-ADR cohort:
 
 ADR-024's project-control amendment is explicitly in scope for this
 documentation-cleanup sequence, so ADR-024 also receives a narrow current-claim
-and public-information review as the 25th audit target.
+and public-information review within the audited cohort.
 Claims about staffing or external affiliation must be supported by fresh,
 authorized public evidence or generalized to the minimum fact needed by the
 decision. Normative controls are labelled as requirements, not represented as
@@ -560,7 +562,7 @@ Before claiming completion, verify:
 - the primary checkout still contains only its pre-existing unrelated
   untracked file;
 - capture the final target pre-merge OID. If the target branch moved, compare
-  every planned pre-existing affected path (35 deletions and 32 modifications)
+  every planned pre-existing affected path (35 deletions and 34 modifications)
   and both protected retained designs against the frozen baseline; stop and
   re-review any overlap. Also assert that the five additions remain absent on
   the target. For safe disjoint drift, merge the captured target into the work
@@ -568,8 +570,8 @@ Before claiming completion, verify:
   immediately before final merge and repeat this check if it moved again;
 - stage exact task pathspecs only, never `git add .`;
 - the final tracked diff against the captured target OID matches the literal
-  Appendix A allowlist exactly: 5 additions, 32 modifications, and 35 deletions
-  (72 paths total). Aggregate counts alone are insufficient. The retained
+  Appendix A allowlist exactly: 5 additions, 34 modifications, and 35 deletions
+  (74 paths total). Aggregate counts alone are insufficient. The retained
   Composer-assistant and universal Web-plugin-policy designs are unchanged;
 - after Task 5 removes the self-matching plan, a guarded tracked-Markdown link
   check finds no inline or reference-style link target containing the three
@@ -619,7 +621,7 @@ plan payload (or from the plan's pre-deletion parent commit), sorts it into a
 temporary expected file, sorts `git diff --name-status --no-renames` output
 into a temporary actual file, and uses `cmp` on the two. It runs first for
 `$TARGET_PREMERGE..HEAD` on the work branch and then for `HEAD^1..HEAD` after
-the no-fast-forward integration, against these exact 72 entries:
+the no-fast-forward integration, against these exact 74 entries:
 
 ```text
 A	docs/project-control/milestone-forecast-register.md
@@ -645,6 +647,8 @@ M	docs/architecture/adr/013-declared-required-fields-contract.md
 M	docs/architecture/adr/014-schema-config-mode-contract.md
 M	docs/architecture/adr/015-creates-tokens-contract.md
 M	docs/architecture/adr/019-two-axis-terminal-model.md
+M	docs/architecture/adr/021-sources-and-sinks-uniformly-boundary.md
+M	docs/architecture/adr/022-shareable-reviews.md
 M	docs/architecture/adr/023-custom-python-ci-analyzer.md
 M	docs/architecture/adr/024-delivery-governance-for-single-maintainer-mode.md
 M	docs/architecture/adr/025-multi-source-ingestion.md
