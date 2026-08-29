@@ -125,9 +125,12 @@ seven.
 *Why it is kept rather than retired.* A large-file resolution defect degraded
 97–100 % of analyzed files through 2026-08 (five consecutive failed runs in
 the two hours before the fix); agents measurably stopped using it (Codex:
-1,970 calls in July ending in 1,882 cancellations over two days, 0 in
+1,970 calls in July, 1,882 of them cancelled over two days, then 164 in
 August; Claude Code: 104 of 180,517 tool calls, none from search-specialist
-or lane agents). The extractor fix landed 2026-08-29 17:50 local and the
+or lane agents). The agents' own recorded reason was less "wrong answer"
+than "trust question": stale-index warnings (38 explicit statements across
+both harnesses) and the rule that a zero-caller answer must be corroborated
+by grep — "once I'm going to grep, I skip the first step." The extractor fix landed 2026-08-29 17:50 local and the
 first post-fix run degraded 3 of 45 files. The maintainers' preference is to
 salvage: the graph is theirs, the three approved capabilities have no
 substitute, and the remaining problems are enumerable. The salvage worklist
