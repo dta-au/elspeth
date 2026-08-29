@@ -154,3 +154,14 @@
   IDENTICAL 59-finding set at the Wave-3 base (postB43c), Wave-3 close (w3_final) and Wave-4 base, and
   `git log 25cce9cdb..99d43f87d` on them is empty — Wave-3's outside-bucket identity checks were blind to
   those files but nothing moved in them; every Wave-3 identity claim stands.
+- tier-B27 MERGED (lane HEAD d92ead51b, elspeth-23dd89ac63): 215 → 25 (190 removed, 25 rationalised), 19
+  boundaries, 11 new pinning tests. Hub scan 2575 → 2385, outside-bucket identity EMPTY. Real fix: approvals.py
+  imported Ed25519PublicKey lazily inside `except Exception: return False`, so a missing/broken `cryptography`
+  read as a bad signature on the gate guarding terraform apply — hoisted to module scope. Hub at merge
+  (941b9718f): corrected the payload_root rationale (false "pydantic Path field with validate_default" claim on a
+  METHOD — capture sub-lane caught it, lane shipped it uncorrected) and reseeded the masquerade baseline (−1:
+  contracts.py::check_error_with_cause now amnestied by its boundary; 37 entries). Lane self-reports worth
+  keeping: `-c core.hooksPath=.git/hooks` inside a worktree runs ZERO hooks (silent --no-verify); `type(x) is
+  Path` is a live bug (pydantic yields PosixPath); gate_ledger got no boundary because 4/5 callers are write-path
+  self-checks (read-back prose would be false). Filed by lane: elspeth-obs-539724f2db (wrong check id on
+  malformed captured_at). Issue title/description corrected to 215.
