@@ -2041,6 +2041,11 @@ def _schema8_only_response_fields(body: GuidedRespondRequest, *allowed: str) -> 
 
 
 def _schema8_permitted_plugins(turn: Turn) -> tuple[str, ...]:
+    # Exact-type reads of a Turn payload are correct because BOTH producers
+    # thaw: ``_finalize_guided_turn`` and ``_load_durable_current_turn`` each
+    # build ``payload`` as ``dict(deep_thaw(...))``, and ``deep_thaw`` recurses.
+    # A producer that stopped thawing would break this loudly (InvariantError),
+    # never silently — but the coupling is two functions away, so name it here.
     options = turn["payload"]["options"]
     if type(options) is not list:
         raise InvariantError("single-select turn has no server-held option list")
@@ -2802,6 +2807,8 @@ async def post_guided_respond(
 
         if body.edit_target is None:
             raise AuditIntegrityError("guided proposal revision is missing its target")
+        # Exact-list read: both Turn producers (``_finalize_guided_turn``,
+        # ``_load_durable_current_turn``) hand over ``dict(deep_thaw(...))``.
         raw_targets = current_turn["payload"]["edit_targets"]
         requested = {
             "kind": body.edit_target.kind,
@@ -2824,6 +2831,9 @@ async def post_guided_respond(
             "edge": "connections",
             "output": "outputs",
         }[body.edit_target.kind]
+        # Exact-list/exact-dict reads below: both Turn producers
+        # (``_finalize_guided_turn``, ``_load_durable_current_turn``) build the
+        # payload as ``dict(deep_thaw(...))``, so nothing frozen reaches here.
         raw_components = payload[collection_key]
         if type(raw_components) is not list:
             raise AuditIntegrityError("guided wire projection lost its component collection")

@@ -723,13 +723,19 @@ def _step_1_uploaded_bind_form_options(form_turn: Turn) -> dict[str, object]:
     pressing Continue on that form would have submitted.
     """
     prefilled = form_turn["payload"]["prefilled"]
-    # KEEP ``isinstance(..., Mapping)``: ``form_turn`` reaches here BOTH freshly
-    # built (``_finalize_guided_turn`` — a plain dict) and reloaded from the
-    # content-addressed payload store (``prepare_guided_json_payload`` runs
-    # ``deep_freeze``, so nested mappings are ``MappingProxyType``, for which
-    # both ``type(x) is dict`` and ``isinstance(x, dict)`` are False).
-    # Narrowing this reject-gate to an exact type would make it fire on every
-    # replayed prefill.
+    # KEEP ``isinstance(..., Mapping)``: this reads a payload the server wrote
+    # and read back, which ADR-032 puts in the parse-what-we-do-not-own domain
+    # regardless of who authored the bytes. Both ``form_turn`` producers hand
+    # over an EXACT dict today — ``guided._finalize_guided_turn`` and
+    # ``guided._load_durable_current_turn`` each build the payload as
+    # ``dict(deep_thaw(...))``, and ``deep_thaw`` recurses, so the nested
+    # prefill is a plain dict on the replay path too (measured 2026-08-29).
+    # The tolerant ABC form is kept so this reject-gate's correctness does not
+    # rest on that producer detail: the frozen ``MappingProxyType`` that
+    # ``prepare_guided_json_payload`` holds inside ``PreparedGuidedJsonPayload``
+    # is one moved thaw away, and for it BOTH ``type(x) is dict`` and
+    # ``isinstance(x, dict)`` are False. That is a latent robustness argument,
+    # not a live population.
     if not isinstance(prefilled, Mapping):
         raise AuditIntegrityError("source schema form has no server-held prefill to bind")
     options = deep_thaw(prefilled)

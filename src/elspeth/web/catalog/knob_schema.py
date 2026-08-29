@@ -375,6 +375,18 @@ def _composer_extras(info: FieldInfo) -> Mapping[str, Any] | None:
     test stays green. Anything else present is an authoring mistake in a model
     we own (``KnobSchema`` is Tier 1) and raises at catalog load rather than
     shipping a silently wrong composer surface.
+
+    The callable arm is the one permissive branch left, and it is vacuously
+    safe today rather than merely tolerated: every ``json_schema_extra=``
+    declaration under ``src/`` is a dict literal (measured 2026-08-29 —
+    ``plugins/infrastructure/config_base.py`` x4, ``plugins/transforms/llm/
+    base.py``, ``plugins/transforms/llm/multi_query.py``,
+    ``web/composer/pipeline_planner.py``), so no callable mutator reaches this
+    read. It stays permissive because pydantic's own declared type admits the
+    form; a future field declaring ``composer_hidden`` through a callable would
+    be offered as a knob, which is why the arm is pinned by
+    ``tests/unit/web/catalog/test_knob_schema_composer_help.py::
+    test_callable_and_absent_extras_stay_the_no_op`` rather than left implicit.
     """
     extra = info.json_schema_extra
     if extra is None or callable(extra):
