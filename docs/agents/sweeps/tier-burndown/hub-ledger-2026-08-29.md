@@ -229,3 +229,20 @@
   rc 0, 1135 harness tests green post-merge. Tickets: elspeth-f124a558a0 (map effect check), elspeth-09450c9ba9
   (map root check), elspeth-4620c87aa0 (dead naive clause). obs elspeth-obs-539724f2db left open (manifest_schema
   captured_at, same class, different file). Final full suite running at 2319dec1d.
+
+## WAVE 4 CLOSED (2026-08-29, hub; suite tip 2319dec1d)
+- Final full suite at 2319dec1d: 43753 passed / 66 skipped / 1 xfailed / 0 failed (21m06s, -n 16, detached
+  worktree). All five Wave-4 issues CLOSED anchored feature/unified-lineage@2319dec1d (B26 elspeth-1213f153ae,
+  B27 elspeth-23dd89ac63, B28 elspeth-be73a74f17, lintmap elspeth-0bd4fb6042, stagecmd elspeth-23ee8e3440 with
+  fix_verification). All Wave-4 + fix + audit + suite worktrees reclaimed; remaining worktrees are other
+  sessions'/waves' (barrier-nav-width unmerged work, tier-lintprecision another session, lensA-wording +
+  wave1-audit historical).
+- FINAL NUMBERS: Wave 4 removed 384 (2594 → 2210) + w4fix 1 (→ 2209); codex-salvage delta 0. W1–W4 + fixes:
+  3,898 → 2,209 = 1,689 removed. John's target was ~2k: "I'll call it a win."
+- STILL OWED AT THE RE-STAGE (operator seam, NOT started): ONE stage_scan after the last fix merge; the
+  f0e38838d check-judge-quality re-run with a real LLM before any sign-bundle; the 40 Wave-3 stale signed
+  entries → stale_delete per the Wave-3 section; lens-A W3 F3 possibly-signed prose is operator-routed. New
+  sign_bundle_plan (stagecmd) now prices the run per lane. Open follow-ups for assignment: elspeth-f124a558a0
+  (exemption-map effect check — 18/78 entries exempt zero sites), elspeth-09450c9ba9 (map root check),
+  elspeth-4620c87aa0 (dead naive clause), elspeth-3b6708ef3d, elspeth-b5d005a913, elspeth-d152024c84,
+  elspeth-69149540e0, elspeth-2cab8e43b1; obs elspeth-obs-539724f2db open (manifest_schema captured_at code).
