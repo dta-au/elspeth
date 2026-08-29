@@ -122,7 +122,8 @@ rendering, teaching) will not turn the tutorial red.
    default CI suite.
 2. *Battery collector scenario (staging, MANUAL-FIRE):* a fixed
    collector-authoring scenario added to
-   `tests/e2e/tutorial-reliability.staging.spec.ts`. The battery is fired by
+   `src/elspeth/web/frontend/tests/e2e/tutorial-reliability.staging.spec.ts`.
+   The battery is fired by
    the operator only (never overlapping rounds), and the scenario's baseline
    of record — tool-call counts and repair rounds — is **PENDING CALIBRATION**
    until the first calibration round; until then it records and does not
@@ -132,7 +133,7 @@ rendering, teaching) will not turn the tutorial red.
 3. *Projection and decoder pins (unit, both sides):*
    `tests/unit/web/composer/guided/test_collector_guard.py` (inverted from
    refusal pin to projection pin, with mutation evidence) and the collector
-   cases in `src/api/guidedDecoder.test.ts`.
+   cases in `src/elspeth/web/frontend/src/api/guidedDecoder.test.ts`.
 
 **Reconsideration triggers** (carried verbatim from the WS6 dispatch ruling):
 

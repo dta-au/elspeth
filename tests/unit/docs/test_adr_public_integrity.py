@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -62,6 +63,14 @@ _OPAQUE_MEMORY_REFERENCE = re.compile(
     r"\s*[:=]?\s*`?(?:project|feedback)_[a-z0-9_]+\b",
     re.IGNORECASE,
 )
+_QUOTED_REVISION = re.compile(r"`(?P<revision>[0-9a-f]{7,40})`", re.IGNORECASE)
+_COMMIT_CITATION_GROUP = re.compile(
+    r"\bcommits?\s*:?\s*"
+    r"(?P<revisions>`[0-9a-f]{7,40}`"
+    r"(?:\s*(?:,\s*|,?\s+and\s+)`[0-9a-f]{7,40}`)*)",
+    re.IGNORECASE,
+)
+_REPOSITORY_FILE_REFERENCE = re.compile(r"`(?P<path>(?:src|tests)/[^`\n]+)`")
 
 
 def _active_adrs() -> tuple[Path, ...]:
@@ -102,6 +111,35 @@ def _public_provenance_violations(text: str) -> tuple[str, ...]:
             violations.append("opaque project-memory authority")
 
     return tuple(dict.fromkeys(violations))
+
+
+def _public_commit_citations(text: str) -> tuple[str, ...]:
+    citations: list[str] = []
+    for group in _COMMIT_CITATION_GROUP.finditer(text):
+        citations.extend(match.group("revision") for match in _QUOTED_REVISION.finditer(group.group("revisions")))
+    return tuple(dict.fromkeys(citations))
+
+
+def _reachable_git_commits() -> frozenset[str]:
+    result = subprocess.run(
+        ("git", "rev-list", "--all"),
+        cwd=REPOSITORY_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return frozenset(result.stdout.splitlines())
+
+
+def _resolve_git_commit(revision: str) -> str | None:
+    result = subprocess.run(
+        ("git", "rev-parse", "--verify", f"{revision}^{{commit}}"),
+        cwd=REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def test_audited_adrs_name_the_maintainer_as_accountable_authority() -> None:
@@ -163,6 +201,45 @@ def test_active_adrs_do_not_use_private_or_ephemeral_provenance() -> None:
         failures.extend(f"{path.name}: {violation}" for violation in _public_provenance_violations(text))
 
     assert not failures, "Active ADRs contain non-public provenance:\n" + "\n".join(failures)
+
+
+def test_audited_adr_commit_citations_resolve_to_reachable_history() -> None:
+    reachable_commits = _reachable_git_commits()
+    failures: list[str] = []
+
+    for filename in sorted(AUDITED_ADRS):
+        text = (ADR_DIRECTORY / filename).read_text(encoding="utf-8")
+        for revision in _public_commit_citations(text):
+            resolved = _resolve_git_commit(revision)
+            if resolved is None:
+                failures.append(f"{filename}: {revision} does not resolve as a commit")
+            elif resolved not in reachable_commits:
+                failures.append(f"{filename}: {revision} is not reachable from a Git ref")
+
+    assert not failures, "Audited ADR commit citations must remain publicly reachable:\n" + "\n".join(failures)
+
+
+def test_adr_031_live_control_references_exist() -> None:
+    text = (ADR_DIRECTORY / "031-tutorial-is-a-fixed-script-canary.md").read_text(encoding="utf-8")
+    references = tuple(match.group("path") for match in _REPOSITORY_FILE_REFERENCE.finditer(text))
+
+    assert references, "ADR-031 must cite its live compensating controls"
+    missing = tuple(path for path in references if not (REPOSITORY_ROOT / path).is_file())
+    assert not missing, "ADR-031 cites missing live controls:\n" + "\n".join(missing)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Evidence: commit `deadbeef`.", ("deadbeef",)),
+        ("Evidence: commits `deadbeef`, `cafebabe` and `0123456789`.", ("deadbeef", "cafebabe", "0123456789")),
+        ("The content hash is `deadbeef`.", ()),
+        ("Filigree issue `elspeth-deadbeef` records the decision.", ()),
+        ("The word commit appears after unrelated hash `deadbeef`.", ()),
+    ],
+)
+def test_public_commit_citation_boundary_cases(text: str, expected: tuple[str, ...]) -> None:
+    assert _public_commit_citations(text) == expected
 
 
 @pytest.mark.parametrize(
