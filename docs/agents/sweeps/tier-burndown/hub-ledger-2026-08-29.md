@@ -121,3 +121,10 @@
   whole-tree base and records the surfaced findings; wave-end: full suite in a worktree, two-lens audit,
   close issues anchored at the tip, then PAUSE (re-stage is the operator seam: ONE stage_scan after the
   last fix merge; f0e38838d judge-quality re-run still owed by the operator).
+- CORRECTION (caught by tier-B27's reconciliation, hub-measured): the hub's findings-count regex
+  `^[a-z_/]+\.py:[0-9]+:` rejects digit-bearing filenames, dropping s3.py (23), plugins/sources/aws_s3_source.py
+  (18), plugins/sinks/aws_s3_sink.py (8), web/composer/telemetry_phase8.py (10) = 59 findings from every
+  Wave-3 and Wave-4 absolute count. Correct regex: `^[a-z0-9_/]+\.py:[0-9]+:`. Corrected absolutes: Wave-3
+  base 2932 (not 2873) → Wave-3 close 2594 (not 2535); the 338 removed and the 1,304 W1–W3 total are
+  UNCHANGED (the dropped files did not move). Wave-4 base @99d43f87d = 2594 whole-tree, harness = 434
+  (B26=198, B27=215 incl. s3.py, B28=21). s3.py belongs to B27 (worklist and brief corrected in place).
