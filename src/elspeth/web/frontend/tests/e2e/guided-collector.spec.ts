@@ -644,12 +644,12 @@ test.describe("guided collector authoring (mocked wire-contract canary)", () => 
     // the batch-in cardinality claim. These are technical facts, so each
     // component row keeps them behind its own "Technical details" disclosure
     // (elspeth-ca456d9d8d) — open every row before asserting on them.
-    await expect(page.getByText("Closes the row group opened by Collector step")).toHaveCount(0);
     for (const summary of await page
       .locator("details.wire-stage__row-technical > summary")
       .all()) {
       await summary.click();
     }
+    await expect(page.getByText("Closes the row group opened by Collector step")).toHaveCount(0);
     await expect(page.getByText("Closes the row group opened by Explode step")).toBeVisible();
     await expect(page.getByText("Policy: require all")).toBeVisible();
     await expect(page.getByText(/Cardinality: batch → zero or many/)).toBeVisible();
