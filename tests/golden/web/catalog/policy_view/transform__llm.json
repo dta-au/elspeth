@@ -527,84 +527,98 @@
         "description": "Operator-approved LLM profile alias",
         "name": "profile",
         "required": true,
+        "tier": "common",
         "type": "string"
       },
       {
         "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
         "name": "schema",
         "required": true,
+        "tier": "common",
         "type": "object"
       },
       {
         "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
         "name": "required_input_fields",
         "required": false,
+        "tier": "common",
         "type": "object"
       },
       {
         "description": "Multi-query specs (None = single-query mode)",
         "name": "queries",
         "required": false,
+        "tier": "common",
         "type": "object"
       },
       {
         "description": "Jinja2 prompt template",
         "name": "prompt_template",
         "required": true,
+        "tier": "common",
         "type": "string"
       },
       {
         "description": "Optional system prompt",
         "name": "system_prompt",
         "required": false,
+        "tier": "common",
         "type": "object"
       },
       {
         "description": "Sampling temperature",
         "name": "temperature",
         "required": false,
+        "tier": "advanced",
         "type": "number"
       },
       {
         "description": "Field name for LLM response in output",
         "name": "response_field",
         "required": false,
+        "tier": "common",
         "type": "string"
       },
       {
         "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
         "name": "response_format",
         "required": false,
+        "tier": "advanced",
         "type": "object"
       },
       {
         "description": "Typed structured-output field definitions for single-prompt mode (None = unstructured response). Multi-query mode declares output_fields per query instead.",
         "name": "output_fields",
         "required": false,
+        "tier": "advanced",
         "type": "object"
       },
       {
         "description": "Row columns to resolve as image message parts (absent = text-only)",
         "name": "image_inputs",
         "required": false,
+        "tier": "advanced",
         "type": "object"
       },
       {
         "description": "Per-image byte cap (hard upper bound 20 MiB)",
         "name": "max_image_bytes",
         "required": false,
+        "tier": "advanced",
         "type": "integer"
       },
       {
         "description": "Maximum resolved images per LLM call",
         "name": "max_images_per_call",
         "required": false,
+        "tier": "advanced",
         "type": "integer"
       },
       {
         "description": "Lookup data loaded from YAML file",
         "name": "lookup",
         "required": false,
+        "tier": "advanced",
         "type": "object"
       }
     ]

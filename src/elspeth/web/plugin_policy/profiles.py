@@ -365,6 +365,7 @@ class _LLMProfileResolver:
                 pending.update(_schema_refs(definition))
         if referenced_definitions:
             public_json_schema["$defs"] = referenced_definitions
+        canonical_tiers = _canonical_field_tiers(full_schema)
         if full_schema.plugin_type == "source":
             raw_fields = full_schema.knob_schema.get("fields", ())
             first_raw_field: dict[str, dict[str, Any]] = {}
@@ -376,6 +377,7 @@ class _LLMProfileResolver:
                     "name": "profile",
                     "label": "profile",
                     "kind": "enum",
+                    "tier": _DEFAULT_COMPOSER_TIER,
                     "required": True,
                     "nullable": False,
                     "enum": list(available_aliases),
@@ -391,6 +393,8 @@ class _LLMProfileResolver:
                     raise ValueError(f"source profile field {name!r} has no canonical knob projection") from exc
                 if "visible_when" in field:
                     del field["visible_when"]
+                if "tier" not in field:
+                    field["tier"] = _projected_tier(name, canonical_tiers)
                 fields.append(field)
         else:
             # Keep the established transform policy-view projection
@@ -400,6 +404,10 @@ class _LLMProfileResolver:
                 {
                     "name": name,
                     "type": "string" if name == "profile" else str(schema["type"] if "type" in schema else "object"),
+                    # The canonical composer tier for this knob, so the
+                    # inspector partitions a policy view exactly as it
+                    # partitions the unprofiled catalog schema.
+                    "tier": _projected_tier(name, canonical_tiers),
                     "required": name in public_json_schema["required"],
                     # The composer-surface help text substitutes the CLI/YAML
                     # description on web knobs (mirrors
@@ -593,10 +601,14 @@ class _BedrockGuardrailProfileResolver:
                 pending.update(_schema_refs(definition))
         if referenced_definitions:
             public_json_schema["$defs"] = referenced_definitions
+        canonical_tiers = _canonical_field_tiers(full_schema)
         fields = [
             {
                 "name": name,
                 "type": "string" if name == "profile" else str(schema["type"] if "type" in schema else "object"),
+                # As in the LLM projection above: carry the canonical composer
+                # tier so the policy view partitions like the catalog schema.
+                "tier": _projected_tier(name, canonical_tiers),
                 "required": name in required,
                 # Mirrors the LLM profile lowering above: composer-surface help
                 # text substitutes the CLI/YAML description on web knobs, and a
@@ -781,6 +793,7 @@ class _S3SourceProfileResolver:
                 "name": "profile",
                 "label": "Profile",
                 "kind": "enum",
+                "tier": _DEFAULT_COMPOSER_TIER,
                 "required": True,
                 "nullable": False,
                 "enum": list(available_aliases),
@@ -793,6 +806,8 @@ class _S3SourceProfileResolver:
             except KeyError as exc:
                 raise ValueError("malformed_profile_schema") from exc
             field_projection["required"] = name in required
+            if "tier" not in field_projection:
+                field_projection["tier"] = _DEFAULT_COMPOSER_TIER
             if name == "key":
                 field_projection["label"] = "Relative Object Key"
                 field_projection["description"] = "Relative object key within the operator-approved S3 source prefix"
@@ -970,6 +985,7 @@ class _TextractProfileResolver:
             {
                 "name": "profile",
                 "type": "string",
+                "tier": _DEFAULT_COMPOSER_TIER,
                 "required": True,
                 "description": "Operator-approved Textract document profile alias",
                 "choices": list(available_aliases),
@@ -981,6 +997,8 @@ class _TextractProfileResolver:
             except KeyError as exc:
                 raise ValueError("malformed_profile_schema") from exc
             field_projection["required"] = name in required
+            if "tier" not in field_projection:
+                field_projection["tier"] = _DEFAULT_COMPOSER_TIER
             if name == "key_field":
                 field_projection["description"] = (
                     "Input row field containing the relative S3 object key within the operator-approved document location"
@@ -1064,6 +1082,50 @@ class _TextractProfileResolver:
 
     def selected_alias(self, usable_aliases: tuple[str, ...]) -> str | None:
         return usable_aliases[0] if len(usable_aliases) == 1 else None
+
+
+# Every field the catalog lowers carries a composer tier
+# (``web/catalog/knob_schema._attach_tier``: "Every wire field carries a tier
+# so the form never has to guess"), and its own default when a plugin declares
+# no ``composer_tier`` is "common". The hand-built policy-view projections
+# below must carry that fact forward: a projected field with no tier reaches
+# the inspector as a field the catalog KNOWS but does not rank, and the live
+# ``transform:llm`` policy view shipped all fourteen of its knobs that way —
+# emptying the visible partition and burying the prompt under the advanced
+# disclosure (elspeth-a6ea581e8a).
+_DEFAULT_COMPOSER_TIER = "common"
+
+
+def _canonical_field_tiers(full_schema: PluginSchemaInfo) -> dict[str, str]:
+    """Map each canonical knob field name to the composer tier it was lowered with.
+
+    First occurrence wins, matching the ``first_raw_field`` projection below:
+    a flattened discriminated union repeats a field name once per variant, and
+    the projections take the first copy.
+
+    ``knob_schema`` is ELSPETH's own catalog lowering output, not a foreign
+    boundary, so this reads it nominally (ADR-032): membership then index, no
+    ``.get`` defaults and no ``isinstance`` re-derivation of a shape the
+    lowering already guarantees. A field the lowering left untiered simply
+    does not appear here, and ``_projected_tier`` supplies the default.
+    """
+    knob_schema = full_schema.knob_schema
+    raw_fields = knob_schema["fields"] if "fields" in knob_schema else ()
+    tiers: dict[str, str] = {}
+    for raw_field in raw_fields:
+        name = raw_field["name"]
+        if "tier" in raw_field and name not in tiers:
+            tiers[name] = raw_field["tier"]
+    return tiers
+
+
+def _projected_tier(name: str, canonical_tiers: Mapping[str, str]) -> str:
+    """The tier one projected field carries: the canonical one, else "common".
+
+    A synthesized field (the operator ``profile`` selector) has no canonical
+    counterpart and is never advanced — it is the first thing the author picks.
+    """
+    return canonical_tiers[name] if name in canonical_tiers else _DEFAULT_COMPOSER_TIER
 
 
 @observation_boundary(

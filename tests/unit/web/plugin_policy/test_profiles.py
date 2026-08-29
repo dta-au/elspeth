@@ -1289,6 +1289,86 @@ def _profile_registry() -> OperatorProfileRegistry:
     return OperatorProfileRegistry(policy=policy, settings=runtime)
 
 
+def test_llm_policy_view_knob_fields_carry_the_canonical_composer_tier() -> None:
+    """The hand-built transform projection carries the tier it copied its knobs from.
+
+    ``web/catalog/knob_schema._attach_tier`` puts a tier on every lowered
+    field. The policy view builds its knob projection by hand and shipped all
+    fourteen ``transform:llm`` knobs with no ``tier`` key at all, so the
+    inspector — which partitions on tier — put every LLM option, the prompt
+    included, behind "Advanced settings" (elspeth-a6ea581e8a).
+    """
+    full = create_catalog_service().get_schema("transform", "llm")
+    canonical_tiers = {field["name"]: field["tier"] for field in full.knob_schema["fields"]}
+
+    public = _profile_registry().public_schema(PluginId("transform", "llm"), full, available_aliases=("tutorial",))
+
+    projected = {field["name"]: field["tier"] for field in public.knob_schema["fields"] if "tier" in field}
+    assert [field["name"] for field in public.knob_schema["fields"]] == list(projected), "every projected knob field carries a tier"
+    # ``profile`` is synthesized by the policy view and has no canonical
+    # counterpart; it is the first thing the author picks, never advanced.
+    assert projected["profile"] == "common"
+    assert {name: tier for name, tier in projected.items() if name != "profile"} == {
+        name: canonical_tiers[name] for name in projected if name != "profile"
+    }
+    # The regression's user-visible half: the knobs the inspector shows by
+    # default are non-empty and include the prompt.
+    assert {name for name, tier in projected.items() if tier in {"essential", "common"}} >= {"profile", "prompt_template", "schema"}
+
+
+def test_every_operator_profile_projection_tiers_every_knob_field() -> None:
+    """All five hand-built policy-view projections, not only ``transform:llm``.
+
+    Sibling projections share the defect class: each assembles knob fields by
+    hand, so tiering one and leaving the others untiered would leave the same
+    empty-visible-partition bug reachable from an S3, Textract, or Bedrock node.
+    """
+    catalog = create_catalog_service()
+
+    s3_runtime = RuntimeWebPluginConfig.from_settings(
+        _settings(
+            deployment_aws_region="ap-southeast-1",
+            plugin_allowlist=("source:aws_s3",),
+            aws_s3_source_profiles=({"alias": "demo-input", "bucket": "elspeth-demo-input", "prefix": "incoming"},),
+        )
+    )
+    bedrock_runtime = RuntimeWebPluginConfig.from_settings(
+        _settings(
+            bedrock_guardrail_profiles=(
+                {
+                    "alias": "prompt-default",
+                    "plugin": "aws_bedrock_prompt_shield",
+                    "guardrail_identifier": "privateguardrail",
+                    "guardrail_version": "7",
+                    "region": "us-east-1",
+                },
+            ),
+        )
+    )
+
+    def _registry(runtime: RuntimeWebPluginConfig) -> OperatorProfileRegistry:
+        return OperatorProfileRegistry(
+            policy=compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime), settings=runtime
+        )
+
+    textract_registry, _textract_id = _textract_registry()
+    cases = (
+        (_profile_registry(), "transform", "llm", ("tutorial",)),
+        (_profile_registry(), "source", "llm", ("tutorial",)),
+        (textract_registry, "transform", "aws_textract_document_analysis", ("acceptance-docs",)),
+        (_registry(s3_runtime), "source", "aws_s3", ("demo-input",)),
+        (_registry(bedrock_runtime), "transform", "aws_bedrock_prompt_shield", ("prompt-default",)),
+    )
+
+    untiered: list[str] = []
+    for registry, kind, name, aliases in cases:
+        public = registry.public_schema(PluginId(kind, name), catalog.get_schema(kind, name), available_aliases=aliases)
+        assert public.knob_schema["fields"], f"{kind}:{name} projected no knob fields"
+        untiered.extend(f"{kind}:{name}.{field['name']}" for field in public.knob_schema["fields"] if "tier" not in field)
+
+    assert untiered == []
+
+
 def test_public_llm_schema_exposes_alias_not_private_provider_binding() -> None:
     full = create_catalog_service().get_schema("transform", "llm")
     public = _profile_registry().public_schema(

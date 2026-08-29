@@ -166,18 +166,21 @@
         "description": "Operator-approved Bedrock Guardrail profile alias",
         "name": "profile",
         "required": true,
+        "tier": "common",
         "type": "string"
       },
       {
         "description": "Input row fields whose text is evaluated by the Guardrail.",
         "name": "fields",
         "required": true,
+        "tier": "common",
         "type": "array"
       },
       {
         "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
         "name": "schema",
         "required": true,
+        "tier": "common",
         "type": "object"
       }
     ]
