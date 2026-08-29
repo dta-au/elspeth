@@ -62,6 +62,7 @@ describe("TutorialTurn7Graduation", () => {
         tutorial_session_id: null,
         tutorial_run_id: null,
         tutorial_source_data_hash: null,
+        show_advanced: false,
         updated_at: "2026-05-19T12:35:00Z",
       }),
     );

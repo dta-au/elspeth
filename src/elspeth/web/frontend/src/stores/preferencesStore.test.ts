@@ -12,7 +12,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { selectTutorialCompleted, usePreferencesStore } from "./preferencesStore";
+import { selectShowAdvanced, selectTutorialCompleted, usePreferencesStore } from "./preferencesStore";
 import { resetStore } from "@/test/store-helpers";
 import {
   fetchUserComposerPreferences,
@@ -47,6 +47,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-15T00:00:00Z",
     });
 
@@ -75,6 +76,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-12T05:00:00Z",
     });
 
@@ -111,6 +113,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-15T00:00:00Z",
     });
 
@@ -156,6 +159,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-19T12:30:00Z",
     });
 
@@ -184,6 +188,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-19T12:30:00Z",
     });
 
@@ -216,6 +221,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-19T12:30:00Z",
     });
 
@@ -271,6 +277,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-09T00:00:00Z",
     });
     // Simulate the in-flight write settling shortly after the click.
@@ -324,6 +331,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null;
       tutorial_run_id: null;
       tutorial_source_data_hash: null;
+      show_advanced: false;
       updated_at: string;
     }) => void;
     mockUpdate.mockImplementationOnce(
@@ -348,6 +356,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-09T00:00:00Z",
     });
 
@@ -372,6 +381,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-09T00:00:00Z",
     });
 
@@ -400,6 +410,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-19T12:30:00Z",
     });
 
@@ -432,6 +443,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: stamp,
     });
 
@@ -492,6 +504,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-15T00:00:00Z",
     });
 
@@ -521,6 +534,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-15T00:00:00Z",
     });
 
@@ -689,6 +703,7 @@ describe("preferencesStore — banner cluster + error surface (Phase 1B Panel)",
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-16T00:00:00Z",
     });
 
@@ -712,6 +727,7 @@ describe("preferencesStore — banner cluster + error surface (Phase 1B Panel)",
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-16T00:00:00Z",
     });
 
@@ -758,6 +774,7 @@ describe("preferencesStore — banner cluster + error surface (Phase 1B Panel)",
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-16T00:00:00Z",
     });
 
@@ -778,6 +795,7 @@ describe("preferencesStore — banner cluster + error surface (Phase 1B Panel)",
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: stamp,
     });
 
@@ -863,6 +881,7 @@ describe("preferencesStore — tutorial resume state (elspeth-918f4434b3)", () =
       tutorial_session_id: "sess-1",
       tutorial_run_id: "run-1",
       tutorial_source_data_hash: "hash-1",
+      show_advanced: false,
       updated_at: "2026-07-02T00:00:00Z",
     });
 
@@ -886,6 +905,7 @@ describe("preferencesStore — tutorial resume state (elspeth-918f4434b3)", () =
       tutorial_session_id: "sess-2",
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-02T00:00:00Z",
     });
 
@@ -921,6 +941,7 @@ describe("preferencesStore — tutorial resume state (elspeth-918f4434b3)", () =
       tutorial_session_id: "sess-3",
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-02T00:00:00Z",
     });
 
@@ -953,6 +974,7 @@ describe("preferencesStore — tutorial resume state (elspeth-918f4434b3)", () =
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-02T00:00:00Z",
     });
 
@@ -964,6 +986,33 @@ describe("preferencesStore — tutorial resume state (elspeth-918f4434b3)", () =
     expect(state.tutorialSessionId).toBeNull();
     expect(state.tutorialRunId).toBeNull();
     expect(state.tutorialSourceDataHash).toBeNull();
+  });
+
+  it("loads showAdvanced from the payload and defaults to false before bootstrap", async () => {
+    expect(usePreferencesStore.getState().showAdvanced).toBe(false);
+    mockFetch.mockResolvedValueOnce({
+      default_mode: "guided",
+      banner_dismissed_at: null,
+      freeform_intro_dismissed_at: null,
+      tutorial_completed_at: null,
+      tutorial_stage: null,
+      tutorial_session_id: null,
+      tutorial_run_id: null,
+      tutorial_source_data_hash: null,
+      show_advanced: true,
+      updated_at: "2026-05-15T00:00:00Z",
+    });
+    await usePreferencesStore.getState().bootstrap();
+    expect(selectShowAdvanced(usePreferencesStore.getState())).toBe(true);
+  });
+
+  it("setShowAdvanced writes optimistically and reverts on failure", async () => {
+    mockUpdate.mockRejectedValueOnce(new Error("offline"));
+    await expect(usePreferencesStore.getState().setShowAdvanced(true)).rejects.toThrow("offline");
+    const state = usePreferencesStore.getState();
+    expect(state.showAdvanced).toBe(false);
+    expect(state.writeError).toMatch(/Couldn't save your preference/);
+    expect(mockUpdate).toHaveBeenCalledWith({ show_advanced: true });
   });
 });
 
@@ -982,6 +1031,7 @@ describe("preferencesStore — markTutorialGraduated 429 retry", () => {
     tutorial_session_id: null,
     tutorial_run_id: null,
     tutorial_source_data_hash: null,
+    show_advanced: false,
     updated_at: "2026-08-16T00:00:00Z",
   };
 

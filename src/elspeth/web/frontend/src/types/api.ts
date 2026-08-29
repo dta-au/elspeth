@@ -100,6 +100,8 @@ export interface UserComposerPreferencesPayload {
   tutorial_session_id: string | null;
   tutorial_run_id: string | null;
   tutorial_source_data_hash: string | null;
+  // Detail level (elspeth-9c11df65f8). false = standard view.
+  show_advanced: boolean;
   // Nullable to mirror the backend Panel-U1 contract: when no DB row
   // exists for the user, the GET response represents the in-server
   // default and updated_at is null (no write event has occurred to
@@ -120,6 +122,7 @@ export interface UpdateUserComposerPreferencesPayload {
   tutorial_session_id?: string | null;
   tutorial_run_id?: string | null;
   tutorial_source_data_hash?: string | null;
+  show_advanced?: boolean;
   // Request-only telemetry discriminator: marks a completion write as an
   // explicit in-tutorial exit (elspeth-61591e64bb). Only valid alongside a
   // non-null tutorial_completed_at in the same PATCH; never echoed back.

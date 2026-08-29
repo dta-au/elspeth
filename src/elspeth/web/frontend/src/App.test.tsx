@@ -1791,6 +1791,7 @@ describe("App preferences bootstrap (Phase 1B)", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-10T07:30:00Z",
     });
 

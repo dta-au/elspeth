@@ -75,6 +75,9 @@ interface PreferencesState {
   tutorialSessionId: string | null;
   tutorialRunId: string | null;
   tutorialSourceDataHash: string | null;
+  // Detail level (elspeth-9c11df65f8). false = standard view. Read it ONLY
+  // through useShowAdvanced()/selectShowAdvanced so consumers cannot drift.
+  showAdvanced: boolean;
   loaded: boolean;
   writing: boolean;
   // Most-recent error from a setDefaultMode or dismiss call. Components
@@ -89,6 +92,7 @@ interface PreferencesState {
   saveTutorialProgress: (progress: TutorialProgress) => Promise<void>;
   resolveDefaultMode: () => Promise<ComposerMode>;
   setDefaultMode: (mode: ComposerMode, activeSessionId?: string | null) => Promise<void>;
+  setShowAdvanced: (value: boolean) => Promise<void>;
   saveTutorialMode: (mode: ComposerMode) => Promise<void>;
   markTutorialGraduated: (options?: {
     publishLocally?: boolean;
@@ -145,6 +149,7 @@ const INITIAL_STATE = {
   tutorialSessionId: null as string | null,
   tutorialRunId: null as string | null,
   tutorialSourceDataHash: null as string | null,
+  showAdvanced: false,
   loaded: false,
   writing: false,
   writeError: null as string | null,
@@ -182,6 +187,7 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         tutorialSessionId: payload.tutorial_session_id,
         tutorialRunId: payload.tutorial_run_id,
         tutorialSourceDataHash: payload.tutorial_source_data_hash,
+        showAdvanced: payload.show_advanced,
         loaded: true,
       });
     } catch (err) {
@@ -306,6 +312,26 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         // Revert the watermark on failure so the banner doesn't suppress
         // for a write that didn't land.
         optedOutAtSessionId: wasOptOut ? null : get().optedOutAtSessionId,
+      });
+      throw err;
+    }
+  },
+
+  setShowAdvanced: async (value) => {
+    if (get().writing) return;
+    const previous = get().showAdvanced;
+    set({ showAdvanced: value, writing: true, writeError: null });
+    try {
+      const payload = await updateUserComposerPreferences({ show_advanced: value });
+      set({ showAdvanced: payload.show_advanced, writing: false });
+    } catch (err) {
+      set({
+        showAdvanced: previous,
+        writing: false,
+        writeError:
+          err instanceof Error
+            ? `Couldn't save your preference: ${err.message}`
+            : "Couldn't save your preference.",
       });
       throw err;
     }
@@ -639,4 +665,13 @@ initCrossTabSync();
 
 export function selectTutorialCompleted(state: PreferencesState): boolean {
   return state.tutorialCompleted;
+}
+
+export function selectShowAdvanced(state: PreferencesState): boolean {
+  return state.showAdvanced;
+}
+
+/** The single consumer entry point for the detail-level flag. */
+export function useShowAdvanced(): boolean {
+  return usePreferencesStore(selectShowAdvanced);
 }
