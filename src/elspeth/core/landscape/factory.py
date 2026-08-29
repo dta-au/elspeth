@@ -204,6 +204,25 @@ class ExecutionReadRepository:
         return self._repo.get_artifacts(*args, **kwargs)
 
 
+class PayloadStoreReadRepository:
+    """Read-only capability view over a payload store.
+
+    Exposes retrieval only: ``store``/``delete`` never reach an
+    inspection-only caller, even though the wrapped store implements them.
+    """
+
+    __slots__ = ("_store",)
+
+    def __init__(self, store: PayloadStore) -> None:
+        self._store = store
+
+    def retrieve(self, content_hash: str) -> bytes:
+        return self._store.retrieve(content_hash)
+
+    def exists(self, content_hash: str) -> bool:
+        return self._store.exists(content_hash)
+
+
 class LandscapeReadRepositories:
     """Typed read repository surface for inspection-only Landscape callers."""
 
@@ -226,7 +245,7 @@ class LandscapeReadRepositories:
         query: QueryRepository,
         run_status_projection: AuditRunStatusProjection,
         barrier_restore: BarrierRestoreReadModel,
-        payload_store: PayloadStore | None,
+        payload_store: PayloadStoreReadRepository | None,
     ) -> None:
         self.run_lifecycle = run_lifecycle
         self.data_flow = data_flow
@@ -266,6 +285,7 @@ class LandscapeWriteRepositories:
         scheduler: TokenSchedulerRepository,
         run_coordination: RunCoordinationRepository,
         audit_export_snapshots: AuditExportSnapshotRepository,
+        payload_store: PayloadStore | None,
     ) -> None:
         self.read = read
         self.run_lifecycle = run_lifecycle
@@ -275,7 +295,7 @@ class LandscapeWriteRepositories:
         self.query = read.query
         self.run_status_projection = read.run_status_projection
         self.barrier_restore = read.barrier_restore
-        self.payload_store = read.payload_store
+        self.payload_store = payload_store
         self.scheduler = scheduler
         self.run_coordination = run_coordination
         self.audit_export_snapshots = audit_export_snapshots
@@ -386,7 +406,7 @@ class RecorderFactory:
             query=query,
             run_status_projection=run_status_projection,
             barrier_restore=barrier_restore,
-            payload_store=payload_store,
+            payload_store=PayloadStoreReadRepository(payload_store) if payload_store is not None else None,
         )
 
     def __init__(self, db: LandscapeDB, *, payload_store: PayloadStore | None = None) -> None:
@@ -549,7 +569,7 @@ class RecorderFactory:
             query=self._query,
             run_status_projection=self._run_status_projection,
             barrier_restore=self._barrier_restore,
-            payload_store=self._payload_store,
+            payload_store=PayloadStoreReadRepository(self._payload_store) if self._payload_store is not None else None,
         )
 
     def write_repositories(self) -> LandscapeWriteRepositories:
@@ -565,4 +585,5 @@ class RecorderFactory:
             scheduler=self.scheduler,
             run_coordination=self.run_coordination,
             audit_export_snapshots=self.audit_export_snapshots,
+            payload_store=self._payload_store,
         )

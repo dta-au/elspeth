@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, cast
+from weakref import WeakSet
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.engine import Connection
@@ -346,7 +347,7 @@ class AuditExportSnapshotRegistration:
 _VERIFICATION_PROOF: Final = object()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
 class VerifiedAuditExportCandidate:
     """Proof-carrying candidate produced only by ``verify_candidate``.
 
@@ -477,6 +478,7 @@ class AuditExportSnapshotRepository:
     def __init__(self) -> None:
         self._snapshot_loader = _AuditExportSnapshotRowLoader()
         self._chunk_loader = AuditExportSnapshotChunkLoader()
+        self._verified_candidates: WeakSet[VerifiedAuditExportCandidate] = WeakSet()
 
     @staticmethod
     def winner_from_candidate(candidate: AuditExportSnapshotCandidate) -> AuditExportSnapshotWinner:
@@ -596,7 +598,9 @@ class AuditExportSnapshotRepository:
             signed_manifest_verifier=signed_manifest_verifier,
             record_signature_verifier=record_signature_verifier,
         )
-        return VerifiedAuditExportCandidate(candidate=candidate, _proof=_VERIFICATION_PROOF)
+        verified = VerifiedAuditExportCandidate(candidate=candidate, _proof=_VERIFICATION_PROOF)
+        self._verified_candidates.add(verified)
+        return verified
 
     def register_candidate(
         self,
@@ -630,7 +634,7 @@ class AuditExportSnapshotRepository:
         verified: VerifiedAuditExportCandidate,
     ) -> AuditExportSnapshotRegistration:
         """Short write/CAS registration of a verification-proven candidate."""
-        if type(verified) is not VerifiedAuditExportCandidate:
+        if type(verified) is not VerifiedAuditExportCandidate or verified not in self._verified_candidates:
             raise TypeError("verified must be exact VerifiedAuditExportCandidate from verify_candidate")
         candidate = verified.candidate
         key = AuditExportSnapshotRegistryKey.from_snapshot(candidate.snapshot)
