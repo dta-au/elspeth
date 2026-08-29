@@ -1,7 +1,7 @@
 # ADR-043: Project Tooling — Filigree and Loomweave Only; Everything Else Ruled Out Until Superseded
 
 **Date:** 2026-08-29
-**Status:** Accepted (Loomweave section provisional — see §Loomweave)
+**Status:** Accepted
 **Deciders:** ELSPETH maintainers
 **Tags:** tooling, delivery-posture, trust-tier, gates, related-adr-046
 
@@ -109,16 +109,32 @@ on and works; the 28 issue↔entity bindings it can see were written as
 side-effects and have never driven a decision — they are tolerated, not
 relied on.
 
-*Provisional:* a large-file extraction defect made Loomweave's answers
-unreliable through 2026-08 (missing entities; "zero callers" returned as if
-authoritative — see the "zero callers = no evidence" trap in
-`docs/agents/recent-code-hints.md`), and agents measurably stopped using it.
-The fix landed on 2026-08-29 with refinement continuing. A utility
-evaluation on the repaired extractor — usage forensics from session
-transcripts, a live capability probe against `git grep`/`git log -L`/`ast`
-ground truth across file sizes, and a cost/reliability profile — is in
-progress; this section is confirmed or Loomweave is retired by an amendment
-to this ADR recording its result.
+*Scope of approval.* Loomweave is approved for the questions it measured
+correct on (2026-08-29, live probe against `ast`/`git` ground truth):
+**callers of an entity** (precision/recall 1.0 on every `src/` case probed,
+including a function-local-import caller), **subclasses / relations** (exact,
+where grep returns docstring false positives), **execution paths / call
+trees** (no grep equivalent), and **definition lookup in large files**. It is
+*not* advertised for semantic search, dead-code candidates, HTTP-route
+inventories, or test-caller lists until the defects recorded in
+`docs/superpowers/plans/2026-08-29-loomweave-salvage-worklist.md` are fixed
+— on those questions `git grep` measured as good or better, and a tool that
+is right on three questions and wrong on four teaches agents to distrust all
+seven.
+
+*Why it is kept rather than retired.* A large-file resolution defect degraded
+97–100 % of analyzed files through 2026-08 (five consecutive failed runs in
+the two hours before the fix); agents measurably stopped using it (Codex:
+1,970 calls in July ending in 1,882 cancellations over two days, 0 in
+August; Claude Code: 104 of 180,517 tool calls, none from search-specialist
+or lane agents). The extractor fix landed 2026-08-29 17:50 local and the
+first post-fix run degraded 3 of 45 files. The maintainers' preference is to
+salvage: the graph is theirs, the three approved capabilities have no
+substitute, and the remaining problems are enumerable. The salvage worklist
+is the condition of this approval; the measurement that decides whether it
+worked is adoption, re-run with the same transcript forensics after the next
+delivery wave. If lane and Explore agents still make zero Loomweave calls
+against a working index, this section is amended to a retirement.
 
 ### Everything else is ruled out
 

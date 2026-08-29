@@ -378,6 +378,29 @@ does Y".
 Full reference: `loomweave-workflow` skill, `loomweave --help`, MCP schemas.
 <!-- /loomweave:instructions -->
 
+### ELSPETH's Loomweave usage
+
+The block above is installer-written. ELSPETH's own guidance
+([ADR-043](docs/architecture/adr/043-project-tooling.md)):
+
+- **Reach for it for:** who calls X (`entity_callers_list`), what subclasses
+  or implements X (`entity_relation_list`, `direction=in`), execution paths /
+  call trees (`entity_execution_path_list`, `entity_orientation_pack_get`),
+  and where X is defined in a large file (`entity_find`). These measured
+  correct against `ast` ground truth and have no grep equivalent.
+- **Do not rely on it for** semantic search, dead-code lists, HTTP-route
+  inventories, or test-caller lists until the salvage worklist closes; on
+  those `git grep` measured as good or better.
+- `entity_find` takes **`pattern`** — not `name`, not `query`; 43 % of all
+  historical calls failed on that.
+- **Zero callers is not "no callers".** Read `traversal_complete`,
+  `scope_excludes`, and `unresolved_candidates` before concluding; class
+  instantiations and calls from large test files may sit there as
+  `why: dynamic`. Confirm a negative with `git grep`.
+- Check `project_status_get` staleness first; a re-analyze is triggered by
+  the git hooks on the main checkout, not by worktree commits. Any list over
+  ~100 rows overflows the MCP result cap — page with the cursor.
+
 ## Judge-signature stage (tier-model allowlist signing)
 
 The trust-tier CI failure is a deliberate fail-closed state: it prevents
