@@ -8,7 +8,7 @@
 
 **Tech Stack:** FastAPI + Pydantic v2 (backend, `src/elspeth/web`), React 18 + Zustand + vitest/@testing-library + Playwright (frontend, `src/elspeth/web/frontend`), pytest (backend).
 
-**Spec:** Wave 1 plan §"Roadmap: Waves 2 and 3" (`docs/superpowers/plans/2026-08-29-composer-detail-level-wave1.md:1431-end`) — the 8-row Wave 2 table is the scope; the Wave 2 scope memo (`.superpowers/sdd/2026-08-29-composer-detail-level-wave1/wave2-scope-memo.md`) carries the binding rulings; epic `elspeth-cd8abcba3f`; tickets `elspeth-af559a0bab`, `elspeth-34e810312c`, `elspeth-aa39cffb16`, `elspeth-05a240b82a`, `elspeth-ca456d9d8d`, `elspeth-8555a6a9e0`, `elspeth-c8a402a9a4`, `elspeth-a6ea581e8a` (follow-up half). Every file:line below was re-verified against branch head `acf7040e0` (2026-08-30); the round-1 review reports live beside the memo (`wave2-review-{reality,quality,architecture}.md`).
+**Spec:** Wave 1 plan §"Roadmap: Waves 2 and 3" (`docs/superpowers/plans/2026-08-29-composer-detail-level-wave1.md:1431-end`) — the 8-row Wave 2 table is the scope; the Wave 2 scope memo (`.superpowers/sdd/2026-08-29-composer-detail-level-wave1/wave2-scope-memo.md`) carries the binding rulings; epic `elspeth-cd8abcba3f`; tickets `elspeth-af559a0bab`, `elspeth-34e810312c`, `elspeth-aa39cffb16`, `elspeth-05a240b82a`, `elspeth-ca456d9d8d`, `elspeth-8555a6a9e0`, `elspeth-c8a402a9a4`, `elspeth-a6ea581e8a` (follow-up half). Every file:line below was re-verified against branch head `acf7040e0` (2026-08-30); the round-1 review reports live beside the memo (`wave2-review-{reality,quality,architecture}.md`). A go/no-go drift check at `ab9aee6fa` (three independent lanes, 2026-08-30) corrected four test-pin claims (Task 1 Step 9, Task 3 Step 4, Task 5 addendum) and the Task 0 tracker state; remaining line drift from `3b7281965`/`900b86b8f` is cosmetic (`ConfigRows.tsx` nested `<dt>` :83-105, `OptionRows.tsx` `<details>` :140, `HeaderVersionSelector.tsx` `confirmLabel` :357, `PluginCard.tsx` Schema button :214-222).
 
 ## Global Constraints
 
@@ -85,7 +85,7 @@ Record the count and the HEAD sha beside it. This must happen before Task 1 land
 
 - [ ] **Step 2: Unblock the tracker**
 
-The tracker still shows the Wave 1 blockers open (`elspeth-9c11df65f8` = building, `elspeth-9cca900d41` = fixing, `elspeth-27efd1e801` = fixing), so `filigree show` reports six of the eight Wave 2 tickets as `Blocked by:` and only `af559a0bab`/`a6ea581e8a` as ready. The memo says the dependencies are satisfied in code (Wave 1 merge-ready at e6dc2da1b + follow-ups). The hub closes the three Wave 1 tickets with a comment naming the landing commits (`filigree add-comment <id> "..."`; bugs go `fixing → verifying → close`, the feature `building → close`), then confirms `filigree show` on each Wave 2 ticket reads `Ready: YES`. Lanes then claim with `filigree start-work <id> --assignee <lane>`.
+The Wave 1 blockers are already closed (checked 2026-08-30 at ab9aee6fa: `elspeth-9c11df65f8` = done, `elspeth-9cca900d41` / `elspeth-27efd1e801` / `elspeth-b9ebdf9011` = closed), and `filigree show` reports seven of the eight Wave 2 tickets `Ready: YES`; the eighth, `elspeth-c8a402a9a4`, is `Blocked by: elspeth-af559a0bab` — the intended Task 1 → Task 7 dependency, which clears when Task 1 lands. The hub only confirms this state (`filigree show <id>` on each Wave 2 ticket); if a Wave 1 ticket has been reopened since, close it with a comment naming the landing commits first. Lanes then claim with `filigree start-work <id> --assignee <lane>`.
 
 ---
 
@@ -520,7 +520,7 @@ In `deriveVersionLabel` (`:230-253`) the applied arm becomes:
   }
 ```
 
-(`TOOL_CALL_DESCRIPTIONS` is already imported at `versionLabels.ts:1`.) `HeaderVersionSelector.tsx:14` imports and `:282` calls `describeVersionOperation` — rename both to `versionOperationIdentifier` (no other consumer: grepped). `versionLabels.test.ts`: the `describeVersionOperation` block (`:126-163`) is renamed and now expects `Applied: set_pipeline`-style raw strings (unknown tool still yields the raw name; unlabeled version still null); `deriveVersionLabel` applied tests (`:165`, `:202`) expect the sentence (e.g. `"Applied: Adds or replaces a connection between two nodes in the pipeline."` for `upsert_edge`; `"Applied: Updates one or more configuration options on a transform or gate node."` for `patch_node_options`). `HeaderVersionSelector.test.tsx` pins only `edited` / `session created` names (verified) and is not touched by this task.
+(`TOOL_CALL_DESCRIPTIONS` is already imported at `versionLabels.ts:1`.) `HeaderVersionSelector.tsx:14` imports and `:282` calls `describeVersionOperation` — rename both to `versionOperationIdentifier` (no other consumer: grepped). `versionLabels.test.ts`: the `describeVersionOperation` block (`:126-163`) is renamed and now expects `Applied: set_pipeline`-style raw strings (unknown tool still yields the raw name; unlabeled version still null); `deriveVersionLabel` applied tests (`:165`, `:202`) expect the sentence (e.g. `"Applied: Adds or replaces a connection between two nodes in the pipeline."` for `upsert_edge`; `"Applied: Updates one or more configuration options on a transform or gate node."` for `patch_node_options`). `HeaderVersionSelector.test.tsx` DOES pin an applied label: the "labels a version from its applied tool-call stamp" test (`:168-200`) asserts `getByRole("option", { name: /^version 2 — applied: upsert_edge$/i })` (`:196-198`) and `within(option).getByText("Applied: upsert_edge")` (`:199`). Both break once `deriveVersionLabel` returns the sentence — update them to the sentence (`/^version 2 — applied: adds or replaces a connection between two nodes in the pipeline\.$/i` and `"Applied: Adds or replaces a connection between two nodes in the pipeline."`) and add the file to the Step 11 pathspec. Its other pins (`edited` / `session created`) are untouched; Task 7 renames the role queries later.
 
 - [ ] **Step 10: Run the affected frontend suites**
 
@@ -530,7 +530,7 @@ Expected: PASS. Then `npx tsc --noEmit -p .` → clean.
 - [ ] **Step 11: Commit**
 
 ```bash
-git add src/elspeth/web/frontend/src/test/defaultDomPins.ts src/elspeth/web/frontend/src/components/chat/toolCallDescriptions.ts src/elspeth/web/frontend/src/components/chat/ToolCallCard.tsx src/elspeth/web/frontend/src/components/chat/ToolCallCard.test.tsx src/elspeth/web/frontend/src/components/chat/ProposalDiff.tsx src/elspeth/web/frontend/src/components/chat/ProposalDiff.test.tsx src/elspeth/web/frontend/src/components/chat/chat.css src/elspeth/web/frontend/src/components/header/versionLabels.ts src/elspeth/web/frontend/src/components/header/versionLabels.test.ts src/elspeth/web/frontend/src/components/header/HeaderVersionSelector.tsx
+git add src/elspeth/web/frontend/src/test/defaultDomPins.ts src/elspeth/web/frontend/src/components/chat/toolCallDescriptions.ts src/elspeth/web/frontend/src/components/chat/ToolCallCard.tsx src/elspeth/web/frontend/src/components/chat/ToolCallCard.test.tsx src/elspeth/web/frontend/src/components/chat/ProposalDiff.tsx src/elspeth/web/frontend/src/components/chat/ProposalDiff.test.tsx src/elspeth/web/frontend/src/components/chat/chat.css src/elspeth/web/frontend/src/components/header/versionLabels.ts src/elspeth/web/frontend/src/components/header/versionLabels.test.ts src/elspeth/web/frontend/src/components/header/HeaderVersionSelector.tsx src/elspeth/web/frontend/src/components/header/HeaderVersionSelector.test.tsx
 git commit -m "feat(chat): humanised sentence is the tool-card primary label; raw name demoted to mono secondary; shared default-DOM pin (elspeth-af559a0bab)"
 ```
 
@@ -690,7 +690,7 @@ git commit -m "feat(execution): run history hides UUIDs and raw diagnostics behi
 **Files:**
 - Modify: `src/elspeth/web/frontend/src/components/composer/CompletionBar.tsx:96`, `CompletionBar.test.tsx`
 - Create: `src/elspeth/web/frontend/src/components/catalog/UnavailableComponentRow.tsx`
-- Modify: `src/elspeth/web/frontend/src/components/sidebar/ImportYamlModal.tsx:1080-1099`, `src/elspeth/web/frontend/src/components/catalog/CatalogDrawer.tsx:565-593` (+ `CatalogDrawer.test.tsx` and the ImportYamlModal test file if they pin the raw `<code>{plugin_id}</code>`)
+- Modify: `src/elspeth/web/frontend/src/components/sidebar/ImportYamlModal.tsx:1080-1107`, `src/elspeth/web/frontend/src/components/catalog/CatalogDrawer.tsx:565-593`, and BOTH test files — `CatalogDrawer.test.tsx:295,:299` and `ImportYamlModal.test.tsx:1063,:1067` pin the raw plugin id (`transform:legacy_llm`, `sink:database`) in `toHaveTextContent` and in the Remove button's aria-label regex; all four move to the display-name + `title` contract (verified 2026-08-30)
 - Modify (e2e): `src/elspeth/web/frontend/tests/e2e/helpers/api.ts`, `tests/e2e/helpers/workspace-assertions.ts:19-22,:128-135`, `tests/e2e/composer-workspace-geometry.spec.ts:309-312,:733-745,:812-825,:895-908`
 
 **Interfaces:**
@@ -784,7 +784,7 @@ export function UnavailableComponentRow({
 }
 ```
 
-In `CatalogDrawer.tsx:565-593` and `ImportYamlModal.tsx:1080-1099`, each `policyFindings.map((finding) => (<li …>…</li>))` becomes:
+In `CatalogDrawer.tsx:565-593` and `ImportYamlModal.tsx:1080-1107`, each `policyFindings.map((finding) => (<li …>…</li>))` becomes:
 
 ```tsx
                 {policyFindings.map((finding) => (
@@ -802,14 +802,14 @@ In `CatalogDrawer.tsx:565-593` and `ImportYamlModal.tsx:1080-1099`, each `policy
                         >
                           Remove
                         </Button>
-                        …the surface's existing second button (CatalogDrawer's Replace, copied verbatim from :582-588 with the same aria-label/title treatment; ImportYamlModal has only Remove — keep its existing single button)…
+                        …the surface's existing Replace button, copied verbatim with the same aria-label/title treatment (CatalogDrawer `:582-588`; ImportYamlModal `:1098-1104`, `onClick={requestDisabledComponentReplacement}` — its aria-label currently embeds `pluginKind(finding.plugin_id)`, which becomes `pluginDisplayName(...)` with the raw id in `title`). Both surfaces have BOTH buttons.…
                       </>
                     }
                   />
                 ))}
 ```
 
-(Each file keeps its own `unavailableReasonLabel` import and click handlers; add `pluginDisplayName` to each file's imports.) The catalog directory gate checks classes *applied* in `components/catalog/` against the whole stylesheet barrel: `validation-banner-error-item` and `import-yaml-actions` are defined there (they already render from `CatalogDrawer.tsx`), so no gate record changes. Update any test pins on the raw `<code>{plugin_id}</code>` in `CatalogDrawer.test.tsx` / the ImportYamlModal tests to the display-name + `title` contract.
+(Each file keeps its own `unavailableReasonLabel` import and click handlers; add `pluginDisplayName` to each file's imports.) The catalog directory gate checks classes *applied* in `components/catalog/` against the whole stylesheet barrel: `validation-banner-error-item` and `import-yaml-actions` are defined there (they already render from `CatalogDrawer.tsx`), so no gate record changes. Update the four test pins on the raw plugin id to the display-name + `title` contract: `CatalogDrawer.test.tsx:295` (`toHaveTextContent("transform:legacy_llm")`) and `:299` (`/remove disabled component legacy_transform.*transform:legacy_llm/i`); `ImportYamlModal.test.tsx:1063` (`toHaveTextContent("sink:database")`) and `:1067` (`/remove disabled component legacy_output.*sink:database/i`). `title` is not `textContent`, so each textContent pin becomes a `pluginDisplayName(...)` text pin plus a `toHaveAttribute("title", "<raw id>")`; the aria-label regexes take the display name. (`ImportYamlModal.test.tsx:1112`'s "is not enabled" message is a different string and is unaffected.)
 
 - [ ] **Step 5: e2e — seed the preference where the Import button is measured**
 
@@ -857,11 +857,11 @@ Run: `npx vitest run src/components/composer/CompletionBar.test.tsx src/componen
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/elspeth/web/frontend/src/components/composer/CompletionBar.tsx src/elspeth/web/frontend/src/components/composer/CompletionBar.test.tsx src/elspeth/web/frontend/src/components/catalog/UnavailableComponentRow.tsx src/elspeth/web/frontend/src/components/catalog/CatalogDrawer.tsx src/elspeth/web/frontend/src/components/catalog/CatalogDrawer.test.tsx src/elspeth/web/frontend/src/components/sidebar/ImportYamlModal.tsx src/elspeth/web/frontend/tests/e2e/helpers/api.ts src/elspeth/web/frontend/tests/e2e/helpers/workspace-assertions.ts src/elspeth/web/frontend/tests/e2e/composer-workspace-geometry.spec.ts
+git add src/elspeth/web/frontend/src/components/composer/CompletionBar.tsx src/elspeth/web/frontend/src/components/composer/CompletionBar.test.tsx src/elspeth/web/frontend/src/components/catalog/UnavailableComponentRow.tsx src/elspeth/web/frontend/src/components/catalog/CatalogDrawer.tsx src/elspeth/web/frontend/src/components/catalog/CatalogDrawer.test.tsx src/elspeth/web/frontend/src/components/sidebar/ImportYamlModal.tsx src/elspeth/web/frontend/src/components/sidebar/ImportYamlModal.test.tsx src/elspeth/web/frontend/tests/e2e/helpers/api.ts src/elspeth/web/frontend/tests/e2e/helpers/workspace-assertions.ts src/elspeth/web/frontend/tests/e2e/composer-workspace-geometry.spec.ts
 git commit -m "feat(composer): Import YAML renders only with show_advanced; shared unavailable-component row; e2e seeds the preference where the button is measured (elspeth-aa39cffb16)"
 ```
 
-(Add the ImportYamlModal test file to the pathspec only if Step 4 edited it.)
+(`ImportYamlModal.test.tsx` is in the pathspec unconditionally — Step 4 always edits its two pins.)
 
 **Ticket disposition:** CLOSE at end of wave.
 
@@ -1418,7 +1418,7 @@ describe("detail level (elspeth-ca456d9d8d)", () => {
 
 Source rows (`:425-440`) keep `label` + `({stepLabelForPlugin(source.plugin)})` + the `Validation failure:` sentence visible; cardinality, guaranteed fields, and `Stable ID: <code>…</code>` move into the same per-row `<details className="wire-stage__row-technical" open={showAdvanced}>`. Output rows (`:479-507`) keep `label` + `({stepLabelForPlugin(output.plugin)})` + `Write failure:` visible; field lists, `Schema mode:` + the business-schema `<ul>`, and the Stable ID move in. The old `<details><summary>Stable ID</summary>…` disclosures are absorbed. The Routes section, its roll-up, the routes-level raw-edge `Technical details` (`:536-541`), warnings, and the blocker panel (`:310`, `blockersId`) are untouched.
 3. `ProposePipelineTurn.tsx` — graph subtitles (`:277`, `:283`, `:289`): `stepLabelForPlugin(source.plugin.id)`, `node.plugin === null ? null : stepLabelForPlugin(node.plugin.id)`, `stepLabelForPlugin(output.plugin.id)` (import it); the components list (`:407-433`) replaces ` · ${node.plugin.id}` with ` · ${stepLabelForPlugin(node.plugin.id)}` (same for source/output lines) and gates its `node_options_summary` loop: common pairs always, advanced pairs only when `useShowAdvanced()` is true (this list has no per-row disclosure; a plain gate — no new surface — is the honest form of "debug mode expands"). `ProposePipelineTurn.test.tsx` gains a top-level `beforeEach(() => resetStore(usePreferencesStore))` (the component is now a flag reader) and a test that an advanced pair renders only with the flag.
-   **Live-check addendum (39578c6f Check 1, flag off):** the Spec tab's `Plugin` row (`PipelineSpecView.tsx:104-107`) and the node inspector's plugin line (`GraphView.tsx:697-698`) render the raw plugin id (`field_mapper`, `llm`, …) as plain `<dd>`/`<p>` text — the same "humanise plugin.id" defect this ticket owns, on two more surfaces. Fix both identically: `<dd title={row.plugin}>{pluginDisplayName(row.plugin)}</dd>` and `<p className="graph-config-plugin" title={config.plugin}>{pluginDisplayName(config.plugin)}</p>` (`pluginDisplayName` from `@/components/catalog/pluginDisplayName` — the catalog register, e.g. "Field Mapper", since these rows name the plugin's identity; `stepLabelForPlugin` stays the guided-turn register). Neither test file pins these values today (grepped); add one assertion each — `PipelineSpecView.test.tsx`: the `Plugin` `<dd>` reads `pluginDisplayName("csv")` with `title="csv"`; `GraphView.test.tsx`: the `.graph-config-plugin` line likewise. Do not touch `routingValue` (`PipelineSpecView.tsx:52-66`): 3b7281965 renders `branches` maps as prose like `routes`, and `PipelineSpecView.test.tsx` pins it. Task 8 edits both files afterwards (it passes `plugin` to `OptionRows`); the two tasks are sequential, so there is no conflict.
+   **Live-check addendum (39578c6f Check 1, flag off):** the Spec tab's `Plugin` row (`PipelineSpecView.tsx:104-107`) and the node inspector's plugin line (`GraphView.tsx:697-698`) render the raw plugin id (`field_mapper`, `llm`, …) as plain `<dd>`/`<p>` text — the same "humanise plugin.id" defect this ticket owns, on two more surfaces. Fix both identically: `<dd title={row.plugin}>{pluginDisplayName(row.plugin)}</dd>` and `<p className="graph-config-plugin" title={config.plugin}>{pluginDisplayName(config.plugin)}</p>` (`pluginDisplayName` from `@/components/catalog/pluginDisplayName` — the catalog register, e.g. "Field Mapper", since these rows name the plugin's identity; `stepLabelForPlugin` stays the guided-turn register). `PipelineSpecView.test.tsx` pins no plugin text today, but `GraphView.test.tsx:358` does — `within(panel).getByText("llm")` in the "opens a structured plugin configuration panel" test (`:323`) is the `.graph-config-plugin` line, and `pluginDisplayName("llm")` returns `"LLM"` (`llm` is in the ACRONYMS set, `pluginDisplayName.ts:33`; `getByText` is exact and case-sensitive), so that pin breaks. Update `:358` to `getByText("LLM")` + `toHaveAttribute("title", "llm")`, and add one assertion to `PipelineSpecView.test.tsx`: the `Plugin` `<dd>` reads `pluginDisplayName("csv")` with `title="csv"`. (`GraphView.test.tsx:301` `getByText("llm_transform")` is the graph node label, not the config panel — unaffected.) Do not touch `routingValue` (`PipelineSpecView.tsx:49-67`): 3b7281965 renders `branches` maps as prose like `routes`, and `PipelineSpecView.test.tsx` pins it. Task 8 edits both files afterwards (it passes `plugin` to `OptionRows`); the two tasks are sequential, so there is no conflict.
 4. `guided.css` — after `.wire-stage__raw`:
 
 ```css
