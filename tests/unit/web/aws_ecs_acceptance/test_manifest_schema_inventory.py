@@ -1283,3 +1283,48 @@ def test_complete_retained_evidence_requires_paired_metric_and_trace_counts(tmp_
 def test_mutable_manifest_check_fails_loudly_for_corrupt_final_evidence() -> None:
     with pytest.raises(KeyError, match="phase"):
         acceptance._require_mutable_control_manifest({"final_evidence": {}})
+
+
+def test_validate_control_manifest_rejects_payloads_outside_the_closed_field_set(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "control.json"
+    _init_control_manifest(manifest_path)
+    valid = json.loads(manifest_path.read_text())
+
+    assert acceptance._validate_control_manifest(valid) == valid
+
+    for payload in (
+        ["not", "a", "mapping"],
+        {},
+        {**valid, "surplus_field": True},
+        {name: value for name, value in valid.items() if name != "aws"},
+        {**valid, "schema": "elspeth.aws-ecs-control-manifest.v4"},
+        {**valid, "acceptance_run_id": "not-a-uuid"},
+        {**valid, "candidate_sha": "not-a-git-sha"},
+        {**valid, "aws": {"account_id": "12345678901", "region": "ap-southeast-2"}},
+        {**valid, "cleanup_required": "yes"},
+    ):
+        with pytest.raises(acceptance.AcceptanceCheckError, match="control_manifest_schema"):
+            acceptance._validate_control_manifest(payload)
+
+
+def test_validate_retained_evidence_receipt_rejects_payloads_outside_the_closed_field_set(tmp_path: Path) -> None:
+    run_id = "4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48"
+    manifest_path = tmp_path / "control.json"
+    _init_control_manifest(manifest_path, bind_retained=False)
+    manifest = acceptance._read_control_manifest(manifest_path)
+    checkpoint = _retained_checkpoint(run_id, {"A", "B"}, "2026-07-14T01:01:20Z")
+
+    receipt, _receipt_sha256 = acceptance._validate_retained_evidence_receipt(checkpoint, manifest=manifest)
+    assert receipt == checkpoint
+
+    for payload in (
+        ["not", "a", "mapping"],
+        {},
+        {**checkpoint, "surplus_field": True},
+        {name: value for name, value in checkpoint.items() if name != "captured_at"},
+        {**checkpoint, "schema": "elspeth.aws-ecs-retained-evidence.v0"},
+        {**checkpoint, "acceptance_run_id": "8b1f2c3d-0000-4000-8000-000000000000"},
+        {**checkpoint, "scenarios": {"A": {}}},
+    ):
+        with pytest.raises(acceptance.AcceptanceCheckError, match="retained_evidence"):
+            acceptance._validate_retained_evidence_receipt(payload, manifest=manifest)
