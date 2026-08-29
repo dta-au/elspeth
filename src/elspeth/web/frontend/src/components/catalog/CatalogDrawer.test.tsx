@@ -7,6 +7,7 @@ import { useAuthStore } from "@/stores/authStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
 import { unavailablePluginDisplayName } from "./UnavailableComponentRow";
 
 vi.mock("@/api/client", () => ({
@@ -86,6 +87,8 @@ vi.mock("@/api/client", () => ({
 
 // Import the mocked client so we can assert on call counts.
 import { listSources, listTransforms, listSinks } from "@/api/client";
+
+beforeEach(() => resetStore(usePreferencesStore));
 
 describe("CatalogDrawer", () => {
   beforeEach(() => {
