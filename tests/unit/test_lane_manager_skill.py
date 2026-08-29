@@ -361,11 +361,10 @@ def test_cli_round_trip_dry_run(repo: Path, tmp_path: Path) -> None:
     assert "## Blocked (1)" in report.stdout
 
 
-def test_skill_doc_names_every_mechanism_and_the_ladder() -> None:
+def test_skill_doc_is_harness_neutral_and_names_the_ladder() -> None:
     text = SKILL_MD.read_text(encoding="utf-8")
     assert text.startswith("---\nname: lane-manager\n")
     for token in (
-        "ListAgents",
         "git diff",
         "git log",
         ".claude/lanes/",
@@ -377,7 +376,22 @@ def test_skill_doc_names_every_mechanism_and_the_ladder() -> None:
         "redispatch",
         "block",
         "merge-order",
+        "claude-code.md",
     ):
         assert token in text, token
-    for phrase in ("ListAgents", "worktree", "dead"):
-        assert phrase in text.split("## Phase 4")[1].split("## Phase 5")[0]
+    for primitive in ("**spawn**", "**list-live**", "**message**"):
+        assert primitive in text, primitive
+    body = text.split("---", 2)[2]
+    for claude_tool in ("ListAgents", "SendMessage", "`Agent`", "Workflow"):
+        assert claude_tool not in body, f"{claude_tool} belongs in claude-code.md, not the neutral procedure"
+    phase4 = text.split("## Phase 4")[1].split("## Phase 5")[0]
+    for phrase in ("list-live", "worktree", "dead"):
+        assert phrase in phase4
+
+
+def test_claude_code_enhancement_binds_every_primitive() -> None:
+    text = (SKILL_DIR / "claude-code.md").read_text(encoding="utf-8")
+    for primitive, tool in (("spawn", "`Agent`"), ("list-live", "`ListAgents`"), ("message", "`SendMessage`")):
+        assert primitive in text and tool in text, (primitive, tool)
+    assert "idle_notification" in text
+    assert "verify" in text

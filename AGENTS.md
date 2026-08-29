@@ -237,9 +237,10 @@ per-agent test-parallelism ceiling, because 24 CPUs do not multiply.
 When fanning several lanes out from a ticket list, use the `lane-manager`
 skill: it keeps a per-run state file under `.claude/lanes/`, verifies every
 lane from `git log`/`git diff` and the lane's test command rather than its
-own report, checks `ListAgents` + the worktree before calling an idle lane
-dead, escalates nudge → re-dispatch → BLOCKED without stalling, and emits the
-landed/blocked/merge-order report.
+own report, checks the live-agent list + the worktree before calling an idle
+lane dead, escalates nudge → re-dispatch → BLOCKED without stalling, and emits the
+landed/blocked/merge-order report. `SKILL.md` is harness-neutral (Codex too);
+`claude-code.md` beside it is the Claude Code binding.
 
 Optimization priorities when choosing how to work, in order:
 
