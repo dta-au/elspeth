@@ -1,6 +1,8 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui";
+import { stepLabelForPlugin } from "@/components/chat/interpretationStepLabel";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 
 import type {
   GuidedEditTarget,
@@ -8,7 +10,6 @@ import type {
   GuidedProposalRetryAction,
   GuidedRespondAction,
   ProposalFlow,
-  ProposalNodeBehavior,
   ProposePipelinePayload,
 } from "@/types/guided";
 import {
@@ -16,6 +17,8 @@ import {
   type ReadOnlyPipelineGraphEdge,
   type ReadOnlyPipelineGraphNode,
 } from "./ReadOnlyPipelineGraph";
+import { behaviorSummary, gateSummary } from "./behaviorSummary";
+import { optionTier } from "./optionTiers";
 import { nodeOptionText } from "./WireStageTurn";
 import { WireReviewList, type WireReviewItem } from "./WireReviewList";
 
@@ -116,84 +119,6 @@ function flowLabel(flow: ProposalFlow, routeKeys: ReadonlyMap<string, string>): 
   }
 }
 
-/** "When <condition> — true → <dest>, false → <dest>" (F11): the authored
- *  predicate verbatim, with each author-visible route key resolved to the
- *  destination the proposal actually wires. Ordinal aliases stay visible in
- *  parentheses (they are the revise-target labels). */
-function gateSummary(
-  behavior: Extract<ProposalNodeBehavior, { kind: "gate" }>,
-  gateId: string,
-  edges: ProposePipelinePayload["graph"]["edges"],
-  labelById: ReadonlyMap<string, string>,
-): string {
-  const targetLabel = (edge: ProposePipelinePayload["graph"]["edges"][number]): string =>
-    edge.to_endpoint.kind === "discard"
-      ? "discard"
-      : (labelById.get(edge.to_endpoint.stable_id) ?? edge.to_endpoint.stable_id);
-  const destination = (alias: string): string | null => {
-    const direct = edges.find(
-      (edge) =>
-        edge.from_endpoint.stable_id === gateId &&
-        edge.flow.kind === "gate_route" &&
-        edge.flow.route === alias,
-    );
-    if (direct !== undefined) return targetLabel(direct);
-    const forks = edges.filter(
-      (edge) =>
-        edge.from_endpoint.stable_id === gateId &&
-        edge.flow.kind === "gate_fork" &&
-        edge.flow.routes.includes(alias),
-    );
-    if (forks.length === 0) return null;
-    return forks.map(targetLabel).join(" + ");
-  };
-  const arms = behavior.routes.map(({ alias, key }) => {
-    const dest = destination(alias);
-    return dest === null ? `${key} (${alias})` : `${key} → ${dest} (${alias})`;
-  });
-  const forkNote =
-    behavior.fork_branches.length > 0 ? ` ${behavior.fork_branches.length} fork branches.` : "";
-  return `When ${behavior.condition} — ${arms.join(", ")}.${forkNote}`;
-}
-
-function behaviorSummary(
-  behavior: Exclude<ProposalNodeBehavior, { kind: "gate" }>,
-  nodeLabel: (stableId: string) => string | null = () => null,
-): string {
-  switch (behavior.kind) {
-    case "transform":
-      return "Transforms each incoming item.";
-    case "collector": {
-      const opener = nodeLabel(behavior.opener_stable_id);
-      const policyText = behavior.policy === "require_all"
-        ? "requiring every member to arrive"
-        : "releasing whichever members arrived (best effort)";
-      return `Collects every row expanded by ${opener ?? "its scope opener"} and releases the group as one batch, ${policyText}.`;
-    }
-    case "aggregation": {
-      const triggers: string[] = [];
-      if (behavior.count !== null) triggers.push(`count ${behavior.count}`);
-      if (behavior.timeout_seconds !== null) triggers.push(`timeout ${behavior.timeout_seconds}s`);
-      if (behavior.trigger_kinds.includes("condition")) triggers.push("condition");
-      return `Collects until ${triggers.join(" or ")}; ${behavior.output_mode} output.`;
-    }
-    case "queue":
-      return "Queue continues in sequence without correlating records.";
-    case "coalesce": {
-      const timeout = behavior.timeout_seconds === null
-        ? ""
-        : `; timeout ${behavior.timeout_seconds}s`;
-      return `Joins ${behavior.branch_aliases.join(", ")} using ${behavior.policy} / ${behavior.merge}${timeout}.`;
-    }
-    case "row_union": {
-      const timeout = behavior.timeout_seconds === null
-        ? ""
-        : `; timeout ${behavior.timeout_seconds}s`;
-      return `Waits for ${behavior.branch_aliases.join(", ")}, then forwards every row without merging records${timeout}.`;
-    }
-  }
-}
-
 function reviewStatusCopy(
   state: GuidedProposalReviewState,
   isCurrentBinding: boolean,
@@ -229,6 +154,7 @@ export function ProposePipelineTurn({
   disabled = false,
   isTutorial = false,
 }: ProposePipelineTurnProps): JSX.Element {
+  const showAdvanced = useShowAdvanced();
   const statusRef = useRef<HTMLParagraphElement | null>(null);
   const revisionFeedbackId = useId();
   const retainedCorrection =
@@ -274,19 +200,19 @@ export function ProposePipelineTurn({
       id: source.stable_id,
       label: source.label,
       kind: "source" as const,
-      subtitle: source.plugin.id,
+      subtitle: stepLabelForPlugin(source.plugin.id),
     })),
     ...payload.nodes.map((node) => ({
       id: node.stable_id,
       label: node.label,
       kind: node.node_type,
-      subtitle: node.plugin?.id ?? null,
+      subtitle: node.plugin === null ? null : stepLabelForPlugin(node.plugin.id),
     })),
     ...payload.outputs.map((output) => ({
       id: output.stable_id,
       label: output.label,
       kind: "output" as const,
-      subtitle: output.plugin.id,
+      subtitle: stepLabelForPlugin(output.plugin.id),
     })),
     ...(hasDiscard
       ? [{ id: DISCARD_NODE_ID, label: "discard", kind: "discard" as const, subtitle: null }]
@@ -408,11 +334,11 @@ export function ProposePipelineTurn({
         <h4 id="guided-proposal-components">Components</h4>
         <ul>
           {payload.graph.sources.map((source) => (
-            <li key={source.stable_id}>{source.label} · {source.plugin.id}</li>
+            <li key={source.stable_id}>{source.label} · {stepLabelForPlugin(source.plugin.id)}</li>
           ))}
           {payload.nodes.map((node) => (
             <li key={node.stable_id}>
-              <strong>{node.label} · {node.node_type}{node.plugin === null ? "" : ` · ${node.plugin.id}`}</strong>
+              <strong>{node.label} · {node.node_type}{node.plugin === null ? "" : ` · ${stepLabelForPlugin(node.plugin.id)}`}</strong>
               <span>
                 {" "}
                 {node.behavior.kind === "gate"
@@ -421,14 +347,19 @@ export function ProposePipelineTurn({
               </span>
               {/* R2-F3: the behavior discriminant alone made every transform
                   read as "transforms each incoming item"; the allowlisted key
-                  options say what this one actually does. */}
-              {node.node_options_summary.map((entry) => (
-                <p key={entry.key}>{nodeOptionText(entry)}</p>
-              ))}
+                  options say what this one actually does. Advanced-tier pairs
+                  are gated on show_advanced (elspeth-ca456d9d8d) — this list
+                  has no per-row disclosure, so a plain gate, not a new
+                  surface, is the honest form of "debug mode expands". */}
+              {node.node_options_summary
+                .filter((entry) => showAdvanced || optionTier(entry) !== "advanced")
+                .map((entry) => (
+                  <p key={entry.key}>{nodeOptionText(entry)}</p>
+                ))}
             </li>
           ))}
           {payload.outputs.map((output) => (
-            <li key={output.stable_id}>{output.label} · {output.plugin.id}</li>
+            <li key={output.stable_id}>{output.label} · {stepLabelForPlugin(output.plugin.id)}</li>
           ))}
         </ul>
       </section>

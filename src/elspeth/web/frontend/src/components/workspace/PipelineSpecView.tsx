@@ -1,3 +1,4 @@
+import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
 import { PipelineGloss } from "@/components/chat/guided/PipelineGloss";
 import { OptionRows } from "@/components/inspector/OptionRows";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -104,7 +105,10 @@ function SpecSection({ name, rows }: SpecSectionProps): JSX.Element {
                   {row.plugin !== null && (
                     <div>
                       <dt>Plugin</dt>
-                      <dd>{row.plugin}</dd>
+                      {/* Human register on the label, the raw catalog id in
+                          `title` for operators to copy (elspeth-ca456d9d8d):
+                          same treatment as the catalog card. */}
+                      <dd title={row.plugin}>{pluginDisplayName(row.plugin)}</dd>
                     </div>
                   )}
                   {routingEntries.map(([field, value]) => (

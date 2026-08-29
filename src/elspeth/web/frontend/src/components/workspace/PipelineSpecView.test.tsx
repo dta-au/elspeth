@@ -1,6 +1,7 @@
 import { render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 
+import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
 import { useSessionStore } from "@/stores/sessionStore";
 import { makeComposition } from "@/test/composerFixtures";
 import { PipelineSpecView } from "./PipelineSpecView";
@@ -47,6 +48,21 @@ describe("PipelineSpecView", () => {
     expect(container).toHaveTextContent("Sources");
     expect(container).toHaveTextContent("Nodes");
     expect(container).toHaveTextContent("Outputs");
+  });
+
+  it("names a plugin in the human register and keeps the raw id in title", () => {
+    // elspeth-ca456d9d8d: the Plugin row printed the raw catalog id as visible
+    // text; the copy register puts the display name on the surface and the
+    // exact id in `title`, where operators can still read and copy it.
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+
+    render(<PipelineSpecView />);
+
+    const sources = screen.getByRole("region", { name: "Sources" });
+    const pluginValue = within(sources).getByText(pluginDisplayName("csv_file"));
+    expect(pluginValue.tagName).toBe("DD");
+    expect(pluginValue).toHaveAttribute("title", "csv_file");
+    expect(within(sources).queryByText("csv_file")).toBeNull();
   });
 
   it("uses deterministic source ordering while preserving node and output order", () => {

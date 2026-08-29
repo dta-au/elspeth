@@ -47,6 +47,7 @@ import {
 import { plural } from "@/utils/plural";
 import { BADGE_COLORS, BADGE_BACKGROUNDS, EDGE_COLORS, EDGE_LABEL_COLOR, VALIDATION_COLORS } from "@/styles/tokens";
 import { Button, TypeBadge } from "@/components/ui";
+import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
 import type { CompositionState } from "@/types/index";
 
 import { ConfigRows } from "./ConfigRows";
@@ -695,7 +696,12 @@ function NodeConfigPanel({
           <TypeBadge type={config.typeLabel} />
           <h3>{config.id} config</h3>
           {config.plugin && (
-            <p className="graph-config-plugin">{config.plugin}</p>
+            /* Human register on the line, the raw catalog id in `title`
+               (elspeth-ca456d9d8d) — the config panel names the plugin's
+               identity, so it uses the catalog register. */
+            <p className="graph-config-plugin" title={config.plugin}>
+              {pluginDisplayName(config.plugin)}
+            </p>
           )}
         </div>
         <Button

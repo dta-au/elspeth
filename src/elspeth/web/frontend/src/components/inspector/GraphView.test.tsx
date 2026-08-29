@@ -354,7 +354,11 @@ describe("GraphView", () => {
     // composing the shared .type-badge-* token classes.
     const typeChip = within(panel).getByText("transform");
     expect(typeChip).toHaveClass("type-badge", "type-badge-transform");
-    expect(within(panel).getByText("llm")).toBeInTheDocument();
+    // elspeth-ca456d9d8d: the config panel's plugin line reads in the catalog
+    // register ("LLM"), with the raw id kept in `title` for operators.
+    const pluginLine = within(panel).getByText("LLM");
+    expect(pluginLine).toBeInTheDocument();
+    expect(pluginLine).toHaveAttribute("title", "llm");
     // "prompt" and "output_schema" are not in ESSENTIAL_OPTION_KEYS, so they
     // land under "Advanced settings" and are relabeled by optionLabel's
     // titleCaseLabel fallback like every other row (copy register: no

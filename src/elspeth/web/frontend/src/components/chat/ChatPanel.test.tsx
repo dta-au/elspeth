@@ -1776,7 +1776,9 @@ describe("ChatPanel mode discriminator", () => {
     render(<ChatPanel isTutorial />);
 
     expect(screen.getByText("Review pipeline proposal")).toBeVisible();
-    expect(screen.getByText("orders-source · csv")).toBeVisible();
+    // elspeth-ca456d9d8d: the proposal components list names a plugin by its
+    // catalog display label ("CSV"), not its raw id.
+    expect(screen.getByText("orders-source · CSV")).toBeVisible();
     expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
     expect(screen.queryByRole("button", { name: /Revise/ })).toBeNull();
