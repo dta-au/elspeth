@@ -276,6 +276,58 @@ def test_verify_textract_maps_denied_or_unreachable_probes_to_static_checks(
     assert "raw provider message sentinel" not in str(raised.value)
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        {},
+        {"Error": {}},
+        {"Error": {"Code": ""}},
+        {"Error": {"Code": 403}},
+        {"Error": {"Code": None}},
+        {"Error": {"Message": "raw provider message sentinel"}},
+    ],
+)
+def test_client_error_code_returns_none_for_malformed_provider_error_shapes(response: dict[str, Any]) -> None:
+    assert textract_module._client_error_code(ClientError(response, "StartDocumentAnalysis")) is None
+
+
+def test_client_error_code_returns_none_when_error_member_is_not_a_mapping() -> None:
+    error = ClientError({}, "StartDocumentAnalysis")
+    error.response = {"Error": "AccessDeniedException"}
+
+    assert textract_module._client_error_code(error) is None
+
+
+def test_client_error_code_projects_only_a_non_empty_string_code() -> None:
+    error = _client_error("InvalidJobIdException", "GetDocumentAnalysis")
+
+    assert textract_module._client_error_code(error) == "InvalidJobIdException"
+
+
+def test_probe_invocable_fails_closed_on_malformed_provider_error() -> None:
+    def invoke() -> object:
+        raise ClientError({"Error": {"Code": None}}, "StartDocumentAnalysis")
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="textract_probe_check"):
+        textract_module._probe_invocable(
+            invoke,
+            invocable_codes=frozenset({"InvalidS3ObjectException"}),
+            check="textract_probe_check",
+        )
+
+
+def test_verify_textract_treats_blank_profile_settings_as_unconfigured() -> None:
+    client = _FakeSDKClient(
+        start_error=_client_error("InvalidS3ObjectException", "StartDocumentAnalysis"),
+        get_error=_client_error("InvalidJobIdException", "GetDocumentAnalysis"),
+    )
+
+    details = _verify(_textract_env(ELSPETH_WEB__AWS_TEXTRACT_PROFILES="   "), client)
+
+    assert details["profiles_configured"] == 0
+    assert len(client.start_calls) == 1
+
+
 def test_verify_textract_accepts_outright_probe_success_as_invocable() -> None:
     details = _verify(_textract_env(), _FakeSDKClient())
 
@@ -292,6 +344,17 @@ def test_verify_textract_reports_close_failure_after_successful_probes() -> None
 
     with pytest.raises(acceptance.AcceptanceCheckError, match="textract_resource_close"):
         _verify(_textract_env(), client)
+
+
+def test_verify_textract_probe_failure_wins_over_close_failure() -> None:
+    client = _FakeSDKClient(
+        start_error=_client_error("AccessDeniedException", "StartDocumentAnalysis"),
+        close_error=RuntimeError("close failed"),
+    )
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="textract_start_document_analysis"):
+        _verify(_textract_env(), client)
+    assert client.closed is True
 
 
 def _receipt_env() -> dict[str, str]:

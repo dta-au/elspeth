@@ -100,3 +100,57 @@
 - Wave 4 (B26–28, web/_aws_ecs_acceptance, ~434 findings) remains PAUSED on John's module-level
   @trust_boundary decision (plan doc note); the wave-3 evidence for that call: boundary-per-payload-type
   removed 113/121 in plugin_policy (B54) and the acceptance harness is Tier-3-by-construction throughout.
+
+## WAVE 4 PREP (authorised by John 2026-08-29; base 99d43f87d)
+- John's rulings this session: (1) Wave 4 GO with per-payload-type `@trust_boundary` declarations in B54's
+  shape (NOT a blanket module declaration); (2) flow.py archive DROPPED — directory deleted, obs
+  elspeth-obs-bb4ce637ce dismissed with the ruling; (3) land elspeth-0bd4fb6042 (exemption-map cleanup) and
+  elspeth-23ee8e3440 (stage_status flags) as fix lanes alongside the wave.
+- Base corpus @99d43f87d (allowlist-disabled, findings-only): 2535 whole-tree; web/_aws_ecs_acceptance = 411
+  (B26=198, B27=192, B28=21; s3.py 0). Saved: scratchpad `w4_prefix_corpus_raw.txt`. ZERO signed allowlist
+  entries and ZERO per-file caps bind the package — lanes work the whole list, no subtraction.
+- The exemption map (0bd4fb6042) has NO entries for the harness, so the fix lanes and the wave lanes touch
+  disjoint files; the ~+3 findings the map cleanup surfaces (routes/_helpers.py, lens-B F4) are hub-owned
+  after merge, counted OUTSIDE the Wave-4 removal number.
+- Dispatched @99d43f87d, worktrees `.claude/worktrees/tier-*`, `-n 2` each: tier-lintmap (fable,
+  elspeth-0bd4fb6042), tier-stagecmd (opus, elspeth-23ee8e3440), tier-B26 (opus, elspeth-1213f153ae),
+  tier-B27 (opus, elspeth-23dd89ac63), tier-B28 (fable, elspeth-be73a74f17). Briefs: scratchpad
+  `LANE_BRIEF_FIX_COMMON.md`, `LANE_BRIEF_LINTMAP.md`, `LANE_BRIEF_STAGECMD.md`, `LANE_BRIEF_W4.md`
+  (+W2/W3 verbatim); worklists `worklists4/B2*.md`.
+- Merge plan: --no-ff per lane after hub's own scan + full diff review; lintmap merge → hub re-measures the
+  whole-tree base and records the surfaced findings; wave-end: full suite in a worktree, two-lens audit,
+  close issues anchored at the tip, then PAUSE (re-stage is the operator seam: ONE stage_scan after the
+  last fix merge; f0e38838d judge-quality re-run still owed by the operator).
+- CORRECTION (caught by tier-B27's reconciliation, hub-measured): the hub's findings-count regex
+  `^[a-z_/]+\.py:[0-9]+:` rejects digit-bearing filenames, dropping s3.py (23), plugins/sources/aws_s3_source.py
+  (18), plugins/sinks/aws_s3_sink.py (8), web/composer/telemetry_phase8.py (10) = 59 findings from every
+  Wave-3 and Wave-4 absolute count. Correct regex: `^[a-z0-9_/]+\.py:[0-9]+:`. Corrected absolutes: Wave-3
+  base 2932 (not 2873) → Wave-3 close 2594 (not 2535); the 338 removed and the 1,304 W1–W3 total are
+  UNCHANGED (the dropped files did not move). Wave-4 base @99d43f87d = 2594 whole-tree, harness = 434
+  (B26=198, B27=215 incl. s3.py, B28=21). s3.py belongs to B27 (worklist and brief corrected in place).
+- tier-lintmap MERGED (b5a5ecc51, elspeth-0bd4fb6042): map re-keyed to qualified symbol paths (84 → 78 live
+  entries; 12 dead removed; 2 bare-name collisions made explicit: state.py from_dict ×6, redaction.py
+  provider ×2 — narrowing needs per-site evidence), single resolver backs the test pin + whole-tree ERROR.
+  Hub scan: 2594 → 2594, comm -3 EMPTY (corrected regex). CORRECTION to the prep note above: deleting a DEAD
+  entry moves the corpus by ZERO — the "+3 surfacing" never existed (routes/_helpers.py:964/970/971 were
+  already in the base). Lane committed with SKIP=elspeth-lints-trust-tier after an A/B showing the hook's
+  rc=1 is the elspeth-13f0cc04fb fail-closed state, byte-identical on base and branch.
+  (lintmap follow-up: `task` type has no `verifying` status — stays in_progress until wave-end close; the
+  merged commit body of b5a5ecc51 quotes the old-regex 2535/1235 figures — superseded by this ledger, not
+  rewritten. Lane re-derived under the corrected regex: 2594→2594 and real-allowlist 1270→1270, both empty.)
+- tier-B28 MERGED (0d0214b9d, lane HEAD a80e2aa79, elspeth-be73a74f17): 21 → 2 (19 removed, 2 rationalised:
+  EINTR flock retry R6, close-in-finally R4). Hub scan 2594 → 2575, outside-bucket identity EMPTY. Real fixes:
+  lock open-or-create handler returns the published descriptor; receipt_store parses (schema) BEFORE binding;
+  textract `_client_error_code` = non_raising boundary over ClientError.response with None failing closed in
+  `_probe_invocable`. Hub-reviewed flags: lexists/unlink(missing_ok) accepted (exclusive create is the
+  os.link FileExistsError path; dangling-symlink pin added). Lane's own absolute counts (2592/2573) carry a
+  2-line offset vs hub's; deltas identical (19).
+- tier-stagecmd MERGED (lane HEAD c0cf09f39, elspeth-23ee8e3440): every staging tool now emits
+  `sign_bundle_plan` (per-lane actions + judge calls from `sign_bundle_transaction._JUDGE_GATED_KINDS`,
+  lane-scoped `--lanes` commands cheapest-first, `--continue-on-block` above 10 judge calls, un-rationaled
+  justify advisory). Whole-bundle `sign_bundle_command` kept; handoff doc + both skill twins updated.
+  Corpus unchanged (no rules/ edits). Issue is a bug type → `verifying` accepted; close at wave end.
+- Retroactive check on the regex blind spot (raised by tier-stagecmd): the four digit-named files carry an
+  IDENTICAL 59-finding set at the Wave-3 base (postB43c), Wave-3 close (w3_final) and Wave-4 base, and
+  `git log 25cce9cdb..99d43f87d` on them is empty — Wave-3's outside-bucket identity checks were blind to
+  those files but nothing moved in them; every Wave-3 identity claim stands.

@@ -8,6 +8,31 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — the tier_model `_R5_NAMED_BOUNDARY_CONTEXTS` exemption map is
+  MEASURED now: every entry must resolve to exactly ONE live definition, and a
+  moved function is NOT successor-included.** Before elspeth-0bd4fb6042 the
+  map carried 12 dead entries (2 dead file keys incl. `web/sessions/routes.py`,
+  7 dead function keys) and 2 bare-name collisions (`state.py::from_dict`
+  matched SIX classmethods, `redaction.py::provider` two closures) that nothing
+  reported. Now: (a) keys are qualified `symbol_stack` paths, so a same-named
+  method on another class or a future function reusing a retired name inherits
+  nothing; (b) `resolve_named_boundary_contexts(root)` is the single authority —
+  `tests/unit/elspeth_lints/test_tier_model_named_boundary_map.py` pins the
+  live tree and prints the failing rows as a table, and every whole-tree
+  `collect_check_result` on a `src/elspeth` root re-runs it and reports a stale
+  entry as an ERROR (`STALE NAMED-BOUNDARY MAP ENTRIES` / JSON
+  `stale_named_boundary_contexts` / lint message "Stale tier-model
+  named-boundary map entry"), the same fail-closed treatment a stale allowlist
+  entry gets; pre-commit `files=` mode skips it like allowlist staleness.
+  Consequences: adding an entry needs audit evidence AND the pin passing;
+  deleting a function named in the map turns the whole-tree gate red until the
+  entry goes; when a function MOVES to another file, do NOT add the new
+  location — its findings surface and go through the allowlist like any other
+  site. Deleting a DEAD entry moves the corpus by ZERO (it suppressed nothing);
+  the "+3 for `_extract_runtime_model_snapshot`" expected by lens B had already
+  surfaced at the package split (`routes/_helpers.py:964/970/971` are in the
+  2594 baseline at 99d43f87d — 2594, not 2535: the hub's earlier count dropped
+  digit-bearing filenames).
 - **2026-08-29 — masquerade resolver STOP RULES (do not re-walk the six-freeze
   road).** The sparse-SSA `flow.py` prototype (archived at
   `/home/john/codex-cleanup-archive-2026-08-16/orphaned-work/ac-masquerade-bounded/`)
@@ -52,6 +77,37 @@ is a working document under the normal delivery posture.
      "tool_calls")`, so a row read back from the DB is `mappingproxy` at BOTH
      the envelope and the `invocation` level; `type(x) is dict` is permanently
      False and would re-disable the branch. Mutation-verified both ways.
+- **2026-08-29 — three honest shapes for the secure-file and provider-error
+  findings in the acceptance harness (B28, measured on
+  `web/_aws_ecs_acceptance/{secure_documents,receipt_store,textract}.py`,
+  21 → 2 with no sidecar restatement).**
+  1. **A non-raising `@trust_boundary` on a provider-error PROJECTION whose
+     `None` the caller fails closed on.** `textract.py::_client_error_code`
+     reads `error.response.get("Error")` off a botocore `ClientError`; the
+     tier_model walk keeps the `<source_param>.<attr>.get()` chain, so
+     `suppresses=("R1","R5")` under `source_param="error"` cleared all three
+     sites. `non_raising=True` is honest ONLY because `_probe_invocable`
+     treats `None` as not-invocable and raises — an accept-gate consumer would
+     make the same declaration a silent skip (W3-1 polarity rule).
+  2. **`FileNotFoundError` swallows in a secure writer have stdlib forms that
+     say what they mean.** The create pre-check `try: path.lstat() /
+     except FileNotFoundError: pass / else: raise exists` is
+     `if os.path.lexists(path): raise exists` (outcome-identical: any other
+     lstat errno fails `mkstemp`/`os.link` one step later under the same
+     `write_check`); the `finally` temp-file cleanup is
+     `Path(tmp).unlink(missing_ok=True)`; and an open-or-create lock is a
+     handler that RETURNS the freshly published descriptor
+     (`_open_receipt_manifest_lock` → `_publish_receipt_manifest_lock`). What
+     stays is the EINTR retry in `_flock_retry_interrupted` — unbounded by
+     design, rationalised, not shaped.
+  3. **Parse, THEN bind.** `receipt_store` compared nine `document.get(k)`
+     values against the manifest BEFORE `_validate_stored_receipt` had
+     enforced `set(payload) == fields`. Running the schema parse first (the
+     order every other receipt kind already used) makes every downstream read
+     membership-form on a validated document; the only observable change is
+     that a document failing both now reports `receipt_store_schema`, and no
+     document that was rejected is accepted. `json.loads` output on a path
+     with no frozen owner between it and the read is `type(x) is not dict`.
 - **2026-08-29 — widening a `@trust_boundary`'s `suppresses=` ROTATES its
   `test_fingerprint`, and `trust_boundary.tests` is a CI-ONLY gate that no
   pre-commit hook runs.** Measured in B60 on
@@ -92,7 +148,9 @@ is a working document under the normal delivery posture.
   A minimal probe file reproduced the chain and DID fire, which rules out any
   general "exception dispatch is exempt" behaviour. The cause is
   `TierModelVisitor._is_allowed_r5_context` → `_is_named_tier3_boundary_context`,
-  which looks the CURRENT FUNCTION'S NAME up in a `ClassVar[dict[str,
+  which looks the current definition's QUALIFIED path (`".".join(symbol_stack)`,
+  e.g. `CompositionState.from_dict`; bare names only for module-level
+  functions — qualified since elspeth-0bd4fb6042) up in a `ClassVar[dict[str,
   frozenset[str]]]` keyed by scan-root-relative file path
   (`elspeth-lints/.../trust_tier/tier_model/rule.py`, ~line 418); the map
   already lists `web/sessions/_auto_title.py: {"_auto_title_exception_class",
@@ -1523,6 +1581,35 @@ is a working document under the normal delivery posture.
   not turn `_path_matches_rule` from `re.search` into `fullmatch` as part of a
   walker change: shipped unanchored filters rely on substring semantics and
   require a separate audited migration.
+
+- **2026-08-29 — `sign_bundle_transaction._JUDGE_GATED_KINDS` is the ONE
+  authority for "which action kinds spend a judge call"; price off it, never
+  off a local copy** (elspeth-23ee8e3440). The MCP staging surface renders the
+  operator's paste-ready `sign-bundle` command, and that command's cost is
+  entirely a function of this set (`justify` + `drift_repair` reach
+  `_run_justify`; `rotation` and `stale_delete` are mechanical YAML rewrites).
+  Three call sites already read it, so a fourth private `frozenset({"justify",
+  "drift_repair"})` would quote a price the transaction does not actually
+  spend the moment the split moves. `mcp/server.py::_judge_calling_kinds()`
+  imports it lazily for exactly this reason. Traps:
+  - **A lane's price is not its size.** The `resign` lane holds all three
+    mechanical kinds *and* `drift_repair`, so a 366-action `resign` lane can
+    cost 0 judge calls while a same-size `new_judgment` lane costs 366. Any
+    "how expensive is this bundle" answer must count kinds, not actions.
+  - The renderer's `--lanes` values must come from the bundle's own
+    `action.lane` (derived from `kind` by `BundleAction.__post_init__`), never
+    a typed literal — that is what keeps them inside `cli._SIGN_BUNDLE_LANES`
+    without importing the argparse module into the keyless MCP surface.
+  - Every rendered command carries `--dry-run`, so pasting one spends nothing.
+    Word any cost annotation as what the scope costs *once `--dry-run` is
+    dropped*; saying the command costs N judge calls is simply false.
+  - Testing it: assert on rendered VALUES (`--lanes new_judgment`), never the
+    bare flag name — the response carries several commands and a substring
+    check cannot discriminate between them. Pair every presence assertion with
+    an absence control on the opposite bundle (single-lane vs mixed, at the
+    threshold vs one over), and build `BundleAction` fixtures by direct
+    construction: the masquerade gate scans tests, so parametrizing by
+    attribute name and resolving with `getattr` turns the whole tree red.
 
 - **2026-08-28 — in `sign-bundle`, a judged BLOCK is DURABLE STATE, not a
   return value: never use one as a generic "stop the run" mechanism**

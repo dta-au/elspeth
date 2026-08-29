@@ -22,6 +22,7 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.plugins.transforms.aws.textract_client import build_textract_sdk_client
 from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysisConfig
@@ -42,6 +43,17 @@ _START_INVOCABLE_CODES = frozenset({"InvalidS3ObjectException"})
 _GET_INVOCABLE_CODES = frozenset({"InvalidJobIdException"})
 
 
+@trust_boundary(
+    tier=3,
+    source="botocore ClientError.response emitted by the Textract SDK client for a probe call",
+    source_param="error",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns None unless Error.Code is a non-empty str; the caller (_probe_invocable) treats None as "
+        "not-invocable and raises AcceptanceCheckError, so a malformed provider error never proves an action"
+    ),
+    non_raising=True,
+)
 def _client_error_code(error: ClientError) -> str | None:
     error_payload = error.response.get("Error")
     code = error_payload.get("Code") if isinstance(error_payload, Mapping) else None
@@ -79,8 +91,10 @@ def _verify_textract_profiles(
     and the granted document location is invocable by the task role via the
     same negative-space StartDocumentAnalysis probe as the raw-SDK lane.
     """
-    raw = env.get("ELSPETH_WEB__AWS_TEXTRACT_PROFILES")
-    if raw is None or not raw.strip():
+    if "ELSPETH_WEB__AWS_TEXTRACT_PROFILES" not in env:
+        return {"profiles_configured": 0, "profile_locations_invocable": True}
+    raw = env["ELSPETH_WEB__AWS_TEXTRACT_PROFILES"]
+    if not raw.strip():
         return {"profiles_configured": 0, "profile_locations_invocable": True}
     try:
         parsed = json.loads(raw)

@@ -1240,3 +1240,286 @@ def test_stage_preview_judges_annotated_rationale_with_rule_definition_and_simil
     assert annotated_request.rationale_duplicate_count == 1
     assert [entry.key for entry in annotated_request.similar_entries] == [other_key]
     assert "payload is Tier-3 external data" in annotated_request.similar_entries[0].reason_excerpt
+
+
+# --------------------------------------------------------------------------- #
+# elspeth-23ee8e3440 -- the paste-ready sign-bundle command prices its own scope
+#
+# The command used to be one hardcoded whole-bundle string, so a bundle mixing a
+# mechanical ``resign`` lane with a large un-rationaled ``new_judgment`` lane
+# read exactly like a cheap one. These tests pin the derivation: which kinds
+# cost a judge call, which flags each scope earns, and that the rendered lane
+# names come from the CLI's own vocabulary.
+# --------------------------------------------------------------------------- #
+
+
+def _render_ctx(tmp_path: Path) -> Any:
+    """A context for the pure renderers -- no tree, no git, nothing to verify."""
+    return judge_server._ServerContext(
+        root=tmp_path / "src_root",
+        allowlist_dir=tmp_path / "allowlist",
+        staged_dir=tmp_path / "staged",
+    )
+
+
+def _justify(index: int, *, draft_rationale: str | None = None) -> BundleAction:
+    return BundleAction(
+        lane="new_judgment",
+        kind="justify",
+        key=f"plugins/j{index}.py::Widget.lookup::R1::{'a' * 12}",
+        file_path=f"plugins/j{index}.py",
+        symbol="Widget.lookup",
+        fingerprint="a" * 12,
+        draft_rationale=draft_rationale,
+    )
+
+
+def _drift_repair(index: int) -> BundleAction:
+    return BundleAction(
+        lane="resign",
+        kind="drift_repair",
+        key=f"plugins/d{index}.py::Widget.lookup::R1::{'b' * 12}",
+        diagnosis_status="SCOPE_BINDING_DRIFT",
+    )
+
+
+def _rotation(index: int) -> BundleAction:
+    return BundleAction(
+        lane="resign",
+        kind="rotation",
+        key=f"plugins/r{index}.py::Widget.lookup::R1::{'c' * 12}",
+        source_file="widget.yaml",
+    )
+
+
+def _stale_delete(index: int) -> BundleAction:
+    return BundleAction(
+        lane="resign",
+        kind="stale_delete",
+        key=f"plugins/s{index}.py::Widget.lookup::R1::{'d' * 12}",
+        source_file="widget.yaml",
+    )
+
+
+def _bundle_of(root: Path, allowlist_dir: Path, actions: tuple[BundleAction, ...]) -> ReviewBundle:
+    """A structurally valid bundle carrying exactly ``actions`` (never verified)."""
+    return ReviewBundle(
+        bundle_id="render-bundle",
+        schema_version=2,
+        created_at="2026-08-29T00:00:00+00:00",
+        staged_by="agent-x",
+        root=str(root),
+        allowlist_dir=str(allowlist_dir),
+        source_rev="e" * 40,
+        source_dirty=False,
+        source_snapshot_sha256="f" * 64,
+        actions=actions,
+    )
+
+
+def test_priced_judge_calls_track_the_fire_time_authority(tmp_path: Path) -> None:
+    """The quoted price is the transaction's own judge-gated split, not a copy.
+
+    ``sign_bundle_transaction`` decides which exit-1 is a judged BLOCK; pricing
+    off any other set would quote a cost the operator does not actually pay.
+    """
+    from elspeth_lints.core.review_bundle import _KIND_TO_LANE
+    from elspeth_lints.core.sign_bundle_transaction import _JUDGE_GATED_KINDS
+
+    assert _JUDGE_GATED_KINDS.issubset(_KIND_TO_LANE)
+    ctx = _render_ctx(tmp_path)
+    one_of_each = (_justify(1), _drift_repair(1), _rotation(1), _stale_delete(1))
+    for action in one_of_each:
+        bundle = _bundle_of(ctx.root, ctx.allowlist_dir, (action,))
+        plan = judge_server._sign_bundle_plan(ctx, tmp_path / "authority.json", bundle)
+        expected = 1 if action.kind in _JUDGE_GATED_KINDS else 0
+        assert plan["judge_calls_total"] == expected, action.kind
+        assert plan["judge_calling_kinds"] == sorted(_JUDGE_GATED_KINDS)
+
+
+def test_rendered_lane_names_come_from_the_cli_lane_vocabulary(tmp_path: Path) -> None:
+    """Every ``--lanes`` value the server renders must be one the CLI accepts."""
+    from elspeth_lints.core.cli import _SIGN_BUNDLE_LANES
+
+    ctx = _render_ctx(tmp_path)
+    bundle = _bundle_of(ctx.root, ctx.allowlist_dir, (_justify(1), _rotation(1), _drift_repair(1)))
+
+    plan = judge_server._sign_bundle_plan(ctx, tmp_path / "b.json", bundle)
+
+    rendered_lanes = [entry["lane"] for entry in plan["per_lane"]]
+    assert rendered_lanes
+    assert set(rendered_lanes) <= set(_SIGN_BUNDLE_LANES)
+    for entry in plan["per_lane"]:
+        assert f"--lanes {entry['lane']}" in entry["command"]
+
+
+def test_single_lane_bundle_renders_no_lane_flag_and_no_continue_on_block(tmp_path: Path) -> None:
+    """One lane means the default scope already equals it -- a flag would be noise."""
+    ctx = _render_ctx(tmp_path)
+    bundle_path = tmp_path / "single.json"
+    bundle = _bundle_of(ctx.root, ctx.allowlist_dir, (_rotation(1), _rotation(2), _stale_delete(1)))
+
+    command = judge_server._sign_bundle_command(ctx, bundle_path, bundle)
+    plan = judge_server._sign_bundle_plan(ctx, bundle_path, bundle)
+
+    assert "--lanes" not in command
+    assert "--continue-on-block" not in command
+    assert "--dry-run" in command
+    assert str(bundle_path) in command
+    assert plan["actions_total"] == 3
+    assert plan["judge_calls_total"] == 0
+    assert [(e["lane"], e["actions"], e["judge_calls"]) for e in plan["per_lane"]] == [("resign", 3, 0)]
+    # A single-lane bundle has no cheaper scoping to advertise.
+    assert not any("mixes" in note for note in plan["notes"])
+
+
+def test_mixed_lane_bundle_prices_each_lane_cheapest_first(tmp_path: Path) -> None:
+    """The resign lane's judge cost is its ``drift_repair`` actions -- not its size."""
+    ctx = _render_ctx(tmp_path)
+    bundle_path = tmp_path / "mixed.json"
+    actions = (_rotation(1), _stale_delete(1), _drift_repair(1), _justify(1), _justify(2), _justify(3))
+    bundle = _bundle_of(ctx.root, ctx.allowlist_dir, actions)
+
+    plan = judge_server._sign_bundle_plan(ctx, bundle_path, bundle)
+
+    assert plan["actions_total"] == 6
+    assert plan["judge_calls_total"] == 4
+    # Cheapest first: resign is 3 actions but only 1 judge call.
+    assert [(e["lane"], e["actions"], e["judge_calls"]) for e in plan["per_lane"]] == [
+        ("resign", 3, 1),
+        ("new_judgment", 3, 3),
+    ]
+    assert any("mixes 2 lanes" in note for note in plan["notes"])
+    assert any("--dry-run" in note and "spends no judge call" in note for note in plan["notes"])
+
+
+def test_continue_on_block_appears_only_above_the_threshold(tmp_path: Path) -> None:
+    """Exactly at the threshold is a watched run; one more is left unattended."""
+    ctx = _render_ctx(tmp_path)
+    bundle_path = tmp_path / "threshold.json"
+    threshold = judge_server._CONTINUE_ON_BLOCK_JUDGE_CALL_THRESHOLD
+
+    at = _bundle_of(ctx.root, ctx.allowlist_dir, tuple(_justify(i) for i in range(threshold)))
+    over = _bundle_of(ctx.root, ctx.allowlist_dir, tuple(_justify(i) for i in range(threshold + 1)))
+
+    at_command = judge_server._sign_bundle_command(ctx, bundle_path, at)
+    over_command = judge_server._sign_bundle_command(ctx, bundle_path, over)
+
+    assert "--continue-on-block" not in at_command
+    assert "--continue-on-block" in over_command
+    assert not any("--continue-on-block" in note for note in judge_server._sign_bundle_plan(ctx, bundle_path, at)["notes"])
+    assert any("--continue-on-block" in note for note in judge_server._sign_bundle_plan(ctx, bundle_path, over)["notes"])
+
+
+def test_continue_on_block_is_scoped_per_lane_not_per_bundle(tmp_path: Path) -> None:
+    """A cheap lane's own command must not inherit the expensive lane's flag."""
+    ctx = _render_ctx(tmp_path)
+    bundle_path = tmp_path / "scoped.json"
+    threshold = judge_server._CONTINUE_ON_BLOCK_JUDGE_CALL_THRESHOLD
+    actions = (_rotation(1), *(_justify(i) for i in range(threshold + 1)))
+    bundle = _bundle_of(ctx.root, ctx.allowlist_dir, actions)
+
+    plan = judge_server._sign_bundle_plan(ctx, bundle_path, bundle)
+    by_lane = {entry["lane"]: entry for entry in plan["per_lane"]}
+
+    assert by_lane["resign"]["judge_calls"] == 0
+    assert "--continue-on-block" not in by_lane["resign"]["command"]
+    assert "--continue-on-block" in by_lane["new_judgment"]["command"]
+
+
+def test_plan_flags_justify_actions_that_carry_no_draft_rationale(tmp_path: Path) -> None:
+    """The 2026-08-28 pathology: judge calls spent on a lane with no rationales."""
+    ctx = _render_ctx(tmp_path)
+    bundle_path = tmp_path / "unrationaled.json"
+    actions = (_justify(1, draft_rationale="gadget parses an upstream payload"), _justify(2), _justify(3, draft_rationale="   "))
+    bundle = _bundle_of(ctx.root, ctx.allowlist_dir, actions)
+
+    notes = judge_server._sign_bundle_plan(ctx, bundle_path, bundle)["notes"]
+
+    rationale_notes = [note for note in notes if "draft_rationale" in note]
+    assert len(rationale_notes) == 1
+    # Whitespace-only counts as absent, so 2 of 3.
+    assert "2 of 3 justify action(s)" in rationale_notes[0]
+    assert "stage_annotate" in rationale_notes[0]
+    assert "near-certain-BLOCK" in rationale_notes[0]
+
+
+def test_plan_stays_silent_when_every_justify_action_is_rationaled(tmp_path: Path) -> None:
+    """Control for the un-rationaled flag: a fully annotated lane earns no warning."""
+    ctx = _render_ctx(tmp_path)
+    bundle = _bundle_of(
+        ctx.root,
+        ctx.allowlist_dir,
+        (_justify(1, draft_rationale="parses an upstream payload"), _justify(2, draft_rationale="parses a tool-call payload")),
+    )
+
+    notes = judge_server._sign_bundle_plan(ctx, tmp_path / "ok.json", bundle)["notes"]
+
+    assert not any("draft_rationale" in note for note in notes)
+
+
+def test_action_free_rekey_bundle_renders_the_plain_command(tmp_path: Path) -> None:
+    """``stage_status`` emits the command for a rekey bundle that has no actions."""
+    ctx = _render_ctx(tmp_path)
+    bundle_path = tmp_path / "rekey.json"
+    bundle = _bundle_of(ctx.root, ctx.allowlist_dir, ())
+
+    command = judge_server._sign_bundle_command(ctx, bundle_path, bundle)
+    plan = judge_server._sign_bundle_plan(ctx, bundle_path, bundle)
+
+    assert "--lanes" not in command
+    assert "--continue-on-block" not in command
+    assert command.endswith("--dry-run")
+    assert plan["per_lane"] == []
+    assert plan["actions_total"] == 0
+    assert plan["judge_calls_total"] == 0
+
+
+def test_command_stays_key_free_at_every_scope(tmp_path: Path) -> None:
+    """[O1]: the placeholder convention and the unquoted ``--owner "$USER"`` stay."""
+    ctx = _render_ctx(tmp_path)
+    bundle = _bundle_of(ctx.root, ctx.allowlist_dir, (_justify(1), _rotation(1)))
+    plan = judge_server._sign_bundle_plan(ctx, tmp_path / "keyfree.json", bundle)
+
+    commands = [judge_server._sign_bundle_command(ctx, tmp_path / "keyfree.json", bundle)]
+    commands.extend(entry["command"] for entry in plan["per_lane"])
+    for command in commands:
+        assert judge_server._OPERATOR_KEY_PLACEHOLDER in command
+        assert '--owner "$USER"' in command
+        assert "<operator-held-key>" in command
+
+
+def test_every_tool_that_emits_the_command_also_emits_the_plan(tmp_path: Path) -> None:
+    """All four emitting sites inherit the pricing, not just ``stage_status``."""
+    ctx, staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
+    justify_key = next(a.key for a in read_bundle(staged_dir / f"{bundle_id}.json").actions if a.kind == "justify")
+
+    calls = [
+        ("stage_status", {"bundle_id": bundle_id}),
+        ("stage_annotate", {"bundle_id": bundle_id, "rationales": {justify_key: "parses an upstream tool-call payload"}}),
+        ("stage_preview", {"bundle_id": bundle_id}),
+    ]
+    payloads = {}
+    with (
+        patch("elspeth_lints.core.judge.build_readonly_tool_scope", return_value=object()),
+        patch(
+            "elspeth_lints.core.judge.call_judge",
+            return_value=_fake_response(JudgeVerdict.ACCEPTED, "boundary is genuine"),
+        ),
+    ):
+        for name, arguments in calls:
+            outcome = judge_server._run_tool(ctx, name, arguments)
+            assert outcome.is_error is False, outcome.text
+            payloads[name] = json.loads(outcome.text)
+    # stage_scan is the fourth site; re-running it rewrites the same bundle id.
+    scan = judge_server._run_tool(ctx, "stage_scan", {"bundle_id": "plan-scan"})
+    assert scan.is_error is False, scan.text
+    payloads["stage_scan"] = json.loads(scan.text)
+
+    assert set(payloads) == {"stage_status", "stage_annotate", "stage_preview", "stage_scan"}
+    for name, payload in payloads.items():
+        assert "sign-bundle" in payload["sign_bundle_command"], name
+        plan = payload["sign_bundle_plan"]
+        assert plan["judge_calling_kinds"] == ["drift_repair", "justify"], name
+        assert plan["actions_total"] == payload.get("actions_total", plan["actions_total"]), name
+        assert [entry["lane"] for entry in plan["per_lane"]] == ["new_judgment"], name

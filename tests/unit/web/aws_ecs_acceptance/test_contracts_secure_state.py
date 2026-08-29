@@ -493,6 +493,50 @@ def test_receipt_manifest_lock_retries_interrupted_flock(
     assert operations == [real_fcntl.LOCK_EX, real_fcntl.LOCK_EX, real_fcntl.LOCK_UN]
 
 
+@pytest.mark.parametrize("content", ["[]", '"document"', "null", "7"])
+def test_read_protected_document_rejects_non_object_json(tmp_path: Path, content: str) -> None:
+    secure_documents = importlib.import_module("elspeth.web._aws_ecs_acceptance.secure_documents")
+    path = tmp_path / "control.json"
+    path.write_text(content)
+    path.chmod(0o600)
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="control_manifest_file"):
+        secure_documents._read_protected_document(path, check="control_manifest_file")
+
+
+def test_protected_document_create_refuses_any_existing_entry_including_dangling_symlink(tmp_path: Path) -> None:
+    secure_documents = importlib.import_module("elspeth.web._aws_ecs_acceptance.secure_documents")
+    parent = tmp_path / "control"
+    parent.mkdir(mode=0o700)
+    dangling = parent / "dangling.json"
+    dangling.symlink_to(parent / "missing-target.json")
+    existing = parent / "existing.json"
+    existing.write_text("{}")
+    existing.chmod(0o600)
+
+    for path in (dangling, existing):
+        with pytest.raises(acceptance.AcceptanceCheckError, match="control_manifest_exists"):
+            secure_documents._write_protected_document(
+                path,
+                {"items": []},
+                create=True,
+                exists_check="control_manifest_exists",
+                write_check="control_manifest_file",
+            )
+    assert existing.read_text() == "{}"
+    assert not [candidate for candidate in os.listdir(parent) if candidate.endswith(".tmp")]
+
+    fresh = parent / "fresh.json"
+    secure_documents._write_protected_document(
+        fresh,
+        {"items": []},
+        create=True,
+        exists_check="control_manifest_exists",
+        write_check="control_manifest_file",
+    )
+    assert json.loads(fresh.read_text()) == {"items": []}
+
+
 def test_protected_document_write_rejects_symlinked_immediate_parent(tmp_path: Path) -> None:
     secure_documents = importlib.import_module("elspeth.web._aws_ecs_acceptance.secure_documents")
     real_parent = tmp_path / "real"
