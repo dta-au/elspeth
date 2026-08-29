@@ -8,6 +8,37 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — widening a `@trust_boundary`'s `suppresses=` ROTATES its
+  `test_fingerprint`, and `trust_boundary.tests` is a CI-ONLY gate that no
+  pre-commit hook runs.** Measured in B60 on
+  `web/sessions/routes/composer/state.py::_reject_disallowed_source_paths`.
+  Two facts that cost time separately:
+  1. **The fingerprint is over the referenced TEST's AST, not the decorated
+     function.** `elspeth_lints.rules.trust_boundary.tests.rule::
+     _fingerprint_test_function` is
+     `sha256(ast.dump(func, annotate_fields=True, include_attributes=False))`
+     of the function `test_ref` resolves to. So editing the *test* to pin a
+     newly-suppressed arm rotates it, while comments, whitespace, and line
+     moves inside that test are free. Recompute it by calling the rule's own
+     `_resolve_test_ref(test_ref, repo_root).fingerprint` — never hand-edit,
+     and never guess from the old value.
+  2. **Nothing local catches a stale one.** `.pre-commit-config.yaml` has no
+     `trust_boundary.tests` hook (it has `trust_tier.tier_model`), and the
+     runtime decorator in `contracts/trust_boundary.py` stores
+     `test_fingerprint` without ever checking it. The only enforcement is
+     `.github/workflows/ci.yaml`'s
+     `--rules trust_boundary.tests,trust_boundary.scope,trust_boundary.tier`.
+     Run that command yourself after ANY decorator or pinning-test edit:
+     a green `pytest` and a green commit prove nothing about it.
+  The corollary for burn-down lanes: widening `suppresses=` on an existing
+  honest boundary is the cheap zero-code removal (B47/B42), but it is only
+  honest if the boundary's own pinning test actually asserts the widened arm.
+  Here the `test_ref` pinned only the 400-reject arm, which stays green if the
+  `isinstance(value, str)` skip gate is deleted — so the R5 widening required
+  adding the skip assertions (int, `None`, nested mapping, absent key) to the
+  named test, which then rotated the fingerprint. Same both-arms rule as the
+  frozen-input pins in W2 brief item 15, applied to boundary metadata.
+
 - **2026-08-29 — POLARITY decides how bad a `type(x) is dict` freeze trap is,
   and an accept-gate that GATES A CONTROL BLOCK is fail-OPEN, not a
   conservative abstention.** Landed by the Wave-3 hygiene lane over the four
