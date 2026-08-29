@@ -150,3 +150,7 @@
   lane-scoped `--lanes` commands cheapest-first, `--continue-on-block` above 10 judge calls, un-rationaled
   justify advisory). Whole-bundle `sign_bundle_command` kept; handoff doc + both skill twins updated.
   Corpus unchanged (no rules/ edits). Issue is a bug type → `verifying` accepted; close at wave end.
+- Retroactive check on the regex blind spot (raised by tier-stagecmd): the four digit-named files carry an
+  IDENTICAL 59-finding set at the Wave-3 base (postB43c), Wave-3 close (w3_final) and Wave-4 base, and
+  `git log 25cce9cdb..99d43f87d` on them is empty — Wave-3's outside-bucket identity checks were blind to
+  those files but nothing moved in them; every Wave-3 identity claim stands.
