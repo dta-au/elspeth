@@ -25,7 +25,8 @@ from typing import Any
 from elspeth_lints.core.allowlist import JudgeVerdict
 from elspeth_lints.core.judge import (
     DEFAULT_JUDGE_MAX_TOKENS,
-    DEFAULT_JUDGE_MODEL,
+    TRANSPORT_OPENROUTER,
+    AgentToolScope,
     JudgeRequest,
     JudgeResponse,
     call_judge,
@@ -116,7 +117,9 @@ class JudgeQualityReport:
     """Aggregate score for a corpus evaluation run."""
 
     corpus_path: Path
-    requested_model_id: str
+    requested_model_id: str | None
+    judge_transport: str
+    judge_tool_mode: str
     min_accuracy: float
     results: tuple[JudgeQualityCaseResult, ...]
 
@@ -145,6 +148,16 @@ class JudgeQualityReport:
     @property
     def failures(self) -> tuple[JudgeQualityCaseResult, ...]:
         return tuple(result for result in self.results if not result.passed)
+
+    @property
+    def served_model_ids(self) -> tuple[str, ...]:
+        """Distinct model ids the transport actually served.
+
+        ``requested_model_id`` is None whenever the caller let ``call_judge``
+        resolve the per-transport default, so the served ids are what names
+        the model that produced this accuracy number.
+        """
+        return tuple(sorted({result.response.model_id for result in self.results if result.response.model_id}))
 
 
 def load_judge_quality_corpus(path: Path) -> tuple[JudgeQualityCase, ...]:
@@ -210,11 +223,28 @@ def evaluate_judge_quality_corpus(
     min_accuracy: float = DEFAULT_JUDGE_QUALITY_MIN_ACCURACY,
     min_cases: int = JUDGE_QUALITY_MIN_CASES,
     max_cases: int = JUDGE_QUALITY_MAX_CASES,
-    model_id: str = DEFAULT_JUDGE_MODEL,
+    model_id: str | None = None,
     max_tokens: int = DEFAULT_JUDGE_MAX_TOKENS,
+    transport: str = TRANSPORT_OPENROUTER,
+    tool_scope: AgentToolScope | None = None,
     judge_caller: JudgeCaller | None = None,
 ) -> JudgeQualityReport:
-    """Call the judge for every case and return the scored report."""
+    """Call the judge for every case and return the scored report.
+
+    ``transport`` selects the provider path, so the gate can measure the same
+    judge a signing run will use. ``model_id`` stays None unless the caller
+    pins one: the OpenRouter slug and the Codex/Agent model ids are different
+    namespaces, and ``call_judge`` owns that per-transport resolution.
+
+    ``tool_scope`` runs the judge tool-augmented, which is how the signing
+    path actually judges: the Codex harness exists so the judge can SEARCH
+    THE TREE rather than rule on one excerpt. A rationale whose load-bearing
+    claim is a control in another function or a pinning test is not decidable
+    from the excerpt at all — the judge policy forbids crediting an
+    unverifiable control-location claim (f0e38838d) — so a blinded run scores
+    the harness's absence, not the judge. Leave it None only to measure the
+    blinded configuration deliberately.
+    """
     _validate_evaluation_config(
         case_count=len(cases),
         min_accuracy=min_accuracy,
@@ -224,13 +254,17 @@ def evaluate_judge_quality_corpus(
     )
 
     def default_judge_caller(request: JudgeRequest) -> JudgeResponse:
-        return call_judge(request, model_id=model_id, max_tokens=max_tokens)
+        return call_judge(request, model_id=model_id, max_tokens=max_tokens, transport=transport, tool_scope=tool_scope)
 
     caller = judge_caller or default_judge_caller
     results = tuple(JudgeQualityCaseResult(case=case, response=caller(case.to_request())) for case in cases)
     return JudgeQualityReport(
         corpus_path=corpus_path,
         requested_model_id=model_id,
+        judge_transport=transport,
+        # Derived from the scope actually passed to the judge, never asserted:
+        # the report must name the configuration that produced the number.
+        judge_tool_mode="blinded" if tool_scope is None else "readonly",
         min_accuracy=min_accuracy,
         results=results,
     )
@@ -242,7 +276,13 @@ def render_judge_quality_report_text(report: JudgeQualityReport) -> str:
         (
             "check-judge-quality: "
             f"corpus={report.corpus_path}, "
-            f"requested_model={report.requested_model_id}, "
+            # Transport and tool mode name WHICH judge produced this number:
+            # a blinded-transport accuracy is not evidence about a
+            # tool-augmented signing judge.
+            f"transport={report.judge_transport}, "
+            f"tools={report.judge_tool_mode}, "
+            f"requested_model={report.requested_model_id or '(transport default)'}, "
+            f"served_model={','.join(report.served_model_ids) or 'unreported'}, "
             f"total={report.total_count}, "
             f"passed={report.passed_count}, "
             f"failed={report.failed_count}, "
@@ -279,10 +319,13 @@ def render_judge_quality_report_json(report: JudgeQualityReport) -> str:
         "accuracy": report.accuracy,
         "corpus_path": report.corpus_path.as_posix(),
         "failed": report.failed_count,
+        "judge_tool_mode": report.judge_tool_mode,
+        "judge_transport": report.judge_transport,
         "min_accuracy": report.min_accuracy,
         "passed": report.passes,
         "passed_count": report.passed_count,
         "requested_model": report.requested_model_id,
+        "served_models": list(report.served_model_ids),
         "total": report.total_count,
         "cases": [
             {

@@ -1171,10 +1171,27 @@ def _build_parser() -> argparse.ArgumentParser:
         default=30,
         help="Maximum accepted corpus size. Default: 30.",
     )
+    _add_judge_transport_arg(check_quality)
+    _add_judge_tools_arg(check_quality)
+    check_quality.add_argument(
+        "--root",
+        type=Path,
+        default=Path("src/elspeth"),
+        help="Source tree the readonly judge may search. Default: src/elspeth.",
+    )
+    check_quality.add_argument(
+        "--allowlist-dir",
+        type=Path,
+        default=Path("config/cicd/enforce_tier_model"),
+        help="Allowlist directory the readonly judge may search alongside --root.",
+    )
     check_quality.add_argument(
         "--model",
         default=None,
-        help="OpenRouter model id. Defaults to the judge module's DEFAULT_JUDGE_MODEL.",
+        help=(
+            "Judge model id in the SELECTED transport's namespace (OpenRouter slug, "
+            "Agent SDK id, or Codex model). Defaults to that transport's own default."
+        ),
     )
     check_quality.add_argument(
         "--max-tokens",
@@ -5771,10 +5788,10 @@ def _run_check_judge_quality(args: argparse.Namespace) -> int:
     """
     from elspeth_lints.core.judge import (
         DEFAULT_JUDGE_MAX_TOKENS,
-        DEFAULT_JUDGE_MODEL,
         JudgeConfigurationError,
         JudgeContractError,
         JudgeTransportError,
+        build_readonly_tool_scope,
     )
     from elspeth_lints.core.judge_quality import (
         JudgeQualityError,
@@ -5784,6 +5801,16 @@ def _run_check_judge_quality(args: argparse.Namespace) -> int:
         render_judge_quality_report_text,
     )
 
+    transport = _CLI_TRANSPORT_CHOICES[args.judge_transport]
+    tool_scope = None
+    if args.judge_tools == "readonly":
+        if transport not in _READONLY_TOOL_TRANSPORTS:
+            sys.stderr.write(_READONLY_TOOLS_TRANSPORT_ERROR)
+            return 2
+        # The same scope the signing paths build, so this gate measures the
+        # judge that will actually sign rather than a blinded stand-in.
+        tool_scope = build_readonly_tool_scope(root=args.root.resolve(), allowlist_dir=args.allowlist_dir.resolve())
+
     try:
         cases = load_judge_quality_corpus(args.corpus)
         report = evaluate_judge_quality_corpus(
@@ -5792,8 +5819,12 @@ def _run_check_judge_quality(args: argparse.Namespace) -> int:
             min_accuracy=args.min_accuracy,
             min_cases=args.min_cases,
             max_cases=args.max_cases,
-            model_id=args.model or DEFAULT_JUDGE_MODEL,
+            # None stays None: call_judge resolves the default BY TRANSPORT,
+            # and the OpenRouter slug is invalid for the Codex/Agent paths.
+            model_id=args.model,
             max_tokens=args.max_tokens or DEFAULT_JUDGE_MAX_TOKENS,
+            transport=transport,
+            tool_scope=tool_scope,
         )
     except JudgeQualityError as exc:
         sys.stderr.write(f"check-judge-quality: cannot run: {exc}\n")
