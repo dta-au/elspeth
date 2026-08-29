@@ -1,7 +1,7 @@
 # Executed Evidence
 
 Evidence was executed on 2026-08-12 AEST in
-`/home/john/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12`, a
+`.claude/worktrees/state-engine-assessment-2026-08-12` (under the main checkout), a
 clean detached worktree at `af79b34040f5ce5fd989aa0d42a1b80ad8366829`.
 The local environment used Python 3.13.1, pytest 9.0.3, SQLite 3.47.1, and
 SQLAlchemy 2.0.45. No full test suite was run.

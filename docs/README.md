@@ -23,19 +23,17 @@ history.
 | Developing plugins | [Data Trust and Error Handling](guides/data-trust-and-error-handling.md), [Plugin Development Guide](../PLUGIN.md), then [Plugin Protocol](contracts/plugin-protocol.md) |
 | Contributing to the codebase | [Contributing](../CONTRIBUTING.md) |
 | Evaluating ELSPETH | [Executive Summary](release/executive-summary.md), [Composer Guide](release/composer-guide.md), [Platform Architecture](release/platform-architecture.md), [Public-Sector Assessment Mapping](release/assessment-mapping.md), and [Audit and Lineage Guarantees](release/guarantees.md) |
-| Reviewing delivery confidence and decisions | [Project Control Report](project-control/project-control-report.md), with the supporting [T&M](project-control/tm-register.md), [RAID](project-control/raid-register.md), and [milestone forecast](project-control/milestone-forecast-register.md) registers |
+| Reviewing delivery confidence and decisions | [Project Control](project-control/README.md) — the control registers are maintained by the project but not published in the repository |
 
 ---
 
 ## Project Control
 
 ELSPETH uses a lean four-document control set, not a full project-management
-method. Start with the [Project Control Report](project-control/project-control-report.md)
-for the current status, exceptions, and asks. Its supporting registers are:
-
-- [T&M Register](project-control/tm-register.md) — resource evidence, allocation, and reconciliation gaps
-- [RAID Register](project-control/raid-register.md) — live material risks, assumptions, issues, and dependencies
-- [Milestone and Forecast Register](project-control/milestone-forecast-register.md) — commitments, forecasts, dependencies, and change
+method: a Project Control Report with supporting T&M, RAID, and milestone and
+forecast registers. They are maintained by the project but are not published
+in this repository; [docs/project-control/README.md](project-control/README.md)
+explains the arrangement and how to request them.
 
 ---
 

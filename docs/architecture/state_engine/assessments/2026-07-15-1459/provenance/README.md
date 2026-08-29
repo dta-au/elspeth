@@ -4,7 +4,7 @@
 
 | Property | Value |
 | --- | --- |
-| Repository | `/home/john/elspeth` |
+| Repository | main checkout (repository root) |
 | Branch | `release/0.7.1` |
 | Assessment HEAD | `0dcd61acaa44082d93ec205683700e798748ee6d` |
 | Map baseline commit | `31a06b16d32c6d94ac98f288f72f55474225730e` |

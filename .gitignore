@@ -44,6 +44,10 @@ scratch/
 # Throwaway repro tests for agent sessions; whole-tree gates subtract
 # gitignored files (tests/helpers/tree_gate.py), so scratch cannot skew them.
 /tests/_scratch/
+# Project-control registers (PCR, T&M, RAID, milestone/forecast) are kept
+# locally in full and are not published; only the folder README is tracked.
+docs/project-control/*
+!docs/project-control/README.md
 # Generated bug-analysis docs and model-authored raw review findings.
 docs/bugs/generated/
 /docs/quality-audit/findings-panel-raw/

@@ -2,7 +2,7 @@
   "schema": "warpline.reverify_worklist.v1",
   "ok": true,
   "query": {
-    "repo": "/home/john/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12",
+    "repo": "~/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12",
     "tool": "warpline_reverify_worklist_get",
     "arguments": {
       "rev_range": "3c782ac3c7efb0550495be38f75800eddffa639a..af79b34040f5ce5fd989aa0d42a1b80ad8366829",

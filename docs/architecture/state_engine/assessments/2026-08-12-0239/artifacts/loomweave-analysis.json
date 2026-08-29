@@ -4,10 +4,10 @@
     "loomweave",
     "worktree",
     "analyze",
-    "/home/john/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12",
+    "~/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12",
     "--no-incremental"
   ],
-  "source_root": "/home/john/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12",
+  "source_root": "~/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12",
   "isolated_store_id": "wt-be4cafe43983c9793bbee6fcb29c125233f6f86bd2aa0fb26127a4614031e3bf",
   "run_id": "1aa9de74-7763-44a5-98e6-07cc88ff0d66",
   "run_status_in_isolated_database": "completed",
