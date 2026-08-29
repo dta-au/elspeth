@@ -396,6 +396,10 @@ async function installCollectorRoutes(page: Page, state: FixtureState): Promise<
           default_mode: "guided",
           banner_dismissed_at: null,
           tutorial_completed_at: null,
+          // The PATCH response echoes the persisted preferences and the store
+          // reads show_advanced straight off it, so it carries the same value
+          // the GET above states (elspeth-ca456d9d8d).
+          show_advanced: false,
           updated_at: "2026-08-25T12:11:00Z",
         },
       });
