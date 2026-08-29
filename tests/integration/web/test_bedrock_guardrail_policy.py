@@ -360,7 +360,7 @@ def test_profiled_prompt_shield_contract_uses_executable_binding_without_mutatin
                     "fingerprint_field": "page_fingerprint",
                     "format": "text",
                     "http": {
-                        "abuse_contact": "policy-test@foundryside.dev",
+                        "abuse_contact": "policy-test@example.gov.au",
                         "scraping_reason": "profile-aware contract integration test",
                     },
                     "schema": {"mode": "observed"},

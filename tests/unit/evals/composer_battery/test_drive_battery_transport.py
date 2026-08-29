@@ -133,7 +133,7 @@ def test_build_client_selects_the_transport_the_base_url_names(origin) -> None:
     _, base = origin
 
     assert isinstance(db.build_client(base), db.UnixSocketClient)
-    assert isinstance(db.build_client("https://elspeth.foundryside.dev"), db.RequestsClient)
+    assert isinstance(db.build_client("https://elspeth.example.gov.au"), db.RequestsClient)
 
 
 def test_a_unix_base_that_is_not_a_socket_is_refused_at_construction(tmp_path: Path) -> None:
@@ -151,7 +151,7 @@ def test_a_unix_base_that_is_not_a_socket_is_refused_at_construction(tmp_path: P
 @pytest.mark.parametrize(
     ("base", "expected"),
     [
-        ("https://elspeth.foundryside.dev", "not a unix:// base URL"),
+        ("https://elspeth.example.gov.au", "not a unix:// base URL"),
         ("unix://run/elspeth/uvicorn.sock", "three slashes"),
         ("unix://", "socket path must be absolute"),
     ],

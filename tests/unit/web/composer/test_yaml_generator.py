@@ -794,7 +794,7 @@ class TestGenerateYaml:
         assert public_options["field_mapping"] == {"customer_blob_id": "customer_id"}
 
     def test_public_yaml_strips_guided_blob_storage_path_without_committed_blob_ref(self) -> None:
-        blob_path = "/home/john/elspeth/data/blobs/session/20b944e3_project_pages.json"
+        blob_path = "/srv/elspeth/data/blobs/session/20b944e3_project_pages.json"
         blob_ref = "20b944e3-fd46-434f-b9a2-4fb508db30f0"
         guided_session = replace(
             GuidedSession.initial(),
@@ -840,7 +840,7 @@ class TestGenerateYaml:
         assert blob_path not in public_yaml
 
     def test_public_yaml_fails_closed_when_reviewed_name_drifts_onto_live_blob_path(self) -> None:
-        blob_path = "/home/john/elspeth/data/blobs/session/renamed.json"
+        blob_path = "/srv/elspeth/data/blobs/session/renamed.json"
         stable_id = "11111111-1111-4111-8111-111111111111"
         guided_session = replace(
             GuidedSession.initial(),
@@ -882,7 +882,7 @@ class TestGenerateYaml:
         ids=["none", "empty", "wrong_type", "noncanonical_uuid"],
     )
     def test_public_yaml_rejects_present_invalid_reviewed_blob_ref(self, invalid_blob_ref: object) -> None:
-        blob_path = "/home/john/elspeth/data/blobs/session/source.json"
+        blob_path = "/srv/elspeth/data/blobs/session/source.json"
         stable_id = "11111111-1111-4111-8111-111111111111"
         guided_session = replace(
             GuidedSession.initial(),
@@ -927,14 +927,14 @@ class TestGenerateYaml:
             {"file": ""},
             {"path": None},
             {"file": 123},
-            {"path": "/home/john/elspeth/data/blobs/foreign/source.json", "file": None},
-            {"path": "/home/john/elspeth/data/blobs/foreign/so\x00urce.json"},
+            {"path": "/srv/elspeth/data/blobs/foreign/source.json", "file": None},
+            {"path": "/srv/elspeth/data/blobs/foreign/so\x00urce.json"},
         ],
         ids=["empty_path", "empty_file", "none_path", "wrong_type_file", "valid_path_invalid_file", "nul_path"],
     )
     def test_public_yaml_rejects_invalid_reviewed_path_carriers(self, invalid_carriers: dict[str, object]) -> None:
         stable_id = "11111111-1111-4111-8111-111111111111"
-        live_path = "/home/john/elspeth/data/blobs/foreign/source.json"
+        live_path = "/srv/elspeth/data/blobs/foreign/source.json"
         snapshot_options = {**invalid_carriers, "blob_ref": stable_id}
         guided_session = replace(
             GuidedSession.initial(),
@@ -974,8 +974,8 @@ class TestGenerateYaml:
 
     def test_public_yaml_accepts_two_valid_reviewed_path_carriers(self) -> None:
         stable_id = "11111111-1111-4111-8111-111111111111"
-        path = "/home/john/elspeth/data/blobs/source.json"
-        file = "/home/john/elspeth/data/blobs/source-alias.json"
+        path = "/srv/elspeth/data/blobs/source.json"
+        file = "/srv/elspeth/data/blobs/source-alias.json"
         guided_session = replace(
             GuidedSession.initial(),
             source_order=(stable_id,),
@@ -1016,23 +1016,23 @@ class TestGenerateYaml:
         ("reviewed_carriers", "live_options"),
         [
             (
-                {"path": " /home/john/elspeth/data/blobs/bogus.json "},
-                {"path": "/home/john/elspeth/data/blobs/live.json"},
+                {"path": " /srv/elspeth/data/blobs/bogus.json "},
+                {"path": "/srv/elspeth/data/blobs/live.json"},
             ),
-            ({"path": " /home/john/elspeth/data/blobs/bogus.json "}, {"schema": {"mode": "observed"}}),
+            ({"path": " /srv/elspeth/data/blobs/bogus.json "}, {"schema": {"mode": "observed"}}),
             (
-                {"path": "/home/john/elspeth/data/blobs/source.json"},
+                {"path": "/srv/elspeth/data/blobs/source.json"},
                 {
-                    "path": "/home/john/elspeth/data/blobs/source.json",
-                    "file": "/home/john/elspeth/data/blobs/secret.json",
+                    "path": "/srv/elspeth/data/blobs/source.json",
+                    "file": "/srv/elspeth/data/blobs/secret.json",
                 },
             ),
             (
                 {
-                    "path": "/home/john/elspeth/data/blobs/source.json",
-                    "file": "/home/john/elspeth/data/blobs/source-alias.json",
+                    "path": "/srv/elspeth/data/blobs/source.json",
+                    "file": "/srv/elspeth/data/blobs/source-alias.json",
                 },
-                {"path": "/home/john/elspeth/data/blobs/source.json"},
+                {"path": "/srv/elspeth/data/blobs/source.json"},
             ),
         ],
         ids=["mismatched_path", "missing_live_carrier", "extra_live_carrier", "missing_live_reviewed_carrier"],
@@ -1081,7 +1081,7 @@ class TestGenerateYaml:
 
     def test_public_yaml_rejects_reviewed_blob_ref_without_string_path_carrier(self) -> None:
         stable_id = "11111111-1111-4111-8111-111111111111"
-        live_path = "/home/john/elspeth/data/blobs/foreign/source.json"
+        live_path = "/srv/elspeth/data/blobs/foreign/source.json"
         guided_session = replace(
             GuidedSession.initial(),
             source_order=(stable_id,),
@@ -1652,7 +1652,7 @@ class TestGuidedTerminalProofDirectionSplit:
     def _guided_state(self, terminal: object) -> CompositionState:
         from elspeth.web.composer.guided.state_machine import GuidedSession as _GuidedSession
 
-        storage_path = f"/home/john/elspeth/data/blobs/session/{self._BLOB_REF}.csv"
+        storage_path = f"/srv/elspeth/data/blobs/session/{self._BLOB_REF}.csv"
         guided_session = replace(
             _GuidedSession.initial(),
             source_order=(self._STABLE_ID,),

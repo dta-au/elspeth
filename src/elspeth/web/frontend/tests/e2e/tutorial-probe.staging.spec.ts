@@ -5,8 +5,8 @@
 //
 // Run: STAGING_USERNAME="${STAGING_USERNAME:?set STAGING_USERNAME in the environment}" \
 //      STAGING_PASSWORD="${STAGING_PASSWORD:?set STAGING_PASSWORD in the environment}" \
-//      STAGING_BASE_URL=https://elspeth.foundryside.dev \
-//      PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
+//      STAGING_BASE_URL=https://elspeth.example.gov.au \
+//      PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.example.gov.au \
 //      npx playwright test --config=playwright.staging.config.ts tutorial-probe
 
 import { mkdirSync } from "node:fs";

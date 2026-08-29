@@ -49,7 +49,7 @@ from scripts.eval._backfill_lib import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EVAL_ROOT = REPO_ROOT / "evals/2026-05-03-composer"
 
-# The staging deploy elspeth.foundryside.dev runs out of this checkout
+# The staging deploy elspeth.example.gov.au runs out of this checkout
 # (per memory: staging_deployment.md) and writes sink outputs to
 # ``data/outputs/`` relative to repo root. The relative paths in each
 # scenario's final_yaml.json (e.g. ``outputs/q3_*.csv``) are resolved

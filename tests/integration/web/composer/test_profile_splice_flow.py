@@ -133,7 +133,7 @@ def _reviewed_state() -> CompositionState:
         "fingerprint_field": "page_fingerprint",
         "format": "text",
         "http": {
-            "abuse_contact": "profile-splice@foundryside.dev",
+            "abuse_contact": "profile-splice@example.gov.au",
             "scraping_reason": "profile splice integration contract",
         },
         "schema": {"mode": "observed"},

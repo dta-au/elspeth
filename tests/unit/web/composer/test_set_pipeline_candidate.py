@@ -959,7 +959,7 @@ def test_guided_tutorial_shape_short_form_review_builds_a_valid_candidate(tmp_pa
                     "url_field": "url",
                     "content_field": "page_content",
                     "fingerprint_field": "page_fingerprint",
-                    "http": {"abuse_contact": "ops@foundryside.dev", "scraping_reason": "Tutorial demo"},
+                    "http": {"abuse_contact": "ops@example.gov.au", "scraping_reason": "Tutorial demo"},
                 },
             },
             {

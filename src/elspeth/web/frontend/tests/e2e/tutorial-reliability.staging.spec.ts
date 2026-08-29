@@ -1,6 +1,6 @@
 // Tutorial reliability battery (non-mocked staging spec).
 //
-// Drives the REAL first-run composer tutorial against elspeth.foundryside.dev,
+// Drives the REAL first-run composer tutorial against elspeth.example.gov.au,
 // resets between every run, grades each run on four dimensions (a/b/c/d), does a
 // real-system re-run for dim (b), and writes one JSON RunRecord per run under
 // tests/e2e/.harness-results/<batch_id>/run-NN.json (gitignored).

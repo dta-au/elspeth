@@ -448,14 +448,14 @@ describe("SchemaFormTurn", () => {
       const { container } = render(
         <SchemaFormTurn
           payload={pluginPayload([field({ name: "path", kind: "text", required: true })], {
-            path: "/home/john/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json",
+            path: "/srv/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json",
           })}
           onSubmit={vi.fn()}
           isTutorial
         />,
       );
       expect(screen.getByText("project_pages.json")).toBeInTheDocument();
-      expect(screen.queryByText(/\/home\/john\/elspeth\/data\/blobs/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/\/srv\/elspeth\/data\/blobs/)).not.toBeInTheDocument();
       expect(container.querySelector(".guided-schema-input")).toBeNull();
     });
 
@@ -464,7 +464,7 @@ describe("SchemaFormTurn", () => {
       render(
         <SchemaFormTurn
           payload={pluginPayload([field({ name: "path", kind: "text", required: true })], {
-            path: "/home/john/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json",
+            path: "/srv/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json",
           })}
           onSubmit={vi.fn()}
         />,
@@ -474,7 +474,7 @@ describe("SchemaFormTurn", () => {
       // match on the base label.
       const input = screen.getByLabelText(/path/) as HTMLInputElement;
       expect(input.value).toBe(
-        "/home/john/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json",
+        "/srv/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json",
       );
       expect(input).not.toHaveAttribute("readonly");
     });
@@ -484,7 +484,7 @@ describe("SchemaFormTurn", () => {
       // receive the real storage_path so the run can read the blob.
       const onSubmit = vi.fn();
       const realPath =
-        "/home/john/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json";
+        "/srv/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json";
       render(
         <SchemaFormTurn
           payload={pluginPayload([field({ name: "path", kind: "text", required: true })], {

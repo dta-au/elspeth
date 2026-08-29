@@ -655,7 +655,7 @@ describe("RunOutputsPanel", () => {
         fileArtifact({
           sink_node_id: "final_report",
           path_or_uri:
-            "/home/john/.local/share/elspeth/data/blobs/session-1/blob-abc_report.json",
+            "/var/lib/elspeth/data/blobs/session-1/blob-abc_report.json",
           storage_kind: "blob",
         }),
       ]),
@@ -668,7 +668,7 @@ describe("RunOutputsPanel", () => {
     );
     expect(
       screen.queryByText(
-        "/home/john/.local/share/elspeth/data/blobs/session-1/blob-abc_report.json",
+        "/var/lib/elspeth/data/blobs/session-1/blob-abc_report.json",
       ),
     ).not.toBeInTheDocument();
   });
@@ -679,7 +679,7 @@ describe("RunOutputsPanel", () => {
         fileArtifact({
           sink_node_id: "final_report",
           path_or_uri:
-            "/home/john/.local/share/elspeth/data/payloads/ab/abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+            "/var/lib/elspeth/data/payloads/ab/abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
           storage_kind: "payload",
         }),
       ]),
@@ -692,7 +692,7 @@ describe("RunOutputsPanel", () => {
     );
     expect(
       screen.queryByText(
-        "/home/john/.local/share/elspeth/data/payloads/ab/abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+        "/var/lib/elspeth/data/payloads/ab/abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
       ),
     ).not.toBeInTheDocument();
   });

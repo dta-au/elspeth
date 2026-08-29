@@ -42,7 +42,7 @@ python -m pytest --collect-only -q
 Use the repository virtualenv for local checks:
 
 ```bash
-/home/john/elspeth/.venv/bin/python -m pytest
+/srv/elspeth/.venv/bin/python -m pytest
 ```
 
 ## Suite Layout

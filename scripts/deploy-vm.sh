@@ -6,7 +6,7 @@
 # image that will be used for the next invocation.
 #
 # This is not the source-checkout systemd/Caddy deployment used by
-# elspeth.foundryside.dev.
+# elspeth.example.gov.au.
 #
 # Usage:
 #   ./deploy-vm.sh <image-tag>
