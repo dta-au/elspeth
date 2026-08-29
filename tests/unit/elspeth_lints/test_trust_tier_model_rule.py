@@ -739,6 +739,45 @@ class TestR4BroadExcept:
         r4_findings = [f for f in findings if f.rule_id == "R4"]
         assert len(r4_findings) == 1
 
+    def test_broad_except_with_explicit_error_result_return_is_not_r4(self) -> None:
+        """elspeth-8d46db34ff D3: R4 must honour a non-default return like R6 does."""
+        source = dedent("""
+            def probe():
+                try:
+                    run()
+                except Exception as exc:
+                    return ContractCheck("n", False, sanitize_error(exc))
+        """)
+        findings = parse_and_visit(source)
+
+        assert [f for f in findings if f.rule_id == "R4"] == []
+
+    def test_broad_except_returning_default_still_fires_r4(self) -> None:
+        """Adversarial twin for D3: ``return None`` is still a swallow."""
+        source = dedent("""
+            def probe():
+                try:
+                    run()
+                except Exception:
+                    return None
+        """)
+        findings = parse_and_visit(source)
+
+        assert len([f for f in findings if f.rule_id == "R4"]) == 1
+
+    def test_broad_except_returning_empty_list_still_fires_r4(self) -> None:
+        """Adversarial twin for D3: an empty container is a silent default."""
+        source = dedent("""
+            def probe():
+                try:
+                    run()
+                except Exception:
+                    return []
+        """)
+        findings = parse_and_visit(source)
+
+        assert len([f for f in findings if f.rule_id == "R4"]) == 1
+
 
 # =============================================================================
 # R6: Silent specific exception handling
@@ -829,6 +868,110 @@ class TestR6SilentExcept:
 
         r6_findings = [f for f in findings if f.rule_id == "R6"]
         assert len(r6_findings) == 1
+
+    def test_error_entry_appended_to_accumulator_is_explicit(self) -> None:
+        """elspeth-8d46db34ff D4: recording a closed-vocabulary error is an outcome."""
+        source = dedent("""
+            def validate(entries):
+                try:
+                    run()
+                except ValueError as exc:
+                    entries.append(ValidationEntry(error_code="bad_thing", blocking=True))
+        """)
+        findings = parse_and_visit(source)
+
+        assert [f for f in findings if f.rule_id == "R6"] == []
+
+    def test_error_entry_appended_via_local_then_append_is_explicit(self) -> None:
+        source = dedent("""
+            def validate(entries):
+                try:
+                    run()
+                except ValueError as exc:
+                    entry = ValidationEntry(error_code="bad_thing", blocking=True)
+                    entries.append(entry)
+        """)
+        findings = parse_and_visit(source)
+
+        assert [f for f in findings if f.rule_id == "R6"] == []
+
+    def test_private_factory_appended_to_errors_accumulator_is_explicit(self) -> None:
+        """The live composer shape: ``errors.append(_err(component, str(exc), "high", code))``."""
+        source = dedent("""
+            def validate(errors):
+                try:
+                    run()
+                except ValueError as exc:
+                    errors.append(_err("node:x", str(exc), "high", "scope_name_invalid"))
+        """)
+        findings = parse_and_visit(source)
+
+        assert [f for f in findings if f.rule_id == "R6"] == []
+
+    def test_private_factory_appended_to_self_diagnostics_is_explicit(self) -> None:
+        source = dedent("""
+            class Checker:
+                def validate(self):
+                    try:
+                        run()
+                    except ExpressionEvaluationError:
+                        self._diagnostics.append(_blocking_diagnostic(code="gate_mismatch", message="m"))
+        """)
+        findings = parse_and_visit(source)
+
+        assert [f for f in findings if f.rule_id == "R6"] == []
+
+    def test_builtin_call_appended_to_errors_accumulator_still_fires_r6(self) -> None:
+        """Adversarial twin: ``errors.append(str(exc))`` records no closed-vocabulary entry."""
+        source = dedent("""
+            def validate(errors):
+                try:
+                    run()
+                except ValueError as exc:
+                    errors.append(str(exc))
+        """)
+        findings = parse_and_visit(source)
+
+        assert len([f for f in findings if f.rule_id == "R6"]) == 1
+
+    def test_private_factory_appended_to_unknown_list_still_fires_r6(self) -> None:
+        """Adversarial twin: the receiver must be a validator accumulator, not any list."""
+        source = dedent("""
+            def validate(seen):
+                try:
+                    run()
+                except ValueError as exc:
+                    seen.append(_normalise(exc))
+        """)
+        findings = parse_and_visit(source)
+
+        assert len([f for f in findings if f.rule_id == "R6"]) == 1
+
+    def test_append_without_error_code_still_fires_r6(self) -> None:
+        """Adversarial twin for D4: appending to a log list is still a swallow."""
+        source = dedent("""
+            def validate(seen):
+                try:
+                    run()
+                except ValueError as exc:
+                    seen.append(str(exc))
+        """)
+        findings = parse_and_visit(source)
+
+        assert len([f for f in findings if f.rule_id == "R6"]) == 1
+
+    def test_error_entry_constructed_but_not_recorded_still_fires_r6(self) -> None:
+        """Adversarial twin for D4: constructing an entry and dropping it is not an outcome."""
+        source = dedent("""
+            def validate(entries):
+                try:
+                    run()
+                except ValueError as exc:
+                    ValidationEntry(error_code="bad_thing", blocking=True)
+        """)
+        findings = parse_and_visit(source)
+
+        assert len([f for f in findings if f.rule_id == "R6"]) == 1
 
 
 # =============================================================================
@@ -1481,6 +1624,112 @@ class TestR5IsinstanceClassification:
         """)
 
         assert len(self._r5_findings(source)) == 2
+
+
+class TestR5PostInitExemptionAliases:
+    """elspeth-8d46db34ff D2: the frozen-dataclass ``__post_init__`` exemption follows self fields."""
+
+    @staticmethod
+    def _r5(source: str) -> list[Finding]:
+        return [f for f in parse_and_visit(dedent(source)) if f.rule_id == "R5"]
+
+    def test_loop_variable_over_self_field_is_exempt(self) -> None:
+        assert (
+            self._r5("""
+            from dataclasses import dataclass
+
+            @dataclass(frozen=True)
+            class Message:
+                content: tuple
+
+                def __post_init__(self):
+                    for part in self.content:
+                        if not isinstance(part, (TextPart, ImagePart)):
+                            raise TypeError("bad part")
+        """)
+            == []
+        )
+
+    def test_loop_variable_over_non_self_iterable_still_fires(self) -> None:
+        findings = self._r5("""
+            from dataclasses import dataclass
+
+            @dataclass(frozen=True)
+            class Message:
+                content: tuple
+
+                def __post_init__(self):
+                    for part in load_parts():
+                        if not isinstance(part, (TextPart, ImagePart)):
+                            raise TypeError("bad part")
+        """)
+        assert len(findings) == 1
+
+    def test_private_validator_return_over_self_field_is_exempt(self) -> None:
+        assert (
+            self._r5("""
+            from dataclasses import dataclass
+
+            @dataclass(frozen=True)
+            class Effect:
+                row: object
+
+                def __post_init__(self):
+                    frozen_row = _freeze_canonical_row_value(self.row, "row")
+                    if not isinstance(frozen_row, Mapping):
+                        raise TypeError("bad row")
+        """)
+            == []
+        )
+
+    def test_public_callee_return_over_self_field_still_fires(self) -> None:
+        """Only module-private validators are trusted to return the field's own value."""
+        findings = self._r5("""
+            from dataclasses import dataclass
+
+            @dataclass(frozen=True)
+            class Effect:
+                row: object
+
+                def __post_init__(self):
+                    frozen_row = freeze(self.row, "row")
+                    if not isinstance(frozen_row, Mapping):
+                        raise TypeError("bad row")
+        """)
+        assert len(findings) == 1
+
+    def test_private_callee_over_non_self_argument_still_fires(self) -> None:
+        findings = self._r5("""
+            from dataclasses import dataclass
+
+            @dataclass(frozen=True)
+            class Effect:
+                row: object
+
+                def __post_init__(self):
+                    frozen_row = _freeze_canonical_row_value(load_row(), "row")
+                    if not isinstance(frozen_row, Mapping):
+                        raise TypeError("bad row")
+        """)
+        assert len(findings) == 1
+
+    def test_loop_variable_over_aliased_self_field_is_exempt(self) -> None:
+        assert (
+            self._r5("""
+            from dataclasses import dataclass
+
+            @dataclass(frozen=True)
+            class Message:
+                content: tuple
+
+                def __post_init__(self):
+                    parts = self.content
+                    for part in parts:
+                        if not isinstance(part, TextPart):
+                            raise TypeError("bad part")
+        """)
+            == []
+        )
 
 
 # =============================================================================

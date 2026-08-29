@@ -1506,10 +1506,7 @@ def _assert_planner_call_matches_manifest(
     invariant=(
         "returns a field-name-to-value mapping merged from vars() and pydantic __pydantic_extra__ "
         "when derivable, or None when the value is not a Mapping and has no accessible __dict__; "
-        "never raises (TypeError from vars() and AttributeError from the extras probe are both caught). "
-        "The isinstance(extra, Mapping) site is reached only through object.__getattribute__(value, ...), "
-        "a call that launders the suppression root, so it stays outside this decorator's suppressed scope "
-        "by the analyzer's own model even though extra is semantically still value-derived"
+        "never raises (TypeError from vars() and AttributeError from the extras probe are both caught)"
     ),
 )
 def _provider_fields(value: Any) -> Mapping[str, Any] | None:

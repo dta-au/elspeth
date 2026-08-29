@@ -8,6 +8,31 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — five tier_model precision classes are FIXED (elspeth-8d46db34ff);
+  do not rationalise or reshape code around them any more, and do not expect the
+  pre-fix finding sets.** (D1) A name bound in a `try` body now survives the
+  post-try derived-name join when EVERY handler ends in an unconditional
+  `raise`/`return`/`break`/`continue` — `try: data = json.loads(resp.content)
+  except ... as e: raise X from e` keeps `data` rooted at `source_param`; a
+  single falling-through handler still drops it. (D2) The frozen-dataclass
+  `__post_init__` R5 exemption follows `for part in self.<field>` loop
+  variables and locals bound to a MODULE-PRIVATE call over a self field
+  (`frozen = _freeze(self.row, ...)`); a public callee (`freeze(self.row)`) is
+  NOT trusted. (D3) R4 uses the same "explicit outcome" predicate as R6
+  (`_handler_is_silent`): a non-default `return`/`yield`, a `raise`, a routed
+  `TransformResult.error`, or a recorded error entry clears a broad handler;
+  `return None`/`return []` still fire. (D4) Recording a CONSTRUCTED record
+  into a validator accumulator is explicit — receiver name in
+  `errors/warnings/diagnostics/entries/failures/issues/problems` (bare or
+  `self._errors`), value a non-builtin call or a handler-local bound to one, or
+  any `append/add` of a call carrying `error_code=`; `errors.append(str(exc))`
+  and `seen.append(_normalise(exc))` still fire. (D5) `subject_is_rooted`
+  roots `enumerate/zip/sorted/reversed/list/tuple/iter(<rooted arg>)` at the
+  argument — a closed list; `normalise(payload)` still roots at `normalise`.
+  Measured allowlist-disabled @ae34b48b3: 2573 → 2484, 89 removed, 0 added
+  (R1 14 / R4 24 / R5 36 / R6 15). The re-stage will find signed entries for
+  those 89 sites gone → `stale_delete`, and per-file caps in
+  `config/cicd/enforce_tier_model/*.yaml` ratchet down (chat_solver 31→13).
 - **2026-08-29 — the tier_model `_R5_NAMED_BOUNDARY_CONTEXTS` exemption map is
   MEASURED now: every entry must resolve to exactly ONE live definition, and a
   moved function is NOT successor-included.** Before elspeth-0bd4fb6042 the

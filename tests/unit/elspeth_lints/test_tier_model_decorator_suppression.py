@@ -685,6 +685,109 @@ class TestSuppressionNegative:
 # =============================================================================
 
 
+class TestDerivedNameTrailPrecision:
+    """elspeth-8d46db34ff D1/D5: the derived-name trail survives raising handlers and passthrough builtins."""
+
+    @staticmethod
+    def _boundary(body: str) -> str:
+        header = dedent("""
+            from elspeth.contracts import trust_boundary
+
+            @trust_boundary(
+                tier=3,
+                source="external payload",
+                source_param="payload",
+                suppresses=("R1", "R5"),
+                invariant="raises on malformed payload",
+            )
+            def handler(payload):
+        """)
+        return header + indent(dedent(body).strip(), "    ") + "\n"
+
+    def test_name_bound_in_try_body_survives_join_when_every_handler_raises(self) -> None:
+        source = self._boundary("""
+            try:
+                data = json.loads(payload.content)
+            except (ValueError, TypeError) as exc:
+                raise LLMClientError("bad") from exc
+            return data.get("x")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_name_bound_in_try_body_survives_join_when_handler_ends_in_guarded_raise(self) -> None:
+        source = self._boundary("""
+            try:
+                data = json.loads(payload.content)
+            except ValueError as exc:
+                if strict:
+                    raise LLMClientError("bad") from exc
+                else:
+                    return None
+            return data.get("x")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_name_rebound_in_falling_through_handler_does_not_survive_join(self) -> None:
+        source = self._boundary("""
+            try:
+                data = json.loads(payload.content)
+            except (ValueError, TypeError):
+                data = other()
+            return data.get("x")
+        """)
+        r1 = _findings_by_rule(_findings(source), "R1")
+        assert len(r1) == 1
+        assert 'data.get("x")' in r1[0].code_snippet
+
+    def test_name_bound_in_try_body_does_not_survive_when_one_handler_falls_through(self) -> None:
+        source = self._boundary("""
+            try:
+                data = json.loads(payload.content)
+            except ValueError as exc:
+                raise LLMClientError("bad") from exc
+            except TypeError:
+                data = other()
+            return data.get("x")
+        """)
+        assert len(_findings_by_rule(_findings(source), "R1")) == 1
+
+    def test_enumerate_over_source_param_keeps_loop_item_derived(self) -> None:
+        source = self._boundary("""
+            for index, item in enumerate(payload):
+                if isinstance(item, Mapping):
+                    item.get("name")
+        """)
+        findings = _findings(source)
+        assert _findings_by_rule(findings, "R5") == []
+        assert _findings_by_rule(findings, "R1") == []
+
+    def test_zip_and_sorted_over_source_param_keep_loop_item_derived(self) -> None:
+        source = self._boundary("""
+            for left, right in zip(payload, sorted(payload)):
+                left.get("a")
+                right.get("b")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_enumerate_over_unrelated_iterable_still_fires(self) -> None:
+        source = self._boundary("""
+            for index, item in enumerate(other_list()):
+                if isinstance(item, Mapping):
+                    item.get("name")
+        """)
+        findings = _findings(source)
+        assert len(_findings_by_rule(findings, "R5")) == 1
+        assert len(_findings_by_rule(findings, "R1")) == 1
+
+    def test_non_passthrough_call_over_source_param_still_does_not_root(self) -> None:
+        """The documented rule stands: ``foo(payload)`` is rooted at ``foo``."""
+        source = self._boundary("""
+            for item in normalise(payload):
+                item.get("name")
+        """)
+        assert len(_findings_by_rule(_findings(source), "R1")) == 1
+
+
 class TestDecoratorDiagnostics:
     """Malformed decorators emit their own findings and do not suppress."""
 
