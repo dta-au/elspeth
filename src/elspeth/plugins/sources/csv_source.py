@@ -99,7 +99,7 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ffb1e0e20cdf780d"
+    source_file_hash: str | None = "sha256:5e8324e0e8280e22"
     # Structural observed-cell fact (elspeth-e6e552ce34): csv.reader yields
     # strings, and observed schemas preserve parsed cells untouched (module
     # docstring), so under mode: observed EVERY emitted cell is str by

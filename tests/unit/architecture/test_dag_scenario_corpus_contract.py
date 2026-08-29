@@ -642,7 +642,18 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "68837dc46eb087e82e00191d178f05781ab9f0a5016
 # scripts/cicd/plugin_hash.py::compute_source_file_hash); the manifest's 15
 # literal pins and reopen-resume's resumed_full_projection_sha256 were re-pinned
 # first, then this digest. No oracle_freeze snapshot moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "2de4dc3cd4dd5bc128db2a0f7b4512f8a2360c699219489491e35ba257080f36"
+# Rotated 2026-08-30 for the composer-detail-level wave (elspeth-9cca900d41):
+# a PLUGIN PROVENANCE rotation, not a semantic one. csv_source.py gained
+# composer_tier json_schema_extra annotations on delimiter/encoding/skip_rows
+# (a knob-schema/composer-surface change, no CSVSource behavior moved), so its
+# source_file_hash moved (ffb1e0e20cdf780d -> 5e8324e0e8280e22, recomputed with
+# scripts/cicd/plugin_hash.py::compute_source_file_hash); the manifest's 15
+# literal pins were re-pinned first, then reopen-resume's
+# resumed_full_projection_sha256 (339130f89f7e72d6f6276b98f62a945081eac3ea139dd04041e126a1f97c6a22
+# -> 73c47a4d86c6606e80c405cdb0a7039921c60b255ced886ed5d390384b0822ee, captured
+# from test_checkpoint_reopen_resume_has_exact_restart_evidence's own failure
+# output), then this digest. No oracle_freeze snapshot moved.
+EXPECTED_CASE_REGISTRY_SHA256 = "03f48bce2f0d53d337f14d707c4a9556d06d59d93fcf58ff7f9895ad3d21f5ed"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
