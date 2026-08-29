@@ -26,16 +26,13 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 
 ## Gotchas
 
-- **STOP — read [CONTRIBUTING.md § Whole-tree gates and conventions you will hit](CONTRIBUTING.md#whole-tree-gates-and-conventions-you-will-hit)
+- **STOP — read [CONTRIBUTING.md § Whole-tree gates](CONTRIBUTING.md#whole-tree-gates-and-conventions-you-will-hit)
   BEFORE writing code. This is not optional.** Whole-tree AST gates pin the
   EXACT set of dynamic-attribute sites, masquerade sites (tests included),
   wire-shape templates, and output bytes; a locally green scoped run proves
   nothing about them, and one careless `getattr` turns the branch red for
-  every sibling (this has happened — 7201beeb7). The rules live there; the
-  dated incident log behind them is
-  [docs/agents/recent-code-hints.md](docs/agents/recent-code-hints.md). When
-  you land a new convention or whole-tree trap, add the rule to CONTRIBUTING
-  and the dated item to the appendix in the same commit.
+  every sibling (this has happened — 7201beeb7). Dated incident log:
+  [docs/agents/recent-code-hints.md](docs/agents/recent-code-hints.md).
 - Scoped test runs miss cross-cutting gates — run the full `pytest tests/`
   before merging.
 - `elspeth-lints check` requires an explicit `--rules` selection and exits 2
