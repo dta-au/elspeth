@@ -532,7 +532,7 @@ export function ArgumentFields({ args }: ArgumentFieldsProps) {
   if (fields.length === 0) {
     return (
       <p className="tool-call-arg-empty" data-testid="proposal-arg-fields">
-        This tool call takes no arguments.
+        No settings change in this step.
       </p>
     );
   }

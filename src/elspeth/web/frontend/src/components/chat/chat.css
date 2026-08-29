@@ -1782,6 +1782,15 @@
   color: var(--color-text-muted);
 }
 
+.tool-call-ribbon-text {
+  min-width: 0;
+}
+.tool-call-ribbon-name {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--color-text-secondary);
+}
+
 /* Tool-call info trigger + tooltip.
    The trigger replaces the previous decorative .tool-call-ribbon-icon span:
    it's a real <button> so keyboard users can focus it. Tooltip body shows

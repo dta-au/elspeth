@@ -312,7 +312,11 @@ describe("MessageBubble", () => {
         />,
       );
 
-      expect(screen.getByText("Proposed: set_pipeline")).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "Proposed: Replaces the entire pipeline configuration in a single operation.",
+        ),
+      ).toBeInTheDocument();
       await user.click(
         screen.getByRole("button", {
           name: `Accept proposal: ${proposal.summary}`,

@@ -9,6 +9,7 @@ import { useShareableReviewStore } from "@/stores/shareableReviewStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
 import {
   COMPLETION_BLOCKED_VALIDATION_READINESS,
   INVALID_VALIDATION_READINESS,
@@ -65,6 +66,7 @@ describe("CompletionBar", () => {
     });
     useShareableReviewStore.getState().reset();
     resetStore(useInterpretationEventsStore);
+    resetStore(usePreferencesStore);
   });
 
   it("keeps the horizontal compact override scoped to the workspace action bar", () => {
@@ -96,7 +98,24 @@ describe("CompletionBar", () => {
     expect(container.firstChild).toBeNull();
   });
 
+  it("hides Import YAML with the default detail level — exactly two completion gestures", () => {
+    useSessionStore.setState({ activeSessionId: "sess-1" });
+    useExecutionStore.setState({
+      validationResult: _validValidation(),
+      isExecuting: false,
+      progress: null,
+      execute: vi.fn(),
+    });
+    render(<CompletionBar />);
+    const bar = screen.getByTestId("completion-bar");
+    expect(within(bar).getAllByRole("button").map((b) => b.textContent)).toEqual([
+      "Save for review",
+      "Run pipeline",
+    ]);
+  });
+
   it("renders the three verbs as DIRECT children with Run last (elspeth-929fc5d4a7; recut 2026-08-15)", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
@@ -249,6 +268,7 @@ describe("CompletionBar", () => {
   // nor the validation axis may disable it. Both extremes of each axis are
   // pinned here.
   it("Import-YAML button ignores validation and content state", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     // Case 1: empty pipeline (beforeEach leaves compositionState null), no
     // validation run yet (validationResult === null).
     useSessionStore.setState({ activeSessionId: "sess-1" });
@@ -316,6 +336,7 @@ describe("CompletionBar", () => {
   });
 
   it("clicking Import-YAML dispatches the open-import-modal event", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useSessionStore.setState({
       activeSessionId: "sess-1",
       compositionState: _nonEmptyComposition(),

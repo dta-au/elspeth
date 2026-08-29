@@ -1,7 +1,12 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ProgressView } from "./ProgressView";
 import { useWebSocket } from "@/hooks/useWebSocket";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { useSessionStore } from "@/stores/sessionStore";
+import { resetStore } from "@/test/store-helpers";
+import { makeComposition } from "@/test/composerFixtures";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 
 vi.mock("@/hooks/useWebSocket", () => ({
   useWebSocket: vi.fn(),
@@ -29,6 +34,8 @@ function progressFixture(overrides: Record<string, unknown> = {}) {
 describe("ProgressView", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetStore(usePreferencesStore);
+    resetStore(useSessionStore);
   });
 
   it("renders live progress with explicit source and token units", () => {
@@ -171,8 +178,9 @@ describe("ProgressView", () => {
     expect(screen.getAllByText("9,324")).toHaveLength(2);
     expect(screen.getByText("Tokens terminal")).toBeInTheDocument();
     expect(screen.getByText("Tokens structural")).toBeInTheDocument();
-    expect(screen.getByText("Audit closure")).toBeInTheDocument();
-    expect(screen.getByText("closed")).toBeInTheDocument();
+    expect(
+      screen.getByText("Audit closure: complete — every row is accounted for."),
+    ).toBeInTheDocument();
   });
 
   // M07 (WCAG 4.1.3): a single polite live region announces the run phase for
@@ -419,5 +427,71 @@ describe("ProgressView", () => {
     render(<ProgressView />);
 
     expect(screen.queryByText("Running — counts so far")).not.toBeInTheDocument();
+  });
+});
+
+function mountProgress(overrides: Record<string, unknown>) {
+  (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
+    activeRunId: "run-1",
+    wsDisconnected: false,
+    progress: progressFixture(overrides),
+  });
+  return render(<ProgressView />);
+}
+
+function accounting(integrity: Partial<{ closure: string; missing_terminal_outcomes: number; duplicate_terminal_outcomes: number }>) {
+  return {
+    source: { rows_processed: 1, rows_rejected: 0, rows_read: 1 },
+    tokens: { emitted: 4, terminal: 4, succeeded: 4, failed: 0, structural: 0, pending: 0, abandoned: 0 },
+    routing: { routed_success: 0, routed_failure: 0, quarantined: 0, discarded: 0 },
+    integrity: { closure: "closed", missing_terminal_outcomes: 0, duplicate_terminal_outcomes: 0, ...integrity },
+  };
+}
+
+describe("detail level (elspeth-05a240b82a)", () => {
+  beforeEach(() => {
+    resetStore(usePreferencesStore);
+    useSessionStore.setState({ compositionState: null } as never);
+  });
+
+  it("keeps the closure verdict visible and collapses the six-cell grid by default", () => {
+    const { container } = mountProgress({ status: "completed", accounting: accounting({}) });
+    expect(screen.getByText("Audit closure: complete — every row is accounted for.")).toBeInTheDocument();
+    const detail = screen.getByText("Accounting detail").closest("details") as HTMLElement;
+    expect(detail).not.toBeNull();
+    expect(detail).not.toHaveAttribute("open");
+    expect(within(detail).getByText("Tokens emitted")).toBeInTheDocument();
+    expectNoIdentifiersInDefaultDom(container);
+  });
+
+  it("opens the grid when show_advanced is on, and keeps integrity warnings out of the disclosure", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    mountProgress({ status: "completed", accounting: accounting({ closure: "open", missing_terminal_outcomes: 2 }) });
+    expect(screen.getByText("Accounting detail").closest("details")).toHaveAttribute("open");
+    expect(screen.getByText("Missing terminal").closest("details")).toBeNull();
+  });
+
+  it("glosses quarantined rows", () => {
+    mountProgress({ status: "completed", tokens_quarantined: 3 });
+    expect(screen.getByText("3 quarantined", { selector: "span" })).toHaveAttribute(
+      "title",
+      "Quarantined rows are kept in the audit trail but excluded from the output.",
+    );
+  });
+
+  it("summarises the recent-errors feed to a count and resolves node ids in the disclosure", () => {
+    useSessionStore.setState({ compositionState: makeComposition(2) } as never);
+    mountProgress({
+      status: "failed",
+      tokens_failed: 2,
+      recent_errors: [
+        { node_id: "select_columns", message: "boom", row_id: "r-1" },
+        { node_id: "select_columns", message: "boom again", row_id: "r-2" },
+      ],
+    });
+    const details = screen.getByText("2 rows failed — view details").closest("details") as HTMLElement;
+    expect(details).not.toBeNull();
+    expect(details).not.toHaveAttribute("open");
+    expect(within(details).queryAllByText(/^select_columns$/)).toHaveLength(0);
   });
 });

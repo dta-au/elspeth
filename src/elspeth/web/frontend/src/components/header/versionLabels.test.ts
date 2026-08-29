@@ -1,5 +1,4 @@
 import { describe, it, expect } from "vitest";
-import { TOOL_CALL_DESCRIPTIONS } from "@/components/chat/toolCallDescriptions";
 import type {
   ChatMessage,
   CompositionStateVersion,
@@ -9,7 +8,7 @@ import type {
 import {
   appliedToolCallName,
   deriveVersionLabel,
-  describeVersionOperation,
+  versionOperationIdentifier,
   isSnapshotOnly,
 } from "./versionLabels";
 
@@ -123,8 +122,8 @@ describe("appliedToolCallName", () => {
   });
 });
 
-describe("describeVersionOperation", () => {
-  it("humanizes a known applied tool via TOOL_CALL_DESCRIPTIONS", () => {
+describe("versionOperationIdentifier", () => {
+  it("returns the raw applied-tool identifier, for the operator title", () => {
     const messages = [
       makeMessage([
         {
@@ -134,15 +133,12 @@ describe("describeVersionOperation", () => {
         },
       ]),
     ];
-    const description = describeVersionOperation(
-      makeVersion({ id: "st-2", version: 2 }),
-      messages,
-    );
-    expect(description).toBe(TOOL_CALL_DESCRIPTIONS.set_pipeline);
-    expect(description).toMatch(/pipeline/i);
+    expect(
+      versionOperationIdentifier(makeVersion({ id: "st-2", version: 2 }), messages),
+    ).toBe("Applied: set_pipeline");
   });
 
-  it("returns null for unknown tools and unlabeled versions", () => {
+  it("returns the raw name for an unknown tool, and null for an unlabeled version", () => {
     const messages = [
       makeMessage([
         {
@@ -153,10 +149,10 @@ describe("describeVersionOperation", () => {
       ]),
     ];
     expect(
-      describeVersionOperation(makeVersion({ id: "st-2", version: 2 }), messages),
-    ).toBeNull();
+      versionOperationIdentifier(makeVersion({ id: "st-2", version: 2 }), messages),
+    ).toBe("Applied: not_a_real_tool");
     expect(
-      describeVersionOperation(makeVersion({ id: "st-3", version: 3 }), []),
+      versionOperationIdentifier(makeVersion({ id: "st-3", version: 3 }), []),
     ).toBeNull();
   });
 });
@@ -174,7 +170,7 @@ describe("deriveVersionLabel", () => {
       ]),
     ];
     expect(deriveVersionLabel(version, [version], messages)).toBe(
-      "Applied: upsert_edge",
+      "Applied: Adds or replaces a connection between two nodes in the pipeline.",
     );
   });
 
@@ -216,7 +212,7 @@ describe("deriveVersionLabel", () => {
       ]),
     ];
     expect(deriveVersionLabel(v5, [v2, v5], messages)).toBe(
-      "Applied: patch_node_options",
+      "Applied: Updates one or more configuration options on a transform or gate node.",
     );
   });
 

@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ToolCallCard } from "./ToolCallCard";
 import type { CompositionProposal, CompositionState, ToolCall } from "@/types/api";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 
 const toolCall: ToolCall = {
   id: "call-1",
@@ -14,6 +15,21 @@ const toolCall: ToolCall = {
     arguments: "{\"source\":{\"plugin\":\"csv\"}}",
   },
 };
+
+function makeToolCall(
+  name: string,
+  overrides: { outcome?: ToolCall["outcome"]; applied_state_version?: number | null } = {},
+): ToolCall {
+  return {
+    id: `call-${name}`,
+    type: "function",
+    function: { name, arguments: "{}" },
+    ...(overrides.outcome !== undefined ? { outcome: overrides.outcome } : {}),
+    ...(overrides.applied_state_version !== undefined
+      ? { applied_state_version: overrides.applied_state_version }
+      : {}),
+  };
+}
 
 const proposal: CompositionProposal = {
   id: "proposal-1",
@@ -43,7 +59,11 @@ describe("ToolCallCard", () => {
       />,
     );
 
-    expect(screen.getByText("Proposed: set_pipeline")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Proposed: Replaces the entire pipeline configuration in a single operation.",
+      ),
+    ).toBeInTheDocument();
     expect(screen.getByText(proposal.summary)).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
@@ -71,7 +91,7 @@ describe("ToolCallCard", () => {
       />,
     );
 
-    expect(screen.getByText("Looked up: get_pipeline_state")).toBeInTheDocument();
+    expect(screen.getByText("Looked up: Reads the current pipeline state being composed in this session.")).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /Accept proposal/ }),
     ).not.toBeInTheDocument();
@@ -100,7 +120,7 @@ describe("ToolCallCard", () => {
           onReject={vi.fn()}
         />,
       );
-      expect(screen.getByText("Applied: upsert_node")).toBeInTheDocument();
+      expect(screen.getByText("Applied: Adds a new transform or gate node, or replaces an existing one with the same id.")).toBeInTheDocument();
       expect(screen.getByText("v3")).toBeInTheDocument();
       expect(screen.queryByText(/Looked up/)).not.toBeInTheDocument();
     });
@@ -114,7 +134,7 @@ describe("ToolCallCard", () => {
           onReject={vi.fn()}
         />,
       );
-      expect(screen.getByText("Applied: upsert_node")).toBeInTheDocument();
+      expect(screen.getByText("Applied: Adds a new transform or gate node, or replaces an existing one with the same id.")).toBeInTheDocument();
       expect(screen.queryByText(/^v\d+$/)).not.toBeInTheDocument();
     });
 
@@ -128,7 +148,9 @@ describe("ToolCallCard", () => {
         />,
       );
       expect(
-        screen.getByText("Attempted: upsert_node (not applied)"),
+        screen.getByText(
+          "Attempted: Adds a new transform or gate node, or replaces an existing one with the same id. (not applied)",
+        ),
       ).toBeInTheDocument();
       expect(screen.queryByText(/Looked up/)).not.toBeInTheDocument();
     });
@@ -142,7 +164,11 @@ describe("ToolCallCard", () => {
           onReject={vi.fn()}
         />,
       );
-      expect(screen.getByText("Failed: upsert_node")).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "Failed: Adds a new transform or gate node, or replaces an existing one with the same id.",
+        ),
+      ).toBeInTheDocument();
     });
 
     it("labels a cancelled dispatch as Cancelled", () => {
@@ -154,7 +180,11 @@ describe("ToolCallCard", () => {
           onReject={vi.fn()}
         />,
       );
-      expect(screen.getByText("Cancelled: upsert_node")).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "Cancelled: Adds a new transform or gate node, or replaces an existing one with the same id.",
+        ),
+      ).toBeInTheDocument();
     });
 
     it("never claims completion — or a lookup — for a non-read-only call with no outcome stamp", () => {
@@ -171,7 +201,11 @@ describe("ToolCallCard", () => {
           onReject={vi.fn()}
         />,
       );
-      expect(screen.getByText("Ran: upsert_node")).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "Ran: Adds a new transform or gate node, or replaces an existing one with the same id.",
+        ),
+      ).toBeInTheDocument();
       expect(screen.queryByText(/Completed/)).not.toBeInTheDocument();
       expect(screen.queryByText(/Looked up/)).not.toBeInTheDocument();
     });
@@ -192,7 +226,11 @@ describe("ToolCallCard", () => {
           onReject={vi.fn()}
         />,
       );
-      expect(screen.getByText("Completed: create_blob")).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "Completed: Creates a new file from inline content for the pipeline to use.",
+        ),
+      ).toBeInTheDocument();
       expect(screen.queryByText(/Looked up/)).not.toBeInTheDocument();
     });
 
@@ -211,7 +249,7 @@ describe("ToolCallCard", () => {
         />,
       );
       expect(
-        screen.getByText("Looked up: get_pipeline_state"),
+        screen.getByText("Looked up: Reads the current pipeline state being composed in this session."),
       ).toBeInTheDocument();
     });
   });
@@ -277,6 +315,66 @@ describe("ToolCallCard", () => {
     expect(
       screen.queryByRole("button", { name: /Accept proposal/ }),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("ToolCallCard humanised primary label (elspeth-af559a0bab)", () => {
+  it("renders the sentence as the ribbon primary and the raw name as mono secondary", () => {
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall("upsert_node", { outcome: "applied", applied_state_version: 3 })}
+        proposal={null}
+        onAccept={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByText(
+        "Applied: Adds a new transform or gate node, or replaces an existing one with the same id.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("upsert_node", { selector: "code" })).toBeInTheDocument();
+    expect(screen.getByText("v3")).toBeInTheDocument();
+  });
+
+  it("keeps the rejected qualifier attached to the sentence", () => {
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall("upsert_node", { outcome: "rejected" })}
+        proposal={null}
+        onAccept={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByText(
+        "Attempted: Adds a new transform or gate node, or replaces an existing one with the same id. (not applied)",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("falls back to the raw-name label for an unknown tool (no dishonest sentence)", () => {
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall("mystery_tool")}
+        proposal={null}
+        onAccept={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Ran: mystery_tool")).toBeInTheDocument();
+  });
+
+  it("default DOM of a settled card passes the shared identifier pin", () => {
+    const { container } = render(
+      <ToolCallCard
+        toolCall={makeToolCall("set_source_from_blob", { outcome: "applied", applied_state_version: 7 })}
+        proposal={null}
+        onAccept={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    );
+    expectNoIdentifiersInDefaultDom(container);
   });
 });
 

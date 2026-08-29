@@ -4,7 +4,11 @@ import type { CompositionProposal, CompositionState, ToolCall } from "@/types/ap
 import { Button } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { ArgumentFields, buildProposalDiff, ProposalChanges } from "./ProposalDiff";
-import { describeToolCall, toolCallOutcomeLabel } from "./toolCallDescriptions";
+import {
+  TOOL_CALL_DESCRIPTIONS,
+  describeToolCall,
+  toolCallOutcomeLabelParts,
+} from "./toolCallDescriptions";
 
 /**
  * A button-triggered tooltip explaining what a composer tool call does in
@@ -92,7 +96,18 @@ export function ToolCallCard({
     // "Completed", and an unstamped non-read-only row renders "Ran" — no
     // stamp means no server evidence of success, so no success is claimed.
     const outcome = toolCall.outcome;
-    const label = toolCallOutcomeLabel(toolCall.function.name, outcome);
+    const { prefix, qualifier } = toolCallOutcomeLabelParts(
+      toolCall.function.name,
+      outcome,
+    );
+    // Sentence primary, identifier secondary — the ComposingIndicator ruling
+    // (ComposingIndicator.tsx:320-346) applied to the settled ribbon. The
+    // evidential prefix stays attached to the PRIMARY line: a failed mutation
+    // rendered as a bare sentence would claim the mutation happened. An
+    // unmapped name has no honest sentence (describeToolCall's fallback is
+    // generic), so it keeps the raw-name label and no secondary.
+    const sentence: string | undefined =
+      TOOL_CALL_DESCRIPTIONS[toolCall.function.name];
     const appliedVersion =
       outcome === "applied" && typeof toolCall.applied_state_version === "number"
         ? toolCall.applied_state_version
@@ -105,7 +120,13 @@ export function ToolCallCard({
           toolName={toolCall.function.name}
           describedById={`tool-call-info-${toolCall.id}`}
         />
-        <span>{label}</span>
+        <span className="tool-call-ribbon-text">
+          {prefix}: {sentence ?? toolCall.function.name}
+          {qualifier}
+        </span>
+        {sentence !== undefined && (
+          <code className="tool-call-ribbon-name">{toolCall.function.name}</code>
+        )}
         {appliedVersion !== null && (
           <code
             className="tool-call-ribbon-version"
@@ -119,17 +140,23 @@ export function ToolCallCard({
   }
 
   const isPending = proposal.status === "pending";
-  const heading =
+  const proposalSentence: string | undefined =
+    TOOL_CALL_DESCRIPTIONS[proposal.tool_name];
+  const headingPrefix =
     proposal.status === "pending"
-      ? `Proposed: ${proposal.tool_name}`
+      ? "Proposed"
       : proposal.status === "committed"
-        ? `Applied: ${proposal.tool_name}`
-        : `Rejected: ${proposal.tool_name}`;
+        ? "Applied"
+        : "Rejected";
+  const heading = `${headingPrefix}: ${proposalSentence ?? proposal.tool_name}`;
 
   return (
     <article className={`tool-call-card tool-call-card--${proposal.status}`}>
       <header className="tool-call-card-header">
         <strong>{heading}</strong>
+        {proposalSentence !== undefined && (
+          <code className="tool-call-ribbon-name">{proposal.tool_name}</code>
+        )}
         <ToolCallInfo
           toolName={proposal.tool_name}
           describedById={`tool-call-info-${proposal.id}`}

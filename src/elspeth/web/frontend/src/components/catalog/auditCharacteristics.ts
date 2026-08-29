@@ -205,6 +205,16 @@ export const AUDIT_CHARACTERISTICS: AuditCharacteristicMeta[] = [
   },
 ];
 
+/** The three flags that change what happens to the reader's data — the
+ *  default-visible subset (elspeth-8555a6a9e0); the other nine render only
+ *  with show_advanced. Shared by PluginCard's strip and FilterChipStrip so
+ *  the two splits cannot drift. */
+export const DEFAULT_VISIBLE_AUDIT_FLAGS: readonly AuditCharacteristicFlag[] = [
+  "quarantine",
+  "credentials",
+  "external_call",
+];
+
 const _byFlag = new Map<string, AuditCharacteristicMeta>(
   AUDIT_CHARACTERISTICS.map((m) => [m.flag, m]),
 );

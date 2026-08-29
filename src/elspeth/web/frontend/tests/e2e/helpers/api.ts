@@ -60,6 +60,23 @@ export async function createSession(
   return (await resp.json()) as SessionSummary;
 }
 
+/** Detail level (elspeth-aa39cffb16): Import YAML renders only when the
+ *  show_advanced preference is on; specs that measure the three-verb bar
+ *  seed it, and reset it, through this helper. */
+export async function setShowAdvanced(
+  ctx: APIRequestContext,
+  value: boolean,
+): Promise<void> {
+  const resp = await ctx.patch("/api/composer-preferences", {
+    data: { show_advanced: value },
+  });
+  if (!resp.ok()) {
+    throw new Error(
+      `PATCH /api/composer-preferences failed (${resp.status()}): ${(await resp.text()).slice(0, 500)}`,
+    );
+  }
+}
+
 export async function deleteSession(
   ctx: APIRequestContext,
   sessionId: string,

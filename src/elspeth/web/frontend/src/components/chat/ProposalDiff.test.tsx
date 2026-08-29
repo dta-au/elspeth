@@ -300,6 +300,6 @@ describe("ArgumentFields", () => {
 
   it("handles zero-argument tools without rendering an empty list", () => {
     render(<ArgumentFields args={{}} />);
-    expect(screen.getByText("This tool call takes no arguments.")).toBeInTheDocument();
+    expect(screen.getByText("No settings change in this step.")).toBeInTheDocument();
   });
 });

@@ -1,11 +1,14 @@
 import { beforeEach, describe, it, expect, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { CatalogDrawer } from "./CatalogDrawer";
 import * as api from "@/api/client";
 import { useAuthStore } from "@/stores/authStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
+import { unavailablePluginDisplayName } from "./UnavailableComponentRow";
 
 vi.mock("@/api/client", () => ({
   fetchPluginPolicy: vi.fn().mockResolvedValue({
@@ -84,6 +87,8 @@ vi.mock("@/api/client", () => ({
 
 // Import the mocked client so we can assert on call counts.
 import { listSources, listTransforms, listSinks } from "@/api/client";
+
+beforeEach(() => resetStore(usePreferencesStore));
 
 describe("CatalogDrawer", () => {
   beforeEach(() => {
@@ -265,6 +270,14 @@ describe("CatalogDrawer", () => {
     expect(onClose).toHaveBeenCalled();
   });
 
+  // Pins the contract directly rather than only self-referentially (a caller
+  // that hardcodes the same expression as the assertion could drift silently
+  // with it): the composite wire id's "kind:" prefix must be dropped before
+  // humanising, not humanised in place.
+  it("unavailablePluginDisplayName drops the kind prefix before humanising", () => {
+    expect(unavailablePluginDisplayName("transform:legacy_llm")).toBe("Legacy LLM");
+  });
+
   it("renders disabled saved components with keyboard and screen-reader repair actions", async () => {
     useSessionStore.setState({
       compositionState: {
@@ -292,11 +305,15 @@ describe("CatalogDrawer", () => {
       name: /unavailable saved components/i,
     });
     expect(repairRegion).toHaveTextContent("legacy_transform");
-    expect(repairRegion).toHaveTextContent("transform:legacy_llm");
+    expect(repairRegion).toHaveTextContent(unavailablePluginDisplayName("transform:legacy_llm"));
     expect(repairRegion).toHaveTextContent("Not enabled");
+    expect(within(repairRegion).getAllByTitle("transform:legacy_llm").length).toBeGreaterThan(0);
     expect(
       screen.getByRole("button", {
-        name: /remove disabled component legacy_transform.*transform:legacy_llm/i,
+        name: new RegExp(
+          `remove disabled component legacy_transform.*${unavailablePluginDisplayName("transform:legacy_llm")}`,
+          "i",
+        ),
       }),
     ).toBeInTheDocument();
 
@@ -368,6 +385,11 @@ const azure = {
 
 describe("CatalogDrawer — Phase 7B reshape", () => {
   beforeEach(() => {
+    // This block's capability-tag filter chips (elspeth-8555a6a9e0: hidden
+    // by default) are the feature under test here, not the detail-level
+    // gate — set the flag on so the pre-existing filter-chip assertions
+    // still exercise the mechanism they were written to pin.
+    usePreferencesStore.setState({ showAdvanced: true });
     usePluginCatalogStore.getState().clear();
     useSessionStore.setState({ compositionState: null } as never);
     vi.mocked(api.listSources).mockResolvedValue({

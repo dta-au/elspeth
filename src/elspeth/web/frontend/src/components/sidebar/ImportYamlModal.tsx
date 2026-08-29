@@ -9,6 +9,10 @@ import {
   OPEN_IMPORT_YAML_MODAL_EVENT,
 } from "@/lib/composer-events";
 import { PREFILL_CHAT_INPUT_EVENT } from "@/components/catalog/PluginCard";
+import {
+  UnavailableComponentRow,
+  unavailablePluginDisplayName,
+} from "@/components/catalog/UnavailableComponentRow";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { BlobMetadata } from "@/types/api";
@@ -1078,32 +1082,31 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
                   </div>
                   <ul className="validation-banner-fail-list">
                     {successInfo.pluginPolicyFindings.map((finding) => (
-                      <li
+                      <UnavailableComponentRow
                         key={`${finding.component_id}:${finding.plugin_id}`}
-                        className="validation-banner-error-item"
-                      >
-                        <div>
-                          <strong>{finding.component_id}</strong>{" "}
-                          <code>{finding.plugin_id}</code> —{" "}
-                          {unavailableReasonLabel(finding.reason_code)}
-                        </div>
-                        <div className="import-yaml-actions">
-                          <Button
-                            className="btn-small"
-                            aria-label={`Remove disabled component ${finding.component_id} (${finding.plugin_id})`}
-                            onClick={() => requestDisabledComponentRemoval(finding)}
-                          >
-                            Remove
-                          </Button>
-                          <Button
-                            className="btn-small"
-                            aria-label={`Replace disabled component ${finding.component_id} (${finding.plugin_id}) with an available ${pluginKind(finding.plugin_id)}`}
-                            onClick={requestDisabledComponentReplacement}
-                          >
-                            Replace
-                          </Button>
-                        </div>
-                      </li>
+                        finding={finding}
+                        reasonLabel={unavailableReasonLabel(finding.reason_code)}
+                        actions={
+                          <>
+                            <Button
+                              className="btn-small"
+                              aria-label={`Remove disabled component ${finding.component_id} (${unavailablePluginDisplayName(finding.plugin_id)})`}
+                              title={finding.plugin_id}
+                              onClick={() => requestDisabledComponentRemoval(finding)}
+                            >
+                              Remove
+                            </Button>
+                            <Button
+                              className="btn-small"
+                              aria-label={`Replace disabled component ${finding.component_id} (${unavailablePluginDisplayName(finding.plugin_id)}) with an available ${pluginKind(finding.plugin_id)}`}
+                              title={finding.plugin_id}
+                              onClick={requestDisabledComponentReplacement}
+                            >
+                              Replace
+                            </Button>
+                          </>
+                        }
+                      />
                     ))}
                   </ul>
                 </section>

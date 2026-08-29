@@ -11,7 +11,7 @@ import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Button } from "@/components/ui";
 import {
   deriveVersionLabel,
-  describeVersionOperation,
+  versionOperationIdentifier,
   isSnapshotOnly,
 } from "@/components/header/versionLabels";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -279,7 +279,7 @@ export function HeaderVersionSelector(): JSX.Element | null {
                 : deriveVersionLabel(version, stateVersions, messages);
               const operationTitle = snapshotOnly
                 ? undefined
-                : (describeVersionOperation(version, messages) ?? undefined);
+                : (versionOperationIdentifier(version, messages) ?? undefined);
               return (
                 <li
                   key={version.version}

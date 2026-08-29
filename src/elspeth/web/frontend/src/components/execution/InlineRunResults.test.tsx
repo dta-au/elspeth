@@ -9,6 +9,8 @@ import { REQUEST_RUN_EVENT } from "@/lib/composer-events";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useAuthStore } from "@/stores/authStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
 import {
   EXECUTION_BLOCKED_VALIDATION_READINESS,
   makeValidationResult,
@@ -67,6 +69,7 @@ function deferred<T>() {
 
 describe("InlineRunResults", () => {
   beforeEach(() => {
+    resetStore(usePreferencesStore);
     _resetNarrativeModeCacheForTesting();
     vi.restoreAllMocks();
     // Default: empty catalog so useNarrativeMode resolves to false unless
@@ -714,6 +717,7 @@ describe("InlineRunResults", () => {
   });
 
   it("includes the current terminal run in the runs drawer when other runs exist", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useExecutionStore.setState({
       activeRunId: "run-done",
       progress: {
@@ -756,6 +760,7 @@ describe("InlineRunResults", () => {
   // this tab — reload race, or a run started from another tab) must reach the
   // drawer, where the REST-backed Cancel works without in-memory state.
   it("routes an unattached live run into the past-runs drawer so it stays cancellable", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useExecutionStore.setState({
       activeRunId: null,
       progress: null,
@@ -770,11 +775,12 @@ describe("InlineRunResults", () => {
 
     expect(screen.getByText("run-orphan")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /cancel run run-orphan/i }),
+      screen.getByRole("button", { name: /^Cancel Run 1 · /i }),
     ).toBeInTheDocument();
   });
 
   it("shows only terminal runs in the past-runs drawer while another run is active", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useExecutionStore.setState({
       activeRunId: "run-active",
       progress: {
@@ -851,6 +857,7 @@ describe("InlineRunResults", () => {
   });
 
   it("opens and closes the runs drawer", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useExecutionStore.setState({
       activeRunId: null,
       runs: [

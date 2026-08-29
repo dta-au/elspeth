@@ -26,8 +26,10 @@
 import { useEffect, useState, type MouseEvent } from "react";
 import type { PluginSummary, PluginSchemaInfo } from "@/types/index";
 import { Button } from "@/components/ui";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { AuditCharacteristicIcon } from "./AuditCharacteristicIcon";
+import { DEFAULT_VISIBLE_AUDIT_FLAGS } from "./auditCharacteristics";
 import { pluginDisplayName } from "./pluginDisplayName";
 
 /** Event name dispatched by InlineChatSourceEntry and consumed by
@@ -102,7 +104,7 @@ function variantKindLabel(s: DiscriminatedSchema): string {
 function renderFields(properties: Record<string, JsonSchemaField>, required: string[] | undefined): JSX.Element[] {
   const req = new Set(required ?? []);
   return Object.entries(properties).map(([name, field]) => (
-    <div key={name}>
+    <div key={name} className="plugin-card-field-row">
       <span className="plugin-card-field-name">{name}</span>
       <span className="plugin-card-field-type">{field.type ?? "any"}</span>
       {req.has(name) && <span className="plugin-card-field-required">required</span>}
@@ -123,6 +125,7 @@ export function PluginCard({
   onRetrySchema,
   initialExpanded = false,
 }: PluginCardProps) {
+  const showAdvanced = useShowAdvanced();
   const displayName = pluginDisplayName(plugin.name);
   const cardId = `${pluginCardIdSegment(plugin.plugin_type)}-${pluginCardIdSegment(plugin.name)}`;
   const whenText = plugin.usage_when_to_use;
@@ -133,6 +136,10 @@ export function PluginCard({
   const hasExample = hasCatalogText(exampleText);
   const hasDetails = hasWhen || hasAvoid || hasExample;
   const [expanded, setExpanded] = useState(initialExpanded);
+  const schemaOpen = expanded && showAdvanced;
+  const visibleAuditCharacteristics = [...plugin.audit_characteristics]
+    .filter((flag) => showAdvanced || (DEFAULT_VISIBLE_AUDIT_FLAGS as readonly string[]).includes(flag))
+    .sort();
   const [detailsState, setDetailsState] = useState({ cardId, open: false });
   const detailsOpen = hasDetails && detailsState.cardId === cardId && detailsState.open;
   const nameId = `plugin-card-name-${cardId}`;
@@ -179,7 +186,7 @@ export function PluginCard({
         {plugin.description}
       </div>
 
-      {plugin.audit_characteristics.length > 0 && (
+      {visibleAuditCharacteristics.length > 0 && (
         // role="group" so the aria-label is actually exposed — aria-label on
         // a role-less div (role=generic) is ignored by AT (WCAG 1.3.1,
         // elspeth-37293a3b7c).
@@ -188,7 +195,7 @@ export function PluginCard({
           role="group"
           aria-label="Audit characteristics"
         >
-          {[...plugin.audit_characteristics].sort().map((flag) => (
+          {visibleAuditCharacteristics.map((flag) => (
             <AuditCharacteristicIcon key={flag} flag={flag} />
           ))}
         </div>
@@ -211,15 +218,17 @@ export function PluginCard({
             Details
           </Button>
         )}
-        <Button
-          className="btn-small plugin-card-disclosure"
-          onClick={handleDisclosureClick}
-          aria-expanded={expanded}
-          aria-controls={schemaPanelId}
-          aria-label={`Schema for ${displayName}`}
-        >
-          Schema
-        </Button>
+        {showAdvanced && (
+          <Button
+            className="btn-small plugin-card-disclosure"
+            onClick={handleDisclosureClick}
+            aria-expanded={schemaOpen}
+            aria-controls={schemaPanelId}
+            aria-label={`Schema for ${displayName}`}
+          >
+            Schema
+          </Button>
+        )}
       </div>
 
       {detailsOpen && (
@@ -239,7 +248,7 @@ export function PluginCard({
         </div>
       )}
 
-      {expanded && (
+      {schemaOpen && (
         <div id={schemaPanelId} className="plugin-card-expanded">
           {schemaError ? (
             <div className="plugin-card-schema-error">
