@@ -18,7 +18,7 @@
 - **Composer invariants:** no server-side authoring of pipeline structure; **no tutorial-special paths** (ADR-031). Every disclosure in this plan applies identically in tutorial mode.
 - **Audit-required elements stay visible regardless of `show_advanced`:** AuthorityChip, Audit panel rows + Blocks-run/Advisory legend, Run-confirm egress lines, tool-outcome ribbon prefixes, acknowledgement cards, completion honesty gate, "Validation passed · N checks" headline.
 - **Debug mode expands disclosures; it never adds surfaces.** Every item hidden when the flag is off has a plain summary in its place.
-- **Pre-release: no DB migration path.** A new column ships by DB recreation (`web/sessions/schema.py`). Use `server_default` so existing rows read cleanly.
+- **Pre-release: no DB migration path.** A new column ships by DB recreation (`web/sessions/schema.py`); the validator compares column ORDER as well as the set, so after Task 1 lands the running deployment's `data/sessions.db` fails `SessionSchemaError` at startup until recreated (or, to keep live sessions such as `39578c6f`, rebuilt table-by-table into the expected order — validate on a copy first). Use `server_default` so existing rows read cleanly.
 - **Copy register:** sentence case, no internal identifiers in visible text; raw identifiers go in `title`/`data-*` attributes or a `<code>` inside a `<details>`.
 - **Shared checkout:** stage only your own pathspecs; never `git restore`/`clean` files you did not stage; no `git stash` (hook-blocked). Full `pytest tests/` is a background job — cap parallelism at `-n 12` when other agents are running.
 - Frontend commands run from `src/elspeth/web/frontend`: `npx vitest run <path>`; backend from repo root with `source .venv/bin/activate`.
@@ -205,7 +205,7 @@ Expected: all pass, including the pre-existing tests (they construct `ComposerPr
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/elspeth/web/sessions/models.py src/elspeth/web/preferences/models.py src/elspeth/web/preferences/service.py tests/unit/web/preferences/test_models.py tests/unit/web/preferences/test_service.py tests/integration/web/test_preferences_routes.py
+git add src/elspeth/web/sessions/models.py src/elspeth/web/preferences/models.py src/elspeth/web/preferences/service.py tests/unit/web/preferences/test_models.py tests/unit/web/preferences/test_service.py tests/unit/web/preferences/test_schema.py tests/integration/web/test_preferences_routes.py
 git commit -m "feat(preferences): per-user show_advanced detail-level flag (elspeth-9c11df65f8)"
 ```
 
@@ -331,7 +331,7 @@ export function useShowAdvanced(): boolean {
 - [ ] **Step 4: Run the store and panel tests**
 
 Run: `npx vitest run src/stores/preferencesStore.test.ts src/components/settings/ComposerPreferencesPanel.test.tsx`
-Expected: PASS. Then `npx tsc --noEmit -p .` (or the project's `npm run typecheck` if defined in `package.json`) — Expected: clean; any remaining payload literal missing `show_advanced` shows up here.
+Expected: PASS. Then `npm run typecheck` (the root `tsc -p .` invocation fails on this tree because the solution-style root tsconfig's references lack `composite`; `npm run typecheck` runs the app + oidc tsconfigs) — Expected: clean; any remaining payload literal missing `show_advanced` shows up here.
 
 - [ ] **Step 5: Commit**
 
@@ -1407,7 +1407,7 @@ git commit -m "fix(validation): execution banner and side-rail suggestions use t
 
 - [ ] **Step 1: Frontend full run**
 
-Run (from `src/elspeth/web/frontend`): `npx vitest run` then `npm run lint` (if defined) and `npx tsc --noEmit -p .`
+Run (from `src/elspeth/web/frontend`): `npx vitest run` then `npm run lint` and `npm run typecheck`
 Expected: all green.
 
 - [ ] **Step 2: Lint corpus diff**
@@ -1424,7 +1424,7 @@ Run: `pytest tests/ -n 12 -q 2>&1 | tail -30` in the background (worktree prefer
 
 - [ ] **Step 4: Live check on the local deployment**
 
-Executor: the lane that ran Task 8 (it has the branch built). Procedure: build the frontend (`npm run build` in `src/elspeth/web/frontend`), then `sudo systemctl restart elspeth-web` and confirm `/api/system/status` reports the new `frontend_build` value before trusting anything (`is-active` alone lies after a restart — poll the build id). Sign in as the staging operator account (credentials live only in the runnable staging surfaces, never in docs); open session `39578c6f`. Confirm: Spec tab shows no hash/UUID with the default preference; toggle "Show technical detail" in Composer preferences; Spec tab now offers "Raw options (JSON)"; Validation inspector expanded shows the check list only with the flag on; node inspector shows Settings above a collapsed "Connections & schema". Report: one `filigree add-comment elspeth-cd8abcba3f` listing each check as pass/fail with the frontend build id; a failed check reopens the task's ticket rather than being noted in prose.
+Executor: the lane that ran Task 8 (it has the branch built). Procedure: build the frontend (`npm run build` in `src/elspeth/web/frontend`), then `sudo -n /usr/bin/systemctl restart elspeth-web.service` (the sudoers rule matches only this exact form) and confirm `/api/system/status` reports the new `frontend_build` value before trusting anything (`is-active` alone lies after a restart — poll the build id). Sign in as the staging operator account (credentials live only in the runnable staging surfaces, never in docs); open session `39578c6f`. Confirm: Spec tab shows no hash/UUID with the default preference; toggle "Show technical detail" in Composer preferences; Spec tab now offers "Raw options (JSON)"; Validation inspector expanded shows the check list only with the flag on; node inspector shows Settings above a collapsed "Connections & schema". Report: one `filigree add-comment elspeth-cd8abcba3f` listing each check as pass/fail with the frontend build id; a failed check reopens the task's ticket rather than being noted in prose.
 
 - [ ] **Step 5: Close the tickets**
 
