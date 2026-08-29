@@ -303,6 +303,61 @@ def _ok_validation() -> ValidationResult:
     )
 
 
+def _pending_review_validation() -> ValidationResult:
+    """The pending-interpretation handoff as validate_pipeline actually emits it.
+
+    is_valid=False is a SOFT halt: authoring validated and the only blocker is
+    a resolvable review card. Producer-honest per elspeth-fa18d54eef: the
+    strict ledger appends a SKIPPED advisor_signoff tail on every halted run,
+    so the fixture carries it — a consumer that conflates skipped with failed
+    fails here, not in production.
+    """
+    from elspeth.web.execution.schemas import (
+        CHECK_ADVISOR_SIGNOFF,
+        CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
+        ValidationCheck,
+        ValidationReadiness,
+        ValidationReadinessBlocker,
+    )
+    from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
+
+    return ValidationResult(
+        is_valid=False,
+        checks=[
+            ValidationCheck(
+                name=CHECK_ADVISOR_SIGNOFF,
+                passed=False,
+                detail="Skipped: review_interpretations failed",
+                affected_nodes=(),
+                outcome_code=CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
+            )
+        ],
+        errors=[
+            ValidationError(
+                component_id="assess",
+                component_type="transform",
+                message="llm_prompt_template review pending for transform 'assess'",
+                suggestion=None,
+                error_code=None,
+            )
+        ],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=False,
+            completion_ready=True,
+            blockers=[
+                ValidationReadinessBlocker(
+                    code=INTERPRETATION_REVIEW_PENDING_CODE,
+                    component_id="assess",
+                    component_type="transform",
+                    detail="llm_prompt_template review pending",
+                )
+            ],
+        ),
+        semantic_contracts=[],
+    )
+
+
 def _broken_validation() -> ValidationResult:
     return ValidationResult(
         is_valid=False,
@@ -776,6 +831,63 @@ async def test_mark_ready_for_review_fails_validation(session_engine_with_row, p
     with session_engine_with_row.connect() as conn:
         rows = conn.execute(select(composer_completion_events_table)).all()
     assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_mark_ready_for_review_pending_review_gets_honest_reason(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+):
+    """elspeth-3830c620a2: a composition whose ONLY blocker is a pending
+    interpretation review must not be refused as "validation failed" —
+    there are no errors to fix. The block stands (a share of an
+    un-reviewed composition is not yet allowed) but the reason and detail
+    tell the truth."""
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_pending_review_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+    )
+    with pytest.raises(CompositionNotRunnableError) as exc_info:
+        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+
+    assert exc_info.value.reason == "review_pending"
+    assert "review" in exc_info.value.detail
+    assert "fix errors" not in exc_info.value.detail
+    with session_engine_with_row.connect() as conn:
+        rows = conn.execute(select(composer_completion_events_table)).all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_mark_ready_for_review_genuine_failure_keeps_validation_failed(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+):
+    """Negative guard: a genuinely broken composition still reports
+    validation_failed — the handoff carve-out must not widen."""
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_broken_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+    )
+    with pytest.raises(CompositionNotRunnableError) as exc_info:
+        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    assert exc_info.value.reason == "validation_failed"
 
 
 @pytest.mark.asyncio
