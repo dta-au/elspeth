@@ -283,7 +283,7 @@ C4Component
     Rel(database, db, "Connects to")
     Rel(exporter, query_repo, "Reads through")
     Rel(journal, database, "Commits outbox rows with audit writes")
-```mermaid
+```
 
 | Component | File | Responsibility |
 | ----------- | ------ | ---------------- |
