@@ -239,3 +239,84 @@ class TestTelemetryHelperShape:
             reason=None,
             preflight_shape="pending_handoff",
         )
+
+
+# ---------------------------------------------------------------------------
+# elspeth-fa18d54eef root cause — the strict ledger's SKIPPED advisor row is
+# not an advisor verdict.
+# ---------------------------------------------------------------------------
+
+
+def _producer_honest_handoff_result():
+    """The handoff shape as ``validate_pipeline`` ACTUALLY emits it.
+
+    ``_skipped_checks`` (execution/validation.py) emits every check downstream
+    of the halted ``review_interpretations`` stage as ``passed=False`` with
+    ``outcome_code=CHECK_OUTCOME_SKIPPED_AFTER_FAILURE`` — including
+    ``advisor_signoff``. The hand-built ``_handoff_result()`` fixture carries
+    ``checks=[]``, which is why no scripted reproduction ever hit the live
+    defect (the fixture pinned a shape no producer emits).
+    """
+    from elspeth.web.execution.schemas import (
+        CHECK_ADVISOR_SIGNOFF,
+        CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
+        ValidationCheck,
+    )
+
+    base = _handoff_composer_result().runtime_preflight
+    return base.model_copy(
+        update={
+            "checks": [
+                *base.checks,
+                ValidationCheck(
+                    name=CHECK_ADVISOR_SIGNOFF,
+                    passed=False,
+                    detail="Skipped: review_interpretations failed",
+                    affected_nodes=(),
+                    outcome_code=CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
+                ),
+            ]
+        }
+    )
+
+
+class TestSkippedLedgerRowIsNotAnAdvisorVerdict:
+    """Observed live twice on 2026-08-29 (session 7afbc210, turns 2 and 4),
+    and retroactively explains the original 39578c6f turn 3: a CLEAN pass-2
+    fall-through published the pending-handoff "did not clear" notice because
+    the discriminator read the ledger's SKIPPED advisor row as a failure."""
+
+    def test_clean_fallthrough_over_real_handoff_publishes_review_message(self, publication_spy: _RecordingPublicationTelemetry) -> None:
+        result = ComposerResult(
+            message="prose",
+            state=_empty_state(),
+            runtime_preflight=_producer_honest_handoff_result(),
+            raw_assistant_content=None,
+        )
+        published = _replace_advisor_repair_public_result(result, session_id="sess-9")
+        assert published.message == no_tool_policy.ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE
+        assert "did not clear" not in published.message
+        assert [c["branch"] for c in publication_spy.calls] == ["repair_review"]
+
+    def test_real_advisor_failure_still_publishes_the_notice(self, publication_spy: _RecordingPublicationTelemetry) -> None:
+        """A check the advisor path actually built (outcome_code=None) keeps
+        the blocked wording — the fix must not widen into ignoring genuine
+        verdicts."""
+        published = _replace_advisor_repair_public_result(
+            ComposerResult(
+                message="prose",
+                state=_empty_state(),
+                runtime_preflight=_signoff_failed_handoff_result(),
+                raw_assistant_content=None,
+            ),
+            session_id="sess-10",
+        )
+        assert no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE in published.message
+        assert [c["branch"] for c in publication_spy.calls] == ["repair_handoff_signoff_failed"]
+
+    def test_predicate_distinguishes_skipped_from_failed(self) -> None:
+        from elspeth.web.execution.completion_gates import advisor_signoff_check_failed
+
+        assert advisor_signoff_check_failed(_producer_honest_handoff_result().checks) is False
+        assert advisor_signoff_check_failed(_signoff_failed_handoff_result().checks) is True
+        assert advisor_signoff_check_failed([]) is False
