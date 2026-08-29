@@ -729,6 +729,13 @@ test.describe("Composer deterministic workspace geometry", () => {
       await setShowAdvanced(ctx, true);
       await composer.goto(sessionId);
       await composer.waitForChatReady();
+      // The bar's width now depends on Import YAML being mounted, and that
+      // button appears only when fetchUserComposerPreferences() resolves
+      // (preferencesStore). Without this barrier a boundingBox capture can
+      // resolve against the pre-mount, two-verb bar while the button's own
+      // auto-waiting locator resolves post-mount — every button assertion
+      // passes and only the reason's wrapped height is wrong.
+      await expect(composer.importYaml()).toBeVisible();
       await expect(composer.validationStatus()).toHaveAccessibleName(
         "Validation: Passed",
       );
@@ -805,6 +812,13 @@ test.describe("Composer deterministic workspace geometry", () => {
       await setShowAdvanced(ctx, true);
       await composer.goto(sessionId);
       await composer.waitForChatReady();
+      // The bar's width now depends on Import YAML being mounted, and that
+      // button appears only when fetchUserComposerPreferences() resolves
+      // (preferencesStore). Without this barrier a boundingBox capture can
+      // resolve against the pre-mount, two-verb bar while the button's own
+      // auto-waiting locator resolves post-mount — every button assertion
+      // passes and only the reason's wrapped height is wrong.
+      await expect(composer.importYaml()).toBeVisible();
 
       // Asserted, not assumed. Without the reason line in flow the completion
       // group is the same height as the status group and both invariants hold
@@ -892,6 +906,13 @@ test.describe("Composer deterministic workspace geometry", () => {
       await setShowAdvanced(ctx, true);
       await composer.goto(sessionId);
       await composer.waitForChatReady();
+      // The bar's width now depends on Import YAML being mounted, and that
+      // button appears only when fetchUserComposerPreferences() resolves
+      // (preferencesStore). Without this barrier a boundingBox capture can
+      // resolve against the pre-mount, two-verb bar while the button's own
+      // auto-waiting locator resolves post-mount — every button assertion
+      // passes and only the reason's wrapped height is wrong.
+      await expect(composer.importYaml()).toBeVisible();
       const reason = page.locator(".side-rail-execute-reason");
       await expect(reason).toBeVisible();
       await expect(composer.validationStatus()).toHaveAccessibleName(
