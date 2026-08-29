@@ -139,6 +139,16 @@ code, releases, exports, runtime data, or deployed artifacts. If removing a
 practice is a marginal call or may discard a real safeguard, surface the tradeoff
 to the developer before removing it.
 
+Audit grade is a characteristic of the product, not of the project's own
+tooling ([ADR-046](docs/architecture/adr/046-audit-grade-is-a-product-characteristic.md)).
+The issue tracker, code map, hooks, scan stores, and installed helpers get
+ordinary hygiene: purge, delete, reset, or uninstall with the tool's own verbs
+(or direct SQL/`rm` when it has none) and report it — no status-semantics
+debates for tool-internal rows, no ADR for a cache, no backups staged as
+evidence. Destructive shared-state actions still get an operator go-ahead;
+what is removed is the ceremony, not the check. Adding or removing a tool that
+carries standing agent instructions is still a recorded decision.
+
 ## Composer invariants (non-negotiable)
 
 Two rules govern every change to the Web Composer. Neither is subject to a

@@ -65,6 +65,7 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [043](043-retire-wardline.md) | Retire Wardline — elspeth-lints Is the Sole Trust-Boundary Gate | 2026-08-29 | **Accepted** |
 | [044](044-retire-legis.md) | Retire Legis — the elspeth-judge Seam Is the Governance Layer | 2026-08-29 | **Accepted** |
 | [045](045-retire-warpline.md) | Retire Warpline — Loomweave and git Answer the Change-Impact Question | 2026-08-29 | **Accepted** |
+| [046](046-audit-grade-is-a-product-characteristic.md) | Audit Grade Is a Product Characteristic, Not a Project One | 2026-08-29 | **Accepted** |
 
 ## Status Definitions
 
