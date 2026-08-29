@@ -8,6 +8,21 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-29 — masquerade resolver STOP RULES (do not re-walk the six-freeze
+  road).** The sparse-SSA `flow.py` prototype (archived at
+  `/home/john/codex-cleanup-archive-2026-08-16/orphaned-work/ac-masquerade-bounded/`)
+  was REJECTED by two independent reviews on 2026-08-09 (comments on closed
+  issue elspeth-de6f571887): late-global/try-match/annotation-timing/loop-header
+  fail-open misses and non-monotone output. Standing rules from
+  elspeth-02cd60d8cd: NO CFG/SSA/history/replay/lazy-cache/object-emulator
+  growth in the masquerade engine; ≤2.5× runtime per input doubling. The
+  shipped 1,278-line inventory visitor is the single authority. METHOD RULE
+  that came out of it: corpus agreement with the incumbent (0 diffs over 2,866
+  files) does NOT validate a fail-closed analyzer — the defect shapes were
+  simply absent from the tree; adversarial cases are the oracle
+  (memory: adversarial-oracle-for-fail-closed-analyzers). Open follow-ups live
+  in elspeth-34ac84b4b6 (6 verified evasions) and elspeth-df09888129 (perf).
+
 - **2026-08-29 — a hand-built fixture can pin a shape NO PRODUCER EMITS, and
   then every test agrees with a projection that never fires.** Found in B59.
   `_tool_call_outcomes_by_call_id` (web/sessions/routes/_helpers.py) read
