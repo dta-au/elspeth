@@ -30,7 +30,40 @@ last ran.
 
 ### Approved tooling
 
-Exactly two tools carry standing agent instructions in `AGENTS.md`:
+Three tools carry standing agent instructions in `AGENTS.md`: one
+first-party, two third-party.
+
+**elspeth-lints** (first-party) — the project's own static-analysis and gate
+platform, an internal monorepo package at `elspeth-lints/` (not a PyPI
+distribution). It is the single home for every ELSPETH-specific CI/CD
+invariant: the trust-tier model and trust-boundary honesty gates
+(`trust_tier.*`, `trust_boundary.*`, the masquerade gate), plugin and
+composer contracts, contract invariants, immutability, audit-evidence and
+manifest rules, and the meta-rule `meta_no_new_bespoke_cicd_enforcer`, which
+forbids new bespoke enforcers outside the package — so "add a gate" always
+means "add an elspeth-lints rule", never "add a tool". It runs as
+per-rule pre-commit hooks (`elspeth-lints-*` in `.pre-commit-config.yaml`),
+in CI (`.github/workflows/ci.yaml`,
+`enforce-allowlist-judge-gates.yaml`), and by hand
+(`elspeth-lints check --rules … --root src/elspeth`; the `--rules` selection
+is mandatory and `--fail-on-inert` guards against a scan that checked
+nothing). Its judge-signature stage is exposed to agents as the
+`elspeth-judge` MCP server in `.mcp.json` and to the operator as
+`elspeth-lints sign-bundle` / `rekey`, across the two-actor seam described in
+`docs/judge-signature-handoff.md` and the `judge-signature-workflow` skill.
+Unlike the two third-party tools below, elspeth-lints is *product-grade*
+under [ADR-046](046-audit-grade-is-a-product-characteristic.md): its gates,
+allowlists and signatures protect code and releases. Reference material:
+[ADR-023](023-custom-python-ci-analyzer.md) (why a custom analyzer),
+[`elspeth-lints/README.md`](../../../elspeth-lints/README.md) (rule
+coverage and local usage), and `docs/elspeth-lints/` —
+[rationale](../../elspeth-lints/rationale.md),
+[protocols](../../elspeth-lints/protocols.md),
+[rule author guide](../../elspeth-lints/rule-author-guide.md),
+[static/runtime boundary](../../elspeth-lints/static-runtime-boundary.md).
+The exclusion rule below does not constrain elspeth-lints: it is the
+mechanism through which the project adds analysis, and it is what made the
+three retired third-party analyzers redundant.
 
 **Filigree** — the project's issue tracker and work-claim authority. Data in
 `.weft/filigree/` (untracked). Surface: `mcp__filigree__*` MCP server, the
@@ -169,6 +202,11 @@ rest; the full `pytest tests/` run before merge stays the rule.
 
 - The tool set agents act on is a recorded decision with a CI-enforced
   boundary; installer drift cannot silently widen it.
+- New static analysis or gating goes into elspeth-lints as a rule, which
+  `meta_no_new_bespoke_cicd_enforcer` already enforces; a third-party
+  analyzer is only ever a candidate if it answers something elspeth-lints
+  structurally cannot (the interprocedural-taint case in §Wardline), and then
+  only through a superseding ADR.
 - Nothing measured is lost by the three retirements: no true-positive
   Wardline finding, no Legis record, and no Warpline answer that narrowed a
   verification set exists in the project's history.
