@@ -510,7 +510,7 @@ the table below reflects the operator-confirmed current state.
 #callout(kind: "advisory", title: "Remaining ship gate")[
   Phase 9 (migration runner) is necessary before any real-user
   production deploy of any schema-adding phase. The staging
-  staging deployment runs on Phases 1–8 with the
+  deployment runs on Phases 1–8 with the
   operator-managed "delete the old DB" migration policy in effect;
   production-class deploys are blocked on Phase 9.
 ]
