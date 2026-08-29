@@ -218,3 +218,14 @@
   the post-merge tree (audit_export_snapshots.py R6 register_verified_candidate: body[31] → body[32], new
   module-level import). Five GitHub PRs closed as landed (johnm-dta). Not a wave; reported separately by John's
   instruction.
+- tier-w4fix MERGED (2319dec1d, lane HEAD 1601f2d79): all 18 audit work items disposed. Code: 8 boundaries made
+  genuinely non-raising (type-test before hash/compare; RecursionError joins malformed-input tuples; surrogatepass
+  size bound; str(exc) inside the suppress; _receipt_timestamp raises receipt_store_schema); the _orphan_call
+  else:-arm move retired 1 finding honestly (corpus 2210 → 2209, hub-verified, sole diff line). Prose: 5 false
+  strict=True/botocore-subclass mechanisms rewritten to measured ground (botocore returns exact naive-capable
+  datetime; strict removal changes nothing in the walk); s3 R6 pin claims replaced with a test that actually
+  reaches the handler; hints R_TB_NONLITERAL corrected (per-decorator, diagnostic emitted). Pins: capture 15-case
+  operator-env test, evidence reverify-digest case; all changed test_refs re-fingerprinted; trust_boundary gates
+  rc 0, 1135 harness tests green post-merge. Tickets: elspeth-f124a558a0 (map effect check), elspeth-09450c9ba9
+  (map root check), elspeth-4620c87aa0 (dead naive clause). obs elspeth-obs-539724f2db left open (manifest_schema
+  captured_at, same class, different file). Final full suite running at 2319dec1d.
