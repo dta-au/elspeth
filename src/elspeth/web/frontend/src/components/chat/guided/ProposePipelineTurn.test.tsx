@@ -390,6 +390,14 @@ describe("ProposePipelineTurn", () => {
     expect(
       container.querySelector('[data-node-kind="row_union"]'),
     ).not.toBeNull();
+    // The components list names the node type in the reader's register, never
+    // the raw union member, with the raw token recoverable from `title` — the
+    // same derivation the sibling wire-stage row uses.
+    const componentRow = container.querySelector(
+      '.guided-proposal__components strong[title="row_union"]',
+    );
+    expect(componentRow).not.toBeNull();
+    expect(componentRow!.textContent).toBe("node-4 · Row Union");
     expect(
       container.querySelector(
         ".guided-readonly-graph__node--row_union",

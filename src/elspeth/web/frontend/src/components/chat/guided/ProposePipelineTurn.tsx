@@ -338,7 +338,17 @@ export function ProposePipelineTurn({
           ))}
           {payload.nodes.map((node) => (
             <li key={node.stable_id}>
-              <strong>{node.label} · {node.node_type}{node.plugin === null ? "" : ` · ${stepLabelForPlugin(node.plugin.id)}`}</strong>
+              {/* One humanised step label, exactly as the sibling wire-stage
+                  row derives it (WireStageTurn: stepLabelForPlugin(plugin ??
+                  node_type)) — the two surfaces named the same field two
+                  different ways, and `row_union` is a member of the node_type
+                  union, so the raw token reached default visible text. The
+                  raw node_type and plugin id stay recoverable in `title`. */}
+              <strong
+                title={`${node.node_type}${node.plugin === null ? "" : ` · ${node.plugin.id}`}`}
+              >
+                {node.label} · {stepLabelForPlugin(node.plugin?.id ?? node.node_type)}
+              </strong>
               <span>
                 {" "}
                 {node.behavior.kind === "gate"
