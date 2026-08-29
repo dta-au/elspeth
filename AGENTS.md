@@ -388,24 +388,6 @@ clean/allowed state. warpline facts are advisory and never gate. See the
 `warpline-workflow` skill for the full loop.
 <!-- /warpline:instructions -->
 
-<!-- legis:instructions:v1.5.0:37065fbc -->
-## Legis (git/CI + governance)
-
-Legis is the git/CI and governance layer of the Weft suite: graded policy
-enforcement over branch/commit/PR/check context, recorded in an append-only
-audit trail keyed to stable code identity (SEI), so it survives rename/move.
-
-Reach for it when a policy fires at the CI/git boundary, when a change needs a
-recordable override or human sign-off, or when you need git/CI context.
-
-- Prefer the `mcp__legis__*` MCP tools; fall back to the `legis` CLI.
-- Clear a fired policy through `override_submit` (MCP-only), which grades it
-  (self-clear / judged / escalated) and records it — routing around it leaves
-  no trail.
-
-Full reference: the `legis-workflow` skill, `legis --help`, MCP schemas.
-<!-- /legis:instructions -->
-
 ## Judge-signature stage (tier-model allowlist signing)
 
 The trust-tier CI failure is a deliberate fail-closed state: it prevents

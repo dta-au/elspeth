@@ -38,16 +38,6 @@
       "command": "/home/john/.local/bin/filigree-mcp",
       "type": "stdio"
     },
-    "legis": {
-      "args": [
-        "mcp",
-        "--agent-id",
-        "claude-code"
-      ],
-      "command": "/home/john/.local/bin/legis",
-      "env": {},
-      "type": "stdio"
-    },
     "loomweave": {
       "args": [
         "serve"

@@ -100,6 +100,32 @@ def test_wardline_is_not_wired_into_the_project() -> None:
         assert not path.exists(), path
 
 
+LEGIS_SURFACES = (
+    REPO_ROOT / ".agents" / "skills" / "legis-workflow",
+    REPO_ROOT / ".claude" / "skills" / "legis-workflow",
+)
+
+
+def test_legis_is_not_wired_into_the_project() -> None:
+    """Legis was retired 2026-08-29 (ADR-044): a generic twin of the elspeth-judge seam.
+
+    Its installer writes an AGENTS.md block, two skill copies, an MCP server and
+    a SessionStart hook; pin the absence of each so a sibling-tool upgrade
+    cannot re-add it silently.
+    """
+    agents_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    assert "legis:instructions" not in agents_text
+    assert "mcp__legis__" not in agents_text
+
+    mcp_servers = json.loads((REPO_ROOT / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+    assert "legis" not in mcp_servers
+
+    assert not any("legis" in command for command in _hook_commands(_settings()))
+
+    for path in LEGIS_SURFACES:
+        assert not path.exists(), path
+
+
 def test_judge_skill_copies_use_codex_readonly_signing() -> None:
     for path in JUDGE_SKILLS:
         text = path.read_text(encoding="utf-8")

@@ -17,6 +17,13 @@ All notable changes to ELSPETH are documented here.
   findings) was contract-shape noise already enforced by `elspeth-lints`
   `trust_boundary.tests`. Rationale in ADR-043. Boundary honesty stays with
   `elspeth-lints` (`trust_boundary.*` and the masquerade gate).
+- **Legis governance layer** — the `.mcp.json` server, SessionStart hook,
+  `AGENTS.md` installer block and `legis-workflow` skill copies. It arrived
+  with the same tooling sweep as Wardline; its audit log had zero rows, no
+  policy cell was ever configured, and every capability it describes (LLM
+  judge wall, HMAC-signed verdicts bound to fingerprint + AST path, operator
+  escalation, append-only trail) is already a first-party mechanism of the
+  elspeth-judge / `sign-bundle` seam. Rationale in ADR-044.
 - **Composer pipeline recipes** — the `list_recipes` and
   `apply_pipeline_recipe` tools, the five bundled recipe templates, and the
   slot-schema contracts behind them. The server-side prose-to-recipe matcher

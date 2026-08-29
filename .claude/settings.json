@@ -44,15 +44,6 @@
             "timeout": 5
           }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/john/.local/bin/legis session-context",
-            "timeout": 5
-          }
-        ]
       }
     ]
   },
