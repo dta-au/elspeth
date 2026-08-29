@@ -189,8 +189,9 @@ def _orphan_call(method: Callable[..., object], **kwargs: object) -> Mapping[str
         if _aws_error_code(exc) in _ORPHAN_NOT_FOUND_CODES:
             return None
         raise AcceptanceCheckError("orphan_sweep_api") from None
-    if not isinstance(response, Mapping):
-        raise AcceptanceCheckError("orphan_sweep_api")
+    else:
+        if not isinstance(response, Mapping):
+            raise AcceptanceCheckError("orphan_sweep_api")
     return response
 
 
@@ -221,12 +222,14 @@ def _orphan_response_items(response: Mapping[str, object] | None, field: str) ->
     source_param="method",
     suppresses=("R1", "R5"),
     invariant=(
-        "raises AcceptanceCheckError('orphan_sweep_api') on a continuation token that is not a string, on a token "
-        "the provider has already served, and on a page walk that exceeds the bounded page or item ceiling; never "
-        "follows a cycle and never returns an unbounded collection"
+        "raises AcceptanceCheckError('orphan_sweep_api') on a continuation token that is neither None, the empty "
+        "string nor a string (the None and empty-string tests run before any hashing so an unhashable token reaches "
+        "the type test rather than raising TypeError), on a token the provider has already served, and on a page "
+        "walk that exceeds the bounded page or item ceiling; never follows a cycle and never returns an unbounded "
+        "collection"
     ),
     test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_orphan_paged_items_rejects_repeated_and_non_string_continuation_tokens",
-    test_fingerprint="0f8be17cfe7ecea989b7e3fff7908772445c3bdf17c92d6640a4a448a2a5d243",
+    test_fingerprint="53586ce7b79e9fd31c3b58b3b068b96182b06811572bfc8e159649455c094448",
 )
 def _orphan_paged_items(
     method: Callable[..., object],
@@ -252,7 +255,7 @@ def _orphan_paged_items(
         if len(collected) > _ORPHAN_MAX_ITEMS:
             raise AcceptanceCheckError("orphan_sweep_api")
         continuation = response.get(response_token)
-        if continuation in {None, ""}:
+        if continuation is None or continuation == "":
             return collected
         if type(continuation) is not str or continuation in seen_tokens:
             raise AcceptanceCheckError("orphan_sweep_api")
@@ -309,8 +312,10 @@ def _task_definition_owned(
     source_param="indexing_rules",
     suppresses=("R1", "R5"),
     invariant=(
-        "raises AcceptanceCheckError('orphan_sweep_api') on a rule that is not a mapping carrying exactly Name and "
-        "Rule (optionally ModifiedAt), on a duplicate or oversized rule name, on a Rule that is not exactly a "
+        "raises AcceptanceCheckError('orphan_sweep_api') on a destination that is neither None nor one of the "
+        "strings XRay and CloudWatchLogs (the str type test runs before set membership so an unhashable destination "
+        "raises the named error, not TypeError), on a rule that is not a mapping carrying exactly Name and Rule "
+        "(optionally ModifiedAt), on a duplicate or oversized rule name, on a Rule that is not exactly a "
         "Probabilistic mapping, and on a sampling percentage that is not a finite number in 0..100"
     ),
     test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_transaction_search_projection_rejects_malformed_indexing_rules",
@@ -322,7 +327,9 @@ def _transaction_search_projection(
     indexing_rules: list[object],
     spans_log_group_present: bool,
 ) -> dict[str, object]:
-    if destination not in {None, "XRay", "CloudWatchLogs"} or type(spans_log_group_present) is not bool:
+    if destination is not None and (type(destination) is not str or destination not in {"XRay", "CloudWatchLogs"}):
+        raise AcceptanceCheckError("orphan_sweep_api")
+    if type(spans_log_group_present) is not bool:
         raise AcceptanceCheckError("orphan_sweep_api")
     projected_rules: list[dict[str, object]] = []
     seen_names: set[str] = set()
@@ -368,14 +375,21 @@ def _transaction_search_projection(
     source_param="items",
     suppresses=("R1", "R5"),
     invariant=(
-        "counts only items that are mappings whose named field holds one of the expected values; every other "
-        "shape, including a non-mapping item or an absent field, counts as no match and never raises"
+        "counts only items that are mappings whose named field holds a str equal to one of the expected values; "
+        "every other shape - a non-mapping item, an absent field, or a field holding a non-str value including an "
+        "unhashable list or mapping - counts as no match, and the str type test runs before set membership so "
+        "nothing raises"
     ),
 )
 def _named_item_count(items: list[object], *, field: str, expected: frozenset[str]) -> int:
     """Count page items whose ``field`` names one of the expected resources."""
 
-    return sum(isinstance(item, Mapping) and item.get(field) in expected for item in items)
+    matches = 0
+    for item in items:
+        name = item.get(field) if isinstance(item, Mapping) else None
+        if type(name) is str and name in expected:
+            matches += 1
+    return matches
 
 
 @trust_boundary(
@@ -424,18 +438,31 @@ def _expected_resource_policy_count(policies: list[object], *, expected: frozens
 
 @observation_boundary(
     tier=3,
-    source="one CloudWatch metric dimension entry from a ListMetrics page",
-    source_param="item",
+    source="the Dimensions list of one CloudWatch ListMetrics page item",
+    source_param="dimensions",
     suppresses=("R1", "R5"),
     invariant=(
-        "projects the dimension's Name and Value for ordering only; an absent field sorts as None and no shape is "
-        "asserted here, because the comparison against the expected dimension set is the admission test"
+        "returns the dimensions projected to {Name, Value} dicts sorted by (Name, Value) only when the value is a "
+        "list whose every entry is a mapping carrying exactly Name and Value, both str; returns None for every "
+        "other shape - a non-list, a non-mapping entry, an absent or extra key, or a non-str Name or Value - so the "
+        "sort only ever compares str pairs and never raises"
     ),
 )
-def _metric_dimension_sort_key(item: Any) -> tuple[object, object]:
-    """Order one CloudWatch dimension entry for comparison against the inventory."""
+def _metric_dimension_projection(dimensions: object) -> list[dict[str, str]] | None:
+    """Project one metric's dimension list into the shape the inventory pins, or None when it has another shape."""
 
-    return item.get("Name"), item.get("Value")
+    if not isinstance(dimensions, list):
+        return None
+    projected: list[dict[str, str]] = []
+    for dimension in dimensions:
+        if not isinstance(dimension, Mapping) or set(dimension) != {"Name", "Value"}:
+            return None
+        name = dimension["Name"]
+        value = dimension["Value"]
+        if type(name) is not str or type(value) is not str:
+            return None
+        projected.append({"Name": name, "Value": value})
+    return sorted(projected, key=lambda item: (item["Name"], item["Value"]))
 
 
 @observation_boundary(
@@ -445,8 +472,10 @@ def _metric_dimension_sort_key(item: Any) -> tuple[object, object]:
     suppresses=("R1", "R5"),
     invariant=(
         "counts only metrics that are mappings carrying exactly Namespace, MetricName and Dimensions, whose "
-        "namespace and name equal the retained query's and whose dimension list equals the expected set; every "
-        "other shape counts as no match and never raises"
+        "namespace and name equal the retained query's and whose Dimensions project through "
+        "_metric_dimension_projection to exactly the expected sorted {Name, Value} list; every other shape - "
+        "including a dimension entry that is not a mapping, carries an absent or extra key, or holds a non-str "
+        "Name or Value - counts as no match, and no comparison runs on untyped values so nothing raises"
     ),
 )
 def _exact_metric_count(
@@ -463,8 +492,7 @@ def _exact_metric_count(
         and set(metric) == {"Namespace", "MetricName", "Dimensions"}
         and metric.get("Namespace") == namespace
         and metric.get("MetricName") == metric_name
-        and isinstance(metric.get("Dimensions"), list)
-        and sorted(metric["Dimensions"], key=_metric_dimension_sort_key) == expected_dimensions
+        and _metric_dimension_projection(metric.get("Dimensions")) == expected_dimensions
         for metric in metrics
     )
 
@@ -475,19 +503,22 @@ def _exact_metric_count(
     source_param="records",
     suppresses=("R1", "R5"),
     invariant=(
-        "counts only records that are mappings carrying a SamplingRule mapping whose RuleName is one this run "
-        "owns; every other shape counts as no match and never raises"
+        "counts only records that are mappings carrying a SamplingRule mapping whose RuleName is a str equal to one "
+        "this run owns; every other shape - a non-mapping record or rule, an absent RuleName, or a RuleName holding "
+        "a non-str value including an unhashable list or mapping - counts as no match, and the str type test runs "
+        "before set membership so nothing raises"
     ),
 )
 def _sampling_rule_match_count(records: list[object], *, expected: frozenset[str]) -> int:
     """Count surviving X-Ray sampling rules this run is responsible for."""
 
-    return sum(
-        isinstance(record, Mapping)
-        and isinstance(record.get("SamplingRule"), Mapping)
-        and record["SamplingRule"].get("RuleName") in expected
-        for record in records
-    )
+    matches = 0
+    for record in records:
+        rule = record.get("SamplingRule") if isinstance(record, Mapping) else None
+        name = rule.get("RuleName") if isinstance(rule, Mapping) else None
+        if type(name) is str and name in expected:
+            matches += 1
+    return matches
 
 
 @observation_boundary(
@@ -515,17 +546,19 @@ def _observed_trace_ids(traces: list[object]) -> list[str]:
     source_param="response",
     suppresses=("R1", "R5"),
     invariant=(
-        "raises AcceptanceCheckError('orphan_sweep_api') on any destination outside the closed set of None, XRay "
-        "and CloudWatchLogs; never projects an unrecognised destination into the transaction-search baseline"
+        "raises AcceptanceCheckError('orphan_sweep_api') on any Destination that is neither None nor one of the "
+        "strings XRay and CloudWatchLogs (the str type test runs before set membership so an unhashable value raises "
+        "the named error, not TypeError); never projects an unrecognised destination into the transaction-search "
+        "baseline"
     ),
     test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_trace_segment_destination_rejects_an_unrecognised_destination",
-    test_fingerprint="559978f56b5a94e8c586ccfd2087f0ec4885a5cae2344543f8f24ffe6c73ad36",
+    test_fingerprint="c66e9f195dc2bdffc8e27594ddd683b97629c88c546d67e0a483a85455df7658",
 )
 def _trace_segment_destination(response: Mapping[str, object]) -> object:
     """Admit the X-Ray trace segment destination the account currently reports."""
 
     destination = response.get("Destination")
-    if destination not in {None, "XRay", "CloudWatchLogs"}:
+    if destination is not None and (type(destination) is not str or destination not in {"XRay", "CloudWatchLogs"}):
         raise AcceptanceCheckError("orphan_sweep_api")
     return destination
 
