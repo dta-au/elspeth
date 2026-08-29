@@ -67,6 +67,58 @@ is a working document under the normal delivery posture.
   adding the skip assertions (int, `None`, nested mapping, absent key) to the
   named test, which then rotated the fingerprint. Same both-arms rule as the
   frozen-input pins in W2 brief item 15, applied to boundary metadata.
+- **2026-08-29 — tier_model R5 carries a HARD-CODED per-file exemption map in
+  the rule (`_R5_NAMED_BOUNDARY_CONTEXTS`), so "the identical `isinstance`
+  chain fires in my file but not in that one" is not evidence of a structural
+  exemption you can reproduce.** Measured in B61 on `web/sessions/_auto_title.py`,
+  whose `_auto_title_exception_class` runs four `isinstance(exc, …)` arms that
+  report ZERO findings while the structurally identical
+  `_guided_full_failure_code` in `routes/composer/guided_plan.py` reports seven.
+  A minimal probe file reproduced the chain and DID fire, which rules out any
+  general "exception dispatch is exempt" behaviour. The cause is
+  `TierModelVisitor._is_allowed_r5_context` → `_is_named_tier3_boundary_context`,
+  which looks the CURRENT FUNCTION'S NAME up in a `ClassVar[dict[str,
+  frozenset[str]]]` keyed by scan-root-relative file path
+  (`elspeth-lints/.../trust_tier/tier_model/rule.py`, ~line 418); the map
+  already lists `web/sessions/_auto_title.py: {"_auto_title_exception_class",
+  "maybe_auto_title_session"}` alongside `web/app.py`, `web/auth/oidc.py`,
+  `web/composer/audit.py`, `web/composer/llm_response_parsing.py` and a dozen
+  others. Two consequences for a burn-down lane: (a) do not spend time hunting
+  for the code shape that "clears" such a site — diff the file against that map
+  first; (b) that map is rule-owned and operator-maintained, so adding your own
+  function to it is gaming the gate, not fixing it. The other three R5
+  contexts (`_is_tier1_frozen_dataclass_post_init_guard`,
+  `_is_pydantic_before_validator`, `_is_fastapi_route_handler` — the last
+  requires a `web/` path AND a FastAPI method decorator) ARE structural and
+  reproducible.
+- **2026-08-29 — `isinstance(x, PayloadStore)` was the last cluster of
+  `runtime_checkable` Protocol admission gates in `src/elspeth`; all four are
+  now gone and `git grep 'isinstance(.*PayloadStore)' -- src` is empty.** They
+  sat in `web/sessions/guided_payloads.py` (×2) and `web/sessions/guided_replay.py`
+  (×1) plus a `payload_store is None or not isinstance(...)` pair, each raising
+  `TypeError`/`AuditIntegrityError` as if it were a control. Per ADR-032 it was
+  not one: `PayloadStore` declares four methods, so any object with those names
+  passes and a dynamic-attribute implementation is rejected. Deleting them
+  removes theatre, not defence — the real custody control in every case is the
+  content-address round trip that follows (`store` → `retrieve` →
+  `hmac.compare_digest`, or in `load_guided_json_payload` the re-derivation of
+  the SHA-256 from the retrieved bytes). Keep the `payload_store is None`
+  half where the parameter is `PayloadStore | None`: that one is a real
+  fail-closed gate. If you add a new store seam, do not reintroduce the
+  Protocol `isinstance` — annotate nominally and prove the bytes.
+- **2026-08-29 — the `deep_freeze` trap covers `PreparedGuidedAuditRow.envelope`
+  and its NESTED values, which is what `validate_guided_audit_payload_references`
+  reads.** `__post_init__` runs `freeze_fields(self, "envelope")`, so
+  `row.envelope["invocation"]` is a `mappingproxy` on EVERY row, including
+  freshly built ones — measured by constructing a real
+  `PreparedGuidedAuditRow`, not inferred from the builder, which hands
+  `__post_init__` a plain dict. `type(invocation) is dict` would therefore be
+  permanently False; the correct form names `deep_freeze`'s output pair,
+  `type(invocation) not in (dict, MappingProxyType)`, exactly as the dataclass's
+  own envelope guard does. Polarity saved this one: the site is a reject-gate
+  (`not in …` → raise), so the wrong form would have failed loudly rather than
+  silently skipping every audit row — but the same value read behind an
+  accept-gate elsewhere would go quiet.
 
 - **2026-08-29 — POLARITY decides how bad a `type(x) is dict` freeze trap is,
   and an accept-gate that GATES A CONTROL BLOCK is fail-OPEN, not a
