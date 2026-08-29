@@ -28,7 +28,7 @@ import json
 import sys
 from calendar import monthrange
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, ClassVar
@@ -173,6 +173,7 @@ class CheckResult:
     layer_warnings: list[Finding]
     exceeded_file_rules: list[PerFileRule]
     budget_violations: list[AllowlistBudgetViolation]
+    stale_named_boundary_contexts: list[NamedBoundaryContextResolution] = field(default_factory=list)
 
     @property
     def has_errors(self) -> bool:
@@ -185,7 +186,88 @@ class CheckResult:
             or self.unused_file_rules
             or self.exceeded_file_rules
             or self.budget_violations
+            or self.stale_named_boundary_contexts
         )
+
+
+@dataclass(frozen=True)
+class NamedBoundaryContextResolution:
+    """One ``_R5_NAMED_BOUNDARY_CONTEXTS`` entry resolved against a source tree."""
+
+    file_path: str
+    qualified_name: str
+    definition_count: int
+    file_exists: bool
+
+    @property
+    def key(self) -> str:
+        return f"{self.file_path}::{self.qualified_name}"
+
+    @property
+    def status(self) -> str:
+        if not self.file_exists:
+            return "missing_file"
+        if self.definition_count == 0:
+            return "missing_definition"
+        if self.definition_count > 1:
+            return "ambiguous_definition"
+        return "ok"
+
+    @property
+    def is_stale(self) -> bool:
+        """A stale entry grants nothing, or grants more than one body."""
+        return self.status != "ok"
+
+
+def _qualified_definition_paths(tree: ast.Module) -> list[str]:
+    """Return every function definition in ``tree`` as its ``symbol_stack`` path."""
+    paths: list[str] = []
+
+    def walk(node: ast.AST, stack: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                inner = [*stack, child.name]
+                if not isinstance(child, ast.ClassDef):
+                    paths.append(".".join(inner))
+                walk(child, inner)
+            else:
+                walk(child, stack)
+
+    walk(tree, [])
+    return paths
+
+
+def resolve_named_boundary_contexts(root: Path) -> list[NamedBoundaryContextResolution]:
+    """Resolve every judge-free R5 exemption map entry against the tree under ``root``.
+
+    ``root`` is the scan root the map's file keys are relative to (``src/elspeth``).
+    The same resolution backs the unit-test pin and the whole-tree staleness
+    diagnostic so the two can never disagree about what "live" means.
+    """
+    resolutions: list[NamedBoundaryContextResolution] = []
+    for file_path, qualified_names in sorted(TierModelVisitor._R5_NAMED_BOUNDARY_CONTEXTS.items()):
+        source_path = root / file_path
+        counts: dict[str, int] = {}
+        file_exists = source_path.is_file()
+        if file_exists:
+            tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+            for path in _qualified_definition_paths(tree):
+                counts[path] = counts.get(path, 0) + 1
+        for qualified_name in sorted(qualified_names):
+            resolutions.append(
+                NamedBoundaryContextResolution(
+                    file_path=file_path,
+                    qualified_name=qualified_name,
+                    definition_count=counts.get(qualified_name, 0),
+                    file_exists=file_exists,
+                )
+            )
+    return resolutions
+
+
+def _named_boundary_map_applies(root: Path) -> bool:
+    """The map is keyed relative to ``src/elspeth``; elsewhere it grants nothing to check."""
+    return root.name == "elspeth" and root.parent.name == "src"
 
 
 # =============================================================================
@@ -413,26 +495,34 @@ class TierModelVisitor(ast.NodeVisitor):
     )
     # CLOSED LIST: audited R5b boundary-normalization helpers from
     # docs/audit/2026-05-19-cicd-allowlist-audit.md and findings/fp-analyst.md.
-    # Do not replace this with a broad ``web/**`` or ``plugins/**`` glob; new
-    # contexts need their own audit evidence and regression tests.
+    # Keys are scan-root-relative file paths; values are QUALIFIED definition
+    # paths (``Class.method`` / ``outer.inner``, exactly ``symbol_stack``), so
+    # a same-named method on another class or a future function reusing a
+    # retired name cannot inherit the exemption. Every entry must resolve to
+    # exactly one live definition: ``resolve_named_boundary_contexts`` is
+    # pinned by tests/unit/elspeth_lints/test_tier_model_named_boundary_map.py
+    # and re-checked on every whole-tree run, where a stale entry is an
+    # ERROR like a stale allowlist entry. Functions that MOVE to another file
+    # are not successor-included: their findings surface and go through the
+    # allowlist like any other site. Do not replace this with a broad
+    # ``web/**`` or ``plugins/**`` glob; new contexts need their own audit
+    # evidence and regression tests.
     _R5_NAMED_BOUNDARY_CONTEXTS: ClassVar[dict[str, frozenset[str]]] = {
         "engine/dependency_resolver.py": frozenset({"_load_depends_on"}),
-        "plugins/infrastructure/clients/retrieval/azure_search.py": frozenset({"_parse_response"}),
-        "plugins/infrastructure/clients/retrieval/chroma.py": frozenset({"_parse_and_build_chunks"}),
-        "plugins/transforms/azure/prompt_shield.py": frozenset({"_analyze_prompt"}),
-        "web/app.py": frozenset({"_settings_from_env"}),
+        "plugins/infrastructure/clients/retrieval/azure_search.py": frozenset({"AzureSearchProvider._parse_response"}),
+        "plugins/infrastructure/clients/retrieval/chroma.py": frozenset({"ChromaSearchProvider._parse_and_build_chunks"}),
+        "plugins/transforms/azure/prompt_shield.py": frozenset({"AzurePromptShield._analyze_prompt"}),
         "web/auth/local.py": frozenset({"_required_visible_string_claim"}),
         "web/auth/oidc.py": frozenset(
             {
-                "_get_jwk_algorithm",
-                "_get_token_algorithm",
-                "_validate_discovery_document",
-                "_validate_jwks_document",
-                "get_user_info",
+                "JWKSTokenValidator._get_jwk_algorithm",
+                "JWKSTokenValidator._get_token_algorithm",
+                "JWKSTokenValidator._validate_discovery_document",
+                "JWKSTokenValidator._validate_jwks_document",
+                "OIDCAuthProvider.get_user_info",
                 "optional_profile_claim",
             }
         ),
-        "web/composer/_semantic_validator.py": frozenset({"_is_config_probe_exception"}),
         "web/composer/audit.py": frozenset(
             {
                 "_normalize_audit_payload",
@@ -468,24 +558,27 @@ class TierModelVisitor(ast.NodeVisitor):
                 "token_usage_from_response",
             }
         ),
-        "web/composer/recipes.py": frozenset({"_coerce_slot"}),
+        # The bare names ``provider`` and ``_apply`` were nested closures; the
+        # qualified keys name the two ``provider`` closures the bare key
+        # covered (measured 2026-08-29, elspeth-0bd4fb6042).
         "web/composer/redaction.py": frozenset(
             {
-                "_apply",
+                "_build_substitute_provider.provider",
+                "_build_value_provider.provider",
                 "_count_sensitive",
                 "_has_sensitive",
                 "_is_descendable",
                 "_redact_via_policy",
                 "_redact_via_schema",
+                "_redact_via_schema._apply",
                 "_walk_type",
-                "provider",
                 "walk_model_schema",
             }
         ),
         "web/composer/service.py": frozenset(
             {
-                "_cached_runtime_preflight",
-                "_compose_loop",
+                "ComposerServiceImpl._cached_runtime_preflight",
+                "ComposerServiceImpl._compose_loop",
                 # _dispatch_tool_batch was extracted from _compose_loop on
                 # 2026-05-23 (compose-loop-decomp refactor). The Tier-3
                 # boundary that validates the LLM's tool_call.function.arguments
@@ -493,25 +586,28 @@ class TierModelVisitor(ast.NodeVisitor):
                 # decoded_arguments, dict):` — moved with the code. Same
                 # semantics, same boundary, new method name: this is a
                 # 1:1 successor inclusion, not a list extension.
-                "_dispatch_tool_batch",
-                "_litellm_completion_supports_param",
-                "_matching_interpretation_placeholder_count",
-                "_optional_ancestor_present",
-                "_try_apply_freeform_recipe_intent",
-                "_validate_advisor_arguments",
+                "ComposerServiceImpl._dispatch_tool_batch",
+                "ComposerServiceImpl._validate_advisor_arguments",
             }
         ),
         "web/composer/source_inspection.py": frozenset({"_facts_from_objects", "_inspect_json", "_inspect_jsonl"}),
+        # The bare key ``from_dict`` covered six same-named classmethods; the
+        # qualified keys name each one the bare key granted (measured
+        # 2026-08-29, elspeth-0bd4fb6042). Narrowing needs per-site evidence.
         "web/composer/state.py": frozenset(
             {
+                "CompositionState.from_dict",
+                "EdgeSpec.from_dict",
+                "NodeSpec.from_dict",
+                "OutputSpec.from_dict",
+                "PipelineMetadata.from_dict",
+                "SourceSpec.from_dict",
                 "_coalesce_branch_connections",
                 "_coalesce_branch_names",
                 "_declared_input_fields_option",
                 "_is_config_probe_exception",
-                "_is_static_contract_probe_exception",
                 "_serialize_branches",
                 "_validate_web_scrape_abuse_contact_not_reserved",
-                "from_dict",
             }
         ),
         "web/execution/fanout_guard.py": frozenset(
@@ -527,18 +623,16 @@ class TierModelVisitor(ast.NodeVisitor):
         ),
         "web/execution/preflight.py": frozenset({"resolve_runtime_yaml_paths"}),
         "web/execution/routes.py": frozenset({"_run_integrity_http"}),
-        "web/execution/schemas.py": frozenset({"_enforce_data_type"}),
-        "web/execution/service.py": frozenset({"_on_pipeline_done", "_run_pipeline", "_sanitize_error_for_client"}),
-        "web/sessions/_auto_title.py": frozenset({"_auto_title_exception_class", "maybe_auto_title_session"}),
-        "web/sessions/routes.py": frozenset(
+        "web/execution/schemas.py": frozenset({"RunEvent._enforce_data_type"}),
+        "web/execution/service.py": frozenset(
             {
-                "_composer_persisted_validation",
-                "_dispatch_guided_respond",
-                "_extract_runtime_model_snapshot",
-                "_state_data_from_composer_state",
+                "ExecutionServiceImpl._on_pipeline_done",
+                "ExecutionServiceImpl._run_pipeline",
+                "_sanitize_error_for_client",
             }
         ),
-        "web/sessions/service.py": frozenset({"_patch_llm_transform_prompt", "_unwrap_envelope"}),
+        "web/sessions/_auto_title.py": frozenset({"_auto_title_exception_class", "maybe_auto_title_session"}),
+        "web/sessions/service.py": frozenset({"SessionServiceImpl._unwrap_envelope", "_patch_llm_transform_prompt"}),
         "web/sessions/telemetry.py": frozenset({"observed_value"}),
     }
 
@@ -1326,7 +1420,7 @@ class TierModelVisitor(ast.NodeVisitor):
         current_function = self._current_function()
         if current_function is None:
             return False
-        return current_function.name in self._R5_NAMED_BOUNDARY_CONTEXTS.get(self.file_path, frozenset())
+        return ".".join(self.symbol_stack) in self._R5_NAMED_BOUNDARY_CONTEXTS.get(self.file_path, frozenset())
 
     def _containing_direct_assert_test(self, node: ast.Call) -> ast.Assert | None:
         """Return the assert whose direct test conjunct contains ``node``."""
@@ -2958,6 +3052,11 @@ def format_stale_entry_text(entry: AllowlistEntry) -> str:
     return base
 
 
+def format_stale_named_boundary_context_text(resolution: NamedBoundaryContextResolution) -> str:
+    """Format a stale ``_R5_NAMED_BOUNDARY_CONTEXTS`` entry for text output."""
+    return f"\n  Key: {resolution.key}\n  Status: {resolution.status}\n  Definitions: {resolution.definition_count}"
+
+
 def format_expired_entry_text(entry: AllowlistEntry) -> str:
     """Format an expired allowlist entry for text output."""
     return f"\n  Key: {entry.key}\n  Owner: {entry.owner}\n  Expired: {entry.expires}"
@@ -2973,6 +3072,7 @@ def report_json(
     layer_warnings: list[Finding] | None = None,
     exceeded_file_rules: list[PerFileRule] | None = None,
     budget_violations: list[AllowlistBudgetViolation] | None = None,
+    stale_named_boundary_contexts: list[NamedBoundaryContextResolution] | None = None,
 ) -> str:
     """Generate JSON report."""
     result: dict[str, Any] = {
@@ -2993,6 +3093,11 @@ def report_json(
         "stale_allowlist_entries": [{"key": e.key, "owner": e.owner, "reason": e.reason} for e in stale_entries],
         "expired_allowlist_entries": [{"key": e.key, "owner": e.owner, "expires": str(e.expires)} for e in expired_entries],
     }
+    if stale_named_boundary_contexts:
+        result["stale_named_boundary_contexts"] = [
+            {"key": resolution.key, "status": resolution.status, "definitions": resolution.definition_count}
+            for resolution in stale_named_boundary_contexts
+        ]
     if expired_file_rules:
         result["expired_file_rules"] = [
             {"pattern": r.pattern, "rules": r.rules, "reason": r.reason, "expires": str(r.expires)} for r in expired_file_rules
@@ -3099,6 +3204,10 @@ def collect_check_result(
         unused_file_rules = allowlist.get_unused_rules() if allowlist.fail_on_stale else []
         exceeded_file_rules = allowlist.get_exceeded_rules()
 
+    stale_named_boundary_contexts: list[NamedBoundaryContextResolution] = []
+    if not files and _named_boundary_map_applies(resolved_root):
+        stale_named_boundary_contexts = [resolution for resolution in resolve_named_boundary_contexts(resolved_root) if resolution.is_stale]
+
     return CheckResult(
         allowlist_path=resolved_allowlist_path,
         violations=violations,
@@ -3110,6 +3219,7 @@ def collect_check_result(
         layer_warnings=layer_warnings,
         exceeded_file_rules=exceeded_file_rules,
         budget_violations=allowlist.get_budget_violations(),
+        stale_named_boundary_contexts=stale_named_boundary_contexts,
     )
 
 
@@ -3176,6 +3286,15 @@ def _allowlist_diagnostics_to_lints(result: CheckResult) -> list[LintFinding]:
                 entry.source_file,
                 message=f"Stale tier-model allowlist entry: {entry.key}",
                 fingerprint_payload=f"stale:{entry.key}",
+            )
+        )
+    for resolution in result.stale_named_boundary_contexts:
+        findings.append(
+            _diagnostic_finding(
+                Path(__file__),
+                "",
+                message=f"Stale tier-model named-boundary map entry ({resolution.status}): {resolution.key}",
+                fingerprint_payload=f"stale-named-boundary:{resolution.key}",
             )
         )
     for entry in result.expired_entries:
@@ -3495,6 +3614,7 @@ def run_check(args: argparse.Namespace) -> int:
                 result.layer_warnings,
                 result.exceeded_file_rules,
                 result.budget_violations,
+                result.stale_named_boundary_contexts,
             )
         )
     else:
@@ -3532,6 +3652,14 @@ def run_check(args: argparse.Namespace) -> int:
             print("=" * 60)
             for e in result.stale_entries:
                 print(format_stale_entry_text(e))
+
+        if result.stale_named_boundary_contexts:
+            print(f"\n{'=' * 60}")
+            print(f"STALE NAMED-BOUNDARY MAP ENTRIES: {len(result.stale_named_boundary_contexts)}")
+            print("(_R5_NAMED_BOUNDARY_CONTEXTS entries that resolve to no single live definition - remove them)")
+            print("=" * 60)
+            for resolution in result.stale_named_boundary_contexts:
+                print(format_stale_named_boundary_context_text(resolution))
 
         if result.expired_entries:
             print(f"\n{'=' * 60}")

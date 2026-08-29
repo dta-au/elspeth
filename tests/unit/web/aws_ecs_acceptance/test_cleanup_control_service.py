@@ -195,6 +195,28 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
                 now=lambda: datetime(2026, 7, 14, 1, 3, tzinfo=UTC),
             )
     record_path.write_text(json.dumps(record))
+    wrongly_bound_receipt = json.loads(json.dumps(receipt))
+    wrongly_bound_receipt["candidate_image_digest"] = "sha256:" + "e" * 64
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_binding"):
+        acceptance.receipt_store(
+            manifest_path,
+            scenario_id="B",
+            kind="compatibility-record",
+            subject_id=receipt["record_sha256"],  # type: ignore[arg-type]
+            receipt_bytes=json.dumps(wrongly_bound_receipt).encode(),
+            now=lambda: datetime(2026, 7, 14, 1, 4, tzinfo=UTC),
+        )
+    unbound_receipt = json.loads(json.dumps(receipt))
+    del unbound_receipt["expires_at"]
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_schema"):
+        acceptance.receipt_store(
+            manifest_path,
+            scenario_id="B",
+            kind="compatibility-record",
+            subject_id=receipt["record_sha256"],  # type: ignore[arg-type]
+            receipt_bytes=json.dumps(unbound_receipt).encode(),
+            now=lambda: datetime(2026, 7, 14, 1, 4, tzinfo=UTC),
+        )
     receipt_hash = acceptance.receipt_store(
         manifest_path,
         scenario_id="B",
