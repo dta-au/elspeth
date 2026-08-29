@@ -3,6 +3,9 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
 import { useSessionStore } from "@/stores/sessionStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
+import { resetStore } from "@/test/store-helpers";
 import { makeComposition } from "@/test/composerFixtures";
 import { PipelineSpecView } from "./PipelineSpecView";
 
@@ -12,6 +15,11 @@ describe("PipelineSpecView", () => {
       activeSessionId: "session-1",
       compositionState: null,
     });
+    resetStore(usePreferencesStore);
+    // OptionRows (rendered per row in the Spec tab) now reads the catalog
+    // store's schema cache; reset it so no test's seeded schema leaks into a
+    // later one.
+    resetStore(usePluginCatalogStore);
   });
 
   it("renders current metadata and the existing plain-language gloss first", () => {

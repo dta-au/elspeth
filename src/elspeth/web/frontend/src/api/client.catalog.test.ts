@@ -41,6 +41,7 @@ describe("api/client plugin catalog snapshot metadata", () => {
         plugin_type: "source",
         description: "CSV source",
         json_schema: { type: "object" },
+        knob_schema: { fields: [] },
       }), {
         status: 200,
         headers: { "content-type": "application/json", [SNAPSHOT_HEADER]: "snapshot-c" },

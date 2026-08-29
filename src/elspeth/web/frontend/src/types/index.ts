@@ -7,6 +7,7 @@
 // ============================================================================
 
 import type { AuditCharacteristicFlag } from "../components/catalog/auditCharacteristics";
+import type { FieldTier } from "./guided";
 import type { FailedTurn } from "./recovery";
 
 // ── Auth ────────────────────────────────────────────────────────────────────
@@ -432,12 +433,22 @@ export interface PluginSummary {
   audit_characteristics: AuditCharacteristicFlag[];
 }
 
+/** One lowered composer knob as the inspector needs it — the catalog side of
+ *  the same lowered field the guided form reads as KnobField (types/guided.ts).
+ *  `tier` is REQUIRED here: the catalog lowering sets it on every field
+ *  (knob_schema.py _attach_tier); only the guided-turn projection has a
+ *  pre-tier durable story. */
+export type CatalogKnobField = { name: string; tier: FieldTier };
+
 /** Detailed plugin schema info including configuration JSON Schema. */
 export interface PluginSchemaInfo {
   name: string;
   plugin_type: "source" | "transform" | "sink";
   description: string;
   json_schema: Record<string, unknown>;
+  /** Lowered composer knob schema — already on the wire (catalog/schemas.py),
+   *  now typed so pluginCatalogStore exposes it to the inspector. */
+  knob_schema: { fields: CatalogKnobField[] };
 }
 
 export type PluginPolicyCapability = "llm" | "prompt_shield" | "content_safety";

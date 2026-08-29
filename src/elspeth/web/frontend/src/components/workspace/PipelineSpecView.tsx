@@ -8,6 +8,7 @@ interface SpecRow {
   id: string;
   kind: string;
   plugin: string | null;
+  pluginKind: "source" | "transform" | "sink";
   routing: Record<string, unknown>;
   options: Record<string, unknown>;
   description: string | null;
@@ -118,7 +119,11 @@ function SpecSection({ name, rows }: SpecSectionProps): JSX.Element {
                     </div>
                   ))}
                 </dl>
-                <OptionRows options={row.options} ariaLabel={`${singular} ${row.id} settings`} />
+                <OptionRows
+                  options={row.options}
+                  ariaLabel={`${singular} ${row.id} settings`}
+                  plugin={row.plugin === null ? null : { kind: row.pluginKind, name: row.plugin }}
+                />
               </article>
             );
           })}
@@ -135,6 +140,7 @@ function sourceRows(state: CompositionState): SpecRow[] {
       id,
       kind: "source",
       plugin: source.plugin,
+      pluginKind: "source",
       routing: {
         on_success: source.on_success ?? null,
         on_validation_failure: source.on_validation_failure ?? null,
@@ -149,6 +155,7 @@ function nodeRows(state: CompositionState): SpecRow[] {
     id: node.id,
     kind: node.node_type,
     plugin: node.plugin,
+    pluginKind: "transform",
     // Project every field that describes how a node is WIRED, for every node
     // kind (elspeth-59684fb0c8). The routing block drops nulls, so a node
     // carrying none of these is unaffected and gains no empty rows.
@@ -203,6 +210,7 @@ function outputRows(state: CompositionState): SpecRow[] {
     id: output.name,
     kind: "output",
     plugin: output.plugin,
+    pluginKind: "sink",
     routing: {
       on_write_failure: output.on_write_failure ?? null,
     },

@@ -44,6 +44,7 @@ const FLAT_SCHEMA: PluginSchemaInfo = {
     },
     required: ["path"],
   },
+  knob_schema: { fields: [] },
 };
 
 // Minimal Pydantic-shaped discriminated union (real LLM transform shape,
@@ -83,6 +84,7 @@ const DISCRIMINATED_SCHEMA: PluginSchemaInfo = {
       },
     },
   },
+  knob_schema: { fields: [] },
 };
 
 // Fixtures for the detail-level describe block below (elspeth-8555a6a9e0).
@@ -101,6 +103,7 @@ const CARD_SCHEMA: PluginSchemaInfo = {
     properties: { profile: { type: "string" } },
     required: ["profile"],
   },
+  knob_schema: { fields: [] },
 };
 
 describe("PluginCard — collapsed header", () => {

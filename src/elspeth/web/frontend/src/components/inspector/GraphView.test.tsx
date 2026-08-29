@@ -5,6 +5,9 @@ import userEvent from "@testing-library/user-event";
 import { GraphView } from "./GraphView";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
+import { resetStore } from "@/test/store-helpers";
 import type { CompositionProposal, CompositionState, NodeSpec, EdgeSpec } from "@/types/index";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import { projectValidationWorkspaceStatus } from "@/components/workspace/workspaceStatus";
@@ -283,6 +286,11 @@ describe("GraphView", () => {
     // order unless it is reset here.
     useSessionStore.setState({ selectedNodeId: null } as never);
     useExecutionStore.setState({ validationResult: null } as never);
+    resetStore(usePreferencesStore);
+    // OptionRows (rendered inside the node config panel) now reads the
+    // catalog store's schema cache; reset it so no test's seeded schema
+    // leaks into a later one.
+    resetStore(usePluginCatalogStore);
     document.documentElement.removeAttribute("style");
   });
 
@@ -359,8 +367,8 @@ describe("GraphView", () => {
     const pluginLine = within(panel).getByText("LLM");
     expect(pluginLine).toBeInTheDocument();
     expect(pluginLine).toHaveAttribute("title", "llm");
-    // "prompt" and "output_schema" are not in ESSENTIAL_OPTION_KEYS, so they
-    // land under "Advanced settings" and are relabeled by optionLabel's
+    // "prompt" and "output_schema" are not in FALLBACK_VISIBLE_OPTION_KEYS, so
+    // they land under "Advanced settings" and are relabeled by optionLabel's
     // titleCaseLabel fallback like every other row (copy register: no
     // internal identifiers in visible text) — elspeth-a6ea581e8a. The
     // NESTED key `fields` inside `output_schema` gets the same treatment
