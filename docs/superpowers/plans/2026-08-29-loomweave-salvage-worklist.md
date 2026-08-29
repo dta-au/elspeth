@@ -50,7 +50,7 @@ decision in ADR-043 turns on exactly that.
 Re-run the transcript forensics after the next delivery wave with the fixed
 extractor in place and B1/B2 addressed:
 `scripts/loomweave_usage_forensics.py` (copied from the lane's scratchpad on
-2026-08-29; read-only over `~/.claude/projects/-home-john-elspeth`) reports
+2026-08-29; read-only over the agent-memory directory) reports
 Loomweave calls per session class (main / lane / subagent by type),
 empty-result and error rates per tool, and follow-through.
 Success: lane and Explore agents make Loomweave calls for the approved

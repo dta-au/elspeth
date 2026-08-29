@@ -8,7 +8,7 @@
 
 **Tech Stack:** FastAPI + SQLAlchemy + Pydantic v2 (backend), React 18 + Zustand + vitest/@testing-library (frontend, `src/elspeth/web/frontend`), pytest (backend).
 
-**Spec:** Design review artifact https://claude.ai/code/artifact/8ec11b6b-1308-4188-87c6-2c4f78f1f4fb and Filigree epic `elspeth-cd8abcba3f` (children: `elspeth-9c11df65f8` switch, `elspeth-9cca900d41` FieldTier, `elspeth-a6ea581e8a` node inspector, `elspeth-b9ebdf9011` Spec tab, `elspeth-27efd1e801` ValidationResult, `elspeth-0bfd019f68` dead parameter). Waves 2–3 are roadmapped at the end and get their own plans.
+**Spec:** Design review (session artifact, not in the repo) and Filigree epic `elspeth-cd8abcba3f` (children: `elspeth-9c11df65f8` switch, `elspeth-9cca900d41` FieldTier, `elspeth-a6ea581e8a` node inspector, `elspeth-b9ebdf9011` Spec tab, `elspeth-27efd1e801` ValidationResult, `elspeth-0bfd019f68` dead parameter). Waves 2–3 are roadmapped at the end and get their own plans.
 
 ## Global Constraints
 
@@ -1413,7 +1413,7 @@ Expected: all green.
 - [ ] **Step 2: Lint corpus diff**
 
 ```bash
-ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth > /tmp/claude-1000/-home-john-elspeth/lints-after.txt; wc -l /tmp/claude-1000/-home-john-elspeth/lints-after.txt
+ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules all --root src/elspeth > /tmp/lints-after.txt; wc -l /tmp/lints-after.txt
 ```
 
 Compare the finding count against the pre-change capture taken before Task 1 (capture it then with the same command to `lints-before.txt`). Expected: identical counts; `diff` shows no added findings. `knob_schema.py`'s `_attach_tier` reads through `_composer_extras` + membership + index exactly as the other extras readers do (no `getattr`), so the attribute-contracts and masquerade gates are untouched.

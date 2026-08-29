@@ -38,7 +38,7 @@ staging e2e, parity name-presence gate (`scripts/cicd/parity_harness.py`).
 conversation record (sink schema modes: `fixed`=exact, `flexible`=at-least-these,
 `observed`=infer — contracts/schema.py:458-466; fixed-mode firewall semantics —
 guarantees.py:421-427; step-2 information poverty — stage_transitions.py:654
-`_candidate_fields`). Operator (John) directed the inversion 2026-08-19.
+`_candidate_fields`). The maintainer directed the inversion 2026-08-19.
 
 ## Global Constraints
 

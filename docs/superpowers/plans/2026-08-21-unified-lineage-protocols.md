@@ -21,10 +21,10 @@ harness (`run_scenario_case`, `StableRunProjection`), git on the shared `release
 checkout.
 
 **Spec:** docs/superpowers/specs/2026-08-21-barrier-scopes-full-nesting-spec.md
-(rev 3.2 — rulings 1–28 final; §11 is the frozen-oracle authority). Scout inputs (READ
-them, they carry the verified line numbers and classifications):
-docs/superpowers/plans/2026-08-21-unified-lineage-inputs/consumer-roster.md,
-…/fixture-oracle.md, …/test-harness.md.
+(rev 3.2 — rulings 1–28 final; §11 is the frozen-oracle authority). Scout inputs (the
+consumer-roster, fixture-oracle and test-harness inventories under
+`2026-08-21-unified-lineage-inputs/`) were retired from the tree once the WS1
+flip landed; see git history.
 
 ## Global Constraints
 
@@ -68,7 +68,7 @@ docs/superpowers/plans/2026-08-21-unified-lineage-inputs/consumer-roster.md,
 landed, before the WS1b flip commit — WS1b Tasks 7–12 — begins; WS1a's slices are
 behaviour-neutral prep, so the stable projections are unchanged through them):
 
-1. WS0 lands (docs/superpowers/plans/2026-08-21-unified-lineage-ws0-corrections.md).
+1. WS0 lands (the ws0-corrections plan, landed and retired from the tree).
 2. The new NESTED differential fixtures land and are classified FROZEN (fixture-oracle
    scout Risk 2: `sequential-nested-fork-coalesce` EXISTS but is sequential — two
    depth-1 regions in series; §4.1a rows 2–4 and depth 2+ have ZERO substrate today).
@@ -140,7 +140,7 @@ Run all steps; a slice is not closed until all pass.
    SCRATCH=/tmp/claude-1000/tt-baseline; rm -rf "$SCRATCH"; mkdir -p "$SCRATCH"
    git archive HEAD | tar -x -C "$SCRATCH"          # BEFORE the slice's commits: use the pre-slice HEAD
    (cd "$SCRATCH" && ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
-     /home/john/elspeth/.venv/bin/elspeth-lints check --rules all --root src/elspeth \
+     "$REPO/.venv/bin/elspeth-lints" check --rules all --root src/elspeth \
      > /tmp/claude-1000/tt-before.txt); true
    # after the slice's commits (clean tree at the new HEAD):
    ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
