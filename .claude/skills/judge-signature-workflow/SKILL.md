@@ -106,10 +106,24 @@ bundles must be re-staged.
 5. **`stage_status`** — verify the source binding, refuse stale bundles, then
    summarise the bundle (source identity, per-lane counts, preview outcomes,
    and which justify actions still lack a rationale) and emit the
-   **paste-ready operator `sign-bundle` command**. Arg: `bundle_id`.
+   **paste-ready operator `sign-bundle` command** plus `sign_bundle_plan`,
+   which prices it. Arg: `bundle_id`.
 6. **`stage_rekey`** — for a key roll: enumerate currently-valid judge-gated
    entries and flag broken ones into a rekey bundle, recording env-var **names**
    only, never key bytes. Args: `old_key_env`, `new_key_env`.
+
+Every one of those tools emits `sign_bundle_command` (the whole-bundle form) and
+`sign_bundle_plan`, both derived from the bundle's own contents.
+`sign_bundle_plan.per_lane` lists each staged lane cheapest-first with its action
+count, its **judge-call** count, and a `--lanes`-scoped command that fires only
+that lane. Judge calls come from `justify` and `drift_repair` alone — `rotation`
+and `stale_delete` are mechanical — so a lane's price is not its size. Any scope
+over ten judge calls also renders `--continue-on-block`, because one judged BLOCK
+would otherwise end an unattended run. Read `sign_bundle_plan.notes` before
+handing anything over: it flags a bundle whose justify actions carry no
+`draft_rationale`, which spends a judge call per action on a generic placeholder
+and is near-certain to BLOCK. Annotate first. Every rendered command carries
+`--dry-run`, so the counts are what the scope costs once that is dropped.
 
 Then hand the operator the `bundle_id` (or the command `stage_status` printed).
 `stage_rekey.keys`/`broken_keys` are an advisory *preview of scope*, not the set
@@ -124,7 +138,8 @@ the tree and abort before the first write on any mismatch.
 
 ```
 elspeth-lints sign-bundle <bundle.json> --owner <operator-id> \
-  --judge-transport codex-cli --judge-tools readonly --dry-run
+  --judge-transport codex-cli --judge-tools readonly --dry-run \
+  [--lanes resign|new_judgment[,...]] [--continue-on-block]
 elspeth-lints rekey --in <bundle.json> --old-key-env <OLD_VAR> --new-key-env <NEW_VAR>
 ```
 
@@ -134,6 +149,13 @@ elspeth-lints rekey --in <bundle.json> --old-key-env <OLD_VAR> --new-key-env <NE
   with no judge; `stale_delete` removes an orphan. Always preview with `--dry-run`
   first. A dup-key target aborts (`return 2`) with both copies intact.
   Deterministic deletes and rotations run before paid judge calls.
+- `--lanes` scopes the transaction; unselected actions are never attempted,
+  never judged, and stay exactly as they are in the allowlist. The selection is
+  journalled and a resume must match it (omitting the flag inherits it).
+  `--continue-on-block` journals a judged BLOCK and keeps firing, leaving the
+  blocked entries fail-closed and exiting 3 so a partial run never reads as
+  clean. Paste the forms from `sign_bundle_plan` rather than hand-writing
+  either flag — those carry each scope's judge-call price.
 - Non-dry-run `sign-bundle` works in a private same-filesystem transaction.
   Accepted decisions are HMAC-authenticated and journalled there; the active
   allowlist remains byte-identical on BLOCK, failure, or interruption. Only a
