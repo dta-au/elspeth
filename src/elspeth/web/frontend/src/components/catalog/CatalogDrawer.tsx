@@ -44,6 +44,7 @@ import {
   fuzzyMatch,
 } from "@/utils/fuzzyScore";
 import { isInternalPlugin, pluginDisplayName } from "./pluginDisplayName";
+import { UnavailableComponentRow } from "./UnavailableComponentRow";
 
 /**
  * Drop internal-machinery plugins from a catalog tab's list, preserving the
@@ -563,32 +564,31 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
               </p>
               <ul className="validation-banner-fail-list">
                 {policyFindings.map((finding) => (
-                  <li
+                  <UnavailableComponentRow
                     key={`${finding.component_id}:${finding.plugin_id}`}
-                    className="validation-banner-error-item"
-                  >
-                    <div>
-                      <strong>{finding.component_id}</strong>{" "}
-                      <code>{finding.plugin_id}</code> —{" "}
-                      {unavailableReasonLabel(finding.reason_code)}
-                    </div>
-                    <div className="import-yaml-actions">
-                      <Button
-                        className="btn-small"
-                        aria-label={`Remove disabled component ${finding.component_id} (${finding.plugin_id})`}
-                        onClick={() => handleRemoveDisabled(finding)}
-                      >
-                        Remove
-                      </Button>
-                      <Button
-                        className="btn-small"
-                        aria-label={`Replace disabled component ${finding.component_id} (${finding.plugin_id}) with an available ${repairTab(finding.plugin_id).slice(0, -1)}`}
-                        onClick={() => handleReplaceDisabled(finding)}
-                      >
-                        Replace
-                      </Button>
-                    </div>
-                  </li>
+                    finding={finding}
+                    reasonLabel={unavailableReasonLabel(finding.reason_code)}
+                    actions={
+                      <>
+                        <Button
+                          className="btn-small"
+                          aria-label={`Remove disabled component ${finding.component_id} (${pluginDisplayName(finding.plugin_id)})`}
+                          title={finding.plugin_id}
+                          onClick={() => handleRemoveDisabled(finding)}
+                        >
+                          Remove
+                        </Button>
+                        <Button
+                          className="btn-small"
+                          aria-label={`Replace disabled component ${finding.component_id} (${pluginDisplayName(finding.plugin_id)}) with an available ${repairTab(finding.plugin_id).slice(0, -1)}`}
+                          title={finding.plugin_id}
+                          onClick={() => handleReplaceDisabled(finding)}
+                        >
+                          Replace
+                        </Button>
+                      </>
+                    }
+                  />
                 ))}
               </ul>
             </section>

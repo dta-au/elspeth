@@ -37,12 +37,18 @@
  * buttons themselves, and workspace.css moves ExecuteButton's reason line
  * onto its own full-width flex line so helper text can never drive a
  * sibling's height again.
+ *
+ * DETAIL LEVEL (elspeth-aa39cffb16): Import YAML is the hand-edit/re-import
+ * surface for a technical audience and renders only with the show_advanced
+ * preference; export (YAML tab Copy/Download, Ctrl+Shift+Y) stays for
+ * everyone.
  */
 
 import { Button } from "@/components/ui";
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { ExecuteButton } from "@/components/sidebar/ExecuteButton";
 import { ImportYamlButton } from "@/components/sidebar/ImportYamlButton";
 
@@ -54,6 +60,7 @@ export function CompletionBar(): JSX.Element | null {
   const validationResult = useExecutionStore((s) => s.validationResult);
   const openAndMark = useShareableReviewStore((s) => s.openAndMark);
   const inFlight = useShareableReviewStore((s) => s.inFlight);
+  const showAdvanced = useShowAdvanced();
 
   if (!activeSessionId) return null;
 
@@ -93,7 +100,7 @@ export function CompletionBar(): JSX.Element | null {
       >
         Save for review
       </Button>
-      <ImportYamlButton />
+      {showAdvanced && <ImportYamlButton />}
       <ExecuteButton />
     </div>
   );

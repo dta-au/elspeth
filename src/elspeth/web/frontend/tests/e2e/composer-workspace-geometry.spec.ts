@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 
+import { authedContext, setShowAdvanced, tokenFromStorageState } from "./helpers/api";
 import {
   boxWidth,
   expectDesktopWorkspaceGeometry,
@@ -309,6 +310,7 @@ test.describe("Composer deterministic workspace geometry", () => {
           await expectPrimaryControlsInViewport(page, composer, {
             completion: scenario !== "active-guided-decision",
             catalog: scenario !== "active-guided-decision",
+            importYaml: false,
           });
           await expectIntendedPaneScrollers(page, {
             transcriptMustScroll: scenario === "populated-long-transcript",
@@ -722,7 +724,9 @@ test.describe("Composer deterministic workspace geometry", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     const sessionId = await installWorkspaceScenario(page, "populated-long-transcript");
     const composer = new ComposerPage(page);
+    const ctx = await authedContext(tokenFromStorageState(await page.context().storageState()));
     try {
+      await setShowAdvanced(ctx, true);
       await composer.goto(sessionId);
       await composer.waitForChatReady();
       await expect(composer.validationStatus()).toHaveAccessibleName(
@@ -760,6 +764,7 @@ test.describe("Composer deterministic workspace geometry", () => {
         expect(hitLabel).toContain((await action.textContent())?.trim());
       }
     } finally {
+      await setShowAdvanced(ctx, false);
       await deleteWorkspaceScenario(page, sessionId);
     }
   });
@@ -795,7 +800,9 @@ test.describe("Composer deterministic workspace geometry", () => {
     await page.setViewportSize({ width: 1600, height: 900 });
     const sessionId = await installWorkspaceScenario(page, "empty-freeform");
     const composer = new ComposerPage(page);
+    const ctx = await authedContext(tokenFromStorageState(await page.context().storageState()));
     try {
+      await setShowAdvanced(ctx, true);
       await composer.goto(sessionId);
       await composer.waitForChatReady();
 
@@ -853,6 +860,7 @@ test.describe("Composer deterministic workspace geometry", () => {
       expectBottomRowContract(bottomRow!);
       expect(Math.abs(bottomRow!.collapse!.top - chip!.y)).toBeLessThanOrEqual(1);
     } finally {
+      await setShowAdvanced(ctx, false);
       await deleteWorkspaceScenario(page, sessionId);
     }
   });
@@ -879,7 +887,9 @@ test.describe("Composer deterministic workspace geometry", () => {
     await page.setViewportSize({ width: 1280, height: 900 });
     const sessionId = await installWorkspaceScenario(page, "empty-freeform");
     const composer = new ComposerPage(page);
+    const ctx = await authedContext(tokenFromStorageState(await page.context().storageState()));
     try {
+      await setShowAdvanced(ctx, true);
       await composer.goto(sessionId);
       await composer.waitForChatReady();
       const reason = page.locator(".side-rail-execute-reason");
@@ -929,6 +939,7 @@ test.describe("Composer deterministic workspace geometry", () => {
       expect(bottomRow).not.toBeNull();
       expectBottomRowContract(bottomRow!);
     } finally {
+      await setShowAdvanced(ctx, false);
       await deleteWorkspaceScenario(page, sessionId);
     }
   });

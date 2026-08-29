@@ -1,11 +1,12 @@
 import { beforeEach, describe, it, expect, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { CatalogDrawer } from "./CatalogDrawer";
 import * as api from "@/api/client";
 import { useAuthStore } from "@/stores/authStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { pluginDisplayName } from "./pluginDisplayName";
 
 vi.mock("@/api/client", () => ({
   fetchPluginPolicy: vi.fn().mockResolvedValue({
@@ -292,11 +293,15 @@ describe("CatalogDrawer", () => {
       name: /unavailable saved components/i,
     });
     expect(repairRegion).toHaveTextContent("legacy_transform");
-    expect(repairRegion).toHaveTextContent("transform:legacy_llm");
+    expect(repairRegion).toHaveTextContent(pluginDisplayName("transform:legacy_llm"));
     expect(repairRegion).toHaveTextContent("Not enabled");
+    expect(within(repairRegion).getAllByTitle("transform:legacy_llm").length).toBeGreaterThan(0);
     expect(
       screen.getByRole("button", {
-        name: /remove disabled component legacy_transform.*transform:legacy_llm/i,
+        name: new RegExp(
+          `remove disabled component legacy_transform.*${pluginDisplayName("transform:legacy_llm")}`,
+          "i",
+        ),
       }),
     ).toBeInTheDocument();
 
