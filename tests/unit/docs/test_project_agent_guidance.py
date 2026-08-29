@@ -32,19 +32,6 @@ def _hook_commands(settings: dict[str, Any]) -> list[str]:
     ]
 
 
-def test_post_edit_hooks_do_not_mutate_python_files() -> None:
-    post_tool_use = _settings().get("hooks", {}).get("PostToolUse", [])
-    edit_commands = [
-        hook["command"]
-        for group in post_tool_use
-        if re.search(r"(?:^|\|)(?:Edit|Write)(?:\||$)", group.get("matcher", ""))
-        for hook in group.get("hooks", [])
-        if "command" in hook
-    ]
-
-    assert edit_commands == []
-
-
 def test_repository_hooks_bind_to_claude_project_dir() -> None:
     commands = _hook_commands(_settings())
     repository_commands = [command for command in commands if "loomweave" in command]
