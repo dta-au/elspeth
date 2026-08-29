@@ -208,3 +208,13 @@
 - Sequencing after w4fix merges: merge fix/codex-salvage (pre-re-stage merge, own delta vs 2210, 1 sidecar key
   on audit_export_snapshots.py to re-derive), ONE full suite on the final tip, close Wave-4 issues at that tip,
   close the 5 codex PRs, PAUSE for the operator re-stage.
+
+## PRE-RE-STAGE MERGE: fix/codex-salvage (John authorised 2026-08-29; MERGED e42bfe0c0)
+- Six commits (base fe4d87e6b, tip f36f9b81a): PRs #117 #123 #127 #128 #129 re-ported/cherry-picked. Zero merge
+  conflicts; 132 touched-file tests pass; masquerade baseline up to date; full suite at e0caff32d was green
+  (43709 passed) and this merge touches cli.py, contracts/errors.py, landscape/factory.py,
+  landscape/execution/audit_export_snapshots.py + tests + a runbook line — the final full suite runs on the tip
+  after tier-w4fix merges. Corpus delta vs Wave-4 close: 2210 → 2210 (ZERO). One sidecar key re-derived from
+  the post-merge tree (audit_export_snapshots.py R6 register_verified_candidate: body[31] → body[32], new
+  module-level import). Five GitHub PRs closed as landed (johnm-dta). Not a wave; reported separately by John's
+  instruction.
