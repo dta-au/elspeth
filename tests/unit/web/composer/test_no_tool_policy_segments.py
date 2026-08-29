@@ -107,7 +107,9 @@ def test_completion_advisory_notice_is_evidence_scoped_trusted_copy() -> None:
     assert visible_message_segments(content=content, raw_content="") == (
         TrustedSystemNoticeSegment(
             "Completion advisory review did not clear after the available attempts. "
-            "Composer completion is withheld. Review the pipeline and retry the evidence-scoped advisor review."
+            "Composer completion is withheld. Review the pipeline and retry the evidence-scoped advisor review. "
+            "ELSPETH withheld the composer's own summary of this exchange; "
+            "verify the pipeline before assuming every requested change was applied."
         ),
     )
     assert "sign-off" not in content

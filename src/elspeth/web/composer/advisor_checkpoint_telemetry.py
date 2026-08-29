@@ -52,3 +52,53 @@ def record_advisor_checkpoint_pass(
     # path, matching the composer's telemetry policy.
     with suppress(Exception):
         _ADVISOR_CHECKPOINT_PASSES_COUNTER.add(1, {"phase": phase, "verdict": verdict})
+
+
+AdvisorTerminalPublicationBranch = Literal[
+    "terminal_block",
+    "repair_unverified",
+    "repair_success",
+    "repair_handoff_signoff_failed",
+    "repair_review_with_findings",
+    "repair_review",
+    "repair_preflight_failure",
+    "repair_signoff_pending",
+]
+AdvisorPreflightShape = Literal["absent", "green", "pending_handoff", "red"]
+
+_ADVISOR_TERMINAL_PUBLICATIONS_COUNTER = metrics.get_meter(__name__).create_counter(
+    "composer.advisor_terminal_publication.branches",
+    description="Advisor-cohort terminal publications by branch",
+)
+
+
+def record_advisor_terminal_publication(
+    *,
+    session_id: str | None,
+    branch: AdvisorTerminalPublicationBranch,
+    reason: str | None,
+    preflight_shape: AdvisorPreflightShape,
+) -> None:
+    """Best-effort attribution event for one advisor-cohort terminal publication.
+
+    elspeth-fa18d54eef: a live turn published the pending-handoff "did not
+    clear" notice under a journal trail (advisor pass CLEAN, no withheld
+    disclosure row) that the deployed tree could not produce, and which
+    branch published the message was unrecoverable after the fact. Every
+    publication site now names its branch here, so a recurrence is
+    attributable from one journal read. Fields are all backend-derived
+    (closed vocabularies plus the session id) — no advisor findings text and
+    no model prose enter this event.
+    """
+    with suppress(Exception):
+        slog.info(
+            "composer.advisor_terminal_publication",
+            session_id=session_id,
+            branch=branch,
+            reason=reason,
+            preflight_shape=preflight_shape,
+        )
+    # Keep the metric independent from the event sink and off the correctness
+    # path, matching the composer's telemetry policy.
+    with suppress(Exception):
+        _ADVISOR_TERMINAL_PUBLICATIONS_COUNTER.add(1, {"branch": branch, "preflight_shape": preflight_shape})

@@ -685,6 +685,203 @@ class TestSuppressionNegative:
 # =============================================================================
 
 
+class TestDerivedNameTrailPrecision:
+    """elspeth-8d46db34ff D1/D5: the derived-name trail survives raising handlers and passthrough builtins."""
+
+    @staticmethod
+    def _boundary(body: str) -> str:
+        header = dedent("""
+            from elspeth.contracts import trust_boundary
+
+            @trust_boundary(
+                tier=3,
+                source="external payload",
+                source_param="payload",
+                suppresses=("R1", "R5"),
+                invariant="raises on malformed payload",
+            )
+            def handler(payload):
+        """)
+        return header + indent(dedent(body).strip(), "    ") + "\n"
+
+    def test_name_bound_in_try_body_survives_join_when_every_handler_raises(self) -> None:
+        source = self._boundary("""
+            try:
+                data = json.loads(payload.content)
+            except (ValueError, TypeError) as exc:
+                raise LLMClientError("bad") from exc
+            return data.get("x")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_name_bound_in_try_body_survives_join_when_handler_ends_in_guarded_raise(self) -> None:
+        source = self._boundary("""
+            try:
+                data = json.loads(payload.content)
+            except ValueError as exc:
+                if strict:
+                    raise LLMClientError("bad") from exc
+                else:
+                    return None
+            return data.get("x")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_name_rebound_in_falling_through_handler_does_not_survive_join(self) -> None:
+        source = self._boundary("""
+            try:
+                data = json.loads(payload.content)
+            except (ValueError, TypeError):
+                data = other()
+            return data.get("x")
+        """)
+        r1 = _findings_by_rule(_findings(source), "R1")
+        assert len(r1) == 1
+        assert 'data.get("x")' in r1[0].code_snippet
+
+    def test_name_bound_in_try_body_does_not_survive_when_one_handler_falls_through(self) -> None:
+        source = self._boundary("""
+            try:
+                data = json.loads(payload.content)
+            except ValueError as exc:
+                raise LLMClientError("bad") from exc
+            except TypeError:
+                data = other()
+            return data.get("x")
+        """)
+        assert len(_findings_by_rule(_findings(source), "R1")) == 1
+
+    def test_enumerate_over_source_param_keeps_loop_item_derived(self) -> None:
+        source = self._boundary("""
+            for index, item in enumerate(payload):
+                if isinstance(item, Mapping):
+                    item.get("name")
+        """)
+        findings = _findings(source)
+        assert _findings_by_rule(findings, "R5") == []
+        assert _findings_by_rule(findings, "R1") == []
+
+    def test_zip_and_sorted_over_source_param_keep_loop_item_derived(self) -> None:
+        source = self._boundary("""
+            for left, right in zip(payload, sorted(payload)):
+                left.get("a")
+                right.get("b")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_enumerate_over_unrelated_iterable_still_fires(self) -> None:
+        source = self._boundary("""
+            for index, item in enumerate(other_list()):
+                if isinstance(item, Mapping):
+                    item.get("name")
+        """)
+        findings = _findings(source)
+        assert len(_findings_by_rule(findings, "R5")) == 1
+        assert len(_findings_by_rule(findings, "R1")) == 1
+
+    def test_loop_over_helper_call_on_source_param_derives_target_like_assignment(self) -> None:
+        """A ``for`` target is an assignment from the iterable: same derivation rule as ``x = f(payload)``."""
+        source = self._boundary("""
+            for entry in _require_sequence(payload, "nodes"):
+                entry.get("name")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_enumerate_over_helper_call_on_source_param_derives_target(self) -> None:
+        source = self._boundary("""
+            for index, raw_entry in enumerate(_require_sequence(payload, "nodes")):
+                entry = _require_mapping(raw_entry, f"nodes[{index}]")
+                entry.get("name")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_items_of_helper_call_on_source_param_derives_targets(self) -> None:
+        source = self._boundary("""
+            for name, raw_entry in _require_mapping(payload, "sinks").items():
+                if not isinstance(name, str):
+                    raise ValueError("bad")
+                raw_entry.get("plugin")
+        """)
+        findings = _findings(source)
+        assert _findings_by_rule(findings, "R1") == []
+        assert _findings_by_rule(findings, "R5") == []
+
+    def test_comprehension_over_helper_call_on_source_param_derives_target(self) -> None:
+        source = self._boundary("""
+            return [item.get("name") for item in _require_sequence(payload, "q") if isinstance(item, Mapping)]
+        """)
+        findings = _findings(source)
+        assert _findings_by_rule(findings, "R1") == []
+        assert _findings_by_rule(findings, "R5") == []
+
+    def test_with_item_over_source_param_derives_optional_vars(self) -> None:
+        source = self._boundary("""
+            with _opened(payload) as handle:
+                handle.get("x")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_loop_over_helper_call_on_unrelated_value_still_fires(self) -> None:
+        source = self._boundary("""
+            for entry in _require_sequence(other(), "nodes"):
+                entry.get("name")
+        """)
+        assert len(_findings_by_rule(_findings(source), "R1")) == 1
+
+    def test_finding_subject_through_helper_call_still_roots_at_the_helper(self) -> None:
+        """The SUBJECT rule stays strict: ``normalise(payload).get()`` is rooted at ``normalise``."""
+        source = self._boundary("""
+            return normalise(payload).get("name")
+        """)
+        assert len(_findings_by_rule(_findings(source), "R1")) == 1
+
+
+class TestBranchJoinPrecision:
+    """elspeth-8d46db34ff D6: ``if`` joins skip branches that cannot fall through."""
+
+    _boundary = staticmethod(TestDerivedNameTrailPrecision._boundary)
+
+    def test_name_bound_in_surviving_if_branches_survives_when_else_returns(self) -> None:
+        source = self._boundary("""
+            q = payload.get("q")
+            if isinstance(q, Mapping):
+                entries = list(q.items())
+            elif isinstance(q, list):
+                entries = [(item, item) for item in q]
+            else:
+                return []
+            for name, entry in entries:
+                entry.get("o")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_name_bound_in_else_survives_when_if_body_returns(self) -> None:
+        source = self._boundary("""
+            q = payload.get("q")
+            if q is None:
+                return None
+            else:
+                schema = dict(q)
+            return schema.get("m")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_name_bound_on_only_one_surviving_if_path_does_not_survive(self) -> None:
+        """Adversarial twin: two surviving paths, one binds from payload, one from elsewhere."""
+        source = self._boundary("""
+            q = payload.get("q")
+            if isinstance(q, Mapping):
+                entries = list(q.items())
+            elif isinstance(q, list):
+                entries = load_defaults()
+            else:
+                return []
+            for name, entry in entries:
+                entry.get("o")
+        """)
+        assert len(_findings_by_rule(_findings(source), "R1")) == 1
+
+
 class TestDecoratorDiagnostics:
     """Malformed decorators emit their own findings and do not suppress."""
 

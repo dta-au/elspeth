@@ -274,3 +274,17 @@
   fully merged). The operator
   re-stage baseline is now AFTER this merge: the ONE stage_scan covers W1–W4 + w4fix + codex-salvage +
   barrier-nav-width.
+- LINT-PRECISION MERGE 216b3152a (elspeth-8d46db34ff, tier/lintprecision, --no-ff onto 9918fedb0): seven
+  tier_model false-positive classes fixed in the RULE, not the tree — try-join and if-join skip branches that
+  cannot fall through; post-init R5 exemption follows `for x in self.<f>` and module-private `_f(self.<f>)`
+  returns; R4 shares R6's explicit-outcome predicate; constructed error entries recorded into a validator
+  accumulator are explicit; for/with/comprehension targets derive by the assignment rule. Closures still do
+  NOT inherit derived names (deliberate, df3463583). Measured vs clean export of fc05a280c, allowlist-disabled:
+  2207 → 2088, 119 removed, 0 added; three adversarial audit lanes confirmed 119/119. Full suite on the
+  rebased tree 43,807 / 0 failed. RE-STAGE: 6 signed entries now report Stale (finding gone) → stale_delete
+  (contracts/events.py _render_public_phase_error_message; contracts/value_source.py
+  CatalogValueSource.__post_init__; core/operations.py _render_exception; engine/executors/state_guard.py ×2;
+  web/execution/runtime_preflight.py _capture). Per-file caps: chat_solver 31→13 against max_hits 11 (still
+  over — operator decision); tool_batch 5/3 and telemetry/serialization 8/4 unchanged. pipeline_planner
+  `_provider_fields` invariant prose corrected (its "launders the suppression root" explanation was the
+  try-join drop). Rolling hint: docs/agents/recent-code-hints.md 2026-08-29 entry.
