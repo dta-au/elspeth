@@ -34,11 +34,11 @@ def _settings(**kw) -> WebSettings:
 
 
 def test_urls_are_built_under_base() -> None:
-    urls = resolve_tutorial_sample_urls(base_url="https://elspeth.foundryside.dev")
+    urls = resolve_tutorial_sample_urls(base_url="https://elspeth.example.gov.au")
     assert urls == (
-        "https://elspeth.foundryside.dev/tutorial-site/project-1.html",
-        "https://elspeth.foundryside.dev/tutorial-site/project-2.html",
-        "https://elspeth.foundryside.dev/tutorial-site/project-3.html",
+        "https://elspeth.example.gov.au/tutorial-site/project-1.html",
+        "https://elspeth.example.gov.au/tutorial-site/project-2.html",
+        "https://elspeth.example.gov.au/tutorial-site/project-3.html",
     )
 
 

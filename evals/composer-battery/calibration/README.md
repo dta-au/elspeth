@@ -129,7 +129,7 @@ pair-routing precondition holds), but no arm stages a candidate.
 > The `_tripwire` scorer did not consult those flags (fixed in `65d551ee5`),
 > which is why an aborted read was reported as `topology: no committed state`.
 >
-> The cut is Cloudflare's, in front of `elspeth.foundryside.dev` (`server:
+> The cut is Cloudflare's, in front of `elspeth.example.gov.au` (`server:
 > cloudflare` on any response; Caddy configures no timeout and the origin
 > allows 600 s). Ten canary runs in the same hour returned 200 in 25–41 s and
 > never came near it. **The planner surface is not reachable through the

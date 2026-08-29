@@ -85,7 +85,7 @@ def _state_with_cleanup_node(options: dict[str, object]) -> CompositionState:
 
 def _state_with_web_scrape_identity_node(
     *,
-    abuse_contact: str = "abuse-contact-unset@elspeth.foundryside.dev",
+    abuse_contact: str = "abuse-contact-unset@elspeth.example.gov.au",
     scraping_reason: str = "User-requested public web fetch for rules download",
     allowed_hosts: object | None = "public_only",
 ) -> CompositionState:
@@ -1894,7 +1894,7 @@ def test_web_scrape_http_identity_hash_binds_wire_visible_defaults() -> None:
         {
             "review_kind": "web_scrape_http_identity",
             "node_id": "fetch_pages",
-            "abuse_contact": "abuse-contact-unset@elspeth.foundryside.dev",
+            "abuse_contact": "abuse-contact-unset@elspeth.example.gov.au",
             "scraping_reason": "User-requested public web fetch for rules download",
             "allowed_hosts": "public_only",
         }

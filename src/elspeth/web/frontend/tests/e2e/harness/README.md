@@ -1,7 +1,7 @@
 # Tutorial reliability harness
 
 A repeatable, version-tagged battery that drives the first-run composer tutorial
-end-to-end against **staging** (`elspeth.foundryside.dev`), resets between each
+end-to-end against **staging** (`elspeth.example.gov.au`), resets between each
 run, grades every run on four dimensions, and reports how many worked plus a
 classified failure table.
 
@@ -30,10 +30,10 @@ frontend dir:
 ```bash
 cd src/elspeth/web/frontend
 HARNESS_BATCH_ID=batch-2026-06-06 HARNESS_BATCH_SIZE=10 \
-STAGING_BASE_URL=https://elspeth.foundryside.dev \
+STAGING_BASE_URL=https://elspeth.example.gov.au \
 STAGING_USERNAME="${STAGING_USERNAME:?set STAGING_USERNAME in the environment}" \
 STAGING_PASSWORD="${STAGING_PASSWORD:?set STAGING_PASSWORD in the environment}" \
-PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
+PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.example.gov.au \
 npx playwright test --config=playwright.staging.config.ts tutorial-reliability.staging.spec.ts
 ```
 

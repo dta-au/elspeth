@@ -48,8 +48,8 @@
 // `pendingBySession` store, which only the native resolve mutates.
 //
 // Invocation (dev/staging server):
-//   STAGING_BASE_URL=https://elspeth.foundryside.dev \
-//   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
+//   STAGING_BASE_URL=https://elspeth.example.gov.au \
+//   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.example.gov.au \
 //   STAGING_USERNAME="${STAGING_USERNAME:?set STAGING_USERNAME in the environment}" \
 //   STAGING_PASSWORD="${STAGING_PASSWORD:?set STAGING_PASSWORD in the environment}" \
 //   ELSPETH_RUN_COMPOSER_LIVE=1 \

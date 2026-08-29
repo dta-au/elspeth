@@ -2,8 +2,7 @@
 
 The advisory fires for ``transform → passthrough → sink`` chains where the
 passthrough has no schema declaration to anchor an unsatisfied edge contract
-and is not on a gate-fork branch. See plan:
-``/home/john/.claude/plans/dispatch-prompt-floofy-noodle.md``.
+and is not on a gate-fork branch.
 """
 
 from __future__ import annotations

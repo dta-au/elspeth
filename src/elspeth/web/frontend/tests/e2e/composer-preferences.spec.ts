@@ -12,7 +12,7 @@
 //
 // Running against staging is the operator's Task 9 step. For staging
 // the BACKEND_BASE_URL in helpers/api.ts would need to point at
-// elspeth.foundryside.dev (and the storageState would need to carry a
+// elspeth.example.gov.au (and the storageState would need to carry a
 // staging-issued token). This spec ships green against the local
 // playwright environment.
 
@@ -83,18 +83,10 @@ function sessionDbPathForDirectCleanup(): string | null {
 
   // Local Playwright config starts the backend from the repo root, but passes
   // an absolute ELSPETH_WEB__data_dir anchored to the frontend directory.
-  // Source-checkout staging on this host uses /home/john/elspeth/data/sessions.db;
-  // other staging targets should set PLAYWRIGHT_SESSION_DB_PATH explicitly when
-  // a reused account needs reset.
+  // Against a deployed target there is no host-specific default: set
+  // PLAYWRIGHT_SESSION_DB_PATH explicitly when a reused account needs reset.
   if (process.env.PLAYWRIGHT_BACKEND_BASE_URL) {
-    const sourceCheckoutStagingDb = "/home/john/elspeth/data/sessions.db";
-    const stagingBase =
-      process.env.STAGING_BASE_URL ??
-      process.env.PLAYWRIGHT_BACKEND_BASE_URL;
-    return stagingBase.includes("elspeth.foundryside.dev") &&
-      existsSync(sourceCheckoutStagingDb)
-      ? sourceCheckoutStagingDb
-      : null;
+    return null;
   }
   return resolve(process.cwd(), ".e2e-data", "sessions.db");
 }

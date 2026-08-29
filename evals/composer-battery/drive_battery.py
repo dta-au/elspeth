@@ -38,7 +38,6 @@ SETTLE_POLLS = 12
 SETTLE_INTERVAL_S = 5.0
 CANARY_N = 10
 MIN_RUN_SPACING_S = 7.0  # per-user compose rate limit is 10/min (deploy/elspeth-web.env); never let fast failures amplify into 429s
-DEFAULT_BASE = "https://elspeth.foundryside.dev"
 PINNED_PREFERENCES = {
     "trust_mode": "auto_commit",
     "density_default": "high",
@@ -823,9 +822,10 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--base",
-        default=os.environ.get("ELSPETH_EVAL_BASE_URL", DEFAULT_BASE),
-        help="substrate URL; use unix:///run/elspeth/uvicorn.sock to address the origin directly "
-        "and bypass the edge read timeout (elspeth-ad5628ecda)",
+        default=os.environ.get("ELSPETH_EVAL_BASE_URL"),
+        help="substrate URL (default $ELSPETH_EVAL_BASE_URL; no built-in host); use "
+        "unix:///run/elspeth/uvicorn.sock to address the origin directly and bypass the edge "
+        "read timeout (elspeth-ad5628ecda)",
     )
     ap.add_argument("--round", required=True)
     ap.add_argument("--repeats", type=int, default=5)
@@ -843,6 +843,9 @@ def main(argv: list[str] | None = None) -> int:
     from evals.lib.battery_planner import ProbeUnpaired
     from planner_probe import run_probe, run_tripwire, tripwire_preflight  # local import: same directory
 
+    if not ns.base:
+        print("config: --base or $ELSPETH_EVAL_BASE_URL is required (there is no default substrate)", file=sys.stderr)
+        return 64
     version, cases = load_corpus()
     try:
         user, pw = _load_credentials(Path(ns.state_dir))

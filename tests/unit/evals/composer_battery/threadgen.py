@@ -216,7 +216,7 @@ def meta(
         "instrument": instrument or Instrument().to_dict(),
         "identity": {
             "binding": {
-                "substrate": "https://elspeth.foundryside.dev",
+                "substrate": "https://elspeth.example.gov.au",
                 "composer_model": COMPOSER,
                 "advisor_model": ADVISOR,
                 "model_returned": "claude-sonnet-5",

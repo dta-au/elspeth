@@ -41,6 +41,7 @@ import argparse
 import json
 import os
 import secrets
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -48,7 +49,6 @@ from typing import Any
 
 import requests
 
-DEFAULT_BASE = "https://elspeth.aws.foundryside.dev"
 DEFAULT_STATE_DIR = Path(os.environ.get("ELSPETH_BATTERY_STATE_DIR", "/tmp/elspeth-battery"))
 # Terminal run statuses. ``completed_with_failures`` is healthy: rows were
 # quarantined by an on_error route, which is frequently the property under test.
@@ -247,7 +247,11 @@ class Battery:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--base", default=DEFAULT_BASE, help="instance base URL")
+    parser.add_argument(
+        "--base",
+        default=os.environ.get("ELSPETH_EVAL_BASE_URL"),
+        help="instance base URL (default $ELSPETH_EVAL_BASE_URL; no built-in host)",
+    )
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR, help="token + response archive (kept out of the repo)")
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -277,6 +281,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if not args.base:
+        print("--base or $ELSPETH_EVAL_BASE_URL is required (there is no default instance)", file=sys.stderr)
+        return 64
     battery = Battery(args.base, args.state_dir)
     if args.command == "ensure-account":
         return battery.ensure_account()
