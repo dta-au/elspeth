@@ -511,7 +511,7 @@ contract is a build-time failure, not a runtime surprise.
    "Token identity, fork / join / expand mechanics"),
   ("docs/architecture/subsystems.md",
    "Per-subsystem reference (engine, plugins, telemetry, MCP)"),
-  ("docs/architecture/telemetry.md",
+  ("docs/guides/telemetry.md",
    "Telemetry vs Landscape primacy; emission discipline"),
   ("docs/architecture/audit-remediation.md",
    "Audit-trail remediation patterns and replay tooling"),

@@ -40,7 +40,6 @@ Current architecture and design references.
 - [DAG Information and Completeness](architecture/dag/README.md) — permanent criteria, assessment framework, current verdict, and dated evidence
 - [Landscape System](architecture/landscape.md) — audit trail architecture
 - [Landscape Entry Points](architecture/landscape-entry-points.md) — where audit records are created
-- [Telemetry](architecture/telemetry.md) — operational visibility architecture
 - [Barrier Machinery](architecture/barrier-machinery.md) — aggregation and coalesce as structural twins; paired-surfaces table and paired-change checklist
 - [LLM Compatibility Gateway](../gateway/README.md) — the standalone `elspeth-llm-gateway` service: a strict OpenAI Chat Completions subset over an organisation's own invoke API, deployed separately from ELSPETH
 - [ADR Index](architecture/adr/README.md) — accepted architecture decisions
@@ -68,7 +67,6 @@ Tutorials and operator/developer how-to material.
 - [Telemetry Guide](guides/telemetry.md)
 - [Tier-2 Tracing](guides/tier2-tracing.md)
 - [Landscape MCP Analysis](guides/landscape-mcp-analysis.md)
-- [Clarion for Codex Agents](guides/clarion-for-codex-agents.md)
 - [Troubleshooting](guides/troubleshooting.md)
 - [Docker](guides/docker.md)
 - [Deployment Platforms](reference/deployment-platforms.md)

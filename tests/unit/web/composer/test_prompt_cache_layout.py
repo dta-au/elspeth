@@ -8,8 +8,6 @@ catalog message (cacheable, directly after system) and a session-varying
 state message (after chat history, so history stays a stable cacheable
 prefix), and adds an opt-in sliding marker on the last message for the
 freeform tool loop.
-
-See docs/acceptance/2026-08-05-compose-token-cost-addendum.md item 1.
 """
 
 from __future__ import annotations

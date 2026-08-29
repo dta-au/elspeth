@@ -486,9 +486,8 @@ locals {
     # clock, its six calls summing to ~270s (45+50+123+29+17+6) with the worst
     # a 123s thinking tail; the budget was consumed by the chain, not by any
     # one call. At "medium" the same graph completed in ~200s with no
-    # regression on g01 (184s vs 192s). See
-    # docs/acceptance/2026-08-05-compose-cost-measurement.md addendum 1 and the
-    # operator decision on elspeth-930a163c85. This pin was applied to the live
+    # regression on g01 (184s vs 192s). The operator decision is recorded on
+    # elspeth-930a163c85. This pin was applied to the live
     # task definition as an env-only revision and was missing here until
     # elspeth-52af290183, so a cold install silently reverted to "high" — the
     # one combination no acceptance run has ever passed on.

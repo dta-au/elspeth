@@ -3398,8 +3398,7 @@ def test_composer_candidate_reasoning_effort_is_pinned_to_the_measured_value() -
     (45+50+123+29+17+6) with the worst a 123s thinking tail — the budget
     went to the chain, not to any one call. At `medium` the same graph
     completed in ~200s and the regression graph g01 was unchanged (184s vs
-    192s) — `docs/acceptance/2026-08-05-compose-cost-measurement.md`,
-    addendum 1, the operator decision recorded on elspeth-930a163c85.
+    192s). The operator decision is recorded on elspeth-930a163c85.
 
     That decision was applied to the live task definition as an env-only
     revision and never reached this module, so every green acceptance

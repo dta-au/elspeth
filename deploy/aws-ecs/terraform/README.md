@@ -1036,8 +1036,7 @@ returned a `422` at the wall clock: six calls summing to roughly 270s
 (45+50+123+29+17+6), the worst of them a 123s thinking tail — the budget was
 consumed by the chain, not by any single call. At `medium` the same graph
 completed in roughly 200s, and the `g01` regression graph was unchanged (184s
-against 192s). See `docs/acceptance/2026-08-05-compose-cost-measurement.md`
-(addendum 1) and the operator decision recorded on `elspeth-930a163c85`.
+against 192s). The operator decision is recorded on `elspeth-930a163c85`.
 
 Treat the pin as evidence, not as a default worth tidying: every green
 acceptance result on this module was obtained at `medium`, so changing it

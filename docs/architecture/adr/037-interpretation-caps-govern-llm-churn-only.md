@@ -111,15 +111,13 @@ allowed to inherit — or escape — the cap.
   re-introduce server-spent budget.
 - Sessions already wedged by the old behaviour need no data surgery: one
   further compose message re-surfaces the disclosures uncapped.
-- A separate arm remains open (`elspeth-03f5728c33`): a compose cancelled
-  mid-loop skips finalization, leaving `llm_prompt_template` requirements
-  pending with zero events. That is a surfacing-path defect, not a cap
-  defect, and no cap change addresses it.
+- A separate surfacing-path defect was tracked as `elspeth-03f5728c33`: a
+  compose cancelled mid-loop skipped finalization, leaving
+  `llm_prompt_template` requirements pending with zero events. It was not a
+  cap defect, and no cap change addressed it.
 
 ## Related
 
 - ADR-032 — validate by trust domain (the parse/nominally-type split these
   boundary writers sit on)
 - `elspeth-558fa5a321`, `elspeth-9c01c943a5`, `elspeth-03f5728c33`
-- `docs/acceptance/2026-08-04-battery-round-2-report.md` — the incident that
-  produced the evidence

@@ -233,10 +233,6 @@ coverage). The engine step is low-risk and additive.
 
 - Filigree `elspeth-cd0f6a6cd9`; battery evidence run `e41d0e6b`
 - ADR-036 (this decision); ADR-032 (validate by trust domain)
-- `docs/acceptance/2026-08-04-f14-and-battery-handover.md` (battery anchor
-  #2, redeploy env additions)
-- `docs/acceptance/2026-08-03-r3-rca-remediation-tracker.md` (deployment
-  ledger entries 2026-08-04 21:33 / 22:06)
 - `docs/superpowers/plans/2026-07-29-amazon-textract-document-analysis-transform.md`
   (original transform design; its custody commitment covered failure
   messages, not call records — the gap F1 closes)
