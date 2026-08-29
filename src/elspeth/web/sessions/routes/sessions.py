@@ -195,11 +195,13 @@ def _rewrite_source_blob_options(
         targets[old_blob_id] = copied
         rebuilt[key] = str(copied.id)
     for carrier in ("path", "file"):
-        value = rebuilt.get(carrier)
-        if carrier in rebuilt and value is not None and type(value) is not str:
-            raise AuditIntegrityError(f"Tier 1 audit anomaly: {field_path}.{carrier} must be a string")
-        if type(value) is not str:
+        if carrier not in rebuilt:
             continue
+        value = rebuilt[carrier]
+        if value is None:
+            continue
+        if type(value) is not str:
+            raise AuditIntegrityError(f"Tier 1 audit anomaly: {field_path}.{carrier} must be a string")
         if value.startswith(BLOB_REF_PATH_PREFIX):
             try:
                 old_blob_id = UUID(value.removeprefix(BLOB_REF_PATH_PREFIX))
@@ -250,7 +252,9 @@ def _rewrite_session_owned_sink_options(
     base = data_dir.resolve()
     rewritten = False
     for key in ("path", "file", "persist_directory"):
-        value = rebuilt.get(key)
+        if key not in rebuilt:
+            continue
+        value = rebuilt[key]
         if value is None:
             continue
         if type(value) is not str:
@@ -259,11 +263,9 @@ def _rewrite_session_owned_sink_options(
         resolved = raw.resolve() if raw.is_absolute() else (base / raw).resolve()
         for namespace in ("outputs", "blobs"):
             parent_root = base / namespace / str(parent_session_id)
-            try:
-                suffix = resolved.relative_to(parent_root)
-            except ValueError:
+            if not resolved.is_relative_to(parent_root):
                 continue
-            rebuilt[key] = str(base / namespace / str(child_session_id) / suffix)
+            rebuilt[key] = str(base / namespace / str(child_session_id) / resolved.relative_to(parent_root))
             rewritten = True
             break
     return rebuilt, rewritten
@@ -320,8 +322,12 @@ def _rewrite_guided_blob_custody(
         inspection = pending["inspection_facts"]
         if inspection is not None:
             identity = inspection["redacted_identity"]
-            old_ref = identity.get("blob_id")
-            if old_ref is not None:
+            # ``_redacted_identity`` writes ``blob_id`` only for blob-backed
+            # inspections, so absence is a real state; presence is a UUID
+            # string by construction. Membership form mirrors the same read in
+            # ``composer/guided/stage_transitions.py::_inspection_blob_id``.
+            if "blob_id" in identity:
+                old_ref = identity["blob_id"]
                 try:
                     old_blob_id = UUID(old_ref)
                 except (TypeError, ValueError) as exc:
@@ -380,13 +386,22 @@ def _rewrite_fork_state_blob_custody(
     metadata = deep_thaw(state.metadata_)
     composer_meta = deep_thaw(state.composer_meta) if state.composer_meta is not None else None
     rewritten = False
+    # ``options`` presence is asserted rather than defaulted past: every
+    # persisted source and output dict is written from
+    # ``CompositionState.to_dict``, which emits ``"options"`` unconditionally
+    # for both (``description`` is the field it omits when absent). A row
+    # missing the key is a Tier-1 audit anomaly on exactly the field this
+    # function rewrites, so it must abort the fork with a named error rather
+    # than be skipped and produce a child whose blob custody was never rebased.
     if sources is not None:
         if type(sources) is not dict:
             raise AuditIntegrityError("Tier 1 audit anomaly: forked composition sources must be an exact dict")
         for source_name, source in sources.items():
             if type(source) is not dict:
                 raise AuditIntegrityError(f"Tier 1 audit anomaly: sources.{source_name} must be an exact dict")
-            if source.get("options") is not None:
+            if "options" not in source:
+                raise AuditIntegrityError(f"Tier 1 audit anomaly: sources.{source_name} carries no options field")
+            if source["options"] is not None:
                 source["options"], changed = _rewrite_source_blob_options(
                     source["options"],
                     blob_map,
@@ -399,7 +414,9 @@ def _rewrite_fork_state_blob_custody(
     for index, output in enumerate(outputs or []):
         if type(output) is not dict:
             raise AuditIntegrityError(f"Tier 1 audit anomaly: outputs[{index}] must be an exact dict")
-        if output.get("options") is not None:
+        if "options" not in output:
+            raise AuditIntegrityError(f"Tier 1 audit anomaly: outputs[{index}] carries no options field")
+        if output["options"] is not None:
             output["options"], changed = _rewrite_session_owned_sink_options(
                 output["options"],
                 data_dir=data_dir,

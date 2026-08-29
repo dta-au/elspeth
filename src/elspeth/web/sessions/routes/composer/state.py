@@ -190,14 +190,14 @@ def _reject_unbound_blob_storage_sources(state: CompositionState, *, data_dir: s
     tier=3,
     source="pasted/seeded CompositionState carrying web-authored source options",
     source_param="state",
-    suppresses=("R1",),
+    suppresses=("R1", "R5"),
     invariant=(
         "raises HTTPException 400 for any string source path outside the source allowlist; missing or non-string path values are skipped"
     ),
     test_ref=(
         "tests/unit/web/sessions/routes/composer/test_state_boundaries.py::test_reject_disallowed_source_paths_raises_400_outside_allowlist"
     ),
-    test_fingerprint="c28cbd4b88b4649f5617dffed78e013d0b0317904975c8114607dd63ff9324f0",
+    test_fingerprint="2a73310e1ab04480348b8533732615a322b9d47cdfc3a2ca634947af3d8e4b4f",
 )
 def _reject_disallowed_source_paths(state: CompositionState, *, data_dir: str, session_id: str) -> None:
     allowed_dirs = allowed_source_directories(data_dir, session_id=session_id)
@@ -898,9 +898,15 @@ async def _verified_yaml_export_blob_ids(
             blob = await blob_service.get_blob(blob_id)
         except BlobNotFoundError:
             raise AuditIntegrityError("YAML export blob custody verification failed") from None
-        if not isinstance(blob, BlobRecord):
+        # ``BlobServiceProtocol`` is structural, so an implementation could
+        # hand back anything; ``BlobRecord`` is an owned, unsubclassed frozen
+        # dataclass, so exact-type is the closed check (ADR-032) and it fails
+        # closed — anything else aborts the export.
+        if type(blob) is not BlobRecord:
             raise TypeError("BlobServiceProtocol.get_blob() must return BlobRecord")
-        source_paths = {value for key in SOURCE_LOCAL_PATH_OPTION_KEYS if type(value := source.options.get(key)) is str}
+        source_paths = {
+            value for key in SOURCE_LOCAL_PATH_OPTION_KEYS if key in source.options and type(value := source.options[key]) is str
+        }
         if (
             blob.id != blob_id
             or blob.session_id != session_id
