@@ -214,6 +214,12 @@ describe("ValidationResultBanner", () => {
     // Discriminates the forced branch from the full-list branch (see comment
     // above): only the full list would render this ordinary check's detail.
     expect(screen.queryByText("Graph structure is valid")).not.toBeInTheDocument();
+    // Pins the honest partial-count wording (review round 2): 1 of these 2
+    // checks (graph_structure) actually passed, so the standard-view summary
+    // must say so rather than the "All 2 checks passed." it would read if it
+    // counted result.checks.length alone without checking check.passed.
+    expect(screen.getByText("1 of 2 checks passed.")).toBeInTheDocument();
+    expect(screen.queryByText("All 2 checks passed.")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /validation passed\. show details\./i }),
     ).toBeNull();
