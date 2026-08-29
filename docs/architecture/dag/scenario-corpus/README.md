@@ -1,207 +1,86 @@
 # Maintained DAG Scenario Corpus
 
-This directory holds the evergreen, executable inventory used to answer a
-specific question: which parts of Elspeth's mandatory directed acyclic graph
-(DAG) lifecycle have current production-path evidence?
+This directory contains the live, executable inventory used to answer one
+question: which parts of ELSPETH's mandatory DAG lifecycle have current
+production-path evidence?
 
-Start with the [v1 corpus manifest](v1/manifest.yaml). It contains all 15 mandatory
-scenarios, all 11 assessment dimensions, the evidence registry, owned gaps,
-observable exit gates, and the cases that the production-path harness runs.
-The `v1/` directory names the corpus revision; the manifest's serialized
-`schema_version` is independently versioned and is currently `2`. Schema v2
-preserves each durable token parent as an explicit ordinal/key pair.
-The [DAG information hub](../README.md) supplies the broader completeness
-assessment and remediation context.
+Start with the [v1 corpus manifest](v1/manifest.yaml). It is schema version `2`
+and currently contains 15 scenarios, 11 dimensions, 114 evidence records, and
+a derived verdict of `not_complete`. The [DAG information hub](../README.md)
+explains how this evidence fits the broader product-quality criteria.
 
 ## Authority boundary
 
-These files have distinct jobs:
+These sources have distinct jobs:
 
 - The [completeness criteria](../completeness-criteria.md) define the quality
-  bar and the mandatory scenario set. Change them only when the intended bar
-  changes.
-- The [v1 manifest](v1/manifest.yaml) is the authoritative live inventory of
-  scenario cells, declared evidence, ownership, exit gates, and executable
-  case declarations.
+  bar and mandatory scenarios.
+- The [v1 manifest](v1/manifest.yaml) owns the live scenario inventory,
+  evidence and verdict inputs, gap metadata, exit gates, and executable cases.
 - The [typed schema](../../../../tests/fixtures/dag_scenario_corpus/schema.py)
-  defines the closed manifest and observed-evidence shapes. It also derives
+  defines the closed manifest and observed-evidence shapes and derives
   `complete` only when every cell is `pass` or `not_applicable`.
 - The [strict loader](../../../../tests/fixtures/dag_scenario_corpus/loader.py)
-  binds the manifest to the exact scenario and dimension inventory, rejects
-  duplicate or orphaned declarations, validates fixtures, and checks evidence
-  locators.
+  rejects duplicate, missing, orphaned, or invalid declarations and validates
+  fixtures and evidence locators.
 - The [production-path harness](../../../../tests/fixtures/dag_scenario_corpus/harness.py)
-  executes registered cases and returns one common `ScenarioRunEvidence`
-  record for configuration, build, runtime, audit, and recovery facts.
+  executes registered cases and returns common configuration, build, runtime,
+  audit, and recovery evidence.
+- The [unit contract test](../../../../tests/unit/architecture/test_dag_scenario_corpus_contract.py)
+  pins the exact scenario, dimension, case, and evidence registries and checks
+  the links from this live documentation.
 
-Harness workflows are deliberately typed by the boundary they cross. `build`
-loads the real YAML, instantiates plugins in preflight mode, constructs and
-validates the production execution graph, and assembles the pipeline config.
-`BuildExpectation` declares exact node and edge counts, typed node-type counts,
-and sorted edge labels with duplicates preserved. The observed `GraphEvidence`
-records that exact graph shape plus a separately computed topology hash.
-It does not create an audit database or an orchestrator, and its runtime,
-audit, and recovery evidence remains explicitly unattempted. A `build` case is
-therefore executable evidence only for `config` and `build`; it cannot support
-runtime, audit, or recovery cells. A `run` or `recovery` case may use the
-exact-audit `RunExpectation` or the narrower `SummaryRunExpectation`, which
-pins only overall status, output count, and required audit record types. A
-summary expectation cannot by itself establish exact runtime, audit, or
-recovery completeness. A `run` case may instead use
-`SemanticRunExpectation` when scheduler ordering prevents a stable raw
-identity oracle. That expectation pins exact outputs, counters, record counts,
-and an order-insensitive runtime projection, but deliberately excludes raw
-audit identity. Its harness evidence is therefore limited to exactly
-`[config, build, runtime]` and cannot support an audit or recovery pass.
+Filigree does not replace the manifest. It owns delivery status, dependencies,
+and work ownership. Conversely, the manifest's `owner_issue` values connect
+evidence gaps to work but do not replace live tracker state.
 
-Exact projections preserve stateful runtime records as typed evidence rather
-than collapsing them into record counts. Aggregation cases include immutable
-batch membership and a separate `intermediate_outcomes` collection for
-non-terminal `BUFFERED` history; `terminal_dispositions` remains exactly one
-terminal record per token. Expansion cases include stable parent identity,
-expected child count, dense child ordinals, and durable parent links. Source
-validation and transform failures retain their typed error records, while
-sink-effect audit material pins publication and inspect/reconcile/commit
-attempts. This lets the B3 cases prove exact runtime and portable-audit parity
-without broadening terminal semantics or inferring omitted material.
+## Product criteria and lifecycle cells
 
-The current B3 set is deliberately bounded: EOF immutable aggregation, JSON
-parent/child expansion, retry success, source quarantine, transform discard,
-transform error routing, and one ordinary write-once sink. The ordinary cases
-provide runtime/audit evidence. Three dedicated fresh-object cases also
-provide recovery evidence at the EOF aggregation, expansion child-handoff,
-and pending-sink redrive seams. The pending-sink case deliberately spans three
-fresh runtime/object lifetimes within one process: the initial run durably
-reaches `PENDING_SINK` after source exhaustion, the first public resume claims
-that exact work item and faults before sink-effect reservation, and the second
-public resume uses an injected clock to expire and recover that lease before
-publishing. These cases do not promote concurrency or scale, whose gaps remain
-independently owned in the manifest.
-The disposition scenario also keeps runtime and audit partial until the
-authoritative scheduler-disposition and follower-drain work tracked by
-`elspeth-2e66723070` and `elspeth-6f6bbbec00` is integrated; the local exact
-cases remain evidence without substituting for those authorities.
+The assessment uses two related but non-interchangeable views. The framework
+defines **15 product-quality criteria** for the overall DAG capability. The
+manifest evaluates **11 executable lifecycle cells** for each mandatory
+scenario: `config`, `build`, `contracts`, `runtime`, `audit`, `recovery`,
+`concurrency`, `freeform`, `guided`, `round_trip`, and `scale`.
 
-Every `recovery` case also declares a closed `recovery_kind`, so the shared
-harness cannot silently apply one topology's restart assertions to another.
-The `parallel_sink_finalization` evidence records exact before/after sink
-effect, artifact, and attempt identities while fixing `held_barrier_proven` to
-false: terminal-arm asymmetry is useful partial evidence, not proof that one
-parallel coalesce barrier remained held. The `eof_aggregation` case injects one
-fail-once fault before an EOF transform result, then proves that public resume
-retains the original failed batch, creates one distinct completed retry batch,
-and reuses the same ordered three-member token set. The
-`expansion_child_enqueue` case faults after the source is durably exhausted and
-all children are enqueued but before sink flush, then proves exact 3-parent,
-6-child, 3-group, and 9-work-item identity across public resume. That case uses
-the supported observed-schema JSON source contract; fixed-schema `any` resume
-reconstruction remains separately owned by P1 `elspeth-0b0eaa63df`. Both cases
-also require terminal token/work state, checkpoint removal, no source replay,
-canonical outputs, and exact durable/export parity. The
-`pending_sink_redrive` case proves the same work, token, row, payload, sink,
-outcome, path, error, and scheduler-attempt bundle survives expiry. It requires
-one exact sink-specific `RECOVER_EXPIRED_LEASE` transition that clears the old
-owner before a fresh claim, no effect or artifact before recovery, and exactly
-one final sink effect, member, artifact, and publication with the expected
-three public sink-effect attempts. It also proves terminal state, checkpoint
-cleanup, no source replay, and durable/export parity. All three recovery
-proofs remain provisional until they are rerun after the deferred-platform
-rebase.
-
-The checkpoint case adds a separate terminal-resume idempotence proof rather
-than treating the resumed audit history as identical to a fresh run. A fresh
-control and the fail-once EOF crash/resume path are reduced to a typed terminal
-projection: stable rows and lineage, final completed node and scheduler state,
-completed batch membership, terminal dispositions, counters, and canonical
-sink bytes. Those terminal projections must be exactly equal. The resumed
-run's complete durable projection remains independently retained in the
-runtime/audit evidence, including its legitimate failed and successful attempt
-history. Its separate digest is pinned in the manifest after normalizing only
-the ephemeral corpus runtime-root string and deterministically remapping the
-node identities derived from that string; the remaining history stays in the
-digest. A third fresh settings/plugin/graph/config/runtime lifetime
-then calls the public resume API with the stale resume point and must receive
-the exact terminal `NonResumableRunError`. Before and after that refusal the
-harness requires identical SQLite file bytes, durable-record and public-export
-hashes, every entry in the isolated artifact-root tree, and per-declared-artifact
-byte digests. This is an in-process
-fresh-object proof, not an OS-process or multi-process claim. It promotes only
-the checkpoint runtime and audit cells: contracts remain partial under
-`elspeth-f321e3ff21`, recovery remains partial under `elspeth-245b21351b`,
-concurrency and scale remain unchanged, and the evidence is provisional until
-the deferred-platform rebase.
-
-The manifest does not replace the criteria, and a dated assessment does not
-replace the live manifest. Documentary evidence can explain a cell, but only
-executable `harness` or `pytest` evidence can support `pass`.
+The criteria judge whether the product is supportable as a whole. The cells
+show exactly where executable scenario evidence exists or remains incomplete.
 
 ## Status vocabulary
 
-The manifest accepts exactly these lower-case statuses:
-
 | Status | Meaning | Required shape |
 | --- | --- | --- |
-| `pass` | Current executable evidence proves the complete requirement for this cell. | One or more evidence IDs, including at least one `harness` or `pytest` reference; no reason, owner, or exit gate. |
-| `partial` | Current evidence proves part, but not all, of the requirement. | A precise reason, Filigree owner issue, and observable exit gate. Evidence may be attached. |
-| `fail` | Current evidence demonstrates behavior that misses the requirement. | A precise reason, Filigree owner issue, and observable exit gate. Evidence may be attached. |
-| `unknown` | Adequate current production-path evidence has not been executed or does not exist. | A precise reason, Filigree owner issue, and observable exit gate. Evidence may be attached. |
-| `not_applicable` | The dimension genuinely does not apply to this scenario. | A narrow applicability reason; no evidence, owner, or exit gate. |
+| `pass` | Current executable evidence proves the complete cell. | At least one applicable `harness` or `pytest` evidence reference; no gap metadata. |
+| `partial` | Evidence proves part, but not all, of the cell. | Precise reason, Filigree owner issue, and observable exit gate. |
+| `fail` | Evidence demonstrates behavior that misses the requirement. | Precise reason, Filigree owner issue, and observable exit gate. |
+| `unknown` | Adequate current production-path evidence has not been executed or does not exist. | Precise reason, Filigree owner issue, and observable exit gate. |
+| `not_applicable` | The dimension genuinely does not apply. | Narrow reason; no evidence, owner, or exit gate. |
 
-`unknown` is a result, not a skipped test and not permission to infer success.
-Keep the cell visible and owned until executable evidence proves a different
-status. Registered harness cases must run normally: do not hide a coverage gap
-with `skip`, `xfail`, or a plan-only reference.
+Documentary evidence may explain a cell, but only executable `harness` or
+`pytest` evidence can support `pass`. `unknown` remains an owned result; it is
+not permission to infer success or hide a case with `skip` or `xfail`.
 
-## Register executable evidence
-
-Use one of the two executable evidence kinds.
+## Register and promote evidence
 
 For a corpus harness case:
 
-1. Add deterministic inputs and canonical YAML below
+1. Add deterministic inputs and canonical YAML under
    `tests/fixtures/dag_scenario_corpus/v1/<scenario-id>/`.
-2. Add a case beneath that scenario's `cases` list. Its locator is
-   `<scenario-id>:<case-id>`.
-3. Select the narrowest honest workflow: `build` with an exact
-   `BuildExpectation`; `run` with an exact-audit `RunExpectation`, a
-   runtime-only `SemanticRunExpectation`, or a `SummaryRunExpectation`; or
-   `recovery` with an exact-audit `RunExpectation` or
-   `SummaryRunExpectation`. The schema rejects build expectations on later
-   workflows and semantic-runtime expectations on recovery.
-4. Add one top-level evidence record with `kind: harness`, the same locator,
-   a precise claim, and only the stages it proves. Build-only evidence must use
-   exactly `[config, build]`; semantic-runtime evidence must use exactly
-   `[config, build, runtime]`.
-5. Reference that evidence ID only from cells its assertions actually prove.
-6. Extend the table-driven assertions in the
-   [production-path integration test](../../../../tests/integration/core/dag/test_dag_scenario_production_path.py)
-   when the common expectation schema is not sufficient.
+2. Add the case to the matching manifest scenario with the narrowest honest
+   workflow: `build`, `run`, or `recovery`.
+3. Add a top-level `kind: harness` evidence record with the same
+   `<scenario-id>:<case-id>` locator and only the stages it proves.
+4. Reference the evidence only from cells its assertions directly prove.
+5. Extend the table-driven production-path integration assertions when the
+   common expectation schema is insufficient.
 
-For an existing executable test, add a top-level record with `kind: pytest`
-and a repository-relative pytest node locator such as
-`tests/path/test_file.py::test_name`. The loader validates that the file and
-node exist, and the contract suite batch-collects every declared pytest
-locator.
+For an existing executable test, use `kind: pytest` and a repository-relative
+pytest node locator. The loader validates the file and node, and the contract
+suite batch-collects every declared pytest locator.
 
-Use `document` and `decision` references only as supporting context. They
-cannot make a cell pass by themselves.
-
-## Promote a cell
-
-Promote evidence and status in the same commit:
-
-1. Add or strengthen the executable assertion and observe it fail for the
-   missing behavior or proof.
-2. Make the production path and assertion pass.
-3. Register the exact evidence locator in the manifest.
-4. Attach the evidence ID to every cell it directly proves.
-5. Change a cell to `pass` only when that evidence covers the whole cell, then
-   remove its `reason`, `owner_issue`, and `exit_gate` fields.
-6. Run the focused contract and integration suites before committing.
-
-If evidence closes only part of the gap, keep `partial` and rewrite its reason
-and exit gate to state exactly what remains. Do not promote a nearby cell by
-analogy.
+Promote evidence and status in the same commit. Change a cell to `pass` only
+when evidence covers the whole cell, then remove its `reason`, `owner_issue`,
+and `exit_gate`. When evidence closes only part of a gap, retain `partial` and
+rewrite the reason and exit gate to state exactly what remains.
 
 ## Run the focused checks
 
@@ -220,36 +99,38 @@ Run every registered production-path harness case:
   tests/integration/core/dag/test_dag_scenario_production_path.py
 ```
 
-The [unit contract suite](../../../../tests/unit/architecture/test_dag_scenario_corpus_contract.py)
-must reject malformed inventory or evidence. The integration suite must run
-registered cases without skips or expected failures and must assert the
+The unit suite must reject malformed inventory or evidence. The integration
+suite must run registered cases without skips or expected failures and assert
 observed evidence, not merely successful process exit.
-
-## Dated assessments
-
-The live corpus evolves; [dated assessments](../assessments/) remain immutable
-records of one commit. A new assessment should cite:
-
-- `docs/architecture/dag/scenario-corpus/v1/manifest.yaml`;
-- the manifest `schema_version`;
-- the assessed Git commit; and
-- the exact corpus commands and observed results.
-
-Do not rewrite an older assessment when the manifest changes. Add a new dated
-assessment, or add an explicit erratum when the older record itself is wrong.
-The [assessment framework](../assessment-framework.md) defines the complete
-snapshot workflow.
 
 ## Active Filigree work
 
-The foundation and remaining corpus coverage are tracked by
-Filigree issue `elspeth-ef29ef6ba4`. Inspect its live state rather than copying
-a status into this evergreen page:
+This status snapshot was taken on 2026-08-29. It is navigation aid only; use
+the commands below for current status, ownership, and dependencies.
+
+| Issue | Snapshot status | Purpose |
+| --- | --- | --- |
+| `elspeth-ef29ef6ba4` | `in_progress`; blocked by `elspeth-cb1053fe46` | Complete the maintained production-path scenario matrix. |
+| `elspeth-cb1053fe46` | `open`; blocks `elspeth-ef29ef6ba4` | Define and gate the supported scale envelope. |
+| `elspeth-be41d0ea25` | `open` | Repair and CI-bind the normative execution-graph contract. |
 
 ```bash
 filigree show elspeth-ef29ef6ba4 --json
+filigree show elspeth-cb1053fe46 --json
+filigree show elspeth-be41d0ea25 --json
 ```
 
-Keep the issue open while applicable cells still rely on incomplete evidence
-owned by it. Close it only when its full acceptance scope—not merely the
-manifest and harness foundation—is satisfied.
+Do not copy tracker-maintained case totals into this page. The manifest and
+contract test own corpus counts; Filigree owns the state of the work.
+
+## Historical assessment work
+
+Temporary dated notes may be useful while collecting evidence. Before such
+work is retired, update the live manifest first and run its contract test.
+Public readers should use Git history to inspect earlier manifests and
+verdicts. Maintainers may also keep an optional local archive outside the
+published documentation tree, but the live docs must not depend on a dated
+snapshot or present one as current authority.
+
+The [assessment framework](../assessment-framework.md) defines the complete
+reassessment workflow.

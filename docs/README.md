@@ -50,7 +50,7 @@ Current architecture and design references.
 - [Subsystems](architecture/subsystems.md) — compatibility pointer to current subsystem diagrams and ADRs
 - [Token Lifecycle](architecture/token-lifecycle.md) — row identity through forks and joins
 - [State Engine](architecture/state_engine/README.md) — canonical durable scheduler, barrier, sink-effect, proof-catalog, and assessment authority
-- [DAG Information and Completeness](architecture/dag/README.md) — permanent criteria, assessment framework, current verdict, and dated evidence
+- [DAG Information and Completeness](architecture/dag/README.md) — live criteria, executable scenario evidence, current verdict, and delivery ownership
 - [Landscape System](architecture/landscape.md) — audit trail architecture
 - [Landscape Entry Points](architecture/landscape-entry-points.md) — where audit records are created
 - [Barrier Machinery](architecture/barrier-machinery.md) — aggregation and coalesce as structural twins; paired-surfaces table and paired-change checklist

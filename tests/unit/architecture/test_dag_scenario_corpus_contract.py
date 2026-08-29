@@ -984,9 +984,21 @@ sinks:
 
 DAG_HUB_PATH = REPOSITORY_ROOT / "docs/architecture/dag/README.md"
 CORPUS_README_PATH = REPOSITORY_ROOT / "docs/architecture/dag/scenario-corpus/README.md"
-CURRENT_ASSESSMENT_ROOT = REPOSITORY_ROOT / "docs/architecture/dag/assessments/2026-07-18-0319"
-CURRENT_ASSESSMENT_DOCUMENTS = tuple(sorted(CURRENT_ASSESSMENT_ROOT.rglob("*.md")))
-ACTIVE_CORPUS_ISSUE = "elspeth-ef29ef6ba4"
+ASSESSMENT_FRAMEWORK_PATH = REPOSITORY_ROOT / "docs/architecture/dag/assessment-framework.md"
+COMPLETENESS_CRITERIA_PATH = REPOSITORY_ROOT / "docs/architecture/dag/completeness-criteria.md"
+DOCS_INDEX_PATH = REPOSITORY_ROOT / "docs/README.md"
+LIVE_DAG_DOCUMENTS = (
+    DAG_HUB_PATH,
+    CORPUS_README_PATH,
+    ASSESSMENT_FRAMEWORK_PATH,
+    COMPLETENESS_CRITERIA_PATH,
+    DOCS_INDEX_PATH,
+)
+ACTIVE_CORPUS_ISSUES = (
+    "elspeth-ef29ef6ba4",
+    "elspeth-cb1053fe46",
+    "elspeth-be41d0ea25",
+)
 
 EXPECTED_HAPPY_PATH_YAML = b"""sources:
   primary:
@@ -1472,8 +1484,16 @@ def test_parent_traversal_to_existing_target_outside_repository_is_reported(tmp_
     assert _missing_repository_relative_link_targets(document) == ("../../outside.md",)
 
 
-def test_dag_hub_links_the_live_scenario_corpus() -> None:
-    assert "scenario-corpus/README.md" in _markdown_link_targets(DAG_HUB_PATH)
+def test_dag_hub_links_the_live_scenario_corpus_authorities() -> None:
+    targets = _markdown_link_targets(DAG_HUB_PATH)
+    content = DAG_HUB_PATH.read_text(encoding="utf-8")
+
+    assert {
+        "scenario-corpus/README.md",
+        "scenario-corpus/v1/manifest.yaml",
+        "../../../tests/unit/architecture/test_dag_scenario_corpus_contract.py",
+    }.issubset(targets)
+    assert "authoritative live" in content.lower()
 
 
 def test_scenario_corpus_readme_links_manifest_criteria_and_active_issue() -> None:
@@ -1482,11 +1502,28 @@ def test_scenario_corpus_readme_links_manifest_criteria_and_active_issue() -> No
 
     assert "v1/manifest.yaml" in targets
     assert "../completeness-criteria.md" in targets
-    assert ACTIVE_CORPUS_ISSUE in content
-    assert f"filigree show {ACTIVE_CORPUS_ISSUE} --json" in content
+    for issue_id in ACTIVE_CORPUS_ISSUES:
+        assert issue_id in content
+        assert f"filigree show {issue_id} --json" in content
 
 
-@pytest.mark.parametrize("document", [DAG_HUB_PATH, CORPUS_README_PATH, *CURRENT_ASSESSMENT_DOCUMENTS])
+def test_dag_docs_explain_product_criteria_and_executable_lifecycle_cells() -> None:
+    content = "\n".join(path.read_text(encoding="utf-8") for path in (DAG_HUB_PATH, CORPUS_README_PATH, ASSESSMENT_FRAMEWORK_PATH)).lower()
+
+    assert "15 product-quality criteria" in content
+    assert "11 executable lifecycle cells" in content
+
+
+@pytest.mark.parametrize("document", LIVE_DAG_DOCUMENTS)
+def test_live_dag_documents_do_not_depend_on_dated_assessment_paths(document: Path) -> None:
+    assert "assessments/2026-" not in document.read_text(encoding="utf-8")
+
+
+def test_docs_index_links_the_live_dag_hub() -> None:
+    assert "architecture/dag/README.md" in _markdown_link_targets(DOCS_INDEX_PATH)
+
+
+@pytest.mark.parametrize("document", LIVE_DAG_DOCUMENTS)
 def test_dag_corpus_document_repository_relative_links_resolve(document: Path) -> None:
     assert _missing_repository_relative_link_targets(document) == ()
 
