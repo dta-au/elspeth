@@ -145,3 +145,8 @@
   `_probe_invocable`. Hub-reviewed flags: lexists/unlink(missing_ok) accepted (exclusive create is the
   os.link FileExistsError path; dangling-symlink pin added). Lane's own absolute counts (2592/2573) carry a
   2-line offset vs hub's; deltas identical (19).
+- tier-stagecmd MERGED (lane HEAD c0cf09f39, elspeth-23ee8e3440): every staging tool now emits
+  `sign_bundle_plan` (per-lane actions + judge calls from `sign_bundle_transaction._JUDGE_GATED_KINDS`,
+  lane-scoped `--lanes` commands cheapest-first, `--continue-on-block` above 10 judge calls, un-rationaled
+  justify advisory). Whole-bundle `sign_bundle_command` kept; handoff doc + both skill twins updated.
+  Corpus unchanged (no rules/ edits). Issue is a bug type → `verifying` accepted; close at wave end.
