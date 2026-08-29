@@ -60,12 +60,12 @@ def test_envelope_cancelled_and_failed_statuses() -> None:
     doc = json.loads((FIXTURES / "run_ideal/messages.json").read_text())
     tool = next(m for m in doc if m["role"] == "tool" and m["tool_call_id"] == "call_sp")
     tool["composition_state_id"] = None
-    tool["tool_calls"] = [{"_kind": "audit", "status": "cancelled", "version_before": 1, "version_after": 1}]
+    tool["tool_calls"] = [{"_kind": "audit", "invocation": {"status": "cancelled", "version_before": 1, "version_after": 1}}]
     cap.messages = doc
     assert tool_outcomes(cap)["call_sp"] == "cancelled"
-    tool["tool_calls"] = [{"_kind": "audit", "status": "arg_error", "version_before": 1, "version_after": 1}]
+    tool["tool_calls"] = [{"_kind": "audit", "invocation": {"status": "arg_error", "version_before": 1, "version_after": 1}}]
     assert tool_outcomes(cap)["call_sp"] == "failed"
-    tool["tool_calls"] = [{"_kind": "audit", "status": "ok", "version_before": 1, "version_after": 2}]
+    tool["tool_calls"] = [{"_kind": "audit", "invocation": {"status": "ok", "version_before": 1, "version_after": 2}}]
     assert tool_outcomes(cap)["call_sp"] == "applied"
 
 
@@ -134,14 +134,14 @@ def test_tool_outcomes_agree_with_the_server_projection() -> None:
             "failed",
             "as1",
             content={"success": True},
-            envelope={"_kind": "audit", "status": "arg_error", "version_before": 1, "version_after": 1},
+            envelope={"_kind": "audit", "invocation": {"status": "arg_error", "version_before": 1, "version_after": 1}},
         ),
         tg.tool_row(
             5,
             "cancelled",
             "as1",
             content={"success": True},
-            envelope={"_kind": "audit", "status": "cancelled", "version_before": 1, "version_after": 1},
+            envelope={"_kind": "audit", "invocation": {"status": "cancelled", "version_before": 1, "version_after": 1}},
         ),
         tg.tool_row(6, "completed", "as1", content={"success": True, "schema": {}}),
         tg.tool_row(
@@ -149,7 +149,7 @@ def test_tool_outcomes_agree_with_the_server_projection() -> None:
             "env_applied",
             "as1",
             content={"success": True},
-            envelope={"_kind": "audit", "status": "success", "version_before": 1, "version_after": 2},
+            envelope={"_kind": "audit", "invocation": {"status": "success", "version_before": 1, "version_after": 2}},
         ),
         tg.tool_row(8, "err_cancelled", "as1", content={"error_class": "ToolCancelled", "_redaction_status": "cancelled"}),
     ]

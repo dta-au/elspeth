@@ -475,10 +475,22 @@ def _tool_call_outcomes_by_call_id(
             )
             continue
         if envelope is not None:
+            # The per-call delta lives one level DOWN, under ``invocation``:
+            # the fallback writer stores exactly
+            # ``redacted_tool_invocation_content_and_envelope(...)[1]``, which
+            # is ``{"_kind": "audit", "invocation": {...}}``. Reading these
+            # keys off the top level found nothing on every real row, so an
+            # applied mutation fell through to COMPLETED and rendered as a
+            # lookup (elspeth-f5e6723133's own failure mode). ``Mapping``, not
+            # ``type() is dict``: ``ChatMessageRecord.__post_init__`` freezes
+            # ``tool_calls``, so a row read back from the DB hands us
+            # ``mappingproxy`` at BOTH levels.
+            invocation = envelope["invocation"] if "invocation" in envelope else None
+            delta: Mapping[str, Any] = invocation if isinstance(invocation, Mapping) else {}
             # Absence is a legitimate envelope shape, not a damaged row, so the
             # membership read is the honest form.
-            version_before = envelope["version_before"] if "version_before" in envelope else None
-            version_after = envelope["version_after"] if "version_after" in envelope else None
+            version_before = delta["version_before"] if "version_before" in delta else None
+            version_after = delta["version_after"] if "version_after" in delta else None
             # Exact ``int`` rather than ``isinstance``: the envelope round-trips
             # through the session DB's JSON column, so a real version is an exact
             # ``int`` and a JSON ``true`` must not be admitted as version 1.
@@ -488,7 +500,7 @@ def _tool_call_outcomes_by_call_id(
                     applied_state_version=version_after,
                 )
                 continue
-            status = envelope["status"] if "status" in envelope else None
+            status = delta["status"] if "status" in delta else None
             if status == ComposerToolStatus.CANCELLED.value:
                 outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.CANCELLED, applied_state_version=None)
                 continue

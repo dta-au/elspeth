@@ -110,7 +110,7 @@ def test_near_miss_durable_applied_with_lying_rejected_stamp_does_not_repair() -
 def test_cancelled_outcome_is_not_applied_so_a_retry_is_a_repair() -> None:
     rows = tg.ideal_thread(ARGS)
     rows[-1]["composition_state_id"] = None
-    rows[-1]["tool_calls"] = [{"_kind": "audit", "status": "cancelled", "version_before": 1, "version_after": 1}]
+    rows[-1]["tool_calls"] = [{"_kind": "audit", "invocation": {"status": "cancelled", "version_before": 1, "version_after": 1}}]
     rows.append(tg.audit_row(20))
     rows.append(tg.assistant_row(21, [tg.call("sp2", "set_pipeline", ARGS)]))
     rows.append(tg.tool_row(22, "sp2", "as21", state_id="state-3"))

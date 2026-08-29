@@ -281,11 +281,18 @@ def tool_outcomes(capture: Capture) -> dict[str, str]:
             out[row.tool_call_id] = "applied"
             continue
         if env is not None:
-            vb, va = env.get("version_before"), env.get("version_after")
+            # The per-call delta lives under "invocation": the writer stores
+            # {"_kind": "audit", "invocation": {...}} (see decode_tools.
+            # _first_audit_invocation, which already unwraps it the same way).
+            # Reading these keys off the top level matches nothing on a real
+            # capture, so an applied mutation scored as a lookup.
+            invocation = env.get("invocation")
+            delta = invocation if isinstance(invocation, dict) else {}
+            vb, va = delta.get("version_before"), delta.get("version_after")
             if isinstance(vb, int) and isinstance(va, int) and va > vb:
                 out[row.tool_call_id] = "applied"
                 continue
-            status = env.get("status")
+            status = delta.get("status")
             if status == _CANCELLED:
                 out[row.tool_call_id] = "cancelled"
                 continue
