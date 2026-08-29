@@ -3829,6 +3829,27 @@ Every one of the ~25 whole-tree gates had the same exposure. Two rules now:
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-29 — a SKIPPED ledger row is not a verdict: never read
+  `ValidationCheck.passed` alone for a check the ledger may not have reached.**
+  `execution/validation.py::_skipped_checks` emits every check DOWNSTREAM of a
+  halted stage as `passed=False` with
+  `outcome_code=CHECK_OUTCOME_SKIPPED_AFTER_FAILURE` — including
+  `advisor_signoff` — so every pending-handoff strict preflight carries a
+  "failing" advisor check that means NEVER EVALUATED. Reading it as a failure
+  published the "advisory review did not clear" notice over a CLEAN advisor
+  verdict (elspeth-fa18d54eef; live in three sessions before the telemetry
+  caught it). Dispatch through
+  `execution/completion_gates.advisor_signoff_check_failed` (skipped-aware),
+  or for a new check name, discriminate on `outcome_code` yourself. The
+  companion trap is FIXTURE DIVERGENCE: `_handoff_result()`-style hand-built
+  ValidationResults with `checks=[]` pin a shape `validate_pipeline` never
+  emits (the real producer appends the skipped tail), which is exactly why
+  seven scripted reproductions missed a bug three live sessions hit — when a
+  consumer dispatches on checks, give the fixture the producer's skipped rows
+  (`_producer_honest_handoff_result` in
+  `tests/unit/web/composer/test_advisor_terminal_publication.py` is the
+  worked example).
+
 - **2026-08-29 — advisor-cohort terminal copy carries a SHARED withheld-prose
   disclosure, and every publication site is attributed.**
   `no_tool_policy.ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE` is appended to all

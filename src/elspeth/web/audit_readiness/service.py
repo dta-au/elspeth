@@ -32,9 +32,8 @@ from elspeth.web.audit_readiness.models import (
 )
 from elspeth.web.catalog.schemas import PluginKind
 from elspeth.web.composer.state import CompositionState, NodeType
-from elspeth.web.execution.completion_gates import CompletionGateFacts, parse_completion_gates
+from elspeth.web.execution.completion_gates import CompletionGateFacts, advisor_signoff_check_failed, parse_completion_gates
 from elspeth.web.execution.schemas import (
-    CHECK_ADVISOR_SIGNOFF,
     CHECK_OUTCOME_SECRET_REFS_NO_REFS,
     CHECK_OUTCOME_SECRET_REFS_RESOLVED,
     CHECK_OUTCOME_SECRET_REFS_SKIPPED_NO_SERVICE,
@@ -636,7 +635,7 @@ def _build_validation_row(result: ValidationResult) -> ReadinessRow:
         result.is_valid
         and result.readiness.execution_ready
         and not result.readiness.completion_ready
-        and any(check.name == CHECK_ADVISOR_SIGNOFF and not check.passed for check in result.checks)
+        and advisor_signoff_check_failed(result.checks)
     )
     if advisor_completion_pending:
         return ReadinessRow(

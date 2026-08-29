@@ -27,6 +27,7 @@ from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import (
     ADVISOR_SIGNOFF_BLOCKED_CODE,
     CHECK_ADVISOR_SIGNOFF,
+    CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
     VALIDATION_CHECK_NAMES,
     ValidationCheck,
     ValidationReadiness,
@@ -82,6 +83,26 @@ class CompletionGateFacts:
     """Parsed ``completion_gates`` envelope. ``None`` fields = gate not withheld."""
 
     advisor_signoff: AdvisorSignoffGateFact | None
+
+
+def advisor_signoff_check_failed(checks: Sequence[ValidationCheck]) -> bool:
+    """True only for an ``advisor_signoff`` check the advisor path actually built and failed.
+
+    The strict ledger emits every check DOWNSTREAM of a halted stage as
+    ``passed=False`` with ``outcome_code=CHECK_OUTCOME_SKIPPED_AFTER_FAILURE``
+    — including ``advisor_signoff`` (``validation._skipped_checks``). A skipped
+    row means the gate was never reached, not that the advisory review failed;
+    reading it as failure published the pending-handoff "did not clear" notice
+    over a CLEAN advisor verdict (elspeth-fa18d54eef — observed live in
+    sessions 39578c6f and 7afbc210). The advisor-path builders
+    (``_advisor_signoff_pending_validation`` / ``_advisor_signoff_pending_handoff_validation``
+    / :func:`_reconcile_advisor_check` below) all set ``outcome_code=None``,
+    so the outcome code is the honest discriminator.
+    """
+    return any(
+        check.name == CHECK_ADVISOR_SIGNOFF and not check.passed and check.outcome_code != CHECK_OUTCOME_SKIPPED_AFTER_FAILURE
+        for check in checks
+    )
 
 
 def _reconcile_advisor_check(checks: Sequence[ValidationCheck], *, detail: str) -> list[ValidationCheck]:
