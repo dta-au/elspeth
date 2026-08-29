@@ -3,7 +3,7 @@
    .progress-cancel-btn, .progress-bar-outer, .progress-counters-caption,
    .progress-counters*,
    .progress-routing-summary, .progress-accounting*, .progress-cancelled-msg,
-   .progress-failed-msg, .progress-errors-*, .progress-error-*,
+   .progress-failed-msg, .progress-errors, .progress-errors-*, .progress-error-*,
    .run-outcome-notice*, .runs-history-backdrop, .runs-history-drawer,
    .runs-history-drawer-header, .runs-history-drawer-body, .runs-history-list,
    .runs-history-item, .runs-history-item-corruption.
@@ -294,6 +294,25 @@
 
 .progress-accounting-integrity-item--warning strong {
   color: var(--color-error);
+}
+
+.progress-accounting-closure {
+  margin: 0 0 0.25rem;
+  font-weight: 600;
+}
+.progress-accounting-detail {
+  margin-top: 0.25rem;
+}
+.progress-accounting-detail > summary {
+  cursor: pointer;
+  color: var(--color-text-secondary);
+}
+.progress-errors {
+  margin-top: 0.5rem;
+}
+.progress-errors > summary {
+  cursor: pointer;
+  font-weight: 600;
 }
 
 .progress-cancelled-msg {

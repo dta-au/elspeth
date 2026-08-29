@@ -10,12 +10,17 @@
 // - WebSocket disconnect banner with reconnect status
 // ============================================================================
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useExecutionStore } from "@/stores/executionStore";
+import { useSessionStore } from "@/stores/sessionStore";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Button, StatusBadge } from "@/components/ui";
+import { makePhraseFor } from "@/lib/validationHumaniser";
 import {
+  RUN_ACCOUNTING_CLOSURE_PHRASES,
+  RUN_ACCOUNTING_GLOSSES,
   RUN_ACCOUNTING_LABELS,
   RUN_COUNTER_LABELS,
   terminalRunAnnouncement,
@@ -56,7 +61,13 @@ function buildStatusAnnouncement(progress: RunProgress, cancelRequested: boolean
   }
 }
 
-function ProgressAccountingDetails({ accounting }: { accounting: RunAccounting }) {
+function ProgressAccountingDetails({
+  accounting,
+  showAdvanced,
+}: {
+  accounting: RunAccounting;
+  showAdvanced: boolean;
+}) {
   // Labels come from the shared run-panel vocabulary (runTerminalPhrases),
   // not inline literals — one owner holds the sentence-case register
   // (elspeth-406b503a82).
@@ -81,21 +92,10 @@ function ProgressAccountingDetails({ accounting }: { accounting: RunAccounting }
 
   return (
     <div role="group" aria-label="Run accounting" className="progress-accounting">
-      <dl className="progress-accounting-grid">
-        {accountingCounters.map(([label, value]) => (
-          <div key={label} className="progress-accounting-item">
-            <dt>{label}</dt>
-            <dd>{formattedCount(value)}</dd>
-          </div>
-        ))}
-      </dl>
+      <p className="progress-accounting-closure">
+        {RUN_ACCOUNTING_LABELS.auditClosure}: {RUN_ACCOUNTING_CLOSURE_PHRASES[accounting.integrity.closure]}
+      </p>
       <div className="progress-accounting-integrity">
-        <span className="progress-accounting-integrity-item">
-          <span className="progress-accounting-integrity-label">
-            {RUN_ACCOUNTING_LABELS.auditClosure}
-          </span>
-          <strong>{accounting.integrity.closure}</strong>
-        </span>
         {integrityWarnings.map(([label, value]) =>
           value > 0 ? (
             <span key={label} className="progress-accounting-integrity-item progress-accounting-integrity-item--warning">
@@ -105,6 +105,17 @@ function ProgressAccountingDetails({ accounting }: { accounting: RunAccounting }
           ) : null,
         )}
       </div>
+      <details className="progress-accounting-detail" open={showAdvanced}>
+        <summary title={RUN_ACCOUNTING_GLOSSES.token}>Accounting detail</summary>
+        <dl className="progress-accounting-grid">
+          {accountingCounters.map(([label, value]) => (
+            <div key={label} className="progress-accounting-item">
+              <dt>{label}</dt>
+              <dd>{formattedCount(value)}</dd>
+            </div>
+          ))}
+        </dl>
+      </details>
     </div>
   );
 }
@@ -113,6 +124,9 @@ export function ProgressView() {
   const { progress, wsDisconnected, activeRunId } = useWebSocket();
   const cancel = useExecutionStore((s) => s.cancel);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const showAdvanced = useShowAdvanced();
+  const compositionState = useSessionStore((s) => s.compositionState);
+  const phraseFor = useMemo(() => makePhraseFor(compositionState), [compositionState]);
 
   if (!progress || !activeRunId) return null;
 
@@ -289,12 +303,16 @@ export function ProgressView() {
             <span>{progress.tokens_routed_failure.toLocaleString()} routed failure</span>
           )}
           {progress.tokens_quarantined > 0 && (
-            <span>{progress.tokens_quarantined.toLocaleString()} quarantined</span>
+            <span title={RUN_ACCOUNTING_GLOSSES.quarantined}>
+              {progress.tokens_quarantined.toLocaleString()} quarantined
+            </span>
           )}
         </div>
       )}
 
-      {progress.accounting && <ProgressAccountingDetails accounting={progress.accounting} />}
+      {progress.accounting && (
+        <ProgressAccountingDetails accounting={progress.accounting} showAdvanced={showAdvanced} />
+      )}
 
       {/* Cancellation message — visual-only; the announcement is carried by
           the polite live region at the top of the container. */}
@@ -313,10 +331,12 @@ export function ProgressView() {
 
       {/* Recent errors */}
       {progress.recent_errors.length > 0 && (
-        <div>
-          <div className="progress-errors-title">
-            Recent errors ({progress.recent_errors.length})
-          </div>
+        <details className="progress-errors" open={showAdvanced}>
+          <summary className="progress-errors-title">
+            {progress.recent_errors.length === 1
+              ? "1 row failed — view details"
+              : `${progress.recent_errors.length} rows failed — view details`}
+          </summary>
           <div className="progress-errors-container">
             {progress.recent_errors.map((err, i) => (
               <div
@@ -329,7 +349,7 @@ export function ProgressView() {
                       : "none",
                 }}
               >
-                {err.node_id && <strong>{err.node_id}</strong>}
+                {err.node_id && <strong>{phraseFor(err.node_id)}</strong>}
                 {err.node_id && ": "}
                 {err.message}
                 {err.row_id && (
@@ -341,7 +361,7 @@ export function ProgressView() {
               </div>
             ))}
           </div>
-        </div>
+        </details>
       )}
     </div>
   );

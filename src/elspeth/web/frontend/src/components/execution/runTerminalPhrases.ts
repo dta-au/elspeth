@@ -28,7 +28,7 @@
 // can import it without dragging the other's dependency graph along.
 // ============================================================================
 
-import type { TerminalRunStatus } from "@/types/index";
+import type { RunAccountingIntegrity, TerminalRunStatus } from "@/types/index";
 
 interface TerminalRunPhrase {
   /** Subject + verb clause, no trailing punctuation, no totals clause. */
@@ -104,4 +104,18 @@ export const RUN_ACCOUNTING_LABELS = {
   auditClosure: "Audit closure",
   missingTerminal: "Missing terminal",
   duplicateTerminal: "Duplicate terminal",
+} as const;
+
+/** Closure verdict sentences (elspeth-05a240b82a). One owner for the
+ *  sentence-case register (elspeth-406b503a82); ProgressView imports these. */
+export const RUN_ACCOUNTING_CLOSURE_PHRASES: Record<RunAccountingIntegrity["closure"], string> = {
+  closed: "complete — every row is accounted for.",
+  open: "incomplete — some rows are not yet accounted for.",
+  abandoned: "closed with abandoned rows — some rows were marked permanently undecidable.",
+  unknown: "not verified for this run.",
+};
+
+export const RUN_ACCOUNTING_GLOSSES = {
+  token: "A token is one row's journey through the pipeline.",
+  quarantined: "Quarantined rows are kept in the audit trail but excluded from the output.",
 } as const;
