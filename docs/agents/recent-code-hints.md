@@ -26,13 +26,24 @@ is a working document under the normal delivery posture.
   `errors/warnings/diagnostics/entries/failures/issues/problems` (bare or
   `self._errors`), value a non-builtin call or a handler-local bound to one, or
   any `append/add` of a call carrying `error_code=`; `errors.append(str(exc))`
-  and `seen.append(_normalise(exc))` still fire. (D5) `subject_is_rooted`
-  roots `enumerate/zip/sorted/reversed/list/tuple/iter(<rooted arg>)` at the
-  argument — a closed list; `normalise(payload)` still roots at `normalise`.
-  Measured allowlist-disabled @ae34b48b3: 2573 → 2484, 89 removed, 0 added
-  (R1 14 / R4 24 / R5 36 / R6 15). The re-stage will find signed entries for
-  those 89 sites gone → `stale_delete`, and per-file caps in
-  `config/cicd/enforce_tier_model/*.yaml` ratchet down (chat_solver 31→13).
+  and `seen.append(_normalise(exc))` still fire. (D5) A BOUND value derives
+  by the assignment rule everywhere: `for e in _require_sequence(payload)`,
+  `enumerate(f(payload))`, `f(payload).items()`, comprehension iterables and
+  `with f(payload) as h` now bind derived targets exactly as
+  `e = f(payload)` always did (`_value_depends_on_boundary`); the strict
+  `subject_is_rooted` rule is for FINDING SUBJECTS only —
+  `normalise(payload).get()` still roots at `normalise`. (D6) The `if` join
+  skips a branch that cannot fall through, like the `try` join — `else:
+  return []` no longer erases names bound on the surviving branches.
+  NOT changed, deliberately: a nested `def`/`lambda` inside a boundary does
+  NOT inherit the enclosing derived names
+  (`TestBoundaryDoesNotInheritIntoNestedScopes`, since df3463583) — a closure
+  can escape the boundary and defer the Tier-3 read past its invariant, and the
+  lint has no escape analysis; that stays a policy call for the operator.
+  Measured allowlist-disabled @ae34b48b3: 2573 → 2460, 113 removed, 0 added.
+  The re-stage will find signed entries for those sites gone →
+  `stale_delete`, and per-file caps in `config/cicd/enforce_tier_model/*.yaml`
+  ratchet down (chat_solver 31→13).
 - **2026-08-29 — the tier_model `_R5_NAMED_BOUNDARY_CONTEXTS` exemption map is
   MEASURED now: every entry must resolve to exactly ONE live definition, and a
   moved function is NOT successor-included.** Before elspeth-0bd4fb6042 the

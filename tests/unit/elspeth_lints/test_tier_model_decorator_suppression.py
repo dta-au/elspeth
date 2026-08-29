@@ -779,11 +779,105 @@ class TestDerivedNameTrailPrecision:
         assert len(_findings_by_rule(findings, "R5")) == 1
         assert len(_findings_by_rule(findings, "R1")) == 1
 
-    def test_non_passthrough_call_over_source_param_still_does_not_root(self) -> None:
-        """The documented rule stands: ``foo(payload)`` is rooted at ``foo``."""
+    def test_loop_over_helper_call_on_source_param_derives_target_like_assignment(self) -> None:
+        """A ``for`` target is an assignment from the iterable: same derivation rule as ``x = f(payload)``."""
         source = self._boundary("""
-            for item in normalise(payload):
-                item.get("name")
+            for entry in _require_sequence(payload, "nodes"):
+                entry.get("name")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_enumerate_over_helper_call_on_source_param_derives_target(self) -> None:
+        source = self._boundary("""
+            for index, raw_entry in enumerate(_require_sequence(payload, "nodes")):
+                entry = _require_mapping(raw_entry, f"nodes[{index}]")
+                entry.get("name")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_items_of_helper_call_on_source_param_derives_targets(self) -> None:
+        source = self._boundary("""
+            for name, raw_entry in _require_mapping(payload, "sinks").items():
+                if not isinstance(name, str):
+                    raise ValueError("bad")
+                raw_entry.get("plugin")
+        """)
+        findings = _findings(source)
+        assert _findings_by_rule(findings, "R1") == []
+        assert _findings_by_rule(findings, "R5") == []
+
+    def test_comprehension_over_helper_call_on_source_param_derives_target(self) -> None:
+        source = self._boundary("""
+            return [item.get("name") for item in _require_sequence(payload, "q") if isinstance(item, Mapping)]
+        """)
+        findings = _findings(source)
+        assert _findings_by_rule(findings, "R1") == []
+        assert _findings_by_rule(findings, "R5") == []
+
+    def test_with_item_over_source_param_derives_optional_vars(self) -> None:
+        source = self._boundary("""
+            with _opened(payload) as handle:
+                handle.get("x")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_loop_over_helper_call_on_unrelated_value_still_fires(self) -> None:
+        source = self._boundary("""
+            for entry in _require_sequence(other(), "nodes"):
+                entry.get("name")
+        """)
+        assert len(_findings_by_rule(_findings(source), "R1")) == 1
+
+    def test_finding_subject_through_helper_call_still_roots_at_the_helper(self) -> None:
+        """The SUBJECT rule stays strict: ``normalise(payload).get()`` is rooted at ``normalise``."""
+        source = self._boundary("""
+            return normalise(payload).get("name")
+        """)
+        assert len(_findings_by_rule(_findings(source), "R1")) == 1
+
+
+class TestBranchJoinPrecision:
+    """elspeth-8d46db34ff D6: ``if`` joins skip branches that cannot fall through."""
+
+    _boundary = staticmethod(TestDerivedNameTrailPrecision._boundary)
+
+    def test_name_bound_in_surviving_if_branches_survives_when_else_returns(self) -> None:
+        source = self._boundary("""
+            q = payload.get("q")
+            if isinstance(q, Mapping):
+                entries = list(q.items())
+            elif isinstance(q, list):
+                entries = [(item, item) for item in q]
+            else:
+                return []
+            for name, entry in entries:
+                entry.get("o")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_name_bound_in_else_survives_when_if_body_returns(self) -> None:
+        source = self._boundary("""
+            q = payload.get("q")
+            if q is None:
+                return None
+            else:
+                schema = dict(q)
+            return schema.get("m")
+        """)
+        assert _findings_by_rule(_findings(source), "R1") == []
+
+    def test_name_bound_on_only_one_surviving_if_path_does_not_survive(self) -> None:
+        """Adversarial twin: two surviving paths, one binds from payload, one from elsewhere."""
+        source = self._boundary("""
+            q = payload.get("q")
+            if isinstance(q, Mapping):
+                entries = list(q.items())
+            elif isinstance(q, list):
+                entries = load_defaults()
+            else:
+                return []
+            for name, entry in entries:
+                entry.get("o")
         """)
         assert len(_findings_by_rule(_findings(source), "R1")) == 1
 

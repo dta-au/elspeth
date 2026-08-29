@@ -478,9 +478,6 @@ def extract_boundary_metadata(
     return metadata, diagnostics
 
 
-_ITERATOR_PASSTHROUGH_BUILTINS: frozenset[str] = frozenset({"enumerate", "zip", "sorted", "reversed", "list", "tuple", "iter"})
-
-
 def subject_is_rooted(node: ast.AST, derived_names: frozenset[str]) -> bool:
     """Return True if ``node``'s value bottoms out at a name in ``derived_names``.
 
@@ -495,7 +492,9 @@ def subject_is_rooted(node: ast.AST, derived_names: frozenset[str]) -> bool:
       call at ``arguments``. The ``Call.args[0]`` descent the original task
       description mentions only applies to method-style calls like
       ``arguments.get(...)``, where ``Call.func`` already chains through
-      the receiver.
+      the receiver. Values BOUND from a call (``for e in f(arguments)``,
+      ``x = f(arguments)``, ``with f(arguments) as h``) are a different
+      question, answered by :func:`_expr_contains_derived_reference`.
     * ``ast.Starred.value`` — ``*arguments`` is rooted at ``arguments``;
     * ``ast.IfExp`` / ``ast.BoolOp`` — bottoming-out on any operand that is
       rooted counts (an expression like ``arguments.get("x") or default``
@@ -513,17 +512,6 @@ def subject_is_rooted(node: ast.AST, derived_names: frozenset[str]) -> bool:
     if isinstance(node, ast.Attribute):
         return subject_is_rooted(node.value, derived_names)
     if isinstance(node, ast.Call):
-        # ``enumerate(arguments)`` / ``zip(a, arguments)`` hand their positional
-        # arguments' elements straight through (elspeth-8d46db34ff D5). This is
-        # the documented exception to the positional-arg rule below, and it is
-        # a closed list — a user function receiving ``arguments`` still roots at
-        # the function.
-        if (
-            isinstance(node.func, ast.Name)
-            and node.func.id in _ITERATOR_PASSTHROUGH_BUILTINS
-            and any(subject_is_rooted(arg, derived_names) for arg in node.args)
-        ):
-            return True
         # For ``x.method(...)`` the receiver chain is encoded as
         # ``Call.func = Attribute(value=x, attr="method")``. Descending
         # through ``func`` reaches the receiver.
