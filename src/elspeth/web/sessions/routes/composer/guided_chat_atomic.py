@@ -313,23 +313,26 @@ def _guided_advisory_graph_authority(
     current_payload: PreparedGuidedJsonPayload,
 ) -> GuidedAdvisoryGraphAuthority:
     """Bind provider context to the exact current proposal/wire CAS record."""
-    expected_turn_type = {
+    expected_turn_type_by_step = {
         GuidedStep.STEP_3_TRANSFORMS: TurnType.PROPOSE_PIPELINE,
         GuidedStep.STEP_4_WIRE: TurnType.CONFIRM_WIRING,
-    }.get(step)
-    if expected_turn_type is None:
+    }
+    if step not in expected_turn_type_by_step:
         raise AuditIntegrityError("guided advisory graph authority escaped Steps 3 and 4")
+    expected_turn_type = expected_turn_type_by_step[step]
     if type(current_payload) is not PreparedGuidedJsonPayload or current_payload.purpose != "turn":
         raise AuditIntegrityError("guided advisory graph authority requires an exact prepared turn payload")
     if not isinstance(current_turn, Mapping):
         raise AuditIntegrityError("guided advisory graph authority current turn is malformed")
     try:
         turn_type = validate_current_turn(step, current_turn)
-        turn_payload = current_turn["payload"]
     except (KeyError, TypeError, ValueError) as exc:
         raise AuditIntegrityError("guided advisory graph authority current turn is malformed") from exc
     if turn_type is not expected_turn_type:
         raise AuditIntegrityError("guided advisory graph authority turn type does not match the guided step")
+    if "payload" not in current_turn:
+        raise AuditIntegrityError("guided advisory graph authority current turn is malformed")
+    turn_payload = current_turn["payload"]
     if not isinstance(turn_payload, Mapping) or guided_json_payload_id("turn", turn_payload) != current_payload.payload_id:
         raise AuditIntegrityError("guided advisory graph authority turn payload differs from durable custody")
     if current_payload.payload_id != guided_json_payload_id("turn", current_payload.payload):
@@ -338,9 +341,13 @@ def _guided_advisory_graph_authority(
     if type(active_proposal) is not GuidedProposalRef:
         raise AuditIntegrityError("guided advisory graph authority has no exact active proposal binding")
     proposal_id = str(active_proposal.proposal_id)
-    if current_payload.payload.get("proposal_id") != proposal_id:
+    # Membership form, not ``.get()``: a Step-3/4 turn payload that is missing
+    # either binding key has already failed durable custody, so absence is an
+    # audit anomaly and must be named as one rather than compared against a
+    # ``None`` default that can never legitimately match.
+    if "proposal_id" not in current_payload.payload or current_payload.payload["proposal_id"] != proposal_id:
         raise AuditIntegrityError("guided advisory graph authority proposal id differs from active custody")
-    if current_payload.payload.get("draft_hash") != active_proposal.draft_hash:
+    if "draft_hash" not in current_payload.payload or current_payload.payload["draft_hash"] != active_proposal.draft_hash:
         raise AuditIntegrityError("guided advisory graph authority draft hash differs from active custody")
     return GuidedAdvisoryGraphAuthority(
         turn_type=turn_type,
@@ -433,6 +440,13 @@ async def run_guided_chat_provider_attempt(
             api_key=endpoint_api_key,
             reasoning_effort=settings.composer_discovery_reasoning_effort,
         )
+        # KEEP ``isinstance``: this is the NEGATIVE arm of an eight-member owned
+        # union (``Step1SourceChatResult``) and every other member is read for
+        # ``.chat`` and returned. ``type(...) is not GuidedStepChatEmptyResult``
+        # gives mypy no negative-arm narrowing, so the exact-type form forfeits
+        # the static proof that ``.chat`` exists (measured: 8 union-attr /
+        # return-value errors). The positive ``type(...) is`` checks a few lines
+        # down discriminate single members and stay exact.
         if not isinstance(source_outcome, GuidedStepChatEmptyResult):
             if revision_form == "source":
                 assistant_message = (
@@ -476,6 +490,8 @@ async def run_guided_chat_provider_attempt(
             reasoning_effort=settings.composer_discovery_reasoning_effort,
             mark_schema_loaded=mark_schema_loaded,
         )
+        # KEEP ``isinstance`` — same negative-arm narrowing requirement as the
+        # Step-1 branch above, over ``Step2SinkChatResult``.
         if not isinstance(sink_outcome, GuidedStepChatEmptyResult):
             if revision_form == "output":
                 assistant_message = (
@@ -644,8 +660,16 @@ def _prepare_step_1_source_plugin_reselection(
 
 
 def _step_1_inspected_blob_id(facts: SourceInspectionFacts) -> str | None:
-    """Return the blob id an inspection names, or ``None`` for inline facts."""
-    blob_id = facts.redacted_identity.get("blob_id")
+    """Return the blob id an inspection names, or ``None`` for inline facts.
+
+    Membership form mirrors ``composer/guided/stage_transitions.py::
+    _inspection_blob_id``: ``_redacted_identity`` writes ``blob_id`` only for
+    blob-backed inspections, so absence is the inline case rather than a
+    missing key worth defaulting past.
+    """
+    if "blob_id" not in facts.redacted_identity:
+        return None
+    blob_id = facts.redacted_identity["blob_id"]
     return blob_id if type(blob_id) is str and blob_id != "" else None
 
 
@@ -679,8 +703,10 @@ def _step_1_uploaded_bind_is_consumable(
     if target is not None and target.kind == "source":
         return False
     target_id, _plugin = guided_route._schema8_form_target(guided, source=True)
-    intent = guided.pending_source_intents.get(target_id)
-    if intent is None or intent.inspection_facts is None:
+    if target_id not in guided.pending_source_intents:
+        return False
+    intent = guided.pending_source_intents[target_id]
+    if intent.inspection_facts is None:
         return False
     bound_blob_id = _step_1_inspected_blob_id(intent.inspection_facts)
     return bound_blob_id is not None and bound_blob_id == _step_1_inspected_blob_id(inspection_facts)
@@ -697,6 +723,13 @@ def _step_1_uploaded_bind_form_options(form_turn: Turn) -> dict[str, object]:
     pressing Continue on that form would have submitted.
     """
     prefilled = form_turn["payload"]["prefilled"]
+    # KEEP ``isinstance(..., Mapping)``: ``form_turn`` reaches here BOTH freshly
+    # built (``_finalize_guided_turn`` — a plain dict) and reloaded from the
+    # content-addressed payload store (``prepare_guided_json_payload`` runs
+    # ``deep_freeze``, so nested mappings are ``MappingProxyType``, for which
+    # both ``type(x) is dict`` and ``isinstance(x, dict)`` are False).
+    # Narrowing this reject-gate to an exact type would make it fire on every
+    # replayed prefill.
     if not isinstance(prefilled, Mapping):
         raise AuditIntegrityError("source schema form has no server-held prefill to bind")
     options = deep_thaw(prefilled)
@@ -953,7 +986,16 @@ async def post_guided_chat_schema8(
         reserve_if_absent=False,
         takeover_expired=False,
     )
-    if pending is not None and not isinstance(pending, (GuidedOperationLease, GuidedOperationExpired)):
+    # ``reserve_or_replay_guided_operation`` returns a CLOSED owned union:
+    # a lease marker, an expired marker, the replayed response, or None. The
+    # replayed arm is exact by construction — ``response_from_record`` refuses
+    # anything whose ``type(...) is not GuidedChatResponse`` — so naming the
+    # response type positively is both the house exact-type idiom for this
+    # union and fail-closed: an unexpected member falls through to the lease
+    # handling below and ends at an AuditIntegrityError instead of being
+    # returned to the client. Same reasoning at every ``type(...) is``
+    # discrimination of this union in the settlement loop below.
+    if type(pending) is GuidedChatResponse:
         return pending
 
     catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
@@ -999,7 +1041,7 @@ async def post_guided_chat_schema8(
     while True:
         rejoin_after_lock = False
         frozen: _ChatPreflight | None = None
-        bypass_admission = isinstance(pending, GuidedOperationExpired)
+        bypass_admission = type(pending) is GuidedOperationExpired
         if bypass_admission:
             frozen = await preflight()
             pending = await reserve_or_replay_guided_operation(
@@ -1011,7 +1053,7 @@ async def post_guided_chat_schema8(
             )
             if pending is None:  # pragma: no cover
                 raise AuditIntegrityError("Guided Chat takeover was not reserved")
-            if not isinstance(pending, GuidedOperationLease):
+            if type(pending) is GuidedChatResponse:
                 return pending
 
         attempt_guard = contextlib.nullcontext() if bypass_admission else admission_lock
@@ -1026,10 +1068,10 @@ async def post_guided_chat_schema8(
                     reserve_if_absent=False,
                     takeover_expired=False,
                 )
-                if isinstance(rechecked, GuidedOperationExpired):
+                if type(rechecked) is GuidedOperationExpired:
                     pending = rechecked
                     continue
-                if rechecked is not None and not isinstance(rechecked, GuidedOperationLease):
+                if type(rechecked) is GuidedChatResponse:
                     return rechecked
                 pending = rechecked
 
@@ -1047,10 +1089,10 @@ async def post_guided_chat_schema8(
                 replay=replay,
             )
             pending = None
-            if not isinstance(reserved, GuidedOperationLease):
-                if reserved is None or isinstance(reserved, GuidedOperationExpired):  # pragma: no cover
-                    raise AuditIntegrityError("Guided Chat reservation returned no lease")
+            if type(reserved) is GuidedChatResponse:
                 return reserved
+            if type(reserved) is not GuidedOperationLease:  # pragma: no cover
+                raise AuditIntegrityError("Guided Chat reservation returned no lease")
 
             recorder = BufferingRecorder()
             attempt_message_id = uuid4()
@@ -1401,6 +1443,12 @@ async def post_guided_chat_schema8(
                                 ),
                             )
                         except (BlobQuotaExceededError, UnicodeEncodeError) as materialize_exc:
+                            # KEEP ``isinstance`` below: the copy is selected by
+                            # exception HIERARCHY (any quota failure gets the
+                            # quota wording), not by exact class, so narrowing to
+                            # ``type(...) is`` would route a future
+                            # ``BlobQuotaExceededError`` subclass into the
+                            # unencodable-content message.
                             source_resolution = None
                             chat_result = _with_pair_disposition(
                                 StepChatResult(
@@ -1971,6 +2019,14 @@ async def post_guided_chat_schema8(
                     raise HTTPException(status_code=499, detail="Client disconnected while the guided chat turn was running.") from exc
                 raise
             except Exception as exc:
+                # KEEP ``isinstance``: this is exception-HIERARCHY dispatch, so
+                # subclass membership is the intended semantics.
+                # ``AuditIntegrityError`` has live subclasses reachable from this
+                # settlement path (``GuidedCandidateBindingRejected`` in
+                # ``composer/guided/planning.py``, ``QuarantineCleanupError`` in
+                # ``sessions/service.py``, ``LandscapeRecordError``); an exact-type
+                # check would silently reclassify them as ``operation_failed`` and
+                # lose the integrity signal in the durable failure record.
                 failure_code: GuidedOperationFailureCode = (
                     "stale_conflict"
                     if isinstance(exc, GuidedOperationSettlementConflictError)
@@ -2020,10 +2076,10 @@ async def post_guided_chat_schema8(
             )
             if joined is None:
                 raise AuditIntegrityError("Guided Chat fence was lost without a joinable winner")
-            if isinstance(joined, GuidedOperationLease):
-                pending = joined
-                continue
-            return joined
+            if type(joined) is GuidedChatResponse:
+                return joined
+            pending = joined
+            continue
         raise AuditIntegrityError("Guided Chat settlement loop exited without a result")
 
 
