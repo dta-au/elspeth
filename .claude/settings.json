@@ -35,24 +35,6 @@
             "command": "loomweave hook session-start --path \"${CLAUDE_PROJECT_DIR}\""
           }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/john/.local/bin/warpline session-context --repo \"${CLAUDE_PROJECT_DIR}\"",
-            "timeout": 5
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/john/.local/bin/legis session-context",
-            "timeout": 5
-          }
-        ]
       }
     ]
   },

@@ -107,11 +107,13 @@ elspeth run --settings examples/<name>/settings.yaml --execute
   worktrees inherit them. Commit edits to them like any other file; installer
   upgrades that rewrite these files show up as diffs — review before staging.
 - Wardline is NOT part of this project (rolled back 2026-08-29,
-  [ADR-043](docs/architecture/adr/043-retire-wardline.md)): do not run
+  [ADR-043](docs/architecture/adr/043-project-tooling.md)): do not run
   Wardline scans, do not add `weft.toml`, a `wardline-gate` skill, or an
   `.mcp.json` server for it. It arrived via a Loomweave upgrade, and
   `wardline install` rewrites all of those on every run — a guidance test pins
-  their absence. Older plans, ledgers, and hints that cite it are history.
+  their absence. The same ADR retires Legis and Warpline and rules out any
+  tool other than Filigree and Loomweave until a superseding ADR names it.
+  Older plans, ledgers, and hints that cite them are history.
   Trust-boundary honesty is enforced by `elspeth-lints` (`trust_boundary.tests`
   and the masquerade gate) alone.
 - Directory-scoped guides exist where the details live:
@@ -138,6 +140,16 @@ signatures, checksums, audit chains, or admission gates that protect actual
 code, releases, exports, runtime data, or deployed artifacts. If removing a
 practice is a marginal call or may discard a real safeguard, surface the tradeoff
 to the developer before removing it.
+
+Audit grade is a characteristic of the product, not of the project's own
+tooling ([ADR-046](docs/architecture/adr/046-audit-grade-is-a-product-characteristic.md)).
+The issue tracker, code map, hooks, scan stores, and installed helpers get
+ordinary hygiene: purge, delete, reset, or uninstall with the tool's own verbs
+(or direct SQL/`rm` when it has none) and report it — no status-semantics
+debates for tool-internal rows, no ADR for a cache, no backups staged as
+evidence. Destructive shared-state actions still get an operator go-ahead;
+what is removed is the ceremony, not the check. Adding or removing a tool that
+carries standing agent instructions is still a recorded decision.
 
 ## Composer invariants (non-negotiable)
 
@@ -366,45 +378,28 @@ does Y".
 Full reference: `loomweave-workflow` skill, `loomweave --help`, MCP schemas.
 <!-- /loomweave:instructions -->
 
-<!-- warpline:instructions:v1.2.0 -->
-## Warpline (temporal change-impact)
+### ELSPETH's Loomweave usage
 
-`warpline` is the Weft federation's temporal / change-impact authority — "if I
-touch X, what breaks, and what must I re-verify?". Prefer the MCP tools
-(`mcp__warpline__*`); fall back to the `warpline` CLI. Endorsed names and short
-shims return identical schema+data.
+The block above is installer-written. ELSPETH's own guidance
+([ADR-043](docs/architecture/adr/043-project-tooling.md)):
 
-- `warpline_change_list` / `changed` — changed entities for a rev range; call first.
-- `warpline_impact_radius_get` / `blast_radius` — downstream affected set.
-- `warpline_reverify_worklist_get` / `reverify` — worklist to recheck before done.
-- `warpline_entity_timeline_get` / `timeline`, `warpline_entity_churn_count_get` /
-  `churn`, `warpline_edge_snapshot_capture` / `capture_snapshot` (only mutating
-  tool; writes `.weft/warpline/` only).
-
-Enrich-only and local-only: every response is `meta.local_only: true`,
-`peer_side_effects: []`. `enrichment` is a CLOSED vocab
-(`present|absent|unavailable`); sibling absence is explicit, never an implied
-clean/allowed state. warpline facts are advisory and never gate. See the
-`warpline-workflow` skill for the full loop.
-<!-- /warpline:instructions -->
-
-<!-- legis:instructions:v1.5.0:37065fbc -->
-## Legis (git/CI + governance)
-
-Legis is the git/CI and governance layer of the Weft suite: graded policy
-enforcement over branch/commit/PR/check context, recorded in an append-only
-audit trail keyed to stable code identity (SEI), so it survives rename/move.
-
-Reach for it when a policy fires at the CI/git boundary, when a change needs a
-recordable override or human sign-off, or when you need git/CI context.
-
-- Prefer the `mcp__legis__*` MCP tools; fall back to the `legis` CLI.
-- Clear a fired policy through `override_submit` (MCP-only), which grades it
-  (self-clear / judged / escalated) and records it — routing around it leaves
-  no trail.
-
-Full reference: the `legis-workflow` skill, `legis --help`, MCP schemas.
-<!-- /legis:instructions -->
+- **Reach for it for:** who calls X (`entity_callers_list`), what subclasses
+  or implements X (`entity_relation_list`, `direction=in`), execution paths /
+  call trees (`entity_execution_path_list`, `entity_orientation_pack_get`),
+  and where X is defined in a large file (`entity_find`). These measured
+  correct against `ast` ground truth and have no grep equivalent.
+- **Do not rely on it for** semantic search, dead-code lists, HTTP-route
+  inventories, or test-caller lists until the salvage worklist closes; on
+  those `git grep` measured as good or better.
+- `entity_find` takes **`pattern`** — not `name`, not `query`; 43 % of all
+  historical calls failed on that.
+- **Zero callers is not "no callers".** Read `traversal_complete`,
+  `scope_excludes`, and `unresolved_candidates` before concluding; class
+  instantiations and calls from large test files may sit there as
+  `why: dynamic`. Confirm a negative with `git grep`.
+- Check `project_status_get` staleness first; a re-analyze is triggered by
+  the git hooks on the main checkout, not by worktree commits. Any list over
+  ~100 rows overflows the MCP result cap — page with the cursor.
 
 ## Judge-signature stage (tier-model allowlist signing)
 
