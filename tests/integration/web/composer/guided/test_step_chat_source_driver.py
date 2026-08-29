@@ -454,3 +454,75 @@ async def test_source_driver_returns_both_none_on_empty_response() -> None:
             timeout_seconds=30.0,
         )
     assert type(outcome) is GuidedChatEmptyOutcome
+
+
+@pytest.mark.asyncio
+async def test_source_driver_repairs_omitted_plugin_on_unhinted_first_turn() -> None:
+    """elspeth-79e66ff613 stage 2, driver level: the live d52cd949 shape.
+
+    Fresh session (no wizard selection, plugin_hint=None), the model omits
+    ``plugin`` on its first resolve_source call: the wrapper must deliver a
+    resolved result — not the user-facing Retry error — because the solver
+    threads the rejection back for one in-Send resend.
+    """
+    calls: list[dict] = []
+    complete = {
+        "resolution": "source",
+        "plugin": "json",
+        "filename": "rows.json",
+        "mime_type": "application/json",
+        "content": '[{"line": "alpha"}]',
+        "options": {"schema": {"mode": "observed", "guaranteed_fields": ["line"]}},
+        "observed_columns": ["line"],
+        "sample_rows": [{"line": "alpha"}],
+        "assistant_message": "Created the JSON rows as the source.",
+    }
+    omitted = {name: value for name, value in complete.items() if name != "plugin"}
+
+    def _id_bearing_response(call_id: str, args: dict) -> SimpleNamespace:
+        # The repair thread re-materialises the provider turn, so these fakes
+        # carry call ids like every real provider turn does (the file's shared
+        # id-less helper is refused by the repair admission gate by design).
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                id=call_id,
+                                function=SimpleNamespace(name="resolve_source", arguments=json.dumps(args)),
+                            )
+                        ],
+                    )
+                )
+            ]
+        )
+
+    responses = [_id_bearing_response("c_source_1", omitted), _id_bearing_response("c_source_2", complete)]
+
+    async def _omits_plugin_then_resolves(**kwargs):
+        calls.append(kwargs)
+        return responses.pop(0)
+
+    with patch(
+        "elspeth.web.composer.guided.chat_solver._litellm_acompletion",
+        new=_omits_plugin_then_resolves,
+    ):
+        result = await resolve_step_1_source_chat_with_auto_drop(
+            site="test",
+            session_id="session",
+            user_id="user",
+            model="anthropic/claude-sonnet-4.6",
+            user_message="please create a csv file with two case study fields and dummy rows",
+            plugin_hint=None,
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+
+    assert len(calls) == 2
+    assert type(result).__name__ == "Step1SourceResolvedResult"
+    assert result.resolution.plugin == "json"

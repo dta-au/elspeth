@@ -1088,6 +1088,130 @@ async def test_step_1_pair_with_omitted_hinted_plugin_applies_both(monkeypatch: 
 
 
 @pytest.mark.asyncio
+async def test_step_1_shape_rejected_resolve_source_is_repaired_within_one_tool_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """elspeth-79e66ff613 stage 2: the live d52cd949 shape, repaired in-Send.
+
+    Unhinted first turn (plugin_hint=None — the default fresh-session state),
+    the planner omits ``plugin``: instead of terminalizing into the
+    user-facing Retry error, the rejection goes back as the tool result
+    (step-2 parity, chat_solver's resolve_sink arm) and the corrected resend
+    resolves within the same Send. The second attempt's rebuilt tools must
+    still carry the Stage-1 catalog enum, and the recorder keeps the rejected
+    attempt as its own MALFORMED_RESPONSE row (audit honesty)."""
+    calls: list[dict[str, Any]] = []
+
+    async def repairing_acompletion(**kwargs: Any) -> _FakeLLMResponse:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            arguments = {name: value for name, value in _PAIR_SOURCE_ARGUMENTS.items() if name != "plugin"}
+            call = SimpleNamespace(id="c_source_1", function=SimpleNamespace(name="resolve_source", arguments=json.dumps(arguments)))
+        else:
+            call = SimpleNamespace(
+                id="c_source_2", function=SimpleNamespace(name="resolve_source", arguments=json.dumps(_PAIR_SOURCE_ARGUMENTS))
+            )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
+
+    telemetry: list[dict[str, Any]] = []
+    monkeypatch.setattr(chat_solver, "record_guided_shape_repair", lambda **kw: telemetry.append(kw))
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_acompletion)
+    recorder = BufferingRecorder()
+    outcome = await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="please create a csv file with two case study fields and fill it with dummy data",
+        plugin_hint=None,
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+        recorder=recorder,
+    )
+
+    assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
+    assert outcome.resolution.plugin == "json"
+    assert len(calls) == 2
+    repair_messages = calls[1]["messages"]
+    assert repair_messages[-1]["role"] == "tool"
+    assert repair_messages[-1]["tool_call_id"] == "c_source_1"
+    assert "resolve_source rejected" in repair_messages[-1]["content"]
+    assert "plugin" in repair_messages[-1]["content"]
+    assert repair_messages[-2]["role"] == "assistant"
+    assert repair_messages[-2]["tool_calls"][0]["id"] == "c_source_1"
+    # The rebuilt second attempt still constrains plugin with the Stage-1 enum.
+    resolve_source_tool = next(t for t in calls[1]["tools"] if t["function"]["name"] == "resolve_source")
+    assert resolve_source_tool["function"]["parameters"]["properties"]["plugin"]["enum"] == ["csv", "json"]
+    # Audit honesty: the rejected attempt persists as its own row.
+    assert [row.status for row in recorder.llm_calls[-2:]] == [
+        ComposerLLMCallStatus.MALFORMED_RESPONSE,
+        ComposerLLMCallStatus.SUCCESS,
+    ]
+    assert telemetry == [{"step": "step_1_source", "tool": "resolve_source", "outcome": "repaired", "attempt_index": 1}]
+
+
+@pytest.mark.asyncio
+async def test_step_1_shape_repair_is_bounded_by_max_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both attempts malformed: exactly two calls, then today's rejection propagates."""
+    calls: list[dict[str, Any]] = []
+
+    async def always_shape_invalid(**kwargs: Any) -> _FakeLLMResponse:
+        calls.append(kwargs)
+        arguments = {name: value for name, value in _PAIR_SOURCE_ARGUMENTS.items() if name != "plugin"}
+        call = SimpleNamespace(
+            id=f"c_source_{len(calls)}", function=SimpleNamespace(name="resolve_source", arguments=json.dumps(arguments))
+        )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
+
+    telemetry: list[dict[str, Any]] = []
+    monkeypatch.setattr(chat_solver, "record_guided_shape_repair", lambda **kw: telemetry.append(kw))
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", always_shape_invalid)
+    with pytest.raises(chat_solver.GuidedToolArgumentShapeError):
+        await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="please create a csv file",
+            plugin_hint=None,
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+
+    assert len(calls) == 2
+    assert telemetry == [{"step": "step_1_source", "tool": "resolve_source", "outcome": "exhausted", "attempt_index": 1}]
+
+
+@pytest.mark.asyncio
+async def test_step_1_scaffold_leak_is_never_repaired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The except-arm split must not widen: a scaffold leak (quality guard,
+    deliberately unrepaired on step-2 too) still raises on the FIRST attempt
+    with no repair round-trip — the copy/paste hazard the architecture review
+    named."""
+    calls: list[dict[str, Any]] = []
+
+    async def scaffold_leaking(**kwargs: Any) -> _FakeLLMResponse:
+        calls.append(kwargs)
+        arguments = dict(_PAIR_SOURCE_ARGUMENTS)
+        arguments["assistant_message"] = "Done: <tool_call>resolve_source</tool_call>"
+        call = SimpleNamespace(id="c_source_1", function=SimpleNamespace(name="resolve_source", arguments=json.dumps(arguments)))
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", scaffold_leaking)
+    with pytest.raises(chat_solver.AssistantScaffoldLeakError):
+        await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="please create a csv file",
+            plugin_hint=None,
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_step_2_shape_rejected_resolve_sink_is_repaired_within_one_tool_turn(monkeypatch: pytest.MonkeyPatch) -> None:
     """A missing-key resolve_sink gets its shape rejection threaded back once.
 

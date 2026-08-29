@@ -428,3 +428,4 @@ config/cicd/.sign-bundle-transactions/
 # appearing or vanishing mid-run cannot crash or skew a gate on the shared
 # checkout. Never put scratch under any other tests/ directory.
 /tests/_scratch/
+.claude/lanes/
