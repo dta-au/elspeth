@@ -49,6 +49,9 @@ import { BADGE_COLORS, BADGE_BACKGROUNDS, EDGE_COLORS, EDGE_LABEL_COLOR, VALIDAT
 import { Button, TypeBadge } from "@/components/ui";
 import type { CompositionState } from "@/types/index";
 
+import { ConfigRows } from "./ConfigRows";
+import { OptionRows } from "./OptionRows";
+
 const NODE_WIDTH = 260;
 const NODE_HEIGHT = 80;
 const FALLBACK_MINIMAP_NODE_COLOR_VAR = "--color-text-muted";
@@ -663,77 +666,6 @@ function selectedComponentConfig(
   return null;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function ConfigValue({ value }: { value: unknown }): JSX.Element {
-  if (value === null) {
-    return <span className="graph-config-empty-value">not set</span>;
-  }
-  if (Array.isArray(value)) {
-    if (value.length === 0) {
-      return <span className="graph-config-empty-value">empty list</span>;
-    }
-    return (
-      <ul className="graph-config-list">
-        {value.map((item, index) => (
-          <li key={index}>
-            <ConfigValue value={item} />
-          </li>
-        ))}
-      </ul>
-    );
-  }
-  if (isRecord(value)) {
-    const entries = Object.entries(value);
-    if (entries.length === 0) {
-      return <span className="graph-config-empty-value">empty object</span>;
-    }
-    return (
-      <dl className="graph-config-nested">
-        {entries.map(([key, nestedValue]) => (
-          <div key={key}>
-            <dt>{key}</dt>
-            <dd>
-              <ConfigValue value={nestedValue} />
-            </dd>
-          </div>
-        ))}
-      </dl>
-    );
-  }
-  if (typeof value === "boolean") {
-    return <span>{value ? "true" : "false"}</span>;
-  }
-  return <span>{String(value)}</span>;
-}
-
-function ConfigRows({
-  values,
-  emptyText,
-}: {
-  values: Record<string, unknown>;
-  emptyText: string;
-}): JSX.Element {
-  const entries = Object.entries(values);
-  if (entries.length === 0) {
-    return <p className="graph-config-empty-value">{emptyText}</p>;
-  }
-  return (
-    <dl className="graph-config-rows">
-      {entries.map(([key, value]) => (
-        <div key={key}>
-          <dt>{key}</dt>
-          <dd>
-            <ConfigValue value={value} />
-          </dd>
-        </div>
-      ))}
-    </dl>
-  );
-}
-
 function NodeConfigPanel({
   config,
   onClose,
@@ -782,20 +714,17 @@ function NodeConfigPanel({
       </header>
 
       <section className="graph-config-section">
-        <h4>Connections</h4>
+        <h4>Settings</h4>
+        <OptionRows options={config.options} ariaLabel={`${config.id} settings`} />
+      </section>
+
+      <details className="graph-config-section graph-config-connections">
+        <summary>Connections &amp; schema</summary>
         <ConfigRows
           values={config.connections}
           emptyText="No explicit connections configured."
         />
-      </section>
-
-      <section className="graph-config-section">
-        <h4>Plugin options</h4>
-        <ConfigRows
-          values={config.options}
-          emptyText="No plugin options configured."
-        />
-      </section>
+      </details>
     </aside>
   );
 }

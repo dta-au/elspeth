@@ -355,12 +355,23 @@ describe("GraphView", () => {
     const typeChip = within(panel).getByText("transform");
     expect(typeChip).toHaveClass("type-badge", "type-badge-transform");
     expect(within(panel).getByText("llm")).toBeInTheDocument();
-    expect(within(panel).getByText("prompt")).toBeInTheDocument();
+    // "prompt" and "output_schema" are not in ESSENTIAL_OPTION_KEYS, so they
+    // land under "Advanced settings" and are relabeled by optionLabel's
+    // titleCaseLabel fallback like every other row (copy register: no
+    // internal identifiers in visible text) — elspeth-a6ea581e8a.
+    expect(within(panel).getByText("Prompt")).toBeInTheDocument();
     expect(within(panel).getByText("Find colours")).toBeInTheDocument();
-    expect(within(panel).getByText("output_schema")).toBeInTheDocument();
+    expect(within(panel).getByText("Output Schema")).toBeInTheDocument();
     expect(within(panel).getByText("fields")).toBeInTheDocument();
     expect(within(panel).getByText("url")).toBeInTheDocument();
     expect(within(panel).queryByText(/^\{.*\}$/)).not.toBeInTheDocument();
+    // Authored settings come first; wiring is collapsed (elspeth-a6ea581e8a).
+    const settings = within(panel).getByRole("heading", { name: "Settings" });
+    const connections = within(panel).getByText("Connections & schema");
+    expect(
+      settings.compareDocumentPosition(connections) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+    expect(connections.closest("details")).not.toHaveAttribute("open");
   });
 
   it("renders edge labels for on_success", () => {
