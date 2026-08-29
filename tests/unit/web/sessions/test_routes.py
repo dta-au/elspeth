@@ -5018,7 +5018,7 @@ class TestMessageRoutes:
             {"kind": "text", "content": f"- {explanation_canary}"},
             {
                 "kind": "trusted_system_notice",
-                "content": ("Re-read the actual state via `get_pipeline_state` before making further claims about pipeline configuration."),
+                "content": ("Re-check the actual pipeline state before making further claims about pipeline configuration."),
             },
         ]
 

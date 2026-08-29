@@ -173,6 +173,24 @@ describe("AcknowledgementCard — per-kind copy", () => {
     ).toBeTruthy();
   });
 
+  it("pipeline_decision: strips a trailing [user_term: ...] annotation from the draft", () => {
+    // Backward compatibility: events persisted before the register-leak fix
+    // (elspeth-9665dcca32) carry the raw registry-key trailer inside the
+    // draft body. The card is a user surface — the annotation never renders.
+    renderCard(
+      makeEvent({
+        kind: "pipeline_decision",
+        llm_draft:
+          "Recommend inserting a prompt-injection shield. Continuing without it is allowed. " +
+          "[user_term: prompt_injection_shield_recommendation]",
+      }),
+      { stepLabel: "Invest LLM", showAmend: false },
+    );
+    expect(screen.getByText(/recommend inserting a prompt-injection shield/i)).toBeTruthy();
+    expect(screen.queryByText(/user_term/)).toBeNull();
+    expect(screen.queryByText(/prompt_injection_shield_recommendation/)).toBeNull();
+  });
+
   it("invented_source: title 'Source data' + review-before-fetching line", () => {
     renderCard(
       makeEvent({

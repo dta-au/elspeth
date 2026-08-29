@@ -653,7 +653,7 @@ GROUNDING_CORRECTION_HEADER: Final[str] = (
     "stale or refer to an earlier turn."
 )
 GROUNDING_CORRECTION_INSTRUCTION: Final[str] = (
-    "Re-read the actual state via `get_pipeline_state` before making further claims about pipeline configuration."
+    "Re-check the actual pipeline state before making further claims about pipeline configuration."
 )
 _CORRECTION_HEADER: Final[str] = f"[ELSPETH-SYSTEM] {GROUNDING_CORRECTION_HEADER}"
 
