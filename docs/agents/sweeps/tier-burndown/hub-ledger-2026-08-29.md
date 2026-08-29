@@ -135,3 +135,6 @@
   entry moves the corpus by ZERO — the "+3 surfacing" never existed (routes/_helpers.py:964/970/971 were
   already in the base). Lane committed with SKIP=elspeth-lints-trust-tier after an A/B showing the hook's
   rc=1 is the elspeth-13f0cc04fb fail-closed state, byte-identical on base and branch.
+  (lintmap follow-up: `task` type has no `verifying` status — stays in_progress until wave-end close; the
+  merged commit body of b5a5ecc51 quotes the old-regex 2535/1235 figures — superseded by this ledger, not
+  rewritten. Lane re-derived under the corrected regex: 2594→2594 and real-allowlist 1270→1270, both empty.)
