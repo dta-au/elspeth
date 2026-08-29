@@ -19,10 +19,12 @@ import type { ComposerMode } from "@/types/api";
  * while a session is active.
  */
 interface ComposerPreferencesFormProps {
+  onClose?: () => void;
   onResetTutorialComplete?: () => void;
 }
 
 export function ComposerPreferencesForm({
+  onClose,
   onResetTutorialComplete,
 }: ComposerPreferencesFormProps = {}): JSX.Element | null {
   const defaultMode = usePreferencesStore((s) => s.defaultMode);
@@ -195,14 +197,21 @@ export function ComposerPreferencesForm({
           "the button disappeared". resetTutorial clears completion AND the
           resume fields server-side, so the next load starts a fresh Welcome;
           for a user who never started, it is a harmless no-op PATCH. */}
-      <Button
-        compact
-        className="composer-preferences-reset"
-        disabled={writing}
-        onClick={() => void onResetTutorial()}
-      >
-        Reset tutorial
-      </Button>
+      <div className="composer-preferences-actions">
+        {onClose !== undefined && (
+          <Button compact variant="primary" onClick={onClose}>
+            OK
+          </Button>
+        )}
+        <Button
+          compact
+          className="composer-preferences-reset"
+          disabled={writing}
+          onClick={() => void onResetTutorial()}
+        >
+          Reset tutorial
+        </Button>
+      </div>
     </>
   );
 }
@@ -268,6 +277,7 @@ export function ComposerPreferencesPanel({
         </div>
         <div className="secrets-panel-body">
           <ComposerPreferencesForm
+            onClose={onClose}
             onResetTutorialComplete={onResetTutorialComplete ?? onClose}
           />
         </div>

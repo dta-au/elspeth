@@ -405,8 +405,16 @@
   color: var(--color-text-secondary);
 }
 
-.composer-preferences-reset {
+.composer-preferences-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
   margin-top: var(--space-lg);
+}
+
+.composer-preferences-reset {
+  margin-left: auto;
 }
 
 /* .composer-preferences-error is declared with .secrets-form-error in the

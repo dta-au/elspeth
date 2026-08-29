@@ -233,6 +233,19 @@ describe("the composer-preferences fieldsets carry real chrome (elspeth-03f43bde
       );
     }
   });
+
+  it("lays out the action footer with token-scale air and keeps Reset tutorial at the far edge", () => {
+    const actions = ".composer-preferences-actions";
+    expect(declaredValue(actions, "display")).toBe("flex");
+    expect(declaredValue(actions, "justify-content")).toBe("space-between");
+    for (const property of ["gap", "margin-top"]) {
+      const value = px(declaredValue(actions, property));
+      expect(spacingScale.has(value), `${property} ${value}px is off the scale`).toBe(
+        true,
+      );
+    }
+    expect(declaredValue(".composer-preferences-reset", "margin-left")).toBe("auto");
+  });
 });
 
 describe("failure messages carry an error affordance (elspeth-b9871d3648)", () => {

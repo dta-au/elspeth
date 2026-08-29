@@ -292,6 +292,33 @@ describe("ComposerPreferencesPanel — modal chrome", () => {
     expect(close.getAttribute("style")).toBeNull();
   });
 
+  it("renders the preference actions footer with a neutral tutorial reset and a non-persisting OK close", async () => {
+    const onClose = vi.fn();
+    render(<ComposerPreferencesPanel onClose={onClose} />);
+
+    const actions = document.querySelector<HTMLDivElement>(
+      ".composer-preferences-actions",
+    );
+    expect(actions).not.toBeNull();
+    if (actions === null) {
+      throw new Error("Composer preferences actions footer was not rendered");
+    }
+    expect(actions.getAttribute("style")).toBeNull();
+
+    const buttons = within(actions).getAllByRole("button");
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0]).toHaveAccessibleName("OK");
+    expect(buttons[0]).toHaveClass("btn-primary");
+    expect(buttons[1]).toHaveAccessibleName("Reset tutorial");
+    expect(buttons[1]).not.toHaveClass("btn-primary");
+    expect(buttons[1]).not.toHaveClass("btn-danger");
+
+    await userEvent.click(buttons[0]);
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(updateUserComposerPreferences).not.toHaveBeenCalled();
+  });
+
   it("Escape calls onClose (modal dismissal contract)", async () => {
     const onClose = vi.fn();
     render(<ComposerPreferencesPanel onClose={onClose} />);
