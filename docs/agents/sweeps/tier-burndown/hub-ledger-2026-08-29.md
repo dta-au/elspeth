@@ -246,3 +246,29 @@
   (exemption-map effect check — 18/78 entries exempt zero sites), elspeth-09450c9ba9 (map root check),
   elspeth-4620c87aa0 (dead naive clause), elspeth-3b6708ef3d, elspeth-b5d005a913, elspeth-d152024c84,
   elspeth-69149540e0, elspeth-2cab8e43b1; obs elspeth-obs-539724f2db open (manifest_schema captured_at code).
+
+## PRE-RE-STAGE MERGE: fix/barrier-nav-width (John authorised 2026-08-29; MERGED 570194aae)
+- Six commits (base 845afa326, tip 2e0b10a8b) closing elspeth-b6a0a85a15 (P0 gate-in-collector-scope: one
+  closer registry node_id -> (CloserKind, name) in DAGNavigator, terminal-arm dispatch coalesce/collector with
+  row_union as a named fail-closed invariant), elspeth-258bd49d81 (settings.max_expand_group_width default
+  100k: traversal multi-row arm refuses ahead of the mint through transform.on_error with explicit
+  expand_width_exceeded via the single _branch_loss_reason derivation; TokenManager.expand_token same ceiling
+  as fail-closed backstop before any DB work), and elspeth-9db785ace7's close-out nit (unbound-fork advice no
+  longer recommends a row_union closer). All three tickets were already CLOSED with fix_verification naming
+  these commits (adversarial lane confirmations 8102/8103, nothing refuted).
+- Hub verification on the MERGED tree: one conflict (recent-code-hints.md, both sides' dated entries kept
+  additively, newest-first); full source diff personally reviewed (fence threaded settings -> factory ->
+  processor -> TokenManager; parity-yaml a5086db8ea98e150 not_authorable claim verified against the
+  yaml_importer decline in the same diff); corpus 2,209 findings, identity diff vs w4fix baseline EMPTY
+  (postnav.findings.ids = w4fix_after_hub.txt.ids); 1,544 targeted tests green on the merged tree incl.
+  test_dag_navigator (the resolve_jump_target_sink overlap with main's 305673f52 nominal-dispatch rewrite),
+  both new integration suites, runtime-rejection parity gate, masquerade gate, named-boundary-map pin,
+  dag_scenario_corpus contract.
+- Staged-bundle impact: ZERO key drift. Only keyed files touched are core/config.py (B03 module-import key,
+  keyed by module name) and web/composer/yaml_importer.py (B48 body[35]/body[38] keys — the branch adds a dict
+  ENTRY, not a top-level statement; both indices re-verified to resolve to the named functions post-merge).
+  Cosmetic prose drift only: B06 cites contracts/errors.py:961 (now 965), B07 cites engine/processor.py:5298
+  (now 5302) — correct symbols named in both, no mechanism falsehood, left as-is.
+- Full suite at 570194aae launched in a detached worktree (result recorded below when complete). The operator
+  re-stage baseline is now AFTER this merge: the ONE stage_scan covers W1–W4 + w4fix + codex-salvage +
+  barrier-nav-width.
