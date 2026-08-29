@@ -1,8 +1,10 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SchemaFormTurn } from "./SchemaFormTurn";
 import type { FieldKind, KnobField, SchemaFormPayload } from "@/types/guided";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
 
 function pluginPayload(fields: KnobField[], prefilled: Record<string, unknown> = {}): SchemaFormPayload {
   return {
@@ -1078,5 +1080,52 @@ describe("SchemaFormTurn", () => {
 
       expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
     });
+  });
+});
+
+describe("SchemaFormTurn advanced tier", () => {
+  beforeEach(() => resetStore(usePreferencesStore));
+
+  const payload = pluginPayload([
+    field({ name: "prompt_template", label: "Prompt", kind: "text", required: true, tier: "common" }),
+    field({ name: "temperature", label: "Temperature", kind: "number-float", tier: "advanced", default: 0 }),
+  ]);
+
+  it("keeps advanced knobs behind a closed Advanced settings disclosure by default", async () => {
+    const user = userEvent.setup();
+    render(<SchemaFormTurn payload={payload} onSubmit={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    const details = screen.getByText("Advanced settings (1)").closest("details");
+    expect(details).not.toBeNull();
+    expect(details).not.toHaveAttribute("open");
+    // `Prompt` is required, so its accessible name carries the "(required)"
+    // cue (FieldLabel) — match on the base label, as the file's other
+    // required-field assertions do (e.g. `/Template/` above).
+    expect(screen.getByRole("textbox", { name: /Prompt/ })).toBeInTheDocument();
+    expect(screen.getByRole("spinbutton", { name: "Temperature" })).toBeInTheDocument();
+  });
+
+  it("opens the disclosure when show_advanced is on", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    const user = userEvent.setup();
+    render(<SchemaFormTurn payload={payload} onSubmit={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByText("Advanced settings (1)").closest("details")).toHaveAttribute("open");
+  });
+
+  it("opens the disclosure when the flag flips on an already-mounted form", async () => {
+    const user = userEvent.setup();
+    render(<SchemaFormTurn payload={payload} onSubmit={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByText("Advanced settings (1)").closest("details")).not.toHaveAttribute("open");
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
+    expect(screen.getByText("Advanced settings (1)").closest("details")).toHaveAttribute("open");
+  });
+
+  it("treats a field with no tier as common", async () => {
+    const user = userEvent.setup();
+    render(<SchemaFormTurn payload={pluginPayload([field({ name: "path", label: "Path", kind: "text" })])} onSubmit={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.queryByText(/Advanced settings/)).not.toBeInTheDocument();
   });
 });

@@ -1722,6 +1722,17 @@
   color: var(--color-text-secondary);
 }
 
+.guided-schema-advanced {
+  margin-top: 0.75rem;
+  border-top: 1px solid var(--color-border);
+  padding-top: 0.5rem;
+}
+.guided-schema-advanced > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
 /* One property row: label + control + optional hint/error stacked vertically */
 .guided-schema-field-row {
   display: flex;

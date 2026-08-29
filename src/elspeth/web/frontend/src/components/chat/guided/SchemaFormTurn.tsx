@@ -3,7 +3,16 @@ import { useEffect, useId, useState, type ReactNode } from "react";
 import { Button, Input } from "@/components/ui";
 import type { GuidedRespondAction, GuidedSourceBlobCandidate, KnobField, SchemaFormPayload } from "@/types/guided";
 import { TUTORIAL_VALIDATION_FAILURE_CAVEAT } from "@/components/tutorial/copy";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { CodeBlock } from "../CodeBlock";
+
+// Advanced-tier knobs (Task 4's `KnobField.tier`) are grouped behind a
+// `<details>` disclosure rather than rendered inline — an absent tier reads
+// as "common" (older payloads predate the tier annotation), so only an
+// EXPLICIT "advanced" tier is ever hidden by default (elspeth-9cca900d41).
+function isAdvanced(field: KnobField): boolean {
+  return field.tier === "advanced";
+}
 
 interface SchemaFormTurnProps {
   payload: SchemaFormPayload;
@@ -45,6 +54,7 @@ export function SchemaFormTurn({
 
   const prefillBlobId = sourceFormPathPrefill?.id ?? null;
   const hasPathKnob = payload.knobs.fields.some((field) => field.name === "path");
+  const showAdvanced = useShowAdvanced();
   const hasValidationFailureKnob = payload.knobs.fields.some(
     (field) => field.name === "on_validation_failure",
   );
@@ -163,37 +173,48 @@ export function SchemaFormTurn({
         // no value stays visible as a muted "Not set" (the needs-edit banner
         // below names it too).
         (() => {
-          const summaryRows = visibleFields().filter(
+          const rows = visibleFields().filter(
             (f) => isRequiredNow(f, values) || !isEmptyValue(f, values[f.name]),
           );
-          if (summaryRows.length === 0) {
+          const primaryRows = rows.filter((f) => !isAdvanced(f));
+          const advancedRows = rows.filter(isAdvanced);
+          if (rows.length === 0) {
             return (
               <p className="guided-schema-summary-defaults">
                 No settings need review for this step.
               </p>
             );
           }
+          const renderRow = (f: KnobField) => (
+            <div className="guided-schema-summary-row" key={f.name}>
+              <dt className="guided-schema-summary-label">{f.label}</dt>
+              <dd className="guided-schema-summary-value">
+                {summaryValueNode(f, values[f.name])}
+                {showValidationFailureTeaching && f.name === "on_validation_failure" && (
+                  <p className="guided-schema-summary-caveat" role="note">
+                    {TUTORIAL_VALIDATION_FAILURE_CAVEAT}
+                  </p>
+                )}
+              </dd>
+            </div>
+          );
           return (
-            <dl className="guided-schema-summary">
-              {summaryRows.map((f) => (
-                <div className="guided-schema-summary-row" key={f.name}>
-                  <dt className="guided-schema-summary-label">{f.label}</dt>
-                  <dd className="guided-schema-summary-value">
-                    {summaryValueNode(f, values[f.name])}
-                    {showValidationFailureTeaching && f.name === "on_validation_failure" && (
-                      <p className="guided-schema-summary-caveat" role="note">
-                        {TUTORIAL_VALIDATION_FAILURE_CAVEAT}
-                      </p>
-                    )}
-                  </dd>
-                </div>
-              ))}
-            </dl>
+            <>
+              {primaryRows.length > 0 && (
+                <dl className="guided-schema-summary">{primaryRows.map(renderRow)}</dl>
+              )}
+              {advancedRows.length > 0 && (
+                <details className="guided-schema-advanced" open={showAdvanced}>
+                  <summary>Advanced settings ({advancedRows.length})</summary>
+                  <dl className="guided-schema-summary">{advancedRows.map(renderRow)}</dl>
+                </details>
+              )}
+            </>
           );
         })()
       ) : (
         <div className="guided-schema-fields">
-          {visibleFields().map((field) => (
+          {visibleFields().filter((f) => !isAdvanced(f)).map((field) => (
             <KnobFieldRenderer
               key={field.name}
               field={field}
@@ -205,6 +226,23 @@ export function SchemaFormTurn({
               isTutorial={isTutorial}
             />
           ))}
+          {visibleFields().some(isAdvanced) && (
+            <details className="guided-schema-advanced" open={showAdvanced}>
+              <summary>Advanced settings ({visibleFields().filter(isAdvanced).length})</summary>
+              {visibleFields().filter(isAdvanced).map((field) => (
+                <KnobFieldRenderer
+                  key={field.name}
+                  field={field}
+                  required={isRequiredField(field, values)}
+                  value={values[field.name]}
+                  onChange={(value) => onChange(field.name, value)}
+                  idPrefix={reactId}
+                  disabled={disabled}
+                  isTutorial={isTutorial}
+                />
+              ))}
+            </details>
+          )}
         </div>
       )}
       {/* The Edit affordance and this needs-edit banner are non-tutorial only.
