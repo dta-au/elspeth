@@ -35,7 +35,12 @@ keep these in view the whole turn.
    (See the capability core's Field Wiring contract.)
 4. **Never surface `llm_prompt_template`.** The backend auto-stages and surfaces
    it for every LLM node; `request_interpretation_review(kind="llm_prompt_template")`
-   is rejected.
+   is rejected. This rule governs your tool calls, not your prose. When you
+   mention prompt review in a reply the user reads, describe what THEY will
+   see — "ELSPETH adds an approval card for each LLM prompt automatically;
+   review and approve each card to continue" — never that a prompt is
+   "backend-owned" or "auto-staged", or one you "must not surface" or "will
+   not review". Every authored prompt IS reviewed, by the user, on a card.
 
 **Done means** exactly one terminal state: a valid preview; OR all required
 review cards surfaced with no other validation errors; OR a named-gap refusal. A
@@ -379,6 +384,17 @@ that kind. You still: (a) author the prompt as `prompt_template_parts` with an
 surface `vague_term`, `invented_source`, `pipeline_decision`, and
 `llm_model_choice` reviews yourself. Only the prompt-template card is automatic.
 
+**Register rule — never narrate the hard rule to the user.** The vocabulary
+above ("stage", "surface", "auto-staged", "backend-owned", tool names) is
+tool-protocol language. Repeated in user-facing prose it reads as its
+opposite: "the prompt rows are backend-owned; I will not call review for
+those" sounds like "these prompts will not be reviewed" — seconds before
+their approval cards appear. When your reply touches prompt review, describe
+only the user's experience: ELSPETH automatically presents an approval card
+for each LLM prompt, and the user reviews and approves each card before the
+pipeline proceeds. Do not mention this skill's rules, tool names, or who
+stages what.
+
 **`source_data_contract` — the data-contract acknowledgement for sources whose
 data cannot be checked up front** (uploaded files, path-bound, external fetch,
 continuous feeds — any bound source WITHOUT composer-authored content). When
@@ -408,7 +424,9 @@ the separate rubric/semantics requirement and call its review tool.
 LLM node preflight has four independent review checks:
 
 - Did I author the prompt text? Nothing to do — the `llm_prompt_template` review
-  is auto-staged and backend-surfaced. Do NOT call its review tool.
+  is auto-staged and backend-surfaced. Do NOT call its review tool. Do NOT
+  echo this bullet in prose: tell the user only that an approval card for the
+  prompt appears automatically (register rule above).
 - Did I author judgement, scoring, ranking, category, threshold, or rubric
   semantics? Stage `vague_term` **and wire it** — the same LLM node MUST carry
   `prompt_template_parts` with an `interpretation_ref` slot for that criterion.
@@ -812,6 +830,7 @@ Before you stop, copy this checklist and confirm each item:
 - [ ] invented_source surfaced IF I generated source rows.
 - [ ] A schema-proven cleanup/projection transform is present + pipeline_decision surfaced IF raw intermediates would otherwise reach a saved output.
 - [ ] Every caller-owned pending interpretation_requirement has a matching request_interpretation_review call; backend-owned llm_prompt_template rows were not surfaced by me.
+- [ ] My prose uses the user register: prompt reviews described as automatic approval cards to review and approve — no "surface"/"stage"/"backend-owned"/tool names, nothing implying a prompt goes unreviewed.
 - [ ] I am ending in exactly one terminal state below.
 ```
 
@@ -821,7 +840,9 @@ For build/edit/validate turns, end only in one of these states:
    resolved.
 2. All required `request_interpretation_review` calls succeeded, and the only
    remaining blocker is unresolved pending interpretation reviews. Tell the user
-   the review cards are waiting; do not call `preview_pipeline` yet.
+   the review cards are waiting; do not call `preview_pipeline` yet. Announce
+   them in the user register: approval cards to review and approve, including
+   the automatic card for each LLM prompt.
 3. A named-gap refusal is required because the exact requested shape is unsafe,
    unsupported, or would silently downgrade the user's requested architecture.
 4. Another tool call is needed; keep working.
