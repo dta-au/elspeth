@@ -1,7 +1,7 @@
 """Multi-worker run-coordination contracts (epoch 21, ADR-030).
 
 Value objects threaded through the leader/follower coordination protocol
-(design: notes/option-c-multi-worker-coordination-design-2026-06-11.md):
+(design: docs/architecture/design-notes/option-c-multi-worker-coordination-design-2026-06-11.md):
 
 - :func:`mint_worker_id` — the §A.1 single-use worker identity. Minted at
   registration (``begin_run`` / ``acquire_run_leadership`` / ``join``),

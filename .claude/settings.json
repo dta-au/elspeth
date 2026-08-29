@@ -1,5 +1,4 @@
 {
-  "enableAllProjectMcpServers": true,
   "hooks": {
     "PreToolUse": [
       {
@@ -7,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/john/.local/bin/filigree ensure-dashboard",
+            "command": "filigree ensure-dashboard",
             "timeout": 5
           }
         ]
@@ -18,12 +17,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/john/.local/bin/filigree session-context",
+            "command": "filigree session-context",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "/home/john/.local/bin/filigree ensure-dashboard",
+            "command": "filigree ensure-dashboard",
             "timeout": 5
           }
         ]
@@ -48,45 +47,5 @@
         ]
       }
     ]
-  },
-  "enabledPlugins": {
-    "yzmir-systems-thinking@foundryside-marketplace": true,
-    "yzmir-llm-specialist@foundryside-marketplace": true,
-    "meta-sme-protocol@foundryside-marketplace": true,
-    "axiom-python-engineering@foundryside-marketplace": true,
-    "axiom-web-backend@foundryside-marketplace": true,
-    "axiom-mcp-engineering@foundryside-marketplace": true,
-    "axiom-static-analysis-engineering@foundryside-marketplace": true,
-    "axiom-audit-pipelines@foundryside-marketplace": true,
-    "axiom-embedded-database@foundryside-marketplace": true,
-    "axiom-determinism-and-replay@foundryside-marketplace": true,
-    "axiom-devops-engineering@foundryside-marketplace": true,
-    "axiom-planning@foundryside-marketplace": true,
-    "axiom-solution-architect@foundryside-marketplace": true,
-    "ordis-security-architect@foundryside-marketplace": true,
-    "ordis-quality-engineering@foundryside-marketplace": true,
-    "muna-technical-writer@foundryside-marketplace": true,
-    "lyra-ux-designer@foundryside-marketplace": true,
-    "lyra-site-designer@foundryside-marketplace": true,
-    "superpowers@superpowers-marketplace": true,
-    "code-review@claude-plugins-official": true,
-    "commit-commands@claude-plugins-official": true,
-    "pr-review-toolkit@claude-plugins-official": true,
-    "feature-dev@claude-plugins-official": true,
-    "security-guidance@claude-plugins-official": true
-  },
-  "extraKnownMarketplaces": {
-    "foundryside-marketplace": {
-      "source": {
-        "source": "github",
-        "repo": "tachyon-beep/skillpacks"
-      }
-    },
-    "superpowers-marketplace": {
-      "source": {
-        "source": "github",
-        "repo": "obra/superpowers-marketplace"
-      }
-    }
   }
 }

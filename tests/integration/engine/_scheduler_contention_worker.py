@@ -1,7 +1,7 @@
 # tests/integration/engine/_scheduler_contention_worker.py
 """Child-process entry point for the slice-1 two-process contention test.
 
-Option-c design (notes/option-c-multi-worker-coordination-design-2026-06-11.md
+Option-c design (docs/architecture/design-notes/option-c-multi-worker-coordination-design-2026-06-11.md
 §H "Contention (slice 1)", landing plan slice 1): two real OS processes hammer
 ``claim_ready`` / ``recover_expired_leases`` against one WAL SQLite file via
 the real ``TokenSchedulerRepository`` write-intent path, while a third process

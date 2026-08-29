@@ -36,7 +36,7 @@ The third fact, which lives outside pytest: mypy narrows the negative arm of
 forfeits the static proof that ``tuple(...)`` is handed a list.
 
 Both call sites carry a tier-model R5 rationale for the same reason
-(``docs/agents/sweeps/tier-burndown/B45.rationales.json``); this module is the
+(tier-burndown lane B45, 2026-08-29); this module is the
 executable half of that argument.
 """
 

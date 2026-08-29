@@ -8,7 +8,7 @@ third process runs dashboard-style reads over a ``read_only=True`` handle —
 the design's contention scenario: "two-process claim hammer + dashboard-style
 concurrent reads ⇒ heartbeat latency stays inside the liveness window; max
 write-lock hold time measured against ``busy_timeout``"
-(notes/option-c-multi-worker-coordination-design-2026-06-11.md §H).
+(docs/architecture/design-notes/option-c-multi-worker-coordination-design-2026-06-11.md §H).
 
 This is the correctness gate for slice 1 itself: under the old DEFERRED begin,
 thousands of contended SELECT-then-UPDATE claim transactions across two

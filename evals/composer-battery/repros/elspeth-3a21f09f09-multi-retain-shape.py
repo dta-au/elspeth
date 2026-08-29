@@ -7,8 +7,9 @@ tool-call shape that triggered DeferredIntentActionShapeError is visible.
 import asyncio
 import json
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "/home/john/elspeth/src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 import elspeth.web.composer.guided.chat_solver as cs
 

@@ -19,11 +19,12 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "/home/john/elspeth/evals/composer-battery")
-import drive_battery as db
+BATTERY_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BATTERY_DIR))
+import drive_battery as db  # noqa: E402  (path must be set first)
 
 ROUND = "2026-08-26-collector-calibration-freeform"
-RUNS_DIR = Path("/home/john/elspeth/evals/composer-battery/runs")
+RUNS_DIR = BATTERY_DIR / "runs"
 BASE = "unix:///run/elspeth/uvicorn.sock"
 REPEATS = 3
 
@@ -133,7 +134,7 @@ def grade(run_dir: Path) -> dict:
 
 def main() -> int:
     client = db.build_client(BASE)
-    env_budgets = db.read_env_budgets(Path("/home/john/elspeth/.env"))
+    env_budgets = db.read_env_budgets(BATTERY_DIR.parents[1] / ".env")
     b = db.Battery(
         client,
         base=BASE,

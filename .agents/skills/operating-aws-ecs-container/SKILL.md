@@ -261,28 +261,25 @@ Common interpretations:
 Facts learned deploying the composer-parity merge to the live acceptance env.
 Discover-don't-remember still applies, but these are the traps that cost time.
 
-- **Accepted baseline (2026-07-23):** source commit
-  `720d441336434d227c2a00caaac100db48a07d5c`, task definition
-  `arn:aws:ecs:ap-southeast-1:559849758286:task-definition/a-4cb186732570bf935456-web:41`,
-  image digest
-  `sha256:61684a68d7752aa19f9ff402f4e91fbc9580c3c8cae1ae313682d52fa531ac53`.
-  Treat this as a dated recovery breadcrumb, not a substitute for live
+- **Accepted baseline:** record the accepted source commit, task-definition
+  ARN, and image digest in the operator-local notes for the environment
+  (`~/.local/state/elspeth/aws-ecs/`), not in this tracked skill. Treat any
+  such record as a dated recovery breadcrumb, not a substitute for live
   discovery before the next operation.
 
-- **Identity:** account `559849758286`, region `ap-southeast-1`, cluster
-  `acceptance-a-4cb186732570bf935456-cluster`, service
-  `acceptance-a-4cb186732570bf935456-service`, web
-  container `elspeth-web`, arch `X86_64` (linux/amd64), ECR repo
-  `elspeth-acceptance-9f088b9e1d1047a288234c690eb63141`. **Free-credit account:**
-  no frontier Bedrock model access, so the composer runs on **OpenRouter**
-  (`openrouter/anthropic/claude-sonnet-4-6`). `verify-s3` needs
-  `ELSPETH_TEST_S3_BUCKET` (absent → opt-in). `verify-bedrock` reads
-  `ELSPETH_BEDROCK_LIVE_TEST_MODEL`. Revision 41 currently sets it to
-  `bedrock/zai.glm-5`, a Bedrock **Marketplace** model needing a subscription
-  this account lacks, so that check fails on *access*, not transport (doctor
-  `bedrock_provider` is still OK). For a temporary transport verifier, configure
-  the one-shot verifier task to use `apac.amazon.nova-micro-v1:0`; do not mistake
-  that recommendation for the current service configuration.
+- **Identity:** discover the account, region, cluster, service, ECR repository,
+  and container name from the Terraform outputs that own the environment
+  (`terraform output` in the scenario directory) — never from memory or from a
+  tracked document. The web container is `elspeth-web`, arch `X86_64`
+  (linux/amd64). Model access varies by account: if the account lacks frontier
+  Bedrock access, the composer runs on OpenRouter instead; `verify-s3` needs
+  `ELSPETH_TEST_S3_BUCKET` (absent → opt-in); `verify-bedrock` reads
+  `ELSPETH_BEDROCK_LIVE_TEST_MODEL`, and a Bedrock **Marketplace** model there
+  fails on *access*, not transport, when the account lacks the subscription
+  (doctor `bedrock_provider` still reports OK). For a temporary transport
+  verifier, point the one-shot verifier task at a model the account can call
+  (e.g. `apac.amazon.nova-micro-v1:0`); do not mistake that for the current
+  service configuration.
 
 - **Bedrock `bedrock:InvokeModel` is RESOURCE-scoped on the task role**
   (`…-task-role`, inline policy `…-task-policy`). It grants InvokeModel only on:

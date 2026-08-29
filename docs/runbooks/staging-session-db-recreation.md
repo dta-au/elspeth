@@ -444,7 +444,7 @@ For SQLite, `sessions.db`, `sessions.db-wal`, `sessions.db-shm`, and `sessions.d
 5. The Stop/Go Gates above have been run: Landscape code/schema must not reference web-session identifiers.
 6. The candidate source ref has been recorded. Archived predecessor databases
    are evidence only and are never opened by the current release.
-7. The live SQLite deployment is single-worker: `deploy/elspeth-web.service` has no `--workers` flag, `WEB_CONCURRENCY` is unset or `1`, and the startup multi-worker guard in `src/elspeth/web/app.py` remains enabled.
+7. The live SQLite deployment is single-worker: the operator-local `deploy/elspeth-web.service` has no `--workers` flag, `WEB_CONCURRENCY` is unset or `1`, and the startup multi-worker guard in `src/elspeth/web/app.py` remains enabled.
 8. The operator has explicitly signed off on the `user_secrets` blast radius and
    has a documented re-entry/reseed procedure before users resume Composer work.
    **Any archive is a long-lived copy of live encrypted secret material and is

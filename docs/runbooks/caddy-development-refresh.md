@@ -2,8 +2,9 @@
 
 Use this runbook to rebuild the frontend and restart the repository-specific
 source-checkout service behind Caddy. It applies to the development assets
-`deploy/elspeth-web.service` and `deploy/Caddyfile`; it is not the portable
-production installation.
+`deploy/elspeth-web.service` and `deploy/Caddyfile` — both operator-local and
+gitignored because they carry host-specific paths; it is not the portable
+production installation (`deploy/linux-systemd/elspeth-web.service`).
 
 For a new production host, use
 [Native Linux and Azure Ubuntu VM deployment](ansible-ubuntu-deployment.md).
@@ -67,8 +68,8 @@ the backend healthy while the SPA returns an error.
 
 ## 3. Restart the backend
 
-The tracked development unit is host-specific. Compare it with the installed
-unit before restart:
+The development unit is operator-local and host-specific. Compare it with the
+installed unit before restart:
 
 ```bash
 if ! sudo cmp -s \

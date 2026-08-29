@@ -1,20 +1,7 @@
-# Superpowers brainstorming artifacts
-.superpowers/
-
-# notes/ — internal session logs / scratch records: kept on disk, not tracked.
-# History: gitignored as scratch → unignored 2026-05-03 (after a content audit
-# found no secrets) to serve as a tracked evaluation/handoff record → re-ignored
-# 2026-06-07 because the churn of version-controlling internal logs outweighed
-# the value. Notes already committed remain retrievable from git history.
-# Never write credentials, tokens, or PII here regardless of tracking; for
-# transient secrets use /tmp/ or a path explicitly added to .gitignore.
-# (To deliberately share one note, `git add -f notes/<file>` past this ignore.)
-notes/
-
-# Credential-shaped filenames — refused regardless of directory.
-# Defence-in-depth so an accidental jwt.txt or .env can't slip into a tracked
-# location. Filename patterns catch ~80% of leaks; the per-commit content
-# scan at scripts/git-hooks/pre-commit-secret-scan.sh catches most of the rest.
+# ---------------------------------------------------------------------------
+# Credential-shaped filenames — refused in every directory (defence in depth;
+# the pre-commit secret scan at scripts/git-hooks/ catches content).
+# ---------------------------------------------------------------------------
 **/jwt.txt
 **/jwt-*.txt
 **/jwt_*.txt
@@ -31,36 +18,103 @@ notes/
 !**/.env.example
 !**/.env.template
 !**/.env.sample
+.env.local
+.env.*.local
+secrets/
+!src/elspeth/**/secrets/
+!tests/**/secrets/
+credentials.json
+*.key
+!deploy/aws-ecs/trust/global-bundle.pem
 
-# Composer MCP scratch folder (session state, test configs)
+# ---------------------------------------------------------------------------
+# Internal working state — never public.
+# ---------------------------------------------------------------------------
+# Engineering memos, session logs, scratch records. Design notes that code or
+# ADRs cite belong in docs/architecture/design-notes/ instead.
+notes/
+# Superpowers brainstorming artifacts.
+.superpowers/
+# Composer MCP scratch folder (session state, test configs).
 .scratch/*
 !.scratch/.gitkeep
-# scratch/ (no dot) is a duplicate of .scratch/ — never track; use .scratch/.
 scratch/
-
-# Operator-local deployment/acceptance utilities. Durable across sessions
-# (unlike /tmp) but never tracked: they carry account-specific cluster,
-# subnet, and task-definition identifiers for one disposable environment.
+# Operator-local deployment/acceptance utilities (account-specific identifiers).
 /ops-local/
+# Throwaway repro tests for agent sessions; whole-tree gates subtract
+# gitignored files (tests/helpers/tree_gate.py), so scratch cannot skew them.
+/tests/_scratch/
+# Generated bug-analysis docs and model-authored raw review findings.
+docs/bugs/generated/
+/docs/quality-audit/findings-panel-raw/
+docs/audit/triage/
+docs-archive/
+# Local debugging screenshots.
+/images/
 
-# pytest-benchmark output dir — never tracked (recreated on demand).
-/.benchmarks/
+# ---------------------------------------------------------------------------
+# Agent / IDE tooling — tracked project guidance stays under .claude/ and
+# .agents/; only the machine-local subpaths named here are ignored.
+# ---------------------------------------------------------------------------
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/worktrees/
+.claude/plans/
+.claude/lanes/
+.claude/handovers/
+.mcp.json
+!.mcp.json.example
+.codex
+.antigravitycli/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.playwright-mcp/
+.playwright-cli/
+output/playwright/
+# Codex CLI drops a routine ./error.log in its working dir.
+error.log
+# Filigree issue tracker.
+.filigree/
+# Loomweave (installer-written instance state and generated skill copies).
+.loomweave/loomweave.lock
+.loomweave/.gitignore
+.loomweave/config.json
+.loomweave/instance_id
+loomweave.yaml
+.agents/skills/loomweave-workflow/.fingerprint
+.agents/skills/loomweave-workflow/SKILL.md
+.claude/skills/loomweave-workflow/.fingerprint
+.claude/skills/loomweave-workflow/SKILL.md
+# Retired tooling residue (ADR-043).
+.weft/
 
-# evals/ — internal eval corpus + harness kept locally, not shipped (2026-06-28).
-# The eval *library* is a test dependency (tests/unit/evals import evals.lib.*),
-# so evals/__init__.py and evals/lib/ stay tracked; the dated run records and
-# harnesses do not.
+# ---------------------------------------------------------------------------
+# elspeth-lints operator-local state
+# ---------------------------------------------------------------------------
+# .elspeth/rotations.log is deliberately tracked: it is the tier-model
+# rotation audit trail that `elspeth-lints check-rotation-audit` verifies.
+.elspeth/*
+!.elspeth/rotations.log
+.judge-metrics/
+config/cicd/.sign-bundle-transactions/
+# Reaudit crash-recovery sidecars (elspeth_lints/core/reaudit_sidecar.py).
+**/.reaudit-state/
+# atomic_write_text lock siblings (elspeth_lints/core/atomic_io.py).
+config/cicd/**/.*.lock
+
+# ---------------------------------------------------------------------------
+# evals/ — the eval library and the two tracked corpora ship; run records and
+# harness output do not. Order matters: re-include the directory, then its
+# contents, then re-apply the credential rules (last matching rule wins).
+# ---------------------------------------------------------------------------
 /evals/*
 !/evals/__init__.py
 !/evals/lib/
-# Composer capability-parity corpus: tracked fixtures + README.
-# Re-include the directory first, then its contents (mirrors !/evals/lib/), and
-# keep these negations BEFORE the generic __pycache__/*.py[cod]/*.db rules below
-# so junk under the corpus stays ignored.
 !/evals/composer-parity/
 !/evals/composer-parity/**
-# Preserve the repository-wide credential safeguards after the broad corpus
-# exception above (the last matching gitignore rule wins).
 /evals/composer-parity/**/jwt.txt
 /evals/composer-parity/**/jwt-*.txt
 /evals/composer-parity/**/jwt_*.txt
@@ -77,14 +131,9 @@ scratch/
 !/evals/composer-parity/**/.env.example
 !/evals/composer-parity/**/.env.template
 !/evals/composer-parity/**/.env.sample
-
-# composer-battery: tracked instrument (spec docs/superpowers/specs/2026-08-13-composer-battery-design.md)
 !/evals/composer-battery/
 !/evals/composer-battery/**
 /evals/composer-battery/runs/
-# Preserve the repository-wide credential safeguards after the broad corpus
-# exception above (the last matching gitignore rule wins) — the full mirror of
-# composer-parity's block, plus this instrument's credentials.json.
 /evals/composer-battery/**/jwt.txt
 /evals/composer-battery/**/jwt-*.txt
 /evals/composer-battery/**/jwt_*.txt
@@ -103,18 +152,13 @@ scratch/
 !/evals/composer-battery/**/.env.template
 !/evals/composer-battery/**/.env.sample
 
-# Generated bug analysis docs (can be regenerated)
-docs/bugs/generated/
-
-# Byte-compiled / optimized / DLL files
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
-
-# Distribution / packaging
 .Python
 build/
 develop-eggs/
@@ -124,20 +168,16 @@ eggs/
 .eggs/
 lib/
 lib64/
-# evals/lib/ is the eval-harness shared library, NOT a Python build artefact —
-# the generic `lib/` rule above would otherwise hide it.
+# Real source trees the generic lib/ rule would otherwise hide.
 !evals/lib/
 !evals/lib/**
-# Tests for evals/lib mirror the source tree; same hide-by-default issue.
 !tests/unit/evals/lib/
 !tests/unit/evals/lib/**
-# src/elspeth/web/frontend/src/lib/ is the frontend's shared TS helper
-# directory (validationHumaniser.ts, composer-events.ts, …) — a real, tracked
-# source tree, not a Python build artefact. Found 2026-07-10 when a new file
-# added there (validationHumaniser.test.ts) silently failed to show up as
-# untracked under the generic `lib/` rule above.
 !src/elspeth/web/frontend/src/lib/
 !src/elspeth/web/frontend/src/lib/**
+# Re-stated after the negations above so bytecode inside them stays ignored.
+__pycache__/
+*.py[cod]
 parts/
 sdist/
 var/
@@ -147,21 +187,10 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
-# Pycache and other Python build artefacts
-__pycache__/
-*.py[cod]
-
-
-# PyInstaller
 *.manifest
 *.spec
-
-# Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
-
-# Unit test / coverage reports
 htmlcov/
 .tox/
 .nox/
@@ -174,113 +203,66 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
-
-# Translations
+/.benchmarks/
+.mutmut-cache
+mutants/
 *.mo
 *.pot
-
-# Environments
-.env
 .venv
-.node_modules
-node_modules/
-*.tsbuildinfo
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# Generated PDFs from tools/pdf build scripts
-tools/pdf/out/
-
-# mypy
+.uv-cache/
 .mypy_cache/
 .dmypy.json
 dmypy.json
-
-# ruff
 .ruff_cache/
-
-# Pyre type checker
 .pyre/
-
-# pytype static type analyzer
 .pytype/
-
-# Cython debug symbols
 cython_debug/
+.spyderproject
+.spyproject
+.ropeproject
+.ipynb_checkpoints/
+.pre-commit-cache/
+/site
 
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# Project-specific
-/runs/
-*.db
-*.sqlite
-*.sqlite3
-*.journal.jsonl
-
-# Test outputs and analysis artifacts
-test-results.txt
-instantiation-*.txt
-
-# Playwright (frontend E2E)
-# Generated artefacts from src/elspeth/web/frontend Playwright runs.
-# - test-results/      per-test traces, videos, screenshots on failure
-# - playwright-report/ HTML reporter output
-# - .e2e-data/         disposable backend ELSPETH_DATA_DIR (SQLite, blob store)
-# - tests/e2e/.auth/   saved storageState (logged-in cookies, JWT) — never commit
+# ---------------------------------------------------------------------------
+# Node / frontend
+# ---------------------------------------------------------------------------
+.node_modules
+node_modules/
+*.tsbuildinfo
+# Playwright artefacts (traces, reports, disposable backend data, saved auth).
 src/elspeth/web/frontend/test-results/
 src/elspeth/web/frontend/playwright-report/
 src/elspeth/web/frontend/.e2e-data/
 src/elspeth/web/frontend/tests/e2e/.auth/
 src/elspeth/web/frontend/playwright/.cache/
+test-results/.last-run.json
 
-# Secrets - NEVER commit these
-.env.local
-.env.*.local
-secrets/
-!src/elspeth/**/secrets/
-!tests/**/secrets/
-credentials.json
-*.pem
-*.key
-!deploy/aws-ecs/trust/global-bundle.pem
-
-# Jupyter
-.ipynb_checkpoints/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Mutation testing
-.mutmut-cache
-mutants/
-
-# uv
-.uv-cache/
-
-# Git worktrees
-.worktrees/
-
-# Example outputs (dynamic data, not tracked)
-# Use ** to match nested paths (prevents accidental deep-nesting commits)
+# ---------------------------------------------------------------------------
+# Runtime data, databases, example outputs
+# ---------------------------------------------------------------------------
+/runs/
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+landscape.db-shm
+landscape.db-wal
+*.journal.jsonl
+state/
+data/*
+!data/.gitkeep
+!data/skills/
+!data/skills/.gitignore
+!data/skills/*.example
+real/
+examples/retention_purge/payloads/*
 examples/**/output/*
 examples/**/runs/*
 examples/**/chroma_data/*
@@ -288,83 +270,37 @@ examples/**/chroma_data/*
 !examples/*/runs/
 !examples/*/output/.gitkeep
 !examples/*/runs/.gitkeep
+test-results.txt
+instantiation-*.txt
 
-# Local test databases and logs
-state/
-
-# Local web app data - keep only the placeholder directory marker
-data/*
-!data/.gitkeep
-!data/skills/
-!data/skills/.gitignore
-!data/skills/*.example
-
-# Real/production/example data - never commit
-real/
-examples/retention_purge/payloads/
-landscape.db-shm
-landscape.db-wal
-.elspeth/*
-!.elspeth/rotations.log
-.judge-metrics/
-
-# pre-commit cache
-.pre-commit-cache/
-
-# Deployment support artifacts are tracked. Only operator-local values and
-# generated backups remain private.
+# ---------------------------------------------------------------------------
+# Deployment — support artefacts are tracked; operator-local values and
+# generated backups are not.
+# ---------------------------------------------------------------------------
 deploy/**/*.env
 !deploy/**/*.env.example
 deploy/**/*.local.yaml
 deploy/**/*.local.yml
 deploy/**/*.bak-*
 deploy/Caddyfile
+# Source-checkout development unit (host-specific paths); the portable unit is
+# deploy/linux-systemd/elspeth-web.service.
+/deploy/elspeth-web.service
+.worktrees/
 
-# FINAL RULE: Always keep .gitkeep files (preserve directory structure)
-# This must be at the end to override any earlier ignore patterns
-!.gitkeep
-
-# Temporary
-.codex
-
-# Build-artefact PDFs (regeneratable; exceed the pre-commit
-# large-file threshold). Narrow scope to PDF outputs only — the
-# `docs/release/pdf/` pipeline source (build.sh, *.typ, README,
-# Makefile, etc.) IS tracked so the pipeline is reproducible from
-# a fresh checkout.
+# ---------------------------------------------------------------------------
+# Generated documents — pipeline source is tracked, outputs are not.
+# ---------------------------------------------------------------------------
+tools/pdf/out/
 docs/assets/*.pdf
-.claude/scheduled_tasks.lock
-*.db-shm
-*.db-wal
-
-# Reaudit sweep sidecars — ephemeral per-run JSONL state written by
-# `elspeth-lints reaudit` for crash recovery. Lives at
-# `<allowlist_dir>/.reaudit-state/` (i.e. inside `config/cicd/*/`
-# directories that ARE tracked). The sidecars themselves must never be
-# committed — they are operator-local run state and contain per-entry
-# divergence outcomes that have no audit-trail value outside the
-# operator's machine. See `elspeth_lints/core/reaudit_sidecar.py` for
-# the full data-model rationale.
-**/.reaudit-state/
-
-# atomic_write_text lock files — persistent `.<name>.lock` siblings
-# next to managed allowlist YAMLs (the flock idiom; unlinking inside
-# the lock races on re-acquire so they stay on disk between runs).
-# Operators see them as untracked after the first `justify` /
-# `rotate` invocation; they must never be committed. See
-# `elspeth_lints/core/atomic_io.py` for the locking rationale.
-config/cicd/**/.*.lock
-
-# Release PDF pipeline source is intentionally tracked; generated
-# outputs and bulky font source trees are not.
-docs/release/*
-!docs/release/pdf/
+docs/release/pdf/*
 !docs/release/pdf/*.typ
 !docs/release/pdf/Makefile
 !docs/release/pdf/README.md
 !docs/release/pdf/build.sh
 !docs/release/pdf/versions.lock
 !docs/release/pdf/fonts/
+docs/release/pdf/fonts/*
 !docs/release/pdf/fonts/public-sans/
 docs/release/pdf/fonts/public-sans/*
 !docs/release/pdf/fonts/public-sans/LICENSE.md
@@ -374,58 +310,13 @@ docs/release/pdf/fonts/public-sans/fonts/*
 !docs/release/pdf/fonts/public-sans/fonts/ttf/
 !docs/release/pdf/fonts/public-sans/fonts/ttf/**
 docs/release/pdf/out/
-docs/release/pdf/out/**
 docs/release/pdf/output/
-docs/release/pdf/output/**
-docs-archive/
 
-## Internal tooling
-# Local IDE/agent state. Keep tracked project guidance under `.claude/` and
-# `.agents/`; ignore only the machine-local subpaths named here.
-.antigravitycli/
-.claude/settings.local.json
-.claude/worktrees/
-.claude/plans/
+# ---------------------------------------------------------------------------
+# OS
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
 
-# Filigree issue tracker
-.filigree/
-.mcp.json
-docs/audit/triage/
-notes/resign/*
-
-.loomweave/loomweave.lock
-.agents/skills/loomweave-workflow/.fingerprint
-.agents/skills/loomweave-workflow/SKILL.md
-loomweave.yaml
-.loomweave/.gitignore
-.loomweave/config.json
-.loomweave/instance_id
-.claude/skills/loomweave-workflow/.fingerprint
-.claude/skills/loomweave-workflow/SKILL.md
-
-# Filigree issue tracker
-.weft/
-
-
-# Codex CLI drops a routine ./error.log in its working dir; never commit it
-error.log
-
-# Codex panel review writes model-authored raw findings here; never commit them
-/docs/quality-audit/findings-panel-raw/
-
-# Local debugging screenshots — not part of the repo
-/images/
-.playwright-mcp/
-.playwright-cli/
-output/playwright/
-test-results/.last-run.json
-.claude/settings.json
-config/cicd/.sign-bundle-transactions/
-
-# tests/_scratch/ — throwaway repro tests for agent sessions (2026-08-29).
-# pytest collects and runs them like any test, but every whole-tree gate
-# (tests/helpers/tree_gate.py) subtracts gitignored files, so a scratch file
-# appearing or vanishing mid-run cannot crash or skew a gate on the shared
-# checkout. Never put scratch under any other tests/ directory.
-/tests/_scratch/
-.claude/lanes/
+# FINAL RULE: keep .gitkeep files everywhere (overrides earlier ignores).
+!.gitkeep

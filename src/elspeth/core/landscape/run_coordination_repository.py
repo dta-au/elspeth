@@ -2,7 +2,7 @@
 
 Owns the ``run_coordination`` seat row, the ``run_workers`` registry, and the
 ``run_coordination_events`` ledger (design
-notes/option-c-multi-worker-coordination-design-2026-06-11.md §A.2/§B.4/§C/§G).
+docs/architecture/design-notes/option-c-multi-worker-coordination-design-2026-06-11.md §A.2/§B.4/§C/§G).
 Two shared fence constructs live here and in the schema module — one
 definition, one dedicated unit test each (design §G):
 

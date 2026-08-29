@@ -34,7 +34,7 @@ the *Amendment detail* section at the end of this document. The five changes:
 Authority: ADR-030
 ([030-multi-worker-deployment-shape.md](030-multi-worker-deployment-shape.md))
 and the design note
-`notes/option-c-multi-worker-coordination-design-2026-06-11.md`
+`docs/architecture/design-notes/option-c-multi-worker-coordination-design-2026-06-11.md`
 (§D, §E.1–E.5, §G, §H).
 
 ## Context
@@ -455,7 +455,7 @@ bumps for D2 anyway; adding one nullable column is negligible cost.
 ### Architecture assessment
 
 - Commit `a565c404c` — the original durability-unification decision.
-- `notes/option-c-multi-worker-coordination-design-2026-06-11.md` — the
+- `docs/architecture/design-notes/option-c-multi-worker-coordination-design-2026-06-11.md` — the
   multi-worker coordination design behind the 2026-06-13 amendment (§D
   finalization, §E.1 journal-arrival hand-off, §E.2 in-claim arm removal,
   §E.3/§E.3a snapshot exhaustiveness + late-arrival release, §E.5 branch-loss
