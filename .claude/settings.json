@@ -36,6 +36,17 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PROJECT_DIR}/.venv/bin/ruff\" check --fix $CLAUDE_FILE_PATHS 2>&1 | tail -20"
+          }
+        ]
+      }
     ]
   },
   "enabledPlugins": {

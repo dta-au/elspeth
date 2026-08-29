@@ -234,6 +234,14 @@ worktree CWD discipline, operator gates on destructive shared-state actions,
 and the box's finite resources — a wide fan-out must brief an explicit
 per-agent test-parallelism ceiling, because 24 CPUs do not multiply.
 
+When fanning several lanes out from a ticket list, use the `lane-manager`
+skill: it keeps a per-run state file under `.claude/lanes/`, verifies every
+lane from `git log`/`git diff` and the lane's test command rather than its
+own report, checks the live-agent list + the worktree before calling an idle
+lane dead, escalates nudge → re-dispatch → BLOCKED without stalling, and emits the
+landed/blocked/merge-order report. `SKILL.md` is harness-neutral (Codex too);
+`claude-code.md` beside it is the Claude Code binding.
+
 Optimization priorities when choosing how to work, in order:
 
 1. **Code quality** — correctness, integrity, and maintainability come first.
@@ -395,8 +403,9 @@ The block above is installer-written. ELSPETH's own guidance
   historical calls failed on that.
 - **Zero callers is not "no callers".** Read `traversal_complete`,
   `scope_excludes`, and `unresolved_candidates` before concluding; class
-  instantiations and calls from large test files may sit there as
-  `why: dynamic`. Confirm a negative with `git grep`.
+  instantiations (never resolved to a call edge) and calls from files analyzed
+  by a venv-less hook run may sit there as `why: dynamic`. Confirm a negative
+  with `git grep`.
 - Check `project_status_get` staleness first; a re-analyze is triggered by
   the git hooks on the main checkout, not by worktree commits. Any list over
   ~100 rows overflows the MCP result cap — page with the cursor.

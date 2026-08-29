@@ -130,8 +130,12 @@ August; Claude Code: 104 of 180,517 tool calls, none from search-specialist
 or lane agents). The agents' own recorded reason was less "wrong answer"
 than "trust question": stale-index warnings (38 explicit statements across
 both harnesses) and the rule that a zero-caller answer must be corroborated
-by grep — "once I'm going to grep, I skip the first step." The extractor fix landed 2026-08-29 17:50 local and the
-first post-fix run degraded 3 of 45 files. The maintainers' preference is to
+by grep — "once I'm going to grep, I skip the first step." The extractor fix landed 2026-08-29 17:50 local; the first post-fix
+incremental run degraded 3 of 45 files, and the first post-fix full
+re-analyze (run `f085278d`, 38 min, all 3,093 files, 0 skipped) degraded
+**3 files in the whole tree** — `web/sessions/service.py` (13,645 lines,
+reference-site cap), `web/composer/tool_batch.py` (2,354 lines, pyright
+timeout), and one 1,165-line integration test — with zero pyright restarts. The maintainers' preference is to
 salvage: the graph is theirs, the three approved capabilities have no
 substitute, and the remaining problems are enumerable. The salvage worklist
 is the condition of this approval; the measurement that decides whether it

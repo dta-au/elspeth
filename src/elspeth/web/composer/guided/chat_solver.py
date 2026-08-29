@@ -15,6 +15,7 @@ it persists any guided-session state changes.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import math
 import sys
@@ -508,6 +509,37 @@ _STEP_1_SOURCE_TOOL: dict[str, Any] = {
         },
     },
 }
+
+
+def _step_1_source_tool(
+    *,
+    plugin_hint: str | None,
+    available_source_plugins: tuple[str, ...],
+) -> Mapping[str, Any]:
+    """The ``resolve_source`` tool schema for this call.
+
+    elspeth-79e66ff613 (Stage 1): with NO wizard selection (``plugin_hint``
+    None) the parser has no server-owned default to tolerate an omitted
+    ``plugin``, and the planner omits it on roughly one unhinted first turn
+    in four — the guided lane's worst first impression. Constrain the field
+    with the deployment catalog enum and say it is required even now. The
+    catalog is server-owned DATA; the model still makes the choice, so
+    composer invariant 1 (the LLM does the job) is untouched. With a hint —
+    or an empty catalog — the module constant is returned unchanged: the
+    parser's hint default already makes ``plugin`` effectively constant
+    there, and pinning identity keeps the hinted wire bytes byte-stable.
+    """
+    if plugin_hint is not None or not available_source_plugins:
+        return _STEP_1_SOURCE_TOOL
+    tool = copy.deepcopy(_STEP_1_SOURCE_TOOL)
+    plugin_property = tool["function"]["parameters"]["properties"]["plugin"]
+    plugin_property["enum"] = sorted(available_source_plugins)
+    plugin_property["description"] = (
+        "REQUIRED even on the first turn, before any source type is selected: "
+        "choose the source plugin for this data from the enum (the deployment's "
+        "source catalog). Never omit this field."
+    )
+    return tool
 
 
 def _step_1_source_plugin_reselection_tool(
@@ -2579,7 +2611,11 @@ async def maybe_resolve_step_1_source_chat(
             messages.append({"role": "user", "content": untrusted_context})
         messages.append({"role": "user", "content": user_message})
         messages.extend(deferred_repair_thread)
-        tools: list[dict[str, Any]] = [] if form_directed_revision else [_STEP_1_SOURCE_TOOL]
+        tools: list[dict[str, Any]] = (
+            []
+            if form_directed_revision
+            else [dict(_step_1_source_tool(plugin_hint=plugin_hint, available_source_plugins=available_source_plugins))]
+        )
         reselection_tool = _step_1_source_plugin_reselection_tool(
             plugin_hint=plugin_hint if allow_plugin_reselection else None,
             available_source_plugins=available_source_plugins,
