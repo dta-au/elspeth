@@ -1404,13 +1404,38 @@ def _repository_relative_link_targets(path: Path) -> tuple[str, ...]:
     return tuple(relative_targets)
 
 
+def _markdown_heading_fragments(path: Path) -> frozenset[str]:
+    fragments: set[str] = set()
+    occurrences: dict[str, int] = {}
+    tokens = MarkdownIt("commonmark").parse(path.read_text(encoding="utf-8"))
+    for index, token in enumerate(tokens):
+        if token.type != "heading_open" or index + 1 >= len(tokens):
+            continue
+        inline = tokens[index + 1]
+        heading = "".join(child.content for child in inline.children or () if child.type in {"text", "code_inline"})
+        normalized = "".join(character for character in heading.casefold() if character.isalnum() or character in " -_")
+        base = "-".join(normalized.split())
+        occurrence = occurrences.get(base, 0)
+        occurrences[base] = occurrence + 1
+        fragments.add(base if occurrence == 0 else f"{base}-{occurrence}")
+    return frozenset(fragments)
+
+
 def _missing_repository_relative_link_targets(path: Path) -> tuple[str, ...]:
     repository_root = REPOSITORY_ROOT.resolve()
     missing_targets: list[str] = []
-    for target in _repository_relative_link_targets(path):
-        resolved_target = (path.parent / target).resolve()
+    for target in _markdown_link_targets(path):
+        parsed = urlsplit(target)
+        if parsed.scheme or parsed.netloc or parsed.path.startswith("/"):
+            continue
+        relative_path = unquote(parsed.path)
+        resolved_target = (path.parent / relative_path).resolve() if relative_path else path.resolve()
         if not resolved_target.is_relative_to(repository_root) or not resolved_target.exists():
-            missing_targets.append(target)
+            missing_targets.append(relative_path)
+            continue
+        fragment = unquote(parsed.fragment)
+        if fragment and resolved_target.suffix.casefold() == ".md" and fragment not in _markdown_heading_fragments(resolved_target):
+            missing_targets.append(f"{relative_path}#{fragment}")
     return tuple(missing_targets)
 
 
@@ -1460,6 +1485,20 @@ def test_missing_repository_relative_link_target_is_reported(tmp_path: Path, mon
     monkeypatch.setattr(sys.modules[__name__], "REPOSITORY_ROOT", repository_root)
 
     assert _missing_repository_relative_link_targets(document) == ("missing.md",)
+
+
+def test_missing_repository_relative_markdown_fragment_is_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = tmp_path / "repository"
+    document = repository_root / "docs/document.md"
+    document.parent.mkdir(parents=True)
+    (document.parent / "present.md").write_text("# Present heading\n", encoding="utf-8")
+    document.write_text("[missing heading](present.md#missing-heading)\n", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPOSITORY_ROOT", repository_root)
+
+    assert _missing_repository_relative_link_targets(document) == ("present.md#missing-heading",)
 
 
 def test_parent_traversal_to_existing_repository_target_is_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
