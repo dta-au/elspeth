@@ -134,8 +134,8 @@ lowering — and out of the web-authorable surface entirely:
 
 - Filigree `elspeth-cd0f6a6cd9` (battery evidence run `e41d0e6b`)
 - Implementation plan:
-  `docs/superpowers/plans/2026-08-04-textract-profile-bound-bucket.md`
+  the 2026-08-04 textract-profile-bound-bucket implementation plan (implemented; in git history)
 - ADR-032 (validate by trust domain); the kind-qualified profile identity
   note at `src/elspeth/web/composer/planner_authoring_aids.py:1196-1198`
 - Prior transform design:
-  `docs/superpowers/plans/2026-07-29-amazon-textract-document-analysis-transform.md`
+  the 2026-07-29 amazon-textract-document-analysis-transform plan (implemented; in git history)

@@ -166,7 +166,7 @@ If a profile requires `usage`, absent usage is a non-retryable invalid-response 
 > the migration of the nine Composer LLM call sites onto it, and the
 > `composer_profile` / `composer_advisor_profile` profile selectors — is
 > replaced by the endpoint-affordance approach in
-> `docs/superpowers/plans/2026-07-31-llm-gateway-phase3-endpoint-affordance.md`.
+> `the 2026-07-31 llm-gateway phase-3 plan (implemented; in git history)`.
 >
 > **Reason.** ELSPETH already speaks to any OpenAI-compatible endpoint at an
 > arbitrary base URL, through LiteLLM and through its own OpenRouter provider.

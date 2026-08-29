@@ -27,8 +27,8 @@ widening the source to more rows; that changes what the pins mean, it does
 not generalize them.
 
 ``_nested_settings`` / ``build_settings_document`` are IMPORTED by the
-WS5/WS6 crash+resume variant (``docs/superpowers/plans/
-2026-08-21-unified-lineage-ws5-ws6-resume-observability.md``) — both stay
+WS5/WS6 crash+resume variant
+(``tests/e2e/recovery/test_depth5_resume_post_settlement.py``) — both stay
 plain module-level functions, fixture-free, returning the settings DOCUMENT
 (dict) shape ``load_settings_from_config_dict`` consumes (mirrors
 ``examples/fork_coalesce/settings.yaml``'s vocabulary: ``fork_to``,

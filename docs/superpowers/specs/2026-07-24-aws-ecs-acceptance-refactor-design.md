@@ -286,4 +286,4 @@ This option performs release authorization before the structural work, moves hun
 
 ## Superseded planning artifacts
 
-After the developer approves this design, replace `docs/superpowers/plans/2026-07-22-aws-ecs-acceptance-refactor.md` with a new plan derived from this specification. Delete its stale `.review.json`; do not generate another review sidecar.
+After the developer approves this design, replace `the 2026-07-22 aws-ecs-acceptance-refactor plan (implemented; in git history)` with a new plan derived from this specification. Delete its stale `.review.json`; do not generate another review sidecar.

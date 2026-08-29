@@ -264,7 +264,8 @@ class WebSettings(BaseModel):
     # ``api_base``/``api_key`` from every LiteLLM call entirely, so an
     # unconfigured deployment is byte-identical to pre-endpoint-affordance
     # behaviour. Configuration surface only — see
-    # docs/superpowers/plans/2026-07-31-llm-gateway-phase3-endpoint-affordance.md.
+    # docs/reference/environment-variables.md ("Custom LLM Endpoints"); the
+    # 2026-07-31 gateway phase-3 plan that introduced it is in git history.
     # Setting this does NOT rewrite ``composer_model``: LiteLLM shapes the
     # request off the model prefix, not off ``api_base``, so a custom
     # endpoint generally wants an ``openai/``-prefixed (or bare OpenAI-name)

@@ -1,7 +1,7 @@
 # Composer path-quality battery
 
 Spec: `docs/superpowers/specs/2026-08-13-composer-battery-design.md` (rev 4).
-Plan: `docs/superpowers/plans/2026-08-17-composer-battery.md`.
+Plan: implemented; the 2026-08-17 composer-battery plan is retrievable from git history.
 
 The battery fires a fixed operator-voice corpus (`corpus.md`, 18 stratified
 cases + canary) at the local live composer, captures every run to
