@@ -185,9 +185,10 @@ def test_route_with_copy_raises(self) -> None:
 
 ## References
 
-- Implementation and regression coverage: commit `66bb0ef52`,
-  `src/elspeth/contracts/routing.py`, and
-  `tests/unit/contracts/test_routing.py`
+- Original implementation and regression coverage: reachable commit
+  `f4f348de1`.
+- Current enforcement: [routing contract](../../../src/elspeth/contracts/routing.py)
+  and [regression test](../../../tests/unit/contracts/test_routing.py).
 - CLAUDE.md: "Every row reaches exactly one terminal state"
 - ARCHITECTURE.md: Token lifecycle state machine
 

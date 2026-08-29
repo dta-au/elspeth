@@ -49,14 +49,11 @@ _AUTHORITY_FIELD = re.compile(
 _STATUS_FIELD = re.compile(r"^\*\*Status:\*\*\s*(?P<value>.+)$", re.MULTILINE)
 _ACCOUNTABLE_AUTHORITIES = frozenset({"ELSPETH maintainer", "ELSPETH maintainers"})
 _PRIVATE_HOME = re.compile(r"/(?:home|Users)/(?!user(?:/|\b))[^/\s`),]+(?:/[^\s`),]*)?")
-_TMP_PATH = re.compile(r"/tmp(?:/[^\s`),]*)?")
+_TMP_PATH_PATTERN = r"/tmp(?:/[^\s`),]*)?"
+_TMP_PATH = re.compile(_TMP_PATH_PATTERN)
 _PROVENANCE_CONTEXT = re.compile(
     r"\b(?:accountable|authority|deciders?|decision makers?|evidence|provenance|review|plan|reference|source|"
     r"artefacts?|artifacts?|policy)\b",
-    re.IGNORECASE,
-)
-_PROVENANCE_REJECTION = re.compile(
-    r"\b(?:do not|must not|never|reject(?:ed)?|forbid(?:den)?|not (?:a )?(?:durable|valid|acceptable|public))\b",
     re.IGNORECASE,
 )
 _OPAQUE_MEMORY_REFERENCE = re.compile(
@@ -77,6 +74,18 @@ def _top_level_metadata(text: str, pattern: re.Pattern[str]) -> str | None:
     return match.group("value").strip() if match else None
 
 
+def _tmp_path_is_rejected_as_provenance(paragraph: str, path: str) -> bool:
+    quoted_path = rf"`?{re.escape(path)}`?"
+    provenance_kind = r"(?:evidence|provenance|reference|source)"
+    rejection_patterns = (
+        rf"\b(?:do not|must not|never)\s+(?:use|cite|accept|treat)\s+{quoted_path}\s+as\s+{provenance_kind}\b",
+        rf"\b(?:reject|forbid)\s+{quoted_path}\s+as\s+{provenance_kind}\b",
+        rf"{quoted_path}\s+(?:is|are)\s+"
+        rf"(?:rejected|forbidden|not\s+(?:valid|acceptable|durable|public))\s+as\s+{provenance_kind}\b",
+    )
+    return any(re.search(pattern, paragraph, re.IGNORECASE) for pattern in rejection_patterns)
+
+
 def _public_provenance_violations(text: str) -> tuple[str, ...]:
     violations: list[str] = []
 
@@ -84,9 +93,9 @@ def _public_provenance_violations(text: str) -> tuple[str, ...]:
         if _PRIVATE_HOME.search(paragraph):
             violations.append("private absolute path")
 
-        rejects_provenance = bool(_PROVENANCE_REJECTION.search(paragraph))
         has_provenance_context = bool(_PROVENANCE_CONTEXT.search(paragraph))
-        if _TMP_PATH.search(paragraph) and has_provenance_context and not rejects_provenance:
+        tmp_paths = tuple(match.group(0) for match in _TMP_PATH.finditer(paragraph))
+        if has_provenance_context and any(not _tmp_path_is_rejected_as_provenance(paragraph, path) for path in tmp_paths):
             violations.append("ephemeral evidence path")
 
         if _OPAQUE_MEMORY_REFERENCE.search(paragraph):
@@ -174,6 +183,8 @@ def test_active_adrs_do_not_use_private_or_ephemeral_provenance() -> None:
         ("Policy code reads the `project_slug` setting.", False),
         ("Evidence rows may include `feedback_score`.", False),
         ("**Decision evidence:** `project_db_migration_policy` is tracked in the repository.", False),
+        ("**Evidence:** /tmp/review.json is the reference; do not delete it.", True),
+        ("**Evidence:** /tmp/review.json is the reference; /tmp/old.json is rejected as evidence.", True),
         ("References to `/tmp/review.json` are rejected as evidence.", False),
     ],
 )
