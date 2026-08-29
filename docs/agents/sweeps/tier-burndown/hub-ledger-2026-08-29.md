@@ -176,3 +176,7 @@
   resolved additively. Masquerade baseline up to date (37); trust_boundary gates rc=0; 1108 harness/arch/lints
   tests green on the merged tree. NOTE: `docs/architecture/adr/024-...md` is modified in the shared checkout by
   ANOTHER session (not hub, not any lane) — left untouched; `tier-lintprecision` worktree likewise not ours.
+- B26 positive proof (post-merge re-measure at fb95c4c89): its five files emit exactly 175 R_TB_SUPPRESSED lines
+  = the 175 findings removed — every removal is a live suppression, none a voided decorator (zero
+  R_TB_NONLITERAL/MALFORMED/UNKNOWN_KWARG/STACKED tree-wide). Lane's post-merge branch commit 7852f55db (tip
+  re-merge + hints reword, --no-verify with hand-run gates) was superseded by the hub's e0caff32d and deleted.
