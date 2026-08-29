@@ -165,3 +165,14 @@
   Path` is a live bug (pydantic yields PosixPath); gate_ledger got no boundary because 4/5 callers are write-path
   self-checks (read-back prose would be false). Filed by lane: elspeth-obs-539724f2db (wrong check id on
   malformed captured_at). Issue title/description corrected to 215.
+- tier-B26 MERGED (e0caff32d, lane HEAD b425286a7, elspeth-1213f153ae): 198 → 23 (175 removed, 23 rationalised).
+  Hub scan 2575 → 2400 vs ae34b48b3, outside-bucket identity EMPTY. Hub-reviewed in full: threaded receipt-node
+  budget replaces the nonlocal counter exactly; `_sentinel_observed` extracted as a staticmethod boundary;
+  `_operator_receipt` exact-type on the OperatorTelemetryEvidence/OutageEvidence closed union (git grep: no
+  subclasses). Measured method corrections now in recent-code-hints: helper return values DO keep the trail
+  (W3-4 was wrong); the trail-killer is a name assigned inside a `try:` and read after it; "extract a
+  `_decode_or_none` helper" trades the loss for a fresh R6. Fragility noted by lane: `_validate_scenario_inventory`
+  test_ref points at a shared parametrized test — any added param case rotates its fingerprint. Hints conflict
+  resolved additively. Masquerade baseline up to date (37); trust_boundary gates rc=0; 1108 harness/arch/lints
+  tests green on the merged tree. NOTE: `docs/architecture/adr/024-...md` is modified in the shared checkout by
+  ANOTHER session (not hub, not any lane) — left untouched; `tier-lintprecision` worktree likewise not ours.
