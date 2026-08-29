@@ -138,3 +138,10 @@
   (lintmap follow-up: `task` type has no `verifying` status — stays in_progress until wave-end close; the
   merged commit body of b5a5ecc51 quotes the old-regex 2535/1235 figures — superseded by this ledger, not
   rewritten. Lane re-derived under the corrected regex: 2594→2594 and real-allowlist 1270→1270, both empty.)
+- tier-B28 MERGED (0d0214b9d, lane HEAD a80e2aa79, elspeth-be73a74f17): 21 → 2 (19 removed, 2 rationalised:
+  EINTR flock retry R6, close-in-finally R4). Hub scan 2594 → 2575, outside-bucket identity EMPTY. Real fixes:
+  lock open-or-create handler returns the published descriptor; receipt_store parses (schema) BEFORE binding;
+  textract `_client_error_code` = non_raising boundary over ClientError.response with None failing closed in
+  `_probe_invocable`. Hub-reviewed flags: lexists/unlink(missing_ok) accepted (exclusive create is the
+  os.link FileExistsError path; dangling-symlink pin added). Lane's own absolute counts (2592/2573) carry a
+  2-line offset vs hub's; deltas identical (19).
