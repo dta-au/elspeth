@@ -30,6 +30,7 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.config import RuntimeNodeName, validate_runtime_node_name
 from elspeth.web.composer.bounded_json import bounded_json_loads
+from elspeth.web.composer.guided.state_machine import TerminalState
 from elspeth.web.composer.guided_blob_refs import (
     GUIDED_REVIEWED_BLOB_PATH_KEYS,
     GuidedReviewedBlobBinding,
@@ -4211,6 +4212,117 @@ def redact_guided_snapshot_storage_paths(
     guided = composer_meta["guided_session"]
     if type(guided) is not dict:
         raise ValueError("redact_guided_snapshot_storage_paths: composer_meta.guided_session must be a dict")
+    # Persisted checkpoints always carry ``terminal``; an absent key is the
+    # pre-terminal fixture shape and means an active session.
+    terminal = TerminalState.from_dict(guided["terminal"]) if "terminal" in guided and guided["terminal"] is not None else None
+    if terminal is None:
+        return _correlate_guided_snapshot_storage_paths(sources, composer_meta, raw_sources)
+    # A terminal session (exited to freeform, or completed) has left guided
+    # authoring, so the retained review history is no longer a binding custody
+    # claim over whatever now shares its name; it is retained for re-entry.
+    # Provenance is unprovable once the binding fails, so the degraded
+    # projection masks every carrier instead of raising (the raise was the only
+    # thing masking a guided-committed private path) and names the condition.
+    # Admission keeps its own strict direction (yaml_generator, execution).
+    try:
+        return _correlate_guided_snapshot_storage_paths(sources, composer_meta, raw_sources)
+    except AuditIntegrityError:
+        return _degrade_guided_snapshot_storage_paths(sources, composer_meta)
+
+
+def _mask_option_carriers(options: Mapping[str, Any]) -> dict[str, Any]:
+    masked = dict(options)
+    for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
+        if key in masked:
+            masked[key] = REDACTED_BLOB_SOURCE_PATH
+    return masked
+
+
+def _degrade_guided_snapshot_storage_paths(
+    sources: Mapping[str, Any] | None,
+    composer_meta: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Project a terminal session whose reviewed custody no longer binds.
+
+    Every live-source, reviewed-snapshot, and pending-intent path carrier is
+    masked unconditionally and never stamped with a sentinel; the projected
+    ``guided_session`` gains ``custody_unavailable: true``. Projection-only:
+    ``GuidedSession.from_dict`` rejects the key, so it can never persist.
+    """
+    guided = composer_meta["guided_session"]
+    sources_out: dict[str, Any] | None = None
+    if sources is not None:
+        sources_out = {}
+        for live_name, live_source in sources.items():
+            if type(live_source) is not dict:
+                raise ValueError("redact_guided_snapshot_storage_paths: source entries must be dicts when guided blob redaction is active")
+            if "options" not in live_source:
+                sources_out[live_name] = live_source
+                continue
+            live_options = live_source["options"]
+            if type(live_options) is not dict:
+                raise ValueError("redact_guided_snapshot_storage_paths: source.options must be a dict when guided blob redaction is active")
+            masked_source = dict(live_source)
+            masked_source["options"] = _mask_option_carriers(live_options)
+            sources_out[live_name] = masked_source
+
+    reviewed_out: dict[str, Any] = {}
+    for stable_id, snapshot in guided["reviewed_sources"].items():
+        if type(stable_id) is not str or type(snapshot) is not dict or type(snapshot["options"]) is not dict:
+            raise ValueError("redact_guided_snapshot_storage_paths: reviewed_sources entries must be string-keyed dicts")
+        snapshot_masked = dict(snapshot)
+        snapshot_masked["options"] = _mask_option_carriers(snapshot["options"])
+        reviewed_out[stable_id] = snapshot_masked
+    pending_out: dict[str, Any] = {}
+    for stable_id, intent in guided["pending_source_intents"].items():
+        if type(stable_id) is not str or type(intent) is not dict:
+            raise ValueError("redact_guided_snapshot_storage_paths: pending_source_intents entries must be string-keyed dicts")
+        intent_options = intent["options"]
+        if intent_options is None:
+            pending_out[stable_id] = intent
+            continue
+        if type(intent_options) is not dict:
+            raise ValueError(
+                f"redact_guided_snapshot_storage_paths: guided_session.pending_source_intents[{stable_id!r}].options must be a dict or None"
+            )
+        intent_masked = dict(intent)
+        intent_masked["options"] = _mask_option_carriers(intent_options)
+        pending_out[stable_id] = intent_masked
+
+    guided_degraded = dict(guided)
+    guided_degraded["reviewed_sources"] = reviewed_out
+    guided_degraded["pending_source_intents"] = pending_out
+    guided_degraded["custody_unavailable"] = True
+    meta_out = dict(composer_meta)
+    meta_out["guided_session"] = guided_degraded
+
+    if "implicit_decisions" in meta_out:
+        report = meta_out["implicit_decisions"]
+        if type(report) is not dict or "entries" not in report or type(report["entries"]) is not list:
+            raise AuditIntegrityError("guided implicit-decision projection is malformed")
+        masked_entries: list[dict[str, Any]] = []
+        for entry in report["entries"]:
+            if type(entry) is not dict:
+                raise AuditIntegrityError("guided implicit-decision entry is malformed")
+            masked_entry = dict(entry)
+            if "path" in entry and entry["path"] in {"source.path", "source.file"} and "value" in entry:
+                masked_entry["value"] = REDACTED_BLOB_SOURCE_PATH
+            masked_entries.append(masked_entry)
+        masked_report = dict(report)
+        masked_report["entries"] = masked_entries
+        meta_out["implicit_decisions"] = masked_report
+    return sources_out, meta_out
+
+
+def _correlate_guided_snapshot_storage_paths(
+    sources: Mapping[str, Any] | None,
+    composer_meta: Mapping[str, Any],
+    raw_sources: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Strict correlation: every reviewed binding must map to its live source."""
+    sources_out = dict(sources) if sources is not None else None
+    meta_out: dict[str, Any] | None = dict(composer_meta)
+    guided = composer_meta["guided_session"]
     reviewed_sources = guided["reviewed_sources"]
     if type(reviewed_sources) is not dict:
         raise ValueError("redact_guided_snapshot_storage_paths: guided_session.reviewed_sources must be a dict")
