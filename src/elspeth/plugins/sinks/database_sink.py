@@ -48,6 +48,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPrepareRequest,
     SinkEffectReconcileResult,
 )
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SanitizedDatabaseUrl
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.core.canonical import canonical_json
@@ -1101,6 +1102,16 @@ class DatabaseSink(BaseSink):
         return None
 
     @classmethod
+    @trust_boundary(
+        tier=3,
+        source=(
+            "a composer/tool-call config snapshot for this sink — LLM- or operator-authored option values ELSPETH has not yet validated"
+        ),
+        source_param="config_snapshot",
+        suppresses=("R1",),
+        invariant=("returns advisory hint strings only; an absent or non-'replace' if_exists contributes no hint and nothing raises"),
+        non_raising=True,
+    )
     def get_post_call_hints(
         cls,
         *,

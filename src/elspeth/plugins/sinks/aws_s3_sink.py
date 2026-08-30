@@ -424,10 +424,14 @@ def _json_value_chars(value: Any, *, seen: set[int]) -> int:
         if not math.isfinite(value):
             raise S3RecordSerializationError
         return len(json.dumps(value, allow_nan=False))
-    # The container arms mirror json.JSONEncoder's own dispatch (dict subclasses
-    # and list/tuple) so this estimate accepts exactly what the write path will
-    # encode; a frozen mapping or frozenset is a static failure in both places.
-    if isinstance(value, dict):
+    # Rows reach this estimator rebuilt by ``deep_thaw`` (contracts/freeze.py),
+    # which converts mapping proxies and every dict subclass into exact
+    # built-in dicts — so a dict SUBCLASS here is an upstream invariant break,
+    # not a value the write path is entitled to encode. The exact-type check
+    # routes it to the typed serialization failure below instead of silently
+    # widening the Tier-2 contract to whatever json.JSONEncoder happens to
+    # accept.
+    if type(value) is dict:
         identity = id(value)
         if identity in seen:
             raise S3RecordSerializationError

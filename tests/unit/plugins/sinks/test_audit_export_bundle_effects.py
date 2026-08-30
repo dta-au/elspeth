@@ -769,3 +769,14 @@ def test_preflight_rejects_symlink_path_component(tmp_path: Path) -> None:
 
     with pytest.raises(bundle_effects.AuditExportBundlePreflightError, match="symlink"):
         bundle_effects.preflight_audit_export_bundle(alias / "audit")
+
+
+def test_stale_sweep_surfaces_unusable_parent(tmp_path: Path) -> None:
+    """A parent that cannot be pinned propagates instead of reading as a clean sweep.
+
+    The old handlers converted pin/enumeration failure into 0 — indistinguishable
+    from a successful sweep that found nothing. ``preflight_audit_export_bundle``
+    converts this raise into its typed preflight failure.
+    """
+    with pytest.raises(OSError):
+        bundle_effects.cleanup_stale_audit_export_bundle_scratch(tmp_path / "missing")

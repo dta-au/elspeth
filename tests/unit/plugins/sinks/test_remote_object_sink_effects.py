@@ -1111,7 +1111,13 @@ def test_reaffirmed_noop_recognizes_independently_reprepared_identical_content(
     assert not Path(str(plan.safe_evidence["staging_path"])).exists()
 
 
-def test_reaffirmed_result_survives_owned_stage_cleanup_failure(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reaffirmed_prepare_surfaces_owned_stage_cleanup_failure(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed unlink of the code-owned stage is an anomaly that surfaces.
+
+    The old contract swallowed the OSError behind a log line, making a spool
+    that can no longer be cleaned indistinguishable from a healthy one. The
+    cleanup failure now propagates instead of being traded for the reaffirmed
+    plan."""
     monkeypatch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path))
     body = b'{"id":1}'
     staged_hash, staged_size, checksum_b64 = _genesis_identity(
@@ -1139,15 +1145,14 @@ def test_reaffirmed_result_survives_owned_stage_cleanup_failure(tmp_path: Any, m
         checksum_b64=checksum_b64,
     )
 
-    plan = _raw_prepare(
-        effect_id="2" * 64,
-        provider="aws_s3",
-        body=body,
-        checksum_algorithm="sha256",
-        observation=present,
-    )
-
-    assert plan.safe_evidence["publication_kind"] == "reaffirmed"
+    with pytest.raises(OSError, match="owned cleanup failed"):
+        _raw_prepare(
+            effect_id="2" * 64,
+            provider="aws_s3",
+            body=body,
+            checksum_algorithm="sha256",
+            observation=present,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1206,7 +1211,12 @@ def test_reaffirm_requires_the_full_verified_identity_set_not_partial_match(
     assert not remote_effects._stage_path("d" * 64, "aws_s3").exists()
 
 
-def test_collision_error_survives_owned_stage_cleanup_failure(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_collision_prepare_surfaces_owned_stage_cleanup_failure(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stage-cleanup failure on the collision path surfaces as the raised error.
+
+    The collision branch removes the code-owned stage before raising its
+    typed error; a cleanup failure there is an anomaly in the owned spool
+    namespace and propagates instead of being reduced to a log line."""
     monkeypatch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path))
     target_stage = remote_effects._stage_path("3" * 64, "aws_s3")
     original_unlink = Path.unlink
@@ -1224,7 +1234,7 @@ def test_collision_error_survives_owned_stage_cleanup_failure(tmp_path: Any, mon
         size_bytes=len(b'{"id":1}'),
     )
 
-    with pytest.raises(remote_effects.RemoteObjectCollisionError):
+    with pytest.raises(OSError, match="owned cleanup failed"):
         _raw_prepare(
             effect_id="3" * 64,
             provider="aws_s3",
@@ -1568,3 +1578,20 @@ def test_remote_sinks_have_no_process_local_publication_authority(factory: Any) 
             object.__getattribute__(sink, obsolete)
     with pytest.raises(RuntimeError, match="effect coordinator"):
         sink.write([{"id": 1}], SimpleNamespace(run_id="run", contract=None, landscape=None, operation_id="op"))
+
+
+def test_remote_stale_sweep_surfaces_unreadable_building_entries(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-ENOENT lstat failure on a code-owned spool building name propagates."""
+    building = Path(tmp_path) / ".e.body.tmp123.building"
+    building.write_bytes(b"crashed")
+    original_lstat = Path.lstat
+
+    def deny(path: Path, *args: object, **kwargs: object) -> object:
+        if path == building:
+            raise PermissionError(13, "denied")
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", deny)
+
+    with pytest.raises(PermissionError):
+        remote_effects.cleanup_stale_remote_spool_building_files(Path(tmp_path))

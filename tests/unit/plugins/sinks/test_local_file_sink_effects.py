@@ -955,3 +955,40 @@ def test_indented_json_array_effects_preserve_cumulative_format(tmp_path: Path) 
     )
     second_sink.commit_effect(second, _CTX)
     assert target.read_text() == json.dumps([{"id": 1}, {"id": 2}], indent=2)
+
+
+def test_stale_sweep_surfaces_unreadable_building_entries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-ENOENT lstat failure on a code-owned building name propagates.
+
+    Only the concurrent-removal race (the entry is already gone) may be
+    skipped; permission or I/O failures must not read as a clean sweep.
+    """
+    building = tmp_path / f"..out.txt.elspeth-{'5' * 64}.stage.abc123.building"
+    building.write_bytes(b"crashed")
+    original_lstat = Path.lstat
+
+    def deny(path: Path, *args: object, **kwargs: object) -> object:
+        if path == building:
+            raise PermissionError(13, "denied")
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", deny)
+
+    with pytest.raises(PermissionError):
+        local_effects.cleanup_stale_local_effect_building_files(tmp_path)
+
+
+def test_stale_sweep_skips_entries_removed_by_a_concurrent_sweep(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gone-between-glob-and-lstat race is the one silent skip: its goal is met."""
+    building = tmp_path / f"..out.txt.elspeth-{'5' * 64}.stage.abc123.building"
+    building.write_bytes(b"crashed")
+    original_lstat = Path.lstat
+
+    def vanish(path: Path, *args: object, **kwargs: object) -> object:
+        if path == building:
+            raise FileNotFoundError(2, "gone")
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", vanish)
+
+    assert local_effects.cleanup_stale_local_effect_building_files(tmp_path) == 0

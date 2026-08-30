@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import logging
 import os
 import stat
 import tempfile
@@ -35,15 +34,16 @@ _COPY_BYTES: Final = 64 * 1024
 _PUBLICATION_KINDS: Final = frozenset({"conditional_create", "conditional_replace", "inherited", "virtual", "reaffirmed"})
 _REPLACE_AUTHORITIES: Final = frozenset({"none", "overwrite_config", "predecessor_lineage"})
 
-logger = logging.getLogger(__name__)
-
 
 def _unlink_owned_stage(path: Path) -> None:
-    """Best-effort cleanup that cannot replace a primary effect outcome."""
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        logger.warning("remote effect owned-stage cleanup failed")
+    """Remove a code-owned stage body; an already-absent body is success.
+
+    ``missing_ok=True`` covers the one benign outcome. Any other ``OSError``
+    (permission, I/O) on the code-owned spool namespace is an anomaly and
+    propagates — chaining over a primary effect error where one is already in
+    flight — rather than being reduced to a log line.
+    """
+    path.unlink(missing_ok=True)
 
 
 class RemoteObjectEffectError(RuntimeError):
@@ -387,14 +387,15 @@ def cleanup_stale_remote_spool_building_files(
             break
         try:
             result = path.lstat()
-        except OSError:
+        except FileNotFoundError:
+            # A concurrent sweep already removed this entry — its goal is met.
+            # Every other OSError (permission, I/O) on a code-owned building
+            # name is an anomaly and propagates instead of reading as a clean
+            # sweep that found nothing.
             continue
         if not stat.S_ISREG(result.st_mode) or current_time - result.st_mtime < older_than_seconds:
             continue
-        try:
-            path.unlink()
-        except OSError:
-            continue
+        path.unlink(missing_ok=True)
         removed += 1
     return removed
 
