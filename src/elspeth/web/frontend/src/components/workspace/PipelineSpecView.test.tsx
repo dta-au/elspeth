@@ -660,6 +660,65 @@ describe("PipelineSpecView", () => {
     expect(within(union).getByText("Kind").nextElementSibling).toHaveTextContent("Row Union");
   });
 
+  it("reveals the raw id and the raw connection name in <code> with Advanced on (elspeth-f49e1611ab)", () => {
+    // The wave's premise is that the Advanced toggle reveals the identifiers
+    // the default level hides. It did not: the raw id lived in `title` at BOTH
+    // levels, which is mouse-only recovery and no recovery at all on touch.
+    // The default-level half of this rule is the sibling test above and the
+    // pin below; this one is the ON half, and it must assert the ELEMENT —
+    // the pin strips <code>, so it can never witness this content either way.
+    useSessionStore.setState({
+      compositionState: makeComposition(10, {
+        sources: { source: { plugin: "csv", options: {}, on_success: "raw_rows" } },
+        nodes: [
+          { id: "extract_invoice", node_type: "transform", plugin: "llm", input: "raw_rows", on_success: "results", on_error: null, options: {} },
+        ],
+        outputs: [{ name: "results", plugin: "csv", on_write_failure: "discard", options: {} }],
+      }),
+    });
+    usePreferencesStore.setState({ showAdvanced: true });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node extract_invoice" });
+    const heading = within(node).getByRole("heading", { level: 4 });
+    // The reader-register phrase is still the name; the raw id joins it as a
+    // secondary rather than replacing it, and `title` stays as the mouse
+    // convenience beside both.
+    expect(heading).toHaveTextContent("Extract Invoice");
+    expect(heading).toHaveAttribute("title", "extract_invoice");
+    expect(within(heading).getByText("extract_invoice").tagName).toBe("CODE");
+
+    const then = within(node).getByText("Then").nextElementSibling as HTMLElement;
+    expect(then).toHaveTextContent("Results");
+    expect(within(then).getByText("results").tagName).toBe("CODE");
+  });
+
+  it("renders no identifier secondary at the default detail level (elspeth-f49e1611ab)", () => {
+    // The other half of the toggle: with Advanced off the card is byte-for-
+    // byte what it was before the secondary existed. Asserted as the ABSENCE
+    // of the element, because the shared pin strips <code> and so cannot see
+    // a regression here at all.
+    useSessionStore.setState({
+      compositionState: makeComposition(10, {
+        sources: { source: { plugin: "csv", options: {}, on_success: "raw_rows" } },
+        nodes: [
+          { id: "extract_invoice", node_type: "transform", plugin: "llm", input: "raw_rows", on_success: "results", on_error: null, options: {} },
+        ],
+        outputs: [{ name: "results", plugin: "csv", on_write_failure: "discard", options: {} }],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node extract_invoice" });
+    expect(within(node).queryByText("extract_invoice")).toBeNull();
+    expect(within(node).getByRole("heading", { level: 4 })).toHaveAttribute(
+      "title",
+      "extract_invoice",
+    );
+  });
+
   it("names the component feeding each branch of a wired coalesce (elspeth-93f5621f18)", () => {
     // The direction pin. A fan-in node's own `input` is one of its own branch
     // connections, so resolving `branches` through consumers rather than

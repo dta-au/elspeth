@@ -413,6 +413,45 @@ describe("RunsHistoryDrawer", () => {
     expect(failure).not.toHaveTextContent("service_error");
   });
 
+  it("puts the raw diagnostic enum beside its phrase with Advanced on (elspeth-f49e1611ab)", async () => {
+    // A run-failure reason or cause is exactly what a user pastes into a
+    // support search. Before this it lived in `title` at both detail levels,
+    // so a keyboard-only or touch user had no route to it. The phrase stays
+    // and the raw enum joins it in <code>, the same register an UNPHRASED
+    // value already uses — never dressed up as prose.
+    const diagnostics = makeDiagnostics({
+      failure_detail: null,
+      run_status: "completed_with_failures",
+    });
+    diagnostics.tokens[0].terminal_outcome = "routed_failure";
+    diagnostics.tokens[0].states[0].node_id = "transform_textract_93c6c46b8b72";
+    diagnostics.tokens[0].states[0].error = {
+      reason: "submit_failed",
+      error_type: "service_error",
+      code: "InvalidS3ObjectException",
+      cause: "s3_object_unreadable",
+      error: TEXTRACT_S3_UNREADABLE_HINT,
+    };
+    useExecutionStore.setState({
+      runs: [{ id: "r2", status: "completed_with_failures" } as never],
+      diagnosticsByRunId: { r2: diagnostics },
+    } as never);
+    usePreferencesStore.setState({ showAdvanced: true });
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 1 · /i }));
+
+    const failure = screen.getByTestId("run-state-failure-state-1");
+    expect(failure).toHaveTextContent("Reason: the request could not be submitted");
+    expect(within(failure).getByText("submit_failed").tagName).toBe("CODE");
+    expect(within(failure).getByText("s3_object_unreadable").tagName).toBe("CODE");
+    // The phrase and its `title` are unchanged — the raw value is an addition,
+    // not a replacement.
+    expect(
+      within(failure).getByText("the request could not be submitted"),
+    ).toHaveAttribute("title", "submit_failed");
+  });
+
   it("rejects malformed diagnostic identifiers and falls back to the next valid field", async () => {
     const diagnostics = makeDiagnostics({ failure_detail: null });
     diagnostics.tokens[0].states[0].node_id = "content_safety";

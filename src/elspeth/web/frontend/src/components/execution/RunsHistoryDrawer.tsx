@@ -210,6 +210,15 @@ function visibleStateFailure(error: unknown): VisibleStateFailure | null {
 /** One diagnostic enum value: prose when this wave has phrased it (raw value
  *  in `title`), otherwise the identifier register. An unphrased value is never
  *  dressed up as a sentence (elspeth-d74ab492dd). */
+/**
+ * One diagnostic enum. A value nobody has phrased stays in <code> — an
+ * unknown identifier is never dressed up as a sentence (diagnosticPhrases.ts).
+ * A phrased one reads as prose, and with the Advanced detail level on it
+ * carries the raw enum beside it in the same <code> register
+ * (elspeth-f49e1611ab): a run-failure reason or cause is exactly what gets
+ * pasted into a support search, and `title` alone leaves a keyboard-only or
+ * touch user no route to it. `title` stays as the mouse convenience.
+ */
 function DiagnosticValue({
   value,
   phrases,
@@ -217,8 +226,20 @@ function DiagnosticValue({
   value: string;
   phrases: ReadonlyMap<string, string>;
 }): JSX.Element {
+  const showAdvanced = useShowAdvanced();
   const phrase = phrases.get(value);
-  return phrase === undefined ? <code>{value}</code> : <span title={value}>{phrase}</span>;
+  if (phrase === undefined) return <code>{value}</code>;
+  return (
+    <span title={value}>
+      {phrase}
+      {showAdvanced && (
+        <>
+          {" "}
+          <code>{value}</code>
+        </>
+      )}
+    </span>
+  );
 }
 
 function RunStateFailureDetail({

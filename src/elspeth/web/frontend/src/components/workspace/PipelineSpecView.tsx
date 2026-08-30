@@ -5,6 +5,7 @@ import {
 import { PipelineGloss } from "@/components/chat/guided/PipelineGloss";
 import { OptionRows } from "@/components/inspector/OptionRows";
 import { DISCARD_CONNECTION } from "@/lib/graphTopology";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { CompositionState } from "@/types/index";
 import {
@@ -69,6 +70,32 @@ function routingLabel(field: string): string {
 const AUTHOR_NAME_FIELDS: ReadonlySet<string> = new Set(["scope_name"]);
 
 /**
+ * The raw wire token beside the phrase, rendered ONLY with the Advanced
+ * detail level on (elspeth-f49e1611ab). Until this existed the raw form of a
+ * card heading or a routing value lived in `title` alone at BOTH detail
+ * levels — a mouse-only recovery, and no recovery at all on touch, so the
+ * Advanced toggle did not in fact reveal the identifiers this wave hides.
+ * `title` stays where it is: it is the sighted-mouse convenience beside this
+ * <code>, never instead of it.
+ *
+ * <code> is the identifier register the pin already exempts
+ * (test/defaultDomPins.ts IDENTIFIER_SURFACES), the same register
+ * UnavailableComponentRow and DiagnosticValue use — so a raw token here can
+ * never be mistaken for prose, and the default-level pins are untouched
+ * because at the default level nothing is rendered at all.
+ */
+function IdentifierSecondary({ raw }: { raw: string }): JSX.Element | null {
+  const showAdvanced = useShowAdvanced();
+  if (!showAdvanced) return null;
+  return (
+    <>
+      {" "}
+      <code>{raw}</code>
+    </>
+  );
+}
+
+/**
  * One routing <dd>. The reader-register phrase comes from specRouting, which
  * resolves a connection name to the component on the other end (and carries
  * the elspeth-b9ebdf9011 branches-as-prose fix: a `branches`/`routes` map
@@ -89,7 +116,14 @@ function RoutingDd({
 }): JSX.Element {
   if (value === DISCARD_CONNECTION) return <dd>dropped (recorded in the audit trail)</dd>;
   const phrase = routingPhrase(state, index, field, value);
-  if (phrase !== null) return <dd title={phrase.raw}>{phrase.text}</dd>;
+  if (phrase !== null) {
+    return (
+      <dd title={phrase.raw}>
+        {phrase.text}
+        <IdentifierSecondary raw={phrase.raw} />
+      </dd>
+    );
+  }
   if (AUTHOR_NAME_FIELDS.has(field) && typeof value === "string") {
     return <dd title={value}>{titleCaseLabel(value)}</dd>;
   }
@@ -121,7 +155,10 @@ function SpecSection({ name, rows, state, index }: SpecSectionProps): JSX.Elemen
                 className="pipeline-spec-card"
                 aria-label={`${singular} ${row.id}`}
               >
-                <h4 title={row.id}>{titleCaseLabel(row.id)}</h4>
+                <h4 title={row.id}>
+                  {titleCaseLabel(row.id)}
+                  <IdentifierSecondary raw={row.id} />
+                </h4>
                 {row.description !== null && row.description.trim() !== "" && (
                   <p className="pipeline-spec-step-description">
                     {row.description}
