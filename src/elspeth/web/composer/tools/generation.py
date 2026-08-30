@@ -2370,6 +2370,18 @@ def _probe_transform_output_declared_field_names(plugin: str, options: Mapping[s
         transform.close()
 
 
+@trust_boundary(
+    tier=3,
+    source="value_transform NodeSpec options (composer/user-authored config re-read from persisted session state)",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns False (the field-preservation proof abstains) for absent, non-sequence, or "
+        "non-mapping operations shapes and for any operation targeting the field; never raises "
+        "on malformed node options"
+    ),
+    non_raising=True,
+)
 def _value_transform_preserves_field(node: NodeSpec, field_name: str) -> bool:
     # ``node.options`` is composer/user-authored config re-read from persisted
     # session state — Tier-3 origin. Membership form (not ``.get``) records the
@@ -3258,9 +3270,10 @@ def _attribute_proof_diagnostic_to_source(
     source_name: str,
 ) -> Mapping[str, Any]:
     """Attach the authored source identity to one detector-owned diagnostic."""
+    # ``diagnostic`` is detector-owned Tier-1 data (every producer builds
+    # ``evidence_locator`` as a mapping literal); the ``{**evidence}`` splat
+    # crashes with TypeError on corruption, so no defensive shape re-check.
     evidence = diagnostic["evidence_locator"]
-    if not isinstance(evidence, Mapping):
-        raise RuntimeError("proof diagnostic evidence_locator must be a mapping")
     return {
         **diagnostic,
         "evidence_locator": {**evidence, "source_name": source_name},

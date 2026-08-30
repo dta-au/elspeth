@@ -542,7 +542,9 @@ def _execute_upsert_queue_node(
     fork_to: tuple[str, ...] | None = tuple(validated.fork_to) if validated.fork_to is not None else None
     branches: CoalesceBranches | None = None
     if validated.branches is not None:
-        branches = dict(validated.branches) if isinstance(validated.branches, Mapping) else tuple(validated.branches)
+        # pydantic validated branches as exactly list[str] | dict[str, str]; dispatch on
+        # the concrete constructed type rather than re-checking shape via an ABC.
+        branches = dict(validated.branches) if type(validated.branches) is dict else tuple(validated.branches)
     node = NodeSpec(
         id=validated.id,
         node_type="queue",
@@ -698,7 +700,9 @@ def _execute_upsert_node(
 
     branches: CoalesceBranches | None = None
     if validated.branches is not None:
-        branches = dict(validated.branches) if isinstance(validated.branches, Mapping) else tuple(validated.branches)
+        # pydantic validated branches as exactly list[str] | dict[str, str]; dispatch on
+        # the concrete constructed type rather than re-checking shape via an ABC.
+        branches = dict(validated.branches) if type(validated.branches) is dict else tuple(validated.branches)
 
     node = NodeSpec(
         id=node_id,
