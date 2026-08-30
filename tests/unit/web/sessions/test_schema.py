@@ -29,7 +29,7 @@ from elspeth.web.sessions.models import (
     websocket_tickets_table,
 )
 from elspeth.web.sessions.schema import (
-    _EPOCH_44_COORDINATION_TABLES,
+    _COORDINATION_HARD_CUT_TABLES,
     SessionSchemaError,
     _stamp_schema_sentinels,
     _user_tables,
@@ -287,7 +287,7 @@ def test_current_schema_includes_epoch_44_coordination_tables_and_expiry_indexes
             "sessions_cleanup_claims",
         }
     )
-    assert expected_tables == _EPOCH_44_COORDINATION_TABLES
+    assert expected_tables == _COORDINATION_HARD_CUT_TABLES
     assert expected_tables <= set(inspector.get_table_names())
     assert not any("deleted" in table and "session" in table for table in inspector.get_table_names())
 
