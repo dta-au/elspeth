@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import re
-from contextlib import suppress
 from dataclasses import dataclass
 
+import structlog
+
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.audit_protocols import CallRecorder
 from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
@@ -19,6 +21,8 @@ from elspeth.plugins.transforms.aws.guardrails_client import (
     GuardrailServiceError,
     GuardrailSource,
 )
+
+logger = structlog.get_logger(__name__)
 
 _PROFILE_ALIAS = re.compile(r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*\Z")
 _PLUGIN_POLICIES: dict[str, tuple[GuardrailSource, tuple[str, ...]]] = {
@@ -108,5 +112,18 @@ def run_guardrail_live_check(
         raise GuardrailLiveCheckError("Bedrock Guardrail live check failed") from None
     finally:
         if owns_sdk_client and client is not None:
-            with suppress(Exception):
+            try:
                 client.sdk_client.close()
+            except contract_errors.TIER_1_ERRORS:
+                raise
+            except (TypeError, AttributeError, KeyError, NameError):
+                raise  # Programming errors must crash, even during teardown
+            except Exception as close_error:
+                # Provider-defined close failure on a client we own: recorded
+                # here rather than silently discarded, and never allowed to
+                # replace the live-check verdict already decided above.
+                logger.warning(
+                    "guardrail_sdk_client_close_failed",
+                    error=str(close_error),
+                    error_type=type(close_error).__name__,
+                )

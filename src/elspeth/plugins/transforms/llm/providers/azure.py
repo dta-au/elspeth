@@ -333,21 +333,21 @@ def _configure_azure_monitor(config: TracingConfig) -> bool:
     # Wire enable_content_recording to the Azure AI Inference tracing SDK.
     # Without this, the config field is accepted and logged but never applied,
     # leaving operators with a false sense of their content recording policy.
+    # Fail-closed on absence: enable_content_recording is policy-bearing, and
+    # no verifiable downstream control applies it when the instrumentor is
+    # missing — an environment-variable fallback asserts a policy nothing is
+    # proven to read (same posture as the configure_azure_monitor check above).
     try:
         from azure.ai.inference.tracing import AIInferenceInstrumentor
+    except ImportError as exc:
+        raise ImportError(
+            "azure-ai-inference is not installed but azure_ai tracing was configured. "
+            "The content-recording policy (enable_content_recording) is applied through "
+            "AIInferenceInstrumentor and cannot be verifiably enforced without it. "
+            "Install with: uv pip install azure-ai-inference"
+        ) from exc
 
-        AIInferenceInstrumentor().instrument(enable_content_recording=config.enable_content_recording)
-    except ImportError:
-        # azure-ai-inference not installed — fall back to environment variable
-        # which the OpenAI SDK instrumentor reads at trace emission time.
-        import os
-
-        logger.warning(
-            "azure-ai-inference not installed — falling back to environment variable for content recording",
-            hint="Install azure-ai-inference for full tracing support",
-            fallback_env_var="AZURE_TRACING_GEN_AI_CONTENT_RECORDING_ENABLED",
-        )
-        os.environ["AZURE_TRACING_GEN_AI_CONTENT_RECORDING_ENABLED"] = str(config.enable_content_recording).lower()
+    AIInferenceInstrumentor().instrument(enable_content_recording=config.enable_content_recording)
 
     _azure_monitor_configured = True
     return True
