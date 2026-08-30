@@ -562,6 +562,22 @@ describe("preferencesStore", () => {
     expect(state.writeError).toMatch(/administrator|operator|contact/i);
   });
 
+  it("leaves showAdvanced false and surfaces the error when the payload is rejected (elspeth-7d07df6438)", async () => {
+    // The decoder lives in api/preferencesDecoder.ts and is exercised in
+    // isolation there; this pins the CONSEQUENCE of a rejection through the
+    // store's existing fail-closed catch (bootstrap never fabricates a
+    // preference the user never set — see the block comment above).
+    mockFetch.mockRejectedValueOnce(
+      new Error("Invalid composer preferences at composer-preferences: missing show_advanced"),
+    );
+
+    await usePreferencesStore.getState().bootstrap();
+
+    const state = usePreferencesStore.getState();
+    expect(state.showAdvanced).toBe(false);
+    expect(state.writeError).not.toBeNull();
+  });
+
   it("resolveDefaultMode throws immediately without re-bootstrapping when loaded=true and defaultMode=null", async () => {
     // P0.9: the prior implementation guarded as
     // `if (current.loaded && current.defaultMode !== null) return …`,
