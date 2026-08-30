@@ -29,7 +29,7 @@ import { Button } from "@/components/ui";
 import { useShowAdvanced } from "@/stores/preferencesStore";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { AuditCharacteristicIcon } from "./AuditCharacteristicIcon";
-import { DEFAULT_VISIBLE_AUDIT_FLAGS } from "./auditCharacteristics";
+import { DEFAULT_VISIBLE_AUDIT_FLAGS, lookupAuditCharacteristic } from "./auditCharacteristics";
 import { pluginDisplayName } from "./pluginDisplayName";
 
 /** Event name dispatched by InlineChatSourceEntry and consumed by
@@ -139,6 +139,10 @@ export function PluginCard({
   const schemaOpen = expanded && showAdvanced;
   const visibleAuditCharacteristics = [...plugin.audit_characteristics]
     .filter((flag) => showAdvanced || (DEFAULT_VISIBLE_AUDIT_FLAGS as readonly string[]).includes(flag))
+    // An unknown flag renders nothing (AuditCharacteristicIcon), so leaving it
+    // in the list produces an EMPTY role="group" with an aria-label — a group
+    // announced as containing nothing. Drop it here instead.
+    .filter((flag) => lookupAuditCharacteristic(flag) !== null)
     .sort();
   const [detailsState, setDetailsState] = useState({ cardId, open: false });
   const detailsOpen = hasDetails && detailsState.cardId === cardId && detailsState.open;

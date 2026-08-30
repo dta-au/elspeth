@@ -186,6 +186,12 @@ def register_interpretation_routes(router: APIRouter) -> None:
                 },
             ) from exc
 
+        # ``new_state`` was persisted by resolve_interpretation_event through the
+        # gated composition_states insert, and the write gate admits exactly what
+        # the projection can serve (assert_guided_custody_persistable runs the
+        # same correlation), so this projection cannot raise a custody failure.
+        # A legacy unbindable tip surfaces earlier: the service's write refusal
+        # lands in the AuditIntegrityError arm above as a coded 500.
         return InterpretationResolveResponse(
             event=_interpretation_event_response(event),
             new_state=_state_response(new_state),

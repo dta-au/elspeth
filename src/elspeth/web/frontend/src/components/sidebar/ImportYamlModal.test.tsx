@@ -1089,6 +1089,45 @@ describe("ImportYamlModal", () => {
     expect(api.getPluginSchema).not.toHaveBeenCalled();
   });
 
+  it("default DOM of the unavailable-components repair list passes the shared pin with the button names exempted", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-disabled",
+      version: 6,
+      is_valid: false,
+      validation_errors: ["A saved component is unavailable."],
+      plugin_policy_findings: [
+        {
+          component_id: "legacy_output",
+          plugin_id: "sink:database",
+          reason_code: "credential_unavailable",
+          snapshot_fingerprint: "current-snapshot",
+        },
+      ],
+    });
+
+    const { container } = render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    await clickImport();
+
+    await screen.findByRole("region", { name: /unavailable saved components/i });
+    // The unavailable-components region only renders once `phase === "success"`
+    // (ImportYamlModal.tsx), which is mutually exclusive with the
+    // `phase !== "success"` block that mounts the textarea — by the time this
+    // region is present the textarea is already unmounted, so only the aria
+    // exemption is needed here (unlike the :486 pin, which scans the draft
+    // phase where the textarea is still mounted).
+    expectNoIdentifiersInDefaultDom(container, {
+      // SELF-only on the two buttons that carry the author-chosen component
+      // id in their names. The `.import-yaml-actions` SUBTREE form this
+      // replaces exempted the container and everything under it, so any
+      // aria-labelled control added inside later was silently exempt too —
+      // the growth channel defaultDomPins.ts's own docs warn about, and these
+      // two calls were the in-repo copy-paste source for the lazy form.
+      allowAriaLabelSelfSelectors: [".import-yaml-actions button"],
+    });
+  });
+
   // ── Error classes ────────────────────────────────────────────────────────
 
   it("maps a 422 to friendly copy naming the 256 KB limit", async () => {

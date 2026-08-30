@@ -559,3 +559,15 @@ class TestGuidedSessionProfileFields:
         d[removed_field] = 0 if removed_field.endswith("passes_used") else False
         with pytest.raises(InvariantError, match=r"GuidedSession\.from_dict"):
             GuidedSession.from_dict(d)
+
+
+def test_guided_session_from_dict_rejects_projection_only_custody_unavailable_key() -> None:
+    """``custody_unavailable`` is stamped by the degraded projection only
+    (elspeth-201903a286); a persisted record carrying it is a defect."""
+    from elspeth.web.composer.guided.errors import InvariantError
+    from elspeth.web.composer.guided.state_machine import GuidedSession
+
+    record = GuidedSession.initial().to_dict()
+    record["custody_unavailable"] = True
+    with pytest.raises(InvariantError, match="custody_unavailable"):
+        GuidedSession.from_dict(record)

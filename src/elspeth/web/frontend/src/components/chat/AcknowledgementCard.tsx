@@ -136,16 +136,33 @@ function stripUserTermAnnotation(draft: string): string {
   return draft.replace(/\s*\[user_term:[^\]]*\]\s*$/, "");
 }
 
+/**
+ * The card-title fragment for a caller that holds only a step LABEL. Keeps
+ * the pre-elspeth-... wording exactly; production callers pass a resolved
+ * `stepTitle` (humaniseStepTitle), which additionally disambiguates a removed
+ * step by its ghost id.
+ */
+function defaultStepTitle(stepLabel: string): string {
+  return `${stepLabel} step`;
+}
+
+/**
+ * `stepLabel` names the step MID-SENTENCE ("…columns from Summarise"), while
+ * `stepTitle` is the card-title fragment ("Summarise step", "Removed step
+ * (was Extract Invoice)"). Two registers of one name: the title slot has room
+ * to disambiguate a deleted step, the prose slot reads worse if it tries.
+ */
 function getCardPresentation(
   event: InterpretationEvent,
   stepLabel: string,
+  stepTitle: string,
 ): CardPresentation {
   const userTerm = event.user_term ?? "this term";
   const llmDraft = event.llm_draft ?? "";
   switch (event.kind) {
     case "llm_prompt_template":
       return {
-        title: `${stepLabel} step · prompt`,
+        title: `${stepTitle} · prompt`,
         line: "The LLM wrote the instruction for this step.",
         // Prompt cards use the two-stage View→Approve button, so the accept
         // action is named "Approve" (visible label and accessible name must
@@ -154,7 +171,7 @@ function getCardPresentation(
       };
     case "pipeline_decision":
       return {
-        title: `${stepLabel} step · decision`,
+        title: `${stepTitle} · decision`,
         line: (
           <span className="ack-card-decision">
             {stripUserTermAnnotation(llmDraft) || "(no decision recorded)"}
@@ -164,7 +181,7 @@ function getCardPresentation(
       };
     case "llm_model_choice":
       return {
-        title: `${stepLabel} step · model`,
+        title: `${stepTitle} · model`,
         line: (
           <>
             The LLM picked{" "}
@@ -221,8 +238,9 @@ function getCardPresentation(
 export function acknowledgementCardTitle(
   event: InterpretationEvent,
   stepLabel: string,
+  stepTitle: string = defaultStepTitle(stepLabel),
 ): string {
-  return getCardPresentation(event, stepLabel).title;
+  return getCardPresentation(event, stepLabel, stepTitle).title;
 }
 
 export interface AcknowledgementCardProps {
@@ -230,8 +248,15 @@ export interface AcknowledgementCardProps {
   event: InterpretationEvent;
   /** Owning session id; round-tripped to the store actions. */
   sessionId: string;
-  /** Humanised step label resolved from the composition (e.g. "Summarise"). */
+  /** Humanised step label resolved from the composition (e.g. "Summarise"),
+   *  used where the step is named mid-sentence. */
   stepLabel: string;
+  /** The card-title fragment resolved from the composition
+   *  (`humaniseStepTitle`, e.g. "Summarise step" or "Removed step (was
+   *  Extract Invoice)"). Optional: a caller holding only a label gets
+   *  `${stepLabel} step`, which is what every caller rendered before a
+   *  removed step needed disambiguating. */
+  stepTitle?: string;
   /**
    * The session's live composition state (threaded from the stack's existing
    * store subscription — the card itself stays store-free and testable).
@@ -269,6 +294,7 @@ export function AcknowledgementCard({
   event,
   sessionId,
   stepLabel,
+  stepTitle,
   compositionState = null,
   showAmend = false,
   onResolved,
@@ -346,7 +372,11 @@ export function AcknowledgementCard({
     }
   }, [mode]);
 
-  const presentation = getCardPresentation(event, stepLabel);
+  const presentation = getCardPresentation(
+    event,
+    stepLabel,
+    stepTitle ?? defaultStepTitle(stepLabel),
+  );
   const chooseMode = mode === "choose" || !showAmend;
 
   // Data-contract body: the demanded columns with per-field sample warnings,
@@ -602,6 +632,7 @@ export function AcknowledgementCard({
       className="ack-card"
       aria-labelledby={titleId}
       data-testid="acknowledgement-card"
+      data-affected-node-id={event.affected_node_id ?? undefined}
     >
       <h3 id={titleId} className="ack-card-title">
         {presentation.title}
@@ -709,9 +740,24 @@ export function AcknowledgementCard({
             disabled={resolveInFlight}
           />
           {amendIsTooLong && (
+            // Characters, not bytes, in the sentence the writer reads. The
+            // byte overage is an UPPER bound on the characters to remove
+            // (multibyte text shortens faster), so "about" is honest.
+            //
+            // The exact figures go in an .sr-only span, NOT in `title` alone.
+            // This <p> is not focusable, so a keyboard user gets no hover and
+            // no focus tooltip; and `title` on a role="status" element is a
+            // naming fallback, not part of the live-region announcement, so a
+            // screen-reader user would hear only the approximate count. The
+            // .sr-only span is inside the live region and is announced with it.
             <p className="ack-card-amend-cap-warning" role="status">
-              Amendment is {amendByteLength} bytes; the maximum is{" "}
-              {INTERPRETATION_AMENDMENT_MAX_BYTES} bytes.
+              Shorten this by about{" "}
+              {amendByteLength - INTERPRETATION_AMENDMENT_MAX_BYTES} characters
+              to fit the {INTERPRETATION_AMENDMENT_MAX_BYTES / 1024} KB limit.
+              <span className="sr-only">
+                {" "}({amendByteLength} bytes; the maximum is{" "}
+                {INTERPRETATION_AMENDMENT_MAX_BYTES} bytes.)
+              </span>
             </p>
           )}
           <div className="ack-card-amend-actions">

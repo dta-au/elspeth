@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { Button } from "@/components/ui";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { RecoveryDiff } from "./RecoveryDiff";
 import { RecoveryTranscript } from "./RecoveryTranscript";
 import type { CompositionState, ComposerRecoveryError } from "@/types/api";
@@ -44,6 +45,7 @@ export function RecoveryPanel({
   const dialogRef = useRef<HTMLDivElement>(null);
   const [needsConfirmation, setNeedsConfirmation] = useState(false);
   const [showTranscriptControls, setShowTranscriptControls] = useState(false);
+  const showAdvanced = useShowAdvanced();
   useFocusTrap(dialogRef, recoveryError !== null, ".recovery-panel-apply");
 
   if (recoveryError === null || activeSessionId === null) {
@@ -155,26 +157,33 @@ export function RecoveryPanel({
             currentState={currentState}
             recoveredState={recoveryError.partial_state}
           />
-          <div className="recovery-panel-transcript-controls">
-            <Button
-              type="button"
-              onClick={() =>
-                setShowTranscriptControls((currentlyShown) => !currentlyShown)
-              }
-            >
-              View raw transcript controls
-            </Button>
-            {showTranscriptControls ? (
-              <p>
-                Transcript rows are loaded from the audit view with tool rows
-                only; raw provider payloads are not requested.
-              </p>
-            ) : null}
-          </div>
-          <RecoveryTranscript
-            sessionId={activeSessionId}
-            failedTurn={failedTurn}
-          />
+          {/* Raw tool transcript is engineer-register (tool names, call ids,
+              raw responses); RecoveryDiff + the two actions above/below are
+              the audit-required summary and stay (elspeth-f1394307e3). */}
+          {showAdvanced && (
+            <>
+              <div className="recovery-panel-transcript-controls">
+                <Button
+                  type="button"
+                  onClick={() =>
+                    setShowTranscriptControls((currentlyShown) => !currentlyShown)
+                  }
+                >
+                  View raw transcript controls
+                </Button>
+                {showTranscriptControls ? (
+                  <p>
+                    Transcript rows are loaded from the audit view with tool rows
+                    only; raw provider payloads are not requested.
+                  </p>
+                ) : null}
+              </div>
+              <RecoveryTranscript
+                sessionId={activeSessionId}
+                failedTurn={failedTurn}
+              />
+            </>
+          )}
         </div>
 
         <footer className="recovery-panel-actions">

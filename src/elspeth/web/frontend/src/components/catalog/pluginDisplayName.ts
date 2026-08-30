@@ -25,6 +25,7 @@ const ACRONYMS: ReadonlySet<string> = new Set([
   "api",
   "csv",
   "db",
+  "gpt",
   "http",
   "https",
   "id",

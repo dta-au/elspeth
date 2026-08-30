@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace as _replace_dataclass
 
-from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE
+from elspeth.contracts.errors import GuidedCustodyIntegrityError
+from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerResult
 from elspeth.web.sessions.titles import is_default_session_title
 
 from ._helpers import (
@@ -24,6 +25,7 @@ from ._helpers import (
     CompositionStateData,
     CompositionStateResponse,
     Depends,
+    FailedTurnMetadata,
     GuidedSession,
     HTTPException,
     InvariantError,
@@ -44,6 +46,7 @@ from ._helpers import (
     _composer_conversation_tool_or_llm_audit_messages,
     _composer_progress_sink,
     _ComposerRequestTerminalStatus,
+    _failed_turn_response_body,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
     _handle_convergence_error,
@@ -237,6 +240,9 @@ def register_message_routes(router: APIRouter) -> None:
             # reached. Assigned below only when first-message conditions
             # hold.
             auto_title_task: asyncio.Task[None] | None = None
+            # Set once the compose loop returns; the audit-integrity arm below
+            # needs it to describe the turn whose persistence was refused.
+            _compose_result: ComposerResult | None = None
             try:
                 # 3. Transcript snapshot guard + chat history.
                 # ``records`` is the same-transaction transcript returned by
@@ -621,6 +627,7 @@ def register_message_routes(router: APIRouter) -> None:
                         status_code=502,
                         detail={"error_type": "composer_error", "detail": str(exc)},
                     ) from exc
+                _compose_result = result
 
                 # 5. Save state if version changed — post-compose provenance.
                 #
@@ -891,6 +898,38 @@ def register_message_routes(router: APIRouter) -> None:
                 )
                 terminal_status = "completed"
                 return response
+            except GuidedCustodyIntegrityError as exc:
+                # The pre-persist custody gate refused the post-compose tip
+                # (elspeth-4c442aaaa8): the user row is committed and the tip
+                # did not advance, so this is a failed turn — describe it from
+                # the compose result rather than let the app-level handler emit
+                # the no-metadata 500. Custody-only by design: every gate raise
+                # is Guided*, and any other AuditIntegrityError keeps the
+                # app-level handler surface with its own diagnostics.
+                if exc.failed_turn is None and _compose_result is not None:
+                    exc.failed_turn = FailedTurnMetadata(
+                        assistant_message_id=_compose_result.persisted_assistant_message_id,
+                        tool_calls_attempted=len(_compose_result.tool_invocations),
+                        tool_responses_persisted=None if _compose_result.persisted_tool_call_turn else 0,
+                    )
+                if exc.failed_turn is None or _compose_result is None:
+                    raise
+                slog.error(
+                    "http_audit_integrity_error",
+                    session_id=str(session_id),
+                    user_id=user.user_id,
+                    exc_class=type(exc).__name__,
+                    message=str(exc),
+                    site="send_message",
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error_type": "audit_integrity_error",
+                        "detail": "ELSPETH stopped before replying because it could not verify this session's audit trail.",
+                        "failed_turn": await _failed_turn_response_body(service, session.id, exc.failed_turn),
+                    },
+                ) from exc
             except InvariantError as exc:
                 # Same B1-sanitization rationale as the /guided/respond
                 # transition and settlement handlers: server-invariant

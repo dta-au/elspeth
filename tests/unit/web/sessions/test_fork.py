@@ -9,7 +9,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import structlog
@@ -2462,6 +2462,106 @@ class TestForkEndpoint:
         assert stable_id not in reloaded_guided.pending_source_intents
         assert reloaded_guided.reviewed_sources[stable_id].options["blob_ref"] == child_blob_id
         assert str(parent_blob.id) not in str(reloaded_guided.to_dict())
+
+    @pytest.mark.asyncio
+    async def test_explicit_blob_ref_reviewed_source_fork_child_projects_redacted(self, tmp_path) -> None:
+        """A fork rewrites BOTH the reviewed snapshot and the live source to the
+        child blob's private path plus ``blob_ref``. The projection must correlate
+        that binding on the persisted values and serve the child with the path
+        masked (elspeth-75d320fb25: correlating on the generic-redacted copy
+        rejected this consistent shape as a custody mismatch)."""
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
+        from elspeth.web.composer.guided.resolved import SourceResolved
+        from elspeth.web.composer.guided.state_machine import GuidedSession, TurnRecord
+        from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
+        from elspeth.web.dependencies import create_catalog_service
+        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+        from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+
+        app, service, blob_service = _make_fork_app(tmp_path)
+        catalog = create_catalog_service()
+        app.state.catalog_service = catalog
+        app.state.operator_profile_registry = MagicMock(spec=OperatorProfileRegistry)
+        app.state.plugin_snapshot_factory = lambda _user: PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        parent = await service.create_session("alice", "Parent", "local")
+        root = await service.add_message(parent.id, "user", "root", writer_principal="route_user_message")
+        parent_blob = await blob_service.create_blob(parent.id, "orders.csv", b"id,name\n1,Ada\n", "text/csv")
+        stable_id = str(uuid.uuid4())
+        options = {"path": parent_blob.storage_path, "blob_ref": str(parent_blob.id), "schema": {"mode": "observed"}}
+        guided = GuidedSession(
+            step=GuidedStep.STEP_2_SINK,
+            history=(
+                TurnRecord(
+                    step=GuidedStep.STEP_2_SINK,
+                    turn_type=TurnType.INSPECT_AND_CONFIRM,
+                    payload_hash="a" * 64,
+                    response_hash=None,
+                    emitter="server",
+                ),
+            ),
+            source_order=(stable_id,),
+            reviewed_sources={
+                stable_id: SourceResolved(
+                    name="orders",
+                    plugin="csv",
+                    options=options,
+                    observed_columns=("id", "name"),
+                    sample_rows=({"id": 1, "name": "Ada"},),
+                    on_validation_failure="discard",
+                )
+            },
+            root_intent_message_id=str(root.id),
+        )
+        state_data = CompositionStateData(
+            sources={"orders": {"plugin": "csv", "on_success": "out", "options": dict(options), "on_validation_failure": "discard"}},
+            nodes=[],
+            edges=[],
+            outputs=[],
+            metadata_={"name": "Guided", "description": ""},
+            is_valid=True,
+            composer_meta={"guided_session": guided.to_dict()},
+        )
+        state = await service.save_composition_state(parent.id, state_data, provenance="session_seed")
+        await _complete_guided_start_authority(
+            service,
+            session_id=parent.id,
+            root_message=root,
+            state=state,
+            state_data=state_data,
+        )
+        fork_message = await service.add_message(
+            parent.id,
+            "user",
+            "fork",
+            composition_state_id=state.id,
+            writer_principal="route_user_message",
+        )
+        client = TestClient(app)
+        response = client.post(
+            f"/api/sessions/{parent.id}/fork",
+            json={
+                "operation_id": str(uuid.uuid4()),
+                "from_message_id": str(fork_message.id),
+                "new_message_content": "edited",
+            },
+        )
+        assert response.status_code == 201
+        child_id = uuid.UUID(response.json()["session_id"])
+        child_state = await service.get_current_state(child_id)
+        assert child_state is not None
+        child_options = deep_thaw(child_state.sources)["orders"]["options"]
+        child_reviewed = deep_thaw(child_state.composer_meta)["guided_session"]["reviewed_sources"][stable_id]["options"]
+        assert child_options["blob_ref"] == child_reviewed["blob_ref"] != str(parent_blob.id)
+        assert child_options["path"] == child_reviewed["path"] != parent_blob.storage_path
+
+        projected = client.get(f"/api/sessions/{child_id}/state")
+        assert projected.status_code == 200, projected.text
+        body = projected.json()
+        assert body["sources"]["orders"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+        assert body["composer_meta"]["guided_session"]["reviewed_sources"][stable_id]["options"]["path"] == (REDACTED_BLOB_SOURCE_PATH)
+        assert child_options["path"] not in projected.text
+        assert parent_blob.storage_path not in projected.text
 
     @pytest.mark.asyncio
     async def test_fork_endpoint_creates_session(self, tmp_path) -> None:

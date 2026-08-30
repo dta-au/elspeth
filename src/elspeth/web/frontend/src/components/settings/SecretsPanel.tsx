@@ -17,6 +17,15 @@ interface SecretFormErrorTargets {
   value: boolean;
 }
 
+/** Reader-register names for the closed scope enum; the raw scope stays in
+ *  `title` (elspeth-d74ab492dd). Exhaustive by type: adding a scope without a
+ *  name is a compile error. */
+const SCOPE_LABELS: Record<SecretInventoryItem["scope"], string> = {
+  user: "Yours",
+  server: "Deployment",
+  org: "Organisation",
+};
+
 function ScopeBadge({ scope }: { scope: SecretInventoryItem["scope"] }) {
   const colors: Record<SecretInventoryItem["scope"], { bg: string; text: string }> = {
     user: { bg: "var(--color-accent-muted)", text: "var(--color-accent)" },
@@ -28,8 +37,9 @@ function ScopeBadge({ scope }: { scope: SecretInventoryItem["scope"] }) {
     <span
       className="secrets-scope-badge"
       style={{ backgroundColor: bg, color: text }}
+      title={scope}
     >
-      {scope}
+      {SCOPE_LABELS[scope] ?? scope}
     </span>
   );
 }

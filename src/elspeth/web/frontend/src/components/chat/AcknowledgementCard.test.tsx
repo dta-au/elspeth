@@ -520,7 +520,10 @@ describe("AcknowledgementCard — amend", () => {
       (screen.getByRole("button", { name: "Submit" }) as HTMLButtonElement)
         .disabled,
     ).toBe(true);
-    expect(screen.getByText(/8192 bytes/)).toBeTruthy();
+    const warning = screen.getByRole("status");
+    expect(warning).toHaveTextContent("Shorten this by about 8 characters to fit the 8 KB limit.");
+    // Exact figures reachable by every audience, not hover-only.
+    expect(warning).toHaveTextContent("(8200 bytes; the maximum is 8192 bytes.)");
     expect(api.resolveInterpretation).not.toHaveBeenCalled();
   });
 });

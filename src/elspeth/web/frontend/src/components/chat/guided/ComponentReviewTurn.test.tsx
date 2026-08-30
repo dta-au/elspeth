@@ -40,8 +40,8 @@ describe("ComponentReviewTurn", () => {
     render(<ComponentReviewTurn payload={SOURCE_REVIEW} onSubmit={onSubmit} />);
 
     expect(screen.getByRole("heading", { name: "Review sources" })).toBeVisible();
-    expect(screen.getByRole("listitem", { name: "customers, csv, reviewed" })).toBeVisible();
-    expect(screen.getByRole("listitem", { name: "orders, json, reviewed" })).toBeVisible();
+    expect(screen.getByRole("listitem", { name: "customers, CSV" })).toBeVisible();
+    expect(screen.getByRole("listitem", { name: "orders, JSON" })).toBeVisible();
 
     await user.click(screen.getByRole("button", { name: "Edit orders" }));
     await user.click(screen.getByRole("button", { name: "Remove customers" }));
@@ -86,8 +86,8 @@ describe("ComponentReviewTurn", () => {
     );
     // No optimistic reorder: the server response remains the rendered authority.
     expect(screen.getAllByRole("listitem").map((item) => item.getAttribute("aria-label"))).toEqual([
-      "customers, csv, reviewed",
-      "orders, json, reviewed",
+      "customers, CSV",
+      "orders, JSON",
     ]);
 
     rerender(
@@ -97,8 +97,8 @@ describe("ComponentReviewTurn", () => {
       />,
     );
     expect(screen.getAllByRole("listitem").map((item) => item.getAttribute("aria-label"))).toEqual([
-      "orders, json, reviewed",
-      "customers, csv, reviewed",
+      "orders, JSON",
+      "customers, CSV",
     ]);
     await user.click(screen.getByRole("button", { name: "Edit orders" }));
     expect(onSubmit).toHaveBeenLastCalledWith(

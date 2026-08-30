@@ -8,7 +8,9 @@ import { useAuditReadinessStore, getInitialState } from "../../stores/auditReadi
 import { useExecutionStore } from "../../stores/executionStore";
 import { useInlineSourceStore } from "@/stores/inlineSourceStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
 import { resetStore } from "@/test/store-helpers";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import * as api from "../../api/auditReadiness";
 import type { AuditReadinessSnapshot, ValidationResult } from "../../types/api";
 import type { InterpretationEvent } from "@/types/interpretation";
@@ -163,6 +165,7 @@ describe("AuditReadinessPanel", () => {
     useExecutionStore.setState({ validationResult: null } as never);
     resetStore(useInlineSourceStore);
     resetStore(useInterpretationEventsStore);
+    resetStore(usePreferencesStore);
     vi.clearAllMocks();
   });
 
@@ -376,6 +379,7 @@ describe("AuditReadinessPanel", () => {
   });
 
   it("replaces cached ready content with a retryable error after a forced refresh identity failure", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useAuditReadinessStore.setState({
       snapshotsBySession: { [SESSION_ID]: allGreenSnapshot(1) },
     });
@@ -492,6 +496,7 @@ describe("AuditReadinessPanel", () => {
   });
 
   it("force-refreshes the current composition version when Refresh is clicked", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useAuditReadinessStore.setState({
       snapshotsBySession: { [SESSION_ID]: snapshotWithProvenanceWarning(1) },
     });
@@ -515,6 +520,7 @@ describe("AuditReadinessPanel", () => {
   });
 
   it("projects a forced-refresh validation row into the execution validation state", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useAuditReadinessStore.setState({
       snapshotsBySession: { [SESSION_ID]: allGreenSnapshot(1) },
     });
@@ -555,6 +561,7 @@ describe("AuditReadinessPanel", () => {
   });
 
   it("does not project a forced refresh after the active session changes", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useAuditReadinessStore.setState({
       snapshotsBySession: {
         [SESSION_ID]: allGreenSnapshot(1),
@@ -1476,5 +1483,35 @@ describe("AuditReadinessPanel", () => {
       "audit-readiness-row-llm-interpretations",
     );
     expect(row.textContent).toMatch(/not yet surfaced/i);
+  });
+
+  it("hides Refresh with the flag off — the panel already refetches per composition version — and keeps Explain (elspeth-f1394307e3)", async () => {
+    useAuditReadinessStore.setState({ snapshotsBySession: { [SESSION_ID]: allGreenSnapshot(1) } });
+    useSessionStore.setState({ activeSessionId: SESSION_ID, compositionState: makeComposition(1) });
+    const user = userEvent.setup();
+    const { container } = render(<AuditReadinessPanel />);
+    await user.click(screen.getByRole("button", { name: /Audit ready/i }));
+    expect(screen.queryByRole("button", { name: "Refresh audit check now" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Explain what this pipeline will record" })).toBeInTheDocument();
+    expectNoIdentifiersInDefaultDom(container);
+  });
+
+  it("still refetches on a composition-version change with the flag off (elspeth-f1394307e3 cadence guarantee)", async () => {
+    // The ticket's acceptance has TWO halves: "each control absent from the
+    // default DOM and present with the flag; AND no change to the
+    // audit-readiness fetch cadence". Hiding Refresh is only honest because
+    // the panel refetches itself, so that refetch IS the plain summary
+    // standing in for the hidden control — and an unpinned plain summary is
+    // exactly what the epic doctrine warns about. This is the pin.
+    vi.mocked(api.fetchAuditReadiness)
+      .mockResolvedValueOnce(allGreenSnapshot(1))
+      .mockResolvedValueOnce(allGreenSnapshot(2));
+    useSessionStore.setState({ activeSessionId: SESSION_ID, compositionState: makeComposition(1) });
+    render(<AuditReadinessPanel />);
+    await waitFor(() => expect(vi.mocked(api.fetchAuditReadiness)).toHaveBeenCalledTimes(1));
+    act(() => {
+      useSessionStore.setState({ compositionState: makeComposition(2) });
+    });
+    await waitFor(() => expect(vi.mocked(api.fetchAuditReadiness)).toHaveBeenCalledTimes(2));
   });
 });

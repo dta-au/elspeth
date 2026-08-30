@@ -7,6 +7,9 @@ import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Button, Input } from "@/components/ui";
 import { sortedSourceEntries, sourceComponentId } from "@/utils/compositionState";
+import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
+import { modelDisplayName } from "@/components/chat/modelDisplayName";
+import { componentPhrase } from "@/components/workspace/specRouting";
 import type {
   CompositionState,
   NodeSpec,
@@ -175,112 +178,231 @@ function catalogFlagsLlmSource(
  * `llm` identity remains a bounded fallback while the catalog is loading,
  * failed, stale, or missing that entry, so its authored prompt is never
  * silently omitted from consent.
+ *
+ * Returns reader-register lines with the identifier-register sentence beside
+ * each, surfaced via `aria-describedby` (never `title` alone — see below).
  * Exported for tests.
  */
+export interface RunEgressLine {
+  /** Reader register: step labels and plugin display names. */
+  text: string;
+  /** Identifier register — the exact sentence this dialog showed before
+   *  Wave 3, unchanged so every component and plugin is still named by id
+   *  (R2-F7). Surfaced via an `.sr-only` span wired with `aria-describedby`
+   *  on the line, NOT via `title` alone — `title` is not reliably announced
+   *  and an <li> is not focusable, so it is a mouse convenience beside the
+   *  span, never the only route (see the `.sr-only` block below). */
+  identifiers: string;
+}
+
+/**
+ * One egress item — a component, a plugin, a model — in BOTH registers at
+ * once. The registers travel together from the moment the value is derived,
+ * so a sentence cannot exist in one register and not the other.
+ *
+ * This replaced a dual traversal: `egressSentences(register, …)` was called
+ * twice and the two arrays zipped, with a runtime `throw` on a length
+ * mismatch guarding the property "register substitutes label TEXT, never
+ * gates emission". The whole function body was `register ===` conditionals,
+ * so the edit that breaks that property — a clarifying sentence added under
+ * `if (register === "reader")` — is exactly the edit the shape invited, and
+ * its failure landed as an exception on the run-confirm dialog, i.e. on the
+ * product's consent surface (systems I-3). Here the property holds by
+ * construction: `emit` decides once whether a line exists, and every
+ * sentence template below is written once and applied to both registers.
+ */
+interface EgressPhrase {
+  /** Reader register: step labels, plugin display names, phrased models. */
+  reader: string;
+  /** Identifier register: the exact wire form — component id, plugin id,
+   *  model id. */
+  identifier: string;
+}
+
+/** A value that is deliberately the SAME in both registers. */
+function bothRegisters(text: string): EgressPhrase {
+  return { reader: text, identifier: text };
+}
+
+/** "<component> (<qualifier>)" — the shape every egress item takes. */
+function qualified(component: EgressPhrase, qualifier: EgressPhrase): EgressPhrase {
+  return {
+    reader: `${component.reader} (${qualifier.reader})`,
+    identifier: `${component.identifier} (${qualifier.identifier})`,
+  };
+}
+
+/** Prefix both registers with a fixed word ("model "). */
+function prefixed(prefix: string, phrase: EgressPhrase): EgressPhrase {
+  return {
+    reader: `${prefix}${phrase.reader}`,
+    identifier: `${prefix}${phrase.identifier}`,
+  };
+}
+
+/**
+ * Push one disclosure line, or none. `sentence` is written ONCE and applied
+ * to each register's joined item list, and the emptiness test is evaluated
+ * once for both — the two properties the deleted throw was checking.
+ */
+function emit(
+  lines: RunEgressLine[],
+  items: readonly EgressPhrase[],
+  sentence: (list: string) => string,
+): void {
+  if (items.length === 0) return;
+  lines.push({
+    text: sentence(items.map((item) => item.reader).join(", ")),
+    identifiers: sentence(items.map((item) => item.identifier).join(", ")),
+  });
+}
+
 export function buildRunEgressSummary(
   compositionState: CompositionState | null,
   catalogTransforms: readonly PluginSummary[] | null = null,
   catalogLoadFailed = false,
   catalogSources: readonly PluginSummary[] | null = null,
   catalogIsLoading = false,
-): string[] {
+): RunEgressLine[] {
   if (!compositionState) return [];
-  const lines: string[] = [];
+  const state = compositionState;
+  const lines: RunEgressLine[] = [];
 
-  const sourceEntries = sortedSourceEntries(compositionState);
+  /** A source, node or output, by its COMPONENT id — which is exactly the
+   *  identifier register, and exactly the vocabulary `componentPhrase`
+   *  accepts (`sourceComponentId(name)` for a source, the node id, the output
+   *  name). The reader half goes through the SHARED description-first ladder
+   *  rather than `stepLabelForNodeId` alone: that ladder consults a
+   *  description for nodes only, so a source described "Quarterly invoices
+   *  from finance" read that way on the Spec tab and in validation prose but
+   *  "Intake (CSV)" here — on the surface where recognition matters most
+   *  (ux M-4). Same concept, same phrase, every surface. */
+  const component = (id: string): EgressPhrase => ({
+    reader: componentPhrase(state, id),
+    identifier: id,
+  });
+  const plugin = (pluginId: string): EgressPhrase => ({
+    reader: pluginDisplayName(pluginId),
+    identifier: pluginId,
+  });
+  const model = (modelId: string): EgressPhrase => {
+    const cut = modelId.lastIndexOf("/");
+    // The provider path IS the egress destination on this surface. Phrase the
+    // model, keep the route (elspeth-59631ec7f7 / R2-F7). ModelChip keeps the
+    // leaf-only form; a header chip is not a consent surface.
+    return {
+      reader:
+        cut === -1
+          ? modelDisplayName(modelId)
+          : `${modelDisplayName(modelId)} via ${modelId.slice(0, cut)}`,
+      identifier: modelId,
+    };
+  };
+
+  const sourceEntries = sortedSourceEntries(state);
   const catalogCurrent =
     catalogSources !== null && !catalogLoadFailed && !catalogIsLoading;
   const llmSourceEntries = sourceEntries.filter(([, source]) =>
     catalogFlagsLlmSource(source, catalogSources, catalogCurrent),
   );
-  const ordinarySources = sourceEntries
-    .filter(([, source]) =>
-      !catalogFlagsLlmSource(source, catalogSources, catalogCurrent),
-    )
-    .map(
-      ([sourceName, source]) =>
-        `${sourceComponentId(sourceName)} (${source.plugin})`,
-    );
-  if (ordinarySources.length > 0) {
-    lines.push(`Reads source data: ${ordinarySources.join(", ")}.`);
-  }
 
-  const llmSources = llmSourceEntries.map(
-    ([sourceName, source]) =>
-      `${sourceComponentId(sourceName)} (${llmSourceBindingLabel(source)})`,
+  emit(
+    lines,
+    sourceEntries
+      .filter(([, source]) =>
+        !catalogFlagsLlmSource(source, catalogSources, catalogCurrent),
+      )
+      .map(([sourceName, source]) =>
+        qualified(component(sourceComponentId(sourceName)), plugin(source.plugin)),
+      ),
+    (list) => `Reads source data: ${list}.`,
   );
-  if (llmSources.length > 0) {
-    lines.push(
-      `Sends one authored prompt to the configured LLM: ${llmSources.join(", ")}.`,
-    );
-  }
+
+  // `llmSourceBindingLabel` is the same in BOTH registers by design: it
+  // establishes egress SAFETY (provider, model, endpoint and credential
+  // bindings stay operator-private), and the authored profile alias is the
+  // one binding the user may see. Phrasing it would title-case an
+  // operator-chosen token into something that looks like a product name.
+  emit(
+    lines,
+    llmSourceEntries.map(([sourceName, source]) =>
+      qualified(
+        component(sourceComponentId(sourceName)),
+        bothRegisters(llmSourceBindingLabel(source)),
+      ),
+    ),
+    (list) => `Sends one authored prompt to the configured LLM: ${list}.`,
+  );
 
   // `?.` on options: display-only derivation that must tolerate partially
   // formed compositions mid-authoring rather than crash the Run button.
-  const llmNodes = compositionState.nodes
-    .filter(isLlmNode)
-    .map((node) =>
-      typeof node.options?.model === "string"
-        ? `${node.id} (model ${node.options.model})`
-        : node.id,
-    );
-  if (llmNodes.length > 0) {
-    lines.push(`Sends rows to the configured LLM: ${llmNodes.join(", ")}.`);
-  }
+  emit(
+    lines,
+    state.nodes
+      .filter(isLlmNode)
+      .map((node) =>
+        typeof node.options?.model === "string"
+          ? qualified(component(node.id), prefixed("model ", model(node.options.model)))
+          : component(node.id),
+      ),
+    (list) => `Sends rows to the configured LLM: ${list}.`,
+  );
 
-  let networkNodes: string[];
-  let unverifiableNodes: string[] = [];
+  const withPlugin = (node: NodeSpec): EgressPhrase =>
+    qualified(component(node.id), plugin(node.plugin as string));
+
+  let networkNodes: EgressPhrase[];
+  let unverifiableNodes: EgressPhrase[] = [];
 
   if (catalogTransforms !== null) {
     // Catalog loaded — audit_characteristics is authoritative.
-    networkNodes = compositionState.nodes
+    networkNodes = state.nodes
       .filter(
         (node) =>
           node.plugin !== null &&
           catalogFlagsExternalCall(node.plugin, catalogTransforms),
       )
-      .map((node) => `${node.id} (${node.plugin})`);
+      .map(withPlugin);
   } else if (catalogLoadFailed) {
     // Catalog failed to load — the hardcoded set still yields a confident
     // (if incomplete) line, but every other configured, non-LLM transform
     // is genuinely unverifiable: silently omitting it here would reproduce
     // R2-F7's under-disclosure, so it is named explicitly instead.
-    const nonLlmTransforms = compositionState.nodes.filter(
+    const nonLlmTransforms = state.nodes.filter(
       (node) => node.plugin !== null && !isLlmNode(node),
     );
     networkNodes = nonLlmTransforms
       .filter((node) => NETWORK_FETCH_PLUGINS.has(node.plugin as string))
-      .map((node) => `${node.id} (${node.plugin})`);
+      .map(withPlugin);
     unverifiableNodes = nonLlmTransforms
       .filter((node) => !NETWORK_FETCH_PLUGINS.has(node.plugin as string))
-      .map((node) => `${node.id} (${node.plugin})`);
+      .map(withPlugin);
   } else {
     // Not loaded yet (transient) — same fallback behaviour as before
     // catalog-driven classification existed.
-    networkNodes = compositionState.nodes
+    networkNodes = state.nodes
       .filter(
-        (node) =>
-          node.plugin !== null && NETWORK_FETCH_PLUGINS.has(node.plugin),
+        (node) => node.plugin !== null && NETWORK_FETCH_PLUGINS.has(node.plugin),
       )
-      .map((node) => `${node.id} (${node.plugin})`);
+      .map(withPlugin);
   }
 
-  if (networkNodes.length > 0) {
-    lines.push(`Fetches over the network: ${networkNodes.join(", ")}.`);
-  }
-  if (unverifiableNodes.length > 0) {
-    lines.push(
+  emit(lines, networkNodes, (list) => `Fetches over the network: ${list}.`);
+  emit(
+    lines,
+    unverifiableNodes,
+    (list) =>
       `Plugin catalog unavailable — external-service effects could not be ` +
-        `fully enumerated for: ${unverifiableNodes.join(", ")}.`,
-    );
-  }
-
-  const outputs = compositionState.outputs.map(
-    (output) => `${output.name} (${output.plugin})`,
+      `fully enumerated for: ${list}.`,
   );
-  if (outputs.length > 0) {
-    lines.push(`Writes output: ${outputs.join(", ")}.`);
-  }
+
+  emit(
+    lines,
+    state.outputs.map((output) =>
+      qualified(component(output.name), plugin(output.plugin)),
+    ),
+    (list) => `Writes output: ${list}.`,
+  );
 
   return lines;
 }
@@ -694,7 +816,35 @@ export function ExecuteButton(): JSX.Element | null {
           {egressLines.length > 0 && (
             <ul className="run-disclosure-summary">
               {egressLines.map((line) => (
-                <li key={line}>{line}</li>
+                <li key={line.identifiers} title={line.identifiers}>
+                  {line.text}
+                  {/* The identifier register, reachable by AT and by
+                      keyboard users: it is in-flow content of this <li>, so
+                      it is already part of the list item's accessible
+                      content — no `aria-describedby` needed (that would
+                      make AT announce it a second time as a description).
+                      `title` is kept for sighted mouse hover; it is a
+                      convenience, never the only route (the run-button
+                      comment above records why).
+
+                      The "(exact identifiers: …)" FRAMING is load-bearing,
+                      not decoration. Unframed, the <li>'s accessible content
+                      was "Reads source data: Source (CSV). Reads source data:
+                      source (csv)." — and case and parentheses do not survive
+                      speech, so a screen-reader user heard the same sentence
+                      twice, back to back, on every line of a consent dialog.
+                      Four lines became eight sentences that present as a
+                      stutter or a rendering bug. One phrase turns apparent
+                      duplication into an intelligible disclosure and keeps
+                      every sentence (the R2-F7 obligation).
+
+                      Written as a template literal, not JSX text: JSX strips
+                      whitespace around a line break, so a leading space
+                      authored as markup would not survive Prettier rewrapping
+                      the element. The space matters — without it speech runs
+                      the reader sentence into the disclosure. */}
+                  <span className="sr-only">{` (exact identifiers: ${line.identifiers})`}</span>
+                </li>
               ))}
             </ul>
           )}

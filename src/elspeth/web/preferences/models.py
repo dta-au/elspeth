@@ -26,10 +26,25 @@ The Literal ``ComposerMode`` is the single source of truth for the
 permitted-values set. It is paired with:
   - the DB-level CHECK constraint on ``user_preferences_table``
   - the Tier-1 read guard in ``PreferencesService._row_to_prefs``
+  - the ``MODES`` Record in the frontend's
+    ``api/preferencesDecoder.ts``, which is keyed by the ``ComposerMode``
+    TS union so a frontend-side addition is a compile error there
 
-Extending the set requires updating all three call sites in lockstep —
-the Literal here, the CHECK in ``sessions/models.py``, and the service
-read guard.
+Extending the set requires updating all four call sites in lockstep —
+the Literal here, the CHECK in ``sessions/models.py``, the service read
+guard, and the decoder's Record. Only the first three are Python; the
+decoder is the cross-language one, and adding a value here without it
+makes the decoder reject a now-valid payload.
+
+Separately from the permitted-VALUES covenant above, the FIELD SET of
+``ComposerPreferences`` is itself a closed cross-language contract. The
+decoder's ``KEYS`` tuple rejects a missing key and an unexpected key
+alike, so adding or removing a field here without editing ``KEYS``
+breaks every preferences GET at runtime while CI stays green. That axis
+is gated executably by
+``tests/unit/web/composer/test_preferences_decoder_parity.py`` rather
+than by this comment, so a field change fails pytest instead of failing
+at the user.
 """
 
 from datetime import datetime
@@ -44,9 +59,12 @@ ComposerMode = Literal["guided", "freeform"]
 # Welcome bookend is never persisted (nothing has started; ``None`` is the
 # no-in-progress-tutorial state). Extending this set requires updating the
 # Literal here, the ``ck_user_preferences_tutorial_stage`` CHECK in
-# ``sessions/models.py``, and the Tier-1 read guard in
-# ``PreferencesService._row_to_prefs`` in lockstep — same rule as
-# ``ComposerMode`` above.
+# ``sessions/models.py``, the Tier-1 read guard in
+# ``PreferencesService._row_to_prefs``, and the ``STAGES`` Record in the
+# frontend's ``api/preferencesDecoder.ts`` in lockstep — same rule, and the
+# same four sites, as ``ComposerMode`` above. The decoder fails closed on an
+# unlisted stage, so adding a value here without it makes the frontend reject
+# a payload the server considers valid.
 TutorialStage = Literal["guided", "run", "audit", "graduation"]
 
 

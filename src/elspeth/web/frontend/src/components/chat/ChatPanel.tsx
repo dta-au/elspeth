@@ -57,7 +57,7 @@ import {
   usePendingAcknowledgements,
 } from "./AcknowledgementStack";
 import { acknowledgementCardTitle } from "./AcknowledgementCard";
-import { humaniseStepLabel } from "./interpretationStepLabel";
+import { humaniseStepLabel, humaniseStepTitle } from "./interpretationStepLabel";
 import {
   COMPOSE_CONNECTING_MESSAGE,
   COMPOSE_UNAVAILABLE_MESSAGE,
@@ -782,6 +782,7 @@ export function ChatPanel({
         label: acknowledgementCardTitle(
           event,
           humaniseStepLabel(compositionState, event.affected_node_id),
+          humaniseStepTitle(compositionState, event.affected_node_id),
         ),
       })),
     [pendingAcknowledgementEvents, compositionState],

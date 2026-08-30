@@ -1,5 +1,6 @@
 import { useId } from "react";
 
+import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
 import { Button } from "@/components/ui";
 import type {
   ComponentReviewPayload,
@@ -76,12 +77,16 @@ export function ComponentReviewTurn({
             <li
               key={item.stable_id}
               className="guided-component-review-item"
-              aria-label={`${item.name}, ${item.plugin}, reviewed`}
+              // `listitem` supports naming from author, so aria-label is
+              // permitted here (unlike the role-less span ModelChip carried).
+              aria-label={`${item.name}, ${pluginDisplayName(item.plugin)}`}
             >
               <div className="guided-component-review-summary">
                 <strong>{item.name}</strong>
-                <span>{item.plugin}</span>
-                <span>{item.status}</span>
+                {/* `item.status` is closed to "reviewed" (types/guided.ts), so
+                    the word carried no information; the list heading "Review
+                    sources" already says what these rows are. */}
+                <span title={item.plugin}>{pluginDisplayName(item.plugin)}</span>
               </div>
               <div className="guided-component-review-item-actions">
                 {allowed.has("edit") && (

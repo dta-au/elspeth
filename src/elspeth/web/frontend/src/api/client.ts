@@ -59,6 +59,7 @@ import {
   decodeGuidedRespondResponse,
   decodeGuidedStartOperationReconciliation,
 } from "./guidedDecoder";
+import { decodeUserComposerPreferences } from "./preferencesDecoder";
 import type {
   InterpretationEvent,
   InterpretationOptOutResponse,
@@ -755,7 +756,7 @@ export async function fetchUserComposerPreferences(): Promise<UserComposerPrefer
   const response = await fetch("/api/composer-preferences", {
     headers: authHeaders(),
   });
-  return parseResponse<UserComposerPreferencesPayload>(response);
+  return decodeUserComposerPreferences(await parseResponse<unknown>(response));
 }
 
 /** Partial-update the user's account-level composer preferences. */
@@ -767,7 +768,7 @@ export async function updateUserComposerPreferences(
     headers: authHeaders("application/json"),
     body: JSON.stringify(payload),
   });
-  return parseResponse<UserComposerPreferencesPayload>(response);
+  return decodeUserComposerPreferences(await parseResponse<unknown>(response));
 }
 
 /** List composition proposals for a session. */

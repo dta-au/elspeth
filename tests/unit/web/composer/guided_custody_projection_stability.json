@@ -1,0 +1,1428 @@
+{
+  "base_commit": "7cd2fc6db",
+  "cases": {
+    "case_c_reauthored_plain_path[active]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f"
+              },
+              "plugin": "csv"
+            }
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f"
+          },
+          "plugin": "csv"
+        }
+      }
+    },
+    "case_c_reauthored_plain_path[completed]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f"
+              },
+              "plugin": "csv"
+            }
+          },
+          "terminal": {
+            "kind": "completed",
+            "pipeline_yaml": "sources: {}\n",
+            "reason": null
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f"
+          },
+          "plugin": "csv"
+        }
+      }
+    },
+    "case_c_reauthored_plain_path[exited]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f"
+              },
+              "plugin": "csv"
+            }
+          },
+          "terminal": {
+            "kind": "exited_to_freeform",
+            "pipeline_yaml": null,
+            "reason": "user_pressed_exit"
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f"
+          },
+          "plugin": "csv"
+        }
+      }
+    },
+    "defect_fork_explicit_blob_ref_projection_order[active]": {
+      "exception": "GuidedCustodyIntegrityError",
+      "message": "guided blob source mapping is inconsistent",
+      "outcome": "raised"
+    },
+    "defect_fork_explicit_blob_ref_projection_order[completed]": {
+      "exception": "GuidedCustodyIntegrityError",
+      "message": "guided blob source mapping is inconsistent",
+      "outcome": "raised"
+    },
+    "defect_fork_explicit_blob_ref_projection_order[exited]": {
+      "exception": "GuidedCustodyIntegrityError",
+      "message": "guided blob source mapping is inconsistent",
+      "outcome": "raised"
+    },
+    "defect_incident_v13[active]": {
+      "exception": "GuidedCustodyIntegrityError",
+      "message": "guided blob source mapping is inconsistent",
+      "outcome": "raised"
+    },
+    "defect_incident_v13[completed]": {
+      "exception": "GuidedCustodyIntegrityError",
+      "message": "guided blob source mapping is inconsistent",
+      "outcome": "raised"
+    },
+    "defect_incident_v13[exited]": {
+      "exception": "GuidedCustodyIntegrityError",
+      "message": "guided blob source mapping is inconsistent",
+      "outcome": "raised"
+    },
+    "defect_two_sources_one_repointed[active]": {
+      "exception": "GuidedCustodyIntegrityError",
+      "message": "guided blob source mapping is inconsistent",
+      "outcome": "raised"
+    },
+    "defect_two_sources_one_repointed[completed]": {
+      "exception": "GuidedCustodyIntegrityError",
+      "message": "guided blob source mapping is inconsistent",
+      "outcome": "raised"
+    },
+    "defect_two_sources_one_repointed[exited]": {
+      "exception": "GuidedCustodyIntegrityError",
+      "message": "guided blob source mapping is inconsistent",
+      "outcome": "raised"
+    },
+    "empty_sources_explicit_reviewed[active]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>"
+              },
+              "plugin": "csv"
+            }
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {}
+    },
+    "empty_sources_explicit_reviewed[completed]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>"
+              },
+              "plugin": "csv"
+            }
+          },
+          "terminal": {
+            "kind": "completed",
+            "pipeline_yaml": "sources: {}\n",
+            "reason": null
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {}
+    },
+    "empty_sources_explicit_reviewed[exited]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>"
+              },
+              "plugin": "csv"
+            }
+          },
+          "terminal": {
+            "kind": "exited_to_freeform",
+            "pipeline_yaml": null,
+            "reason": "user_pressed_exit"
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {}
+    },
+    "empty_sources_sentinel_reviewed[active]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "path": "blob:11111111-1111-4111-8111-111111111111"
+              },
+              "plugin": "csv"
+            }
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {}
+    },
+    "empty_sources_sentinel_reviewed[completed]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "path": "blob:11111111-1111-4111-8111-111111111111"
+              },
+              "plugin": "csv"
+            }
+          },
+          "terminal": {
+            "kind": "completed",
+            "pipeline_yaml": "sources: {}\n",
+            "reason": null
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {}
+    },
+    "empty_sources_sentinel_reviewed[exited]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "path": "blob:11111111-1111-4111-8111-111111111111"
+              },
+              "plugin": "csv"
+            }
+          },
+          "terminal": {
+            "kind": "exited_to_freeform",
+            "pipeline_yaml": null,
+            "reason": "user_pressed_exit"
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {}
+    },
+    "exact_blob_reuse_case_e[active]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "path": "blob:50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"
+              },
+              "plugin": "csv"
+            }
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b",
+            "path": "blob:50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"
+          },
+          "plugin": "csv"
+        }
+      }
+    },
+    "exact_blob_reuse_case_e[completed]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "path": "blob:50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"
+              },
+              "plugin": "csv"
+            }
+          },
+          "terminal": {
+            "kind": "completed",
+            "pipeline_yaml": "sources: {}\n",
+            "reason": null
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b",
+            "path": "blob:50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"
+          },
+          "plugin": "csv"
+        }
+      }
+    },
+    "exact_blob_reuse_case_e[exited]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "path": "blob:50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"
+              },
+              "plugin": "csv"
+            }
+          },
+          "terminal": {
+            "kind": "exited_to_freeform",
+            "pipeline_yaml": null,
+            "reason": "user_pressed_exit"
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b",
+            "path": "blob:50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"
+          },
+          "plugin": "csv"
+        }
+      }
+    },
+    "explicit_binding_live_without_blob_ref[active]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>",
+                "schema": {
+                  "mode": "observed"
+                }
+              },
+              "plugin": "csv"
+            }
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "<redacted-blob-source-path>",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "plugin": "csv"
+        }
+      }
+    },
+    "explicit_binding_live_without_blob_ref[completed]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>",
+                "schema": {
+                  "mode": "observed"
+                }
+              },
+              "plugin": "csv"
+            }
+          },
+          "terminal": {
+            "kind": "completed",
+            "pipeline_yaml": "sources: {}\n",
+            "reason": null
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "<redacted-blob-source-path>",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "plugin": "csv"
+        }
+      }
+    },
+    "explicit_binding_live_without_blob_ref[exited]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>",
+                "schema": {
+                  "mode": "observed"
+                }
+              },
+              "plugin": "csv"
+            }
+          },
+          "terminal": {
+            "kind": "exited_to_freeform",
+            "pipeline_yaml": null,
+            "reason": "user_pressed_exit"
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "<redacted-blob-source-path>",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "plugin": "csv"
+        }
+      }
+    },
+    "explicit_file_carrier[active]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "file": "<redacted-blob-source-path>"
+              }
+            }
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "file": "<redacted-blob-source-path>"
+          }
+        }
+      }
+    },
+    "explicit_file_carrier[completed]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "file": "<redacted-blob-source-path>"
+              }
+            }
+          },
+          "terminal": {
+            "kind": "completed",
+            "pipeline_yaml": "sources: {}\n",
+            "reason": null
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "file": "<redacted-blob-source-path>"
+          }
+        }
+      }
+    },
+    "explicit_file_carrier[exited]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "file": "<redacted-blob-source-path>"
+              }
+            }
+          },
+          "terminal": {
+            "kind": "exited_to_freeform",
+            "pipeline_yaml": null,
+            "reason": "user_pressed_exit"
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "file": "<redacted-blob-source-path>"
+          }
+        }
+      }
+    },
+    "fork_sentinel_with_matching_live_blob_ref[active]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "22222222-2222-4222-8222-222222222222": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "blob:11111111-1111-4111-8111-111111111111"
+              }
+            }
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "blob_ref": "11111111-1111-4111-8111-111111111111",
+            "path": "blob:11111111-1111-4111-8111-111111111111"
+          }
+        }
+      }
+    },
+    "fork_sentinel_with_matching_live_blob_ref[completed]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "22222222-2222-4222-8222-222222222222": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "blob:11111111-1111-4111-8111-111111111111"
+              }
+            }
+          },
+          "terminal": {
+            "kind": "completed",
+            "pipeline_yaml": "sources: {}\n",
+            "reason": null
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "blob_ref": "11111111-1111-4111-8111-111111111111",
+            "path": "blob:11111111-1111-4111-8111-111111111111"
+          }
+        }
+      }
+    },
+    "fork_sentinel_with_matching_live_blob_ref[exited]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "22222222-2222-4222-8222-222222222222": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "blob:11111111-1111-4111-8111-111111111111"
+              }
+            }
+          },
+          "terminal": {
+            "kind": "exited_to_freeform",
+            "pipeline_yaml": null,
+            "reason": "user_pressed_exit"
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "blob_ref": "11111111-1111-4111-8111-111111111111",
+            "path": "blob:11111111-1111-4111-8111-111111111111"
+          }
+        }
+      }
+    },
+    "freeform_meta_none[active]": {
+      "composer_meta": null,
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "blob_ref": "x",
+            "path": "<redacted-blob-source-path>"
+          }
+        }
+      }
+    },
+    "freeform_meta_without_guided[active]": {
+      "composer_meta": {
+        "repair_turns_used": 0
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "blob_ref": "x",
+            "path": "<redacted-blob-source-path>"
+          }
+        }
+      }
+    },
+    "none_sources_explicit_reviewed[active]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>"
+              },
+              "plugin": "csv"
+            }
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": null
+    },
+    "none_sources_explicit_reviewed[completed]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>"
+              },
+              "plugin": "csv"
+            }
+          },
+          "terminal": {
+            "kind": "completed",
+            "pipeline_yaml": "sources: {}\n",
+            "reason": null
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": null
+    },
+    "none_sources_explicit_reviewed[exited]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "s": {
+              "name": "source",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>"
+              },
+              "plugin": "csv"
+            }
+          },
+          "terminal": {
+            "kind": "exited_to_freeform",
+            "pipeline_yaml": null,
+            "reason": "user_pressed_exit"
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": null
+    },
+    "operator_typed_source[active]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "source",
+              "options": {
+                "path": "/tmp/user.csv",
+                "schema": {
+                  "mode": "observed"
+                }
+              }
+            }
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "/tmp/user.csv"
+          }
+        }
+      }
+    },
+    "operator_typed_source[completed]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "source",
+              "options": {
+                "path": "/tmp/user.csv",
+                "schema": {
+                  "mode": "observed"
+                }
+              }
+            }
+          },
+          "terminal": {
+            "kind": "completed",
+            "pipeline_yaml": "sources: {}\n",
+            "reason": null
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "/tmp/user.csv"
+          }
+        }
+      }
+    },
+    "operator_typed_source[exited]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "source",
+              "options": {
+                "path": "/tmp/user.csv",
+                "schema": {
+                  "mode": "observed"
+                }
+              }
+            }
+          },
+          "terminal": {
+            "kind": "exited_to_freeform",
+            "pipeline_yaml": null,
+            "reason": "user_pressed_exit"
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "/tmp/user.csv"
+          }
+        }
+      }
+    },
+    "pending_intents_mixed[active]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {
+            "a": {
+              "name": "incoming",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>"
+              }
+            },
+            "b": {
+              "name": "typed",
+              "options": {
+                "path": "typed.csv"
+              }
+            },
+            "c": {
+              "name": "bare",
+              "options": null
+            }
+          },
+          "reviewed_sources": {}
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "data.csv"
+          }
+        }
+      }
+    },
+    "pending_intents_mixed[completed]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {
+            "a": {
+              "name": "incoming",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>"
+              }
+            },
+            "b": {
+              "name": "typed",
+              "options": {
+                "path": "typed.csv"
+              }
+            },
+            "c": {
+              "name": "bare",
+              "options": null
+            }
+          },
+          "reviewed_sources": {},
+          "terminal": {
+            "kind": "completed",
+            "pipeline_yaml": "sources: {}\n",
+            "reason": null
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "data.csv"
+          }
+        }
+      }
+    },
+    "pending_intents_mixed[exited]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {
+            "a": {
+              "name": "incoming",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>"
+              }
+            },
+            "b": {
+              "name": "typed",
+              "options": {
+                "path": "typed.csv"
+              }
+            },
+            "c": {
+              "name": "bare",
+              "options": null
+            }
+          },
+          "reviewed_sources": {},
+          "terminal": {
+            "kind": "exited_to_freeform",
+            "pipeline_yaml": null,
+            "reason": "user_pressed_exit"
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "data.csv"
+          }
+        }
+      }
+    },
+    "plural_explicit_by_name[active]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "first",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>"
+              }
+            },
+            "22222222-2222-4222-8222-222222222222": {
+              "name": "second",
+              "options": {
+                "blob_ref": "22222222-2222-4222-8222-222222222222",
+                "path": "<redacted-blob-source-path>"
+              }
+            }
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "first": {
+          "options": {
+            "path": "<redacted-blob-source-path>"
+          }
+        },
+        "second": {
+          "options": {
+            "path": "<redacted-blob-source-path>"
+          }
+        }
+      }
+    },
+    "plural_explicit_by_name[completed]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "first",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>"
+              }
+            },
+            "22222222-2222-4222-8222-222222222222": {
+              "name": "second",
+              "options": {
+                "blob_ref": "22222222-2222-4222-8222-222222222222",
+                "path": "<redacted-blob-source-path>"
+              }
+            }
+          },
+          "terminal": {
+            "kind": "completed",
+            "pipeline_yaml": "sources: {}\n",
+            "reason": null
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "first": {
+          "options": {
+            "path": "<redacted-blob-source-path>"
+          }
+        },
+        "second": {
+          "options": {
+            "path": "<redacted-blob-source-path>"
+          }
+        }
+      }
+    },
+    "plural_explicit_by_name[exited]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "first",
+              "options": {
+                "blob_ref": "11111111-1111-4111-8111-111111111111",
+                "path": "<redacted-blob-source-path>"
+              }
+            },
+            "22222222-2222-4222-8222-222222222222": {
+              "name": "second",
+              "options": {
+                "blob_ref": "22222222-2222-4222-8222-222222222222",
+                "path": "<redacted-blob-source-path>"
+              }
+            }
+          },
+          "terminal": {
+            "kind": "exited_to_freeform",
+            "pipeline_yaml": null,
+            "reason": "user_pressed_exit"
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "first": {
+          "options": {
+            "path": "<redacted-blob-source-path>"
+          }
+        },
+        "second": {
+          "options": {
+            "path": "<redacted-blob-source-path>"
+          }
+        }
+      }
+    },
+    "plural_sentinels_path_and_file[active]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "33333333-3333-4333-8333-333333333333": {
+              "name": "first",
+              "options": {
+                "path": "blob:11111111-1111-4111-8111-111111111111"
+              }
+            },
+            "44444444-4444-4444-8444-444444444444": {
+              "name": "second",
+              "options": {
+                "file": "blob:22222222-2222-4222-8222-222222222222"
+              }
+            }
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "first": {
+          "options": {
+            "path": "blob:11111111-1111-4111-8111-111111111111"
+          }
+        },
+        "second": {
+          "options": {
+            "file": "blob:22222222-2222-4222-8222-222222222222"
+          }
+        }
+      }
+    },
+    "plural_sentinels_path_and_file[completed]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "33333333-3333-4333-8333-333333333333": {
+              "name": "first",
+              "options": {
+                "path": "blob:11111111-1111-4111-8111-111111111111"
+              }
+            },
+            "44444444-4444-4444-8444-444444444444": {
+              "name": "second",
+              "options": {
+                "file": "blob:22222222-2222-4222-8222-222222222222"
+              }
+            }
+          },
+          "terminal": {
+            "kind": "completed",
+            "pipeline_yaml": "sources: {}\n",
+            "reason": null
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "first": {
+          "options": {
+            "path": "blob:11111111-1111-4111-8111-111111111111"
+          }
+        },
+        "second": {
+          "options": {
+            "file": "blob:22222222-2222-4222-8222-222222222222"
+          }
+        }
+      }
+    },
+    "plural_sentinels_path_and_file[exited]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "33333333-3333-4333-8333-333333333333": {
+              "name": "first",
+              "options": {
+                "path": "blob:11111111-1111-4111-8111-111111111111"
+              }
+            },
+            "44444444-4444-4444-8444-444444444444": {
+              "name": "second",
+              "options": {
+                "file": "blob:22222222-2222-4222-8222-222222222222"
+              }
+            }
+          },
+          "terminal": {
+            "kind": "exited_to_freeform",
+            "pipeline_yaml": null,
+            "reason": "user_pressed_exit"
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "first": {
+          "options": {
+            "path": "blob:11111111-1111-4111-8111-111111111111"
+          }
+        },
+        "second": {
+          "options": {
+            "file": "blob:22222222-2222-4222-8222-222222222222"
+          }
+        }
+      }
+    },
+    "sentinel_exact_name_with_implicit_decisions[active]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "22222222-2222-4222-8222-222222222222": {
+              "name": "source",
+              "options": {
+                "path": "blob:11111111-1111-4111-8111-111111111111",
+                "schema": {
+                  "mode": "observed"
+                }
+              }
+            }
+          }
+        },
+        "implicit_decisions": {
+          "entries": [
+            {
+              "category": "source",
+              "path": "source.path",
+              "value": "blob:11111111-1111-4111-8111-111111111111"
+            },
+            {
+              "category": "source",
+              "path": "source.file",
+              "value": "/elsewhere.csv"
+            },
+            {
+              "category": "output",
+              "path": "output.path",
+              "value": "outputs/out.jsonl"
+            }
+          ],
+          "normalization_events": [],
+          "schema_version": 1
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "blob:11111111-1111-4111-8111-111111111111",
+            "schema": {
+              "mode": "observed"
+            }
+          }
+        }
+      }
+    },
+    "sentinel_exact_name_with_implicit_decisions[completed]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "22222222-2222-4222-8222-222222222222": {
+              "name": "source",
+              "options": {
+                "path": "blob:11111111-1111-4111-8111-111111111111",
+                "schema": {
+                  "mode": "observed"
+                }
+              }
+            }
+          },
+          "terminal": {
+            "kind": "completed",
+            "pipeline_yaml": "sources: {}\n",
+            "reason": null
+          }
+        },
+        "implicit_decisions": {
+          "entries": [
+            {
+              "category": "source",
+              "path": "source.path",
+              "value": "blob:11111111-1111-4111-8111-111111111111"
+            },
+            {
+              "category": "source",
+              "path": "source.file",
+              "value": "/elsewhere.csv"
+            },
+            {
+              "category": "output",
+              "path": "output.path",
+              "value": "outputs/out.jsonl"
+            }
+          ],
+          "normalization_events": [],
+          "schema_version": 1
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "blob:11111111-1111-4111-8111-111111111111",
+            "schema": {
+              "mode": "observed"
+            }
+          }
+        }
+      }
+    },
+    "sentinel_exact_name_with_implicit_decisions[exited]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "22222222-2222-4222-8222-222222222222": {
+              "name": "source",
+              "options": {
+                "path": "blob:11111111-1111-4111-8111-111111111111",
+                "schema": {
+                  "mode": "observed"
+                }
+              }
+            }
+          },
+          "terminal": {
+            "kind": "exited_to_freeform",
+            "pipeline_yaml": null,
+            "reason": "user_pressed_exit"
+          }
+        },
+        "implicit_decisions": {
+          "entries": [
+            {
+              "category": "source",
+              "path": "source.path",
+              "value": "blob:11111111-1111-4111-8111-111111111111"
+            },
+            {
+              "category": "source",
+              "path": "source.file",
+              "value": "/elsewhere.csv"
+            },
+            {
+              "category": "output",
+              "path": "output.path",
+              "value": "outputs/out.jsonl"
+            }
+          ],
+          "normalization_events": [],
+          "schema_version": 1
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "source": {
+          "options": {
+            "path": "blob:11111111-1111-4111-8111-111111111111",
+            "schema": {
+              "mode": "observed"
+            }
+          }
+        }
+      }
+    },
+    "two_names_share_one_blob_path[active]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "first",
+              "options": {
+                "blob_ref": "abc12300-0000-4000-8000-000000000000",
+                "path": "<redacted-blob-source-path>"
+              }
+            },
+            "22222222-2222-4222-8222-222222222222": {
+              "name": "second",
+              "options": {
+                "blob_ref": "abc12300-0000-4000-8000-000000000000",
+                "path": "<redacted-blob-source-path>"
+              }
+            }
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "first": {
+          "options": {
+            "path": "<redacted-blob-source-path>"
+          }
+        },
+        "second": {
+          "options": {
+            "path": "<redacted-blob-source-path>"
+          }
+        }
+      }
+    },
+    "two_names_share_one_blob_path[completed]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "first",
+              "options": {
+                "blob_ref": "abc12300-0000-4000-8000-000000000000",
+                "path": "<redacted-blob-source-path>"
+              }
+            },
+            "22222222-2222-4222-8222-222222222222": {
+              "name": "second",
+              "options": {
+                "blob_ref": "abc12300-0000-4000-8000-000000000000",
+                "path": "<redacted-blob-source-path>"
+              }
+            }
+          },
+          "terminal": {
+            "kind": "completed",
+            "pipeline_yaml": "sources: {}\n",
+            "reason": null
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "first": {
+          "options": {
+            "path": "<redacted-blob-source-path>"
+          }
+        },
+        "second": {
+          "options": {
+            "path": "<redacted-blob-source-path>"
+          }
+        }
+      }
+    },
+    "two_names_share_one_blob_path[exited]": {
+      "composer_meta": {
+        "guided_session": {
+          "pending_source_intents": {},
+          "reviewed_sources": {
+            "11111111-1111-4111-8111-111111111111": {
+              "name": "first",
+              "options": {
+                "blob_ref": "abc12300-0000-4000-8000-000000000000",
+                "path": "<redacted-blob-source-path>"
+              }
+            },
+            "22222222-2222-4222-8222-222222222222": {
+              "name": "second",
+              "options": {
+                "blob_ref": "abc12300-0000-4000-8000-000000000000",
+                "path": "<redacted-blob-source-path>"
+              }
+            }
+          },
+          "terminal": {
+            "kind": "exited_to_freeform",
+            "pipeline_yaml": null,
+            "reason": "user_pressed_exit"
+          }
+        }
+      },
+      "outcome": "projected",
+      "sources": {
+        "first": {
+          "options": {
+            "path": "<redacted-blob-source-path>"
+          }
+        },
+        "second": {
+          "options": {
+            "path": "<redacted-blob-source-path>"
+          }
+        }
+      }
+    }
+  }
+}

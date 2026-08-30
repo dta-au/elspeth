@@ -303,10 +303,6 @@ const RULE_LESS_BY_DESIGN: Record<string, string> = {
     "Constant (unconditional) modifier with no sibling variant anywhere; " +
     "the defined base class carries the list treatment. Vestigial — delete " +
     "the token rather than write a rule if it ever gets in the way.",
-  "audit-icon-unknown":
-    "Forward-compatibility modifier rendering in .audit-icon's neutral base " +
-    "treatment: an unrecognised backend flag must not be coloured as though " +
-    "its tone were known. Also recorded in catalogClassNames.test.ts.",
   // --- Text/layout members that inherit their whole treatment ------------
   "audit-icon-label":
     "Inner text span filling the .audit-icon chip; every visual property " +
