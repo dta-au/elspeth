@@ -156,7 +156,7 @@ def read_litellm_model_list() -> tuple[str, ...]:
         "version drift on an installed litellm is never read as an absent or narrowed catalog"
     ),
     test_ref="tests/unit/plugins/llm/test_model_catalog.py::test_parse_litellm_model_list_rejects_malformed_shapes",
-    test_fingerprint="2561fb2cbc05b958e6be1972183864f2e669a20063abaa5d19f40074a6f00ffe",
+    test_fingerprint="6ad65b56729a2875a5a1a49b8a65e249a812039b56a270aa3ba11d5a197263a2",
 )
 def _parse_litellm_model_list(raw: Any) -> tuple[str, ...]:
     """Parse ``litellm.model_list`` into the owned sorted-tuple catalog form."""
