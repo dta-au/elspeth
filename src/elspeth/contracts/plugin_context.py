@@ -445,7 +445,14 @@ class PluginContext:
             "a non-serializable object) falls back to a repr() hash so the quarantine still gets an "
             "audit row. Recording what was actually seen outranks recording it canonically — the "
             "only failures this method raises on are missing node_id/landscape, which are framework "
-            "bugs in the caller, not properties of the row"
+            "bugs in the caller, not properties of the row. The landscape writer this delegates to "
+            "is non-raising on the same input class by construction: "
+            "core/landscape/data_flow/errors.py::record_validation_error routes row_data through "
+            "canonical_or_recorded_hash / canonical_or_recorded_json, which return an explicit "
+            "repr/NonCanonicalMetadata fallback rather than propagating. Pinned end-to-end against a "
+            "real recorder by tests/unit/contracts/test_plugin_context_recording.py::"
+            "TestRecordValidationErrorHappyPath::"
+            "test_non_canonical_row_does_not_leak_row_content_to_logger"
         ),
     )
     def record_validation_error(
