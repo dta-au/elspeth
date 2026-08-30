@@ -56,12 +56,12 @@ interface ValidationResultProps {
  * Ladder: an explicit componentNames map (built from the live composition,
  * SideRailValidationBanner's buildValidationComponentNames) wins outright.
  * Absent that, with no nodes list at all there is nothing to resolve against
- * except the id itself — the caller passed no context, so the raw id is the
- * only honest thing to show. With a nodes list, a component that IS still
- * wired keeps its structural `type:id` label; one that's vanished from the
- * composition (or was never in it) falls through to `phraseFor`, the shared
- * plain-language resolver (elspeth-27efd1e801) — never a bare raw id when a
- * nicer phrase is available.
+ * except the shared plain-language resolver — which is the only honest thing
+ * to show, because a bare raw id is not one (elspeth-93f5621f18). With a
+ * nodes list, a component that IS still wired keeps its structural `type:id`
+ * label; one that's vanished from the composition (or was never in it) falls
+ * through to `phraseFor`, the shared plain-language resolver
+ * (elspeth-27efd1e801) — never a bare raw id when a nicer phrase is available.
  */
 function resolveComponentName(
   componentId: string | null,
@@ -76,7 +76,7 @@ function resolveComponentName(
   ) {
     return componentNames[componentId];
   }
-  if (!nodes) return componentId;
+  if (!nodes) return phraseFor(componentId);
   const node = nodes.find((n) => n.id === componentId);
   return node ? `${node.node_type}:${node.id}` : phraseFor(componentId);
 }

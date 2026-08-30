@@ -12,6 +12,7 @@ import { describe, it, expect } from "vitest";
 import {
   buildStepOrder,
   humaniseStepLabel,
+  isComponentPresent,
   resolveNodePlugin,
   stepLabelForNodeId,
   stepLabelForPlugin,
@@ -109,9 +110,13 @@ describe("humaniseStepLabel — node-name preference (R2-F8b)", () => {
     );
   });
 
-  it("falls back to the raw id when the node is absent from the composition", () => {
+  it("names an absent node 'Removed' — never the raw id (elspeth-93f5621f18)", () => {
     const state = makeCompositionState([]);
-    expect(humaniseStepLabel(state, "ghost_node")).toBe("ghost_node");
+    expect(humaniseStepLabel(state, "ghost_node")).toBe("Removed");
+  });
+
+  it("title-cases the id while the composition is still unloaded (unknown, not removed)", () => {
+    expect(humaniseStepLabel(null, "extract_invoice")).toBe("Extract Invoice");
   });
 
   it("falls back to a generic phrase when there is no id at all", () => {
@@ -247,10 +252,10 @@ describe("stepLabelForNodeId — structural-node description fallback (elspeth-9
     );
   });
 
-  it("still resolves null (raw-id fallback) for a plugin-less node without a description", () => {
+  it("title-cases a present plugin-less node with no description (present, so not 'Removed')", () => {
     const state = makeCompositionState([gateNode()]);
     expect(stepLabelForNodeId(state, "fan_out")).toBeNull();
-    expect(humaniseStepLabel(state, "fan_out")).toBe("fan_out");
+    expect(humaniseStepLabel(state, "fan_out")).toBe("Fan Out");
   });
 
   it("does not let a description override a plugin-resolvable node's own name", () => {
@@ -261,5 +266,21 @@ describe("stepLabelForNodeId — structural-node description fallback (elspeth-9
 
   it("returns null for an id absent from the composition entirely", () => {
     expect(stepLabelForNodeId(makeCompositionState([]), "ghost")).toBeNull();
+  });
+});
+
+describe("isComponentPresent", () => {
+  it("finds nodes, sources and outputs; false for an absent id or unloaded state", () => {
+    const state: CompositionState = {
+      ...makeCompositionState([makeNode("rater", "llm")]),
+      sources: { input: { plugin: "csv", options: {} } },
+      outputs: [{ name: "results", plugin: "csv", options: {} }],
+    };
+    expect(isComponentPresent(state, "rater")).toBe(true);
+    expect(isComponentPresent(state, "input")).toBe(true);
+    expect(isComponentPresent(state, "results")).toBe(true);
+    expect(isComponentPresent(state, "ghost")).toBe(false);
+    expect(isComponentPresent(null, "rater")).toBe(false);
+    expect(isComponentPresent(state, null)).toBe(false);
   });
 });

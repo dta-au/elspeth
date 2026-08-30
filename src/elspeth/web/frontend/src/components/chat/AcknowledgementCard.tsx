@@ -602,6 +602,7 @@ export function AcknowledgementCard({
       className="ack-card"
       aria-labelledby={titleId}
       data-testid="acknowledgement-card"
+      data-affected-node-id={event.affected_node_id ?? undefined}
     >
       <h3 id={titleId} className="ack-card-title">
         {presentation.title}

@@ -6,6 +6,7 @@ import { ValidationResultBanner } from "./ValidationResult";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
+import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/guided/pipelineGloss";
 import type { ValidationResult } from "@/types/index";
 
 const READY_READINESS = {
@@ -420,6 +421,27 @@ describe("ValidationResultBanner detail level (elspeth-27efd1e801)", () => {
       .map((node) => node.textContent)
       .join("");
     expect(headline).not.toMatch(/Schema contract violation/);
-    expect(headline).toMatch(/assess/i);
+    // No nodes/componentNames context is passed, so "assess" cannot resolve
+    // to anything nicer — the honest fallback is the shared generic phrase,
+    // never the raw id itself (elspeth-93f5621f18: this line used to assert
+    // the opposite, pinning the bug this ticket fixes).
+    expect(headline).not.toMatch(/\bassess\b/);
+    expect(headline).toMatch(/this step/i);
+  });
+
+  it("never renders a bare component id when the banner has no nodes list (elspeth-93f5621f18)", () => {
+    useSessionStore.setState({ compositionState: null });
+    render(
+      <ValidationResultBanner
+        result={{ is_valid: false, errors: [{ message: "Field missing", component_id: "select_columns", component_type: "transform" }], warnings: [], checks: [] } as unknown as ValidationResult}
+      />,
+    );
+    expect(screen.queryByText(/select_columns/)).not.toBeInTheDocument();
+    // getAllByText, not getByText: testing-library matches on each element's
+    // own textContent, so a phrase inside an <li> also matches an ancestor and
+    // a single-element query would throw on a multiple-match rather than on
+    // the condition under test. The primary assertion is the queryByText
+    // above — that the raw id is ABSENT — which is unambiguous either way.
+    expect(screen.getAllByText(new RegExp(UNKNOWN_COMPONENT_PHRASE)).length).toBeGreaterThan(0);
   });
 });
