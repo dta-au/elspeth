@@ -358,19 +358,27 @@
    paragraphs and list items carry the line breaks that the declaration used
    to preserve.
 
-   Two consequences of the move, recorded rather than restyled (out of scope
-   for the register change that made them): the family/size no longer have to
-   out-rank base.css's bare-`pre` mono rule, since there is no `<pre>` left to
-   inherit it; and MarkdownRenderer nests a `.markdown-body` (common.css:72)
-   whose own `font-size: var(--font-size-sm)` and `line-height: 1.5` win over
-   the md/relaxed pair set here, so those two now style only the wrapper. The
-   74ch cap is unaffected and still bounds the column. */
+   The family/size no longer have to out-rank base.css's bare-`pre` mono rule,
+   since there is no `<pre>` left to inherit it. But MarkdownRenderer nests a
+   `.markdown-body` (common.css:72) whose own `font-size: var(--font-size-sm)`
+   and `line-height: 1.5` would otherwise win over the md/relaxed pair set
+   here, silently shrinking this narrative one size step AND making the 74ch
+   cap above a false claim — `ch` resolves against the wrapper's md size, so a
+   smaller inner face means a measure of roughly 80+ characters, not 74. The
+   inherit pair below is what keeps both this rule and that paragraph true. */
 .explain-dialog-narrative {
   flex: 1 1 auto;
   max-width: 74ch;
   font-family: var(--font-sans);
   font-size: var(--font-size-md);
   line-height: var(--line-height-relaxed);
+}
+
+/* The narrative's own typography wins over the generic markdown body, so the
+   measure cap above stays honest (see the block comment). */
+.explain-dialog-narrative .markdown-body {
+  font-size: inherit;
+  line-height: inherit;
 }
 
 /* ---------------------------------------------------------------------------
