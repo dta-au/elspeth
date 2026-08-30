@@ -13530,7 +13530,12 @@ async def test_legacy_exited_unbindable_tip_projects_degraded(tmp_path) -> None:
     client = TestClient(app)
     session = await service.create_session("alice", "Legacy", "local")
     exited = TerminalState(kind=TerminalKind.EXITED_TO_FREEFORM, reason=TerminalReason.USER_PRESSED_EXIT, pipeline_yaml=None)
-    await _insert_legacy_composition_state(service, session.id, _legacy_unbindable_guided_state(terminal=exited), provenance="post_compose")
+    legacy = _legacy_unbindable_guided_state(terminal=exited)
+    legacy = replace(
+        legacy,
+        validation_errors=["Source 'source' has no reachable output (E_GRAPH)"],
+    )
+    await _insert_legacy_composition_state(service, session.id, legacy, provenance="post_compose")
 
     response = client.get(f"/api/sessions/{session.id}/state")
 
@@ -13538,6 +13543,7 @@ async def test_legacy_exited_unbindable_tip_projects_degraded(tmp_path) -> None:
     body = response.json()
     assert body["composer_meta"]["guided_session"]["custody_unavailable"] is True
     assert body["sources"]["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+    assert body["validation_errors"] == ["Source 'source' has no reachable output (E_GRAPH)"]
     assert _LEGACY_PRIVATE_PATH not in response.text
 
 
@@ -13578,7 +13584,13 @@ async def test_guided_reenter_refuses_an_unbindable_exited_tip(tmp_path) -> None
     response = client.post(f"/api/sessions/{session.id}/guided/reenter", json={"operation_id": str(uuid.uuid4())})
 
     assert response.status_code == 409, response.text
-    assert response.json()["detail"]["error_type"] == "guided_reenter_custody_unbindable"
+    detail = response.json()["detail"]
+    assert detail["error_type"] == "guided_reenter_custody_unbindable"
+    assert detail["detail"] == (
+        "Guided mode can't resume: the files it reviewed are no longer the files this pipeline uses. "
+        "Restore an earlier version from Composition history, or keep working in freeform."
+    )
+    assert "binds" not in detail["detail"]
     assert _LEGACY_PRIVATE_PATH not in response.text
     current = await service.get_current_state(session.id)
     assert current is not None

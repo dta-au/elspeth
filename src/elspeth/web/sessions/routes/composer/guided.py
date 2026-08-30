@@ -1170,8 +1170,9 @@ async def post_guided_reenter(
                 status_code=409,
                 detail={
                     "error_type": "guided_reenter_custody_unbindable",
-                    "detail": "This guided session's retained source review no longer binds to its sources; "
-                    "revert to an earlier version before re-entering guided mode.",
+                    "detail": "Guided mode can't resume: the files it reviewed are no longer the files "
+                    "this pipeline uses. Restore an earlier version from Composition history, or keep "
+                    "working in freeform.",
                 },
             ) from exc
         existing_meta: dict[str, Any] = {}
@@ -1459,6 +1460,10 @@ async def post_guided_start(
             if terminal is not None
             else None
         )
+        # A replay serves the operation's stored state row, which can predate
+        # the write gate; name a custody projection failure instead of a 500.
+        with _named_guided_custody_projection():
+            composition_state = _state_response(record, policy_catalog=catalog)
         return GetGuidedResponse(
             guided_session=GuidedSessionResponse(
                 step=guided.step.value,
@@ -1496,7 +1501,7 @@ async def post_guided_start(
                 shield_available=_resolve_shield_available(plugin_snapshot),
             ),
             terminal=terminal_response,
-            composition_state=_state_response(record, policy_catalog=catalog),
+            composition_state=composition_state,
         )
 
     async def _verify_start_root(record: CompositionStateRecord) -> None:
@@ -1831,6 +1836,10 @@ async def post_guided_convert(
             if terminal is not None
             else None
         )
+        # A replay serves the operation's stored state row, which can predate
+        # the write gate; name a custody projection failure instead of a 500.
+        with _named_guided_custody_projection():
+            composition_state = _state_response(record, policy_catalog=catalog)
         return GetGuidedResponse(
             guided_session=GuidedSessionResponse(
                 step=guided.step.value,
@@ -1868,7 +1877,7 @@ async def post_guided_convert(
                 shield_available=_resolve_shield_available(plugin_snapshot),
             ),
             terminal=terminal_response,
-            composition_state=_state_response(record, policy_catalog=catalog),
+            composition_state=composition_state,
         )
 
     async def _replay(result: object) -> GetGuidedResponse:
