@@ -55,7 +55,7 @@ const EDITABLE_PROVENANCES: ReadonlySet<InlineSourceProvenance> = new Set([
 /** Reader-register labels for the closed provenance enum; the raw value
  *  stays in `title` (elspeth-d74ab492dd). Exhaustive by type: adding a
  *  provenance without a label is a compile error. */
-export const INLINE_SOURCE_PROVENANCE_LABELS: Record<InlineSourceProvenance, string> = {
+const INLINE_SOURCE_PROVENANCE_LABELS: Record<InlineSourceProvenance, string> = {
   verbatim: "Typed by you",
   "llm-generated": "Drafted by the composer",
   disambiguated: "Chosen by you from the options offered",

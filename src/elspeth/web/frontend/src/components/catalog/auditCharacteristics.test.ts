@@ -65,7 +65,8 @@ describe("auditCharacteristics metadata", () => {
 
   it("returns null for an unknown flag rather than crashing", () => {
     // Future flags added on the backend without a frontend metadata
-    // entry should render as a small grey "unknown" chip, not crash.
+    // entry should render nothing (PluginCard filters them out before
+    // render), not crash.
     expect(lookupAuditCharacteristic("future_flag_2027")).toBeNull();
   });
 

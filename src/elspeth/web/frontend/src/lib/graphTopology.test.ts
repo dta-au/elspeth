@@ -8,6 +8,7 @@ import {
   COALESCE_POLICIES,
   DISCARD_CONNECTION,
   FAN_IN_NODE_TYPES,
+  FORK_CONNECTION,
   IMPLICIT_SELF_PUBLISHING_NODE_TYPES,
 } from "./graphTopology";
 import { buildProducerRegistry } from "@/components/inspector/GraphView";
@@ -164,18 +165,23 @@ const SHARED_FANIN_FIXTURE = makeComposition(1, {
 describe("buildConnectionProducers agrees with GraphView's producer registry", () => {
   it("registers the same producers for the same coalesce/fork composition", () => {
     // The two implementations that this task deliberately did NOT merge. They
-    // diverge only in the two sentinels and in ReactFlow decoration, so the
-    // KEY SET and the producer-id set per key must match exactly. Drift on
-    // this axis is what misrendered a working fork/coalesce pipeline as two
-    // disconnected fragments (session 3f02c8fa) and drew a coalesce with a
-    // single arm (elspeth-625e85c59b) — the two incidents this module exists
-    // to stop recurring.
+    // diverge in the two sentinels, in ReactFlow decoration, and in dedup:
+    // buildConnectionProducers dedupes producer ids per key (`push` above
+    // checks `includes` before appending), buildProducerRegistry does not.
+    // The assertions below Set-compare both the key set and each key's
+    // producer-id set, which absorbs the dedup difference — a duplicate in
+    // GraphView's array still compares equal to the deduped lifted array.
+    // The KEY SET and the producer-id set per key must match exactly. Drift
+    // on this axis is what misrendered a working fork/coalesce pipeline as
+    // two disconnected fragments (session 3f02c8fa) and drew a coalesce with
+    // a single arm (elspeth-625e85c59b) — the two incidents this module
+    // exists to stop recurring.
     const state = SHARED_FANIN_FIXTURE;   // one fixture, used by both assertions
     const lifted = buildConnectionProducers(state);
     const graphView = buildProducerRegistry(state);   // ProducerInfo[] per key
 
     const graphViewKeys = new Set([...graphView.keys()].filter(
-      (key) => key !== "fork" && key !== DISCARD_CONNECTION,
+      (key) => key !== FORK_CONNECTION && key !== DISCARD_CONNECTION,
     ));
     expect(new Set(lifted.keys())).toEqual(graphViewKeys);
     for (const key of graphViewKeys) {
@@ -187,7 +193,7 @@ describe("buildConnectionProducers agrees with GraphView's producer registry", (
     // both sentinels must actually be present in GraphView's index for the
     // filter to be doing anything.
     expect(graphViewKeys.size).toBeGreaterThan(4);
-    expect(graphView.has("fork")).toBe(true);
+    expect(graphView.has(FORK_CONNECTION)).toBe(true);
     expect(graphView.has(DISCARD_CONNECTION)).toBe(true);
   });
 });

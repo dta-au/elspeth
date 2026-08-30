@@ -760,25 +760,20 @@ export function ExecuteButton(): JSX.Element | null {
         >
           {egressLines.length > 0 && (
             <ul className="run-disclosure-summary">
-              {egressLines.map((line, index) => {
-                const identifiersId = `run-egress-ids-${index}`;
-                return (
-                  <li
-                    key={line.identifiers}
-                    aria-describedby={identifiersId}
-                    title={line.identifiers}
-                  >
-                    {line.text}
-                    {/* The identifier register, reachable by AT and by
-                        keyboard users. `title` is kept for sighted mouse
-                        hover; it is a convenience, never the only route
-                        (the run-button comment above records why). */}
-                    <span id={identifiersId} className="sr-only">
-                      {line.identifiers}
-                    </span>
-                  </li>
-                );
-              })}
+              {egressLines.map((line) => (
+                <li key={line.identifiers} title={line.identifiers}>
+                  {line.text}
+                  {/* The identifier register, reachable by AT and by
+                      keyboard users: it is in-flow content of this <li>, so
+                      it is already part of the list item's accessible
+                      content — no `aria-describedby` needed (that would
+                      make AT announce it a second time as a description).
+                      `title` is kept for sighted mouse hover; it is a
+                      convenience, never the only route (the run-button
+                      comment above records why). */}
+                  <span className="sr-only">{line.identifiers}</span>
+                </li>
+              ))}
             </ul>
           )}
           <label className="run-disclosure-opt-out">

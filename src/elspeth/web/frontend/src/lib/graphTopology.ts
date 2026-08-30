@@ -65,6 +65,13 @@ import type { CompositionState } from "@/types/index";
 export const DISCARD_CONNECTION = "discard";
 
 /**
+ * The co-sentinel to DISCARD_CONNECTION: a `routes` alias whose target is
+ * this fork marker is not itself a connection — it is expanded via the
+ * node's `fork_to` array into one producer registration per branch.
+ */
+export const FORK_CONNECTION = "fork";
+
+/**
  * The coalesce member sets, mirrored from `CoalesceSettings.policy` and
  * `.merge` in core/config.py and lifted out of api/guidedDecoder.ts, which
  * held the frontend's only copy privately (it now builds its validation Sets
@@ -240,13 +247,13 @@ export function buildConnectionProducers(
     if (node.on_error && node.on_error !== DISCARD_CONNECTION) push(node.on_error, node.id);
     if (node.routes) {
       for (const target of Object.values(node.routes)) {
-        if (target !== "fork" && target !== DISCARD_CONNECTION) push(target, node.id);
+        if (target !== FORK_CONNECTION && target !== DISCARD_CONNECTION) push(target, node.id);
       }
     }
     if (
       node.node_type === "gate"
       && node.routes
-      && Object.values(node.routes).includes("fork")
+      && Object.values(node.routes).includes(FORK_CONNECTION)
       && node.fork_to
     ) {
       for (const branchConnection of node.fork_to) push(branchConnection, node.id);

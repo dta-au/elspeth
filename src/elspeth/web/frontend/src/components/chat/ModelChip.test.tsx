@@ -44,6 +44,7 @@ describe("ModelChip", () => {
 
     expectNoIdentifiersInDefaultDom(container);
     expect(screen.getByText("Claude Sonnet 5")).toBeInTheDocument();
+    expect(container).not.toHaveTextContent("openrouter");
   });
 
   it("renders nothing while no model is known", () => {

@@ -21,9 +21,11 @@
 // matching change in the others fails CI (vocabulary parity test on
 // adds/removes, TS compiler on type drift).
 //
-// Unknown flags (no entry here) render as a small grey "unknown" chip with
-// the raw flag string as label; this is the forward-compatibility path
-// for flags added on the backend without a corresponding frontend update.
+// Unknown flags (no entry here) render nothing: AuditCharacteristicIcon
+// returns null, and PluginCard filters them out of the list before render
+// so an all-unknown flag set never announces an empty audit-characteristics
+// group. This is the forward-compatibility path for flags added on the
+// backend without a corresponding frontend update.
 // ============================================================================
 
 /** Closed vocabulary of audit-characteristic flag strings.
@@ -48,7 +50,7 @@
  * Forward compatibility for unknown-on-the-wire flags is preserved by
  * keeping ``lookupAuditCharacteristic(flag: string)`` accepting
  * ``string`` — an unknown wire value still resolves to ``null`` and
- * renders the grey "unknown" chip rather than crashing.
+ * renders nothing (PluginCard filters it out) rather than crashing.
  */
 export type AuditCharacteristicFlag =
   // Determinism-derived (composed from Determinism enum)

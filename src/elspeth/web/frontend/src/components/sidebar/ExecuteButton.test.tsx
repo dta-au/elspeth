@@ -368,12 +368,11 @@ describe("ExecuteButton", () => {
 
     const line = within(dialog).getAllByRole("listitem")[0];
     expect(line).toHaveTextContent("Reads source data: Source (CSV).");
-    // Identifier register reachable by AT and by keyboard, not hover-only.
-    const describedBy = line.getAttribute("aria-describedby");
-    expect(describedBy).not.toBeNull();
-    expect(document.getElementById(describedBy as string)).toHaveTextContent(
-      "Reads source data: source (csv).",
-    );
+    // Identifier register reachable by AT and by keyboard, not hover-only: it
+    // is in-flow content of the <li> itself (a `.sr-only` child span, no
+    // `aria-describedby` — that would announce it a second time).
+    expect(line).toHaveTextContent("Reads source data: source (csv).");
+    expect(line).not.toHaveAttribute("aria-describedby");
     // `title` kept for sighted mouse hover — a convenience, not the only route.
     expect(line).toHaveAttribute("title", "Reads source data: source (csv).");
 

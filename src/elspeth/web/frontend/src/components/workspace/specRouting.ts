@@ -30,6 +30,7 @@ import {
   buildConnectionProducers,
   DISCARD_CONNECTION,
   FAN_IN_NODE_TYPES,
+  FORK_CONNECTION,
   type CoalesceMerge,
   type CoalescePolicy,
 } from "@/lib/graphTopology";
@@ -334,7 +335,7 @@ export function routingPhrase(
       const entries = Object.entries(value as Record<string, unknown>).map(
         ([alias, target]): [string, string] => [alias, String(target)],
       );
-      if (field === "routes" && entries.every(([, target]) => target === "fork")) {
+      if (field === "routes" && entries.every(([, target]) => target === FORK_CONNECTION)) {
         return {
           text: "every row continues to all branches",
           raw: entries.map(([alias]) => `${alias} → fork`).join("; "),
