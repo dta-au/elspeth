@@ -507,7 +507,11 @@ class JWKSTokenValidator:
         try:
             header = jwt.get_unverified_header(token)
             token_alg = self._get_token_algorithm(header)
-            kid = header.get("kid")
+            # Tier-3 token header: `kid` is optional per RFC 7515. Membership-
+            # then-subscript keeps the absent->None decision visible; an
+            # absent or unknown kid matches no JWK and raises
+            # _UnknownSigningKeyError below.
+            kid = header["kid"] if "kid" in header else None
             jwk_set = self._parse_jwk_set(jwks)
             matched_jwk = None
             for key in jwk_set.keys:
