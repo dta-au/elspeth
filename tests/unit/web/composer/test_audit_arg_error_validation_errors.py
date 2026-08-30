@@ -334,3 +334,11 @@ def test_arg_error_payload_factory_strips_hostile_pydantic_loc_and_message() -> 
     serialized = json.dumps(_arg_error_payload(arg_err, "set_metadata"), sort_keys=True)
     assert _PYDANTIC_LOC_CANARY not in serialized
     assert _PYDANTIC_MESSAGE_CANARY not in serialized
+
+
+def test_tool_argument_error_code_still_reads_constructed_instances() -> None:
+    """The redaction-safety fallback (missing slot -> None, ratified by
+    TestToolArgumentError::test_private_backing_missing_or_wrong_typed_uses_fixed_fallbacks)
+    must not eat legitimately constructed codes."""
+    exc = ToolArgumentError(argument="pipeline", expected="a mapping", actual_type="str", code="SCHEMA_VALIDATION")
+    assert exc.code == "SCHEMA_VALIDATION"

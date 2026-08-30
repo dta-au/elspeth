@@ -10,6 +10,7 @@ from sqlalchemy import Engine, select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.composer.pipeline_proposal import reviewed_anchor_hash
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import ReviewedSourceAuthority
@@ -36,6 +37,18 @@ def _recorded_content_hash_prefix(raw_source: Mapping[str, Any], *, stable_id: s
     return value
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored reviewed source options (untrusted mapping values persisted with the session)",
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "raises AuditIntegrityError when source-authoring metadata is present but not a mapping, or its "
+        "content_hash is present but not a non-empty string; absence at either level yields None"
+    ),
+    test_ref="tests/unit/web/composer/test_set_pipeline_candidate.py::test_authoring_content_hash_rejects_non_mapping_authoring_metadata",
+    test_fingerprint="8e9130a57ff74f9db27a5c387f797e43636f4f52e58d9de04bad09a679427820",
+)
 def _authoring_content_hash(options: Mapping[str, Any], *, stable_id: str) -> str | None:
     """Parse the full content hash pinned by source-authoring metadata."""
     authoring = options[SOURCE_AUTHORING_KEY] if SOURCE_AUTHORING_KEY in options else None
@@ -63,6 +76,18 @@ def _canonical_blob_id(value: object, *, field_name: str) -> str:
     return value
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored reviewed-source facts carried on the proposal (untrusted persisted session state)",
+    source_param="reviewed_facts",
+    suppresses=("R5",),
+    invariant=(
+        "raises AuditIntegrityError on anchor mismatch or any present-but-malformed reviewed source record; "
+        "an absent reviewed_sources key yields None (no private authority granted)"
+    ),
+    test_ref="tests/unit/web/composer/test_set_pipeline_candidate.py::test_reviewed_source_authority_rejects_non_mapping_reviewed_sources",
+    test_fingerprint="0fa240f7a4335754f2c2fd09a3d22c4380e91e0bd780001aa120a35cdf242a58",
+)
 def resolve_reviewed_source_authority(
     *,
     engine: Engine | None,
@@ -81,8 +106,10 @@ def resolve_reviewed_source_authority(
     if reviewed_anchor_hash(reviewed_facts) != expected_reviewed_anchor_hash:
         raise AuditIntegrityError("reviewed source authority does not match the current reviewed anchor")
     sources = reviewed_facts["reviewed_sources"] if "reviewed_sources" in reviewed_facts else None
-    if not isinstance(sources, Mapping):
+    if sources is None:
         return None
+    if not isinstance(sources, Mapping):
+        raise AuditIntegrityError("reviewed source authority reviewed_sources must be a mapping when present")
     if type(session_id) is not str or not session_id:
         raise AuditIntegrityError("reviewed source authority requires a non-empty session_id")
     if type(user_id) is not str or not user_id:

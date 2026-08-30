@@ -25,6 +25,7 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerP
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobQuotaExceededError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -273,6 +274,17 @@ async def _try_finalize_proposal_custody(
     return "ready"
 
 
+@trust_boundary(
+    tier=3,
+    source="frozen ToolResult.data of a prevalidation-rejected candidate (external authorship retained through freezing)",
+    source_param="candidate_data",
+    suppresses=("R5",),
+    invariant=(
+        "never raises on malformed input: a Mapping is returned as-is, None yields an empty seed, and any "
+        "other shape is carried structurally under the 'candidate_data' key rather than dropped or coerced"
+    ),
+    non_raising=True,
+)
 def _prevalidation_feedback_seed(candidate_data: Any) -> Mapping[str, Any]:
     """Seed the PREVALIDATION_REJECTED feedback payload from a candidate's data.
 

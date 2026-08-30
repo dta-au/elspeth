@@ -391,6 +391,18 @@ _GET_BLOB_METADATA_DECLARATION = ToolDeclaration(
 )
 
 
+@trust_boundary(
+    tier=3,
+    source="existing component options content (web/LLM-authored, thawed from persisted session state) navigated by an LLM-supplied field_path",
+    source_param="container",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when a field_path segment collides with an existing non-object value or "
+        "when field_path carries no segment; never coerces an existing value into an object"
+    ),
+    test_ref="tests/unit/web/composer/test_blob_inline_tools.py::test_set_nested_option_rejects_non_object_segment_collision",
+    test_fingerprint="f737be9d00e5cfa17240cfb4dda84f2dbf1ef46dd5be557429ef27613b2877d2",
+)
 def _set_nested_option(container: dict[str, Any], keys: list[str], value: Any) -> dict[str, Any]:
     if not keys:
         raise ValueError("field_path must include at least one .options.<field> segment")
@@ -757,6 +769,19 @@ def _blob_creation_provenance(content: str, context: ToolContext) -> _BlobCreati
     )
 
 
+@trust_boundary(
+    tier=3,
+    source="one component's frozen options tree (web/LLM-authored content retained through CompositionState freezing)",
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "returns True only on an exact blob_ref/path/file match found by structural traversal; raises "
+        "AuditIntegrityError on a present-but-non-str blob_ref (audited-state corruption) rather than "
+        "treating the blob as unbound"
+    ),
+    test_ref="tests/unit/web/composer/test_blob_inline_tools.py::test_state_options_reference_blob_crashes_on_non_str_blob_ref",
+    test_fingerprint="cc4ab30745da588422649670128e04e05a2b19ad065a5750801cfc3a86e56a3b",
+)
 def _state_options_reference_blob(
     options: Mapping[str, Any],
     blob_id: str,

@@ -550,6 +550,18 @@ class _MalformedLLMResponseError(ComposerServiceError):
         self.provider_metadata = provider_metadata
 
 
+@trust_boundary(
+    tier=3,
+    source="raw LiteLLM/provider-SDK completion response object (untrusted model/provider output)",
+    source_param="response",
+    suppresses=("R5",),
+    invariant=(
+        "raises _MalformedLLMResponseError (carrying only already-admitted provider facts) on any "
+        "malformed choices/message/content/tool_calls surface; never coerces or fabricates a field"
+    ),
+    test_ref="tests/unit/web/composer/test_capture_llm_completion_boundary.py::test_malformed_choices_raises_malformed_llm_response_error",
+    test_fingerprint="bde1559884f55a4452526d639a4c77f46e2f20c2a98cc7884cc3ab2421105866",
+)
 def _capture_composer_llm_completion_fields(
     response: Any,
 ) -> tuple[_AdmittedAssistantMessage, tuple[Any, ...], _AdmittedLLMProviderMetadata]:
@@ -1471,9 +1483,14 @@ def _freeform_planner_conversation_context(
     for history_index, history_message in enumerate(messages):
         if type(history_message) is not dict:
             raise InvariantError("composer chat history entries must be exact dictionaries")
-        authorship = history_message.get(COMPOSER_HISTORY_USER_AUTHORED_KEY)
-        if authorship is None:
+        # The marker is NotRequired[Literal[True]] (protocol.py): ABSENT is the
+        # legitimate assistant-entry state, but any PRESENT value that is not
+        # exactly True — including None — is a broken first-party contract and
+        # must crash, so membership and value are checked separately rather
+        # than letting a `.get()` default fold present-but-invalid into absent.
+        if COMPOSER_HISTORY_USER_AUTHORED_KEY not in history_message:
             continue
+        authorship = history_message[COMPOSER_HISTORY_USER_AUTHORED_KEY]
         if authorship is not True or "role" not in history_message or history_message["role"] != "user":
             raise InvariantError("composer user-authorship marker is malformed")
         content = history_message["content"] if "content" in history_message else None

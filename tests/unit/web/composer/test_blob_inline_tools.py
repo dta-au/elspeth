@@ -865,3 +865,42 @@ def test_tool_definitions_include_inline_blob_authoring_tools() -> None:
     assert definitions["wire_blob_inline_ref"]["parameters"]["required"] == ["field_path", "blob_id"]
     assert definitions["wire_blob_inline_ref"]["parameters"]["additionalProperties"] is False
     assert definitions["delete_blob"]["parameters"]["additionalProperties"] is False
+
+
+def test_set_nested_option_rejects_non_object_segment_collision() -> None:
+    """A field_path segment that collides with an existing non-object value in the
+    web-authored container must be rejected, never coerced into an object."""
+    from elspeth.web.composer.tools.blobs import _set_nested_option
+
+    with pytest.raises(ValueError, match=r"segment 'a' already exists and is not an object"):
+        _set_nested_option({"a": 5}, ["a", "b"], "marker")
+
+
+def test_set_nested_option_rejects_empty_field_path() -> None:
+    from elspeth.web.composer.tools.blobs import _set_nested_option
+
+    with pytest.raises(ValueError, match=r"at least one \.options\.<field> segment"):
+        _set_nested_option({}, [], "marker")
+
+
+def test_state_options_reference_blob_crashes_on_non_str_blob_ref() -> None:
+    """A present-but-non-str blob_ref in frozen state options is audited-state
+    corruption: the reference guard must escalate, not read it as unbound."""
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.composer.tools.blobs import _state_options_reference_blob
+
+    with pytest.raises(AuditIntegrityError, match="non-str blob_ref"):
+        _state_options_reference_blob(
+            {"blob_ref": 7},
+            "0be5905a-3e69-49a5-a8e9-9617b691c665",
+            "blobs/session/file.csv",
+            owner="source 'input'",
+        )
+
+
+def test_state_options_reference_blob_finds_nested_reference() -> None:
+    from elspeth.web.composer.tools.blobs import _state_options_reference_blob
+
+    blob_id = "0be5905a-3e69-49a5-a8e9-9617b691c665"
+    options = {"outer": {"items": ({"blob_ref": blob_id},)}}
+    assert _state_options_reference_blob(options, blob_id, "blobs/session/file.csv", owner="node 'n1'")

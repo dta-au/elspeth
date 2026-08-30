@@ -41,6 +41,7 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer import pipeline_planner
 from elspeth.web.composer.audit import BufferingRecorder, planner_attempt_audit_envelope
 from elspeth.web.composer.capability_skill import load_pipeline_capability_core
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError
@@ -9984,3 +9985,165 @@ async def test_disjoint_candidate_rejections_do_not_draw_the_repeat_notice(
     assert [entry["component"] for entry in second["validation"]["errors"]] == ["output:rows"]
     assert "repeat_notice" not in first
     assert "repeat_notice" not in second
+
+
+# --- Cancellation-vs-settlement control flow (tier-rem/web-composer) ---------
+#
+# The claimed invariant for both helpers: the original cancellation is
+# preserved unconditionally, and a settlement/custody failure is surfaced
+# (chained onto the re-raised cancellation) rather than silently discarded
+# or allowed to REPLACE the cancellation.
+
+
+@pytest.mark.asyncio
+async def test_await_custody_settlement_custody_failure_does_not_replace_cancellation() -> None:
+    """A non-CancelledError custody failure during the post-cancel drain must not
+    escape and replace the active cancellation (judge counterexample: the narrow
+    ``suppress(asyncio.CancelledError)`` let it through)."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def custody() -> None:
+        started.set()
+        await release.wait()
+        raise ValueError("custody write failed")
+
+    observed: list[BaseException] = []
+
+    async def runner() -> None:
+        try:
+            await pipeline_planner._await_custody_settlement(custody())
+        except BaseException as exc:
+            observed.append(exc)
+            raise
+
+    task = asyncio.create_task(runner())
+    await started.wait()
+    task.cancel()
+    # Let the cancellation reach the helper so it is inside its drain loop.
+    for _ in range(3):
+        await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled(), "original cancellation must be preserved unconditionally"
+    assert len(observed) == 1
+    assert isinstance(observed[0], asyncio.CancelledError)
+    # The custody failure is surfaced on the preserved cancellation, not lost.
+    assert isinstance(observed[0].__cause__, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_await_custody_settlement_lets_custody_finish_before_reraising_cancel() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def custody() -> str:
+        started.set()
+        await release.wait()
+        finished.set()
+        return "settled"
+
+    task = asyncio.create_task(pipeline_planner._await_custody_settlement(custody()))
+    await started.wait()
+    task.cancel()
+    for _ in range(3):
+        await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set(), "custody must run to completion despite the cancel"
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_settle_lifecycle_records_settlement_failure_on_preserved_cancellation() -> None:
+    """``suppress(BaseException)`` around ``task.result()`` silently discarded a
+    first-party ``on_settled`` failure; it must surface chained onto the
+    re-raised cancellation instead."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def on_settled(outcome: str) -> None:
+        started.set()
+        await release.wait()
+        raise RuntimeError("lifecycle bookkeeping failed")
+
+    lifecycle = pipeline_planner.PlannerRequestLifecycle(
+        before_start=_unused_async_callable,
+        request_scope=nullcontext,
+        on_settled=on_settled,
+        progress=None,
+    )
+
+    observed: list[BaseException] = []
+
+    async def runner() -> None:
+        try:
+            await pipeline_planner._settle_lifecycle(lifecycle, "cancelled")
+        except BaseException as exc:
+            observed.append(exc)
+            raise
+
+    task = asyncio.create_task(runner())
+    await started.wait()
+    task.cancel()
+    for _ in range(3):
+        await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled(), "original cancellation must be preserved unconditionally"
+    assert len(observed) == 1
+    assert isinstance(observed[0], asyncio.CancelledError)
+    assert isinstance(observed[0].__cause__, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_settle_lifecycle_failure_propagates_when_not_cancelled() -> None:
+    async def on_settled(outcome: str) -> None:
+        raise RuntimeError("lifecycle bookkeeping failed")
+
+    lifecycle = pipeline_planner.PlannerRequestLifecycle(
+        before_start=_unused_async_callable,
+        request_scope=nullcontext,
+        on_settled=on_settled,
+        progress=None,
+    )
+    with pytest.raises(RuntimeError, match="lifecycle bookkeeping failed"):
+        await pipeline_planner._settle_lifecycle(lifecycle, "complete")
+
+
+async def _unused_async_callable() -> None:
+    raise AssertionError("not exercised by these tests")
+
+
+def _withheld_result(data: Any) -> Any:
+    state = _empty_state()
+    return ToolResult(
+        success=False,
+        updated_state=state,
+        validation=state.validate(),
+        affected_nodes=(),
+        data=data,
+    )
+
+
+def test_withheld_component_count_reads_first_party_int() -> None:
+    from elspeth.web.composer.tools._common import COMPONENTS_WITHHELD_KEY
+
+    assert pipeline_planner._withheld_component_count(_withheld_result({COMPONENTS_WITHHELD_KEY: 3})) == 3
+    assert pipeline_planner._withheld_component_count(_withheld_result({})) == 0
+    assert pipeline_planner._withheld_component_count(_withheld_result(None)) == 0
+
+
+def test_withheld_component_count_crashes_on_corrupt_first_party_count() -> None:
+    """COMPONENTS_WITHHELD_KEY is written only by _merge_component_rejections
+    with an int; any other present shape is envelope corruption and must crash
+    instead of silently reading as 'nothing withheld'."""
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.composer.tools._common import COMPONENTS_WITHHELD_KEY
+
+    with pytest.raises(AuditIntegrityError, match="must be an int"):
+        pipeline_planner._withheld_component_count(_withheld_result({COMPONENTS_WITHHELD_KEY: "3"}))

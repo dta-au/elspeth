@@ -564,8 +564,14 @@ def owned_composition_state_review_arguments(authority: Mapping[str, Any]) -> Ow
     for source_name, source in state.sources.items():
         options = deep_thaw(source.options)
         for key in ("blob_ref", "path", "file", SOURCE_AUTHORING_KEY):
-            options.pop(key, None)
-        if options.get("mode") == "bind_source":
+            # Membership-then-del: absence of a redactable key is first-class
+            # in web-authored options; no defaulted pop masking either state.
+            if key in options:
+                del options[key]
+        # Web-authored option content: "mode" is genuinely optional, so
+        # membership-then-index redacts the bind_source marker without a
+        # defaulted lookup fabricating an answer for absent keys.
+        if "mode" in options and options["mode"] == "bind_source":
             del options["mode"]
         safe_sources[source_name] = {
             "plugin": source.plugin,

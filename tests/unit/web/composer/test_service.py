@@ -834,6 +834,25 @@ def test_freeform_planner_context_does_not_override_self_contained_current_inten
     assert context is None
 
 
+def test_freeform_planner_context_present_but_invalid_authorship_marker_crashes() -> None:
+    """The marker is NotRequired[Literal[True]]: absence skips the entry, but a
+    PRESENT non-True value (e.g. None) is a broken first-party contract and must
+    raise instead of being folded into the absent path by a ``.get()`` default."""
+    from elspeth.web.composer.guided.errors import InvariantError
+
+    with pytest.raises(InvariantError, match="user-authorship marker is malformed"):
+        _freeform_planner_conversation_context(
+            "Build the requested pipeline.",
+            [
+                {
+                    "role": "user",
+                    "content": "Route rows with amount > 500 to high_value.",
+                    COMPOSER_HISTORY_USER_AUTHORED_KEY: None,  # type: ignore[typeddict-item]
+                }
+            ],
+        )
+
+
 class TestComposerTextOnlyResponse:
     @pytest.mark.asyncio
     async def test_non_build_text_only_returns_immediately(self) -> None:

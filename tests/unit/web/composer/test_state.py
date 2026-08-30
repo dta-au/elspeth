@@ -13418,3 +13418,101 @@ class TestRowUnionDownstreamBanDoesNotWalkASentinel:
     def test_the_real_error_is_still_reported(self) -> None:
         """Skipping the ban must not hide why the state is invalid."""
         assert "row_union_on_success_invalid" in self._codes(self._state(None, ""))
+
+
+# --- tier-rem/web-composer: pinning tests -----------------------------------
+
+
+def _tier_rem_node(**overrides: Any) -> NodeSpec:
+    defaults: dict[str, Any] = {
+        "id": "n1",
+        "node_type": "transform",
+        "plugin": "passthrough",
+        "input": "in",
+        "on_success": "out",
+        "on_error": "discard",
+        "options": {},
+        "condition": None,
+        "routes": None,
+        "fork_to": None,
+        "branches": None,
+        "policy": None,
+        "merge": None,
+    }
+    defaults.update(overrides)
+    return NodeSpec(**defaults)
+
+
+def test_coalesce_non_string_branch_connection_is_rejected_at_composition_time() -> None:
+    """A persisted payload can hand NodeSpec.from_dict a non-string coalesce
+    branch connection; without an intrinsic type check it validated green here
+    and died at the runtime's CoalesceSettings load (valid-but-not-runnable)."""
+    state = CompositionState(
+        source=None,
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    state = state.with_source(SourceSpec(plugin="csv", on_success="g_in", options={}, on_validation_failure="discard"))
+    state = state.with_node(
+        _tier_rem_node(
+            id="g",
+            node_type="gate",
+            plugin=None,
+            input="g_in",
+            on_success=None,
+            on_error=None,
+            condition="True",
+            routes={"true": "fork", "false": "fork"},
+            fork_to=("x",),
+        )
+    )
+    state = state.with_node(_tier_rem_node(id="tx", input="x", on_success="cx"))
+    state = state.with_node(
+        _tier_rem_node(
+            id="c",
+            node_type="coalesce",
+            plugin=None,
+            input="cx",
+            on_success="main",
+            on_error=None,
+            branches={"x": 7},
+            policy="require_all",
+            merge="union",
+        )
+    )
+    state = state.with_output(OutputSpec(name="main", plugin="csv", options={}, on_write_failure="discard"))
+
+    result = state.validate()
+
+    messages = [e.message for e in result.errors if e.error_code == "coalesce_branches_invalid"]
+    assert any("must be a string (got int)" in message for message in messages), messages
+
+
+def test_template_syntax_rejection_is_owned_by_plugin_config_not_advisory_rules() -> None:
+    """The composer's template advisory rules abstain on unparseable templates;
+    the raising rejection is owned by LLMConfig (pydantic ValidationError at
+    plugin-config admission), so the abstention loses no integrity signal."""
+    from pydantic import ValidationError
+
+    from elspeth.contracts.schema import SchemaConfig
+    from elspeth.plugins.transforms.llm.base import LLMConfig
+    from elspeth.web.composer.state import (
+        _parse_template_names,
+        _validate_prompt_template_variable_bindings,
+    )
+
+    bad_template = "{% if %}"
+    assert _parse_template_names(bad_template) is None
+    node = _tier_rem_node(id="llm1", plugin="llm", options={"prompt_template": bad_template})
+    assert _validate_prompt_template_variable_bindings(node) == ()
+
+    with pytest.raises(ValidationError):
+        LLMConfig(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4.6",
+            prompt_template=bad_template,
+            schema_config=SchemaConfig(mode="observed", fields=None),
+        )

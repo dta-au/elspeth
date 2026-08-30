@@ -357,8 +357,10 @@ def build_source_data_contract_draft(
     "accepted draft text, round-tripped through sessions.db storage",
     source_param="value",
     suppresses=("R5",),
-    invariant="returns the parsed demanded-field tuple or None to abstain; every malformed branch abstains "
-    "— callers treat None as drift and re-open the card, so abstention fails closed",
+    invariant="returns the parsed demanded-field tuple or None to abstain; every malformed branch abstains. "
+    "Abstention strips nothing from the recomputed demand, so the card can stay closed only when "
+    "the independently stored accepted_artifact_hash exactly matches the full current demand — the "
+    "hash, never this parse, is the acknowledgement authority",
 )
 def parse_source_data_contract_accepted_fields(value: str) -> tuple[str, ...] | None:
     """Parse the acknowledged demand set back out of a stored draft/accepted value."""

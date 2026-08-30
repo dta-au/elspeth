@@ -2360,7 +2360,11 @@ def _redact_via_policy(
         known_argument_keys = set(policy.known_argument_keys)
         unknown_keys = [key for key in arguments if key not in known_argument_keys]
         for key in unknown_keys:
-            redacted.pop(key, None)
+            # ``redacted`` is a fresh copy of ``arguments`` and ``unknown_keys``
+            # derives from the same ``arguments``, so every key is present by
+            # construction; ``del`` crashes on a breach of that first-party
+            # invariant instead of masking it with a pop default.
+            del redacted[key]
         if unknown_keys:
             redacted[REDACTED_UNKNOWN_ARGUMENTS_FIELD] = REDACTED_UNKNOWN_ARGUMENT_KEY
 

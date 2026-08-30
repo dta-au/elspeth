@@ -12,15 +12,23 @@ from elspeth.web.composer.yaml_generator import generate_public_yaml, generate_y
 from elspeth.web.composer.yaml_importer import (
     MAX_RUNTIME_YAML_IMPORT_CHARS,
     RuntimeYamlImportError,
+    _collector_nodes_from_runtime_lists,
     _finite_positive_timeout,
     _nodes_from_runtime_list,
+    _optional_str,
     _outputs_from_runtime_sinks,
     _queues_from_runtime_mapping,
     _reject_unimportable_sections,
+    _reject_yaml_aliases,
+    _require_mapping,
     _require_nonblank_str,
+    _require_sequence,
     _require_str,
+    _route_label,
     _row_union_branches,
     _source_from_runtime_entry,
+    _string_mapping,
+    _string_tuple,
     composition_state_from_runtime_yaml,
 )
 
@@ -30,6 +38,46 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 def test_require_str_rejects_non_string_value() -> None:
     with pytest.raises(RuntimeYamlImportError, match=r"sources\.s\.plugin must be a non-empty string"):
         _require_str({"plugin": 7}, "plugin", "sources.s")
+
+
+def test_require_mapping_rejects_non_mapping_value() -> None:
+    with pytest.raises(RuntimeYamlImportError, match=r"sources must be a mapping, got list"):
+        _require_mapping([], "sources")
+
+
+def test_require_sequence_rejects_string_value() -> None:
+    with pytest.raises(RuntimeYamlImportError, match=r"transforms must be a list, got str"):
+        _require_sequence("not-a-list", "transforms")
+
+
+def test_optional_str_rejects_non_string_value() -> None:
+    with pytest.raises(RuntimeYamlImportError, match=r"on_error must be a string when provided"):
+        _optional_str({"on_error": 7}, "on_error")
+
+
+def test_route_label_rejects_empty_label() -> None:
+    with pytest.raises(RuntimeYamlImportError, match=r"route labels must be non-empty strings"):
+        _route_label("")
+
+
+def test_string_mapping_rejects_non_string_value() -> None:
+    with pytest.raises(RuntimeYamlImportError, match=r"routes\.a must be a non-empty string"):
+        _string_mapping({"a": 7}, "routes")
+
+
+def test_string_tuple_rejects_non_string_item() -> None:
+    with pytest.raises(RuntimeYamlImportError, match=r"branches\[0\] must be a non-empty string"):
+        _string_tuple([7], "branches")
+
+
+def test_reject_yaml_aliases_rejects_alias_event() -> None:
+    with pytest.raises(yaml.composer.ComposerError, match=r"aliases are not permitted"):
+        _reject_yaml_aliases("base: &a {x: 1}\nother: *a\n")
+
+
+def test_collector_nodes_rejects_non_sequence_collectors_section() -> None:
+    with pytest.raises(RuntimeYamlImportError, match=r"collectors must be a list, got str"):
+        _collector_nodes_from_runtime_lists("not-a-list", None)
 
 
 def test_require_nonblank_str_rejects_whitespace_only_value() -> None:

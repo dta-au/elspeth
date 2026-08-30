@@ -4342,3 +4342,47 @@ async def test_stalled_state_still_runs_the_checkpoint_and_honours_clean(clean_r
     )
     assert service._run_advisor_checkpoint.await_count == 1
     assert outcome.action == "fall_through"
+
+
+class TestCheckpointTelemetryHelperShape:
+    def test_checkpoint_pass_emit_is_best_effort(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A broken event sink or meter must not fail the completed checkpoint
+        (each ``suppress(Exception)`` bounds exactly one subordinate emit)."""
+        from elspeth.web.composer import advisor_checkpoint_telemetry as telemetry_module
+
+        class _ExplodingLogger:
+            def info(self, *a: Any, **k: Any) -> None:
+                raise RuntimeError("exporter outage")
+
+        class _ExplodingCounter:
+            def add(self, *a: Any, **k: Any) -> None:
+                raise RuntimeError("meter outage")
+
+        monkeypatch.setattr(telemetry_module, "slog", _ExplodingLogger())
+        monkeypatch.setattr(telemetry_module, "_ADVISOR_CHECKPOINT_PASSES_COUNTER", _ExplodingCounter())
+        telemetry_module.record_advisor_checkpoint_pass(
+            session_id="sess-1",
+            phase="early",
+            pass_index=0,
+            verdict="clean",
+            findings_text="finding text",
+        )
+
+    def test_checkpoint_pass_canonicalization_refusal_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``stable_hash`` runs ABOVE the suppression: a canonicalization refusal
+        is a first-party programmer error and must escape, never be swallowed
+        with the emit."""
+        from elspeth.web.composer import advisor_checkpoint_telemetry as telemetry_module
+
+        def _refusing_hash(payload: Any) -> str:
+            raise TypeError("canonicalization refusal")
+
+        monkeypatch.setattr(telemetry_module, "stable_hash", _refusing_hash)
+        with pytest.raises(TypeError, match="canonicalization refusal"):
+            telemetry_module.record_advisor_checkpoint_pass(
+                session_id="sess-1",
+                phase="early",
+                pass_index=0,
+                verdict="clean",
+                findings_text="finding text",
+            )

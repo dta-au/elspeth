@@ -42,7 +42,9 @@ from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # Route-owned provenance marker carried only inside Composer's in-process chat
 # history. ``prompts.build_messages`` removes it before provider dispatch.
-COMPOSER_HISTORY_USER_AUTHORED_KEY: Final[str] = "_elspeth_user_authored"
+# Bare Final (not Final[str]) so mypy infers the Literal type and TypedDict
+# indexing through this constant type-checks at the history boundary.
+COMPOSER_HISTORY_USER_AUTHORED_KEY: Final = "_elspeth_user_authored"
 
 
 class ComposerHistoryMessage(TypedDict):
@@ -1076,6 +1078,14 @@ class ToolArgumentError(Exception):
         try:
             value = BaseException.__getattribute__(self, "_safe_code")
         except AttributeError:
+            # Fail-SAFE, not fail-closed, by ratified design: like the sibling
+            # ``argument``/``expected``/``actual_type`` properties, a missing
+            # or tampered backing slot degrades to the fixed safe constant so
+            # a bypass-constructed or attribute-stripped instance can never
+            # render attacker-controllable content — and never turns the
+            # arg-error rendering path into a crash mid-request. Pinned by
+            # TestToolArgumentError::
+            # test_private_backing_missing_or_wrong_typed_uses_fixed_fallbacks.
             return None
         return (
             value

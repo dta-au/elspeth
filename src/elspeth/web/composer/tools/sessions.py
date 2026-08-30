@@ -2382,6 +2382,18 @@ def _assert_affected_llm_node(
     _assert_affected_component(state, affected_node_id, InterpretationKind.VAGUE_TERM, user_term)
 
 
+@trust_boundary(
+    tier=3,
+    source="CompositionState.nodes whose options carry web/LLM-authored values (prompt_template admitted un-typed from persisted session payloads)",
+    source_param="nodes",
+    suppresses=("R5",),
+    invariant=(
+        "raises ToolArgumentError (argument='nodes[].options.prompt_template', expected='a string') on a "
+        "present non-string prompt_template; never coerces or skips the malformed node"
+    ),
+    test_ref="tests/unit/web/composer/test_request_interpretation_review_tool.py::test_typed_detector_raises_for_non_string_prompt_template",
+    test_fingerprint="7e2a188e6441151da86c4da34971d2b1d764265ddf8f8d005a1709cb39b19ae1",
+)
 def _detect_unresolved_interpretation_placeholders_typed(
     nodes: Sequence[NodeSpec],
 ) -> list[tuple[str, str]]:

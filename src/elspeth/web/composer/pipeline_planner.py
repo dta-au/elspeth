@@ -2304,11 +2304,19 @@ def _rejection_facts_withheld(result: ToolResult, finalizer_owned: _FinalizerOwn
 
 def _withheld_component_count(result: ToolResult) -> int:
     """How many defective components the candidate builder counted but did not list."""
+    # ``ToolResult.data`` is a union-typed owned field (frozen Mapping payloads,
+    # lists, or None depending on the tool); the Mapping dispatch is required
+    # because ``freeze_fields`` yields MappingProxyType, and an absent key is
+    # the first-class "nothing withheld" state.
     data = result.data
     if not isinstance(data, Mapping) or COMPONENTS_WITHHELD_KEY not in data:
         return 0
     withheld = data[COMPONENTS_WITHHELD_KEY]
-    return withheld if type(withheld) is int else 0
+    if type(withheld) is not int:
+        # The key is written only by _merge_component_rejections with an int;
+        # any other shape is first-party envelope corruption.
+        raise AuditIntegrityError(f"{COMPONENTS_WITHHELD_KEY} must be an int; got {type(withheld).__name__}")
+    return withheld
 
 
 # Static usage line, never per-request data. Live planners called
@@ -3130,13 +3138,19 @@ async def _await_custody_settlement(awaitable: Awaitable[Any]) -> Any:
     task: asyncio.Task[Any] = asyncio.create_task(settle())
     try:
         return await asyncio.shield(task)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as cancellation:
+        # Drain until the shielded custody task settles.  Each awaited pass may
+        # raise the task's own failure or a repeat cancellation of THIS
+        # coroutine; both must stay inside the loop — anything escaping here
+        # would REPLACE the active cancellation.  The task's outcome is
+        # observed explicitly below, never lost to this suppress.
         while not task.done():
-            with suppress(asyncio.CancelledError):
+            with suppress(BaseException):
                 await asyncio.shield(task)
-        # Observe a custody failure without replacing the active cancellation.
-        with suppress(BaseException):
-            task.result()
+        if not task.cancelled() and (failure := task.exception()) is not None:
+            # Surface the custody failure chained onto the preserved
+            # cancellation instead of silently discarding it.
+            raise cancellation from failure
         raise
 
 
@@ -3147,16 +3161,18 @@ async def _settle_lifecycle(lifecycle: PlannerRequestLifecycle, outcome: Planner
     task: asyncio.Task[None] = asyncio.create_task(settle())
     try:
         await asyncio.shield(task)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as cancellation:
         # Settlement is operator/UI bookkeeping.  Let it finish even while the
-        # request task is being torn down, observe its result, then preserve
-        # the original cancel. A second cancellation cannot turn a settlement
-        # failure into an unobserved task exception.
+        # request task is being torn down, then preserve the original cancel.
+        # The drain suppress keeps repeat cancellations and the task's own
+        # failure from escaping mid-loop; the task's outcome is observed
+        # explicitly below, so a settlement failure is surfaced (chained onto
+        # the re-raised cancellation) rather than silently discarded.
         while not task.done():
             with suppress(BaseException):
                 await asyncio.shield(task)
-        with suppress(BaseException):
-            task.result()
+        if not task.cancelled() and (failure := task.exception()) is not None:
+            raise cancellation from failure
         raise
 
 
