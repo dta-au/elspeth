@@ -19,7 +19,7 @@ import structlog
 import yaml
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import CheckConstraint
+from sqlalchemy import CheckConstraint, insert
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 
@@ -32,6 +32,7 @@ from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.enums import CreationModality, TerminalOutcome, TerminalPath
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.core.landscape.database import LandscapeDB
@@ -85,6 +86,7 @@ from elspeth.web.sessions._guided_step_chat import (
 )
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import composition_states_table
 from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
     ChatMessageRole,
@@ -647,6 +649,47 @@ def _make_progress_route_app(
     _install_restricted_plugin_policy(app)
     app.include_router(create_session_router())
     return app, service
+
+
+async def _insert_legacy_composition_state(
+    service: SessionServiceImpl,
+    session_id: uuid.UUID,
+    state: CompositionStateData,
+    *,
+    provenance: str,
+    version: int = 1,
+) -> None:
+    """Seed a composition_states row exactly as a pre-gate deployment persisted it.
+
+    ``save_composition_state`` now refuses an active guided pair whose reviewed
+    custody cannot bind (elspeth-4c442aaaa8), so tests that pin the READ-side
+    rejection of such a row have to bypass the write boundary.
+    """
+    from elspeth.web.sessions.service import _enveloped_state_column
+
+    def _sync() -> None:
+        with service._engine.begin() as conn:
+            conn.execute(
+                insert(composition_states_table).values(
+                    id=str(uuid.uuid4()),
+                    session_id=str(session_id),
+                    version=version,
+                    source=None,
+                    sources=_enveloped_state_column(state.sources),
+                    nodes=_enveloped_state_column(state.nodes),
+                    edges=_enveloped_state_column(state.edges),
+                    outputs=_enveloped_state_column(state.outputs),
+                    metadata_=_enveloped_state_column(state.metadata_),
+                    is_valid=state.is_valid,
+                    validation_errors=deep_thaw(state.validation_errors),
+                    composer_meta=_enveloped_state_column(state.composer_meta),
+                    derived_from_state_id=None,
+                    provenance=provenance,
+                    created_at=datetime.now(UTC),
+                )
+            )
+
+    await asyncio.get_running_loop().run_in_executor(None, _sync)
 
 
 def _make_app(
@@ -8566,7 +8609,8 @@ sinks:
                 )
             },
         )
-        await service.save_composition_state(
+        await _insert_legacy_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -8647,7 +8691,8 @@ sinks:
                 )
             },
         )
-        await service.save_composition_state(
+        await _insert_legacy_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -8738,7 +8783,8 @@ sinks:
                 )
             },
         )
-        await service.save_composition_state(
+        await _insert_legacy_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -8804,7 +8850,8 @@ sinks:
                 )
             },
         )
-        await service.save_composition_state(
+        await _insert_legacy_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -13339,3 +13386,318 @@ def test_compose_that_authors_nothing_returns_200_with_null_state(tmp_path: Path
     assert body["proposals"] == []
     current = asyncio.run(service.get_current_state(uuid.UUID(session["id"])))
     assert current is None
+
+
+def test_send_message_refuses_an_active_unbindable_guided_tip_as_a_failed_turn(tmp_path) -> None:
+    """elspeth-4c442aaaa8 EXPECTED-1: the post-compose persist runs the custody
+    gate inside the write lock. A planner-authored source that cannot bind to the
+    retained ACTIVE review (incident v13 shape with terminal=None) is refused
+    before the row lands: the tip does not advance, the user row stays, and the
+    response is the ``audit_integrity_error`` failed-turn surface the frontend
+    already special-cases on the send path — not a bare 500."""
+    from dataclasses import replace
+
+    private = str(tmp_path / "blobs" / "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b_colours.csv")
+    stable_id = "11111111-1111-4111-8111-111111111111"
+    guided = replace(
+        GuidedSession.initial(),
+        source_order=(stable_id,),
+        reviewed_sources={
+            stable_id: SourceResolved(
+                name="source",
+                plugin="csv",
+                options={"path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f", "schema": {"mode": "observed"}},
+                observed_columns=("colour",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+    )
+    composed = CompositionState(
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="out",
+                options={"path": private, "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b", "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=2,
+        guided_session=guided,
+    )
+    app, _service = _make_app(tmp_path)
+    app.state.composer_service = _make_composer_mock(response_text="Pointed the source at colours.csv.", state=composed)
+    client = TestClient(app)
+    session_id = client.post("/api/sessions", json={"title": "Chat"}).json()["id"]
+    assert client.get(f"/api/sessions/{session_id}/state").json() is None
+
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": "use colours.csv"})
+
+    assert response.status_code == 500, response.text
+    detail = response.json()["detail"]
+    assert detail["error_type"] == "audit_integrity_error"
+    assert detail["failed_turn"] == {
+        "assistant_message_id": None,
+        "tool_calls_attempted": 0,
+        "tool_responses_persisted": 0,
+        "transcript_url": None,
+    }
+    assert private not in response.text
+    assert client.get(f"/api/sessions/{session_id}/state").json() is None
+    roles = [m["role"] for m in client.get(f"/api/sessions/{session_id}/messages").json()]
+    assert roles == ["user"]
+
+
+_LEGACY_PRIVATE_PATH = "/srv/elspeth/data/blobs/legacy/50f5b3e9-f52f-4c5f-98df-a20ec7b2627b_colours.csv"
+
+
+def _legacy_unbindable_guided_state(*, terminal: TerminalState | None) -> CompositionStateData:
+    """Incident v13 shape (elspeth-201903a286) as a pre-gate row: a retained
+    sentinel review of ``source`` re-attached to a live ``source`` bound to a
+    different blob."""
+    stable_id = "11111111-1111-4111-8111-111111111111"
+    guided = replace(
+        GuidedSession.initial(),
+        source_order=(stable_id,),
+        reviewed_sources={
+            stable_id: SourceResolved(
+                name="source",
+                plugin="csv",
+                options={"path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f", "schema": {"mode": "observed"}},
+                observed_columns=("colour",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+        terminal=terminal,
+    )
+    return CompositionStateData(
+        sources={
+            "source": {
+                "plugin": "csv",
+                "on_success": "out",
+                "options": {"path": _LEGACY_PRIVATE_PATH, "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"},
+                "on_validation_failure": "discard",
+            }
+        },
+        nodes=[],
+        edges=[],
+        outputs=[],
+        metadata_={"name": "Legacy", "description": ""},
+        is_valid=False,
+        composer_meta={"guided_session": guided.to_dict()},
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_active_unbindable_tip_reads_are_named_409s(tmp_path) -> None:
+    """elspeth-4c442aaaa8 EXPECTED-3: a tip persisted before the write gate whose
+    ACTIVE review cannot bind still refuses to project. Every read arm names the
+    condition with a stable 409 instead of a bare 500, echoes no path, and a
+    revert onto the same row is refused by the write gate under the same name.
+    The frontend load path treats 409 like 500 today (declared non-goal)."""
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    await _insert_legacy_composition_state(service, session.id, _legacy_unbindable_guided_state(terminal=None), provenance="post_compose")
+    tip = await service.get_current_state(session.id)
+    assert tip is not None
+
+    for path in (f"/api/sessions/{session.id}/state", f"/api/sessions/{session.id}/guided"):
+        response = client.get(path)
+        assert response.status_code == 409, (path, response.text)
+        detail = response.json()["detail"]
+        assert detail["error_type"] == "guided_custody_projection_failed"
+        assert detail["detail"] == (
+            "This session's retained guided source review no longer matches the files this pipeline uses; "
+            "restore an earlier version from Composition history to continue."
+        )
+        assert "binds" not in detail["detail"]
+        assert _LEGACY_PRIVATE_PATH not in response.text
+
+    revert = client.post(
+        f"/api/sessions/{session.id}/state/revert",
+        json={"operation_id": str(uuid.uuid4()), "state_id": str(tip.id)},
+    )
+    assert revert.status_code == 409, revert.text
+    assert revert.json()["detail"]["error_type"] == "guided_custody_projection_failed"
+    still_tip = await service.get_current_state(session.id)
+    assert still_tip is not None
+    assert still_tip.version == tip.version
+
+
+@pytest.mark.asyncio
+async def test_legacy_exited_unbindable_tip_projects_degraded(tmp_path) -> None:
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    exited = TerminalState(kind=TerminalKind.EXITED_TO_FREEFORM, reason=TerminalReason.USER_PRESSED_EXIT, pipeline_yaml=None)
+    legacy = _legacy_unbindable_guided_state(terminal=exited)
+    legacy = replace(
+        legacy,
+        validation_errors=["Source 'source' has no reachable output (E_GRAPH)"],
+    )
+    await _insert_legacy_composition_state(service, session.id, legacy, provenance="post_compose")
+
+    response = client.get(f"/api/sessions/{session.id}/state")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["composer_meta"]["guided_session"]["custody_unavailable"] is True
+    assert body["sources"]["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+    assert body["validation_errors"] == ["Source 'source' has no reachable output (E_GRAPH)"]
+    assert _LEGACY_PRIVATE_PATH not in response.text
+
+
+@pytest.mark.asyncio
+async def test_guided_reenter_refuses_an_unbindable_exited_tip(tmp_path) -> None:
+    """Re-entry turns the retained review back into ACTIVE authoring authority,
+    so a tip whose review cannot bind (incident v13, exited) must be refused
+    before settlement (adversary Critical 2): 409 with a stable error_type, no
+    new version, reviewed_sources intact (a /state/revert to a bindable version
+    re-enables re-entry), and GET /state still serves the degraded projection."""
+    from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
+    from elspeth.web.composer.guided.state_machine import TurnRecord
+
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    exited = TerminalState(kind=TerminalKind.EXITED_TO_FREEFORM, reason=TerminalReason.USER_PRESSED_EXIT, pipeline_yaml=None)
+    state_data = _legacy_unbindable_guided_state(terminal=exited)
+    guided_d = deep_thaw(state_data.composer_meta)["guided_session"]
+    guided = replace(
+        GuidedSession.from_dict(guided_d),
+        history=(
+            TurnRecord(
+                step=GuidedStep.STEP_1_SOURCE,
+                turn_type=TurnType.INSPECT_AND_CONFIRM,
+                payload_hash="a" * 64,
+                response_hash=None,
+                emitter="server",
+            ),
+        ),
+    )
+    tip = await service.save_composition_state(
+        session.id,
+        replace(state_data, composer_meta={"guided_session": guided.to_dict()}),
+        provenance="post_compose",
+    )
+
+    response = client.post(f"/api/sessions/{session.id}/guided/reenter", json={"operation_id": str(uuid.uuid4())})
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["error_type"] == "guided_reenter_custody_unbindable"
+    assert detail["detail"] == (
+        "Guided mode can't resume: the files it reviewed are no longer the files this pipeline uses. "
+        "Restore an earlier version from Composition history, or keep working in freeform."
+    )
+    assert "binds" not in detail["detail"]
+    assert _LEGACY_PRIVATE_PATH not in response.text
+    current = await service.get_current_state(session.id)
+    assert current is not None
+    assert current.id == tip.id
+    persisted = GuidedSession.from_dict(deep_thaw(current.composer_meta)["guided_session"])
+    assert persisted.reviewed_sources == guided.reviewed_sources
+    assert persisted.terminal == exited
+    degraded = client.get(f"/api/sessions/{session.id}/state")
+    assert degraded.status_code == 200
+    assert degraded.json()["composer_meta"]["guided_session"]["custody_unavailable"] is True
+
+
+def test_send_message_post_persist_plain_audit_integrity_error_keeps_the_app_handler_surface(tmp_path) -> None:
+    """Only GuidedCustodyIntegrityError takes the failed-turn arm (fix round 1
+    F-A1): a plain AuditIntegrityError raised after the compose loop returned
+    falls through to the app-level handler exactly as at base, so non-custody
+    Tier-1 refusals keep their own diagnostics instead of a custody-shaped body."""
+    mock_composer = _make_composer_mock(response_text="Done.")
+    app, _service = _make_app(tmp_path)
+    app.state.composer_service = mock_composer
+    client = TestClient(app)
+    session_id = client.post("/api/sessions", json={"title": "Chat"}).json()["id"]
+
+    with (
+        patch(
+            "elspeth.web.sessions.routes.messages._pending_proposal_responses",
+            side_effect=AuditIntegrityError("post-persist non-custody refusal"),
+        ),
+        pytest.raises(AuditIntegrityError, match="post-persist non-custody refusal") as excinfo,
+    ):
+        client.post(f"/api/sessions/{session_id}/messages", json={"content": "Hello"})
+    assert excinfo.value.failed_turn is None
+
+
+@pytest.mark.asyncio
+async def test_state_versions_serves_a_degraded_row_for_a_legacy_unbindable_version(tmp_path) -> None:
+    """Fix round 1 F-A2: /state/versions never 409s the whole history and never
+    omits a row. A version whose projection cannot bind serves the degraded
+    projection (mask-all + custody_unavailable) beside untouched siblings, so
+    the user can see the history and pick a bindable version to restore."""
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    good = await service.save_composition_state(
+        session.id,
+        CompositionStateData(
+            sources={"clean": {"plugin": "csv", "on_success": "out", "options": {"path": "clean.csv"}, "on_validation_failure": "discard"}},
+            metadata_={"name": "Good", "description": ""},
+            is_valid=True,
+        ),
+        provenance="session_seed",
+    )
+    await _insert_legacy_composition_state(
+        service, session.id, _legacy_unbindable_guided_state(terminal=None), provenance="post_compose", version=2
+    )
+
+    response = client.get(f"/api/sessions/{session.id}/state/versions")
+
+    assert response.status_code == 200, response.text
+    rows = {row["version"]: row for row in response.json()}
+    assert set(rows) == {1, 2}
+    assert rows[1]["id"] == str(good.id)
+    assert rows[1]["sources"]["clean"]["options"]["path"] == "clean.csv"
+    assert "guided_session" not in (rows[1]["composer_meta"] or {})
+    degraded = rows[2]
+    assert degraded["composer_meta"]["guided_session"]["custody_unavailable"] is True
+    assert degraded["sources"]["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+    assert _LEGACY_PRIVATE_PATH not in response.text
+    # The single-tip read keeps its named 409 for the active-unbindable tip.
+    assert client.get(f"/api/sessions/{session.id}/state").status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_state_revert_onto_a_legacy_unbindable_row_gets_revert_specific_wording(tmp_path) -> None:
+    """Fix round 1 F-A2 (python P5): the refusal detail must not tell the user
+    to "revert to an earlier version" when the refused action IS a revert."""
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    await service.save_composition_state(
+        session.id,
+        CompositionStateData(metadata_={"name": "Good", "description": ""}, is_valid=True),
+        provenance="session_seed",
+    )
+    await _insert_legacy_composition_state(
+        service, session.id, _legacy_unbindable_guided_state(terminal=None), provenance="post_compose", version=2
+    )
+    versions = client.get(f"/api/sessions/{session.id}/state/versions").json()
+    bad_id = next(row["id"] for row in versions if row["version"] == 2)
+
+    revert = client.post(
+        f"/api/sessions/{session.id}/state/revert",
+        json={"operation_id": str(uuid.uuid4()), "state_id": bad_id},
+    )
+
+    assert revert.status_code == 409, revert.text
+    detail = revert.json()["detail"]
+    assert detail["error_type"] == "guided_custody_projection_failed"
+    assert "revert to an earlier version" not in detail["detail"]
+    assert detail["detail"] == (
+        "This version can't be restored: its guided source review no longer matches "
+        "the files this pipeline uses. Choose a different version from Composition history."
+    )
+    assert _LEGACY_PRIVATE_PATH not in revert.text

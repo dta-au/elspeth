@@ -324,11 +324,12 @@ def _composition_state_response(
     state: CompositionStateRecord,
     descriptor: GuidedResponseDescriptor,
 ) -> CompositionStateResponse:
-    sources = deep_thaw(state.sources)
+    raw_sources = deep_thaw(state.sources)
+    sources = raw_sources
     if sources is not None:
         sources = redact_source_storage_path({"sources": sources})["sources"]
     composer_meta = deep_thaw(state.composer_meta) if state.composer_meta is not None else None
-    sources, composer_meta = redact_guided_snapshot_storage_paths(sources, composer_meta)
+    sources, composer_meta = redact_guided_snapshot_storage_paths(sources, composer_meta, raw_sources=raw_sources)
     expected_errors = guided_validation_errors(is_valid=state.is_valid)
     if state.validation_errors != expected_errors:
         raise AuditIntegrityError("Guided result state has an invalid closed validation status")

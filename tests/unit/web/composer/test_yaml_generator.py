@@ -1770,6 +1770,67 @@ class TestGuidedTerminalProofDirectionSplit:
         with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
             derive_guided_blob_refs_for_admission_proof(state)
 
+    @pytest.mark.parametrize("terminal_kind", ["exited", "completed"])
+    def test_three_consumers_disagree_on_unbindable_terminal_history(self, terminal_kind: str) -> None:
+        """One shape, three directions (epic elspeth-c1b8b26d32; elspeth-201903a286).
+
+        A terminal session whose retained review can no longer bind to the live
+        sources (the reviewed name was replaced after the terminal) reaches:
+
+        * export — ``reattach_guided_blob_refs_for_public_export``: identity
+          for EXITED (exited history must not shadow a replaced source); strict
+          raise for COMPLETED (the completed pipeline is still the authored one);
+        * admission — ``derive_guided_blob_refs_for_admission_proof``:
+          ``custody_unavailable=True`` for EXITED (blocks, never admits an
+          unproven source); strict raise for COMPLETED;
+        * projection — ``redact_guided_snapshot_storage_paths`` on BOTH
+          terminals: degraded, every carrier masked, named with
+          ``custody_unavailable: true``. Its two consumers are
+          ``routes/_helpers._state_response`` and
+          ``sessions/guided_replay._composition_state_response`` (the guided
+          settlement replays), which pass the same raw sources.
+
+        A future re-unification of the predicate fails this test loudly.
+        """
+        from elspeth.web.composer.redaction import (
+            REDACTED_BLOB_SOURCE_PATH,
+            redact_guided_snapshot_storage_paths,
+            redact_source_storage_path,
+        )
+        from elspeth.web.composer.yaml_generator import (
+            derive_guided_blob_refs_for_admission_proof,
+            reattach_guided_blob_refs_for_public_export,
+        )
+
+        terminal = self._exited_terminal() if terminal_kind == "exited" else self._completed_terminal()
+        base = self._guided_state(terminal)
+        state = replace(base, sources={"renamed": base.sources["source"]})
+        storage_path = base.sources["source"].options["path"]
+
+        if terminal_kind == "exited":
+            assert reattach_guided_blob_refs_for_public_export(state) is state
+            derivation = derive_guided_blob_refs_for_admission_proof(state)
+            assert derivation.custody_unavailable is True
+            assert derivation.proof_state is state
+        else:
+            with pytest.raises(AuditIntegrityError, match="guided blob"):
+                reattach_guided_blob_refs_for_public_export(state)
+            with pytest.raises(AuditIntegrityError, match="guided blob"):
+                derive_guided_blob_refs_for_admission_proof(state)
+
+        assert state.guided_session is not None
+        raw_sources = state.to_dict()["sources"]
+        composer_meta = {"guided_session": state.guided_session.to_dict()}
+        generic = redact_source_storage_path({"sources": raw_sources})["sources"]
+        projected_sources, projected_meta = redact_guided_snapshot_storage_paths(generic, composer_meta, raw_sources=raw_sources)
+
+        assert projected_meta is not None and projected_sources is not None
+        assert projected_meta["guided_session"]["custody_unavailable"] is True
+        assert projected_sources["renamed"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+        assert storage_path not in repr((projected_sources, projected_meta))
+        # Projection-only: the durable state never carries the marker.
+        assert "custody_unavailable" not in state.guided_session.to_dict()
+
 
 class TestConditionalKeyGuards:
     """Conditionally-emitted node keys are read through a guarded accessor.

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from uuid import uuid4
 
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, GuidedCustodyIntegrityError
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
@@ -43,6 +43,7 @@ from elspeth.web.composer.guided.state_machine import (
 )
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.redaction import assert_guided_custody_persistable
 from elspeth.web.composer.source_inspection import (
     SOURCE_INSPECTION_INTEGRITY_ERRORS,
     SourceInspectionBlobLifecycleError,
@@ -102,6 +103,7 @@ from .._helpers import (
     CompositionState,
     CompositionStateData,
     CompositionStateRecord,
+    CompositionStateResponse,
     ControlSignal,
     Depends,
     GetGuidedResponse,
@@ -133,6 +135,7 @@ from .._helpers import (
     _get_session_compose_lock_registry,
     _initial_composition_state_with_guided_session,
     _inspect_latest_ready_session_blob,
+    _named_guided_custody_projection,
     _replace,
     _request_plugin_policy_context,
     _safe_frame_strings,
@@ -907,6 +910,10 @@ async def get_guided(
         # rebuild) and the payload_hash matches what was recorded on first visit.
         terminal = guided.terminal
         shield_available = _resolve_shield_available(plugin_snapshot)
+        composition_state_out: CompositionStateResponse | None = None
+        if state_record_out is not None:
+            with _named_guided_custody_projection():
+                composition_state_out = _state_response(state_record_out, policy_catalog=catalog)
         return GetGuidedResponse(
             guided_session=GuidedSessionResponse(
                 step=guided.step.value,
@@ -952,7 +959,7 @@ async def get_guided(
             )
             if terminal is not None
             else None,
-            composition_state=_state_response(state_record_out, policy_catalog=catalog) if state_record_out is not None else None,
+            composition_state=composition_state_out,
         )
 
 
@@ -1039,7 +1046,8 @@ async def post_guided_reenter(
                     purpose="turn",
                 ),
             )
-        response = project_guided_response(record, payloads=payloads)
+        with _named_guided_custody_projection():
+            response = project_guided_response(record, payloads=payloads)
         if type(response) is not GetGuidedResponse:
             raise AuditIntegrityError("Guided re-entry projection returned the wrong response type")
         return response
@@ -1147,6 +1155,26 @@ async def post_guided_reenter(
                 status_code=409,
                 detail="Guided session cannot be re-entered because no current turn record exists.",
             )
+        # Re-entry makes the retained review ACTIVE authoring authority again
+        # (on both the restored-COMPLETED and the active branch below), so it
+        # must bind to the tip's sources exactly as the write gate demands of
+        # an active session; a degraded (custody_unavailable) projection is
+        # never re-entered. Reviewed sources stay intact on refusal — a
+        # /state/revert to a bindable version re-enables re-entry.
+        custody_probe = guided.to_dict()
+        custody_probe["terminal"] = None
+        try:
+            assert_guided_custody_persistable(deep_thaw(state_record.sources), {"guided_session": custody_probe})
+        except GuidedCustodyIntegrityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_type": "guided_reenter_custody_unbindable",
+                    "detail": "Guided mode can't resume: the files it reviewed are no longer the files "
+                    "this pipeline uses. Restore an earlier version from Composition history, or keep "
+                    "working in freeform.",
+                },
+            ) from exc
         existing_meta: dict[str, Any] = {}
         if state_record.composer_meta is not None:
             existing_meta = dict(deep_thaw(state_record.composer_meta))
@@ -1432,6 +1460,10 @@ async def post_guided_start(
             if terminal is not None
             else None
         )
+        # A replay serves the operation's stored state row, which can predate
+        # the write gate; name a custody projection failure instead of a 500.
+        with _named_guided_custody_projection():
+            composition_state = _state_response(record, policy_catalog=catalog)
         return GetGuidedResponse(
             guided_session=GuidedSessionResponse(
                 step=guided.step.value,
@@ -1469,7 +1501,7 @@ async def post_guided_start(
                 shield_available=_resolve_shield_available(plugin_snapshot),
             ),
             terminal=terminal_response,
-            composition_state=_state_response(record, policy_catalog=catalog),
+            composition_state=composition_state,
         )
 
     async def _verify_start_root(record: CompositionStateRecord) -> None:
@@ -1804,6 +1836,10 @@ async def post_guided_convert(
             if terminal is not None
             else None
         )
+        # A replay serves the operation's stored state row, which can predate
+        # the write gate; name a custody projection failure instead of a 500.
+        with _named_guided_custody_projection():
+            composition_state = _state_response(record, policy_catalog=catalog)
         return GetGuidedResponse(
             guided_session=GuidedSessionResponse(
                 step=guided.step.value,
@@ -1841,7 +1877,7 @@ async def post_guided_convert(
                 shield_available=_resolve_shield_available(plugin_snapshot),
             ),
             terminal=terminal_response,
-            composition_state=_state_response(record, policy_catalog=catalog),
+            composition_state=composition_state,
         )
 
     async def _replay(result: object) -> GetGuidedResponse:
@@ -2707,7 +2743,8 @@ async def post_guided_respond(
         payloads: tuple[PreparedGuidedJsonPayload, ...] = ()
         if descriptor.next_turn is not None:
             payloads = (load_guided_json_payload(payload_store, payload_id=descriptor.next_turn.payload_id, purpose="turn"),)
-        response = project_guided_response(record, payloads=payloads)
+        with _named_guided_custody_projection():
+            response = project_guided_response(record, payloads=payloads)
         if type(response) is not GuidedRespondResponse:
             raise AuditIntegrityError("Guided RESPOND projection returned the wrong response type")
         return response

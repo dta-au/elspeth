@@ -963,6 +963,10 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tools/_common.py:diff_states:return"
   - "src/elspeth/web/composer/redaction.py:redact_source_storage_path:state_dict"
   - "src/elspeth/web/composer/redaction.py:redact_source_storage_path:return"
+  # Same serialized source.options dict, copied as the base the guided custody
+  # masks land on (elspeth-75d320fb25).
+  - "src/elspeth/web/composer/redaction.py:_projected_source_options:return"
+  - "src/elspeth/web/composer/redaction.py:_mask_option_carriers:return"
   # Planner-visible projection of a serialized CompositionState (elspeth-c67fbbbd83):
   # same serialized-state dict shape as redact_source_storage_path above.
   - "src/elspeth/web/composer/prompts.py:project_server_owned_option_metadata:serialized"

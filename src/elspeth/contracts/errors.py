@@ -988,6 +988,20 @@ class AuditIntegrityError(Exception):
         self.failed_turn = failed_turn
 
 
+@tier_1_error(
+    reason="ADR-008: guided reviewed-source custody cannot bind to the live sources — the audit trail's source provenance is unprovable",
+    caller_module=__name__,
+)
+class GuidedCustodyIntegrityError(AuditIntegrityError):
+    """Raised when a guided session's retained source review cannot bind.
+
+    Every guided blob custody validator and the custody projection raise this
+    subclass so a read arm can name the condition (a stable 409 on a legacy
+    tip persisted before the write gate) without catching the whole
+    ``AuditIntegrityError`` family as if it were custody.
+    """
+
+
 # TIER-2: Authoring-state lowering defect — the state is malformed, no audit mutation has begun, and the author can repair and retry.
 class PipelineLoweringError(ValueError):
     """Raised when a composition state cannot be lowered to runtime pipeline YAML.
