@@ -13510,7 +13510,13 @@ async def test_legacy_active_unbindable_tip_reads_are_named_409s(tmp_path) -> No
     for path in (f"/api/sessions/{session.id}/state", f"/api/sessions/{session.id}/guided"):
         response = client.get(path)
         assert response.status_code == 409, (path, response.text)
-        assert response.json()["detail"]["error_type"] == "guided_custody_projection_failed"
+        detail = response.json()["detail"]
+        assert detail["error_type"] == "guided_custody_projection_failed"
+        assert detail["detail"] == (
+            "This session's retained guided source review no longer matches the files this pipeline uses; "
+            "restore an earlier version from Composition history to continue."
+        )
+        assert "binds" not in detail["detail"]
         assert _LEGACY_PRIVATE_PATH not in response.text
 
     revert = client.post(

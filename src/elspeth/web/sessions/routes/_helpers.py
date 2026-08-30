@@ -900,7 +900,8 @@ def merge_composer_meta_updates(
 
 GUIDED_CUSTODY_PROJECTION_FAILED = "guided_custody_projection_failed"
 GUIDED_CUSTODY_PROJECTION_FAILED_DETAIL = (
-    "This session's retained guided source review no longer binds to its sources; revert to an earlier version to continue."
+    "This session's retained guided source review no longer matches the files this pipeline uses; "
+    "restore an earlier version from Composition history to continue."
 )
 GUIDED_CUSTODY_REVERT_REFUSED_DETAIL = (
     "This version can't be restored: its guided source review no longer matches "
