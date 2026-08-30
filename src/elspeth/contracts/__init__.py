@@ -67,7 +67,7 @@ from elspeth.contracts.barrier_scalars import (
     BarrierScalars,
     CoalescePendingScalars,
 )
-from elspeth.contracts.batch_runtime import BatchTransformRuntimeProtocol
+from elspeth.contracts.batch_runtime import BatchTransformRuntime
 from elspeth.contracts.call_data import (
     CallPayload,
     HTTPCallError,
@@ -594,7 +594,7 @@ __all__ = [  # Grouped by category for readability
     "TransformErrorToken",
     "ValidationErrorToken",
     # plugin protocols
-    "BatchTransformRuntimeProtocol",
+    "BatchTransformRuntime",
     "BatchTransformProtocol",
     "SinkEffectProtocol",
     "SinkEffectContract",

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 import elspeth.contracts.errors as contract_errors
+from elspeth.contracts.batch_runtime import BatchTransformRuntime
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.plugins.infrastructure.batching.ports import OutputPort
 from elspeth.plugins.infrastructure.batching.row_reorder_buffer import (
@@ -38,7 +39,7 @@ if TYPE_CHECKING:
 _logger = structlog.get_logger(__name__)
 
 
-class BatchTransformMixin:
+class BatchTransformMixin(BatchTransformRuntime):
     """Mixin that adds concurrent sub-task processing to any transform.
 
     This mixin enables processing work items concurrently within a single row
