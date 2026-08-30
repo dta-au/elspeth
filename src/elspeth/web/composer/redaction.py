@@ -4185,6 +4185,7 @@ def redact_guided_snapshot_storage_paths(
     composer_meta: Mapping[str, Any] | None,
     *,
     raw_sources: Mapping[str, Any] | None = None,
+    degrade_unbindable: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Redact schema-8 reviewed source paths using each source's blob binding.
 
@@ -4199,6 +4200,12 @@ def redact_guided_snapshot_storage_paths(
     ``blob_ref``-bearing live carrier to a literal, so correlating on its output
     compares a reviewed private path against the literal and rejects a consistent
     fork-rehydrated binding (elspeth-75d320fb25). Omitted, ``sources`` is both.
+
+    ``degrade_unbindable=True`` extends the terminal degrade to ACTIVE
+    sessions for read-only history surfaces (/state/versions): a custody
+    failure serves the masked, ``custody_unavailable``-named projection
+    instead of raising. Never used on a surface that feeds
+    ``guided_response_hash`` or authoring authority.
     """
     sources_out = dict(sources) if sources is not None else None
     meta_out = dict(composer_meta) if composer_meta is not None else None
@@ -4215,7 +4222,7 @@ def redact_guided_snapshot_storage_paths(
     # Persisted checkpoints always carry ``terminal``; an absent key is the
     # pre-terminal fixture shape and means an active session.
     terminal = TerminalState.from_dict(guided["terminal"]) if "terminal" in guided and guided["terminal"] is not None else None
-    if terminal is None:
+    if terminal is None and not degrade_unbindable:
         return _correlate_guided_snapshot_storage_paths(sources, composer_meta, raw_sources)
     # A terminal session (exited to freeform, or completed) has left guided
     # authoring, so the retained review history is no longer a binding custody

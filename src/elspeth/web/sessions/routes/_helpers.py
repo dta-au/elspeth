@@ -703,6 +703,7 @@ def _state_response(
     live_validation: ValidationSummary | None = None,
     *,
     policy_catalog: PolicyCatalogView | None = None,
+    degrade_unbindable_custody: bool = False,
 ) -> CompositionStateResponse:
     """Convert a CompositionStateRecord to a CompositionStateResponse.
 
@@ -735,7 +736,12 @@ def _state_response(
     # is blob-backed) to mask the storage_path in both the snapshot and the
     # committed source before either reaches the wire.
     composer_meta_data = deep_thaw(state.composer_meta) if state.composer_meta is not None else None
-    sources_data, composer_meta_data = redact_guided_snapshot_storage_paths(sources_data, composer_meta_data, raw_sources=raw_sources)
+    sources_data, composer_meta_data = redact_guided_snapshot_storage_paths(
+        sources_data,
+        composer_meta_data,
+        raw_sources=raw_sources,
+        degrade_unbindable=degrade_unbindable_custody,
+    )
 
     return CompositionStateResponse(
         id=str(state.id),
@@ -896,10 +902,14 @@ GUIDED_CUSTODY_PROJECTION_FAILED = "guided_custody_projection_failed"
 GUIDED_CUSTODY_PROJECTION_FAILED_DETAIL = (
     "This session's retained guided source review no longer binds to its sources; revert to an earlier version to continue."
 )
+GUIDED_CUSTODY_REVERT_REFUSED_DETAIL = (
+    "This version can't be restored: its guided source review no longer matches "
+    "the files this pipeline uses. Choose a different version from Composition history."
+)
 
 
 @contextlib.contextmanager
-def _named_guided_custody_projection() -> Iterator[None]:
+def _named_guided_custody_projection(detail: str = GUIDED_CUSTODY_PROJECTION_FAILED_DETAIL) -> Iterator[None]:
     """Name a custody-unbindable tip's read refusal instead of a bare 500.
 
     Only a tip persisted BEFORE the write gate (elspeth-4c442aaaa8) can still
@@ -911,7 +921,7 @@ def _named_guided_custody_projection() -> Iterator[None]:
     except GuidedCustodyIntegrityError as exc:
         raise HTTPException(
             status_code=409,
-            detail={"error_type": GUIDED_CUSTODY_PROJECTION_FAILED, "detail": GUIDED_CUSTODY_PROJECTION_FAILED_DETAIL},
+            detail={"error_type": GUIDED_CUSTODY_PROJECTION_FAILED, "detail": detail},
         ) from exc
 
 

@@ -657,6 +657,7 @@ async def _insert_legacy_composition_state(
     state: CompositionStateData,
     *,
     provenance: str,
+    version: int = 1,
 ) -> None:
     """Seed a composition_states row exactly as a pre-gate deployment persisted it.
 
@@ -672,7 +673,7 @@ async def _insert_legacy_composition_state(
                 insert(composition_states_table).values(
                     id=str(uuid.uuid4()),
                     session_id=str(session_id),
-                    version=1,
+                    version=version,
                     source=None,
                     sources=_enveloped_state_column(state.sources),
                     nodes=_enveloped_state_column(state.nodes),
@@ -13506,7 +13507,7 @@ async def test_legacy_active_unbindable_tip_reads_are_named_409s(tmp_path) -> No
     tip = await service.get_current_state(session.id)
     assert tip is not None
 
-    for path in (f"/api/sessions/{session.id}/state", f"/api/sessions/{session.id}/state/versions", f"/api/sessions/{session.id}/guided"):
+    for path in (f"/api/sessions/{session.id}/state", f"/api/sessions/{session.id}/guided"):
         response = client.get(path)
         assert response.status_code == 409, (path, response.text)
         assert response.json()["detail"]["error_type"] == "guided_custody_projection_failed"
@@ -13610,3 +13611,75 @@ def test_send_message_post_persist_plain_audit_integrity_error_keeps_the_app_han
     ):
         client.post(f"/api/sessions/{session_id}/messages", json={"content": "Hello"})
     assert excinfo.value.failed_turn is None
+
+
+@pytest.mark.asyncio
+async def test_state_versions_serves_a_degraded_row_for_a_legacy_unbindable_version(tmp_path) -> None:
+    """Fix round 1 F-A2: /state/versions never 409s the whole history and never
+    omits a row. A version whose projection cannot bind serves the degraded
+    projection (mask-all + custody_unavailable) beside untouched siblings, so
+    the user can see the history and pick a bindable version to restore."""
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    good = await service.save_composition_state(
+        session.id,
+        CompositionStateData(
+            sources={"clean": {"plugin": "csv", "on_success": "out", "options": {"path": "clean.csv"}, "on_validation_failure": "discard"}},
+            metadata_={"name": "Good", "description": ""},
+            is_valid=True,
+        ),
+        provenance="session_seed",
+    )
+    await _insert_legacy_composition_state(
+        service, session.id, _legacy_unbindable_guided_state(terminal=None), provenance="post_compose", version=2
+    )
+
+    response = client.get(f"/api/sessions/{session.id}/state/versions")
+
+    assert response.status_code == 200, response.text
+    rows = {row["version"]: row for row in response.json()}
+    assert set(rows) == {1, 2}
+    assert rows[1]["id"] == str(good.id)
+    assert rows[1]["sources"]["clean"]["options"]["path"] == "clean.csv"
+    assert "guided_session" not in (rows[1]["composer_meta"] or {})
+    degraded = rows[2]
+    assert degraded["composer_meta"]["guided_session"]["custody_unavailable"] is True
+    assert degraded["sources"]["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+    assert _LEGACY_PRIVATE_PATH not in response.text
+    # The single-tip read keeps its named 409 for the active-unbindable tip.
+    assert client.get(f"/api/sessions/{session.id}/state").status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_state_revert_onto_a_legacy_unbindable_row_gets_revert_specific_wording(tmp_path) -> None:
+    """Fix round 1 F-A2 (python P5): the refusal detail must not tell the user
+    to "revert to an earlier version" when the refused action IS a revert."""
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    await service.save_composition_state(
+        session.id,
+        CompositionStateData(metadata_={"name": "Good", "description": ""}, is_valid=True),
+        provenance="session_seed",
+    )
+    await _insert_legacy_composition_state(
+        service, session.id, _legacy_unbindable_guided_state(terminal=None), provenance="post_compose", version=2
+    )
+    versions = client.get(f"/api/sessions/{session.id}/state/versions").json()
+    bad_id = next(row["id"] for row in versions if row["version"] == 2)
+
+    revert = client.post(
+        f"/api/sessions/{session.id}/state/revert",
+        json={"operation_id": str(uuid.uuid4()), "state_id": bad_id},
+    )
+
+    assert revert.status_code == 409, revert.text
+    detail = revert.json()["detail"]
+    assert detail["error_type"] == "guided_custody_projection_failed"
+    assert "revert to an earlier version" not in detail["detail"]
+    assert detail["detail"] == (
+        "This version can't be restored: its guided source review no longer matches "
+        "the files this pipeline uses. Choose a different version from Composition history."
+    )
+    assert _LEGACY_PRIVATE_PATH not in revert.text

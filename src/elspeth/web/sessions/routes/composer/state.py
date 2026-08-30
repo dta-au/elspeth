@@ -33,6 +33,7 @@ from elspeth.web.sessions.routes.guided_operations import (
 )
 
 from .._helpers import (
+    GUIDED_CUSTODY_REVERT_REFUSED_DETAIL,
     UTC,
     UUID,
     Any,
@@ -477,8 +478,11 @@ async def get_state_versions(
     service = request.app.state.session_service
     catalog, _snapshot = _request_plugin_policy_context(request, user)
     versions = await service.get_state_versions(session.id, limit=limit, offset=offset)
-    with _named_guided_custody_projection():
-        return [_state_response(v, policy_catalog=catalog) for v in versions]
+    # Never 409 the whole history and never omit a row: a version whose custody
+    # cannot bind serves the degraded (masked, custody_unavailable-named)
+    # projection beside untouched siblings, so a bindable version stays
+    # reachable for restore. The single-tip GET /state keeps its named 409.
+    return [_state_response(v, policy_catalog=catalog, degrade_unbindable_custody=True) for v in versions]
 
 
 @router.post(
@@ -520,7 +524,7 @@ async def revert_state(
         if type(result) is not GuidedCompositionStateResult:
             raise AuditIntegrityError("State revert replay has a non-state result locator")
         replay_state = await service.get_state_in_session(result.state_id, session.id)
-        with _named_guided_custody_projection():
+        with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
             return _state_response(replay_state, policy_catalog=catalog)
 
     reserved = await reserve_or_replay_guided_operation(
@@ -537,7 +541,7 @@ async def revert_state(
 
     async with compose_lock:
         try:
-            with _named_guided_custody_projection():
+            with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
                 new_state = await service.revert_state_for_guided_operation(
                     reserved.fence,
                     state_id=body.state_id,
@@ -556,7 +560,7 @@ async def revert_state(
             )
             raise_guided_operation_failure(failure)
 
-    with _named_guided_custody_projection():
+    with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
         return _state_response(new_state, policy_catalog=catalog)
 
 
