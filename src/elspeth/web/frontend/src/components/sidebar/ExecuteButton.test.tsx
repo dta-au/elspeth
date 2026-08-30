@@ -1322,6 +1322,53 @@ describe("buildRunEgressSummary", () => {
     expect(lines.map((line) => line.identifiers)).toEqual([
       "Sends one authored prompt to the configured LLM: source (model bedrock/anthropic.claude-3-haiku-20240307-v1:0).",
     ]);
+    // An LLM SOURCE's binding label is unchanged in both registers BY DESIGN
+    // (it establishes egress safety, and phrasing an operator-chosen token
+    // would make it look like a product name), so `modelDisplayName` never
+    // runs on this line. Pinned so the two registers cannot silently diverge
+    // here — the node path, where the phrasing does run, is pinned separately.
+    // The component NAME still switches register ("Source" vs "source"); it is
+    // the model binding that is carried through verbatim.
+    expect(lines.map((line) => line.text)).toEqual([
+      "Sends one authored prompt to the configured LLM: Source (model bedrock/anthropic.claude-3-haiku-20240307-v1:0).",
+    ]);
+  });
+
+  it("carries a non-wordish model id raw into the reader register rather than mangling it", () => {
+    // The consent surface the review named: an LLM NODE's model goes through
+    // `modelDisplayName`, and a Bedrock id used to read "(model
+    // Anthropic.claude 3 Haiku 20240307 V1:0 via bedrock)" — a date stamp and
+    // a version suffix title-cased as if they were words. On a dialog whose
+    // whole job is earning consent, a garbled model name undermines the trust
+    // the phrasing exists to build. The provider path is still split off, so
+    // the guard changed the PHRASING only.
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          source: { plugin: "csv", options: {}, on_success: "classify_in", on_validation_failure: "discard" },
+        },
+        nodes: [
+          {
+            id: "classify",
+            node_type: "transform",
+            plugin: "llm",
+            input: "classify_in",
+            on_success: "results",
+            on_error: null,
+            options: { model: "bedrock/anthropic.claude-3-haiku-20240307-v1:0" },
+          },
+        ],
+        outputs: [{ name: "results", plugin: "csv", options: {} }],
+      }),
+    );
+
+    expect(lines.map((line) => line.text)).toContain(
+      "Sends rows to the configured LLM: Classify (model anthropic.claude-3-haiku-20240307-v1:0 via bedrock).",
+    );
+    // The identifier register is untouched by the guard: it never phrased.
+    expect(lines.map((line) => line.identifiers)).toContain(
+      "Sends rows to the configured LLM: classify (model bedrock/anthropic.claude-3-haiku-20240307-v1:0).",
+    );
   });
 
   it("shows only the authored profile alias and never private resolved values", () => {
