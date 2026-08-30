@@ -245,7 +245,12 @@ defaults:
     # for the one extra file — honest accounting of the split, not new defensive
     # surface. The 10 in-place fingerprint rotations and 2 R4 + 1 R5 fingerprinted
     # entries this merge also rotated/added stay within the allow_hits ceilings.
-    max_per_file_rules: 99
+    # 2026-08-30: 99 → 82 — deleted the 3 per_file_rules that covered zero findings
+    # (contracts/identity.py R5, plugins/sinks/database_sink.py R5,
+    # web/composer/tools/_common.py R1); no findings surfaced
+    # (docs/plans/2026-08-30-per-file-blanket-migration-tools/blanket_census.py
+    # unused_blankets). Plan: docs/plans/2026-08-30-per-file-blanket-migration.md.
+    max_per_file_rules: 82
     # Bumped from 95 → 98 on 2026-05-30: collapsed 17 fragile per-fingerprint
     # allow_hits entries for web/composer/tools/_common.py into 3 durable
     # per_file_rules (R1/R5/R9) after an import addition rotated every one of

@@ -27,13 +27,6 @@ per_file_rules:
     (classify_runtime_type) variants
   expires: null
   max_hits: 14
-- pattern: contracts/identity.py
-  rules:
-  - R5
-  reason: Tier 1 __post_init__ type guards — validates row_id, token_id, and optional
-    lineage fields are str
-  expires: null
-  max_hits: 1
 - pattern: contracts/audit.py
   rules:
   - R5
