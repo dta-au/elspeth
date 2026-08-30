@@ -142,9 +142,13 @@ describe("routingPhrase", () => {
     // The other half of the pin: if the marker leaked onto the resolved arm it
     // would be noise on every healthy card, and the distinction it exists to
     // draw would be gone in the other direction.
-    expect(routingPhrase(state, index, "on_success", "raw_rows").text).not.toContain(
-      "not connected",
-    );
+    // Asserted as an EQUALITY, not a `?.text` not-to-contain: optional
+    // chaining would make this pass vacuously the day the resolved arm starts
+    // returning null, which is the direction a regression here would take.
+    expect(routingPhrase(state, index, "on_success", "raw_rows")).toEqual({
+      text: "Extract Invoice",
+      raw: "raw_rows",
+    });
   });
 
   it("never marks the fork/discard sentinels, which are not connections at all", () => {
