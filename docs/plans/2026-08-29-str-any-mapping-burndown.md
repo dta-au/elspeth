@@ -305,7 +305,7 @@ Lane brief (copy verbatim into every subagent prompt, then append the bucket's f
 - [ ] **Wave 2** (`web/composer`, `web/sessions`, `composer_mcp` — 27 buckets, 1,207 sites): same dispatch; `fable` on `redaction.py`, `sessions/*`, `secrets`, `auth`, `blobs`. These files are the composer's authoring path — **Composer invariants apply**: a type change must not add a server-side path around the provider; if a `dict[str, Any]` is a planner tool payload, the owned type is the wire shape the planner already emits, nothing narrower.
 - [ ] **Wave-2 merge**: as Wave 1, plus the composer parity gate (`scripts/cicd/parity_harness.py`) and the whole-tree wire-shape gates named in recent-code-hints.
 - [ ] **Wave 3** (`web/*` remainder, `web/plugin_policy`, `web/execution`, `web/catalog`, `web/auth` — 11 buckets, 165 sites): same; `fable` on `auth`, `secrets`.
-- [ ] **Wave-3 merge**: as above; full suite; `wardline scan . --fail-on ERROR --fail-on-inert --trust-pack scripts.wardline_pack --allow-custom-packs --local-only` (type changes at Tier-3 boundaries are exactly what it audits).
+- [ ] **Wave-3 merge**: as above; full suite; compare the `trust_tier.tier_model` finding-corpus **count** before/after the wave (`ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing elspeth-lints check --rules trust_tier.tier_model --root src/elspeth`) — type changes at Tier-3 boundaries are exactly what it audits; the count must not grow.
 
 ### Task 6: Residue round
 

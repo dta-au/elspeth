@@ -612,20 +612,6 @@ the same commit; the rules live there, the history lives here.
      entries also report stale in that run (their files are absent from `$T`) — only lines naming
      your file are evidence. Carry a dead entry's reasoning onto a live `ast=` key and flag the dead
      key for pruning (elspeth-obs-07866fb4e4); never hand-edit the YAML.
-  3. Do not run wardline through `mcp__wardline__*` from a worktree lane. The MCP server is launched
-     from the MAIN checkout by `.mcp.json`, and its `path` argument is documented as "subdir relative
-     to project root" — so a path-scoped scan resolves into main, not the worktree: the same
-     split-tree confidently-wrong answer as the `PYTHONPATH` traps, and silent. Measured:
-     `mcp__wardline__scan` on `src/elspeth/web/composer/tools` returned 0 active defects AND
-     `resolution.inert: true` (0 trust boundaries recognised) for a subtree carrying five
-     `@trust_boundary` decorators, while the CLI run from inside the worktree recognised 199
-     boundaries tree-wide and passed `--fail-on-inert`. (Inertness there could be the wrong tree or
-     path-scoped pack resolution — not disentangled; either way the result is void.) The gate of
-     record from inside the worktree was `wardline scan . --fail-on ERROR --fail-on-inert
-     --trust-pack scripts.wardline_pack --allow-custom-packs --local-only`, whose binary is
-     `~/.local/bin/wardline`, NOT `.venv/bin/wardline` (exit 127) — and `wardline` is not importable
-     from the venv either. Corollary: an `inert: true` wardline result is never evidence, whatever
-     its active count.
   See [CONTRIBUTING: Convention: lints and tier-model tooling](../../CONTRIBUTING.md#convention-lints-and-tier-model-tooling).
 
 - **2026-08-29 — mypy gives `type(x) is C` NO negative-branch narrowing on a union, so the exact-type idiom is not a drop-in for `isinstance` when the ELSE branch reads the other arm**
