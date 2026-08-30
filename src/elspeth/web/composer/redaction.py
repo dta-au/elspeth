@@ -4230,6 +4230,37 @@ def redact_guided_snapshot_storage_paths(
         return _degrade_guided_snapshot_storage_paths(sources, composer_meta)
 
 
+def assert_guided_custody_persistable(
+    sources: Mapping[str, Any] | None,
+    composer_meta: Mapping[str, Any] | None,
+) -> None:
+    """Refuse to persist an active guided session whose custody cannot bind.
+
+    Takes the same raw serialized inputs the projection correlates on, so the
+    write gate and the read projection agree by construction: whatever this
+    admits, ``redact_guided_snapshot_storage_paths`` projects, and a pair it
+    refuses would have re-raised on every later read of the persisted tip.
+    No guided snapshot or a populated terminal passes (the projection degrades
+    a terminal pair instead); an active pair runs the strict correlation.
+    """
+    if composer_meta is None or "guided_session" not in composer_meta:
+        return
+    guided = composer_meta["guided_session"]
+    if guided is None:
+        return
+    if type(guided) is not dict:
+        raise ValueError("assert_guided_custody_persistable: composer_meta.guided_session must be a dict")
+    # The custody claim lives in the schema-8 review keys; a checkpoint that
+    # carries neither makes no claim for this gate to bind (its other shape
+    # defects stay the read side's to refuse, exactly as before the gate).
+    if "reviewed_sources" not in guided or "pending_source_intents" not in guided:
+        return
+    if "terminal" in guided and guided["terminal"] is not None:
+        TerminalState.from_dict(guided["terminal"])
+        return
+    _correlate_guided_snapshot_storage_paths(sources, composer_meta, sources)
+
+
 def _mask_option_carriers(options: Mapping[str, Any]) -> dict[str, Any]:
     masked = dict(options)
     for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:

@@ -1453,3 +1453,67 @@ def test_redact_guided_snapshot_rejects_malformed_terminal_before_degrading() ->
     sources, composer_meta = _two_guided_committed_sources_repointed_after_exit({"kind": "exited_to_freeform"})
     with pytest.raises(InvariantError, match=r"TerminalState\.from_dict"):
         _project(sources, composer_meta)
+
+
+def _incident_active_shape() -> tuple[dict[str, Any], dict[str, Any]]:
+    private = "/srv/elspeth/data/blobs/s1/50f5b3e9-f52f-4c5f-98df-a20ec7b2627b_colours.csv"
+    sources = {"source": {"plugin": "csv", "options": {"path": private, "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"}}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "11111111-1111-4111-8111-111111111111": {
+                    "name": "source",
+                    "plugin": "csv",
+                    "options": {"path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f"},
+                }
+            },
+            "pending_source_intents": {},
+            "terminal": None,
+        }
+    }
+    return sources, composer_meta
+
+
+def test_assert_guided_custody_persistable_passes_without_a_guided_snapshot() -> None:
+    from elspeth.web.composer.redaction import assert_guided_custody_persistable
+
+    sources, _meta = _incident_active_shape()
+    assert_guided_custody_persistable(sources, None)
+    assert_guided_custody_persistable(sources, {"repair_turns_used": 0})
+    assert_guided_custody_persistable(None, None)
+
+
+def test_assert_guided_custody_persistable_rejects_an_active_unbindable_pair() -> None:
+    from elspeth.web.composer.redaction import assert_guided_custody_persistable
+
+    sources, composer_meta = _incident_active_shape()
+    with pytest.raises(AuditIntegrityError, match="guided blob"):
+        assert_guided_custody_persistable(sources, composer_meta)
+
+
+@_TERMINALS
+def test_assert_guided_custody_persistable_passes_terminal_pairs_that_project_degraded(terminal: dict[str, Any]) -> None:
+    from elspeth.web.composer.redaction import assert_guided_custody_persistable
+
+    sources, composer_meta = _incident_active_shape()
+    composer_meta["guided_session"]["terminal"] = terminal
+    assert_guided_custody_persistable(sources, composer_meta)
+    assert _project(sources, composer_meta)[1]["guided_session"]["custody_unavailable"] is True
+
+
+def test_assert_guided_custody_persistable_agrees_with_projection_on_the_fork_shape() -> None:
+    """Gate and projection consume the same raw inputs, so the fork-rehydrated
+    explicit-blob_ref shape that the projection accepts is also persistable, and
+    the shape the projection rejects in an active session is not."""
+    from elspeth.web.composer.redaction import assert_guided_custody_persistable
+
+    raw_sources, composer_meta = _fork_explicit_shape()
+    composer_meta["guided_session"]["terminal"] = None
+    assert_guided_custody_persistable(raw_sources, composer_meta)
+    assert _project(raw_sources, composer_meta)[0]["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+
+    renamed = {"renamed": raw_sources["source"]}
+    with pytest.raises(AuditIntegrityError):
+        assert_guided_custody_persistable(renamed, composer_meta)
+    with pytest.raises(AuditIntegrityError):
+        _project(renamed, composer_meta)

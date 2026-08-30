@@ -68,7 +68,11 @@ from elspeth.web.composer.provider_telemetry import (
     record_settled_composer_audit_message,
     record_settled_composer_provider_calls,
 )
-from elspeth.web.composer.redaction import normalize_set_pipeline_redacted_arguments, redact_tool_call_arguments
+from elspeth.web.composer.redaction import (
+    assert_guided_custody_persistable,
+    normalize_set_pipeline_redacted_arguments,
+    redact_tool_call_arguments,
+)
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.source_demand import (
     build_source_data_contract_draft,
@@ -5421,6 +5425,9 @@ class SessionServiceImpl:
         # handler — all of which Schedule 1A reviewed and merged.
         state = payload.data
         derived_from_state_id = payload.derived_from_state_id
+        # An active guided pair that cannot bind would re-raise on every read
+        # of this row; refuse it here, under the lock, before it becomes the tip.
+        assert_guided_custody_persistable(deep_thaw(state.sources), deep_thaw(state.composer_meta))
         # B1: allocate version under _session_write_lock. The
         # SELECT-MAX-then-INSERT sequence is atomic against every other
         # writer for this session because the caller is required to be
@@ -9199,6 +9206,7 @@ class SessionServiceImpl:
             # (CLAUDE.md No Legacy Code Policy: no belt-and-suspenders).
             with self._session_process_locked_begin(sid) as conn:
                 with self._session_write_lock(conn, sid):
+                    assert_guided_custody_persistable(deep_thaw(state.sources), deep_thaw(state.composer_meta))
                     result = conn.execute(
                         select(func.max(composition_states_table.c.version)).where(composition_states_table.c.session_id == sid)
                     ).scalar()
@@ -9851,6 +9859,12 @@ class SessionServiceImpl:
                         raise ValueError(f"State not found: {state_id}")
                     if prior_row.session_id != sid:
                         raise ValueError(f"State {state_id} does not belong to session {session_id}")
+                    # The prior row may predate the write gate; copying it
+                    # verbatim would re-tip the session onto an unbindable pair.
+                    assert_guided_custody_persistable(
+                        self._unwrap_envelope(prior_row.sources),
+                        self._unwrap_envelope(prior_row.composer_meta),
+                    )
 
                     max_version = conn.execute(
                         select(func.max(composition_states_table.c.version)).where(composition_states_table.c.session_id == sid)

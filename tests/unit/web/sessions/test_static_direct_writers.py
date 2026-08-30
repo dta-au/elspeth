@@ -1402,6 +1402,28 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
         ),
     ),
     ReviewedWriter(
+        path="tests/unit/web/sessions/test_guided_custody_gate.py",
+        enclosing_symbol="TestWriteBoundaryGate.test_set_active_state_refuses_to_copy_a_legacy_unbindable_active_row",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "Seeds a composition_states row that predates the pre-persist guided "
+            "custody gate (elspeth-4c442aaaa8) so set_active_state's refusal to "
+            "re-tip onto it can be pinned; the gate itself blocks the service path."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_routes.py",
+        enclosing_symbol="_insert_legacy_composition_state._sync",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "Seeds pre-gate rows carrying deliberately invalid reviewed snapshots so "
+            "the YAML export route's read-side rejection stays pinned now that "
+            "save_composition_state refuses them (elspeth-4c442aaaa8)."
+        ),
+    ),
+    ReviewedWriter(
         path="tests/unit/web/sessions/test_service.py",
         enclosing_symbol="TestRunEvents.test_append_and_list_run_events_preserves_order_and_payload",
         table="composition_states",
