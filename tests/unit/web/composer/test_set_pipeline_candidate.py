@@ -435,6 +435,41 @@ def _named_reviewed_pipeline(tmp_path: Path, facts: dict[str, Any]) -> dict[str,
     return pipeline
 
 
+def test_reviewed_source_authority_rejects_non_mapping_reviewed_sources() -> None:
+    """Present-but-malformed reviewed_sources is corruption, not absence."""
+    facts = {"reviewed_sources": "not-a-mapping"}
+    with pytest.raises(AuditIntegrityError, match="reviewed_sources must be a mapping"):
+        resolve_reviewed_source_authority(
+            engine=None,
+            session_id="session",
+            user_id="review-owner",
+            reviewed_facts=facts,
+            expected_reviewed_anchor_hash=reviewed_anchor_hash(facts),
+        )
+
+
+def test_reviewed_source_authority_returns_none_for_absent_reviewed_sources() -> None:
+    facts: dict[str, object] = {"other": "facts"}
+    assert (
+        resolve_reviewed_source_authority(
+            engine=None,
+            session_id="session",
+            user_id="review-owner",
+            reviewed_facts=facts,
+            expected_reviewed_anchor_hash=reviewed_anchor_hash(facts),
+        )
+        is None
+    )
+
+
+def test_authoring_content_hash_rejects_non_mapping_authoring_metadata() -> None:
+    from elspeth.web.composer.reviewed_source_authority import _authoring_content_hash
+    from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
+
+    with pytest.raises(AuditIntegrityError, match="source authoring metadata must be a mapping"):
+        _authoring_content_hash({SOURCE_AUTHORING_KEY: "bad"}, stable_id="s1")
+
+
 def test_reviewed_source_authority_resolves_only_ready_owned_current_anchor(tmp_path: Path) -> None:
     engine, session_id, _other_session, blobs = _reviewed_source_harness(tmp_path)
     blob = blobs[0]
