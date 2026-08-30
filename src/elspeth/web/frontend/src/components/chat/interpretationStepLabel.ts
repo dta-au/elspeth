@@ -188,6 +188,38 @@ export function humaniseStepLabel(
 }
 
 /**
+ * The card-TITLE form of the same name: "Summarise step", and — for a node the
+ * loaded composition no longer has — "Removed step (was Extract Invoice)".
+ *
+ * Why this is not `${humaniseStepLabel(...)} step`: that produced the literal
+ * word "Removed" for EVERY deleted node, so two acknowledgement cards
+ * referencing two different removed steps carried identical titles with no
+ * visible or hoverable disambiguator at either detail level — the raw id lived
+ * only in `data-affected-node-id`, which the plan itself calls a forensic home
+ * invisible to every audience (ux M-2). Title-casing the ghost id is not an
+ * identifier leak under this wave's own rule: a node id is author/LLM-chosen,
+ * so it IS the author's own name for the step (see this module's header).
+ *
+ * The resolution ladder is `humaniseStepLabel`'s, structurally — never a
+ * comparison against the string "Removed", which a node genuinely named
+ * `removed` would satisfy while still being present.
+ *
+ * The no-id case is "this step", not "this step step".
+ */
+export function humaniseStepTitle(
+  state: CompositionState | null,
+  nodeId: string | null,
+): string {
+  if (nodeId === null) return "this step";
+  const label = stepLabelForNodeId(state, nodeId);
+  if (label !== null) return `${label} step`;
+  if (state !== null && !isComponentPresent(state, nodeId)) {
+    return `Removed step (was ${titleCaseLabel(nodeId)})`;
+  }
+  return `${titleCaseLabel(nodeId)} step`;
+}
+
+/**
  * Build a stable pipeline-step ordering index over the composition:
  * sources (object order) → nodes (array order) → outputs.  Used to order the
  * acknowledgement cards by pipeline step before created_at.

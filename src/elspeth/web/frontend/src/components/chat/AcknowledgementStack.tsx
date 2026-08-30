@@ -25,7 +25,11 @@ import { Button } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { AcknowledgementCard } from "./AcknowledgementCard";
 import { supportsAmendment } from "./acknowledgementLabels";
-import { buildStepOrder, humaniseStepLabel } from "./interpretationStepLabel";
+import {
+  buildStepOrder,
+  humaniseStepLabel,
+  humaniseStepTitle,
+} from "./interpretationStepLabel";
 import {
   describeError,
   type DisplayedError,
@@ -247,6 +251,7 @@ export function AcknowledgementStack({
           event={event}
           sessionId={sessionId}
           stepLabel={humaniseStepLabel(compositionState, event.affected_node_id)}
+          stepTitle={humaniseStepTitle(compositionState, event.affected_node_id)}
           // Live state for the card's resolved-prompt rendering
           // (elspeth-990f5ea562): refreshed on every sibling resolve, so an
           // open prompt card re-renders with fresh substitutions.

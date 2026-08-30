@@ -357,18 +357,44 @@ describe("AcknowledgementStack — compositionState threading", () => {
 });
 
 describe("AcknowledgementStack — removed node label (elspeth-93f5621f18)", () => {
-  it("names a deleted node 'Removed' in the card title and keeps the raw id on a data attribute", () => {
+  it("names a deleted node by the step it was, and keeps the raw id on a data attribute", () => {
     // An event whose affected node is absent from the loaded composition.
     useSessionStore.setState({ compositionState: makeCompositionState([]) });
     seedPending([makeEvent("e-ghost", { kind: "llm_prompt_template", affected_node_id: "ghost_node" })]);
     const { container } = render(<AcknowledgementStack sessionId={SID} />);
-    expect(screen.getByRole("heading", { name: "Removed step · prompt" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Removed step (was Ghost Node) · prompt" }),
+    ).toBeInTheDocument();
     const card = screen.getByTestId("acknowledgement-card");
     expect(card).toHaveAttribute("data-affected-node-id", "ghost_node");
+    // The ghost id is the author's own NAME for the step, so title-casing it
+    // into the heading is not an identifier leak — the raw form still lives
+    // only on data-affected-node-id.
     expect(card).not.toHaveTextContent("ghost_node");
     // The wave's acceptance gate, on the surface this task most changes: the
     // raw id survives ONLY on data-affected-node-id, which the pin does not
     // inspect (it reads text nodes and aria-labels).
+    expectNoIdentifiersInDefaultDom(container);
+  });
+
+  it("gives two cards for two different removed nodes distinct titles (ux M-2)", () => {
+    // The defect: both read "Removed step · prompt", with the only
+    // disambiguator on data-affected-node-id — a forensic home invisible to
+    // every audience, so a user with two pending cards could not tell which
+    // deleted step each was about.
+    useSessionStore.setState({ compositionState: makeCompositionState([]) });
+    seedPending([
+      makeEvent("e-one", { kind: "llm_prompt_template", affected_node_id: "extract_invoice" }),
+      makeEvent("e-two", { kind: "llm_prompt_template", affected_node_id: "rate_coolness" }),
+    ]);
+    const { container } = render(<AcknowledgementStack sessionId={SID} />);
+
+    expect(
+      screen.getByRole("heading", { name: "Removed step (was Extract Invoice) · prompt" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Removed step (was Rate Coolness) · prompt" }),
+    ).toBeInTheDocument();
     expectNoIdentifiersInDefaultDom(container);
   });
 });
