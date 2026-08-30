@@ -392,24 +392,27 @@ class _TextractAuditedClient(AuditedClientBase):
         telemetry_request: RawCallPayload,
         telemetry_response: RawCallPayload,
     ) -> None:
+        # Event construction — hashing and payload conversion included —
+        # happens BEFORE the try: a failure there is a first-party bug and
+        # crashes without entering the best-effort containment below, which
+        # wraps only the callback delivery.
+        event = ExternalCallCompleted(
+            timestamp=datetime.now(UTC),
+            run_id=self._run_id,
+            call_type=CallType.HTTP,
+            provider="aws-textract",
+            status=status,
+            latency_ms=latency_ms,
+            state_id=self._telemetry_state_id(),
+            token_id=self._telemetry_token_id(),
+            request_hash=stable_hash(request_payload.to_dict()),
+            response_hash=stable_hash(response_payload.to_dict()),
+            request_payload=telemetry_request,
+            response_payload=telemetry_response,
+            token_usage=None,
+        )
         try:
-            self._telemetry_emit(
-                ExternalCallCompleted(
-                    timestamp=datetime.now(UTC),
-                    run_id=self._run_id,
-                    call_type=CallType.HTTP,
-                    provider="aws-textract",
-                    status=status,
-                    latency_ms=latency_ms,
-                    state_id=self._telemetry_state_id(),
-                    token_id=self._telemetry_token_id(),
-                    request_hash=stable_hash(request_payload.to_dict()),
-                    response_hash=stable_hash(response_payload.to_dict()),
-                    request_payload=telemetry_request,
-                    response_payload=telemetry_response,
-                    token_usage=None,
-                )
-            )
+            self._telemetry_emit(event)
         except contract_errors.TIER_1_ERRORS:
             raise
         except (TypeError, AttributeError, KeyError, NameError):

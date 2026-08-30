@@ -17,6 +17,7 @@ from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
 from elspeth.core.security.web import NetworkError as SSRFNetworkError
 from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest, validate_url_for_ssrf
@@ -200,6 +201,19 @@ def _final_response_ip(response: httpx.Response) -> str:
     return final_host
 
 
+@trust_boundary(
+    tier=3,
+    source="HTTP response headers returned by an external server via httpx",
+    source_param="response",
+    suppresses=("R1",),
+    invariant=(
+        "normalizes the media type from the content-type header; an absent header "
+        "becomes the empty string, which cannot match any configured allowed "
+        "content type and so surfaces as the row's unsupported_content_type error — "
+        "never raises, never fabricates a type"
+    ),
+    non_raising=True,
+)
 def _normalized_content_type(response: httpx.Response) -> str:
     return cast(str, response.headers.get("content-type", "")).split(";", 1)[0].strip().lower()
 

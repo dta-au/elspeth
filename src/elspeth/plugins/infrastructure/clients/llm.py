@@ -218,6 +218,18 @@ def _classify_llm_error(exception: Exception) -> str:
     return "unknown"
 
 
+@trust_boundary(
+    tier=3,
+    source="provider token-usage payloads returned by the LLM client library (OpenAI, Azure, LiteLLM) — an SDK object, a mapping, or a partial aggregate-only payload",
+    source_param="usage",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "normalizes mapping- and attribute-shaped usage payloads through TokenUsage.from_dict; "
+        "an absent payload becomes TokenUsage.unknown() and absent or non-int counters become "
+        "explicit None — never a fabricated zero, never a raise"
+    ),
+    non_raising=True,
+)
 def _extract_usage_from_provider_response(usage: Any) -> TokenUsage:
     """Normalize provider usage objects at the Tier 3 boundary.
 
@@ -333,27 +345,29 @@ class AuditedLLMClient(AuditedClientBase):
         are bugs in our code and must crash), and only genuine operational
         telemetry-transport failures fall through to the last-resort logger.
         The telemetry callback is a bare ``Callable`` supplied by the caller, so
-        the residual catch cannot be narrowed to a typed telemetry error.
+        the residual catch cannot be narrowed to a typed telemetry error. Event
+        construction — hashing included — happens BEFORE the try: a failure
+        there is a first-party bug and crashes without ever entering the
+        best-effort containment below, which wraps only the callback delivery.
         """
+        event = ExternalCallCompleted(
+            timestamp=datetime.now(UTC),
+            run_id=self._run_id,
+            call_type=CallType.LLM,
+            provider=self._provider,
+            status=call_status,
+            latency_ms=latency_ms,
+            state_id=self._telemetry_state_id(),
+            operation_id=self._telemetry_operation_id(),
+            token_id=self._telemetry_token_id(),
+            request_hash=stable_hash(request_data),
+            response_hash=stable_hash(response_data) if response_data is not None else None,
+            request_payload=request_payload,
+            response_payload=response_payload,
+            token_usage=token_usage,
+        )
         try:
-            self._telemetry_emit(
-                ExternalCallCompleted(
-                    timestamp=datetime.now(UTC),
-                    run_id=self._run_id,
-                    call_type=CallType.LLM,
-                    provider=self._provider,
-                    status=call_status,
-                    latency_ms=latency_ms,
-                    state_id=self._telemetry_state_id(),
-                    operation_id=self._telemetry_operation_id(),
-                    token_id=self._telemetry_token_id(),
-                    request_hash=stable_hash(request_data),
-                    response_hash=stable_hash(response_data) if response_data is not None else None,
-                    request_payload=request_payload,
-                    response_payload=response_payload,
-                    token_usage=token_usage,
-                )
-            )
+            self._telemetry_emit(event)
         except contract_errors.TIER_1_ERRORS:
             raise  # System bugs and audit integrity violations must crash
         except (TypeError, AttributeError, KeyError, NameError):

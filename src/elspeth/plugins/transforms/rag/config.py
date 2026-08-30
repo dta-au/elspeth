@@ -23,18 +23,25 @@ _ProviderEntry = tuple[type[Any], Callable[..., Any]]
 
 
 def _get_providers() -> dict[str, _ProviderEntry]:
-    """Lazy provider registry — only imports providers whose deps are installed."""
+    """Lazy provider registry — only imports providers whose deps are installed.
+
+    Only the ABSENCE of a provider's optional third-party SDK removes it from
+    the registry. A first-party retrieval module that fails its own import —
+    or an installed SDK missing a transitive dependency — is a broken install
+    and propagates rather than reading as "provider unavailable"
+    (the same posture as ``read_litellm_model_list``).
+    """
     providers: dict[str, _ProviderEntry] = {}
 
-    try:
-        from elspeth.plugins.infrastructure.clients.retrieval.azure_search import (
-            AzureSearchProvider,
-            AzureSearchProviderConfig,
-        )
+    # azure_search speaks the Azure Search REST API through httpx (a core
+    # dependency) and needs no optional SDK: it is unconditionally available,
+    # and any import failure here is a first-party bug that must surface.
+    from elspeth.plugins.infrastructure.clients.retrieval.azure_search import (
+        AzureSearchProvider,
+        AzureSearchProviderConfig,
+    )
 
-        providers["azure_search"] = (AzureSearchProviderConfig, AzureSearchProvider)
-    except ModuleNotFoundError:
-        pass  # azure SDK not installed — azure_search provider unavailable
+    providers["azure_search"] = (AzureSearchProviderConfig, AzureSearchProvider)
 
     try:
         from elspeth.plugins.infrastructure.clients.retrieval.chroma import (
@@ -53,8 +60,15 @@ def _get_providers() -> dict[str, _ProviderEntry]:
             return ChromaSearchProvider(config=config, execution=execution, run_id=run_id)
 
         providers["chroma"] = (ChromaSearchProviderConfig, _chroma_factory)
-    except ModuleNotFoundError:
-        pass  # chromadb not installed — chroma provider unavailable
+    except ModuleNotFoundError as exc:
+        # Only chromadb itself being absent is the documented optional-extra
+        # state ([rag] not installed). A chromadb that is installed but fails
+        # its own import — a missing transitive dependency, a broken wheel —
+        # or a missing first-party module propagates: the remediation for an
+        # absent provider ("install elspeth[rag]") is wrong for a broken one.
+        missing = exc.name or ""
+        if missing != "chromadb" and not missing.startswith("chromadb."):
+            raise
 
     return providers
 

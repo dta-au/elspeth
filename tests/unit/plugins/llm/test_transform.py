@@ -2621,6 +2621,17 @@ class TestConfigureAzureMonitor:
         yield
         _reset_azure_monitor_state()
 
+    @staticmethod
+    def _fake_inference_tracing_module() -> Any:
+        """Stand-in azure.ai.inference.tracing module for the instrumentor import."""
+        from types import SimpleNamespace
+
+        class _Instrumentor:
+            def instrument(self, *, enable_content_recording: bool) -> None:
+                del enable_content_recording
+
+        return SimpleNamespace(AIInferenceInstrumentor=_Instrumentor)
+
     def test_raises_import_error_when_sdk_is_none(self) -> None:
         """_configure_azure_monitor raises ImportError when SDK is None (not installed)."""
         from elspeth.plugins.transforms.llm.providers.azure import _configure_azure_monitor
@@ -2673,13 +2684,18 @@ class TestConfigureAzureMonitor:
 
     def test_idempotency_second_call_returns_true_without_reconfiguring(self) -> None:
         """Second call to _configure_azure_monitor returns True without calling SDK again."""
+        import sys
+
         from elspeth.plugins.transforms.llm.providers.azure import _configure_azure_monitor
         from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig
 
         config = AzureAITracingConfig(connection_string="InstrumentationKey=test")
-        with patch(
-            "elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor",
-        ) as mock_sdk:
+        with (
+            patch(
+                "elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor",
+            ) as mock_sdk,
+            patch.dict(sys.modules, {"azure.ai.inference.tracing": self._fake_inference_tracing_module()}),
+        ):
             # First call — configures
             result1 = _configure_azure_monitor(config)
             assert result1 is True
@@ -2692,6 +2708,8 @@ class TestConfigureAzureMonitor:
 
     def test_idempotency_logs_warning_on_second_call(self) -> None:
         """Second call logs a warning about duplicate initialization."""
+        import sys
+
         from elspeth.plugins.transforms.llm.providers.azure import _configure_azure_monitor
         from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig
 
@@ -2699,9 +2717,10 @@ class TestConfigureAzureMonitor:
         with (
             patch("elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor"),
             patch("elspeth.plugins.transforms.llm.providers.azure.logger") as mock_logger,
+            patch.dict(sys.modules, {"azure.ai.inference.tracing": self._fake_inference_tracing_module()}),
         ):
             _configure_azure_monitor(config)
-            mock_logger.reset_mock()  # Clear warnings from first call (env-var fallback)
+            mock_logger.reset_mock()  # Isolate the second call's warning
 
             _configure_azure_monitor(config)
             # Assert warning was emitted — don't match exact message prose
@@ -2727,7 +2746,12 @@ class TestConfigureAzureMonitor:
             _configure_azure_monitor(config)
 
         # Second call with working SDK — should succeed (not blocked by idempotency)
-        with patch("elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor") as mock_sdk:
+        import sys
+
+        with (
+            patch("elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor") as mock_sdk,
+            patch.dict(sys.modules, {"azure.ai.inference.tracing": self._fake_inference_tracing_module()}),
+        ):
             result2 = _configure_azure_monitor(config)
             assert result2 is True
             mock_sdk.assert_called_once()
