@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import shutil
 import threading
@@ -43,7 +44,7 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex, stable_hash
-from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer.authority_hashing import composer_authority_hash, project_composer_authority_payload
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
@@ -1533,8 +1534,14 @@ def _settlement_fork_blob_plan(
     ).all():
         try:
             decoded = json.loads(row.content)
-        except (TypeError, json.JSONDecodeError):
-            continue
+        except json.JSONDecodeError as exc:
+            # Every ``session_fork`` audit row is first-party JSON (the fork
+            # writer serializes the frozen plan envelope itself), and
+            # ``content`` is a non-nullable TEXT column, so an undecodable
+            # row is Tier-1 corruption. Skipping it silently could let the
+            # exactly-one-plan gate below pass on a different row while the
+            # corrupt candidate vanishes without a trace.
+            raise AuditIntegrityError("session_fork audit row content is not valid JSON") from exc
         if (
             type(decoded) is dict
             and "schema" in decoded
@@ -1557,6 +1564,22 @@ def _settlement_fork_blob_plan(
     return candidates[0]
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "arbitrary nested JSON-shaped values from persisted composition-state payloads and "
+        "fork-plan content — composer-authored structures whose nesting no first-party "
+        "contract bounds"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns a pure boolean verdict (does any nested string reference a forbidden parent "
+        "blob id); unrecognized leaf shapes are False, never raised — the caller "
+        "(_verify_fork_settlement_blob_custody) enforces the custody decision"
+    ),
+    non_raising=True,
+)
 def _value_references_parent_blob(value: Any, forbidden: frozenset[str]) -> bool:
     if type(value) is str:
         return value in forbidden or (value.startswith("blob:") and value.removeprefix("blob:") in forbidden)
@@ -2231,9 +2254,12 @@ def _classify_authoritative_composition_proposal(
     reviewed_facts: Mapping[str, Any] | None,
 ) -> AuthoritativeCompositionProposal:
     """Accept only one of the two closed current proposal event schemas."""
+    # ``ProposalEventRecord.payload`` is typed ``Mapping[str, Any]`` and frozen
+    # by the record's own ``__post_init__`` — a first-party audit-event value
+    # whose authorship a DB round-trip does not demote. Read it directly; a
+    # corrupted non-mapping crashes on the key-set dispatch below instead of
+    # being defensively revalidated here.
     payload = creation_event.payload
-    if not isinstance(payload, Mapping):
-        raise AuditIntegrityError("proposal creation event payload must be a mapping")
     if set(payload) == _TOOL_PROPOSAL_CREATED_FIELDS:
         expected = {
             "schema": _TOOL_PROPOSAL_CREATED_SCHEMA,
@@ -2381,6 +2407,19 @@ def _interpretation_hash_domain_v2(
     return domain_dict
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "composer-authored nested values persisted inside composition-state rows — "
+        "CompositionStateRecord freezes its containers but does not promote the nested "
+        "option/source shapes it couriers"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises InterpretationPlaceholderConsumedError when the value is not a mapping; never coerces or defaults",
+    test_ref=("tests/unit/web/sessions/test_interpretation_trust_boundaries.py::test_require_mapping_rejects_non_mapping"),
+    test_fingerprint="c317fd5bd9c3ee59b637d72483ee43dfddeee80883c34cecb11bd3115702f565",
+)
 def _require_mapping(value: object, *, message: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise InterpretationPlaceholderConsumedError(message)
@@ -2501,6 +2540,22 @@ def _validate_pipeline_decision_semantics_from_state_record(
     )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "composer-authored options.interpretation_requirements value persisted inside "
+        "composition-state node/source options and read back from sessions storage"
+    ),
+    source_param="requirements_value",
+    suppresses=("R5",),
+    invariant=(
+        "raises InterpretationPlaceholderConsumedError when the requirements value is not a "
+        "list/tuple, an entry is not a mapping, a user_term is not a string, or there is not "
+        "exactly one pending matching requirement; never defaults a malformed shape"
+    ),
+    test_ref=("tests/unit/web/sessions/test_interpretation_trust_boundaries.py::test_matching_pending_requirement_index_rejects_non_list"),
+    test_fingerprint="6baf14f68736f1ca77f5a1b6b3450db0aebc5d44337d6646d54f7523b75e9bc3",
+)
 def _matching_pending_requirement_index(
     requirements_value: object,
     *,
@@ -2530,6 +2585,68 @@ def _matching_pending_requirement_index(
             f"{context}: does not contain exactly one pending {kind.value!r} requirement for {user_term!r}; found {len(matching_indexes)}"
         )
     return requirements, matching_indexes[0]
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "composer-authored options.interpretation_requirements value persisted inside "
+        "composition-state node/source options and read back from sessions storage"
+    ),
+    source_param="requirements_value",
+    suppresses=("R5",),
+    invariant=(
+        "raises InterpretationPlaceholderConsumedError when a PRESENT requirements value is not "
+        "a list/tuple, an entry is not a mapping, or a vague_term entry's user_term is not a "
+        "string; None (absent) is the legitimate legacy/unstaged case and returns False — a "
+        "malformed value is never silently routed to the legacy arm"
+    ),
+    test_ref=(
+        "tests/unit/web/sessions/test_interpretation_trust_boundaries.py::test_has_matching_vague_term_requirement_rejects_malformed_value"
+    ),
+    test_fingerprint="59dfeae2f6ebcac673f880e762d171bea173c3e31df18db78834d65d061c6214",
+)
+def _has_matching_vague_term_requirement(
+    requirements_value: object,
+    *,
+    user_term: str,
+    context: str,
+    require_pending: bool,
+) -> bool:
+    """Strict discriminator between the structured and legacy vague-term arms.
+
+    ``True`` — a well-formed vague_term requirement row matches ``user_term``
+    (and is pending, when ``require_pending``). ``False`` — the value is
+    absent (``None``) or holds no matching row: the legitimate legacy /
+    other-kinds case. Malformed shapes RAISE instead of reading as ``False``,
+    so corruption can never masquerade as "legacy node" and slip into the
+    ``prompt_template`` fallback (the bug class this replaces: the previous
+    inline ``isinstance(...) and any(...)`` scans silently classified a
+    non-list value or non-mapping row as legacy).
+    """
+    if requirements_value is None:
+        return False
+    if not isinstance(requirements_value, (list, tuple)):
+        raise InterpretationPlaceholderConsumedError(f"{context}: options.interpretation_requirements is not a list")
+    normalized_user_term = user_term.strip()
+    found = False
+    for requirement in requirements_value:
+        if not isinstance(requirement, Mapping):
+            raise InterpretationPlaceholderConsumedError(f"{context}: interpretation requirement entry is not a mapping")
+        requirement_kind = requirement["kind"] if "kind" in requirement else InterpretationKind.VAGUE_TERM.value
+        if requirement_kind != InterpretationKind.VAGUE_TERM.value:
+            continue
+        requirement_term = requirement["user_term"] if "user_term" in requirement else None
+        if type(requirement_term) is not str:
+            raise InterpretationPlaceholderConsumedError(f"{context}: interpretation requirement user_term is invalid")
+        if requirement_term.strip() != normalized_user_term:
+            continue
+        if require_pending:
+            requirement_status = requirement["status"] if "status" in requirement else None
+            if requirement_status != "pending":
+                continue
+        found = True
+    return found
 
 
 def _review_requirement_identity(
@@ -2687,14 +2804,11 @@ def _reviewed_content_identity(
 
     if kind is InterpretationKind.VAGUE_TERM:
         raw_requirements = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
-        structured_match = isinstance(raw_requirements, (list, tuple)) and any(
-            isinstance(requirement, Mapping)
-            and (requirement["kind"] if "kind" in requirement else InterpretationKind.VAGUE_TERM.value)
-            == InterpretationKind.VAGUE_TERM.value
-            and "user_term" in requirement
-            and type(requirement["user_term"]) is str
-            and requirement["user_term"].strip() == user_term.strip()
-            for requirement in raw_requirements
+        structured_match = _has_matching_vague_term_requirement(
+            raw_requirements,
+            user_term=user_term,
+            context=context,
+            require_pending=False,
         )
         if structured_match:
             requirement_identity = _review_requirement_identity(
@@ -2708,15 +2822,15 @@ def _reviewed_content_identity(
                 raise InterpretationPlaceholderConsumedError(
                     f"{context}: structured vague-term review requires options.{PROMPT_TEMPLATE_PARTS_KEY}"
                 )
+            # ``prompt_structure_hash_from_options`` returned non-None above,
+            # which means ``_prompt_parts`` already parsed this exact value:
+            # every part is a mapping with a valid ``kind``, and every
+            # interpretation_ref part carries a non-empty ``requirement_id``
+            # (interpretation_state._prompt_parts raises otherwise). Direct
+            # reads are therefore the honest form — re-checking shapes here
+            # would be defensive revalidation of a just-proven contract.
             parts = options[PROMPT_TEMPLATE_PARTS_KEY]
-            if not any(
-                isinstance(part, Mapping)
-                and "kind" in part
-                and part["kind"] == "interpretation_ref"
-                and "requirement_id" in part
-                and part["requirement_id"] == requirement_identity["id"]
-                for part in parts
-            ):
+            if not any(part["kind"] == "interpretation_ref" and part["requirement_id"] == requirement_identity["id"] for part in parts):
                 raise InterpretationPlaceholderConsumedError(
                     f"{context}: structured vague-term review has no prompt part for its requirement"
                 )
@@ -2775,6 +2889,26 @@ _STRUCTURAL_DIRECTIVE_PREFIXES: tuple[str, ...] = (
 )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "composer-authored node options (interpretation_requirements, prompt_template_parts) "
+        "persisted inside composition-state rows and read back from sessions storage"
+    ),
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "raises InterpretationPlaceholderConsumedError on any malformed structured-interpretation "
+        "shape (non-list requirements, non-mapping entries, invalid ids/terms, non-list "
+        "prompt_template_parts, malformed parts); returns None only for the legitimate "
+        "no-structured-state cases, never for malformed ones"
+    ),
+    test_ref=(
+        "tests/unit/web/sessions/test_interpretation_trust_boundaries.py"
+        "::test_patch_structured_interpretation_prompt_rejects_non_list_requirements"
+    ),
+    test_fingerprint="0aa1a62f40c40d1820b942378ecd90ee7eef0544d0c8a370460459c465d1cdf4",
+)
 def _patch_structured_interpretation_prompt(
     *,
     options: Mapping[str, Any],
@@ -3146,15 +3280,11 @@ def _resolve_vague_term(
         message=f"resolve_interpretation_event: node {affected_node_id!r} options is not a mapping",
     )
     requirements_value = live_options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in live_options else None
-    has_structured_site = isinstance(requirements_value, (list, tuple)) and any(
-        isinstance(requirement, Mapping)
-        and (requirement["kind"] if "kind" in requirement else InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
-        and "user_term" in requirement
-        and type(requirement["user_term"]) is str
-        and requirement["user_term"].strip() == user_term.strip()
-        and "status" in requirement
-        and requirement["status"] == "pending"
-        for requirement in requirements_value
+    has_structured_site = _has_matching_vague_term_requirement(
+        requirements_value,
+        user_term=user_term,
+        context="resolve_interpretation_event",
+        require_pending=True,
     )
     if not has_structured_site:
         if surfacing_state_record is None:
@@ -3824,7 +3954,15 @@ class SessionServiceImpl:
             if cancellation is not None:
                 raise cancellation from failure
             raise
-        project(result)
+        try:
+            project(result)
+        except BaseException as projection_failure:
+            # The captured cancellation must be re-raised on EVERY exit path
+            # once observed — a projection bug must not silently discard it
+            # (the task would complete "normally" after being cancelled).
+            if cancellation is not None:
+                raise cancellation from projection_failure
+            raise
         if cancellation is not None:
             raise cancellation
         return result
@@ -6074,8 +6212,25 @@ class SessionServiceImpl:
                     ) from exc
 
                 quarantine_root = staged_blob_dir.parent
-                with contextlib.suppress(OSError):
+                try:
                     quarantine_root.rmdir()
+                except OSError as rmdir_exc:
+                    # ENOTEMPTY / ENOENT are the probe's expected negative
+                    # verdicts (other sessions' staged directories still live
+                    # under the shared quarantine root, or another archiver
+                    # already reaped it) — an explicit no-op outcome, not a
+                    # failure. Anything else (permissions, I/O) is recorded:
+                    # the archive is committed and the session's own staged
+                    # directory is purged, but the operator needs to know the
+                    # shared root cannot be tidied.
+                    if rmdir_exc.errno not in (errno.ENOTEMPTY, errno.ENOENT):
+                        self._log.warning(
+                            "archive_session.quarantine_root_rmdir_failed",
+                            session_id=sid,
+                            quarantine_root=str(quarantine_root),
+                            errno=rmdir_exc.errno,
+                            exc_class=type(rmdir_exc).__name__,
+                        )
 
         await self._run_sync(_sync)
 
@@ -7417,16 +7572,11 @@ class SessionServiceImpl:
                         requirements_value = (
                             options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
                         )
-                        has_structured_match = isinstance(requirements_value, (list, tuple)) and any(
-                            isinstance(requirement, Mapping)
-                            and (requirement["kind"] if "kind" in requirement else InterpretationKind.VAGUE_TERM.value)
-                            == InterpretationKind.VAGUE_TERM.value
-                            and "user_term" in requirement
-                            and type(requirement["user_term"]) is str
-                            and requirement["user_term"].strip() == user_term.strip()
-                            and "status" in requirement
-                            and requirement["status"] == "pending"
-                            for requirement in requirements_value
+                        has_structured_match = _has_matching_vague_term_requirement(
+                            requirements_value,
+                            user_term=user_term,
+                            context="create_pending_interpretation_event",
+                            require_pending=True,
                         )
                         if has_structured_match:
                             requirements, matching_index = _matching_pending_requirement_index(
