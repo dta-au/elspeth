@@ -147,6 +147,15 @@ class RuntimeYamlImportError(ValueError):
     """Raised when runtime YAML cannot be represented as composer state."""
 
 
+@trust_boundary(
+    tier=3,
+    source="operator-supplied runtime pipeline YAML text (untrusted import payload)",
+    source_param="pipeline_yaml",
+    suppresses=("R5",),
+    invariant="raises yaml.composer.ComposerError on any alias event; never rewrites or drops one",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_reject_yaml_aliases_rejects_alias_event",
+    test_fingerprint="0dcac1a023fede17e0e5ce4cc511d5310cb619f6b3e67196c8c964231f1907bd",
+)
 def _reject_yaml_aliases(pipeline_yaml: str) -> None:
     """Reject YAML anchors/aliases before safe construction.
 
@@ -173,6 +182,15 @@ def _reject_yaml_aliases(pipeline_yaml: str) -> None:
             )
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML value (untrusted import payload)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises RuntimeYamlImportError unless the value is a mapping",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_require_mapping_rejects_non_mapping_value",
+    test_fingerprint="0a4c7a1f3e60423beb80f88cfb3b1049518ae908efee57f276d68a40e24c1fc0",
+)
 def _require_mapping(value: Any, path: str) -> Mapping[str, Any]:
     if isinstance(value, Mapping):
         return cast(Mapping[str, Any], value)
@@ -185,6 +203,15 @@ def _optional_mapping(value: Any, path: str) -> Mapping[str, Any]:
     return _require_mapping(value, path)
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML value (untrusted import payload)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises RuntimeYamlImportError unless the value is a non-string sequence",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_require_sequence_rejects_string_value",
+    test_fingerprint="8d25f3187d9000818fbfef8dd47b2cf8734935e33273b27331cb89bcf54a79bb",
+)
 def _require_sequence(value: Any, path: str) -> Sequence[Any]:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return value
@@ -207,6 +234,15 @@ def _require_str(entry: Mapping[str, Any], key: str, path: str) -> str:
     raise RuntimeYamlImportError(f"{path}.{key} must be a non-empty string")
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML entry mapping (untrusted import payload)",
+    source_param="entry",
+    suppresses=("R1", "R5"),
+    invariant="raises RuntimeYamlImportError unless the key is absent (None) or holds a string",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_optional_str_rejects_non_string_value",
+    test_fingerprint="efdd2f5514efb13c1b614ffeb6fca26d5274f397eefd6e8f3c20ae11f47615c8",
+)
 def _optional_str(entry: Mapping[str, Any], key: str) -> str | None:
     value = entry.get(key)
     if value is None:
@@ -258,6 +294,15 @@ def _finite_positive_timeout(entry: Mapping[str, Any], path: str) -> float | Non
     return normalized
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML route label value (untrusted import payload)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises RuntimeYamlImportError unless the value is True, False, or a non-empty string",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_route_label_rejects_empty_label",
+    test_fingerprint="369da61cce315dbb305231a7e98fe86cf3d97e22c7ba20ae935c886fa9d10bbf",
+)
 def _route_label(value: Any) -> str:
     if value is True:
         return "true"
@@ -268,6 +313,15 @@ def _route_label(value: Any) -> str:
     raise RuntimeYamlImportError("route labels must be non-empty strings")
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML routes mapping (untrusted import payload)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises RuntimeYamlImportError unless every value is a non-empty string under a valid route-label key",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_string_mapping_rejects_non_string_value",
+    test_fingerprint="28d2245ae29c56cdebda0c15b7e9e7829c06e421b245e3af3d2c615d8fdee3b7",
+)
 def _string_mapping(value: Any, path: str) -> dict[str, str]:
     result: dict[str, str] = {}
     for raw_key, raw_value in _require_mapping(value, path).items():
@@ -277,6 +331,15 @@ def _string_mapping(value: Any, path: str) -> dict[str, str]:
     return result
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML string-list value (untrusted import payload)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises RuntimeYamlImportError unless every sequence item is a non-empty string",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_string_tuple_rejects_non_string_item",
+    test_fingerprint="7fc7ae9cd28d6965855e6def717c73be9fd3d864268145cc49fba31cf5a63234",
+)
 def _string_tuple(value: Any, path: str) -> tuple[str, ...]:
     items = []
     for index, item in enumerate(_require_sequence(value, path)):
@@ -341,7 +404,7 @@ def _source_from_runtime_entry(source_name: str, entry: Any) -> SourceSpec:
     if "blob_ref" in options:
         raise RuntimeYamlImportError(f"sources.{source_name}.options.blob_ref must be supplied via source_blob_ids")
     on_validation_failure = source.get("on_validation_failure")
-    option_on_validation_failure = options.pop("on_validation_failure", None)
+    option_on_validation_failure = options.pop("on_validation_failure") if "on_validation_failure" in options else None
     if on_validation_failure is None:
         on_validation_failure = option_on_validation_failure
     if not isinstance(on_validation_failure, str):
@@ -419,11 +482,10 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
                 raise RuntimeYamlImportError(f"{path}.branches must contain at least two input connections")
             # Runtime coalesces consume ``branches``. NodeSpec.input is not an
             # additional connection, but its required placeholder uses the
-            # first arriving branch by convention.
-            if isinstance(branch_spec, Mapping):
-                first_branch_input = next(iter(branch_spec.values()))
-            else:
-                first_branch_input = branch_spec[0]
+            # first arriving branch by convention. dict is the concrete type
+            # _string_mapping constructs, so this is owned-union dispatch on
+            # the parsed value, not a shape re-check of external data.
+            first_branch_input = next(iter(branch_spec.values())) if type(branch_spec) is dict else next(iter(branch_spec))
             if "input" in entry:
                 coalesce_input = _require_str(entry, "input", path)
                 if coalesce_input != first_branch_input:
@@ -510,6 +572,18 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
     return nodes
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML collectors: section (untrusted import payload)",
+    source_param="collectors_section",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises RuntimeYamlImportError on non-sequence sections, non-mapping entries, unknown fields, "
+        "or malformed collector fields; an absent options key becomes an empty options dict on the owned NodeSpec"
+    ),
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_collector_nodes_rejects_non_sequence_collectors_section",
+    test_fingerprint="532d66389e446a09d84600c76b14ee44a2a136b866e0395d3289704efefce1a9",
+)
 def _collector_nodes_from_runtime_lists(collectors_section: Any, scopes_section: Any) -> list[NodeSpec]:
     """Fold ``collectors:`` and ``scopes:`` into collector NodeSpecs.
 
