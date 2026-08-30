@@ -8,7 +8,7 @@ import functools
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException, Request
@@ -103,6 +103,7 @@ from .._helpers import (
     _get_session_compose_lock_registry,
     _inspect_latest_ready_session_blob,
     _is_client_disconnect_cancel,
+    _log_last_resort_diagnostic,
     _named_guided_custody_projection,
     _publish_progress,
     _replace,
@@ -724,25 +725,18 @@ def _step_1_uploaded_bind_form_options(form_turn: Turn) -> dict[str, object]:
     pressing Continue on that form would have submitted.
     """
     prefilled = form_turn["payload"]["prefilled"]
-    # KEEP ``isinstance(..., Mapping)``: this reads a payload the server wrote
-    # and read back, which ADR-032 puts in the parse-what-we-do-not-own domain
-    # regardless of who authored the bytes. Both ``form_turn`` producers hand
-    # over an EXACT dict today — ``guided._finalize_guided_turn`` and
-    # ``guided._load_durable_current_turn`` each build the payload as
-    # ``dict(deep_thaw(...))``, and ``deep_thaw`` recurses, so the nested
-    # prefill is a plain dict on the replay path too (measured 2026-08-29).
-    # The tolerant ABC form is kept so this reject-gate's correctness does not
-    # rest on that producer detail: the frozen ``MappingProxyType`` that
-    # ``prepare_guided_json_payload`` holds inside ``PreparedGuidedJsonPayload``
-    # is one moved thaw away, and for it BOTH ``type(x) is dict`` and
-    # ``isinstance(x, dict)`` are False. That is a latent robustness argument,
-    # not a live population.
-    if not isinstance(prefilled, Mapping):
+    # Exact ``dict``: both ``form_turn`` producers — ``guided._finalize_guided_turn``
+    # and ``guided._load_durable_current_turn`` — build the payload as
+    # ``dict(deep_thaw(...))`` with recursive thaw, so the server-held prefill
+    # is a plain dict on live and replay paths alike (measured 2026-08-29).
+    # Serialization and read-back do not demote first-party authorship; a
+    # Mapping-tolerant read here would be latent recovery from a hypothetical
+    # future producer bug (a moved thaw), which is exactly the defensive
+    # pattern the tier model forbids. Anything but an exact dict is
+    # first-party corruption and crashes.
+    if type(prefilled) is not dict:
         raise AuditIntegrityError("source schema form has no server-held prefill to bind")
-    options = deep_thaw(prefilled)
-    if type(options) is not dict:  # pragma: no cover - deep_thaw of a Mapping is a dict
-        raise AuditIntegrityError("source schema form prefill did not thaw to an exact dict")
-    return options
+    return cast("dict[str, object]", deep_thaw(prefilled))
 
 
 def _prepare_step_1_uploaded_source_bind(
@@ -2000,7 +1994,7 @@ async def post_guided_chat_schema8(
             except GuidedOperationFenceLostError:
                 rejoin_after_lock = True
             except asyncio.CancelledError as exc:
-                with contextlib.suppress(Exception):
+                try:
                     await asyncio.shield(
                         service.fail_guided_operation_with_audit(
                             GuidedOperationFailureCommand(
@@ -2015,13 +2009,39 @@ async def post_guided_chat_schema8(
                             )
                         )
                     )
+                except GuidedOperationFenceLostError:
+                    # Fence lost during cancellation settlement: another
+                    # worker owns the operation's durable outcome, so this
+                    # request has nothing left to record and keeps unwinding
+                    # as cancelled.
+                    pass
+                except Exception as settlement_exc:
+                    # The failure settlement is a durable audit write. A
+                    # failed write must surface — riding silently under the
+                    # cancellation response would report 499 while the
+                    # operation row is left unsettled with no recorded cause.
+                    raise AuditIntegrityError("Guided Chat could not record its cancellation settlement") from settlement_exc
                 if progress_started:
-                    with contextlib.suppress(Exception):
+                    try:
                         await asyncio.shield(
                             _publish_progress(
                                 progress_sink,
                                 event=client_cancelled_progress_event(),
                             )
+                        )
+                    except Exception as progress_exc:
+                        # First-party progress sink: a failed cancelled-phase
+                        # publication can leave an active-phase snapshot
+                        # visible until session archival clears the registry,
+                        # so the failure is recorded rather than silent while
+                        # the cancellation stays the declared outcome.
+                        _log_last_resort_diagnostic(
+                            slog.error,
+                            "guided.cancelled_progress_publish_failed",
+                            session_id=str(session_id),
+                            exc_class=type(progress_exc).__name__,
+                            site="post_guided_chat.cancelled_progress",
+                            frames=_safe_frame_strings(progress_exc),
                         )
                 if _is_client_disconnect_cancel(exc):
                     raise HTTPException(status_code=499, detail="Client disconnected while the guided chat turn was running.") from exc
@@ -2042,20 +2062,20 @@ async def post_guided_chat_schema8(
                     if isinstance(exc, (AuditIntegrityError, InvariantError))
                     else "operation_failed"
                 )
-                with contextlib.suppress(Exception):
-                    slog.error(
-                        "guided.operation_terminal_failure",
-                        session_id=str(session_id),
-                        user_id=user.user_id,
-                        exc_class=type(exc).__name__,
-                        site="post_guided_chat",
-                        frames=_safe_frame_strings(exc),
-                        # See ``guided.py``'s post_guided_start site (R2-F16b):
-                        # correlates this log line to the response's
-                        # X-Request-ID; lenient read so a missing middleware
-                        # cannot break the error path.
-                        request_id=_failure_log_request_id(request),
-                    )
+                _log_last_resort_diagnostic(
+                    slog.error,
+                    "guided.operation_terminal_failure",
+                    session_id=str(session_id),
+                    user_id=user.user_id,
+                    exc_class=type(exc).__name__,
+                    site="post_guided_chat",
+                    frames=_safe_frame_strings(exc),
+                    # See ``guided.py``'s post_guided_start site (R2-F16b):
+                    # correlates this log line to the response's
+                    # X-Request-ID; lenient read so a missing middleware
+                    # cannot break the error path.
+                    request_id=_failure_log_request_id(request),
+                )
                 try:
                     failed = await service.fail_guided_operation_with_audit(
                         GuidedOperationFailureCommand(

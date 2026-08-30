@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from dataclasses import replace
 from uuid import UUID, uuid4
 
@@ -22,7 +21,7 @@ from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline, Pipeline
 from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase, composition_content_hash
 from elspeth.web.composer.progress import client_cancelled_progress_event
 from elspeth.web.composer.proposals import build_tool_proposal_summary
-from elspeth.web.composer.protocol import ComposerServiceError
+from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerServiceError
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -56,6 +55,7 @@ from .._helpers import (
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
     _is_client_disconnect_cancel,
+    _log_last_resort_diagnostic,
     _request_plugin_policy_context,
     _safe_frame_strings,
     _state_from_record,
@@ -157,16 +157,21 @@ def _note_guided_full_secondary_failure(
     secondary: BaseException,
     site: str,
 ) -> None:
-    """Record bounded cleanup diagnostics without replacing the primary outcome."""
-    with contextlib.suppress(Exception):
-        slog.error(
-            "guided.plan_failure_settlement_secondary_failure",
-            primary_failure_code=primary_failure_code,
-            secondary_exc_class=type(secondary).__name__,
-            site=site,
-            frames=_safe_frame_strings(secondary),
-            request_id=_failure_log_request_id(request),
-        )
+    """Record bounded cleanup diagnostics without replacing the primary outcome.
+
+    Field assembly (``_safe_frame_strings``, ``_failure_log_request_id``) runs
+    un-suppressed so a first-party bug in diagnostic construction crashes
+    honestly; only the last-resort emission inside the helper is guarded.
+    """
+    _log_last_resort_diagnostic(
+        slog.error,
+        "guided.plan_failure_settlement_secondary_failure",
+        primary_failure_code=primary_failure_code,
+        secondary_exc_class=type(secondary).__name__,
+        site=site,
+        frames=_safe_frame_strings(secondary),
+        request_id=_failure_log_request_id(request),
+    )
 
 
 async def _publish_guided_full_terminal_preserving_primary(
@@ -178,14 +183,31 @@ async def _publish_guided_full_terminal_preserving_primary(
 ) -> None:
     """Terminalize progress without allowing UI cleanup to replace the primary.
 
-    This runs only after a fence failure or durable winner has established the
-    authoritative outcome. A ``CancelledError`` raised by this secondary sink
-    is therefore cleanup failure, not the route's primary cancellation. Keep
-    the catch explicit: other ``BaseException`` subclasses must still escape.
+    This runs only after a fence failure or durable winner has established
+    the authoritative outcome. A ``CancelledError`` that ORIGINATES inside
+    this secondary sink is cleanup failure, not the route's primary
+    cancellation — but a cancellation injected into the enclosing task while
+    awaiting the sink is genuine task cancellation and must keep unwinding.
+    ``Task.cancelling()`` distinguishes the two: an injected cancel
+    increments the enclosing task's cancelling count, a sink-internal
+    ``CancelledError`` does not. Other ``BaseException`` subclasses still
+    escape.
     """
     try:
         await progress(event)
-    except (asyncio.CancelledError, Exception) as progress_exc:
+    except asyncio.CancelledError as progress_exc:
+        enclosing_task = asyncio.current_task()
+        if enclosing_task is not None and enclosing_task.cancelling() > 0:
+            # Cancellation was injected into THIS task at the sink await —
+            # not a sink failure; keep unwinding as genuinely cancelled.
+            raise
+        _note_guided_full_secondary_failure(
+            request=request,
+            primary_failure_code=primary_outcome,
+            secondary=progress_exc,
+            site="terminal_progress",
+        )
+    except Exception as progress_exc:
         _note_guided_full_secondary_failure(
             request=request,
             primary_failure_code=primary_outcome,
@@ -199,6 +221,14 @@ def _guided_full_failure_code(exc: BaseException) -> GuidedOperationFailureCode:
         return "stale_conflict"
     if isinstance(exc, AuditIntegrityError):
         return "integrity_error"
+    if isinstance(exc, ComposerPluginCrashError):
+        # BEFORE the ComposerServiceError arm (its superclass): a plugin
+        # crash is a first-party Tier 1/2 bug, and its contract forbids
+        # laundering it into a provider fault (see ComposerPluginCrashError's
+        # route-ordering note; CCO1 enforces the except-clause mirror of this
+        # ordering). "provider_unavailable" would blame the provider and
+        # invite a retry that can never succeed.
+        return "operation_failed"
     if isinstance(exc, BlobIntegrityError | BlobContentMissingError):
         return "integrity_error"
     if isinstance(exc, BlobQuotaExceededError):
@@ -652,6 +682,11 @@ async def post_guided_plan(
                 secondary=cleanup_exc,
                 site="failure_settlement",
             )
+            # The failure settlement is a durable audit write. Failing to
+            # record the terminal outcome must surface — preserving the
+            # cancellation response would leave the operation row unsettled
+            # with only a best-effort log line as evidence.
+            raise AuditIntegrityError("Guided PLAN could not record its terminal failure") from cleanup_exc
         terminal_event = (
             _guided_full_complete_progress_event(
                 declined=type(joined_winner) is GuidedPlanDeclinedResponse,
@@ -708,8 +743,11 @@ async def post_guided_plan(
                     secondary=lookup_exc,
                     site="fence_lost_winner_lookup",
                 )
-                await progress(_guided_full_failed_progress_event(failure_code))
-                raise_guided_operation_failure(GuidedOperationFailed(failure_code=failure_code))
+                # A bug in the system-owned winner rejoin must propagate.
+                # Fabricating a coded failure from the earlier primary here
+                # would launder a first-party defect into a routine failure
+                # response.
+                raise
             if joined is None or isinstance(joined, (GuidedOperationLease, GuidedOperationExpired)):
                 _note_guided_full_secondary_failure(
                     request=request,
@@ -732,8 +770,10 @@ async def post_guided_plan(
                 secondary=cleanup_exc,
                 site="failure_settlement",
             )
-            await progress(_guided_full_failed_progress_event(failure_code))
-            raise_guided_operation_failure(GuidedOperationFailed(failure_code=failure_code))
+            # Mirror of the cancellation arm: a failed durable failure
+            # settlement surfaces as an integrity error instead of being
+            # replaced by a coded failure derived from the earlier primary.
+            raise AuditIntegrityError("Guided PLAN could not record its terminal failure") from cleanup_exc
         await progress(_guided_full_failed_progress_event(failure_code))
         raise_guided_operation_failure(failed)
 

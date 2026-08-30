@@ -126,7 +126,15 @@ def is_authentic_guided_synthetic_invocation(invocation: ComposerToolInvocation)
         return False
     try:
         arguments = json.loads(invocation.arguments_canonical)
-    except (TypeError, ValueError):
+    except json.JSONDecodeError:
+        # An undecodable ``arguments_canonical`` is simply "not an authentic
+        # server synthetic event" — the predicate's declared negative verdict,
+        # which the sole caller (service._require_exact_guided_intent_cancellation_audit)
+        # enforces fail-closed by raising AuditIntegrityError. Only the JSON
+        # parse verdict is absorbed: ``arguments_canonical`` is typed ``str``
+        # on the owned contract, so a TypeError here would be first-party
+        # corruption and now propagates instead of masquerading as
+        # inauthenticity.
         return False
     return (
         invocation.tool_name in _GUIDED_SYNTHETIC_TOOLS

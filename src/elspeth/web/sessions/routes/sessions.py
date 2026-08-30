@@ -53,11 +53,19 @@ from ._helpers import (
     UserIdentity,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
+    _log_last_resort_diagnostic,
     _session_response,
     _verify_session_ownership,
     deep_thaw,
     get_current_user,
+    slog,
 )
+
+# Upper bound on consecutive fence-loss rejoin attempts in the session-fork
+# settlement loop; repeated losses are pathological lease churn and terminate
+# in AuditIntegrityError instead of an unbounded retry (mirrors the guided
+# START loop's bound in routes/composer/guided.py).
+_FORK_FENCE_REJOIN_ATTEMPTS = 5
 
 
 def _copied_blob_for_inline_marker(
@@ -652,7 +660,12 @@ def register_session_routes(router: APIRouter) -> None:
                 raise AuditIntegrityError("Session fork replay locator has the wrong result kind")
             return ForkSessionResponse(session_id=result.session_id)
 
-        while True:
+        # Bounded fence-loss rejoin (was ``while True``): each iteration either
+        # returns a durable result, raises, or observes a lost fence and
+        # rejoins through ``reserve_or_replay_guided_operation``. Repeated
+        # losses are pathological lease churn and terminate in an explicit
+        # integrity failure instead of an unbounded retry.
+        for _fence_rejoin_attempt in range(_FORK_FENCE_REJOIN_ATTEMPTS):
             try:
                 reserved = await reserve_or_replay_guided_operation(
                     service=service,
@@ -752,9 +765,24 @@ def register_session_routes(router: APIRouter) -> None:
                             fence.operation_id,
                         )
                     except (AuditIntegrityError, BlobError, SQLAlchemyError, OSError) as cleanup_exc:
+                        # The exception note alone is not a record: the tail
+                        # below surfaces the PRIMARY failure through
+                        # raise_guided_operation_failure, which raises a new
+                        # HTTPException — FastAPI answers it without logging
+                        # the chained context, so notes on primary_exc reach
+                        # nobody. Leaked fork blobs are operator-actionable
+                        # residue and get an explicit last-resort record.
                         primary_exc.add_note(
                             f"RecoveryFailed[{type(cleanup_exc).__name__}]: fork blob cleanup failed for "
                             f"child {staged.session.id} ({cleanup_exc})"
+                        )
+                        _log_last_resort_diagnostic(
+                            slog.error,
+                            "session.fork_blob_cleanup_failed",
+                            session_id=str(session_id),
+                            child_session_id=str(staged.session.id),
+                            operation_id=fence.operation_id,
+                            exc_class=type(cleanup_exc).__name__,
                         )
                     else:
                         for error in cleanup.errors:
@@ -762,8 +790,18 @@ def register_session_routes(router: APIRouter) -> None:
                                 f"RecoveryFailed[{error.exc_type}]: could not delete fork blob {error.blob_id} "
                                 f"from child {staged.session.id} ({error.detail})"
                             )
+                            _log_last_resort_diagnostic(
+                                slog.error,
+                                "session.fork_blob_cleanup_failed",
+                                session_id=str(session_id),
+                                child_session_id=str(staged.session.id),
+                                operation_id=fence.operation_id,
+                                exc_class=error.exc_type,
+                                blob_id=str(error.blob_id),
+                            )
                     # The failed child is retained as archived audit evidence.
                     # Only its copied blobs are compensatable; deleting the
                     # session would also destroy the frozen plan envelope.
 
                 raise_guided_operation_failure(failed)
+        raise AuditIntegrityError("Session fork lost its operation fence on every rejoin attempt without a joinable winner")

@@ -489,10 +489,19 @@ def test_guided_full_failure_atomically_retains_sanitized_audit_without_a_checkp
     )
 
 
-def test_guided_full_failure_cleanup_error_preserves_the_primary_provider_outcome(
+def test_guided_full_failure_settlement_error_surfaces_integrity_error(
     composer_test_client,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A failed durable failure settlement crashes; it is never replaced.
+
+    Tier-remediation web-sessions (bundle sign-2026-08-30-w1): the old
+    behavior preserved the primary provider outcome and reduced the failed
+    ``fail_guided_operation_with_audit`` write to a best-effort log line,
+    leaving the operation row unsettled while the client saw a routine 503.
+    The settlement failure now surfaces as ``AuditIntegrityError``, with the
+    bounded secondary diagnostic still recorded and secret-free.
+    """
     from structlog.testing import capture_logs
 
     class _PrimaryFailurePlanner:
@@ -513,26 +522,21 @@ def test_guided_full_failure_cleanup_error_preserves_the_primary_provider_outcom
     session = composer_test_client.post("/api/sessions", json={"title": "guided cleanup primacy"}).json()
     operation_id = "00000000-0000-4000-8000-000000000074"
 
-    with capture_logs() as logs:
-        response = composer_test_client.post(
+    # The bare-FastAPI test fixture carries none of create_app's exception
+    # handlers, so the surfaced AuditIntegrityError propagates to the test
+    # transport verbatim — which pins the mechanism (in production the
+    # registered handler answers it as the audit_integrity_error 500).
+    with capture_logs() as logs, pytest.raises(AuditIntegrityError, match="could not record its terminal failure"):
+        composer_test_client.post(
             f"/api/sessions/{session['id']}/guided/plan",
             json={"operation_id": operation_id, "intent": "Preserve the provider failure."},
         )
 
-    assert response.status_code == 503, response.text
-    assert response.json()["detail"]["failure_code"] == "provider_unavailable"
     secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
     assert len(secondary_events) == 1
     assert secondary_events[0]["primary_failure_code"] == "provider_unavailable"
     assert secondary_events[0]["secondary_exc_class"] == "RuntimeError"
     assert secondary_secret not in str(secondary_events)
-    _assert_guided_plan_terminal_progress(
-        composer_test_client,
-        session=session,
-        operation_id=operation_id,
-        phase="failed",
-        reason="provider_unavailable",
-    )
 
 
 def test_guided_full_no_winner_after_failure_fence_loss_preserves_primary_outcome(
@@ -1628,10 +1632,19 @@ def test_guided_full_cancel_after_atomic_settlement_still_publishes_terminal_pro
     )
 
 
-def test_guided_full_cancellation_cleanup_error_preserves_cancelled_error_and_progress(
+def test_guided_full_cancellation_settlement_error_surfaces_integrity_error(
     composer_test_client,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A failed cancellation settlement crashes instead of riding the cancel.
+
+    Tier-remediation web-sessions (bundle sign-2026-08-30-w1): the old
+    behavior kept unwinding the cancellation while the failed
+    ``fail_guided_operation_with_audit`` write was reduced to a log line,
+    leaving the operation row unsettled with no surfaced cause. The
+    settlement failure now surfaces as ``AuditIntegrityError``, with the
+    bounded secondary diagnostic still recorded and secret-free.
+    """
     from structlog.testing import capture_logs
 
     secondary_secret = "cancel-cleanup-secret-must-not-be-logged"  # secret-scan: allow-this-line
@@ -1662,12 +1675,17 @@ def test_guided_full_cancellation_cleanup_error_preserves_cancelled_error_and_pr
             request_task = asyncio.create_task(
                 client.post(
                     f"/api/sessions/{session['id']}/guided/plan",
-                    json={"operation_id": operation_id, "intent": "Cancel while preserving the primary outcome."},
+                    json={"operation_id": operation_id, "intent": "Cancel while surfacing the settlement failure."},
                 )
             )
             await asyncio.wait_for(planner.started.wait(), timeout=3)
             request_task.cancel("primary caller cancellation")
-            with pytest.raises(asyncio.CancelledError, match="primary caller cancellation"):
+            # The route consumes the injected cancellation, attempts the
+            # durable failure settlement, and — because that settlement
+            # itself fails — surfaces AuditIntegrityError instead of
+            # completing the unwind as a quiet cancel (the bare-FastAPI
+            # fixture has no exception handlers, so the type propagates).
+            with pytest.raises(AuditIntegrityError, match="could not record its terminal failure"):
                 await request_task
 
     with capture_logs() as logs:
@@ -1678,13 +1696,6 @@ def test_guided_full_cancellation_cleanup_error_preserves_cancelled_error_and_pr
     assert secondary_events[0]["primary_failure_code"] == "request_cancelled"
     assert secondary_events[0]["secondary_exc_class"] == "RuntimeError"
     assert secondary_secret not in str(secondary_events)
-    _assert_guided_plan_terminal_progress(
-        composer_test_client,
-        session=session,
-        operation_id=operation_id,
-        phase="cancelled",
-        reason="client_cancelled",
-    )
 
 
 def test_guided_full_cancellation_fence_loss_checks_for_a_winner_before_preserving_cancellation(

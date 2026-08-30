@@ -673,3 +673,30 @@ def test_all_actions_unretainable_in_one_send_leave_state_unchanged() -> None:
 
     assert type(result) is DeferredRequestUnchanged
     assert result.guided.deferred_intents == ()
+
+
+def test_unparseable_catalog_identity_is_not_the_unavailable_seam() -> None:
+    """Pin the recognizer's ValueError branch (tier-rem web-sessions).
+
+    ``_has_unmentioned_unavailable_action_identity`` parses the MODEL-authored
+    ``catalog_kind:catalog_name`` through ``PluginId.parse``; an identity that
+    defeats the grammar is simply "not the unavailable-catalog seam" — the
+    recognizer's declared False verdict — and the action still flows through
+    ``validate_deferred_intent_action`` on the caller's every path
+    (guided_chat_intent_management.apply path), so nothing is silently
+    accepted.
+    """
+    from elspeth.web.sessions.routes.composer.guided_chat_intent_management import (
+        _has_unmentioned_unavailable_action_identity,
+    )
+
+    catalog = _catalog(available=frozenset({PluginId("transform", "passthrough")}))
+    malformed = replace(_action("passthrough"), catalog_name="Not A Plugin!")
+    assert (
+        _has_unmentioned_unavailable_action_identity(
+            malformed,
+            catalog=catalog,
+            originating_message_content="Please add a dedup step later.",
+        )
+        is False
+    )
