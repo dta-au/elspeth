@@ -4226,8 +4226,8 @@ def redact_guided_snapshot_storage_paths(
     # Admission keeps its own strict direction (yaml_generator, execution).
     try:
         return _correlate_guided_snapshot_storage_paths(sources, composer_meta, raw_sources)
-    except AuditIntegrityError:
-        return _degrade_guided_snapshot_storage_paths(sources, composer_meta)
+    except GuidedCustodyIntegrityError:
+        return _degrade_guided_snapshot_storage_paths(sources, composer_meta, raw_sources)
 
 
 def assert_guided_custody_persistable(
@@ -4242,6 +4242,12 @@ def assert_guided_custody_persistable(
     refuses would have re-raised on every later read of the persisted tip.
     No guided snapshot or a populated terminal passes (the projection degrades
     a terminal pair instead); an active pair runs the strict correlation.
+
+    Custody only: a degenerate checkpoint — ``guided_session`` set to None, or
+    a dict without the schema-8 review keys — makes no custody claim and
+    passes, even though the projection rejects those shapes with
+    ValueError/KeyError on read. Shape defects stay the read side's to refuse,
+    exactly as before this gate existed.
     """
     if composer_meta is None or "guided_session" not in composer_meta:
         return
@@ -4269,16 +4275,31 @@ def _mask_option_carriers(options: Mapping[str, Any]) -> dict[str, Any]:
     return masked
 
 
+def _sweep_equal_strings(value: Any, needles: frozenset[str]) -> Any:
+    """Replace every string equal to a needle, anywhere in a projected structure."""
+    if type(value) is str and value in needles:
+        return REDACTED_BLOB_SOURCE_PATH
+    if type(value) is dict:
+        return {key: _sweep_equal_strings(item, needles) for key, item in value.items()}
+    if type(value) is list:
+        return [_sweep_equal_strings(item, needles) for item in value]
+    return value
+
+
 def _degrade_guided_snapshot_storage_paths(
     sources: Mapping[str, Any] | None,
     composer_meta: Mapping[str, Any],
+    raw_sources: Mapping[str, Any] | None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Project a terminal session whose reviewed custody no longer binds.
 
     Every live-source, reviewed-snapshot, and pending-intent path carrier is
-    masked unconditionally and never stamped with a sentinel; the projected
-    ``guided_session`` gains ``custody_unavailable: true``. Projection-only:
-    ``GuidedSession.from_dict`` rejects the key, so it can never persist.
+    masked unconditionally and never stamped with a sentinel; then every
+    string anywhere in the projection equal to a raw live carrier value is
+    masked too, so a private path planted under a non-carrier key cannot ride
+    out. The projected ``guided_session`` gains ``custody_unavailable: true``.
+    Projection-only: ``GuidedSession.from_dict`` rejects the key, so it can
+    never persist.
     """
     guided = composer_meta["guided_session"]
     sources_out: dict[str, Any] | None = None
@@ -4342,6 +4363,17 @@ def _degrade_guided_snapshot_storage_paths(
         masked_report = dict(report)
         masked_report["entries"] = masked_entries
         meta_out["implicit_decisions"] = masked_report
+
+    live_carrier_values = frozenset(
+        value
+        for live_source in (raw_sources or {}).values()
+        if type(live_source) is dict and "options" in live_source and type(live_source["options"]) is dict
+        for key in GUIDED_REVIEWED_BLOB_PATH_KEYS
+        if key in live_source["options"] and type(value := live_source["options"][key]) is str
+    )
+    if live_carrier_values:
+        sources_out = _sweep_equal_strings(sources_out, live_carrier_values)
+        meta_out = _sweep_equal_strings(meta_out, live_carrier_values)
     return sources_out, meta_out
 
 
@@ -4500,11 +4532,11 @@ def _correlate_guided_snapshot_storage_paths(
     if private_path_projections and meta_out is not None and "implicit_decisions" in meta_out:
         report = meta_out["implicit_decisions"]
         if type(report) is not dict or "entries" not in report or type(report["entries"]) is not list:
-            raise GuidedCustodyIntegrityError("guided implicit-decision projection is malformed")
+            raise AuditIntegrityError("guided implicit-decision projection is malformed")
         redacted_entries: list[dict[str, Any]] = []
         for entry in report["entries"]:
             if type(entry) is not dict:
-                raise GuidedCustodyIntegrityError("guided implicit-decision entry is malformed")
+                raise AuditIntegrityError("guided implicit-decision entry is malformed")
             redacted_entry = dict(entry)
             if (
                 "path" in entry

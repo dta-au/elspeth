@@ -16,7 +16,7 @@ from typing import Annotated, Any
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, GuidedCustodyIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
@@ -1252,11 +1252,21 @@ def test_redact_guided_snapshot_raw_correlation_stamps_sentinel_over_generic_mas
             "pending_source_intents": {},
         }
     }
+    composer_meta["implicit_decisions"] = {
+        "schema_version": 1,
+        "entries": [{"path": "source.path", "value": real_path, "category": "source"}],
+        "normalization_events": [],
+    }
     generic_sources = redact_source_storage_path({"sources": raw_sources})["sources"]
 
     sources_out, meta_out = redact_guided_snapshot_storage_paths(generic_sources, composer_meta, raw_sources=raw_sources)
 
     assert sources_out["source"]["options"] == {"path": sentinel, "blob_ref": blob_id}
+    # The raw-path correlation also masks the implicit-decision echo of the raw
+    # carrier value — at base the projection map was keyed on the generic
+    # literal, so this entry leaked the private path (accepted leak fix,
+    # fix round 1 F-A5).
+    assert meta_out["implicit_decisions"]["entries"][0]["value"] == sentinel
     assert real_path not in str((sources_out, meta_out))
 
 
@@ -1517,3 +1527,69 @@ def test_assert_guided_custody_persistable_agrees_with_projection_on_the_fork_sh
         assert_guided_custody_persistable(renamed, composer_meta)
     with pytest.raises(AuditIntegrityError):
         _project(renamed, composer_meta)
+
+
+def test_redact_guided_snapshot_non_custody_integrity_raise_escapes_the_terminal_branch() -> None:
+    """The terminal branch degrades CUSTODY failures only (fix round 1 F-A3): a
+    projected/raw shape disagreement is a programming error and must surface."""
+    private = "/srv/elspeth/data/blobs/s1/shape.csv"
+    raw_sources = {"source": {"plugin": "csv", "options": {"path": private, "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"}}}
+    projected = {"source": {"plugin": "csv"}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "11111111-1111-4111-8111-111111111111": {
+                    "name": "source",
+                    "plugin": "csv",
+                    "options": {"path": private, "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"},
+                }
+            },
+            "pending_source_intents": {},
+            "terminal": _EXITED_TERMINAL,
+        }
+    }
+    with pytest.raises(AuditIntegrityError, match="mirror the raw source shape") as excinfo:
+        redact_guided_snapshot_storage_paths(projected, composer_meta, raw_sources=raw_sources)
+    assert not isinstance(excinfo.value, GuidedCustodyIntegrityError)
+
+
+@pytest.mark.parametrize("terminal", [None, _EXITED_TERMINAL], ids=["active", "exited"])
+def test_redact_guided_snapshot_malformed_implicit_decisions_is_not_a_custody_condition(terminal: object) -> None:
+    """A malformed implicit_decisions report is a serializer defect, not a
+    custody condition (fix round 1 F-A3): it must raise plain
+    AuditIntegrityError on active AND terminal tips — never the custody type
+    the 409 arms name, never the degraded projection."""
+    real_path = "/internal/blobs/session/source.csv"
+    sources = {"source": {"options": {"path": real_path, "schema": {"mode": "observed"}}}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "22222222-2222-4222-8222-222222222222": {"name": "source", "options": {"path": "blob:11111111-1111-4111-8111-111111111111"}}
+            },
+            "pending_source_intents": {},
+            "terminal": terminal,
+        },
+        "implicit_decisions": {"schema_version": 1, "entries": "not-a-list"},
+    }
+    with pytest.raises(AuditIntegrityError, match="implicit-decision projection is malformed") as excinfo:
+        _project(sources, composer_meta)
+    assert not isinstance(excinfo.value, GuidedCustodyIntegrityError)
+
+
+def test_redact_guided_snapshot_degrade_value_sweeps_planted_private_paths() -> None:
+    """Degrade branch only (fix round 1 F-B1): after key-masking, any string in
+    the projected sources or composer_meta EQUAL to a raw live carrier value is
+    masked too, so a private path planted under a non-carrier key (options.glob,
+    an implicit_decisions entry labeled outside source.path/file) cannot ride
+    out on the degraded projection. The branch is new at this fix, so the sweep
+    carries no stored-hash risk."""
+    sources, composer_meta = _two_guided_committed_sources_repointed_after_exit(_EXITED_TERMINAL)
+    sources["a"]["options"]["glob"] = _PRIVATE_A
+    composer_meta["implicit_decisions"]["entries"].append({"path": "source.nested.path", "value": _PRIVATE_A, "category": "source"})
+
+    sources_out, meta_out = _project(sources, composer_meta)
+
+    projected = json.dumps((sources_out, meta_out))
+    assert _PRIVATE_A not in projected
+    assert sources_out["a"]["options"]["glob"] == REDACTED_BLOB_SOURCE_PATH
+    assert meta_out["guided_session"]["custody_unavailable"] is True
