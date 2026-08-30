@@ -140,12 +140,11 @@ def _typing_special_form_name(value: object) -> str | None:
         module = sys.modules[module_name] if module_name in sys.modules else None
         if not isinstance(module, ModuleType):
             continue
+        namespace = vars(module)
         for special_form_name in _TYPING_SPECIAL_FORM_NAMES:
-            try:
-                canonical = inspect.getattr_static(module, special_form_name)
-            except AttributeError:
+            if special_form_name not in namespace:
                 continue
-            if canonical is value:
+            if namespace[special_form_name] is value:
                 return special_form_name
     return None
 

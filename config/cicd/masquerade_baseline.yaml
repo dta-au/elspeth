@@ -136,16 +136,6 @@ entries:
   classification: reflection-owned-table
   justification: Field names are explicitly checked against the receiver's declared
     dataclass field table before access; unknown names fail before reflection.
-- path: src/elspeth/contracts/runtime_val_manifest.py
-  qualname: _typing_special_form_name
-  kind: getattr_static
-  occurrences: 1
-  probe_shapes:
-  - f8308a75d60ad35840630376d0735e8c7b314f7c72606da3c4571bb1ad941a61
-  classification: approved-introspection
-  justification: Fetches the canonical typing special form off a module object for
-    an `is` identity comparison; static introspection of stdlib structure, not a trust
-    decision (PLAN.md Finding 4, elspeth-02cd60d8cd).
 - path: src/elspeth/contracts/schema_contract.py
   qualname: PipelineRow.__getattr__
   kind: dunder_getattr
