@@ -53,7 +53,7 @@ def engine():
 
 @pytest.fixture(scope="module")
 def service(engine):
-    return PreferencesService(engine, now=lambda: datetime(2026, 5, 15, tzinfo=UTC))
+    return PreferencesService(engine)
 
 
 class _RecordingCounter:
@@ -97,9 +97,9 @@ def test_get_for_user_with_row_returns_real_updated_at(service):
     asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(default_mode="freeform")))
     prefs = asyncio.run(service.get_composer_preferences(user))
     assert prefs.updated_at is not None
-    assert prefs.updated_at == datetime(2026, 5, 15, tzinfo=UTC).replace(tzinfo=None) or prefs.updated_at == datetime(
-        2026, 5, 15, tzinfo=UTC
-    )
+    with service._engine.connect() as conn:
+        stored = conn.execute(select(user_preferences_table.c.updated_at).where(user_preferences_table.c.user_id == user)).scalar_one()
+    assert prefs.updated_at == stored
 
 
 def test_update_persists_and_round_trips(service):
@@ -778,7 +778,7 @@ def test_concurrent_partial_patches_return_serialized_current_state(tmp_path):
     """
     engine = create_session_engine(f"sqlite:///{tmp_path / 'preferences-race.db'}")
     metadata.create_all(engine)
-    service = PreferencesService(engine, now=lambda: datetime(2026, 5, 16, tzinfo=UTC))
+    service = PreferencesService(engine)
     user = "alice-concurrent-partial-return"
     stamp = datetime(2026, 5, 16, 12, 30, tzinfo=UTC)
 

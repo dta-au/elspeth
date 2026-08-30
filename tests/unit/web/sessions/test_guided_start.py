@@ -17,6 +17,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
@@ -32,9 +33,9 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import composition_states_table, guided_operation_events_table, guided_operations_table
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 class _CatalogServiceFake:
@@ -77,6 +78,26 @@ class _BlobServiceFake:
         return None
 
 
+async def _save_composition_state(service, session_id, state, *, provenance):  # type: ignore[no-untyped-def]
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
+
+
 def _make_app(tmp_path, user_id="alice", database_url: str | None = None):
     if database_url is None:
         engine = create_session_engine(
@@ -87,7 +108,7 @@ def _make_app(tmp_path, user_id="alice", database_url: str | None = None):
     else:
         engine = create_session_engine(database_url)
     initialize_session_schema(engine)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -122,7 +143,10 @@ def _make_app(tmp_path, user_id="alice", database_url: str | None = None):
     # None resolver means "shield unavailable" (a missing key is a wiring error).
     app.state.scoped_secret_resolver = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
-    app.state.composer_progress_registry = ComposerProgressRegistry()
+    app.state.composer_progress_registry = ComposerProgressRegistry(
+        engine=engine,
+        session_operation_authority=service.session_operation_authority,
+    )
     app.include_router(create_session_router())
     return app, service
 
@@ -175,6 +199,46 @@ async def test_guided_start_seeds_tutorial_profile_and_persists(tmp_path) -> Non
     get_resp = client.get(f"/api/sessions/{session.id}/guided")
     assert get_resp.status_code == 200
     assert get_resp.json()["guided_session"]["profile"] == {"coaching": True, "bookends": True}
+
+
+@pytest.mark.asyncio
+async def test_guided_start_reconciliation_reads_active_attempt_without_acquiring_compose(tmp_path) -> None:
+    from elspeth.web.sessions.routes._helpers import _SessionComposeLockRegistry
+
+    app, service = _make_app(tmp_path)
+    registry = _SessionComposeLockRegistry()
+    app.state.session_compose_lock_registry = registry
+    session = await service.create_session("alice", "T", "local")
+    operation_id = str(uuid.uuid4())
+    claim = await service.reserve_guided_operation(
+        session_id=session.id,
+        operation_id=operation_id,
+        kind="guided_start",
+        request_hash="c" * 64,
+        actor="worker",
+        lease_seconds=300,
+    )
+    assert claim.fence.attempt == 1
+    compose_lock = await registry.get_lock(str(session.id))
+    await compose_lock.acquire()
+
+    try:
+        with (
+            patch.object(service, "get_guided_start_reconciliation", wraps=service.get_guided_start_reconciliation) as read,
+            patch.object(service, "reconcile_guided_start_operation", wraps=service.reconcile_guided_start_operation) as mutate,
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                response = await asyncio.wait_for(
+                    client.post(f"/api/sessions/{session.id}/guided/start/{operation_id}/reconcile"),
+                    timeout=1,
+                )
+    finally:
+        compose_lock.release()
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "in_progress"}
+    read.assert_awaited_once()
+    mutate.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -557,7 +621,8 @@ async def test_guided_start_rejects_existing_freeform_state_without_guided_sessi
             "on_validation_failure": "halt",
         }
     }
-    existing = await service.save_composition_state(
+    existing = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             sources=freeform_source,
@@ -761,18 +826,46 @@ async def test_guided_start_does_not_overwrite_head_changed_after_preflight(tmp_
         nonlocal raced_record
         outcome = await original_reserve(**kwargs)
         if raced_record is None:
-            raced_record = await service.save_composition_state(
-                session.id,
-                CompositionStateData(
-                    sources={},
-                    nodes={},
-                    edges={},
-                    outputs={},
-                    metadata_={"name": "Raced freeform", "description": ""},
-                    composer_meta=None,
-                ),
-                provenance="post_compose",
+            # This is a genuine competing freeform writer. Hand off from the
+            # route's incumbent lease, then let the successor acquire, write,
+            # and release its own exact COMPOSE authority.
+            await service._run_sync(
+                service.session_operation_authority.release,
+                kwargs["session_operation_context"],
             )
+            successor_context = await service._run_sync(
+                lambda: service.session_operation_authority.acquire(
+                    session_id=session.id,
+                    operation_kind=SessionOperationKind.COMPOSE,
+                    owner_instance_id=service.session_operation_owner_instance_id,
+                    lease_seconds=service.session_operation_lease_seconds,
+                )
+            )
+            try:
+                raced_record = await service.save_composition_state(
+                    session.id,
+                    CompositionStateData(
+                        sources={},
+                        nodes={},
+                        edges={},
+                        outputs={},
+                        metadata_={"name": "Raced freeform", "description": ""},
+                        composer_meta=None,
+                    ),
+                    provenance="post_compose",
+                    session_operation_context=successor_context,
+                )
+                await service.fail_guided_operation(
+                    outcome.fence,
+                    failure_code="stale_conflict",
+                    actor="composer_route",
+                    session_operation_context=successor_context,
+                )
+            finally:
+                await service._run_sync(
+                    service.session_operation_authority.release,
+                    successor_context,
+                )
         return outcome
 
     with patch.object(service, "reserve_guided_operation", side_effect=reserve_after_freeform_race):
@@ -807,7 +900,8 @@ async def test_guided_start_completed_retry_replays_after_later_freeform_head(tm
     payload = {"profile": "tutorial", "operation_id": operation_id}
     committed = client.post(f"/api/sessions/{session.id}/guided/start", json=payload)
     assert committed.status_code == 200
-    later_freeform = await service.save_composition_state(
+    later_freeform = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             sources={},
@@ -831,6 +925,12 @@ async def test_guided_start_completed_retry_replays_after_later_freeform_head(tm
 
 @pytest.mark.asyncio
 async def test_guided_start_empty_race_settles_exact_guided_winner(tmp_path) -> None:
+    """One guided-start operation may observe state written by its own substep.
+
+    The injected write deliberately reuses the route operation's exact COMPOSE
+    context: it models re-entrant work in the same logical operation, not a
+    second writer bypassing session serialization.
+    """
     from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
     from elspeth.web.sessions.protocol import CompositionStateData
     from elspeth.web.sessions.routes._helpers import _initial_composition_state_with_guided_session
@@ -845,6 +945,7 @@ async def test_guided_start_empty_race_settles_exact_guided_winner(tmp_path) -> 
         nonlocal winner_record
         outcome = await original_reserve(**kwargs)
         if winner_record is None:
+            live_compose_context = kwargs["session_operation_context"]
             winner = _materialize_first_turn(
                 _initial_composition_state_with_guided_session(profile=TUTORIAL_PROFILE),
                 app.state.catalog_service,
@@ -863,6 +964,7 @@ async def test_guided_start_empty_race_settles_exact_guided_winner(tmp_path) -> 
                     composer_meta={"guided_session": winner.guided_session.to_dict()},
                 ),
                 provenance="session_seed",
+                session_operation_context=live_compose_context,
             )
         return outcome
 
@@ -882,6 +984,7 @@ async def test_guided_start_empty_race_settles_exact_guided_winner(tmp_path) -> 
 
 @pytest.mark.asyncio
 async def test_guided_start_late_empty_race_converges_inside_atomic_seed(tmp_path) -> None:
+    """Atomic seed convergence rechecks a same-operation predecessor write."""
     from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
     from elspeth.web.sessions.protocol import CompositionStateData
     from elspeth.web.sessions.routes._helpers import _initial_composition_state_with_guided_session
@@ -901,6 +1004,8 @@ async def test_guided_start_late_empty_race_converges_inside_atomic_seed(tmp_pat
         )
         assert winner.guided_session is not None
         winner_data = winner.to_dict()
+        # The hook runs inside the original seed operation, so the forwarded
+        # exact context is the same operation's authority, not a competitor's.
         winner_record = await service.save_composition_state(
             session.id,
             CompositionStateData(
@@ -912,6 +1017,7 @@ async def test_guided_start_late_empty_race_converges_inside_atomic_seed(tmp_pat
                 composer_meta={"guided_session": winner.guided_session.to_dict()},
             ),
             provenance="session_seed",
+            session_operation_context=kwargs["session_operation_context"],
         )
         return await original_seed(*args, **kwargs)
 
@@ -947,7 +1053,8 @@ async def test_guided_start_replay_rejects_cross_session_result_locator(tmp_path
     client = TestClient(app)
     session = await service.create_session("alice", "T", "local")
     foreign = await service.create_session("alice", "Other", "local")
-    foreign_state = await service.save_composition_state(
+    foreign_state = await _save_composition_state(
+        service,
         foreign.id,
         CompositionStateData(
             sources={},
@@ -1092,6 +1199,8 @@ async def test_guided_start_takes_over_expired_lease_and_stale_worker_cannot_set
                 "operation_id": operation_id,
             },
         )
+    stale_session_context = await service._guided_test_context(session.id, "guided_start")
+    await service._run_sync(service.session_operation_authority.release, stale_session_context)
 
     with patch.object(service, "renew_guided_operation", wraps=service.renew_guided_operation) as renew:
         takeover = client.post(f"/api/sessions/{session.id}/guided/start", json=payload)
@@ -1122,7 +1231,7 @@ async def test_guided_start_rejoins_after_fence_loss_without_polling_under_lock(
     original_renew = service.renew_guided_operation
     renew_calls = 0
 
-    async def lose_first_fence(fence, *, actor, lease_seconds):
+    async def lose_first_fence(fence, *, actor, lease_seconds, session_operation_context):
         nonlocal renew_calls
         renew_calls += 1
         if renew_calls == 1:
@@ -1139,7 +1248,12 @@ async def test_guided_start_rejoins_after_fence_loss_without_polling_under_lock(
                     },
                 )
             raise GuidedOperationFenceLostError(fence)
-        return await original_renew(fence, actor=actor, lease_seconds=lease_seconds)
+        return await original_renew(
+            fence,
+            actor=actor,
+            lease_seconds=lease_seconds,
+            session_operation_context=session_operation_context,
+        )
 
     with patch.object(service, "renew_guided_operation", side_effect=lose_first_fence):
         response = client.post(

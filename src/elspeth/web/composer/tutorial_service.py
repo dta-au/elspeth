@@ -41,6 +41,8 @@ from elspeth.web.composer.tutorial_models import (
     TutorialRunResponse,
 )
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.errors import UnresolvedInterpretationPlaceholderError
 from elspeth.web.execution.outputs import filesystem_path_candidates
 from elspeth.web.execution.protocol import ExecutionService
@@ -122,6 +124,30 @@ class _LiveTutorialRun:
 class _VerifiedArtifactBytes:
     path: Path
     content: bytes
+
+
+async def _close_tutorial_execute_lease_before_transfer(lease: SessionOperationLease) -> None:
+    """Join exact lease cleanup even when request cancellation repeats."""
+    close_task = asyncio.create_task(
+        lease.close(),
+        name="tutorial-execution-pretransfer-lease-close",
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not close_task.done():
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+            continue
+    try:
+        close_task.result()
+    except BaseException as close_error:
+        if cancellation is None:
+            raise
+        cancellation.add_note(f"Tutorial execution pre-transfer lease close also failed with {type(close_error).__name__}.")
+    if cancellation is not None:
+        raise cancellation from None
 
 
 def _tutorial_launch_blocker(
@@ -295,13 +321,23 @@ async def _run_live_tutorial(
     session_service: SessionServiceProtocol,
 ) -> _LiveTutorialRun:
     execution_service: ExecutionService = request.app.state.execution_service
+    lease = await SessionOperationLease.acquire(
+        session_service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id=session_service.session_operation_owner_instance_id,
+        lease_seconds=session_service.session_operation_lease_seconds,
+    )
+    transferred = False
     try:
         run_id = await execution_service.execute(
             session_id,
             state_id=state_id,
+            session_operation_lease=lease,
             user_id=user.user_id,
             auth_provider_type=settings.auth_provider,
         )
+        transferred = True
     except UnresolvedInterpretationPlaceholderError as exc:
         # A pending interpretation review (e.g. the planner-authored LLM
         # prompt awaiting its Accept card) is a launch blocker in the
@@ -324,6 +360,9 @@ async def _run_live_tutorial(
                 ),
             },
         ) from exc
+    finally:
+        if not transferred:
+            await _close_tutorial_execute_lease_before_transfer(lease)
     run_timeout_seconds = settings.composer_transport_idle_ceiling_seconds - settings.composer_transport_headroom_seconds
     run_record = await _wait_for_terminal_run(
         session_service,

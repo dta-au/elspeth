@@ -32,6 +32,7 @@ from elspeth.web.sessions.models import (
     guided_operation_events_table,
     guided_operations_table,
     proposal_events_table,
+    session_operation_fences_table,
 )
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
@@ -53,6 +54,7 @@ from elspeth.web.sessions.routes.guided_operations import (
 )
 from elspeth.web.sessions.schemas import CompositionProposalResponse
 from elspeth.web.sessions.service import _composition_state_data_content_hash
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 
 
 def _dml_target_table(context: ExecutionContext) -> FromClause | None:
@@ -812,7 +814,8 @@ def test_guided_full_preserves_an_existing_canonical_state_as_the_checkpoint_bas
     session = composer_test_client.post("/api/sessions", json={"title": "guided full existing"}).json()
     service = composer_test_client.app.state.session_service
     existing = asyncio.run(
-        service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            service,
             UUID(session["id"]),
             CompositionStateData(
                 sources={
@@ -884,7 +887,8 @@ def test_guided_full_settlement_rejects_command_state_that_differs_from_the_obse
     session_id = UUID(session["id"])
     service = composer_test_client.app.state.session_service
     existing = asyncio.run(
-        service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            service,
             session_id,
             CompositionStateData(
                 sources={},
@@ -899,7 +903,7 @@ def test_guided_full_settlement_rejects_command_state_that_differs_from_the_obse
     )
     real_stage = service.stage_guided_full_pipeline_proposal
 
-    async def stage_mismatched_state(command):
+    async def stage_mismatched_state(command, *, session_operation_context):
         mismatched_state = replace(command.state, metadata_={"name": "different checkpoint bytes"})
         mismatched_hash = _composition_state_data_content_hash(mismatched_state)
         mismatched_proposal = PipelineProposal.create(
@@ -920,7 +924,8 @@ def test_guided_full_settlement_rejects_command_state_that_differs_from_the_obse
                 command,
                 state=mismatched_state,
                 plan=replace(command.plan, proposal=mismatched_proposal),
-            )
+            ),
+            session_operation_context=session_operation_context,
         )
 
     monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", stage_mismatched_state)
@@ -993,15 +998,15 @@ def test_guided_full_replay_fails_closed_on_persisted_authority_tamper(
     engine = composer_test_client.app.state.session_engine
     service = composer_test_client.app.state.session_service
     if tamper == "response_hash":
-        reserve = service.reserve_guided_operation
+        get_operation = service.get_guided_operation
 
-        async def tampered_reserve(*args, **kwargs):
-            outcome = await reserve(*args, **kwargs)
+        async def tampered_get_operation(*args, **kwargs):
+            outcome = await get_operation(*args, **kwargs)
             if isinstance(outcome, GuidedOperationCompleted):
                 return replace(outcome, response_hash="0" * 64)
             return outcome
 
-        monkeypatch.setattr(service, "reserve_guided_operation", tampered_reserve)
+        monkeypatch.setattr(service, "get_guided_operation", tampered_get_operation)
     else:
         get_messages = service.get_messages
 
@@ -1800,6 +1805,15 @@ def test_guided_full_takeover_fences_stale_worker_and_joins_one_winner(
                         "session_id": session["id"],
                         "operation_id": operation_id,
                     },
+                )
+                # A takeover owns both authorities. Expiring only the guided
+                # row while the original COMPOSE fence remains live must fail;
+                # release that exact session-operation generation too so the
+                # test models an actually abandoned worker.
+                conn.execute(
+                    session_operation_fences_table.update()
+                    .where(session_operation_fences_table.c.session_id == session["id"])
+                    .values(released_at=datetime.now(UTC))
                 )
             winner = asyncio.create_task(client.post(f"/api/sessions/{session['id']}/guided/plan", json=body))
             await asyncio.wait_for(planner.takeover_started.wait(), timeout=3)

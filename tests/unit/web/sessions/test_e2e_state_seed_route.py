@@ -66,7 +66,10 @@ def _make_app(
     app.state.composer_service = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.execution_service = None
-    app.state.composer_progress_registry = ComposerProgressRegistry()
+    app.state.composer_progress_registry = ComposerProgressRegistry(
+        engine=engine,
+        session_operation_authority=service.session_operation_authority,
+    )
     app.state.scoped_secret_resolver = None
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)

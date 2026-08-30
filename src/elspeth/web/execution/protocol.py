@@ -12,8 +12,10 @@ from uuid import UUID
 from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.completion_gates import CompletionGateFacts
 from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -89,7 +91,13 @@ class ExecutionService(Protocol):
     execute() returns immediately; the pipeline runs in a background thread.
     """
 
-    async def validate(self, session_id: UUID, *, user_id: str | None = None) -> ValidationResult:
+    async def validate(
+        self,
+        session_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+        user_id: str | None = None,
+    ) -> ValidationResult:
         """Async dry-run validation using real engine code paths.
 
         Loads the current CompositionState for the session, generates YAML,
@@ -108,6 +116,7 @@ class ExecutionService(Protocol):
         self,
         state: CompositionState,
         *,
+        session_operation_context: SessionOperationContext,
         user_id: str | None = None,
         session_id: UUID | None = None,
         completion_gates: CompletionGateFacts | None = None,
@@ -132,6 +141,7 @@ class ExecutionService(Protocol):
         session_id: UUID,
         state_id: UUID | None = None,
         *,
+        session_operation_lease: SessionOperationLease,
         user_id: str | None = None,
         auth_provider_type: str | None = None,
         fanout_ack_token: str | None = None,

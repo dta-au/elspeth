@@ -9,13 +9,31 @@ from uuid import uuid4
 import pytest
 
 import elspeth.web.sessions._auto_title as at
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+
+_TEST_CONTEXT = SessionOperationContext(
+    fence=SessionOperationFence(
+        session_id="auto-title-sampling-session",
+        operation_id="auto-title-sampling-operation",
+        lease_token="auto-title-sampling-token",
+        operation_epoch=2,
+    ),
+    operation_kind=SessionOperationKind.COMPOSE,
+)
 
 
 class _TitleService:
     def __init__(self) -> None:
         self.updates: list[tuple[object, str]] = []
 
-    async def update_session_title(self, session_id: object, title: str) -> None:
+    async def update_session_title(
+        self,
+        session_id: object,
+        title: str,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
+        del session_operation_context
         self.updates.append((session_id, title))
 
 
@@ -41,6 +59,7 @@ async def test_auto_title_omits_sampling_when_none(monkeypatch: pytest.MonkeyPat
         model="gpt-5",
         temperature=None,
         seed=None,
+        session_operation_context=_TEST_CONTEXT,
     )
 
     assert "temperature" not in captured
@@ -65,6 +84,7 @@ async def test_auto_title_sends_configured_sampling(monkeypatch: pytest.MonkeyPa
         model="gpt-4o",
         temperature=0.0,
         seed=42,
+        session_operation_context=_TEST_CONTEXT,
     )
 
     assert captured["temperature"] == 0.0

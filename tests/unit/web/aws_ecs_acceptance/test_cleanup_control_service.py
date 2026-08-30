@@ -118,7 +118,7 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
             },
             "structural_changes": (
                 f"session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_{SQLITE_SCHEMA_EPOCH}"
-                "_blob_cleanup_guided_decline_and_row_union_barrier"
+                "_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema"
             ),
             "semantics_only_changes": "guided_coalesce_timeout_seconds_and_node_options_summary_required",
             "archive_export_decision": "required_before_forward_migration",
@@ -178,7 +178,10 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
         (("schema_facts", "previous", "session_epoch"), 34),
         (
             ("schema_facts", "structural_changes"),
-            "session_epoch_34_to_37_blob_cleanup_and_guided_decline_contract",
+            (
+                f"session_epoch_34_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_{SQLITE_SCHEMA_EPOCH}"
+                "_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema"
+            ),
         ),
     ):
         mutated = json.loads(json.dumps(record))

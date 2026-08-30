@@ -14,19 +14,20 @@ import structlog
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import Engine
 from testcontainers.postgres import PostgresContainer
-from tests.integration.web.conftest import _make_session
+from tests.integration.web.conftest import _ensure_released_session_operation_fence, _make_session
 from tests.unit.web.sessions.test_routes import _make_app
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import execute_tool
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions._persist_payload import RedactedToolRow, StatePayload
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl, StaleComposeStateError
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -118,6 +119,31 @@ def _state_data(state: CompositionState) -> CompositionStateData:
     )
 
 
+async def _save_seed_state(
+    service: SessionServiceImpl,
+    session_id: uuid.UUID,
+    state: CompositionStateData,
+) -> CompositionStateRecord:
+    """Persist a test seed under a short-lived real COMPOSE lease."""
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance="session_seed",
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
+
+
 class _BlockingSpliceComposer:
     """Execute the real splice handler while exposing route-lock ordering."""
 
@@ -141,8 +167,19 @@ class _BlockingSpliceComposer:
         progress: Any = None,
         guided_terminal: Any = None,
         user_message_id: str | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ComposerResult:
-        del message, chat_messages, session_id, current_state_id, user_id, progress, guided_terminal, user_message_id
+        del (
+            message,
+            chat_messages,
+            session_id,
+            current_state_id,
+            user_id,
+            progress,
+            guided_terminal,
+            user_message_id,
+            session_operation_context,
+        )
         result = execute_tool(
             "splice_transform",
             _splice_arguments(),
@@ -178,10 +215,10 @@ async def test_concurrent_http_splices_serialize_reload_and_apply_once(tmp_path:
         )
         assert created.status_code == 201
         session_id = uuid.UUID(created.json()["id"])
-        initial_record = await service.save_composition_state(
+        initial_record = await _save_seed_state(
+            service,
             session_id,
             _state_data(_initial_state()),
-            provenance="session_seed",
         )
 
         async def send(content: str):
@@ -248,13 +285,14 @@ def test_concurrent_postgres_splice_persistence_rejects_stale_writer_without_los
             session_id=str(session_id),
             title="PostgreSQL splice concurrency proof",
         )
+    _ensure_released_session_operation_fence(postgres_service, session_id)
 
     initial_state = _initial_state()
     initial_record = asyncio.run(
-        postgres_service.save_composition_state(
+        _save_seed_state(
+            postgres_service,
             session_id,
             _state_data(initial_state),
-            provenance="session_seed",
         )
     )
     catalog, snapshot = _policy_context()
@@ -272,6 +310,12 @@ def test_concurrent_postgres_splice_persistence_rejects_stale_writer_without_los
     successes: list[str | None] = []
     stale_rejections: list[StaleComposeStateError] = []
     unexpected: list[BaseException] = []
+    compose_context = postgres_service.session_operation_authority.acquire(
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=postgres_service.session_operation_owner_instance_id,
+        lease_seconds=postgres_service.session_operation_lease_seconds,
+    )
 
     def persist(writer: str) -> None:
         tool_call_id = f"splice-{writer}"
@@ -295,6 +339,7 @@ def test_concurrent_postgres_splice_persistence_rejects_stale_writer_without_los
                 expected_current_state_id=str(initial_record.id),
                 writer_principal="compose_loop",
                 plugin_crash_pending=False,
+                session_operation_context=compose_context,
             )
             successes.append(outcome.current_state_id)
         except StaleComposeStateError as exc:
@@ -306,10 +351,13 @@ def test_concurrent_postgres_splice_persistence_rejects_stale_writer_without_los
         threading.Thread(target=persist, args=("a",), name="splice-writer-a"),
         threading.Thread(target=persist, args=("b",), name="splice-writer-b"),
     ]
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join(timeout=30)
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=30)
+    finally:
+        postgres_service.session_operation_authority.release(compose_context)
 
     assert all(not worker.is_alive() for worker in workers)
     assert unexpected == []

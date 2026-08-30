@@ -23,6 +23,7 @@ from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMet
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.routes import _initial_composition_state_with_guided_session
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 _CURRENT_TOKEN = object()
@@ -98,7 +99,8 @@ def _persist_state(
     existing_meta["guided_session"] = guided.to_dict()
     data = state.to_dict()
     asyncio.run(
-        service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            service,
             UUID(session_id),
             CompositionStateData(
                 sources=data["sources"],

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedAssistantMessage,
     _AdmittedToolCall,
@@ -45,6 +46,7 @@ async def persist_turn_audit(
     assistant_tool_calls: tuple[_AdmittedToolCall, ...],
     plugin_crash: ComposerPluginCrashError | None,
     session_id: str | None,
+    session_operation_context: SessionOperationContext | None,
     current_state_id: str | None,
     persisted_tool_call_turn: bool,
     persisted_assistant_message_id: str | None,
@@ -208,6 +210,8 @@ async def persist_turn_audit(
     failed_turn: FailedTurnMetadata | None = None
     unwind_audit_failed = False
     if session_id is not None:
+        if type(session_operation_context) is not SessionOperationContext:
+            raise AuditIntegrityError("Compose turn audit persistence requires exact session operation authority")
         sessions_service = service._require_sessions_service()
         try:
             audit_outcome = await sessions_service.persist_compose_turn_async(
@@ -220,6 +224,7 @@ async def persist_turn_audit(
                 expected_current_state_id=current_state_id,
                 writer_principal="compose_loop",
                 plugin_crash_pending=plugin_crash is not None,
+                session_operation_context=session_operation_context,
             )
         except AuditIntegrityError as exc:
             exc.failed_turn = FailedTurnMetadata(

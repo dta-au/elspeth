@@ -390,6 +390,86 @@ def test_cli_diagnose_reports_authoritative_signature_mismatch(
     assert "re-justify required" in captured.out
 
 
+@pytest.mark.parametrize("signature_problem", ["missing", "invalid"])
+def test_signature_failure_does_not_hide_shifted_live_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signature_problem: str,
+) -> None:
+    """Binding disposition owns routing even when signed metadata also fails."""
+    from elspeth_lints.core.judge_signature_diagnosis import diagnose_judge_signatures
+
+    root, target = _build_source_tree(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    old_key = _write_v2_entry(
+        allowlist_dir,
+        source_root=root,
+        include_signature=signature_problem != "missing",
+    )
+    if signature_problem == "invalid":
+        yaml_path = allowlist_dir / "plugins.yaml"
+        yaml_path.write_text(
+            yaml_path.read_text(encoding="utf-8").replace(_RATIONALE, "tampered signed rationale"),
+            encoding="utf-8",
+        )
+    target.write_text("_SHIM = 1\n\n\n" + _SOURCE, encoding="utf-8")
+    live_key = _canonical_key(_live_widget_finding(root))
+    assert live_key != old_key
+
+    if signature_problem == "missing":
+        monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", raising=False)
+    else:
+        monkeypatch.setenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", _HMAC_KEY)
+    report = diagnose_judge_signatures(root=root, allowlist_dir=allowlist_dir)
+
+    assert len(report.items) == 1
+    item = report.items[0]
+    assert item.status == "AST_PATH_BINDING_DRIFT"
+    assert item.key == old_key
+    assert item.repair_key == live_key
+    assert item.signature_status == ("MISSING_SIGNATURE" if signature_problem == "missing" else "INVALID_SIGNATURE")
+    assert (item.signature_detail is not None) == (signature_problem == "invalid")
+
+
+@pytest.mark.parametrize("signature_problem", ["missing", "invalid"])
+def test_signature_failure_does_not_hide_missing_source_disposition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signature_problem: str,
+) -> None:
+    """An absent bound source is deletion work, never a signature-repair lane."""
+    from elspeth_lints.core.judge_signature_diagnosis import diagnose_judge_signatures
+
+    root, target = _build_source_tree(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    old_key = _write_v2_entry(
+        allowlist_dir,
+        source_root=root,
+        include_signature=signature_problem != "missing",
+    )
+    if signature_problem == "invalid":
+        yaml_path = allowlist_dir / "plugins.yaml"
+        yaml_path.write_text(
+            yaml_path.read_text(encoding="utf-8").replace(_RATIONALE, "tampered signed rationale"),
+            encoding="utf-8",
+        )
+    target.unlink()
+
+    if signature_problem == "missing":
+        monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", raising=False)
+    else:
+        monkeypatch.setenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", _HMAC_KEY)
+    report = diagnose_judge_signatures(root=root, allowlist_dir=allowlist_dir)
+
+    assert len(report.items) == 1
+    item = report.items[0]
+    assert item.status == "SOURCE_FILE_MISSING"
+    assert item.key == old_key
+    assert item.repair_key is None
+    assert item.signature_status == ("MISSING_SIGNATURE" if signature_problem == "missing" else "INVALID_SIGNATURE")
+    assert (item.signature_detail is not None) == (signature_problem == "invalid")
+
+
 def test_cli_sign_loads_env_removes_stale_entry_and_invokes_justify(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

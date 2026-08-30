@@ -18,6 +18,9 @@ from pydantic import BaseModel
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
+from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFenceLost, SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.guided_operations import guided_operation_request_hash
 from elspeth.web.sessions.protocol import (
     GuidedOperationActive,
@@ -25,26 +28,26 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationCompleted,
     GuidedOperationConflictError,
     GuidedOperationFailed,
+    GuidedOperationFailureCode,
     GuidedOperationFence,
+    GuidedOperationFenceLostError,
     GuidedOperationKind,
     GuidedOperationOutcome,
     GuidedOperationResult,
+    GuidedOperationSettlementConflictError,
     GuidedOperationTakenOver,
     SessionServiceProtocol,
 )
 
 _ACTOR = "composer_route"
+
+
 _LEASE_SECONDS = 300
+
+
 _POLL_SECONDS = 0.05
 
-# Ceiling for a NEW guided operation waiting on the per-session admission
-# lock. The admission lock is held across the whole respond settlement —
-# including the in-request pipeline planner, observed at 200s+ live — so an
-# unbounded wait turns a competing different-body request (double-click race,
-# second tab) into a silent multi-minute hang that then dies stale. Same-body
-# retries never wait here: they join or replay via the pre-admission lookup.
-# The ceiling absorbs ordinary quick settlements; a planner-length hold
-# answers fast with the coded conflict below.
+
 GUIDED_RESPOND_ADMISSION_WAIT_SECONDS: float = 10.0
 
 
@@ -117,9 +120,18 @@ _SAFE_FAILURES: dict[str, tuple[int, str]] = {
 
 @dataclass(frozen=True, slots=True)
 class GuidedOperationLease:
-    """A route owns the only fence authorised to perform durable writes."""
+    """A route owns both renewable authorities for one guided operation."""
 
     fence: GuidedOperationFence
+    session_lease: SessionOperationLease
+
+    @property
+    def session_operation_context(self) -> SessionOperationContext:
+        return self.session_lease.context
+
+    async def close(self) -> None:
+        """Release session authority after the guided row is terminal."""
+        await self.session_lease.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +223,170 @@ async def _replay_completed[ResponseT: BaseModel](
     return response
 
 
+async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T]) -> T:
+    """Join owned cleanup despite repeated cancellation of the caller."""
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
+
+
+async def run_guided_reconciliation_mutation[T](
+    session_lease: SessionOperationLease,
+    mutation: Awaitable[T],
+) -> T:
+    """Finish one atomic reconciliation before releasing its session fence."""
+
+    async def execute_mutation() -> T:
+        return await mutation
+
+    mutation_task: asyncio.Task[T] = asyncio.create_task(
+        execute_mutation(),
+        name="guided-reconciliation-mutation",
+    )
+    try:
+        result = await asyncio.shield(mutation_task)
+    except asyncio.CancelledError as cancellation:
+        try:
+            await _join_shielded_task_after_cancellation(mutation_task)
+        except BaseException as cleanup_error:
+            cancellation.add_note(f"Guided reconciliation cancellation cleanup also failed with {type(cleanup_error).__name__}.")
+        close_task = asyncio.create_task(session_lease.close(), name="guided-reconciliation-session-close")
+        try:
+            await _join_shielded_task_after_cancellation(close_task)
+        except BaseException as close_error:
+            cancellation.add_note(f"Guided reconciliation session cleanup also failed with {type(close_error).__name__}.")
+        raise cancellation from None
+    except BaseException as primary:
+        try:
+            await session_lease.close()
+        except BaseException as close_error:
+            if close_error is not primary:
+                primary.add_note(f"Guided reconciliation session cleanup also failed with {type(close_error).__name__}.")
+        raise
+    await session_lease.close()
+    return result
+
+
+def _guided_failure_code_for_exception(error: BaseException) -> GuidedOperationFailureCode:
+    if isinstance(error, asyncio.CancelledError):
+        return "request_cancelled"
+    if isinstance(error, GuidedOperationSettlementConflictError) or (isinstance(error, HTTPException) and error.status_code == 409):
+        return "stale_conflict"
+    if isinstance(error, (AuditIntegrityError, InvariantError)):
+        return "integrity_error"
+    return "operation_failed"
+
+
+@dataclass(slots=True)
+class _GuidedOperationLeaseGuard:
+    service: SessionServiceProtocol
+    lease: GuidedOperationLease
+
+    async def __aenter__(self) -> _GuidedOperationLeaseGuard:
+        return self
+
+    async def finish(self, primary: BaseException | None) -> None:
+        """Run exit cleanup from an existing route try/finally envelope."""
+        await self.__aexit__(
+            type(primary) if primary is not None else None,
+            primary,
+            primary.__traceback__ if primary is not None else None,
+        )
+
+    async def finish_active_exception(self) -> None:
+        """Finish using the exception, if any, currently crossing ``finally``."""
+        import sys
+
+        await self.finish(sys.exception())
+
+    async def __aexit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        _traceback: object,
+    ) -> bool:
+        guard_error: BaseException | None = None
+        guided_authority_lost = False
+        if exc_value is None:
+            fail_task = asyncio.create_task(
+                self.service.fail_guided_operation(
+                    self.lease.fence,
+                    failure_code="operation_failed",
+                    actor=_ACTOR,
+                    session_operation_context=self.lease.session_operation_context,
+                ),
+                name="guided-operation-guard-prove-terminal",
+            )
+            try:
+                await _join_shielded_task_after_cancellation(fail_task)
+            except GuidedOperationFenceLostError:
+                guided_authority_lost = True
+            except BaseException as proof_error:
+                guard_error = proof_error
+            else:
+                guard_error = AuditIntegrityError("Guided route returned before its guided operation became terminal")
+        elif not isinstance(exc_value, GuidedOperationFenceLostError):
+            fail_task = asyncio.create_task(
+                self.service.fail_guided_operation(
+                    self.lease.fence,
+                    failure_code=_guided_failure_code_for_exception(exc_value),
+                    actor=_ACTOR,
+                    session_operation_context=self.lease.session_operation_context,
+                ),
+                name="guided-operation-guard-fail",
+            )
+            try:
+                await _join_shielded_task_after_cancellation(fail_task)
+            except GuidedOperationFenceLostError:
+                guided_authority_lost = True
+            except BaseException as cleanup_error:
+                if cleanup_error is not exc_value:
+                    exc_value.add_note(f"Guided-operation failure cleanup also failed with {type(cleanup_error).__name__}.")
+
+        close_task = asyncio.create_task(self.lease.close(), name="guided-operation-guard-close")
+        try:
+            await _join_shielded_task_after_cancellation(close_task)
+        except SessionOperationFenceLost as close_error:
+            primary = exc_value or guard_error
+            if primary is not None:
+                primary.add_note(f"Session-operation guided cleanup also failed with {type(close_error).__name__}.")
+            elif not guided_authority_lost:
+                raise
+        except BaseException as close_error:
+            primary = exc_value or guard_error
+            if primary is None:
+                raise
+            if close_error is not primary:
+                primary.add_note(f"Session-operation guided cleanup also failed with {type(close_error).__name__}.")
+        if guard_error is not None:
+            raise guard_error from None
+        return False
+
+
+def guided_operation_lease_guard(
+    *,
+    service: SessionServiceProtocol,
+    lease: GuidedOperationLease,
+) -> _GuidedOperationLeaseGuard:
+    """Encompass all post-claim work and close guided authority first on error."""
+    return _GuidedOperationLeaseGuard(service=service, lease=lease)
+
+
+@contextlib.asynccontextmanager
+async def guided_operation_lock_guard(
+    *,
+    service: SessionServiceProtocol,
+    lease: GuidedOperationLease,
+    lock: asyncio.Lock,
+) -> AsyncIterator[None]:
+    """Enter cleanup authority before awaiting the route's compose lock."""
+    async with guided_operation_lease_guard(service=service, lease=lease), lock:
+        yield
+
+
 @overload
 async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
     *,
@@ -292,7 +468,7 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
         raise AuditIntegrityError("Strict guided operation request has a non-string operation_id")
     request_hash = guided_operation_request_hash(session_id=session_id, kind=kind, request=request)
 
-    async def reserve() -> GuidedOperationOutcome:
+    async def reserve(session_lease: SessionOperationLease) -> GuidedOperationOutcome:
         try:
             return await service.reserve_guided_operation(
                 session_id=session_id,
@@ -301,6 +477,7 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
                 request_hash=request_hash,
                 actor=_ACTOR,
                 lease_seconds=_LEASE_SECONDS,
+                session_operation_context=session_lease.context,
             )
         except GuidedOperationConflictError as exc:
             raise HTTPException(
@@ -308,26 +485,71 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
                 detail="Operation id is already bound to a different request.",
             ) from exc
 
-    if reserve_if_absent:
-        outcome: GuidedOperationOutcome = await reserve()
-        observed_by_get = False
-    else:
+    try:
+        existing = await service.get_guided_operation(
+            session_id=session_id,
+            operation_id=operation_id,
+            kind=kind,
+            request_hash=request_hash,
+        )
+    except GuidedOperationConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Operation id is already bound to a different request.",
+        ) from exc
+    outcome: GuidedOperationOutcome | None = existing
+    observed_by_get = True
+    session_lease: SessionOperationLease | None = None
+
+    async def acquire_and_reserve() -> GuidedOperationOutcome:
+        nonlocal session_lease
+        operation_kind = SessionOperationKind.SESSION_FORK if kind == "session_fork" else SessionOperationKind.COMPOSE
+        session_lease = await SessionOperationLease.acquire(
+            service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=operation_kind,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        reserve_task = asyncio.create_task(reserve(session_lease), name="guided-operation-reserve")
         try:
-            existing = await service.get_guided_operation(
-                session_id=session_id,
-                operation_id=operation_id,
-                kind=kind,
-                request_hash=request_hash,
-            )
-        except GuidedOperationConflictError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail="Operation id is already bound to a different request.",
-            ) from exc
-        if existing is None:
+            return await asyncio.shield(reserve_task)
+        except asyncio.CancelledError as cancellation:
+            try:
+                cancellation_outcome = await _join_shielded_task_after_cancellation(reserve_task)
+                if isinstance(cancellation_outcome, (GuidedOperationClaimed, GuidedOperationTakenOver)):
+                    fail_task = asyncio.create_task(
+                        service.fail_guided_operation(
+                            cancellation_outcome.fence,
+                            failure_code="request_cancelled",
+                            actor=_ACTOR,
+                            session_operation_context=session_lease.context,
+                        ),
+                        name="guided-operation-cancelled-reserve-fail",
+                    )
+                    await _join_shielded_task_after_cancellation(fail_task)
+            except BaseException as cleanup_error:
+                cancellation.add_note(f"Guided-operation reservation cancellation cleanup also failed with {type(cleanup_error).__name__}.")
+            try:
+                close_task = asyncio.create_task(session_lease.close(), name="guided-operation-cancelled-reserve-close")
+                await _join_shielded_task_after_cancellation(close_task)
+            except BaseException as close_error:
+                cancellation.add_note(f"Session-operation reservation cancellation cleanup also failed with {type(close_error).__name__}.")
+            session_lease = None
+            raise cancellation from None
+        except BaseException as primary:
+            try:
+                await session_lease.close()
+            except BaseException as close_error:
+                primary.add_note(f"Session-operation reservation cleanup also failed with {type(close_error).__name__}.")
+            session_lease = None
+            raise
+
+    if outcome is None:
+        if not reserve_if_absent:
             return None
-        outcome = existing
-        observed_by_get = True
+        outcome = await acquire_and_reserve()
+        observed_by_get = False
     while True:
         # ``GuidedOperationOutcome`` is a closed union of five exact,
         # unsubclassed frozen dataclasses this package owns, so the exact-type
@@ -336,13 +558,25 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
         # no negative-branch narrowing, and the ``GuidedOperationActive``
         # reads after it need it.
         if type(outcome) is GuidedOperationClaimed or type(outcome) is GuidedOperationTakenOver:
-            return GuidedOperationLease(fence=outcome.fence)
+            if session_lease is None:
+                raise AuditIntegrityError("Guided operation claim has no owning session lease")
+            return GuidedOperationLease(fence=outcome.fence, session_lease=session_lease)
         if type(outcome) is GuidedOperationCompleted:
+            if session_lease is not None:
+                await session_lease.close()
+                session_lease = None
             return await _replay_completed(outcome, replay, after_verified)
         if type(outcome) is GuidedOperationFailed:
+            if session_lease is not None:
+                await session_lease.close()
+                session_lease = None
             raise_guided_operation_failure(outcome)
         if not isinstance(outcome, GuidedOperationActive):
             raise AuditIntegrityError("Guided operation reserve returned an unknown outcome")
+
+        if session_lease is not None:
+            await session_lease.close()
+            session_lease = None
 
         if outcome.expired and observed_by_get:
             if not takeover_expired:
@@ -350,7 +584,7 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
             # ``expired`` is computed against the database clock by the read
             # primitive. Never compare the persisted timestamp with the web
             # host clock: even modest skew can create a tight reserve loop.
-            outcome = await reserve()
+            outcome = await acquire_and_reserve()
             observed_by_get = False
             continue
         await asyncio.sleep(_POLL_SECONDS)

@@ -33,6 +33,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from elspeth.web.composer.guided.state_machine import TerminalReason, TerminalState
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 # ---------------------------------------------------------------------------
@@ -887,7 +888,14 @@ class TestStepChatRejections:
             validation_errors=record.validation_errors,
             composer_meta=existing_meta,
         )
-        asyncio.run(service.save_composition_state(UUID(session_id), new_data, provenance="session_seed"))
+        asyncio.run(
+            _save_composition_state_with_compose_authority(
+                service,
+                UUID(session_id),
+                new_data,
+                provenance="session_seed",
+            )
+        )
 
         status, body = _post_chat(
             composer_test_client,
@@ -937,7 +945,14 @@ class TestStepChatRejections:
             validation_errors=record.validation_errors,
             composer_meta=existing_meta,
         )
-        asyncio.run(service.save_composition_state(UUID(session_id), new_data, provenance="session_seed"))
+        asyncio.run(
+            _save_composition_state_with_compose_authority(
+                service,
+                UUID(session_id),
+                new_data,
+                provenance="session_seed",
+            )
+        )
 
         status, body = _post_chat(
             composer_test_client,
@@ -1887,7 +1902,14 @@ class TestChatHistoryDiscriminatorPersistence:
             validation_errors=None,
             composer_meta={"guided_session": guided_dict},
         )
-        asyncio.run(service.save_composition_state(session_uuid, state_data, provenance="session_seed"))
+        asyncio.run(
+            _save_composition_state_with_compose_authority(
+                service,
+                session_uuid,
+                state_data,
+                provenance="session_seed",
+            )
+        )
 
         with pytest.raises(InvariantError, match="missing keys"):
             composer_test_client.get(f"/api/sessions/{session_id}/guided")

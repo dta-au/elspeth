@@ -16,6 +16,7 @@ from elspeth.web.sessions.models import blobs_table, composition_proposals_table
 
 _TOP_LEVEL_BLOB_TOOLS = frozenset(
     {
+        "delete_blob",
         "set_source_from_blob",
         "update_blob",
         "wire_blob_inline_ref",
@@ -186,15 +187,24 @@ def pending_proposal_reference_id(
     *,
     session_id: str,
     blob_id: str,
-    exclude_proposal_id: str | None = None,
+    accepting_proposal_id: str | None = None,
+    accepting_tool_name: str | None = None,
 ) -> str | None:
-    """Return the pending proposal retaining a blob, if any.
+    """Return a pending proposal retaining a blob, excluding one exact acceptance.
 
-    ``exclude_proposal_id`` names the proposal currently being executed by
-    a proposal-accept replay: its own retention edge must not block the
-    very mutation it authorizes, while every other pending proposal still
-    does.
+    The exclusion is server-owned evidence, not a blanket PROPOSAL exemption.
+    Its row is revalidated as pending, same-session (by the query), the expected
+    tool, and an authoritative reference to this exact blob before exclusion.
     """
+    if (accepting_proposal_id is None) is not (accepting_tool_name is None):
+        raise AuditIntegrityError("Tier 1: accepting proposal identity and tool must be provided together")
+    if accepting_proposal_id is not None and (
+        type(accepting_proposal_id) is not str
+        or not accepting_proposal_id
+        or type(accepting_tool_name) is not str
+        or accepting_tool_name not in {"update_blob", "delete_blob"}
+    ):
+        raise AuditIntegrityError("Tier 1: accepting proposal retention binding is malformed")
     rows = conn.execute(
         select(
             composition_proposals_table.c.id,
@@ -206,9 +216,8 @@ def pending_proposal_reference_id(
             composition_proposals_table.c.tool_name.in_(_BLOB_REFERENCE_TOOLS),
         )
     ).fetchall()
+    excluded_exact_acceptance = False
     for proposal_id, tool_name, arguments_json in rows:
-        if exclude_proposal_id is not None and str(proposal_id) == exclude_proposal_id:
-            continue
         if type(arguments_json) is not dict:
             raise AuditIntegrityError(
                 f"Tier 1: pending proposal {proposal_id} arguments_json is {type(arguments_json).__name__}, expected dict"
@@ -217,6 +226,14 @@ def pending_proposal_reference_id(
             references = proposal_blob_reference_ids(tool_name, arguments_json)
         except ValueError as exc:
             raise AuditIntegrityError(f"Tier 1: pending proposal {proposal_id} has malformed blob authority: {exc}") from exc
-        if blob_id in references:
-            return str(proposal_id)
+        if blob_id not in references:
+            continue
+        if accepting_proposal_id is not None and str(proposal_id) == accepting_proposal_id:
+            if tool_name != accepting_tool_name:
+                raise AuditIntegrityError("Tier 1: accepting proposal tool does not match blob mutation")
+            excluded_exact_acceptance = True
+            continue
+        return str(proposal_id)
+    if accepting_proposal_id is not None and not excluded_exact_acceptance:
+        raise AuditIntegrityError("Tier 1: accepting proposal is not a pending authoritative reference to this blob")
     return None

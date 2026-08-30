@@ -17,6 +17,7 @@ from uuid import UUID
 if TYPE_CHECKING:
     from pydantic import SecretStr
 
+    from elspeth.contracts.session_operation import SessionOperationContext
     from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.guided.planning import GuidedCorrectionTarget, GuidedRevisionAuthority
@@ -209,6 +210,10 @@ class ComposerResult:
     # tool_invocations again for that turn.
     persisted_assistant_message_id: str | None = None
     persisted_tool_call_turn: bool = False
+    # Exact durable composition-state head after the final persisted tool turn.
+    # Routes use this as the final response-settlement CAS; re-reading latest
+    # would bless an out-of-band writer that raced the compose loop.
+    final_persisted_state_id: UUID | None = None
     # Number of forced repair turns the proof step injected into this compose
     # invocation. Capped at 2 by the loop. 0 means first-pass success; 1 or 2
     # means the model was given proof_diagnostics back as a synthesized
@@ -273,6 +278,8 @@ class ComposerResult:
                 "the state-claim grounding correction shape on the "
                 "happy-path)."
             )
+        if self.final_persisted_state_id is not None and type(self.final_persisted_state_id) is not UUID:
+            raise TypeError("final_persisted_state_id must be an exact UUID or None")
         # Cap-assert on repair_turns_used. The loop enforces the bound
         # informally via ``_MAX_REPAIR_TURNS`` (web/composer/service.py),
         # but the field flows into the audit trail via
@@ -1247,6 +1254,7 @@ class ComposerService(Protocol):
         progress: ComposerProgressSink | None = None,
         guided_terminal: TerminalState | None = None,
         user_message_id: str | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop.
 
@@ -1298,6 +1306,7 @@ class ComposerService(Protocol):
         supersedes_draft_hash: str | None,
         recorder: BufferingRecorder,
         operation_fence: GuidedOperationFence,
+        session_operation_context: SessionOperationContext,
         progress: ComposerProgressSink | None = None,
         correction_target: GuidedCorrectionTarget | None = None,
         revision_authority: GuidedRevisionAuthority | None = None,
@@ -1316,6 +1325,7 @@ class ComposerService(Protocol):
         plugin_snapshot: PluginAvailabilitySnapshot,
         recorder: BufferingRecorder,
         operation_fence: GuidedOperationFence,
+        session_operation_context: SessionOperationContext,
         progress: ComposerProgressSink | None = None,
     ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
         """Plan one ordinary guided-full proposal through the shared planner."""
@@ -1328,6 +1338,7 @@ class ComposerService(Protocol):
         session_id: str | None,
         current_state_id: str | None,
         only_missing_evidence: bool = False,
+        session_operation_context: SessionOperationContext,
     ) -> None:
         """Kind-general backend surfacer for the GUIDED commit path (B1).
 

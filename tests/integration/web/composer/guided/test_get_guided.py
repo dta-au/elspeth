@@ -30,6 +30,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 # ---------------------------------------------------------------------------
@@ -536,7 +537,14 @@ def _seed_guided_session(client: TestClient, session_id: str, guided_session_dic
         validation_errors=None,
         composer_meta=new_composer_meta,
     )
-    asyncio.run(service.save_composition_state(session_uuid, state_data, provenance="session_seed"))
+    asyncio.run(
+        _save_composition_state_with_compose_authority(
+            service,
+            session_uuid,
+            state_data,
+            provenance="session_seed",
+        )
+    )
 
 
 class _FailOncePayloadStore:

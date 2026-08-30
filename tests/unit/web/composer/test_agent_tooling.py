@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, insert, select
@@ -40,7 +40,7 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, chat_messages_table
+from elspeth.web.sessions.models import blobs_table, chat_messages_table, session_operation_fences_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
 EXPECTED_REDACTED_BLOB_SOURCE_PATH = "<redacted-blob-source-path>"
@@ -137,6 +137,8 @@ def execute_tool(
     session_id: str | None = None,
     **kwargs: Any,
 ) -> ToolResult:
+    owned_authority = None
+    owned_context = None
     supplied_snapshot = kwargs.pop("plugin_snapshot", None)
     if isinstance(catalog, PolicyCatalogView):
         if not isinstance(supplied_snapshot, PluginAvailabilitySnapshot):
@@ -160,17 +162,72 @@ def execute_tool(
             user_message_content = f"Use this exact content:\n{content}"
             kwargs["user_message_id"] = _insert_user_message(session_engine, session_id, user_message_content)
             kwargs["user_message_content"] = user_message_content
-    return _execute_tool(
-        tool_name,
-        arguments,
-        state,
-        policy_catalog,
-        plugin_snapshot=snapshot,
-        data_dir=data_dir,
-        session_engine=session_engine,
-        session_id=session_id,
-        **kwargs,
-    )
+    if (
+        tool_name in {"create_blob", "update_blob", "delete_blob"}
+        and session_engine is not None
+        and session_id is not None
+        and "session_operation_authority" not in kwargs
+        and "session_operation_context" not in kwargs
+    ):
+        from elspeth.contracts.session_operation import SessionOperationKind
+        from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+
+        with session_engine.begin() as conn:
+            if (
+                conn.execute(
+                    select(session_operation_fences_table.c.session_id).where(session_operation_fences_table.c.session_id == session_id)
+                ).one_or_none()
+                is None
+            ):
+                now = datetime.now(UTC)
+                conn.execute(
+                    session_operation_fences_table.insert().values(
+                        session_id=session_id,
+                        operation_id=f"test-bootstrap-{uuid4()}",
+                        lease_token=f"test-bootstrap-token-{uuid4()}",
+                        operation_kind=SessionOperationKind.CREATE.value,
+                        owner_instance_id="agent-tooling-test-bootstrap",
+                        operation_epoch=1,
+                        lease_expires_at=now,
+                        released_at=now,
+                    )
+                )
+
+        authority = SQLiteLocalSessionOperationAuthority(session_engine)
+        operation_context = authority.acquire(
+            session_id=UUID(session_id),
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=f"agent-tooling-test-{uuid4()}",
+            lease_seconds=30,
+        )
+        kwargs["session_operation_authority"] = authority
+        kwargs["session_operation_context"] = operation_context
+        owned_authority = authority
+        owned_context = operation_context
+
+        if data_dir is None and tool_name in {"update_blob", "delete_blob"}:
+            with session_engine.connect() as conn:
+                storage_path = conn.execute(
+                    select(blobs_table.c.storage_path).where(blobs_table.c.id == arguments.get("blob_id")).limit(1)
+                ).scalar_one_or_none()
+            if storage_path is not None:
+                data_dir = str(Path(storage_path).resolve().parents[2])
+
+    try:
+        return _execute_tool(
+            tool_name,
+            arguments,
+            state,
+            policy_catalog,
+            plugin_snapshot=snapshot,
+            data_dir=data_dir,
+            session_engine=session_engine,
+            session_id=session_id,
+            **kwargs,
+        )
+    finally:
+        if owned_authority is not None and owned_context is not None:
+            owned_authority.release(owned_context)
 
 
 @pytest.fixture()
@@ -189,7 +246,7 @@ def blob_env(tmp_path: Path) -> dict[str, Any]:
     engine = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(engine)
 
-    session_id = "test-session-001"
+    session_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
         conn.execute(
@@ -270,7 +327,51 @@ class TestCreateBlob:
             catalog,
         )
         assert result.success is False
-        assert "session context" in result.data["error"]
+        assert "session operation authority context" in result.data["error"]
+
+    def test_proposal_authority_cannot_directly_create_blob(self, blob_env: dict[str, Any]) -> None:
+        from elspeth.contracts.session_operation import SessionOperationKind
+        from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+
+        state = _empty_state()
+        catalog = _mock_catalog()
+        initial_result = execute_tool(
+            "create_blob",
+            {"filename": "existing.csv", "mime_type": "text/csv", "content": "existing"},
+            state,
+            catalog,
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+        assert initial_result.success is True
+
+        authority = SQLiteLocalSessionOperationAuthority(blob_env["engine"])
+        operation_context = authority.acquire(
+            session_id=UUID(blob_env["session_id"]),
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=f"agent-tooling-proposal-test-{uuid4()}",
+            lease_seconds=30,
+        )
+        try:
+            result = execute_tool(
+                "create_blob",
+                {"filename": "forbidden.csv", "mime_type": "text/csv", "content": "forbidden"},
+                state,
+                catalog,
+                data_dir=blob_env["data_dir"],
+                session_engine=blob_env["engine"],
+                session_id=blob_env["session_id"],
+                session_operation_authority=authority,
+                session_operation_context=operation_context,
+            )
+        finally:
+            authority.release(operation_context)
+
+        assert result.success is False
+        assert result.data["error"] == "create_blob requires exact COMPOSE authority for this session."
+        with blob_env["engine"].connect() as conn:
+            assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 1
 
     def test_writes_file_to_disk(self, blob_env: dict[str, Any]) -> None:
         state = _empty_state()
@@ -315,6 +416,7 @@ class TestUpdateBlob:
             {"blob_id": blob_id, "content": "new content"},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
         )
@@ -330,6 +432,7 @@ class TestUpdateBlob:
             {"blob_id": "nonexistent", "content": "x"},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
         )
@@ -890,13 +993,28 @@ class TestCrossSessionIsolation:
         )
         blob_id = create_result.data["blob_id"]
         # Try to delete from a different session — should fail (not found)
+        other_session_id = str(uuid4())
+        now = datetime.now(UTC)
+        with blob_env["engine"].begin() as conn:
+            from elspeth.web.sessions.models import sessions_table
+
+            conn.execute(
+                sessions_table.insert().values(
+                    id=other_session_id,
+                    user_id="other-user",
+                    auth_provider_type="local",
+                    title="Other Session",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
         result = execute_tool(
             "delete_blob",
             {"blob_id": blob_id},
             state,
             catalog,
             session_engine=blob_env["engine"],
-            session_id="other-session-999",
+            session_id=other_session_id,
         )
         assert result.success is False
 

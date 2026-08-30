@@ -40,6 +40,7 @@ from elspeth.contracts.blobs import (
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
 from elspeth.plugins.sources.field_normalization import resolve_field_names
@@ -143,6 +144,7 @@ async def inspect_selected_ready_session_blob(
     session_id: UUID,
     *,
     selected_blob_id: UUID | None,
+    session_operation_context: SessionOperationContext,
 ) -> SourceInspectionFacts | None:
     """Inspect one explicit or unambiguous ready blob owned by a session.
 
@@ -164,7 +166,10 @@ async def inspect_selected_ready_session_blob(
 
     if selected_blob_id is not None:
         try:
-            record = await blob_service.get_blob(selected_blob_id)
+            record = await blob_service.get_blob(
+                selected_blob_id,
+                session_operation_context=session_operation_context,
+            )
         except BlobNotFoundError as exc:
             raise ValueError("selected source blob is not ready in this session") from exc
         if record.session_id != session_id or record.status != "ready":
@@ -184,6 +189,7 @@ async def inspect_selected_ready_session_blob(
         prefix, verified_hash, total_size = await blob_service.read_blob_content_prefix_verified(
             record.id,
             prefix_bytes=_MAX_BYTES,
+            session_operation_context=session_operation_context,
         )
     except (BlobNotFoundError, BlobStateError) as exc:
         raise SourceInspectionBlobLifecycleError from exc

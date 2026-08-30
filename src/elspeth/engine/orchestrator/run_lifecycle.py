@@ -344,6 +344,7 @@ class RunLifecycleCoordinator:
         openrouter_catalog_sha256: str | None = None,
         openrouter_catalog_source: str | None = None,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
         initialize_database_phase: InitializeDatabasePhase,
         execute_run: ExecuteRun,
     ) -> RunResult:
@@ -412,6 +413,8 @@ class RunLifecycleCoordinator:
 
         # DATABASE phase - create factory and begin run (mints the epoch-1
         # leader seat — ADR-030 uniformity rule)
+        if check_coordination_latch is not None:
+            check_coordination_latch()
         factory, run, coordination_token = initialize_database_phase(
             config,
             payload_store,
@@ -456,6 +459,12 @@ class RunLifecycleCoordinator:
         )
         _heartbeat.start()
 
+        def _check_combined_coordination_latch() -> None:
+            """Require both the engine seat and optional caller authority."""
+            _heartbeat.check_and_raise()
+            if check_coordination_latch is not None:
+                check_coordination_latch()
+
         run_completed = False
         run_start_time = time.perf_counter()
         run_span_stack = ExitStack()
@@ -485,7 +494,7 @@ class RunLifecycleCoordinator:
                     # write to refuse.  The latch is an optimization on top of the
                     # epoch/membership fences — both independently refuse the same
                     # writes — but the latch surfaces the condition proactively.
-                    check_coordination_latch=_heartbeat.check_and_raise,
+                    check_coordination_latch=_check_combined_coordination_latch,
                 )
 
             # ADR-030 §D (audit-derived terminal status on ALL paths — bug
@@ -498,10 +507,12 @@ class RunLifecycleCoordinator:
             # demoted to a parity cross-check (loud on unexplained mismatch;
             # the two documented rows_coalesce_failed divergences are
             # tolerated — see assert_terminal_counter_parity).
+            _check_combined_coordination_latch()
             terminal_status, audit_counters = derive_terminal_status_from_audit(factory, run.run_id)
             assert_terminal_counter_parity(live=result, audit=audit_counters, run_id=run.run_id)
 
             # Complete run with reproducibility grade computation
+            _check_combined_coordination_latch()
             factory.run_lifecycle.finalize_run(run.run_id, status=terminal_status, token=coordination_token)
             result = audit_counters.to_run_result(run.run_id, terminal_status)
             run_completed = True
@@ -510,6 +521,7 @@ class RunLifecycleCoordinator:
             # for recovery, not needed after success). LEADER WORK: the
             # delete is epoch-fenced (ADR-030 §C.4 row 5), so it must run
             # BEFORE the seat release vacates the fence's CAS target.
+            _check_combined_coordination_latch()
             self._checkpoints.delete_checkpoints(run.run_id)
 
             # ADR-030 §A.3: stop the heartbeat thread BEFORE releasing the
@@ -550,6 +562,7 @@ class RunLifecycleCoordinator:
                         "Export is enabled but no audit_export_content_store_resolver was provided; "
                         "prior immutable winning store IDs must remain resolvable."
                     )
+                _check_combined_coordination_latch()
                 self.execute_export_phase(
                     factory,
                     run.run_id,

@@ -1,1 +1,49 @@
-"""Web-runtime coordination authorities (handle-free repository writers)."""
+"""Public contracts for web-runtime coordination."""
+
+from elspeth.web.coordination.contracts import (
+    PROTOCOL_BUMP_NOT_REQUIRED_CHANGES,
+    PROTOCOL_BUMP_REQUIRED_CHANGES,
+    WEB_COORDINATION_PROTOCOL_VERSION,
+    ArchiveDeleteReconciliation,
+    CancellationSource,
+    CleanupClaimLost,
+    CompatibilityKey,
+    FenceLossReason,
+    InstanceState,
+    RecoveryRequiredReason,
+    RunOwnershipFence,
+    RunOwnershipFenceLost,
+    RunSagaState,
+    SessionOperationContext,
+    SessionOperationFence,
+    SessionOperationFenceLost,
+    SessionOperationKind,
+    SessionOperationLeaseDisposition,
+    SessionOperationTerminalOutcomeUnknown,
+    StartPermitState,
+)
+from elspeth.web.coordination.lifecycle import SessionOperationLease
+
+__all__ = [
+    "PROTOCOL_BUMP_NOT_REQUIRED_CHANGES",
+    "PROTOCOL_BUMP_REQUIRED_CHANGES",
+    "WEB_COORDINATION_PROTOCOL_VERSION",
+    "ArchiveDeleteReconciliation",
+    "CancellationSource",
+    "CleanupClaimLost",
+    "CompatibilityKey",
+    "FenceLossReason",
+    "InstanceState",
+    "RecoveryRequiredReason",
+    "RunOwnershipFence",
+    "RunOwnershipFenceLost",
+    "RunSagaState",
+    "SessionOperationContext",
+    "SessionOperationFence",
+    "SessionOperationFenceLost",
+    "SessionOperationKind",
+    "SessionOperationLease",
+    "SessionOperationLeaseDisposition",
+    "SessionOperationTerminalOutcomeUnknown",
+    "StartPermitState",
+]

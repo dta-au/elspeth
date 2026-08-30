@@ -40,6 +40,8 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.telemetry_phase8 import record_audit_fetch_failure
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.ownership import verify_session_ownership
 from elspeth.web.sessions.protocol import SessionServiceProtocol
@@ -64,6 +66,14 @@ def create_audit_readiness_router() -> APIRouter:
         """Return the six-row audit-readiness snapshot for ``session_id``."""
         await verify_session_ownership(session_id, user, request)
         service: ReadinessService = request.app.state.readiness_service
+        session_service: SessionServiceProtocol = request.app.state.session_service
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.BLOB_READ,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
         # Phase 8 Sub-task 7f (B3 cohort b2). A 404 from the "no
         # composition state" branch is a not-found signal, not a
         # fetch failure, so it MUST NOT emit
@@ -74,20 +84,24 @@ def create_audit_readiness_router() -> APIRouter:
         # Telemetry-only signal under CLAUDE.md non-decision read
         # superset exception — no companion audit event is required.
         try:
-            result = await service.compute_snapshot(
-                session_id=session_id,
-                user_id=user.user_id,
+            try:
+                result = await service.compute_snapshot(
+                    session_id=session_id,
+                    user_id=user.user_id,
+                    session_operation_context=lease.context,
+                )
+            except CompositionStateNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from None
+            except Exception:
+                telemetry: _SessionsTelemetry = request.app.state.sessions_telemetry
+                record_audit_fetch_failure(telemetry)
+                raise
+            return JSONResponse(
+                content=result.model_dump(mode="json"),
+                headers={"Cache-Control": _NO_STORE},
             )
-        except CompositionStateNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from None
-        except Exception:
-            telemetry: _SessionsTelemetry = request.app.state.sessions_telemetry
-            record_audit_fetch_failure(telemetry)
-            raise
-        return JSONResponse(
-            content=result.model_dump(mode="json"),
-            headers={"Cache-Control": _NO_STORE},
-        )
+        finally:
+            await lease.close()
 
     @router.get(
         "/api/sessions/{session_id}/audit-readiness/explain",

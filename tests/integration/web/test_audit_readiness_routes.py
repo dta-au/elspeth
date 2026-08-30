@@ -40,6 +40,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions.protocol import CompositionStateData
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 
 
 def test_snapshot_returns_six_canonical_rows(
@@ -293,7 +294,8 @@ def test_secrets_row_surfaces_disallowed_secret_ref_from_real_validate_pipeline(
             version=1,
         )
         state_d = state.to_dict()
-        await session_service.save_composition_state(
+        await _save_composition_state_with_compose_authority(
+            session_service,
             record.id,
             CompositionStateData(
                 sources=state_d["sources"],

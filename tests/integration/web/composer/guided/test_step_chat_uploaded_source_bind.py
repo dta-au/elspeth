@@ -281,6 +281,41 @@ class TestSourceFormBlobPrefillFallback:
         intents = _guided(client, session_id)["composition_state"]["composer_meta"]["guided_session"]["pending_source_intents"]
         assert next(iter(intents.values()))["inspection_facts"] is None
 
+    def test_compatible_upload_fallback_uses_bounded_verified_inspection(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Fallback inspection must never materialize every ready blob in memory."""
+        client = composer_test_client
+        session_id = _create_session(client)
+        _upload_inventory_csv(client, session_id, filename="inventory.csv")
+        _upload_inline_blob(
+            client,
+            session_id,
+            filename="rows.json",
+            content='[{"sku": "SKU-001"}]',
+            mime_type="application/json",
+        )
+        blob_service = client.app.state.blob_service
+        original_prefix_read = blob_service.read_blob_content_prefix_verified
+        prefix_limits: list[int] = []
+
+        async def _forbid_full_read(*_args: object, **_kwargs: object) -> bytes:
+            raise AssertionError("guided fallback must not materialize full blob content")
+
+        async def _record_prefix_read(blob_id: UUID, *, prefix_bytes: int, **kwargs: object) -> tuple[bytes, str, int]:
+            prefix_limits.append(prefix_bytes)
+            return await original_prefix_read(blob_id, prefix_bytes=prefix_bytes, **kwargs)
+
+        monkeypatch.setattr(blob_service, "read_blob_content", _forbid_full_read)
+        monkeypatch.setattr(blob_service, "read_blob_content_prefix_verified", _record_prefix_read)
+
+        form = _post_respond(client, session_id, chosen=["csv"])["next_turn"]
+
+        assert form["payload"]["prefilled"]["path"].startswith("blob:")
+        assert prefix_limits == [8 * 1024, 8 * 1024]
+
     def test_several_compatible_uploads_stay_ambiguous_and_do_not_prefill(
         self,
         composer_test_client: TestClient,

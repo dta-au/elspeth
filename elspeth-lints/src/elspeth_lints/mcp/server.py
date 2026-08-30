@@ -151,15 +151,17 @@ _CONTINUE_ON_BLOCK_JUDGE_CALL_THRESHOLD = 10
 
 def _require_str_arg(arguments: dict[str, Any], name: str) -> str:
     value = arguments.get(name)
-    if not isinstance(value, str) or not value:
+    if type(value) is not str or not value:
         raise ValueError(f"argument {name!r} is required and must be a non-empty string")
     return value
 
 
 def _resolve_bundle_path(ctx: _ServerContext, arguments: dict[str, Any]) -> Path:
     """Resolve ``<staged_dir>/<bundle_id>.json`` from the ``bundle_id`` arg."""
+    from elspeth_lints.core.review_bundle import resolve_staged_bundle_path
+
     bundle_id = _require_str_arg(arguments, "bundle_id")
-    return ctx.staged_dir / f"{bundle_id}.json"
+    return resolve_staged_bundle_path(staged_dir=ctx.staged_dir, bundle_id=bundle_id)
 
 
 def _shell_join_keep_user(parts: list[str]) -> str:
@@ -480,9 +482,11 @@ def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
     * ``rotation`` -- remove findings already assigned to judge-gated diagnosis,
       then plan the residual pre-judge population; residual ambiguity fails
       staging because no deterministic action can represent it safely;
-    * ``new_judgment`` -- live findings covered by neither an exact canonical
-      key nor a per-file rule in the full allowlist, excluding identity groups
-      already reserved for a diagnosis action in this bundle.
+    * ``new_judgment`` -- live findings covered by neither a per-file rule nor
+      an identity-prefix in the **full, unfiltered** allowlist (the double-route
+      guard: an fp-shifted judge-gated entry's live finding shares its prefix
+      with the drifted entry, so it routes to ``drift_repair`` alone, never also
+      to a spurious ``new_judgment``).
     """
     from elspeth_lints.core.bundle_verify import _STALE_DELETE_ORPHAN_STATUSES
     from elspeth_lints.core.judge_signature_diagnosis import (
@@ -491,9 +495,11 @@ def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
     )
     from elspeth_lints.core.review_bundle import BundleAction
     from elspeth_lints.core.tier_model_scan import (
+        TargetCoverage,
         census_tree_targets,
+        plan_judge_cleanup_groups,
         plan_non_judge_rotations,
-        routable_new_judgment_findings,
+        scan_tree_findings,
     )
     from elspeth_lints.rules.trust_tier.tier_model.rule import _load_tier_model_allowlist
 
@@ -501,6 +507,14 @@ def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
 
     # drift_repair + stale_delete from the keyless diagnosis index.
     diagnosis = diagnose_judge_signatures(root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+    diagnosis_keys: set[str] = set()
+    duplicate_diagnosis_keys: set[str] = set()
+    for item in diagnosis.items:
+        if item.key in diagnosis_keys:
+            duplicate_diagnosis_keys.add(item.key)
+        diagnosis_keys.add(item.key)
+    if duplicate_diagnosis_keys:
+        raise ValueError("stage_scan found duplicate diagnosis key(s): " + ", ".join(repr(key) for key in sorted(duplicate_diagnosis_keys)))
     for item in diagnosis.items:
         if item.status in _SIGNABLE_DIAGNOSIS_STATUSES:
             actions.append(
@@ -518,16 +532,31 @@ def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
     # Scan once, classify full coverage, then remove findings already assigned
     # to judge-gated diagnosis before planning the residual pre-judge lane.
     allowlist = _load_tier_model_allowlist(ctx.allowlist_dir)
-    covered_keys = {entry.key for entry in allowlist.entries}
-    target_scan = census_tree_targets(
-        root=ctx.root,
-        covered_keys=covered_keys,
-        per_file_rules=allowlist.per_file_rules,
-    )
+    raw_findings = tuple(scan_tree_findings(root=ctx.root))
     rotation_plan = plan_non_judge_rotations(
-        findings=target_scan.findings,
+        findings=raw_findings,
         allowlist=allowlist,
         diagnosis_items=diagnosis.items,
+    )
+    cleanup_groups = plan_judge_cleanup_groups(
+        findings=raw_findings,
+        allowlist=allowlist,
+        orphan_keys=frozenset(item.key for item in diagnosis.items if item.status in _STALE_DELETE_ORPHAN_STATUSES),
+    )
+    resign_assigned_keys = {rotation.new_key for rotation in rotation_plan.rotations}
+    resign_assigned_keys.update(finding_key for group in cleanup_groups for finding_key in group.finding_keys)
+    target_coverage = TargetCoverage(
+        exact_keys=frozenset(entry.key for entry in allowlist.entries),
+        diagnosis_assigned_keys=frozenset(
+            item.repair_key for item in diagnosis.items if item.status in _SIGNABLE_DIAGNOSIS_STATUSES and item.repair_key is not None
+        ),
+        resign_assigned_keys=frozenset(resign_assigned_keys),
+    )
+    target_scan = census_tree_targets(
+        root=ctx.root,
+        findings=raw_findings,
+        coverage=target_coverage,
+        per_file_rules=allowlist.per_file_rules,
     )
     if rotation_plan.ambiguous:
         groups = ", ".join(
@@ -537,16 +566,21 @@ def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
     for rotation in rotation_plan.rotations:
         actions.append(BundleAction(lane="resign", kind="rotation", key=rotation.old_key, source_file=rotation.entry_source_file))
 
-    # New-judgment coverage is exact. Identity-prefix grouping is used only to
-    # keep outstanding diagnosis work in a separate authority lane.
-    for finding in routable_new_judgment_findings(
-        uncovered_findings=target_scan.uncovered_findings,
-        diagnosis_items=diagnosis.items,
-        rotation_plan=rotation_plan,
-    ):
+    # new_judgment lane: coverage check against the FULL, unfiltered allowlist.
+    for finding in target_scan.uncovered_findings:
         actions.append(_new_judgment_action_from_finding(finding))
 
     actions.sort(key=lambda action: (action.kind, action.key))
+    action_keys: set[str] = set()
+    duplicate_action_keys: set[str] = set()
+    for action in actions:
+        if action.key in action_keys:
+            duplicate_action_keys.add(action.key)
+        action_keys.add(action.key)
+    if duplicate_action_keys:
+        raise ValueError(
+            "stage_scan found duplicate semantic action key(s): " + ", ".join(repr(key) for key in sorted(duplicate_action_keys))
+        )
     return actions, target_scan.census
 
 
@@ -576,8 +610,7 @@ def _tool_stage_scan(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
     from elspeth_lints.core.review_bundle import SCHEMA_VERSION, ReviewBundle, write_bundle
     from elspeth_lints.core.source_snapshot import SourceSnapshotChangedError, observe_source_snapshot
 
-    bundle_id_arg = arguments.get("bundle_id")
-    bundle_id = bundle_id_arg if isinstance(bundle_id_arg, str) and bundle_id_arg else f"stage-scan-{uuid.uuid4().hex[:12]}"
+    bundle_id = _require_str_arg(arguments, "bundle_id") if "bundle_id" in arguments else f"stage-scan-{uuid.uuid4().hex[:12]}"
     staged_by_arg = arguments.get("staged_by")
     staged_by = staged_by_arg if isinstance(staged_by_arg, str) and staged_by_arg else "elspeth-judge-agent"
 
@@ -615,6 +648,8 @@ def _tool_stage_scan(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
         "target_census": {
             "raw_target_count": target_census.raw_target_count,
             "exact_covered_count": target_census.exact_covered_count,
+            "diagnosis_assigned_count": target_census.diagnosis_assigned_count,
+            "resign_assigned_count": target_census.resign_assigned_count,
             "per_file_covered_count": target_census.per_file_covered_count,
             "uncovered_count": target_census.uncovered_count,
         },
@@ -858,8 +893,7 @@ def _tool_stage_rekey(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
 
     old_key_env = _require_str_arg(arguments, "old_key_env")
     new_key_env = _require_str_arg(arguments, "new_key_env")
-    bundle_id_arg = arguments.get("bundle_id")
-    bundle_id = bundle_id_arg if isinstance(bundle_id_arg, str) and bundle_id_arg else f"stage-rekey-{uuid.uuid4().hex[:12]}"
+    bundle_id = _require_str_arg(arguments, "bundle_id") if "bundle_id" in arguments else f"stage-rekey-{uuid.uuid4().hex[:12]}"
     staged_by_arg = arguments.get("staged_by")
     staged_by = staged_by_arg if isinstance(staged_by_arg, str) and staged_by_arg else "elspeth-judge-agent"
 

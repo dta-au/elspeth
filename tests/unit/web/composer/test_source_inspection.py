@@ -21,12 +21,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.blobs import BlobNotFoundError, BlobRecord
 from elspeth.contracts.enums import CreationModality
@@ -42,6 +44,10 @@ from elspeth.web.composer.source_inspection import (
     inspect_csv_source_content,
     inspect_selected_ready_session_blob,
 )
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.schema import initialize_session_schema
 
 
 class TestDeclaredFieldIsRequiredBoundary:
@@ -710,6 +716,36 @@ def _blob_record_stub(
     )
 
 
+@pytest.fixture()
+def source_inspection_context() -> Iterator[SessionOperationContext]:
+    """Provide one real SQLite-backed COMPOSE authority context."""
+    engine = create_session_engine(
+        "sqlite:///:memory:",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    initialize_session_schema(engine)
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = authority.create_session_with_initial_fence(
+        user_id="test-user",
+        title="Source inspection test",
+        auth_provider_type="local",
+        owner_instance_id="source-inspection-bootstrap",
+        lease_seconds=30,
+    )
+    context = authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="source-inspection-test",
+        lease_seconds=30,
+    )
+    try:
+        yield context
+    finally:
+        authority.release(context)
+        engine.dispose()
+
+
 class _NoListingBlobService:
     """Spy blob service that fails the test if a full-session listing occurs.
 
@@ -726,11 +762,27 @@ class _NoListingBlobService:
     with ``AttributeError`` instead of silently passing.
     """
 
-    def __init__(self, record: BlobRecord, content: bytes) -> None:
+    def __init__(
+        self,
+        record: BlobRecord,
+        content: bytes,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
         self._record = record
         self._content = content
+        self._session_operation_context = session_operation_context
 
-    async def get_blob(self, blob_id: UUID) -> BlobRecord:
+    def _assert_operation_context(self, session_operation_context: SessionOperationContext) -> None:
+        assert type(session_operation_context) is SessionOperationContext
+        assert session_operation_context is self._session_operation_context
+
+    async def get_blob(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> BlobRecord:
+        self._assert_operation_context(session_operation_context)
         if blob_id != self._record.id:
             raise BlobNotFoundError(str(blob_id))
         return self._record
@@ -739,7 +791,14 @@ class _NoListingBlobService:
         del session_id, limit, offset
         raise AssertionError("explicit selection must not list session blobs")
 
-    async def read_blob_content_prefix_verified(self, blob_id: UUID, *, prefix_bytes: int) -> tuple[bytes, str, int]:
+    async def read_blob_content_prefix_verified(
+        self,
+        blob_id: UUID,
+        *,
+        prefix_bytes: int,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[bytes, str, int]:
+        self._assert_operation_context(session_operation_context)
         assert blob_id == self._record.id
         verified_hash = hashlib.sha256(self._content).hexdigest()
         return self._content[:prefix_bytes], verified_hash, len(self._content)
@@ -751,35 +810,42 @@ class TestExplicitSelectionResolvesDirectly:
     a Python filter over every blob in the session.
     """
 
-    def test_explicit_selection_never_lists_session_blobs(self) -> None:
-        session_id = uuid4()
+    def test_explicit_selection_never_lists_session_blobs(
+        self,
+        source_inspection_context: SessionOperationContext,
+    ) -> None:
+        session_id = UUID(source_inspection_context.fence.session_id)
         content = b"id\n1\n"
         record = _blob_record_stub(
             session_id=session_id,
             content_hash=hashlib.sha256(content).hexdigest(),
             size_bytes=len(content),
         )
-        service = _NoListingBlobService(record, content)
+        service = _NoListingBlobService(record, content, source_inspection_context)
 
         facts = asyncio.run(
             inspect_selected_ready_session_blob(
                 cast(Any, service),
                 session_id,
                 selected_blob_id=record.id,
+                session_operation_context=source_inspection_context,
             )
         )
 
         assert facts is not None
         assert facts.source_kind == "csv"
 
-    def test_explicit_selection_rejects_blob_from_other_session(self) -> None:
-        session_id = uuid4()
+    def test_explicit_selection_rejects_blob_from_other_session(
+        self,
+        source_inspection_context: SessionOperationContext,
+    ) -> None:
+        session_id = UUID(source_inspection_context.fence.session_id)
         content = b"id\n1\n"
         record = _blob_record_stub(
             session_id=uuid4(),  # a different session
             content_hash=hashlib.sha256(content).hexdigest(),
         )
-        service = _NoListingBlobService(record, content)
+        service = _NoListingBlobService(record, content, source_inspection_context)
 
         with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
             asyncio.run(
@@ -787,18 +853,22 @@ class TestExplicitSelectionResolvesDirectly:
                     cast(Any, service),
                     session_id,
                     selected_blob_id=record.id,
+                    session_operation_context=source_inspection_context,
                 )
             )
 
-    def test_explicit_selection_rejects_non_ready_blob(self) -> None:
-        session_id = uuid4()
+    def test_explicit_selection_rejects_non_ready_blob(
+        self,
+        source_inspection_context: SessionOperationContext,
+    ) -> None:
+        session_id = UUID(source_inspection_context.fence.session_id)
         content = b"id\n1\n"
         record = _blob_record_stub(
             session_id=session_id,
             content_hash=hashlib.sha256(content).hexdigest(),
             status="pending",
         )
-        service = _NoListingBlobService(record, content)
+        service = _NoListingBlobService(record, content, source_inspection_context)
 
         with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
             asyncio.run(
@@ -806,13 +876,17 @@ class TestExplicitSelectionResolvesDirectly:
                     cast(Any, service),
                     session_id,
                     selected_blob_id=record.id,
+                    session_operation_context=source_inspection_context,
                 )
             )
 
-    def test_explicit_selection_rejects_unknown_blob_id(self) -> None:
-        session_id = uuid4()
+    def test_explicit_selection_rejects_unknown_blob_id(
+        self,
+        source_inspection_context: SessionOperationContext,
+    ) -> None:
+        session_id = UUID(source_inspection_context.fence.session_id)
         record = _blob_record_stub(session_id=session_id)
-        service = _NoListingBlobService(record, b"")
+        service = _NoListingBlobService(record, b"", source_inspection_context)
 
         with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
             asyncio.run(
@@ -820,10 +894,14 @@ class TestExplicitSelectionResolvesDirectly:
                     cast(Any, service),
                     session_id,
                     selected_blob_id=uuid4(),
+                    session_operation_context=source_inspection_context,
                 )
             )
 
-    def test_large_blob_never_requires_full_content_bytes(self) -> None:
+    def test_large_blob_never_requires_full_content_bytes(
+        self,
+        source_inspection_context: SessionOperationContext,
+    ) -> None:
         """Finding B (memory): the module must never need — or be handed —
         a full-content bytes object for a large blob. It only ever accepts a
         bounded prefix plus a size/hash the store already verified.
@@ -833,7 +911,7 @@ class TestExplicitSelectionResolvesDirectly:
         ``inspect_selected_ready_session_blob``/``inspect_blob_content``) —
         only an ``int`` size and a bounded prefix cross the boundary.
         """
-        session_id = uuid4()
+        session_id = UUID(source_inspection_context.fence.session_id)
         total_size = 100 * 1024 * 1024  # 100 MiB — never materialized.
         prefix = b"id,name\n1,a\n"
         verified_hash = "a" * 64  # opaque digest the fake store "verified"
@@ -845,14 +923,29 @@ class TestExplicitSelectionResolvesDirectly:
         )
 
         class _HugeBlobService:
-            async def get_blob(self, blob_id: UUID) -> BlobRecord:
+            async def get_blob(
+                self,
+                blob_id: UUID,
+                *,
+                session_operation_context: SessionOperationContext,
+            ) -> BlobRecord:
+                assert type(session_operation_context) is SessionOperationContext
+                assert session_operation_context is source_inspection_context
                 assert blob_id == record.id
                 return record
 
             async def list_blobs(self, *args: object, **kwargs: object) -> list[BlobRecord]:
                 raise AssertionError("explicit selection must not list session blobs")
 
-            async def read_blob_content_prefix_verified(self, blob_id: UUID, *, prefix_bytes: int) -> tuple[bytes, str, int]:
+            async def read_blob_content_prefix_verified(
+                self,
+                blob_id: UUID,
+                *,
+                prefix_bytes: int,
+                session_operation_context: SessionOperationContext,
+            ) -> tuple[bytes, str, int]:
+                assert type(session_operation_context) is SessionOperationContext
+                assert session_operation_context is source_inspection_context
                 assert blob_id == record.id
                 # A real streaming store hashes chunk-by-chunk; this fake
                 # need only prove the module is satisfied by a small prefix
@@ -865,6 +958,7 @@ class TestExplicitSelectionResolvesDirectly:
                 cast(Any, _HugeBlobService()),
                 session_id,
                 selected_blob_id=record.id,
+                session_operation_context=source_inspection_context,
             )
         )
 
