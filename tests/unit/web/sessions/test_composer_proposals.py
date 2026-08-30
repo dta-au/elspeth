@@ -13,6 +13,7 @@ from sqlalchemy import insert, inspect, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.blobs import BlobPendingProposalError
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
@@ -23,7 +24,6 @@ from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
-from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     composition_proposals_table,
@@ -129,14 +129,13 @@ async def _create_pending_test_blob(
     blob_service: BlobServiceImpl,
     session_id: UUID,
 ) -> BlobRecord:
-    async with _session_operation_context(service, session_id, SessionOperationKind.EXECUTE) as context:
-        return await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="proposal.csv",
-            mime_type="text/csv",
-            created_by="assistant",
-            session_operation_context=context,
-        )
+    del service
+    return await blob_service.create_pending_blob(
+        session_id=session_id,
+        filename="proposal.csv",
+        mime_type="text/csv",
+        created_by="assistant",
+    )
 
 
 async def _delete_test_blob(
@@ -145,8 +144,8 @@ async def _delete_test_blob(
     session_id: UUID,
     blob_id: UUID,
 ) -> None:
-    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
-        await blob_service.delete_blob(blob_id, session_operation_context=context)
+    del service, session_id
+    await blob_service.delete_blob(blob_id)
 
 
 async def _get_test_blob(
@@ -155,8 +154,8 @@ async def _get_test_blob(
     session_id: UUID,
     blob_id: UUID,
 ) -> BlobRecord:
-    async with _session_operation_context(service, session_id, SessionOperationKind.BLOB_READ) as context:
-        return await blob_service.get_blob(blob_id, session_operation_context=context)
+    del service, session_id
+    return await blob_service.get_blob(blob_id)
 
 
 def _pipeline_plan_result(
@@ -320,14 +319,12 @@ async def test_update_trust_mode_writes_audit_event_before_return(service) -> No
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
 
-    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
-        transition = await service.update_composer_preferences(
-            session_id,
-            trust_mode="auto_commit",
-            density_default="medium",
-            actor="user:alice",
-            session_operation_context=context,
-        )
+    transition = await service.update_composer_preferences(
+        session_id,
+        trust_mode="auto_commit",
+        density_default="medium",
+        actor="user:alice",
+    )
 
     # B2 (Phase 8a-2): service returns a transition wrapper exposing
     # both prior and current state. ``current`` is the post-write
@@ -365,14 +362,12 @@ async def test_update_trust_mode_no_op_returns_prior_equal_current(service) -> N
 
     # The session seed has trust_mode='explicit_approve'; PATCH back
     # the same value.
-    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
-        transition = await service.update_composer_preferences(
-            session_id,
-            trust_mode="explicit_approve",
-            density_default="high",
-            actor="user:alice",
-            session_operation_context=context,
-        )
+    transition = await service.update_composer_preferences(
+        session_id,
+        trust_mode="explicit_approve",
+        density_default="high",
+        actor="user:alice",
+    )
 
     assert transition.prior.trust_mode == transition.current.trust_mode == "explicit_approve"
     assert transition.prior.density_default == transition.current.density_default == "high"
@@ -820,22 +815,21 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
     """A deterministic barrier proves the lock closes both race outcomes."""
     engine = create_session_engine(f"sqlite:///{tmp_path / 'race.db'}")
     initialize_session_schema(engine)
-    session_service = DualFencedSessionServiceHarness(
+    session_service = SessionServiceImpl(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
     )
-    blob_service = BlobServiceImpl(
-        engine,
-        tmp_path,
-    )
-    session_id = (await session_service.create_session("alice", "Composer UX", "local")).id
-    blob = await _create_test_blob(
-        session_service,
-        blob_service,
-        session_id,
+    blob_service = BlobServiceImpl(engine, tmp_path)
+    session_id = uuid4()
+    with engine.begin() as conn:
+        _insert_session(conn, str(session_id))
+    blob = await blob_service.create_blob(
+        session_id=session_id,
         filename="race.csv",
         content=b"value\n1\n",
+        mime_type="text/csv",
+        created_by="assistant",
     )
 
     entered = threading.Event()
@@ -844,6 +838,7 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
     async def create_proposal():
         async with _session_operation_context(session_service, session_id, SessionOperationKind.COMPOSE) as context:
             return await session_service.create_composition_proposal(
+                session_operation_context=context,
                 session_id=session_id,
                 tool_call_id=f"call_{winner}",
                 tool_name="set_source_from_blob",
@@ -854,7 +849,6 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
                 arguments_redacted_json={"blob_id": str(blob.id)},
                 base_state_id=None,
                 actor="composer-web:user-alice",
-                session_operation_context=context,
             )
 
     if winner == "proposal":
@@ -871,57 +865,39 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
         monkeypatch.setattr(service_module, "validate_proposal_blob_references", blocked_validate)
         proposal_task = asyncio.create_task(create_proposal())
         assert await asyncio.to_thread(entered.wait, 5)
-        delete_task = asyncio.create_task(
-            _delete_test_blob(
-                session_service,
-                blob_service,
-                session_id,
-                blob.id,
-            )
-        )
+        delete_task = asyncio.create_task(blob_service.delete_blob(blob.id))
         await asyncio.sleep(0)
         release.set()
 
         proposal = await proposal_task
-        with pytest.raises(SessionOperationConflictError):
+        with pytest.raises(BlobPendingProposalError):
             await delete_task
         assert proposal.status == "pending"
-        assert await _get_test_blob(session_service, blob_service, session_id, blob.id) == blob
+        assert await blob_service.get_blob(blob.id) == blob
         return
 
-    from elspeth.web.coordination import repository as coordination_repository_module
+    from elspeth.web.blobs import service as blob_service_module
 
-    original_pending = coordination_repository_module.pending_proposal_reference_id
-    pending_check_count = 0
+    original_pending = blob_service_module.pending_proposal_reference_id
 
     def blocked_pending(*args, **kwargs):
-        nonlocal pending_check_count
-        pending_check_count += 1
-        if pending_check_count == 2:
-            entered.set()
-            if not release.wait(timeout=5):
-                raise AssertionError("delete race barrier timed out")
+        entered.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("delete race barrier timed out")
         return original_pending(*args, **kwargs)
 
-    monkeypatch.setattr(coordination_repository_module, "pending_proposal_reference_id", blocked_pending)
-    delete_task = asyncio.create_task(
-        _delete_test_blob(
-            session_service,
-            blob_service,
-            session_id,
-            blob.id,
-        )
-    )
+    monkeypatch.setattr(blob_service_module, "pending_proposal_reference_id", blocked_pending)
+    delete_task = asyncio.create_task(blob_service.delete_blob(blob.id))
     assert await asyncio.to_thread(entered.wait, 5)
     proposal_task = asyncio.create_task(create_proposal())
     await asyncio.sleep(0)
     release.set()
 
     await delete_task
-    with pytest.raises(SessionOperationConflictError):
+    with pytest.raises(ValueError, match="does not exist"):
         await proposal_task
     with pytest.raises(BlobNotFoundError):
-        await _get_test_blob(session_service, blob_service, session_id, blob.id)
+        await blob_service.get_blob(blob.id)
     assert await session_service.list_composition_proposals(session_id) == []
 
 

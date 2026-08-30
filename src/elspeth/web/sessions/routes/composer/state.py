@@ -406,31 +406,16 @@ async def update_composer_preferences(
     # TOCTOU window — see plan §"Option not taken — read-before-write
     # from the route handler"). The PATCH response shape is unchanged;
     # we only project ``current`` into the response model.
-    lease = await SessionOperationLease.acquire(
-        service.session_operation_authority,
-        session_id=session.id,
-        operation_kind=SessionOperationKind.COMPOSE,
-        owner_instance_id=service.session_operation_owner_instance_id,
-        lease_seconds=service.session_operation_lease_seconds,
+    # Deliberately NO session-operation lease here: the preferences writer is
+    # serialized on the per-session write lock, not the compose lease, so a
+    # mid-plan trust downgrade can land while a compose turn is in flight
+    # (elspeth-01d4c6e683; see the service docstring).
+    transition = await service.update_composer_preferences(
+        session.id,
+        trust_mode=body.trust_mode,
+        density_default=body.density_default,
+        actor=f"user:{user.user_id}",
     )
-    try:
-        transition = await service.update_composer_preferences(
-            session.id,
-            trust_mode=body.trust_mode,
-            density_default=body.density_default,
-            actor=f"user:{user.user_id}",
-            session_operation_context=lease.context,
-        )
-    except BaseException as primary:
-        try:
-            await lease.close()
-        except BaseException as cleanup_error:
-            if cleanup_error is not primary:
-                if not isinstance(cleanup_error, Exception):
-                    cleanup_error.add_note(f"Composer preferences operation also failed with {type(primary).__name__}.")
-                    raise
-                primary.add_note(f"Composer preferences lease cleanup also failed with {type(cleanup_error).__name__}.")
-        raise
 
     # The awaited service return is the commit boundary. Everything below
     # observes that durable transition and must not turn it into a retryable
@@ -451,14 +436,6 @@ async def update_composer_preferences(
                 exc_class=type(telemetry_error).__name__,
             )
 
-    try:
-        await lease.close()
-    except Exception as cleanup_error:
-        slog.error(
-            "composer_preferences_postcommit_cleanup_failed",
-            session_id=str(session.id),
-            exc_class=type(cleanup_error).__name__,
-        )
     return _composer_preferences_response(transition.current)
 
 

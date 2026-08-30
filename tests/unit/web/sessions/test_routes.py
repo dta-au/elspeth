@@ -243,12 +243,7 @@ async def _update_test_composer_preferences(
     session_id: uuid.UUID,
     **kwargs: Any,
 ) -> None:
-    async with _compose_session_operation_context(service, session_id) as context:
-        await service.update_composer_preferences(
-            session_id,
-            session_operation_context=context,
-            **kwargs,
-        )
+    await service.update_composer_preferences(session_id, **kwargs)
 
 
 def _ready_blob_record(
@@ -8267,13 +8262,7 @@ sinks:
             )
 
         assert resp.status_code == 200, resp.text
-        app.state.blob_service.get_blob.assert_awaited_once()
-        blob_call = app.state.blob_service.get_blob.await_args
-        assert blob_call.args == (blob_id,)
-        context = blob_call.kwargs["session_operation_context"]
-        assert type(context) is SessionOperationContext
-        assert context.operation_kind is SessionOperationKind.COMPOSE
-        assert context.fence.session_id == str(session.id)
+        app.state.blob_service.get_blob.assert_awaited_once_with(blob_id)
         record = await service.get_current_state(session.id)
         assert record is not None
         source_options = record.sources["source"]["options"]
@@ -8376,13 +8365,7 @@ sinks:
 
         assert resp.status_code == 404
         assert resp.json()["detail"] == "Blob not found"
-        app.state.blob_service.get_blob.assert_awaited_once()
-        blob_call = app.state.blob_service.get_blob.await_args
-        assert blob_call.args == (blob_id,)
-        context = blob_call.kwargs["session_operation_context"]
-        assert type(context) is SessionOperationContext
-        assert context.operation_kind is SessionOperationKind.COMPOSE
-        assert context.fence.session_id == str(session.id)
+        app.state.blob_service.get_blob.assert_awaited_once_with(blob_id)
 
     @pytest.mark.asyncio
     async def test_post_state_yaml_rejects_oversized_document(self, tmp_path) -> None:
@@ -9935,24 +9918,8 @@ class TestComposerProgressRoutes:
     async def test_progress_endpoint_returns_latest_snapshot_for_owned_session(self, tmp_path) -> None:
         app, service = _make_progress_route_app(tmp_path)
         registry = app.state.composer_progress_registry
-        context = service.session_operation_authority.acquire(
-            session_id=service.session.id,
-            operation_kind=SessionOperationKind.COMPOSE,
-            owner_instance_id=f"progress-endpoint-{uuid.uuid4()}",
-            lease_seconds=30,
-        )
-        await registry.start_request(
-            session_operation_context=context,
-            request_id="message-1",
-            user_id=service.session.user_id,
-            event=ComposerProgressEvent(
-                phase="starting",
-                headline="The composer request has started.",
-                evidence=("The exact COMPOSE operation owns durable progress.",),
-            ),
-        )
         await registry.publish(
-            session_operation_context=context,
+            session_id=str(service.session.id),
             request_id="message-1",
             user_id=service.session.user_id,
             event=ComposerProgressEvent(
@@ -10125,17 +10092,10 @@ class TestComposerInFlightEndpoint:
     async def test_returns_only_authenticated_users_in_flight_sessions(self, tmp_path) -> None:
         app, service = _make_progress_route_app(tmp_path)
         registry = app.state.composer_progress_registry
-        authority = service.session_operation_authority
 
         # alice has one in-flight and one completed session.
-        active_context = authority.acquire(
-            session_id=service.session.id,
-            operation_kind=SessionOperationKind.COMPOSE,
-            owner_instance_id=f"progress-active-{uuid.uuid4()}",
-            lease_seconds=30,
-        )
-        await registry.start_request(
-            session_operation_context=active_context,
+        await registry.publish(
+            session_id=str(service.session.id),
             request_id="msg-1",
             user_id="alice",
             event=ComposerProgressEvent(
@@ -10144,34 +10104,11 @@ class TestComposerInFlightEndpoint:
                 evidence=("Prompt was built.",),
             ),
         )
-        completed_session = authority.create_session_with_initial_fence(
-            user_id="alice",
-            auth_provider_type="local",
-            title="Completed progress",
-            owner_instance_id=f"progress-create-{uuid.uuid4()}",
-            lease_seconds=30,
-        )
-        completed_context = authority.acquire(
-            session_id=completed_session.id,
-            operation_kind=SessionOperationKind.COMPOSE,
-            owner_instance_id=f"progress-completed-{uuid.uuid4()}",
-            lease_seconds=30,
-        )
-        await registry.start_request(
-            session_operation_context=completed_context,
+        await registry.publish(
+            session_id="alice-completed-session",
             request_id="msg-completed",
             user_id="alice",
             event=ComposerProgressEvent(
-                phase="starting",
-                headline="The composer request has started.",
-                evidence=("The exact COMPOSE operation owns durable progress.",),
-            ),
-        )
-        await registry.finish_request(
-            session_operation_context=completed_context,
-            request_id="msg-completed",
-            user_id="alice",
-            terminal_event=ComposerProgressEvent(
                 phase="complete",
                 headline="The composer response is ready.",
                 evidence=("Saved.",),
@@ -10179,21 +10116,8 @@ class TestComposerInFlightEndpoint:
             ),
         )
         # bob has one in-flight session — must not appear in alice's view.
-        bob_session = authority.create_session_with_initial_fence(
-            user_id="bob",
-            auth_provider_type="local",
-            title="Bob progress",
-            owner_instance_id=f"progress-create-{uuid.uuid4()}",
-            lease_seconds=30,
-        )
-        bob_context = authority.acquire(
-            session_id=bob_session.id,
-            operation_kind=SessionOperationKind.COMPOSE,
-            owner_instance_id=f"progress-bob-{uuid.uuid4()}",
-            lease_seconds=30,
-        )
-        await registry.start_request(
-            session_operation_context=bob_context,
+        await registry.publish(
+            session_id="bob-active-session",
             request_id="msg-bob",
             user_id="bob",
             event=ComposerProgressEvent(

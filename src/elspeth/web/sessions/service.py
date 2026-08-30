@@ -6261,7 +6261,6 @@ class SessionServiceImpl:
         trust_mode: ComposerTrustMode,
         density_default: ComposerDensityDefault,
         actor: str,
-        session_operation_context: SessionOperationContext,
     ) -> ComposerSessionPreferencesTransition:
         """Update composer preferences and append the audit event first.
 
@@ -6294,26 +6293,64 @@ class SessionServiceImpl:
         either durable before settlement (and blocks it) or lands after
         the commit.
         """
+        now = self._now()
         sid = str(session_id)
-        event_id = str(uuid.uuid4())
 
         def _sync() -> ComposerSessionPreferencesTransition:
-            with (
-                self._session_process_locked_begin(sid) as conn,
-                self._session_write_lock(conn, sid),
-                self._session_composer_mutation_transaction(
-                    conn,
-                    session_id=sid,
-                    session_operation_context=session_operation_context,
-                    expected_kind=SessionOperationKind.COMPOSE,
-                ) as transaction,
-            ):
-                return transaction.session.update_composer_preferences(
-                    event_id=event_id,
-                    trust_mode=trust_mode,
-                    density_default=density_default,
-                    actor=actor,
+            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+                # B2 (load-bearing): load the prior record inside the same
+                # transaction as the audit insert and the state update.
+                # A concurrent PATCH cannot interpose because the per-
+                # session write lock above serialises writes for this
+                # ``sid`` and the SELECT runs inside the same connection
+                # as the UPDATE.
+                prior_row = conn.execute(select(sessions_table).where(sessions_table.c.id == sid)).one()
+                prior_record = ComposerSessionPreferencesRecord(
+                    session_id=UUID(prior_row.id),
+                    trust_mode=prior_row.trust_mode,
+                    density_default=prior_row.density_default,
+                    interpretation_review_disabled=bool(prior_row.interpretation_review_disabled),
+                    updated_at=self._ensure_utc(prior_row.updated_at),
                 )
+                # Audit fires before state mutation per CLAUDE.md
+                # §"Telemetry and Logging" primacy rule. B1 (load-bearing):
+                # the payload now carries ``prior_trust_mode`` so a
+                # downstream telemetry counter emitting
+                # ``{from_mode, to_mode}`` attributes remains a strict
+                # subset of audit-recorded reality.
+                conn.execute(
+                    insert(proposal_events_table).values(
+                        id=str(uuid.uuid4()),
+                        session_id=sid,
+                        proposal_id=None,
+                        event_type="trust_mode.changed",
+                        actor=actor,
+                        payload={
+                            "trust_mode": trust_mode,
+                            "prior_trust_mode": prior_record.trust_mode,
+                            "density_default": density_default,
+                        },
+                        created_at=now,
+                    )
+                )
+                conn.execute(
+                    update(sessions_table)
+                    .where(sessions_table.c.id == sid)
+                    .values(
+                        trust_mode=trust_mode,
+                        density_default=density_default,
+                        updated_at=now,
+                    )
+                )
+                row = conn.execute(select(sessions_table).where(sessions_table.c.id == sid)).one()
+                current_record = ComposerSessionPreferencesRecord(
+                    session_id=UUID(row.id),
+                    trust_mode=row.trust_mode,
+                    density_default=row.density_default,
+                    interpretation_review_disabled=bool(row.interpretation_review_disabled),
+                    updated_at=self._ensure_utc(row.updated_at),
+                )
+                return ComposerSessionPreferencesTransition(prior=prior_record, current=current_record)
 
         return cast(ComposerSessionPreferencesTransition, await self._run_sync(_sync))
 

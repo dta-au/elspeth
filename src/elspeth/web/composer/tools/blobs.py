@@ -100,6 +100,7 @@ from elspeth.web.sessions.models import (
     composition_states_table,
     runs_table,
 )
+from elspeth.web.sessions.proposal_blob_effects import record_applied_blob_proposal_effect
 from elspeth.web.sessions.proposal_blob_refs import pending_proposal_reference_id
 
 
@@ -1556,6 +1557,25 @@ def _execute_update_blob(
                         )
                         .values(**update_values)
                     )
+                    if context.executing_proposal_id is not None:
+                        # Accept-path execution: the durable applied-effect
+                        # receipt commits with the metadata so acceptance can
+                        # credit exactly this effect (blob-only proposals).
+                        committed_row = conn.execute(
+                            select(blobs_table).where(
+                                blobs_table.c.id == blob_id,
+                                blobs_table.c.session_id == session_id,
+                            )
+                        ).one()
+                        record_applied_blob_proposal_effect(
+                            conn,
+                            session_id=session_id,
+                            accepting_proposal_id=str(context.executing_proposal_id),
+                            tool_name="update_blob",
+                            blob_id=blob_id,
+                            result_row=committed_row,
+                            now=datetime.now(UTC),
+                        )
 
                     # Atomic two-rename swap — the final mutations before
                     # the with-block commit.  The prior bytes are parked at
@@ -1736,6 +1756,7 @@ def _execute_delete_blob(
             session_engine=session_engine,
             session_id=session_id,
             data_dir=context.data_dir,
+            executing_proposal_id=(str(context.executing_proposal_id) if context.executing_proposal_id is not None else None),
         )
 
 
@@ -1746,6 +1767,7 @@ def _execute_delete_blob_locked(
     session_engine: Engine,
     session_id: str,
     data_dir: str | None,
+    executing_proposal_id: str | None = None,
 ) -> ToolResult:
     """Delete one blob while the caller holds its session blob lock."""
     blob = _sync_get_blob(session_engine, blob_id, session_id)
@@ -1800,6 +1822,8 @@ def _execute_delete_blob_locked(
                 conn,
                 session_id=session_id,
                 blob_id=blob_id,
+                accepting_proposal_id=executing_proposal_id,
+                accepting_tool_name="delete_blob" if executing_proposal_id is not None else None,
             )
             if retaining_proposal_id is not None:
                 return _failure_result(
@@ -1885,6 +1909,18 @@ def _execute_delete_blob_locked(
             )
             if deleted.rowcount != 1:
                 raise AuditIntegrityError(f"blob {blob_id} left session custody before its qualified delete completed")
+            if executing_proposal_id is not None:
+                # Accept-path execution: bind the durable applied-effect
+                # receipt to the pre-delete row snapshot in this commit.
+                record_applied_blob_proposal_effect(
+                    conn,
+                    session_id=session_id,
+                    accepting_proposal_id=executing_proposal_id,
+                    tool_name="delete_blob",
+                    blob_id=blob_id,
+                    result_row=locked_row,
+                    now=registered_at,
+                )
     except Exception as primary_exc:
         if stage is not None:
             _restore_staged_blob_deletion(stage, primary_exc)

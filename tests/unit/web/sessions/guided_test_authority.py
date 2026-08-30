@@ -215,7 +215,6 @@ class DualFencedSessionServiceHarness(SessionServiceImpl):
     accept_composition_proposal = _kw_writer("accept_composition_proposal", SessionOperationKind.PROPOSAL)
     settle_pipeline_composition_proposal = _kw_writer("settle_pipeline_composition_proposal", SessionOperationKind.PROPOSAL)
     create_run = _kw_writer("create_run", SessionOperationKind.EXECUTE)
-    update_composer_preferences = _kw_writer("update_composer_preferences", SessionOperationKind.COMPOSE)
 
     def _run_writer(name: str):  # type: ignore[misc]
         async def _wrapped(self, *args, session_operation_context=None, **kwargs):

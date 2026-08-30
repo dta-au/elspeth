@@ -3753,7 +3753,6 @@ class SessionServiceProtocol(Protocol):
         trust_mode: ComposerTrustMode,
         density_default: ComposerDensityDefault,
         actor: str,
-        session_operation_context: SessionOperationContext,
     ) -> ComposerSessionPreferencesTransition: ...
 
     async def create_composition_proposal(

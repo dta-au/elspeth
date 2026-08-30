@@ -635,9 +635,7 @@ async def test_accept_update_blob_proposal_serializes_against_reject(
     def wrapper_factory(original):
         def gated_execute_tool(*args, **kwargs):
             observed_tool_authority.update(
-                authority=kwargs.get("session_operation_authority"),
-                context=kwargs.get("session_operation_context"),
-                accepting_proposal_id=kwargs.get("_accepting_proposal_id"),
+                accepting_proposal_id=kwargs.get("executing_proposal_id"),
             )
             entered_tool.set()
             if not release_tool.wait(timeout=5):
@@ -670,10 +668,10 @@ async def test_accept_update_blob_proposal_serializes_against_reject(
 
     assert accept_response.status_code == 200
     assert reject_response.status_code == 409
-    assert observed_tool_authority["authority"] is service.session_operation_authority
-    assert observed_tool_authority["context"].operation_kind is SessionOperationKind.PROPOSAL
-    assert observed_tool_authority["context"].fence.session_id == str(session_id)
-    assert observed_tool_authority["accepting_proposal_id"] == proposal.id
+    # The blob layer is HEAD's (open decision 1 on elspeth-4d6c0dd0f5): the
+    # tool receives the accepting proposal identity rather than the lane's
+    # authority+context pair; the route still holds the PROPOSAL lease.
+    assert observed_tool_authority["accepting_proposal_id"] == str(proposal.id)
     assert Path(blob.storage_path).read_text(encoding="utf-8") == "approved content"
     proposals = await service.list_composition_proposals(session_id)
     assert [item.status for item in proposals] == ["committed"]

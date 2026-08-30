@@ -88,3 +88,67 @@ def blob_row_snapshot_payload(row: Any) -> dict[str, Any]:
         "creating_composer_skill_hash": row.creating_composer_skill_hash,
         "creating_arguments_hash": row.creating_arguments_hash,
     }
+
+
+def record_applied_blob_proposal_effect(
+    conn: Any,
+    *,
+    session_id: str,
+    accepting_proposal_id: str,
+    tool_name: str,
+    blob_id: str,
+    result_row: Any,
+    now: datetime,
+) -> None:
+    """Write the durable applied-effect receipt in the effect's own commit.
+
+    Mirrors the repository blob-mutation receipt exactly: the accepting
+    proposal must be the exact pending mutation for this tool, at most one
+    receipt may exist, and the receipt binds the arguments hash and the
+    committed result-row snapshot so acceptance can later verify the effect
+    it is crediting (``_validated_blob_effect_receipt``).
+    """
+    from sqlalchemy import insert, select
+
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.contracts.hashing import stable_hash
+    from elspeth.web.sessions.models import composition_proposals_table, proposal_blob_effect_receipts_table
+
+    proposal = conn.execute(
+        select(composition_proposals_table).where(
+            composition_proposals_table.c.id == accepting_proposal_id,
+            composition_proposals_table.c.session_id == session_id,
+        )
+    ).one_or_none()
+    if proposal is None:
+        raise AuditIntegrityError("Tier 1: blob effect receipt proposal is missing or cross-session")
+    if proposal.status != "pending" or proposal.tool_name != tool_name:
+        raise AuditIntegrityError("Tier 1: blob effect receipt proposal is not the exact pending mutation")
+    arguments_hash = proposal_blob_arguments_hash(
+        tool_name=tool_name,
+        arguments=proposal.arguments_json,
+        blob_id=blob_id,
+    )
+    existing = conn.execute(
+        select(proposal_blob_effect_receipts_table.c.proposal_id).where(
+            proposal_blob_effect_receipts_table.c.proposal_id == accepting_proposal_id,
+            proposal_blob_effect_receipts_table.c.session_id == session_id,
+        )
+    ).one_or_none()
+    if existing is not None:
+        raise AuditIntegrityError("Tier 1: blob proposal effect already has a durable receipt")
+    result_blob_snapshot = blob_row_snapshot_payload(result_row)
+    conn.execute(
+        insert(proposal_blob_effect_receipts_table).values(
+            proposal_id=accepting_proposal_id,
+            session_id=session_id,
+            tool_name=tool_name,
+            blob_id=blob_id,
+            arguments_hash=arguments_hash,
+            result_blob_snapshot=result_blob_snapshot,
+            result_blob_snapshot_hash=stable_hash(result_blob_snapshot),
+            accepted_event_id=None,
+            created_at=now,
+            accepted_at=None,
+        )
+    )
