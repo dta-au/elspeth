@@ -5,10 +5,11 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
 ROOT = Path(__file__).resolve().parents[3]
-CURRENT_VERSION = "0.7.2"
+CURRENT_VERSION = "0.8.0"
 
 
 def _text(relative_path: str) -> str:
@@ -24,13 +25,13 @@ def test_package_and_lockfile_use_current_release_version() -> None:
     assert locked_project["version"] == CURRENT_VERSION
 
 
-def test_current_public_release_surfaces_name_release_072() -> None:
-    assert "**Framework status:** `0.7.2`" in _text("docs/README.md")
-    assert "## 0.7.2 - Release candidate" in _text("CHANGELOG.md")
+def test_current_public_release_surfaces_name_release_080() -> None:
+    assert "**Framework status:** `0.8.0`" in _text("docs/README.md")
+    assert "## 0.8.0 - Release candidate" in _text("CHANGELOG.md")
 
     readme = _text("README.md")
-    assert "![Status: 0.7.2]" in readme
-    assert "## What Changed In 0.7.2" in readme
+    assert "![Status: 0.8.0]" in readme
+    assert "## What Changed In 0.8.0" in readme
 
 
 def test_current_container_examples_require_a_confirmed_published_tag() -> None:
@@ -45,7 +46,7 @@ def test_current_container_examples_require_a_confirmed_published_tag() -> None:
         text = _text(relative_path)
         assert "IMAGE_TAG" in text, relative_path
         assert "exact published" in text, relative_path
-        assert "v0.7.2" not in text, relative_path
+        assert "v0.8.0" not in text, relative_path
         assert "v0.7.1" not in text, relative_path
         assert "elspeth:latest" not in text, relative_path
 
@@ -62,24 +63,30 @@ def test_first_pipeline_docker_walkthrough_creates_the_mounted_state_directory()
     assert "mkdir -p my-pipeline/{config,input,output,state}" not in tutorial
 
 
-def test_current_operator_runbooks_use_072_candidate_and_071_baseline() -> None:
+def test_current_operator_runbooks_use_080_candidate_and_071_baseline() -> None:
     ansible = _text("docs/runbooks/ansible-ubuntu-deployment.md")
-    assert "schema-incompatible 0.7.2 upgrade from 0.7.1" in ansible
-    assert "direct 0.7.1→0.7.2 upgrade" in ansible
+    assert "schema-incompatible 0.8.0 upgrade from 0.7.1" in ansible
+    assert "direct 0.7.1→0.8.0 upgrade" in ansible
     assert "full 40-character Git commit SHA" in ansible
-    assert "ELSPETH_RELEASE_REF=v0.7.2" not in ansible
+    assert "ELSPETH_RELEASE_REF=v0.8.0" not in ansible
     assert "ELSPETH_ROLLBACK_REF=v0.7.1" not in ansible
 
     sharing = _text("docs/guides/sharing-pipelines.md")
-    assert "For 0.7.2" in sharing
+    assert "For 0.8.0" in sharing
     assert f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}" in sharing
-    assert "SQLITE_SCHEMA_EPOCH=35" in sharing
+    assert "SQLITE_SCHEMA_EPOCH=36" in sharing
 
     aws = _text("docs/runbooks/aws-ecs-deployment.md")
-    assert "elspeth:ecs-0.7.2-closeout" in aws
-    assert '"candidate_package_version": "0.7.2"' in aws
+    assert "elspeth:ecs-0.8.0-closeout" in aws
+    assert '"candidate_package_version": "0.8.0"' in aws
     assert '"previous_package_version": "0.7.1"' in aws
-    assert f'"candidate": {{"session_epoch": {SESSION_SCHEMA_EPOCH}, "landscape_epoch": 31' in aws
+    assert f'"candidate": {{"session_epoch": {SESSION_SCHEMA_EPOCH}, "landscape_epoch": {SQLITE_SCHEMA_EPOCH}' in aws
     assert '"previous": {"session_epoch": 35, "landscape_epoch": 29' in aws
-    assert f'"structural_changes": "session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_31' in aws
-    assert f"repair forward with epoch-{SESSION_SCHEMA_EPOCH} session/epoch-31 Landscape code" in aws
+    assert (
+        f'"structural_changes": "session_epoch_35_to_{SESSION_SCHEMA_EPOCH}'
+        f"_landscape_epoch_29_to_{SQLITE_SCHEMA_EPOCH}"
+        '_blob_cleanup_guided_decline_and_row_union_barrier"'
+    ) in aws
+    assert ".schema_facts.previous.landscape_epoch == 29" in aws
+    assert f".schema_facts.candidate.landscape_epoch == {SQLITE_SCHEMA_EPOCH}" in aws
+    assert f"repair forward with epoch-{SESSION_SCHEMA_EPOCH} session/epoch-{SQLITE_SCHEMA_EPOCH} Landscape code" in aws

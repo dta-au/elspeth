@@ -16,7 +16,7 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # (and the release docs the docs tests check), not slide through.
     # Landscape epoch 34: unified-lineage groundwork tables (token_lineage_frames,
     # group_records, group_losses) plus token_work_items.lineage_path_json; the
-    # 0.7.2 release docs and CHANGELOG already state the 34 boundary.
+    # 0.8.0 release docs and CHANGELOG already state the 34 boundary.
     # Epoch 35: WS1b flip — branch_name/fork_group_id/expand_group_id and
     # token_outcomes.expected_branches_json retired as stored columns.
     # Epoch 36 (elspeth-8655045f98): coalesce_effects.group_id, nullable=False

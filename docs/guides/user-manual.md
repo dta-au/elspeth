@@ -376,10 +376,10 @@ elspeth health --json
 ```json
 {
   "status": "healthy",
-  "version": "0.7.2",
+  "version": "0.8.0",
   "commit": "abc123f",
   "checks": {
-    "version": {"status": "ok", "value": "0.7.2"},
+    "version": {"status": "ok", "value": "0.8.0"},
     "python": {"status": "ok", "value": "3.13.1"},
     "database": {"status": "ok", "value": "connected"},
     "plugins": {"status": "ok", "value": "6 sources, 19 transforms, 6 sinks"}

@@ -797,7 +797,7 @@ EXPECTED_DISPATCH_CONTRACTS = {
     ("gate-ledger", "init"): D(
         "gate_ledger_init",
         Path("control.json"),
-        branch="release/0.7.2",
+        branch="release/0.8.0",
         starting_sha="c" * 40,
         plan_sha256="d" * 64,
         program_base_sha="e" * 40,
@@ -934,7 +934,7 @@ def _dispatch_namespace(path: tuple[str, ...]) -> SimpleNamespace:
         "verdict_failure": None,
         "emergency_cleanup_deadline_utc": None,
         "cleanup_escalation": None,
-        "branch": "release/0.7.2",
+        "branch": "release/0.8.0",
         "starting_sha": "c" * 40,
         "plan_sha256": "d" * 64 if path == ("gate-ledger", "init") else None,
         "program_base_sha": "e" * 40,

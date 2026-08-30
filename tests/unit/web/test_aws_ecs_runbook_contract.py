@@ -489,7 +489,7 @@ def test_runbook_pins_core_runtime_and_identity_contracts() -> None:
         "AllowedOAuthFlows",
         "AllowedOAuthScopes",
         "CallbackURLs",
-        "elspeth:ecs-0.7.2-closeout",
+        "elspeth:ecs-0.8.0-closeout",
         "TARGET_PLATFORM",
         "runtimePlatform",
         "linux/amd64",
@@ -1145,8 +1145,8 @@ def test_runbook_requires_immutable_rds_trust_before_release_promotion() -> None
     assert "session_tls" in text
     assert "landscape_tls" in text
     assert "c5e65357b7470cf1a702eeb084e865f0f5e0e43ab9741b76e872fa7568029700" in text
-    assert text.index("session_tls") < text.index("0.7.2-RC-290726")
-    assert text.index("landscape_tls") < text.index("0.7.2-RC-290726")
+    assert text.index("session_tls") < text.index("0.8.0-RC-290726")
+    assert text.index("landscape_tls") < text.index("0.8.0-RC-290726")
 
 
 def test_terraform_readme_one_shot_verifier_fails_closed_per_step() -> None:

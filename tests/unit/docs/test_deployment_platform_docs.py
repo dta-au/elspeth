@@ -312,7 +312,7 @@ def test_navigation_and_repository_structure_are_honest() -> None:
 def test_deployment_changelog_states_the_contract_without_claiming_multi_replica() -> None:
     """The notes naming the deployment contract must not overclaim it.
 
-    Checked against the 0.7.2 section, not ``## Unreleased``: the contract moved
+    Checked against the 0.8.0 section, not ``## Unreleased``: the contract moved
     there when that work shipped (48cd87369), and an assertion pointed at the
     section the text left behind stops guarding anything. The negatives are the
     invariant — a single-VM Azure story and no ``deploy/platforms`` tree — and
@@ -322,7 +322,7 @@ def test_deployment_changelog_states_the_contract_without_claiming_multi_replica
     Ubuntu VM" is one phrase to a reader and two lines to ``in``.
     """
     text = _read(CHANGELOG)
-    before_release, release_onward = text.split("## 0.7.2", maxsplit=1)
+    before_release, release_onward = text.split("## 0.8.0", maxsplit=1)
     assert "## Unreleased" in before_release
 
     release_notes = release_onward.split("\n## ", maxsplit=1)[0]

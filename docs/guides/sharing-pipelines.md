@@ -67,9 +67,9 @@ accept this trade-off.
 
 ## First-deploy operator action
 
-For 0.7.2, shareable-review state is part of the broader web session database
+For 0.8.0, shareable-review state is part of the broader web session database
 contract. The release expects `SESSION_SCHEMA_EPOCH=47` and
-`SQLITE_SCHEMA_EPOCH=35`. Session epoch 29 introduced durable guided
+`SQLITE_SCHEMA_EPOCH=36`. Session epoch 29 introduced durable guided
 operations, session epoch 30 added the closed `quota_exceeded` terminal failure
 code used for stable HTTP 413 fork replay, and later session epochs completed
 proposal admission, retryable blob cleanup, ordinary guided-plan decline
@@ -87,8 +87,8 @@ one index. Epoch 34 adds the unified-lineage groundwork tables
 `token_work_items.lineage_path_json`. Epoch 35 flips lineage onto that
 groundwork: the tri-column `fork_group_id`/`expand_group_id`/`branch_name`
 discriminators are retired and `token_lineage_frames`/`lineage_path_json`
-become the sole lineage truth. A
-Landscape store below epoch 35 is stale and must be recreated. When
+become the sole lineage truth. Epoch 36 binds coalesce effects to their
+non-null lineage group. A Landscape store below epoch 36 is stale and must be recreated. When
 upgrading from an older pre-1.0 build, stop and
 uninstall the web service, archive/export evidence when required, recreate each
 configured database whose epoch is stale, then reinstall and initialize this

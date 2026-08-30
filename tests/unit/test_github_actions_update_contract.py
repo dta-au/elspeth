@@ -1,4 +1,4 @@
-"""Contracts for the GitHub Actions versions reviewed for release/0.7.2."""
+"""Contracts for the GitHub Actions versions reviewed for release/0.8.0."""
 
 from __future__ import annotations
 

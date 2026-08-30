@@ -129,7 +129,7 @@ _OPERATOR_METRIC_DIMENSION_FIELDS = (
     ("aws.ecs.task.revision", "operator_telemetry_task_definition_revision"),
 )
 
-_CANDIDATE_PACKAGE_VERSION = "0.7.2"
+_CANDIDATE_PACKAGE_VERSION = "0.8.0"
 
 _ROLLBACK_PACKAGE_VERSION = "0.7.1"
 
