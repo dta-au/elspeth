@@ -179,6 +179,22 @@ class TestLLMProfileCatalogParsing:
 
 
 class TestBatchProfileNodeLowering:
+    def test_lowering_rejects_malformed_raw_config_shapes(self) -> None:
+        """``_lower_llm_profile_nodes`` is the YAML trust boundary for the catalog.
+
+        Pins the ``@trust_boundary`` honesty contract: a raw config whose
+        ``llm_profiles`` entry is not a mapping, or whose
+        ``default_llm_profile`` names no profile, is refused with ValueError
+        before any profile model is built or any node is rewritten.
+        """
+        non_mapping_profile: dict[str, Any] = {"llm_profiles": {"gw-primary": "not-a-mapping"}}
+        with pytest.raises(ValueError, match=r"llm_profiles\['gw-primary'\] must be a mapping"):
+            _lower_llm_profile_nodes(non_mapping_profile, materialize=True)
+
+        dangling_default: dict[str, Any] = {"llm_profiles": {}, "default_llm_profile": "nope"}
+        with pytest.raises(ValueError, match="default_llm_profile 'nope' does not name a configured llm_profiles entry"):
+            _lower_llm_profile_nodes(dangling_default, materialize=False)
+
     def test_profile_node_lowers_to_executable_provider_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("LLM_GATEWAY_BEARER_TOKEN", "sk-test-value")
         cfg = _config(

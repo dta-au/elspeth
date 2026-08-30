@@ -84,7 +84,9 @@ def _enforce_vault_url_allowlist(vault_url: str) -> None:
     if _contains_control_character(vault_url):
         raise SecretLoadError("vault_url must not contain control characters")
 
-    raw = os.environ.get(_KEYVAULT_ALLOWLIST_ENV_VAR, "")
+    if _KEYVAULT_ALLOWLIST_ENV_VAR not in os.environ:
+        return
+    raw = os.environ[_KEYVAULT_ALLOWLIST_ENV_VAR]
     allowed = {entry.rstrip("/") for entry in raw.replace(",", " ").split() if entry.strip()}
     if not allowed:
         return
@@ -151,7 +153,9 @@ def load_secrets_from_config(config: SecretsConfig) -> list[SecretResolutionInpu
     # Audit recording requires ELSPETH_FINGERPRINT_KEY to compute secret fingerprints.
     # Without it, secrets would be fetched but audit recording would fail later,
     # leaving secret resolution events unrecorded (violates auditability standard).
-    fingerprint_key_available = os.environ.get("ELSPETH_FINGERPRINT_KEY") or "ELSPETH_FINGERPRINT_KEY" in config.mapping
+    fingerprint_key_available = (
+        "ELSPETH_FINGERPRINT_KEY" in os.environ and os.environ["ELSPETH_FINGERPRINT_KEY"] != ""
+    ) or "ELSPETH_FINGERPRINT_KEY" in config.mapping
     if not fingerprint_key_available:
         raise SecretLoadError(
             "ELSPETH_FINGERPRINT_KEY is required when loading secrets from Key Vault.\n"
