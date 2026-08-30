@@ -2291,12 +2291,16 @@ class TestPeriodicOrphanCleanup:
         assert "SELECT * FROM runs" not in str(event)
 
     @pytest.mark.asyncio
-    async def test_schema_compatibility_failure_is_redacted_and_loop_retries(
+    async def test_schema_compatibility_failure_terminates_task_without_leaking_detail(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """An incompatible Landscape schema is operator-actionable state, not
+        a transient: retrying every interval can never fix it. It must escape
+        the narrowed catch (terminating the task so it surfaces at lifespan
+        shutdown, same mechanism as programmer bugs) and must not be logged
+        through the redacted retry channel."""
         sentinel = "opaque-schema-secret SELECT raw_schema FROM forbidden"
-        recovered = asyncio.Event()
         finalize_calls: list[bool] = []
 
         class _RecordSessionService:
@@ -2316,10 +2320,7 @@ class TestPeriodicOrphanCleanup:
             create_tables: bool,
         ) -> tuple[frozenset[object], frozenset[object]]:
             finalize_calls.append(create_tables)
-            if len(finalize_calls) == 1:
-                raise SchemaCompatibilityError(sentinel)
-            recovered.set()
-            return frozenset(), frozenset()
+            raise SchemaCompatibilityError(sentinel)
 
         monkeypatch.setattr(app_module, "_finalize_orphaned_landscape_runs", finalize)
         telemetry = build_sessions_telemetry()
@@ -2335,19 +2336,12 @@ class TestPeriodicOrphanCleanup:
                     create_tables=False,
                 )
             )
-            try:
-                await asyncio.wait_for(recovered.wait(), timeout=5.0)
-            finally:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            with pytest.raises(SchemaCompatibilityError):
+                await asyncio.wait_for(task, timeout=5.0)
 
-        assert finalize_calls[:2] == [False, False]
+        assert finalize_calls == [False]
         failures = [entry for entry in logs if entry.get("event") == "periodic_orphan_cleanup_failed"]
-        assert len(failures) == 1
-        assert failures[0]["exc_class"] == "SchemaCompatibilityError"
-        assert "exc_info" not in failures[0]
-        assert sentinel not in repr(failures[0])
+        assert failures == []
 
     @pytest.mark.asyncio
     async def test_cancellation_is_clean(self) -> None:

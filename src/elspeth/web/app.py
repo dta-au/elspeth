@@ -45,7 +45,7 @@ from elspeth.contracts.secrets import (
     SecretDecryptionError,
 )
 from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
+from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.logging import configure_logging
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -342,9 +342,14 @@ async def _periodic_orphan_cleanup(
                     landscape_url,
                     create_tables=create_tables,
                 )
-        except (SQLAlchemyError, OSError, SchemaCompatibilityError) as cleanup_exc:
+        except (SQLAlchemyError, OSError) as cleanup_exc:
             # Narrow catch — only recoverable audit/IO failures are
             # absorbed so the loop retries on the next interval.
+            # SchemaCompatibilityError is deliberately NOT in the tuple:
+            # an incompatible Landscape schema is operator-actionable
+            # state, not a transient — retrying every interval can never
+            # fix it, so it propagates, terminates the task, and surfaces
+            # at lifespan shutdown (see the task-death note below).
             # SQLAlchemyError covers DB-layer transients raised from
             # cancel_all_orphaned_runs (engine.begin(), conn.execute());
             # OSError covers SQLite file-level failures that can escape
@@ -510,7 +515,14 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             landscape_url,
             create_tables=create_landscape_tables,
         )
-    except (SQLAlchemyError, OSError, SchemaCompatibilityError) as cleanup_exc:
+    except (SQLAlchemyError, OSError) as cleanup_exc:
+        # Transient DB/IO faults only: the startup sweep is retried with the
+        # same reconcile arm by _periodic_orphan_cleanup every
+        # orphan_run_check_interval_seconds, so booting degraded is bounded.
+        # SchemaCompatibilityError is deliberately NOT caught — an
+        # incompatible Landscape schema needs the operator and must fail
+        # startup rather than let the service run with unreconcilable audit
+        # state.
         slog.error(
             "lifespan_orphan_cleanup_failed",
             exc_class=type(cleanup_exc).__name__,
@@ -799,6 +811,19 @@ class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
 
     _MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
 
+    @trust_boundary(
+        tier=3,
+        source="client-supplied Content-Length HTTP request header at the ASGI middleware layer; "
+        "clients may omit or falsify it, so absence is legal and every present value is validated "
+        "before use",
+        source_param="request",
+        suppresses=("R1",),
+        invariant="never raises on the header value: absence passes the request through to the "
+        "per-field Pydantic caps, a non-ASCII-decimal or negative value returns a 400 response, "
+        "and a declared size over _MAX_BODY_BYTES returns a 413 response; the header is never "
+        "coerced into a fabricated length",
+        non_raising=True,
+    )
     async def dispatch(self, request: StarletteRequest, call_next):  # type: ignore[no-untyped-def]
         content_length = request.headers.get("content-length")
         if content_length is None:
@@ -907,10 +932,14 @@ def _frontend_build_identity(dist_dir: Path) -> str | None:
     import re
 
     index_html = dist_dir / "index.html"
-    try:
-        content = index_html.read_text(encoding="utf-8")
-    except OSError:
+    # Absence (dev/test: no built dist) legitimately disarms the feature.
+    # Any other read failure on a file that EXISTS (permissions, IO) is a
+    # deployment defect and must crash create_app rather than silently
+    # disarm the cache-coherence beacon (the prior `except OSError: return
+    # None` collapsed both into the absence path).
+    if not index_html.is_file():
         return None
+    content = index_html.read_text(encoding="utf-8")
     match = re.search(r"/assets/(index-[A-Za-z0-9_-]+\.js)", content)
     return match.group(1) if match else None
 
@@ -1327,9 +1356,7 @@ def _create_app(
     # any future surface). The counters are intentionally process-scoped —
     # one Counter per metric, not one per consumer — so OTel aggregates by
     # attribute set instead of by injection site.
-    sessions_telemetry = build_sessions_telemetry(
-        meter=operator_runtime.provider.get_meter("elspeth.web.composer", __version__)
-    )
+    sessions_telemetry = build_sessions_telemetry(meter=operator_runtime.provider.get_meter("elspeth.web.composer", __version__))
     app.state.sessions_telemetry = sessions_telemetry
 
     app.state.session_engine = session_engine  # available to guided step handlers
