@@ -456,6 +456,7 @@ class TestBuildSchemaFormTurns:
             "label": "On Write Failure",
             "description": "Sink name for rows that cannot be written, or 'discard' for explicit drop",
             "kind": "text",
+            "tier": "common",
             "required": False,
             "nullable": False,
         }
