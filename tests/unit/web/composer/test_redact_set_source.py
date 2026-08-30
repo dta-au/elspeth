@@ -1182,3 +1182,85 @@ def test_redact_guided_snapshot_implicit_decision_report_without_entries_fails_c
     del meta["implicit_decisions"]["entries"]
     with pytest.raises(AuditIntegrityError, match="implicit-decision projection is malformed"):
         redact_guided_snapshot_storage_paths(sources, meta)
+
+
+_FORK_EXPLICIT_BLOB_REF = "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"
+_FORK_EXPLICIT_PATH = "/srv/elspeth/data/blobs/child/50f5b3e9_colours.csv"
+
+
+def _fork_explicit_shape() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Fork-rehydrated explicit-blob_ref shape: reviewed snapshot and live source
+    both carry the SAME private path and the SAME blob_ref (elspeth-75d320fb25)."""
+    sources = {"source": {"plugin": "csv", "options": {"path": _FORK_EXPLICIT_PATH, "blob_ref": _FORK_EXPLICIT_BLOB_REF}}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "11111111-1111-4111-8111-111111111111": {
+                    "name": "source",
+                    "plugin": "csv",
+                    "options": {"path": _FORK_EXPLICIT_PATH, "blob_ref": _FORK_EXPLICIT_BLOB_REF},
+                }
+            },
+            "pending_source_intents": {},
+        }
+    }
+    return sources, composer_meta
+
+
+def test_redact_guided_snapshot_correlates_on_raw_sources_after_generic_redaction() -> None:
+    """Projection order (elspeth-75d320fb25): ``redact_source_storage_path`` runs
+    first and masks the live carrier, so a correlation on the generic-redacted copy
+    compares the reviewed private path against the redacted literal and raises.
+    Passing the raw sources as ``raw_sources`` correlates on the persisted values
+    and applies the guided masks onto the generic-redacted copy."""
+    raw_sources, composer_meta = _fork_explicit_shape()
+    generic_sources = redact_source_storage_path({"sources": raw_sources})["sources"]
+    assert generic_sources["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+
+    raw_out, raw_meta = redact_guided_snapshot_storage_paths(raw_sources, composer_meta)
+    projected_out, projected_meta = redact_guided_snapshot_storage_paths(generic_sources, composer_meta, raw_sources=raw_sources)
+
+    assert projected_out == raw_out
+    assert projected_meta == raw_meta
+    assert projected_out["source"]["options"] == {"path": REDACTED_BLOB_SOURCE_PATH, "blob_ref": _FORK_EXPLICIT_BLOB_REF}
+    assert _FORK_EXPLICIT_PATH not in str((projected_out, projected_meta))
+    assert raw_sources["source"]["options"]["path"] == _FORK_EXPLICIT_PATH
+
+
+def test_redact_guided_snapshot_projection_order_without_raw_sources_still_raises() -> None:
+    """The defect shape stays a raise when the caller withholds the raw sources:
+    the generic-redacted copy carries no reviewed path to correlate on."""
+    raw_sources, composer_meta = _fork_explicit_shape()
+    generic_sources = redact_source_storage_path({"sources": raw_sources})["sources"]
+    with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+        redact_guided_snapshot_storage_paths(generic_sources, composer_meta)
+
+
+def test_redact_guided_snapshot_raw_correlation_stamps_sentinel_over_generic_mask() -> None:
+    """Fork sentinel shape: the live source carries blob_ref (generic masks it) and
+    the reviewed snapshot carries the sentinel. The sentinel is projected, exactly as
+    the pre-raw-correlation order produced."""
+    blob_id = "11111111-1111-4111-8111-111111111111"
+    sentinel = f"blob:{blob_id}"
+    real_path = "/internal/blobs/child/source.csv"
+    raw_sources = {"source": {"options": {"path": real_path, "blob_ref": blob_id}}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "22222222-2222-4222-8222-222222222222": {"name": "source", "options": {"path": sentinel, "blob_ref": blob_id}}
+            },
+            "pending_source_intents": {},
+        }
+    }
+    generic_sources = redact_source_storage_path({"sources": raw_sources})["sources"]
+
+    sources_out, meta_out = redact_guided_snapshot_storage_paths(generic_sources, composer_meta, raw_sources=raw_sources)
+
+    assert sources_out["source"]["options"] == {"path": sentinel, "blob_ref": blob_id}
+    assert real_path not in str((sources_out, meta_out))
+
+
+def test_redact_guided_snapshot_rejects_raw_sources_that_disagree_in_shape() -> None:
+    raw_sources, composer_meta = _fork_explicit_shape()
+    with pytest.raises(AuditIntegrityError, match="raw_sources"):
+        redact_guided_snapshot_storage_paths({"other": raw_sources["source"]}, composer_meta, raw_sources=raw_sources)

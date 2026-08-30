@@ -4167,9 +4167,23 @@ def redact_source_storage_path(state_dict: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+def _projected_source_options(live_source: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy a projected source's options as the base the guided masks land on.
+
+    The raw twin has already been checked to carry a dict ``options``; the
+    projection base is the same serializer output after the generic redaction,
+    which only replaces carrier values, so the shape must agree.
+    """
+    if type(live_source) is not dict or "options" not in live_source or type(live_source["options"]) is not dict:
+        raise AuditIntegrityError("guided blob redaction projected source options must mirror the raw source shape")
+    return dict(live_source["options"])
+
+
 def redact_guided_snapshot_storage_paths(
     sources: Mapping[str, Any] | None,
     composer_meta: Mapping[str, Any] | None,
+    *,
+    raw_sources: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Redact schema-8 reviewed source paths using each source's blob binding.
 
@@ -4177,9 +4191,20 @@ def redact_guided_snapshot_storage_paths(
     it in ``guided_session.reviewed_sources``. Each reviewed snapshot is matched to
     the committed source by its persisted name and exact storage-path value. Both
     copies are redacted without mutating the persisted input dictionaries.
+
+    ``sources`` is the projection base the masks are applied onto; ``raw_sources``
+    (when given) is the persisted, pre-``redact_source_storage_path`` copy the
+    reviewed bindings are correlated against. The generic redaction masks a
+    ``blob_ref``-bearing live carrier to a literal, so correlating on its output
+    compares a reviewed private path against the literal and rejects a consistent
+    fork-rehydrated binding (elspeth-75d320fb25). Omitted, ``sources`` is both.
     """
     sources_out = dict(sources) if sources is not None else None
     meta_out = dict(composer_meta) if composer_meta is not None else None
+    if raw_sources is None:
+        raw_sources = sources
+    elif sources is None or set(raw_sources) != set(sources):
+        raise AuditIntegrityError("guided blob redaction raw_sources must name exactly the projected sources")
 
     if composer_meta is None or "guided_session" not in composer_meta:
         return sources_out, meta_out
@@ -4232,9 +4257,9 @@ def redact_guided_snapshot_storage_paths(
         changed = True
         reviewed_bindings.append((name, binding.paths))
 
-    if rebuilt_sources is not None and reviewed_bindings:
+    if rebuilt_sources is not None and raw_sources is not None and reviewed_bindings:
         live_source_options: dict[str, dict[str, Any]] = {}
-        for live_name, live_source in rebuilt_sources.items():
+        for live_name, live_source in raw_sources.items():
             if type(live_source) is not dict:
                 raise ValueError("redact_guided_snapshot_storage_paths: source entries must be dicts when guided blob redaction is active")
             if "options" not in live_source:
@@ -4261,7 +4286,7 @@ def redact_guided_snapshot_storage_paths(
             ]
             if len(candidates) != 1:
                 raise AuditIntegrityError("guided blob source mapping is inconsistent")
-            options_redacted = dict(live_options)
+            options_redacted = _projected_source_options(live_source)
             for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
                 if key in live_options and type(value := live_options[key]) is str and value in live_reviewed_paths:
                     private_path_projections[value] = REDACTED_BLOB_SOURCE_PATH
@@ -4270,12 +4295,12 @@ def redact_guided_snapshot_storage_paths(
             source_redacted["options"] = options_redacted
             rebuilt_sources[live_name] = source_redacted
 
-    if rebuilt_sources and sentinel_bindings:
+    if rebuilt_sources and raw_sources is not None and sentinel_bindings:
         missing_names = set(sentinel_bindings) - set(rebuilt_sources)
         if missing_names:
             raise AuditIntegrityError("guided blob sentinel source mapping is inconsistent")
         for source_name, binding in sentinel_bindings.items():
-            live_source = rebuilt_sources[source_name]
+            live_source = raw_sources[source_name]
             if type(live_source) is not dict or "options" not in live_source or type(live_source["options"]) is not dict:
                 raise AuditIntegrityError("guided blob sentinel source mapping is inconsistent")
             live_options = live_source["options"]
@@ -4285,7 +4310,8 @@ def redact_guided_snapshot_storage_paths(
                 live_source_options={source_name: live_options},
             )
             sentinels = dict(binding.carriers)
-            redacted_options = dict(live_options)
+            live_source = rebuilt_sources[source_name]
+            redacted_options = _projected_source_options(live_source)
             for key, private_path in live_carriers:
                 sentinel = sentinels[key]
                 if private_path in private_path_projections and private_path_projections[private_path] != sentinel:

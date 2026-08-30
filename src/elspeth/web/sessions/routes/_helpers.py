@@ -719,7 +719,8 @@ def _state_response(
     # future contract violation surfaces as ``KeyError`` rather than being
     # masked by a silent fallback — silent-failure-hunter I6 review finding,
     # 2026-05-24.
-    sources_data = deep_thaw(state.sources)
+    raw_sources = deep_thaw(state.sources)
+    sources_data = raw_sources
     if sources_data is not None:
         redacted = redact_source_storage_path({"sources": sources_data})
         sources_data = redacted["sources"]
@@ -734,7 +735,7 @@ def _state_response(
     # is blob-backed) to mask the storage_path in both the snapshot and the
     # committed source before either reaches the wire.
     composer_meta_data = deep_thaw(state.composer_meta) if state.composer_meta is not None else None
-    sources_data, composer_meta_data = redact_guided_snapshot_storage_paths(sources_data, composer_meta_data)
+    sources_data, composer_meta_data = redact_guided_snapshot_storage_paths(sources_data, composer_meta_data, raw_sources=raw_sources)
 
     return CompositionStateResponse(
         id=str(state.id),
