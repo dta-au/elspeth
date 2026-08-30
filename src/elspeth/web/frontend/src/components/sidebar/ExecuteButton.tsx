@@ -770,8 +770,25 @@ export function ExecuteButton(): JSX.Element | null {
                       make AT announce it a second time as a description).
                       `title` is kept for sighted mouse hover; it is a
                       convenience, never the only route (the run-button
-                      comment above records why). */}
-                  <span className="sr-only">{line.identifiers}</span>
+                      comment above records why).
+
+                      The "(exact identifiers: …)" FRAMING is load-bearing,
+                      not decoration. Unframed, the <li>'s accessible content
+                      was "Reads source data: Source (CSV). Reads source data:
+                      source (csv)." — and case and parentheses do not survive
+                      speech, so a screen-reader user heard the same sentence
+                      twice, back to back, on every line of a consent dialog.
+                      Four lines became eight sentences that present as a
+                      stutter or a rendering bug. One phrase turns apparent
+                      duplication into an intelligible disclosure and keeps
+                      every sentence (the R2-F7 obligation).
+
+                      Written as a template literal, not JSX text: JSX strips
+                      whitespace around a line break, so a leading space
+                      authored as markup would not survive Prettier rewrapping
+                      the element. The space matters — without it speech runs
+                      the reader sentence into the disclosure. */}
+                  <span className="sr-only">{` (exact identifiers: ${line.identifiers})`}</span>
                 </li>
               ))}
             </ul>

@@ -372,6 +372,16 @@ describe("ExecuteButton", () => {
     // is in-flow content of the <li> itself (a `.sr-only` child span, no
     // `aria-describedby` — that would announce it a second time).
     expect(line).toHaveTextContent("Reads source data: source (csv).");
+    // FRAMED, so a screen reader hears a disclosure instead of the same
+    // sentence twice: case and parentheses do not survive speech, so the
+    // unframed span read "Reads source data: Source (CSV). Reads source data:
+    // source (csv)." as one stutter per line. Asserted on RAW textContent, not
+    // toHaveTextContent, which normalises whitespace and so cannot see the
+    // leading space — and without that space speech runs the reader sentence
+    // straight into the disclosure.
+    expect(line.textContent).toBe(
+      "Reads source data: Source (CSV). (exact identifiers: Reads source data: source (csv).)",
+    );
     expect(line).not.toHaveAttribute("aria-describedby");
     // `title` kept for sighted mouse hover — a convenience, not the only route.
     expect(line).toHaveAttribute("title", "Reads source data: source (csv).");
