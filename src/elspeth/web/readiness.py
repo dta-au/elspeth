@@ -434,7 +434,9 @@ class ReadinessProbeRunner:
         with self._lock:
             if self._closed:
                 return _static_failures(check_names, "probe runner closed")
-            existing = self._futures.get(label)
+            # Absence is the common legal state: first probe for this label,
+            # or the prior worker's done-callback already retired its entry.
+            existing = self._futures[label] if label in self._futures else None
             if existing is not None and not existing.done():
                 return _static_failures(check_names, "probe already in flight")
             source = self._executor.submit(fn, *args)
