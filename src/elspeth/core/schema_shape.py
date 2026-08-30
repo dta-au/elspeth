@@ -12,7 +12,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast, overload
+from typing import TYPE_CHECKING, Any, assert_never, cast, overload
 
 from sqlalchemy import (
     CHAR,
@@ -34,6 +34,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.schema import CreateIndex
 from sqlalchemy.sql.ddl import CreateConstraint
 from sqlalchemy.sql.schema import Constraint, Table
+
+from elspeth.contracts.trust_boundary import trust_boundary
 
 if TYPE_CHECKING:
     from sqlalchemy.sql.ddl import ExecutableDDLElement
@@ -716,13 +718,19 @@ def _proven_pg_catalog_text_builtin_calls(
         return _EMPTY_TEXT_BUILTIN_PROOF
     bind: Engine | Connection | None = inspector.bind
     try:
+        # Exhaustive dispatch over SQLAlchemy's declared Engine|Connection|None
+        # union. Only the valid None arm degrades to the empty proof; an
+        # impostor bind object crashes via assert_never instead of silently
+        # weakening the catalog proof (the old conflated else masked both).
         if isinstance(bind, Connection):
             proof_rows = _text_builtin_identity_rows_on_connection(bind)
         elif isinstance(bind, Engine):
             with bind.connect() as connection:
                 proof_rows = _text_builtin_identity_rows_on_connection(connection)
-        else:
+        elif bind is None:
             return _EMPTY_TEXT_BUILTIN_PROOF
+        else:
+            assert_never(bind)
     except SQLAlchemyError:
         return _EMPTY_TEXT_BUILTIN_PROOF
 
@@ -1469,7 +1477,7 @@ def _expected_postgresql_operator_classes(index: Index, dialect: Dialect) -> tup
         raw_operator_classes = options["ops"]
     else:
         raw_operator_classes = None
-    return _normalize_postgresql_operator_classes(raw_operator_classes)
+    return _normalize_declared_postgresql_operator_classes(raw_operator_classes)
 
 
 def _actual_postgresql_operator_classes(
@@ -1489,10 +1497,37 @@ def _actual_postgresql_operator_classes(
         raw_operator_classes = options["postgresql_ops"]
     else:
         raw_operator_classes = None
-    return _normalize_postgresql_operator_classes(raw_operator_classes)
+    return _normalize_reflected_postgresql_operator_classes(raw_operator_classes)
 
 
-def _normalize_postgresql_operator_classes(value: object) -> tuple[tuple[str, str], ...]:
+def _normalize_declared_postgresql_operator_classes(value: Any) -> tuple[tuple[str, str], ...]:
+    """Normalize the DECLARED ``postgresql_ops`` mapping from an owned Index.
+
+    Tier 1 (our schema definition): a declared non-mapping value is a code
+    defect that crashes with the natural AttributeError from ``.items()`` —
+    it must never be converted into an ordinary schema difference.
+    """
+    if value is None:
+        return ()
+    return tuple(sorted((str(key), str(operator_class).strip()) for key, operator_class in value.items()))
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "the postgresql_ops entry of index dialect options reflected from the live database by the "
+        "SQLAlchemy inspector — external database state ELSPETH does not own"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "a non-Mapping reflected value normalizes to the ('<invalid>', repr(value)) sentinel pair, which "
+        "surfaces as an ordinary schema difference; never raises on malformed input"
+    ),
+    non_raising=True,
+)
+def _normalize_reflected_postgresql_operator_classes(value: object) -> tuple[tuple[str, str], ...]:
+    """Normalize the REFLECTED ``postgresql_ops`` mapping (Tier-3 database state)."""
     if value is None:
         return ()
     if not isinstance(value, Mapping):
