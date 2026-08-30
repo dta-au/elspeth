@@ -288,3 +288,45 @@
   over — operator decision); tool_batch 5/3 and telemetry/serialization 8/4 unchanged. pipeline_planner
   `_provider_fields` invariant prose corrected (its "launders the suppression root" explanation was the
   try-join drop). Rolling hint: docs/agents/recent-code-hints.md 2026-08-29 entry.
+
+## 2026-08-30 — PER-FILE BLANKET MIGRATION, WAVE 1 (plan docs/plans/2026-08-30-per-file-blanket-migration.md, epic elspeth-e561df3c4e)
+
+- Why: the four whole-of-repo waves never saw 974 findings because worklists were built from REPORTED
+  findings and a `per_file_rules` blanket suppresses reporting. John's rulings (08-30): every exception is
+  REGULARLY re-approved by the judge (90-day expiry + resign lane is the design); a permanent suppression of
+  any shape is the defect; closed-set R5 dispatch goes to the judge individually; `_R5_NAMED_BOUNDARY_CONTEXTS`
+  is the same defect class, left open as a possible Wave 4.
+- Task 1 @e52e2c4cc: 3 zero-coverage blankets deleted (identity.py R5, database_sink.py R5, _common.py R1);
+  max_per_file_rules 99 → 82; corpus 2051/2051 same regex.
+- Wave 1: 11 lanes (C01–C06, E01–E03, L01, L02) in .claude/worktrees/tier-<b>, each --no-ff merged onto
+  tier/blanket-burndown (e41a8f755..072bc23b4), every source diff reviewed by the hub. Dispositions of the
+  602 blanket-standing findings: 43 F, 54 D, 505 J (+4 re-approvals of signed entries rotated by lane
+  edits: gate.py R4, explain_screen.py R1×2, plugin_context.py R6). Notable F: scheduler_drain converges on
+  its own `_is_result_tuple` TypeIs; token_traversal drops an unreachable tripwire; config.py env reads →
+  membership form, `_fingerprint_config_for_audit` → exact `type()` on model_dump data; canonical.py NaT
+  tautology; database.py test-double-shaped guard removed; runtime_val_manifest getattr_static → vars()
+  (masquerade baseline entry deleted, count DOWN one). D: 9 new @trust_boundary on real YAML parse entry
+  points (config.py ×2, schema.py ×7, runtime.py ×2), token_usage widened, 3 @observation_boundary.
+- Blankets deleted @39168d8b4: every block in core/contracts/engine/tui/testing (45) → 37 remain.
+  blanket_census.py: raw 2094 → 1997 (−97 = 43F + 54D, exact), standing 974 → 372 (−602, exact),
+  unused 0. sidecar_join.py (ast-path join, fp re-derived on the merged tree): 506/506 bound, 0 unbound.
+  Real-allowlist uncovered net of R_TB_SUPPRESSED: 797 → 1306 (= 505 + 4 rotations + 797). Ceilings:
+  max_allow_hits 652 → 1611 (601 − 188 stale_delete + 693 carried + 505), max_total_entries 745 → 1648,
+  max_per_file_rules 82 → 37, max_permanent_per_file_rules 99 → 37.
+- Gates on the merged tree: check-per-file-blanket-ratchet --baseline-ref 791ecca15 rc=0;
+  trust_boundary.tests/scope/tier rc=0 (all 54 D fingerprints verified here); full suite: see next entry.
+- Measurement traps found this wave (memory + broadcast): the findings regex ALSO matches R_TB_SUPPRESSED
+  observation lines (1,254), so a D lane's count would not drop — exclude them, and the census is the only
+  wave-arithmetic authority; the session scratchpad root is shared by all lanes (generic filenames were
+  overwritten cross-lane); the persistent shell CWD is shared by every agent in a session, so a sibling's
+  `cd` moves a bare relative command into another worktree (E02 caught it via a foreign commit subject; no
+  damage, verified by blob SHA). The (file, rule, symbol) triple is non-unique in EVERY bucket — retired.
+- Follow-ups filed under the epic: elspeth-c4916d0115 (transform.py:754 runtime_checkable Protocol
+  dispatch), elspeth-a90f42ff7a (check-contracts union blind spot), elspeth-1aa8d8910d (begin_run guard
+  adversarial test); standalone P1 elspeth-4f3cd4155b (blobs.py `_state_options_reference_blob` fail-open,
+  found by the rationale lane for sign-2026-08-30 — its two justify actions carry DEFECT text so the judge
+  blocks them).
+- Operator seam: sign-2026-08-30 (c601c957b) was never fired and is stale (another session moved
+  feature/unified-lineage to 7d0fdf534, docs-only). Decision: ONE combined re-stage after this merge —
+  its 1,063 actions (141 previously un-annotated rationales now authored) + Wave 1's ~505 new_judgment +
+  4 drift_repair. One fire instead of two.
