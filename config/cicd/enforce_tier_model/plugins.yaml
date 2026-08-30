@@ -1152,25 +1152,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[31]/body[0]/value/func/value/func/value/value/func/value/args[1]'
   judge_metadata_signature: 'hmac-sha256:v2:3be85c41c0705fdd8036e641fa50b16b2037b687286b56d65a81f86660723fb2'
-- key: plugins/infrastructure/base.py:R3:BaseTransform:__init_subclass__:fp=41338e4f0ac82c1a
-  owner: john
-  reason: |-
-    hasattr(type(declared_schema), '__get__') is the descriptor-protocol test on a value read from cls.__dict__ of a class ELSPETH itself is creating (Tier 1, class-creation time). It does not probe for a missing attribute on data; it distinguishes the two authored shapes a subclass body can legally carry for input_schema — a plain schema value (moved into the property's backing store) versus a descriptor that deliberately overrides the property (left alone). Any descriptor kind (property, function, cached_property) is a legitimate override, so a nominal isinstance against one class would wrongly reject some of them; CPython itself decides descriptor-ness by exactly this type-level __get__ lookup. The site is classified approved-introspection in config/cicd/masquerade_baseline.yaml.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T13:29:17.521920+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
-  judge_rationale: |-
-    RULE MISFIRES — the flagged `hasattr` is not defensively probing data or deciding whether an object satisfies an ELSPETH contract; it is the runtime descriptor-protocol test on the type of a value explicitly obtained from the newly created class's own `__dict__`. The visible code corroborates the site-specific rationale: plain class-body schema values are redirected to the backing store, while objects whose types implement `__get__` are deliberately preserved as descriptor overrides. Because descriptor behavior is defined by that type-level protocol and may legitimately be implemented by multiple descriptor kinds, this is approved semantic introspection rather than the masquerading or missing-attribute pattern R3 targets.
-  judge_signature_version: 2
-  scope_fingerprint: 76ca158a81b8a4bd5054ba34d6b611426accc3c29aa81aee64d27eb178ae2863
-  judge_transport: codex_cli
-  ast_path: 'body[17]/body[47]/body[1]/body[1]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:d0fe0bb772acac1b4873fb54aedb2d78f37a990f7cd5df5b9fb29eb922c8dca5'
 - key: plugins/infrastructure/base.py:R5:BaseTransform:__init_subclass__:fp=a7e867a0933c542d
   owner: john
   reason: |-
