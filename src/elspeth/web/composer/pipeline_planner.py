@@ -2304,11 +2304,19 @@ def _rejection_facts_withheld(result: ToolResult, finalizer_owned: _FinalizerOwn
 
 def _withheld_component_count(result: ToolResult) -> int:
     """How many defective components the candidate builder counted but did not list."""
+    # ``ToolResult.data`` is a union-typed owned field (frozen Mapping payloads,
+    # lists, or None depending on the tool); the Mapping dispatch is required
+    # because ``freeze_fields`` yields MappingProxyType, and an absent key is
+    # the first-class "nothing withheld" state.
     data = result.data
     if not isinstance(data, Mapping) or COMPONENTS_WITHHELD_KEY not in data:
         return 0
     withheld = data[COMPONENTS_WITHHELD_KEY]
-    return withheld if type(withheld) is int else 0
+    if type(withheld) is not int:
+        # The key is written only by _merge_component_rejections with an int;
+        # any other shape is first-party envelope corruption.
+        raise AuditIntegrityError(f"{COMPONENTS_WITHHELD_KEY} must be an int; got {type(withheld).__name__}")
+    return withheld
 
 
 # Static usage line, never per-request data. Live planners called

@@ -259,3 +259,20 @@ def test_zero_call_replay_does_not_reuse_prior_request_count(monkeypatch) -> Non
 
     attributes = {"surface": "guided", "status": "completed"}
     assert request_calls.points == [(1, attributes), (0, attributes)]
+
+
+def test_used_token_reset_failure_is_recorded_and_projection_abstains(monkeypatch) -> None:
+    """ContextVar.reset on an already-used token raises RuntimeError; the projection must
+    record that failure through _log_projection_failure and abstain rather
+    than raise into the settled request path."""
+    module = importlib.import_module("elspeth.web.composer.provider_telemetry")
+    failures: list[tuple[str, str]] = []
+
+    def _capture(*, operation: str, error_type: str) -> None:
+        failures.append((operation, error_type))
+
+    monkeypatch.setattr(module, "_log_projection_failure", _capture)
+    token = module.begin_composer_request_metrics(surface="freeform")
+    module.finish_composer_request_metrics(token, status="completed")
+    assert module.finish_composer_request_metrics(token, status="completed") is None
+    assert failures == [("request", "RuntimeError")]

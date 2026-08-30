@@ -10117,3 +10117,33 @@ async def test_settle_lifecycle_failure_propagates_when_not_cancelled() -> None:
 
 async def _unused_async_callable() -> None:
     raise AssertionError("not exercised by these tests")
+
+
+def _withheld_result(data: Any) -> Any:
+    state = _empty_state()
+    return ToolResult(
+        success=False,
+        updated_state=state,
+        validation=state.validate(),
+        affected_nodes=(),
+        data=data,
+    )
+
+
+def test_withheld_component_count_reads_first_party_int() -> None:
+    from elspeth.web.composer.tools._common import COMPONENTS_WITHHELD_KEY
+
+    assert pipeline_planner._withheld_component_count(_withheld_result({COMPONENTS_WITHHELD_KEY: 3})) == 3
+    assert pipeline_planner._withheld_component_count(_withheld_result({})) == 0
+    assert pipeline_planner._withheld_component_count(_withheld_result(None)) == 0
+
+
+def test_withheld_component_count_crashes_on_corrupt_first_party_count() -> None:
+    """COMPONENTS_WITHHELD_KEY is written only by _merge_component_rejections
+    with an int; any other present shape is envelope corruption and must crash
+    instead of silently reading as 'nothing withheld'."""
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.composer.tools._common import COMPONENTS_WITHHELD_KEY
+
+    with pytest.raises(AuditIntegrityError, match="must be an int"):
+        pipeline_planner._withheld_component_count(_withheld_result({COMPONENTS_WITHHELD_KEY: "3"}))
