@@ -288,3 +288,17 @@
   over — operator decision); tool_batch 5/3 and telemetry/serialization 8/4 unchanged. pipeline_planner
   `_provider_fields` invariant prose corrected (its "launders the suppression root" explanation was the
   try-join drop). Rolling hint: docs/agents/recent-code-hints.md 2026-08-29 entry.
+
+### 2026-08-30 — judge readonly tools were dark on 15% of src (fixed before the next bulk sign)
+
+Diagnosing the killed run `sign-2026-08-30/co3z4sj0` (165 ACCEPTED / 137 BLOCKED / 391
+unreached): the codex judge's `read_file` denied any file the secret scrubber matched — 114 of
+763 `src/elspeth` files, almost all `dotenv_secret_assignment` false positives (a keyword
+argument passing a field named token). 85/137 blocks vs 47/165 accepts sat on those files; the
+judge's "signature and decorators are not visible" prose was a refused read, not laziness.
+Fixed in `310d63525`: `read_file` returns scrubbed text (matched line → marker, numbering
+kept), `grep_files` counts over scrubbed text; agent-SDK transport unchanged (no scrub point).
+Verified live with a teed `codex exec` probe. John's ruling: the judge sees everything the
+agent sees; fold this into the process before the next bulk sign. Consequence: pre-fix BLOCK
+rates are not evidence about rationale quality; the combined post-Wave-1 re-stage is the
+first clean measurement.
