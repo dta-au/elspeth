@@ -298,7 +298,11 @@ def build_step_2_schema_form_turn(
     prefilled: dict[str, Any] = {"schema": {"mode": "observed"}}
     if prefilled_options is not None:
         prefilled.update(deep_thaw(prefilled_options))
-    prefilled.setdefault("on_write_failure", "discard")
+    # Seed the wrapper knob's default only when the staged chat-resolution
+    # options did not carry one: an explicit first-wins choice, not a hidden
+    # missing-key recovery — the form renders the value for operator review.
+    if "on_write_failure" not in prefilled:
+        prefilled["on_write_failure"] = "discard"
     payload: SchemaFormPayload = {
         "mode": "plugin_options",
         "plugin": plugin,
@@ -323,6 +327,11 @@ def _sink_knobs_with_write_failure(knobs: KnobSchema) -> KnobSchema:
                 "label": "On Write Failure",
                 "description": "Sink name for rows that cannot be written, or 'discard' for explicit drop",
                 "kind": "text",
+                # ``tier`` is required on KnobField; "common" matches the
+                # catalog's own wrapper-synthesized knobs, so this core
+                # write-failure route renders untucked like every required
+                # wrapper knob instead of shipping an untiered projection.
+                "tier": "common",
                 "required": False,
                 "nullable": False,
             }
@@ -375,6 +384,23 @@ def build_component_review_turn(
     )
 
 
+@observation_boundary(
+    tier=3,
+    source=(
+        "reviewed source options carried on SourceResolved: free-form plugin configuration authored through "
+        "the composer (planner tool calls or the schema_form), stored verbatim and never schema-validated by "
+        "the composer, so 'blob_ref' and 'path' presence and shape are not guaranteed here"
+    ),
+    source_param="source",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "renders the authored options into the schema_form prefill unchanged (still externally authored, for "
+        "the form and downstream validation to adjudicate) except that a blob-backed source's absolute "
+        "storage path is masked behind the stable blob:<ref> sentinel — only when both 'blob_ref' is present "
+        "and 'path' is a string, so an operator-typed path knob is left untouched; absence of either is a "
+        "normal non-blob shape, and this emitter never raises on malformed source options"
+    ),
+)
 def build_step_1_schema_form_turn_from_resolved(
     source: SourceResolved,
     catalog: CatalogServiceProtocol,
