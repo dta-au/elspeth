@@ -111,11 +111,6 @@ const RULE_LESS_BY_DESIGN: Record<string, string> = {
     "AuditCharacteristicIcon's inner text span. It fills the whole chip and " +
     "takes every visual property — size, weight, colour, case — from " +
     ".audit-icon on its parent; a rule of its own could only restate them.",
-  "audit-icon-unknown":
-    "Forward-compatibility modifier for a backend audit flag that predates " +
-    "its frontend metadata. It deliberately renders in .audit-icon's neutral " +
-    "base treatment: an unrecognised flag must not be coloured as though its " +
-    "tone were known.",
 };
 
 const componentSources = readdirSync(componentDir)

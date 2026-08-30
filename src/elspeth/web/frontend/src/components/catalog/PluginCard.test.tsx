@@ -13,11 +13,22 @@ import { render, screen, within, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { PluginCard } from "./PluginCard";
 import type { PluginSummary, PluginSchemaInfo } from "@/types/index";
+import type { AuditCharacteristicFlag } from "./auditCharacteristics";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { resetStore } from "@/test/store-helpers";
 import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 
 beforeEach(() => resetStore(usePreferencesStore));
+
+// The wire is structurally JSON string[] (types/index.ts:412-420); the TS
+// union tightens in-repo construction so a typo'd flag cannot compile. A
+// fixture simulating an out-of-vocabulary flag arriving over the wire —
+// exactly the drift lookupAuditCharacteristic tolerates at runtime — has to
+// go around that same narrowing, the same way this file already does for
+// PluginSchemaInfo (`as unknown as` below, e.g. :943).
+function withWireDriftFlag(flags: string[]): AuditCharacteristicFlag[] {
+  return flags as unknown as AuditCharacteristicFlag[];
+}
 
 function makePlugin(overrides: Partial<PluginSummary> = {}): PluginSummary {
   return {
@@ -487,6 +498,56 @@ describe("PluginCard — Phase 7B reshape", () => {
     expect(
       screen.getByRole("group", { name: "Audit characteristics" }),
     ).toBeInTheDocument();
+  });
+
+  it("shows the known chip and no raw flag at the DEFAULT detail level (elspeth-0bfd019f68)", () => {
+    // external_call is in DEFAULT_VISIBLE_AUDIT_FLAGS, so its chip renders
+    // here; future_characteristic is filtered out by that same list before it
+    // ever reaches the icon. This test pins the default surface — it does NOT
+    // exercise the deleted branch, which is what the next test is for.
+    const { container } = render(
+      <PluginCard
+        plugin={makePlugin({ audit_characteristics: withWireDriftFlag(["external_call", "future_characteristic"]) })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    expect(screen.getByText("network call")).toBeInTheDocument(); // positive anchor
+    expect(screen.queryByText("future_characteristic")).not.toBeInTheDocument();
+    expectNoIdentifiersInDefaultDom(container);
+  });
+
+  it("renders no chip at all for an out-of-vocabulary flag at the DETAILED level (elspeth-0bfd019f68)", () => {
+    // THIS is the test that exercises the deleted branch: with the flag on,
+    // the unknown characteristic reaches AuditCharacteristicIcon, which now
+    // returns null. Before the change it rendered `future_characteristic`
+    // verbatim, so this assertion goes from red to green on the deletion.
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(
+      <PluginCard
+        plugin={makePlugin({ audit_characteristics: withWireDriftFlag(["external_call", "future_characteristic"]) })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    expect(screen.getByText("network call")).toBeInTheDocument();
+    expect(screen.queryByText("future_characteristic")).not.toBeInTheDocument();
+  });
+
+  it("renders no labelled group at all when every characteristic is out of vocabulary (elspeth-0bfd019f68)", () => {
+    // PluginCard.tsx:189's `length > 0` guard counts flags, not rendered
+    // chips. Without the lookup filter this is a <div role="group"
+    // aria-label="Audit characteristics"> with no children — announced as a
+    // labelled group containing nothing.
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(
+      <PluginCard
+        plugin={makePlugin({ audit_characteristics: withWireDriftFlag(["future_characteristic"]) })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    expect(screen.queryByRole("group", { name: "Audit characteristics" })).not.toBeInTheDocument();
   });
 
   it("renders the 'Use when' prose in the details disclosure", async () => {
