@@ -74,8 +74,11 @@ _CONSUMER_FAN_IN_ARM_RE = re.compile(
 )
 
 
-def _ts_members(pattern: re.Pattern[str], label: str) -> list[str]:
-    """Parse one declaration out of graphTopology.ts and return its members."""
+def _ts_members(pattern: re.Pattern[str], label: str) -> set[str]:
+    """Parse one declaration out of graphTopology.ts and return its members.
+
+    Returns a set because every caller compares membership, never order.
+    """
     text = _TOPOLOGY_PATH.read_text(encoding="utf-8")
     matches = pattern.findall(text)
     assert len(matches) == 1, (
@@ -84,20 +87,12 @@ def _ts_members(pattern: re.Pattern[str], label: str) -> list[str]:
         "rather than deleting the parity assertion, which is the only thing pinning the TS copy to "
         "the Python authority."
     )
-    return _MEMBER_RE.findall(matches[0])
+    return set(_MEMBER_RE.findall(matches[0]))
 
 
 def _ts_self_publishing_node_types() -> set[str]:
     """Parse graphTopology.ts and return the declared member set."""
-    text = _TOPOLOGY_PATH.read_text(encoding="utf-8")
-    matches = _SET_DECLARATION_RE.findall(text)
-    assert len(matches) == 1, (
-        f"Expected exactly one `IMPLICIT_SELF_PUBLISHING_NODE_TYPES` Set declaration in "
-        f"{_TOPOLOGY_PATH.name}, matched {len(matches)}. The declaration moved, was renamed, or "
-        "Prettier rewrote its shape — re-anchor this regex rather than deleting the parity test, "
-        "which is the only thing pinning the TS copy to the Python authority."
-    )
-    return set(_MEMBER_RE.findall(matches[0]))
+    return _ts_members(_SET_DECLARATION_RE, "IMPLICIT_SELF_PUBLISHING_NODE_TYPES")
 
 
 def test_self_publishing_set_matches_the_python_authority() -> None:
@@ -170,10 +165,12 @@ def _py_fan_in_kinds() -> set[str]:
         "set, which would silently stop detecting Python-side drift."
     )
     kinds = set(_MEMBER_RE.findall(matches[0]))
-    assert len(kinds) >= 2, (
-        f"Parsed {sorted(kinds)} from the fan-in arm in {connection_consumers.__name__}; expected "
-        "at least two kinds. The regex matched something other than the tuple literal, and the "
-        "comparison below would be vacuous."
+    assert kinds, (
+        f"Parsed no kinds from the fan-in arm in {connection_consumers.__name__}, so the comparison "
+        "below would be vacuous. Either the regex matched something other than the tuple literal "
+        "(re-anchor it), or the arm is genuinely empty (which is a Python-side change worth "
+        "reading before adjusting this test). A one-member arm is legitimate and passes: the "
+        "previous `>= 2` floor reported it as a regex bug and sent the maintainer hunting one."
     )
     return kinds
 
@@ -195,7 +192,7 @@ def test_fan_in_node_types_matches_the_canonical_consumer_projection() -> None:
     source of truth.
     """
     py_kinds = _py_fan_in_kinds()
-    ts_kinds = set(_ts_members(_FAN_IN_DECLARATION_RE, "FAN_IN_NODE_TYPES"))
+    ts_kinds = _ts_members(_FAN_IN_DECLARATION_RE, "FAN_IN_NODE_TYPES")
     assert ts_kinds, f"No members parsed from FAN_IN_NODE_TYPES in {_TOPOLOGY_PATH} — the assertion would be vacuous."
     assert ts_kinds == py_kinds, (
         f"FAN_IN_NODE_TYPES in {_TOPOLOGY_PATH.name} is {sorted(ts_kinds)}, but "
@@ -217,7 +214,7 @@ def test_coalesce_member_tuples_match_the_backend_literals() -> None:
     py_merges = set(get_args(CoalesceSettings.model_fields["merge"].annotation))
     for label, py_members in (("COALESCE_POLICIES", py_policies), ("COALESCE_MERGES", py_merges)):
         assert py_members, f"No members read from CoalesceSettings for {label} — the assertion would be vacuous."
-        ts_members = set(_ts_members(re.compile(_TUPLE_RE_TEMPLATE.format(name=label)), label))
+        ts_members = _ts_members(re.compile(_TUPLE_RE_TEMPLATE.format(name=label)), label)
         assert ts_members, f"No members parsed from {label} in {_TOPOLOGY_PATH} — the assertion would be vacuous."
         assert ts_members == py_members, (
             f"{label} in {_TOPOLOGY_PATH.name} is {sorted(ts_members)}; `CoalesceSettings` declares "

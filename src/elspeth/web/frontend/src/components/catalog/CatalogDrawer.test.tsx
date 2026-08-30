@@ -801,7 +801,13 @@ describe("CatalogDrawer — unavailable-components notice placement", () => {
     // describe guard against.
     await screen.findByRole("region", { name: "Unavailable saved components" });
     expectNoIdentifiersInDefaultDom(container, {
-      allowAriaLabelSelectors: [".import-yaml-actions"],
+      // SELF-only on the two buttons that carry the author-chosen component
+      // id in their names. The `.import-yaml-actions` SUBTREE form this
+      // replaces exempted the container and everything under it, so any
+      // aria-labelled control added inside later was silently exempt too —
+      // the growth channel defaultDomPins.ts's own docs warn about, and these
+      // two calls were the in-repo copy-paste source for the lazy form.
+      allowAriaLabelSelfSelectors: [".import-yaml-actions button"],
     });
   });
 });

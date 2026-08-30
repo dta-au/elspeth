@@ -1488,6 +1488,27 @@ class TestReplyRegisterRule:
         ):
             assert phrase in section, phrase
 
+    def test_brief_states_the_rules_as_imperatives_not_just_vocabulary(self) -> None:
+        """The vocabulary pins above survive a POLARITY INVERSION.
+
+        Editing "Do not echo tool-argument keys..." to "Echo tool-argument keys
+        where helpful..." keeps every noun phrase in place, so the other tests
+        in this class stay green while the rule means its opposite. Pinning the
+        imperative stems verbatim makes an inverting edit delete pinned
+        wording instead (python M1).
+
+        This is a narrow strengthening, not a change of posture: these are
+        still declaration tests, pinning what the brief SAYS rather than what
+        the model does with it.
+        """
+        section = SYSTEM_PROMPT.split("## Reply Register", 1)[1].split("\n## ", 1)[0]
+        for stem in (
+            "Do not echo tool-argument keys",
+            "never by node id",
+            "Do not paste an ASCII topology tree",
+        ):
+            assert stem in section, stem
+
     def test_termination_checklist_includes_the_register_line(self) -> None:
         checklist = SYSTEM_PROMPT.split("## Termination States", 1)[1]
         assert "no tool-argument keys, validation fields, or enum values in prose" in checklist

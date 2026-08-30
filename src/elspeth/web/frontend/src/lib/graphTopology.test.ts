@@ -10,6 +10,8 @@ import {
   FAN_IN_NODE_TYPES,
   FORK_CONNECTION,
   IMPLICIT_SELF_PUBLISHING_NODE_TYPES,
+  PRODUCER_ARM_KINDS,
+  indexConnectionProducers,
 } from "./graphTopology";
 import { buildProducerRegistry } from "@/components/inspector/GraphView";
 import { makeComposition } from "@/test/composerFixtures";
@@ -195,6 +197,24 @@ describe("buildConnectionProducers agrees with GraphView's producer registry", (
     expect(graphViewKeys.size).toBeGreaterThan(4);
     expect(graphView.has(FORK_CONNECTION)).toBe(true);
     expect(graphView.has(DISCARD_CONNECTION)).toBe(true);
+  });
+
+  it("exercises every producer-registration arm, so a new one cannot pass unexercised", () => {
+    // The cross-check above compares two indexes over ONE fixture. That
+    // catches a new node KIND loudly, but a new publication FIELD (an
+    // `on_timeout` lane, say) added to one copy and not the other fails
+    // SILENTLY unless this fixture happens to exercise it — the exact
+    // Graph-tab-vs-Spec-tab divergence the module header vows to prevent
+    // (systems I-2, remedy b; the full lift stays ticketed
+    // elspeth-fcb0637b07).
+    //
+    // Asserted against PRODUCER_ARM_KINDS rather than a hand-listed set: the
+    // walk's `push` takes an arm kind from that union, so a new arm cannot be
+    // added without naming it there, and naming it there fails THIS assertion
+    // until the fixture below actually drives it. An un-exercised arm trips
+    // the guard instead of passing it.
+    const { arms } = indexConnectionProducers(SHARED_FANIN_FIXTURE);
+    expect(arms).toEqual(new Set(PRODUCER_ARM_KINDS));
   });
 });
 

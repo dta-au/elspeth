@@ -223,8 +223,54 @@ export function branchEntries(
 export function buildConnectionProducers(
   state: CompositionState,
 ): Map<string, string[]> {
+  return indexConnectionProducers(state).producers;
+}
+
+/**
+ * The registration arms the walk below makes. Exported so the cross-check
+ * fixture can assert that it exercises EVERY one of them.
+ *
+ * Why the list exists at all: the four producer-registration loops live twice
+ * — here and in GraphView's `buildProducerRegistry` — and their equivalence is
+ * guarded by one shared fixture. A new node KIND fails loudly (the Python
+ * parity test compares the sets), but a new publication FIELD added to one
+ * copy and not the other fails SILENTLY unless the fixture happens to
+ * exercise it, reproducing the Graph-tab-vs-Spec-tab divergence this module
+ * exists to prevent (systems I-2; the full lift stays ticketed
+ * elspeth-fcb0637b07).
+ *
+ * `push` takes an arm kind from this union, so a new arm cannot be added
+ * without naming it here, and naming it here fails the fixture's coverage
+ * assertion until the fixture actually exercises it. An un-exercised arm
+ * trips the guard instead of passing it.
+ */
+export const PRODUCER_ARM_KINDS = [
+  "source_on_success",
+  "published",
+  "on_error",
+  "routes",
+  "fork_to",
+] as const;
+
+export type ProducerArmKind = (typeof PRODUCER_ARM_KINDS)[number];
+
+export interface ConnectionProducerIndex {
+  /** connection → ids of the components that write it. */
+  producers: Map<string, string[]>;
+  /** Which registration arms actually fired for this composition. Read by the
+   *  cross-check's vacuity guard; production callers want `producers` and use
+   *  `buildConnectionProducers`. */
+  arms: ReadonlySet<ProducerArmKind>;
+}
+
+/** `buildConnectionProducers` plus the record of which arms it took. */
+export function indexConnectionProducers(
+  state: CompositionState,
+): ConnectionProducerIndex {
   const producers = new Map<string, string[]>();
-  const push = (connection: string, producerId: string): void => {
+  const arms = new Set<ProducerArmKind>();
+  const push = (arm: ProducerArmKind, connection: string, producerId: string): void => {
+    arms.add(arm);
     const existing = producers.get(connection);
     if (existing === undefined) producers.set(connection, [producerId]);
     else if (!existing.includes(producerId)) existing.push(producerId);
@@ -238,16 +284,20 @@ export function buildConnectionProducers(
   // dependency graph.
   for (const [sourceName, source] of sortedSourceEntries(state)) {
     if (source.on_success && source.on_success !== DISCARD_CONNECTION) {
-      push(source.on_success, sourceComponentId(sourceName));
+      push("source_on_success", source.on_success, sourceComponentId(sourceName));
     }
   }
   for (const node of state.nodes) {
     const published = publishedSuccessConnection(node);
-    if (published && published !== DISCARD_CONNECTION) push(published, node.id);
-    if (node.on_error && node.on_error !== DISCARD_CONNECTION) push(node.on_error, node.id);
+    if (published && published !== DISCARD_CONNECTION) push("published", published, node.id);
+    if (node.on_error && node.on_error !== DISCARD_CONNECTION) {
+      push("on_error", node.on_error, node.id);
+    }
     if (node.routes) {
       for (const target of Object.values(node.routes)) {
-        if (target !== FORK_CONNECTION && target !== DISCARD_CONNECTION) push(target, node.id);
+        if (target !== FORK_CONNECTION && target !== DISCARD_CONNECTION) {
+          push("routes", target, node.id);
+        }
       }
     }
     if (
@@ -256,8 +306,8 @@ export function buildConnectionProducers(
       && Object.values(node.routes).includes(FORK_CONNECTION)
       && node.fork_to
     ) {
-      for (const branchConnection of node.fork_to) push(branchConnection, node.id);
+      for (const branchConnection of node.fork_to) push("fork_to", branchConnection, node.id);
     }
   }
-  return producers;
+  return { producers, arms };
 }
