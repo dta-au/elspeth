@@ -68,13 +68,23 @@ logger = logging.getLogger(__name__)
 def _contain_cleanup_failure(action: Callable[[], object], description: str) -> None:
     """Run a cleanup step, recording (never propagating) its failure.
 
-    Call ONLY while a primary export, cancellation, or process-control
-    exception is already propagating: replacing that exception would obscure
-    the recovery state, so the cleanup failure is recorded and the primary
-    exception stays the outcome. On a success path, cleanup failures must
-    surface instead — containment there would swallow a real failure behind a
-    successful return. Process-control exceptions raised *by* the cleanup
-    itself (KeyboardInterrupt, SystemExit) still propagate.
+    Two call topologies are legitimate, and only these two:
+
+    1. While a primary export, cancellation, or process-control exception is
+       already propagating — replacing it would obscure the recovery state,
+       so the cleanup failure is recorded (ERROR with traceback) and the
+       primary exception stays the outcome.
+    2. Post-registration teardown of the private spool on the success path —
+       the export is durably registered and its audit record exists, so a
+       temp-resource close failure must not fail the already-registered
+       export (ratified: elspeth-1c31195f26,
+       test_spool_close_failure_does_not_fail_a_registered_export); it is
+       recorded loudly with the export identity in ``description``.
+
+    Containment is never a substitute for recording: every call must pass a
+    ``description`` specific enough to identify what was lost. Process-control
+    exceptions raised *by* the cleanup itself (KeyboardInterrupt, SystemExit)
+    still propagate.
     """
     try:
         action()
@@ -432,11 +442,17 @@ def prepare_audit_export_snapshot(
         )
         _contain_cleanup_failure(spool.close, "spool close after candidate registration failure")
         raise
-    # Success path: no primary exception is propagating, so a spool-close
-    # failure has nothing to mask and must surface rather than be contained
-    # (containment here would let the export return success on a swallowed
-    # failure).
-    spool.close()
+    # Success path: the export is durably registered and its audit record
+    # already exists, so a spool-close failure is post-success cleanup of a
+    # private temp resource. Ratified semantic (elspeth-1c31195f26, pinned by
+    # test_spool_close_failure_does_not_fail_a_registered_export): contain it
+    # and record it loudly with the export identity — an already-registered
+    # export never fails on temp-file teardown, and the failure is never
+    # silent.
+    _contain_cleanup_failure(
+        spool.close,
+        f"spool close after successful registration of candidate {candidate_id} (run {run_id}); registered snapshot is unaffected",
+    )
 
     return snapshots.bind_winner(
         winner,
