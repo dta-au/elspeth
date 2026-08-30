@@ -68,10 +68,13 @@ logger = logging.getLogger(__name__)
 def _contain_cleanup_failure(action: Callable[[], object], description: str) -> None:
     """Run a cleanup step, recording (never propagating) its failure.
 
-    Cleanup runs while a primary export, cancellation, or process-control
-    exception may already be propagating; replacing that exception would
-    obscure the recovery state. Process-control exceptions raised *by* the
-    cleanup itself (KeyboardInterrupt, SystemExit) still propagate.
+    Call ONLY while a primary export, cancellation, or process-control
+    exception is already propagating: replacing that exception would obscure
+    the recovery state, so the cleanup failure is recorded and the primary
+    exception stays the outcome. On a success path, cleanup failures must
+    surface instead — containment there would swallow a real failure behind a
+    successful return. Process-control exceptions raised *by* the cleanup
+    itself (KeyboardInterrupt, SystemExit) still propagate.
     """
     try:
         action()
@@ -427,9 +430,13 @@ def prepare_audit_export_snapshot(
             lambda: content_store.mark_candidate_orphans(candidate_id, descriptors),
             f"orphan marking for candidate {candidate_id}",
         )
+        _contain_cleanup_failure(spool.close, "spool close after candidate registration failure")
         raise
-    finally:
-        _contain_cleanup_failure(spool.close, "spool close after candidate registration")
+    # Success path: no primary exception is propagating, so a spool-close
+    # failure has nothing to mask and must surface rather than be contained
+    # (containment here would let the export return success on a swallowed
+    # failure).
+    spool.close()
 
     return snapshots.bind_winner(
         winner,
