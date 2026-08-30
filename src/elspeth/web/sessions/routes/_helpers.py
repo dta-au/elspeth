@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 import json
 import sys
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as _replace
 from datetime import UTC, datetime
@@ -39,7 +39,7 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
 )
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressReason, ComposerProgressSink
-from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
+from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, GuidedCustodyIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.core.canonical import stable_hash
@@ -890,6 +890,29 @@ def merge_composer_meta_updates(
     merged = cast(CompositionObject, dict(deep_thaw(existing_meta))) if existing_meta is not None else {}
     merged.update(updates)
     return merged
+
+
+GUIDED_CUSTODY_PROJECTION_FAILED = "guided_custody_projection_failed"
+GUIDED_CUSTODY_PROJECTION_FAILED_DETAIL = (
+    "This session's retained guided source review no longer binds to its sources; revert to an earlier version to continue."
+)
+
+
+@contextlib.contextmanager
+def _named_guided_custody_projection() -> Iterator[None]:
+    """Name a custody-unbindable tip's read refusal instead of a bare 500.
+
+    Only a tip persisted BEFORE the write gate (elspeth-4c442aaaa8) can still
+    raise here: the gate refuses new active pairs and the projection degrades
+    terminal ones. The 409 carries a constant detail — never the path.
+    """
+    try:
+        yield
+    except GuidedCustodyIntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error_type": GUIDED_CUSTODY_PROJECTION_FAILED, "detail": GUIDED_CUSTODY_PROJECTION_FAILED_DETAIL},
+        ) from exc
 
 
 def _recovery_partial_state_response(state: CompositionStateRecord) -> dict[str, Any]:
@@ -2659,6 +2682,17 @@ async def _handle_convergence_error(
             )
             persisted_state_id = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
+        except GuidedCustodyIntegrityError as custody_err:
+            # The partial state's guided custody cannot bind (write gate) or
+            # cannot project (legacy tip): keep the recovery body, name the
+            # loss the same way the save-failure arm does.
+            slog.error(
+                f"{log_prefix}_partial_state_custody_unbindable",
+                session_id=str(session_id),
+                exc_class=type(custody_err).__name__,
+            )
+            response_body["partial_state_save_failed"] = True
+            response_body["partial_state_save_error"] = type(custody_err).__name__
         except SQLAlchemyError as save_err:
             # Full SQLAlchemyError family — ``IntegrityError`` alone would
             # let ``OperationalError`` (lock timeout / pool disconnect /
@@ -2805,6 +2839,14 @@ async def _handle_plugin_crash(
             )
             persisted_state_id_pc = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
+        except GuidedCustodyIntegrityError as custody_err:
+            slog.error(
+                f"{log_prefix}_plugin_crash_partial_state_custody_unbindable",
+                session_id=str(session_id),
+                exc_class=type(custody_err).__name__,
+            )
+            response_body["partial_state_save_failed"] = True
+            response_body["partial_state_save_error"] = type(custody_err).__name__
         except SQLAlchemyError as save_err:
             # Full SQLAlchemyError family — a narrow ``IntegrityError``
             # catch would let ``OperationalError`` / ``ProgrammingError`` /
@@ -3042,6 +3084,14 @@ async def _handle_runtime_preflight_failure(
             )
             persisted_state_id_rpf = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
+        except GuidedCustodyIntegrityError as custody_err:
+            slog.error(
+                f"{log_prefix}_runtime_preflight_partial_state_custody_unbindable",
+                session_id=str(session_id),
+                exc_class=type(custody_err).__name__,
+            )
+            response_body["partial_state_save_failed"] = True
+            response_body["partial_state_save_error"] = type(custody_err).__name__
         except SQLAlchemyError as save_err:
             # See sibling helpers for redaction rationale (exc_info
             # omitted; class name only on the response body).

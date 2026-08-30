@@ -102,6 +102,7 @@ from .._helpers import (
     CompositionState,
     CompositionStateData,
     CompositionStateRecord,
+    CompositionStateResponse,
     ControlSignal,
     Depends,
     GetGuidedResponse,
@@ -133,6 +134,7 @@ from .._helpers import (
     _get_session_compose_lock_registry,
     _initial_composition_state_with_guided_session,
     _inspect_latest_ready_session_blob,
+    _named_guided_custody_projection,
     _replace,
     _request_plugin_policy_context,
     _safe_frame_strings,
@@ -907,6 +909,10 @@ async def get_guided(
         # rebuild) and the payload_hash matches what was recorded on first visit.
         terminal = guided.terminal
         shield_available = _resolve_shield_available(plugin_snapshot)
+        composition_state_out: CompositionStateResponse | None = None
+        if state_record_out is not None:
+            with _named_guided_custody_projection():
+                composition_state_out = _state_response(state_record_out, policy_catalog=catalog)
         return GetGuidedResponse(
             guided_session=GuidedSessionResponse(
                 step=guided.step.value,
@@ -952,7 +958,7 @@ async def get_guided(
             )
             if terminal is not None
             else None,
-            composition_state=_state_response(state_record_out, policy_catalog=catalog) if state_record_out is not None else None,
+            composition_state=composition_state_out,
         )
 
 
@@ -1039,7 +1045,8 @@ async def post_guided_reenter(
                     purpose="turn",
                 ),
             )
-        response = project_guided_response(record, payloads=payloads)
+        with _named_guided_custody_projection():
+            response = project_guided_response(record, payloads=payloads)
         if type(response) is not GetGuidedResponse:
             raise AuditIntegrityError("Guided re-entry projection returned the wrong response type")
         return response
@@ -2707,7 +2714,8 @@ async def post_guided_respond(
         payloads: tuple[PreparedGuidedJsonPayload, ...] = ()
         if descriptor.next_turn is not None:
             payloads = (load_guided_json_payload(payload_store, payload_id=descriptor.next_turn.payload_id, purpose="turn"),)
-        response = project_guided_response(record, payloads=payloads)
+        with _named_guided_custody_projection():
+            response = project_guided_response(record, payloads=payloads)
         if type(response) is not GuidedRespondResponse:
             raise AuditIntegrityError("Guided RESPOND projection returned the wrong response type")
         return response

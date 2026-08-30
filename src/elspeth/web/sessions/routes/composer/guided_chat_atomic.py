@@ -103,6 +103,7 @@ from .._helpers import (
     _get_session_compose_lock_registry,
     _inspect_latest_ready_session_blob,
     _is_client_disconnect_cancel,
+    _named_guided_custody_projection,
     _publish_progress,
     _replace,
     _request_plugin_policy_context,
@@ -973,7 +974,8 @@ async def post_guided_chat_schema8(
         payloads: tuple[PreparedGuidedJsonPayload, ...] = ()
         if descriptor.next_turn is not None:
             payloads = (load_guided_json_payload(payload_store, payload_id=descriptor.next_turn.payload_id, purpose="turn"),)
-        response = project_guided_response(record, payloads=payloads)
+        with _named_guided_custody_projection():
+            response = project_guided_response(record, payloads=payloads)
         if type(response) is not GuidedChatResponse:
             raise AuditIntegrityError("Guided Chat projection returned the wrong response type")
         return response

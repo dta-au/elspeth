@@ -25,7 +25,7 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationEr
 
 from elspeth.contracts.blobs import AllowedMimeType
 from elspeth.contracts.composer_interpretation import InterpretationKind
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, GuidedCustodyIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.config import RuntimeNodeName, validate_runtime_node_name
@@ -4376,7 +4376,7 @@ def _correlate_guided_snapshot_storage_paths(
         if type(name) is not str or not name:
             raise ValueError("redact_guided_snapshot_storage_paths: reviewed_sources.name must be a non-empty str")
         if name in reviewed_names:
-            raise AuditIntegrityError("guided reviewed source names must be unique")
+            raise GuidedCustodyIntegrityError("guided reviewed source names must be unique")
         reviewed_names.add(name)
         snap_options = snapshot["options"]
         if type(snap_options) is not dict:
@@ -4428,7 +4428,7 @@ def _correlate_guided_snapshot_storage_paths(
                 paths for reviewed_name, paths in reviewed_bindings if reviewed_name == live_name and live_reviewed_paths <= paths
             ]
             if len(candidates) != 1:
-                raise AuditIntegrityError("guided blob source mapping is inconsistent")
+                raise GuidedCustodyIntegrityError("guided blob source mapping is inconsistent")
             options_redacted = _projected_source_options(live_source)
             for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
                 if key in live_options and type(value := live_options[key]) is str and value in live_reviewed_paths:
@@ -4441,11 +4441,11 @@ def _correlate_guided_snapshot_storage_paths(
     if rebuilt_sources and raw_sources is not None and sentinel_bindings:
         missing_names = set(sentinel_bindings) - set(rebuilt_sources)
         if missing_names:
-            raise AuditIntegrityError("guided blob sentinel source mapping is inconsistent")
+            raise GuidedCustodyIntegrityError("guided blob sentinel source mapping is inconsistent")
         for source_name, binding in sentinel_bindings.items():
             live_source = raw_sources[source_name]
             if type(live_source) is not dict or "options" not in live_source or type(live_source["options"]) is not dict:
-                raise AuditIntegrityError("guided blob sentinel source mapping is inconsistent")
+                raise GuidedCustodyIntegrityError("guided blob sentinel source mapping is inconsistent")
             live_options = live_source["options"]
             live_carriers = validate_guided_reviewed_sentinel_source_mapping(
                 binding,
@@ -4458,7 +4458,7 @@ def _correlate_guided_snapshot_storage_paths(
             for key, private_path in live_carriers:
                 sentinel = sentinels[key]
                 if private_path in private_path_projections and private_path_projections[private_path] != sentinel:
-                    raise AuditIntegrityError("guided blob sentinel path projection is ambiguous")
+                    raise GuidedCustodyIntegrityError("guided blob sentinel path projection is ambiguous")
                 private_path_projections[private_path] = sentinel
                 redacted_options[key] = sentinel
             redacted_source = dict(live_source)
@@ -4500,11 +4500,11 @@ def _correlate_guided_snapshot_storage_paths(
     if private_path_projections and meta_out is not None and "implicit_decisions" in meta_out:
         report = meta_out["implicit_decisions"]
         if type(report) is not dict or "entries" not in report or type(report["entries"]) is not list:
-            raise AuditIntegrityError("guided implicit-decision projection is malformed")
+            raise GuidedCustodyIntegrityError("guided implicit-decision projection is malformed")
         redacted_entries: list[dict[str, Any]] = []
         for entry in report["entries"]:
             if type(entry) is not dict:
-                raise AuditIntegrityError("guided implicit-decision entry is malformed")
+                raise GuidedCustodyIntegrityError("guided implicit-decision entry is malformed")
             redacted_entry = dict(entry)
             if (
                 "path" in entry

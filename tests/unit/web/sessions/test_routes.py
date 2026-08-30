@@ -13448,3 +13448,92 @@ def test_send_message_refuses_an_active_unbindable_guided_tip_as_a_failed_turn(t
     assert client.get(f"/api/sessions/{session_id}/state").json() is None
     roles = [m["role"] for m in client.get(f"/api/sessions/{session_id}/messages").json()]
     assert roles == ["user"]
+
+
+_LEGACY_PRIVATE_PATH = "/srv/elspeth/data/blobs/legacy/50f5b3e9-f52f-4c5f-98df-a20ec7b2627b_colours.csv"
+
+
+def _legacy_unbindable_guided_state(*, terminal: TerminalState | None) -> CompositionStateData:
+    """Incident v13 shape (elspeth-201903a286) as a pre-gate row: a retained
+    sentinel review of ``source`` re-attached to a live ``source`` bound to a
+    different blob."""
+    stable_id = "11111111-1111-4111-8111-111111111111"
+    guided = replace(
+        GuidedSession.initial(),
+        source_order=(stable_id,),
+        reviewed_sources={
+            stable_id: SourceResolved(
+                name="source",
+                plugin="csv",
+                options={"path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f", "schema": {"mode": "observed"}},
+                observed_columns=("colour",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+        terminal=terminal,
+    )
+    return CompositionStateData(
+        sources={
+            "source": {
+                "plugin": "csv",
+                "on_success": "out",
+                "options": {"path": _LEGACY_PRIVATE_PATH, "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"},
+                "on_validation_failure": "discard",
+            }
+        },
+        nodes=[],
+        edges=[],
+        outputs=[],
+        metadata_={"name": "Legacy", "description": ""},
+        is_valid=False,
+        composer_meta={"guided_session": guided.to_dict()},
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_active_unbindable_tip_reads_are_named_409s(tmp_path) -> None:
+    """elspeth-4c442aaaa8 EXPECTED-3: a tip persisted before the write gate whose
+    ACTIVE review cannot bind still refuses to project. Every read arm names the
+    condition with a stable 409 instead of a bare 500, echoes no path, and a
+    revert onto the same row is refused by the write gate under the same name.
+    The frontend load path treats 409 like 500 today (declared non-goal)."""
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    await _insert_legacy_composition_state(service, session.id, _legacy_unbindable_guided_state(terminal=None), provenance="post_compose")
+    tip = await service.get_current_state(session.id)
+    assert tip is not None
+
+    for path in (f"/api/sessions/{session.id}/state", f"/api/sessions/{session.id}/state/versions", f"/api/sessions/{session.id}/guided"):
+        response = client.get(path)
+        assert response.status_code == 409, (path, response.text)
+        assert response.json()["detail"]["error_type"] == "guided_custody_projection_failed"
+        assert _LEGACY_PRIVATE_PATH not in response.text
+
+    revert = client.post(
+        f"/api/sessions/{session.id}/state/revert",
+        json={"operation_id": str(uuid.uuid4()), "state_id": str(tip.id)},
+    )
+    assert revert.status_code == 409, revert.text
+    assert revert.json()["detail"]["error_type"] == "guided_custody_projection_failed"
+    still_tip = await service.get_current_state(session.id)
+    assert still_tip is not None
+    assert still_tip.version == tip.version
+
+
+@pytest.mark.asyncio
+async def test_legacy_exited_unbindable_tip_projects_degraded(tmp_path) -> None:
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    exited = TerminalState(kind=TerminalKind.EXITED_TO_FREEFORM, reason=TerminalReason.USER_PRESSED_EXIT, pipeline_yaml=None)
+    await _insert_legacy_composition_state(service, session.id, _legacy_unbindable_guided_state(terminal=exited), provenance="post_compose")
+
+    response = client.get(f"/api/sessions/{session.id}/state")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["composer_meta"]["guided_session"]["custody_unavailable"] is True
+    assert body["sources"]["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+    assert _LEGACY_PRIVATE_PATH not in response.text

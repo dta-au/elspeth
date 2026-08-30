@@ -56,6 +56,7 @@ from .._helpers import (
     _composer_preferences_response,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
+    _named_guided_custody_projection,
     _record_composer_runtime_preflight_telemetry,
     _request_plugin_policy_context,
     _runtime_preflight_for_state,
@@ -456,7 +457,8 @@ async def get_current_state(
     state = await service.get_current_state(session.id)
     if state is None:
         return None
-    return _state_response(state, policy_catalog=catalog)
+    with _named_guided_custody_projection():
+        return _state_response(state, policy_catalog=catalog)
 
 
 @router.get(
@@ -475,7 +477,8 @@ async def get_state_versions(
     service = request.app.state.session_service
     catalog, _snapshot = _request_plugin_policy_context(request, user)
     versions = await service.get_state_versions(session.id, limit=limit, offset=offset)
-    return [_state_response(v, policy_catalog=catalog) for v in versions]
+    with _named_guided_custody_projection():
+        return [_state_response(v, policy_catalog=catalog) for v in versions]
 
 
 @router.post(
@@ -517,7 +520,8 @@ async def revert_state(
         if type(result) is not GuidedCompositionStateResult:
             raise AuditIntegrityError("State revert replay has a non-state result locator")
         replay_state = await service.get_state_in_session(result.state_id, session.id)
-        return _state_response(replay_state, policy_catalog=catalog)
+        with _named_guided_custody_projection():
+            return _state_response(replay_state, policy_catalog=catalog)
 
     reserved = await reserve_or_replay_guided_operation(
         service=service,
@@ -533,14 +537,15 @@ async def revert_state(
 
     async with compose_lock:
         try:
-            new_state = await service.revert_state_for_guided_operation(
-                reserved.fence,
-                state_id=body.state_id,
-                expected_current_state_id=expected_current.id,
-                expected_current_state_version=expected_current.version,
-                actor="composer_route",
-                response_hash_factory=lambda record: guided_response_hash(_state_response(record, policy_catalog=catalog)),
-            )
+            with _named_guided_custody_projection():
+                new_state = await service.revert_state_for_guided_operation(
+                    reserved.fence,
+                    state_id=body.state_id,
+                    expected_current_state_id=expected_current.id,
+                    expected_current_state_version=expected_current.version,
+                    actor="composer_route",
+                    response_hash_factory=lambda record: guided_response_hash(_state_response(record, policy_catalog=catalog)),
+                )
         except ValueError:
             raise HTTPException(status_code=404, detail="State not found") from None
         except GuidedOperationSettlementConflictError:
@@ -551,7 +556,8 @@ async def revert_state(
             )
             raise_guided_operation_failure(failure)
 
-    return _state_response(new_state, policy_catalog=catalog)
+    with _named_guided_custody_projection():
+        return _state_response(new_state, policy_catalog=catalog)
 
 
 @router.post(
@@ -622,7 +628,8 @@ async def import_state_yaml(
             state=imported_state,
             composition_state_id=UUID(str(state_record.id)),
         )
-        return _state_response(state_record, policy_catalog=catalog)
+        with _named_guided_custody_projection():
+            return _state_response(state_record, policy_catalog=catalog)
 
 
 # Provenance sentinel for interpretation events surfaced by the YAML import
@@ -794,7 +801,8 @@ async def seed_state_for_e2e(
             state_data,
             provenance="session_seed",
         )
-        return _state_response(state_record, policy_catalog=catalog)
+        with _named_guided_custody_projection():
+            return _state_response(state_record, policy_catalog=catalog)
 
 
 def _reattach_guided_blob_refs(state: CompositionState) -> CompositionState:
