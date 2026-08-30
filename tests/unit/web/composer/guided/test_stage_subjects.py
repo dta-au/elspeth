@@ -321,3 +321,14 @@ def test_canonical_subject_definitions_exist_only_in_stage_subjects() -> None:
 
     state_machine = __import__("elspeth.web.composer.guided.state_machine", fromlist=["state_machine"])
     assert canonical.isdisjoint(vars(state_machine))
+
+
+def test_subject_from_dict_missing_kind_is_an_invariant_break() -> None:
+    """A persisted first-party record missing its discriminator crashes, never defaults."""
+    with pytest.raises(InvariantError, match="missing 'kind'"):
+        subject_from_dict({"component_kind": "node", "stable_id": "11111111-1111-4111-8111-111111111111"})
+
+
+def test_constraint_from_dict_missing_kind_is_an_invariant_break() -> None:
+    with pytest.raises(InvariantError, match="missing 'kind'"):
+        constraint_from_dict({"subject": {}, "present": True})
