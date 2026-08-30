@@ -2329,7 +2329,7 @@ class RowProcessor:
                     reason="transient_error_no_retry" if e.retryable else "permanent_error",
                     state_id=stamped_node_state_id(e),
                 )
-            except (ConnectionError, TimeoutError, OSError, CapacityError) as e:
+            except (ConnectionError, TimeoutError, CapacityError) as e:
                 return self._convert_retryable_to_error_result(
                     e,
                     transform,
@@ -2379,7 +2379,13 @@ class RowProcessor:
                 return False
             if isinstance(e, PluginRetryableError):
                 return e.retryable
-            return isinstance(e, ConnectionError | TimeoutError | OSError | CapacityError)
+            # Engine-classified transport signals (see PluginRetryableError's
+            # contract): ConnectionError/TimeoutError are the Python runtime's
+            # canonical transient network failures beneath provider SDKs, and
+            # CapacityError contract-declares retryable=True. Bare OSError is
+            # deliberately NOT here: it spans plugin bug-classes
+            # (FileNotFoundError, PermissionError) that must crash, not retry.
+            return isinstance(e, ConnectionError | TimeoutError | CapacityError)
 
         try:
             return self._retry_manager.execute_with_retry(

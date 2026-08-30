@@ -1501,6 +1501,15 @@ class PluginRetryableError(Exception):
     must inherit from this class. The processor catches PluginRetryableError
     and dispatches to retry logic based on the retryable attribute.
 
+    Deliberate engine-classified carve-out: the processor additionally treats
+    the Python runtime's canonical transient transport signals —
+    ``ConnectionError`` and ``TimeoutError`` — and the contract-owned
+    ``CapacityError`` (``retryable`` always True) as retryable, because they
+    can surface from beneath provider SDKs without a plugin seam to classify
+    them. No other unclassified exception is retried; in particular bare
+    ``OSError`` (``FileNotFoundError``, ``PermissionError``, ...) is a plugin
+    bug-class and crashes.
+
     Attributes:
         retryable: Whether the error is transient and should be retried.
         status_code: HTTP status code if applicable (for audit context).
