@@ -252,15 +252,6 @@ entries:
     (tier-B13) after dropping the dead None default — BaseTransform defines the property,
     so the static lookup cannot miss on a subclass.
 - path: src/elspeth/plugins/infrastructure/base.py
-  qualname: BaseTransform.__init_subclass__
-  kind: hasattr
-  occurrences: 1
-  probe_shapes:
-  - 8b0e21c6db1d04135bd0630647b35a12f13e3e033b29ba6121d09742217ceb53
-  classification: approved-introspection
-  justification: Class-creation descriptor guard paired with getattr_static; it rejects
-    a subclass that shadows BaseTransform.input_schema incorrectly.
-- path: src/elspeth/plugins/infrastructure/base.py
   qualname: BaseTransform._config_named_input_columns
   kind: getattr
   occurrences: 1
@@ -271,17 +262,6 @@ entries:
     declaration; receiver and field-name table are both owned configuration types.
     Re-adjudicated 2026-08-29 (tier-B13) after dropping the dead None default — every
     declared field is present on a validated instance.
-- path: src/elspeth/plugins/infrastructure/clients/llm.py
-  qualname: _extract_usage_from_provider_response
-  kind: getattr
-  occurrences: 3
-  probe_shapes:
-  - 8f37acb03fc9716c42fdfb82ccdef349f1de2309bdefed29275cd44f72e9019c
-  - b152071c62005727ff01cd4a182fd4cc896837b3a8e2f95c1502a8fa1d3a7bdb
-  - cd78238256c587a3f94efda2962ac996ed0f1776579d4c239801e26159111112
-  classification: external-parse
-  justification: Parses optional token counters from vendor LLM usage objects, then
-    constructs the owned TokenUsage value; mapping responses use their mapping API.
 - path: src/elspeth/plugins/transforms/aws/textract_document_analysis.py
   qualname: AWSTextractDocumentAnalysisConfig._consistency
   kind: getattr
