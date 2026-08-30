@@ -849,12 +849,29 @@ def _selected_control_profile(catalog: PolicyCatalogView, capability: PluginCapa
     private binding.
     """
     snapshot = catalog.snapshot
-    if dict(snapshot.control_modes).get(capability, ControlMode.RECOMMEND) is not ControlMode.REQUIRED:
+    modes = dict(snapshot.control_modes)
+    # control_modes is a genuinely partial mapping: the policy compiler copies
+    # only the capabilities the operator configured, and the trained-operator
+    # snapshot carries none. Absence is the first-class fact "not configured",
+    # so the RECOMMEND default is synthesized explicitly after membership,
+    # never via a defaulted lookup that would also mask a broken read.
+    mode = modes[capability] if capability in modes else ControlMode.RECOMMEND
+    if mode is not ControlMode.REQUIRED:
         return None
-    plugin_id = dict(snapshot.selected).get(capability)
+    # ``selected`` is partial by contract: the two shipped constructors emit
+    # every PluginCapability, but ``PluginAvailabilitySnapshot.create`` admits
+    # any subset (default ``()``) and restricted policy views build such
+    # snapshots. Absence is therefore the first-class "no selection" state,
+    # synthesized explicitly after membership — never via a defaulted lookup.
+    selected_by_capability = dict(snapshot.selected)
+    plugin_id = selected_by_capability[capability] if capability in selected_by_capability else None
     if plugin_id is None:
         return None
-    alias = dict(snapshot.selected_profile_aliases).get(plugin_id)
+    # selected_profile_aliases is genuinely partial (empty for the trained-
+    # operator snapshot; populated only for alias-carrying plugins), so
+    # absence is the first-class "no alias" state, synthesized explicitly.
+    alias_by_plugin = dict(snapshot.selected_profile_aliases)
+    alias = alias_by_plugin[plugin_id] if plugin_id in alias_by_plugin else None
     if alias is None:
         usable_by_plugin = dict(snapshot.usable_profile_aliases)
         aliases = usable_by_plugin[plugin_id] if plugin_id in usable_by_plugin else ()
@@ -1762,7 +1779,12 @@ def discovery_digest(
         if not aliases:
             continue
         public_schema = catalog.get_schema(plugin_id.kind, plugin_id.name)
-        public_required = [field["name"] for field in public_schema.knob_schema.get("fields", ()) if field.get("required")]
+        # knob_schema is Tier-1 catalog output: every cached schema passed
+        # validate_knob_schema at catalog load, "fields" is a required
+        # KnobSchema key and "required" a required KnobField key, so direct
+        # access is the honest read — a malformed schema crashes rather than
+        # publishing an incomplete required_options set.
+        public_required = [field["name"] for field in public_schema.knob_schema["fields"] if field["required"]]
         for entry in digest_by_kind[plugin_id.kind]:
             if entry["name"] == plugin_id.name:
                 entry["profile_aliases"] = sorted(aliases)
@@ -2693,16 +2715,23 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
     visible_raw_html_producers = tuple(sorted(_RAW_HTML_CLEANUP_PRODUCER_PLUGINS & visible["transform"]))
     control_modes = dict(catalog.snapshot.control_modes)
     if visible_untrusted_producers and "llm" in visible["transform"]:
+        # Both ``selected`` and ``control_modes`` are partial mappings by
+        # contract (PluginAvailabilitySnapshot.create admits any subset), so
+        # absence is first-class — "no shield selected" / "not configured" —
+        # and each default is synthesized explicitly after membership.
+        selected_by_capability = dict(catalog.snapshot.selected)
+        selected_shield = (
+            selected_by_capability[PluginCapability.PROMPT_SHIELD] if PluginCapability.PROMPT_SHIELD in selected_by_capability else None
+        )
+        shield_mode = (
+            control_modes[PluginCapability.PROMPT_SHIELD] if PluginCapability.PROMPT_SHIELD in control_modes else ControlMode.RECOMMEND
+        )
         aids["prompt_shield"] = {
             "rules": _prompt_shield_rules(
                 # Whichever shield THIS deployment selected (aws_bedrock_prompt_shield,
                 # azure_prompt_shield, …) — never a hardcoded vendor.
-                shield_plugin=(
-                    selected_shield.name
-                    if (selected_shield := dict(catalog.snapshot.selected).get(PluginCapability.PROMPT_SHIELD))
-                    else None
-                ),
-                shield_required=control_modes.get(PluginCapability.PROMPT_SHIELD, ControlMode.RECOMMEND) is ControlMode.REQUIRED,
+                shield_plugin=selected_shield.name if selected_shield else None,
+                shield_required=shield_mode is ControlMode.REQUIRED,
                 shield_auto_wired=shield_auto_wired,
                 untrusted_producers=visible_untrusted_producers,
             ),
