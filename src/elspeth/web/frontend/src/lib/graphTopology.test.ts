@@ -195,7 +195,7 @@ describe("buildConnectionProducers agrees with GraphView's producer registry", (
 describe("shared member sets and sentinels", () => {
   it("pins the frontend's single copy of the coalesce members", () => {
     // Backend authority: CoalesceSettings.policy / .merge in core/config.py.
-    // These were declared privately a SECOND time in api/guidedDecoder.ts:75-76;
+    // These were declared privately a SECOND time in api/guidedDecoder.ts;
     // this module is now the one place the frontend states them.
     //
     // Be honest about what this assertion is: it compares a TypeScript literal
@@ -210,8 +210,9 @@ describe("shared member sets and sentinels", () => {
 
   it("names the discard sentinel so PipelineSpecView and SchemaFormTurn stop spelling it", () => {
     // _producer_resolver.py:208 — discard is not a connection. The two
-    // production sites this replaces are PipelineSpecView.tsx:52 and
-    // SchemaFormTurn.tsx:74. This assertion alone is a tautology; what makes
+    // production sites this replaces are PipelineSpecView.tsx's routing
+    // humaniser and SchemaFormTurn's blob-prefill default. This assertion
+    // alone is a tautology; what makes
     // the constant load-bearing is that both callers import it, which the
     // Task 4 tests and the SchemaFormTurn suite exercise.
     expect(DISCARD_CONNECTION).toBe("discard");

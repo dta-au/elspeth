@@ -52,10 +52,12 @@ import type { CompositionState } from "@/types/index";
  * producer for it). Named here because two frontend sites spelled it as a
  * bare literal and nothing tied them to that rule:
  * components/workspace/PipelineSpecView.tsx:52 and
- * components/chat/guided/SchemaFormTurn.tsx:74.
+ * components/chat/guided/SchemaFormTurn.tsx, in the blob-prefill effect's
+ * `on_validation_failure` default.
  *
  * NOT the same word as `ProposalEndpointKind`'s "discard"
- * (api/guidedDecoder.ts:250, types/guided.ts:600). That is a guided-proposal
+ * (`ProposalEndpointKind` in api/guidedDecoder.ts, `ProposalTargetEndpoint`
+ * in types/guided.ts). That is a guided-proposal
  * ENDPOINT KIND — a discriminated-union literal whose narrowing REQUIRES the
  * literal in the type position, so this constant cannot and must not replace
  * it. Two vocabularies, one word. Do not merge them.
@@ -64,8 +66,9 @@ export const DISCARD_CONNECTION = "discard";
 
 /**
  * The coalesce member sets, mirrored from `CoalesceSettings.policy` and
- * `.merge` in core/config.py and lifted out of api/guidedDecoder.ts:75-76,
- * which held the frontend's only copy privately.
+ * `.merge` in core/config.py and lifted out of api/guidedDecoder.ts, which
+ * held the frontend's only copy privately (it now builds its validation Sets
+ * from these tuples).
  *
  * `as const` so consumers get a union type. Be precise about what that buys:
  * a display map keyed `Record<CoalescePolicy, string>` fails the BUILD when
@@ -184,9 +187,10 @@ export function branchEntries(
 /**
  * Connection name -> ids of the components that PUBLISH it.
  *
- * Lifted from GraphView.tsx:1245-1260 (ProducerInfo, the map, registerProducer)
- * and :1298-1351 (the five registration blocks), which together held the only
- * statement of the rule "which fields publish a connection". A MULTIMAP, not one producer per
+ * Lifted from GraphView.tsx's `buildProducerRegistry` — the `ProducerInfo`
+ * type, the map, `registerProducer`, and the source and node registration
+ * loops it feeds — which together held the only statement of the rule
+ * "which fields publish a connection". A MULTIMAP, not one producer per
  * connection: ELSPETH allows many producers on one connection name under a
  * declared queue (structural fan-in, ADR-028), and overwriting would silently
  * drop every producer but the last and misrender the intentional fan-in.
@@ -194,14 +198,15 @@ export function branchEntries(
  * This is the registration rule ONLY. GraphView decorates each entry with its
  * own `edgeType`/`label` for ReactFlow, and applies three further DRAWING
  * rules on top that are NOT topology and deliberately stay there:
- * queue-as-sole-canonical-producer (GraphView.tsx:1262-1269), the row_union
- * authoritative-outbound semantics (:1270-1296), and the phase-1 alias dedup
- * (:1353-1417).
+ * queue-as-sole-canonical-producer (GraphView.tsx's `queueIds` set), the
+ * row_union authoritative-outbound semantics
+ * (`authoritativeRowUnionOutboundSemantics`), and the phase-1 alias dedup
+ * (`inferredBranchAliases`).
  *
  * The ids are COMPONENT ids, the one namespace sources and nodes share:
  * a source publishes under `sourceComponentId(name)` ("source" for the default
  * source, `source:<name>` otherwise), a node under its own id. That is the
- * vocabulary GraphView registers (:1302), the vocabulary
+ * vocabulary `buildProducerRegistry`'s source loop registers, the vocabulary
  * `buildProducerRegistry` is cross-checked against in graphTopology.test.ts,
  * and the vocabulary lib/validationHumaniser.ts and chat/guided/pipelineGloss.ts
  * key their phrase maps on. A bare source NAME would collide with a node whose
@@ -217,8 +222,8 @@ export function buildConnectionProducers(
     if (existing === undefined) producers.set(connection, [producerId]);
     else if (!existing.includes(producerId)) existing.push(producerId);
   };
-  // sortedSourceEntries, not Object.entries: this is what GraphView.tsx:1299
-  // uses, and a faithful lift keeps the deterministic ordering. Importing it
+  // sortedSourceEntries, not Object.entries: this is what
+  // GraphView.tsx's `buildProducerRegistry` source loop uses, and a faithful lift keeps the deterministic ordering. Importing it
   // — and sourceComponentId, the other half of that source registration —
   // does not break the leaf contract: utils/compositionState.ts imports only
   // types (`import type { CompositionState, SourceSpec } from "@/types/index"`
