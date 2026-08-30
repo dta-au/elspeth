@@ -167,8 +167,20 @@ before touching the configured active allowlist.
 ```
 elspeth-lints sign-bundle <bundle.json> --owner <operator-id> \
   --judge-transport codex-cli --judge-tools readonly --dry-run \
-  [--lanes resign|new_judgment[,...]] [--continue-on-block]
+  [--lanes resign|new_judgment[,...]] [--continue-on-block] [--judge-concurrency N]
 ```
+
+`--judge-concurrency N` (1–8, default 1) runs up to N judge calls at once for
+`justify` actions. Only the judge subprocess overlaps: each action's reads and
+judge call run in a worker that then parks at a *write gate*, and the
+transaction's single writer still visits actions in bundle order, opening one
+gate at a time — so every decision event, candidate write, and journal entry
+happens exactly as it does sequentially, and crash/resume semantics are
+unchanged. A verdict fetched for an action the loop never reaches (a BLOCK
+without `--continue-on-block` stopped it, or ^C) is discarded, never written,
+and re-judged on resume, like any in-flight verdict. `drift_repair` pops its
+stale entry before judging and therefore always runs one at a time, as do
+`rotation` and `stale_delete`. A `resign`-only fire gains nothing from the flag.
 
 `--lanes` scopes the transaction to a subset of the bundle's lanes: `resign`
 (`drift_repair` + `rotation` + `stale_delete`, needing no new rationale) and/or

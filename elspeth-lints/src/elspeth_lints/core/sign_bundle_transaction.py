@@ -21,11 +21,16 @@ import re
 import shutil
 import stat
 import tempfile
+import threading
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from concurrent.futures import Future
 
 from elspeth_lints.core.atomic_io import allowlist_mutation_lock, atomic_update_text
 from elspeth_lints.core.strict_json import StrictJSONError, strict_json_loads
@@ -657,10 +662,110 @@ _ACTION_PRIORITY = {
     "justify": 3,
 }
 
+# The kinds whose judge call may run AHEAD of the serial write loop (see
+# ``_JudgePrefetcher``). ``drift_repair`` is excluded on purpose: its executor
+# pops the stale entry from the candidate BEFORE judging, so it has a write
+# before its judge call and must stay strictly in-order.
+_PREFETCHABLE_KINDS = frozenset({"justify"})
+
 # The kinds that call the real judge. Only these can produce a judged BLOCK
 # (exit 1) and a ``blocked_without_override`` decision event; the deterministic
 # kinds report success or an infrastructure failure (exit 2) and nothing else.
 _JUDGE_GATED_KINDS = frozenset({"justify", "drift_repair"})
+
+
+class _PrefetchAborted(Exception):
+    """Raised inside a prefetch worker whose verdict the transaction will not use.
+
+    The worker is parked at its write gate; the loop has stopped (BLOCK without
+    ``--continue-on-block``, an exit-2 failure, an interrupt) and releases every
+    gate with the abort flag set so the worker unwinds WITHOUT writing.
+    """
+
+
+class _JudgePrefetcher:
+    """Run judge calls ahead of the serial write loop; never write ahead of it.
+
+    ``sign-bundle`` spends almost all of its wall time inside one judge
+    subprocess per action, while every write it performs is milliseconds.
+    Up to ``concurrency`` prefetchable actions therefore run their executor in
+    a worker thread. The executor does its reads and its judge call, then
+    calls ``before_write()`` — the write gate — and parks there. The main loop
+    still visits actions in bundle order and, for each prefetched one, performs
+    the same checkpoint → ``running_action`` → journal sequence it always did;
+    it releases that one gate, waits for the worker's exit code, and verifies
+    the scoped candidate change before moving on. So at any instant at most
+    ONE action is writing to the candidate, and it is the journalled
+    ``running_action`` — the crash/resume contract is unchanged.
+
+    A verdict obtained by a worker that is never released (the loop stopped
+    first) is discarded exactly as an in-flight verdict is lost by a kill: it
+    never became a durable decision event, so a resume re-judges it. A worker
+    is never released after the loop has stopped (``close`` sets the abort flag
+    before opening the gates), so no discarded verdict can reach the candidate.
+    """
+
+    def __init__(
+        self,
+        *,
+        ordered_pending: list[tuple[int, Any]],
+        concurrency: int,
+        execute: Callable[[Any, argparse.Namespace, Callable[[], None]], int],
+        args: argparse.Namespace,
+    ) -> None:
+        self._queue = [(index, action) for index, action in ordered_pending if action.kind in _PREFETCHABLE_KINDS]
+        self._next = 0
+        self._concurrency = concurrency
+        self._execute = execute
+        self._args = args
+        self._futures: dict[int, Future[int]] = {}
+        self._gates: dict[int, threading.Event] = {}
+        self._abort = threading.Event()
+        self._pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="sign-bundle-judge")
+
+    def handles(self, action: Any) -> bool:
+        return action.kind in _PREFETCHABLE_KINDS
+
+    def _submit_next(self) -> None:
+        index, action = self._queue[self._next]
+        self._next += 1
+        gate = threading.Event()
+        self._gates[index] = gate
+
+        def before_write() -> None:
+            gate.wait()
+            if self._abort.is_set():
+                raise _PrefetchAborted(index)
+
+        self._futures[index] = self._pool.submit(self._execute, action, self._args, before_write)
+
+    def _fill(self) -> None:
+        """Keep ``concurrency`` judge calls in flight: submitted but not yet consumed."""
+        while self._next < len(self._queue) and len(self._futures) < self._concurrency:
+            self._submit_next()
+
+    def release_and_wait(self, index: int) -> int:
+        """Open ``index``'s write gate and return its executor exit code."""
+        self._fill()
+        if index not in self._futures:  # pragma: no cover - loop order and queue order agree by construction
+            raise SignBundleTransactionError(f"prefetch queue out of order at action index {index}")
+        self._gates[index].set()
+        try:
+            code = self._futures[index].result()
+        finally:
+            del self._futures[index]
+            del self._gates[index]
+        # Top up immediately so the next judge call overlaps this action's
+        # verification and journal writes.
+        self._fill()
+        return code
+
+    def close(self, *, wait: bool) -> None:
+        """Discard every unconsumed verdict; workers unwind without writing."""
+        self._abort.set()
+        for gate in self._gates.values():
+            gate.set()
+        self._pool.shutdown(wait=wait, cancel_futures=True)
 
 
 def run_sign_bundle_transaction(
@@ -674,8 +779,16 @@ def run_sign_bundle_transaction(
     specs_by_stale_key: dict[str, Any],
     execute_action: Callable[[Any, argparse.Namespace], int],
     continue_on_block: bool = False,
+    judge_concurrency: int = 1,
+    prefetch_execute_action: Callable[[Any, argparse.Namespace, Callable[[], None]], int] | None = None,
 ) -> SignBundleRunResult:
     """Reconcile/fire journaled actions and publish one verified candidate.
+
+    ``judge_concurrency`` > 1 (with ``prefetch_execute_action``) runs the judge
+    calls of upcoming ``justify`` actions in worker threads while the loop
+    below stays the single writer; see ``_JudgePrefetcher``. It is not part of
+    the signing policy: it changes when a judge is asked, never what a minted
+    signature attests.
 
     A judged BLOCK — exit 1 from a judge-gated action, whose executor has
     already restored the candidate to its pre-action bytes (asserted by the
@@ -878,85 +991,47 @@ def run_sign_bundle_transaction(
         enumerate(bundle.actions),
         key=lambda indexed: (_ACTION_PRIORITY[indexed[1].kind], indexed[0]),
     )
-    for index, action in ordered_actions:
-        if index not in selected or index in completed or index in blocked:
-            continue
-        source_file = _action_source_file(
-            action,
-            verification=verification,
-            specs_by_stale_key=specs_by_stale_key,
-        )
-        checkpoint_action_file(
-            tx_path,
-            manifest,
-            source_file,
-        )
-        manifest["running_action"] = index
-        save_manifest(tx_path, manifest)
-        try:
-            code = execute_action(action, candidate_args)
-        except BaseException:
-            raise
-        expected_key = _expected_action_key(
-            action,
-            verification=verification,
-            repair_keys_by_stale_key=repair_keys_by_stale_key,
-        )
-        if code == 0:
-            _prepare_completed_judge_evidence(
-                action,
-                tx_path=tx_path,
-                candidate_dir=Path(manifest["candidate_dir"]),
-                source_file=source_file,
-                expected_key=expected_key,
-            )
-        _assert_action_scoped_candidate_changes(
-            action,
-            tx_path=tx_path,
-            manifest=manifest,
-            source_file=source_file,
-            expected_key=expected_key,
-            verify_semantics=code == 0,
-        )
-        if code != 0:
-            # Judged BLOCK: the executor restored the candidate (asserted above
-            # with verify_semantics=False). Journal the verdict the moment it is
-            # authoritative — BEFORE deciding whether to keep firing — so that a
-            # stop or a kill can never leave it as un-attempted work a resume
-            # would re-judge. The entry stays fail-closed and is reported for
-            # remediation either way.
-            judged_block = code == 1 and action.kind in _JUDGE_GATED_KINDS
-            if judged_block:
-                blocked.add(index)
-                manifest["blocked_actions"] = sorted(blocked)
-            manifest["running_action"] = None
-            commit_action_state(tx_path, manifest)
-            if judged_block and continue_on_block:
-                continue
-            return SignBundleRunResult(
-                code,
-                len(completed),
-                failed_index=index,
-                failed_kind=action.kind,
-                failed_key=action.key,
-                blocked_count=len(blocked),
-                blocked_keys=tuple(bundle.actions[i].key for i in sorted(blocked)),
-            )
-        if not _action_is_complete(
-            action,
-            verification=verification,
-            repair_keys_by_stale_key=repair_keys_by_stale_key,
+    pending_actions = [
+        (index, action) for index, action in ordered_actions if index in selected and index not in completed and index not in blocked
+    ]
+    prefetch: _JudgePrefetcher | None = None
+    if judge_concurrency > 1 and prefetch_execute_action is not None:
+        prefetch = _JudgePrefetcher(
+            ordered_pending=pending_actions,
+            concurrency=judge_concurrency,
+            execute=prefetch_execute_action,
             args=candidate_args,
-            tx_path=tx_path,
-            authoritative=False,
-        ):
-            raise SignBundleTransactionError(
-                f"action reported success but its transaction result did not re-verify: {action.kind} {action.key}"
+        )
+    try:
+        for index, action in pending_actions:
+            outcome = _fire_one_action(
+                index,
+                action,
+                bundle=bundle,
+                verification=verification,
+                specs_by_stale_key=specs_by_stale_key,
+                repair_keys_by_stale_key=repair_keys_by_stale_key,
+                candidate_args=candidate_args,
+                tx_path=tx_path,
+                manifest=manifest,
+                completed=completed,
+                blocked=blocked,
+                continue_on_block=continue_on_block,
+                execute_action=execute_action,
+                prefetch=prefetch,
             )
-        completed.add(index)
-        manifest["completed_actions"] = sorted(completed)
-        manifest["running_action"] = None
-        commit_action_state(tx_path, manifest)
+            if outcome is not None:
+                return outcome
+    except KeyboardInterrupt:
+        # The interrupt also reached every judge subprocess (same process
+        # group); do not block the operator's ^C on their exit.
+        if prefetch is not None:
+            prefetch.close(wait=False)
+            prefetch = None
+        raise
+    finally:
+        if prefetch is not None:
+            prefetch.close(wait=True)
 
     _verify_completed_actions(
         bundle,
@@ -972,6 +1047,123 @@ def run_sign_bundle_transaction(
         verification=verification,
         tx_path=tx_path,
     )
+    return _publish_transaction(
+        bundle=bundle,
+        args=args,
+        tx_path=tx_path,
+        manifest=manifest,
+        completed=completed,
+        blocked=blocked,
+    )
+
+
+def _fire_one_action(
+    index: int,
+    action: Any,
+    *,
+    bundle: Any,
+    verification: Any,
+    specs_by_stale_key: dict[str, Any],
+    repair_keys_by_stale_key: dict[str, str],
+    candidate_args: argparse.Namespace,
+    tx_path: Path,
+    manifest: dict[str, Any],
+    completed: set[int],
+    blocked: set[int],
+    continue_on_block: bool,
+    execute_action: Callable[[Any, argparse.Namespace], int],
+    prefetch: _JudgePrefetcher | None,
+) -> SignBundleRunResult | None:
+    """Checkpoint, fire, verify and journal ONE action; a result means stop."""
+    source_file = _action_source_file(
+        action,
+        verification=verification,
+        specs_by_stale_key=specs_by_stale_key,
+    )
+    checkpoint_action_file(
+        tx_path,
+        manifest,
+        source_file,
+    )
+    manifest["running_action"] = index
+    save_manifest(tx_path, manifest)
+    if prefetch is not None and prefetch.handles(action):
+        code = prefetch.release_and_wait(index)
+    else:
+        code = execute_action(action, candidate_args)
+    expected_key = _expected_action_key(
+        action,
+        verification=verification,
+        repair_keys_by_stale_key=repair_keys_by_stale_key,
+    )
+    if code == 0:
+        _prepare_completed_judge_evidence(
+            action,
+            tx_path=tx_path,
+            candidate_dir=Path(manifest["candidate_dir"]),
+            source_file=source_file,
+            expected_key=expected_key,
+        )
+    _assert_action_scoped_candidate_changes(
+        action,
+        tx_path=tx_path,
+        manifest=manifest,
+        source_file=source_file,
+        expected_key=expected_key,
+        verify_semantics=code == 0,
+    )
+    if code != 0:
+        # Judged BLOCK: the executor restored the candidate (asserted above
+        # with verify_semantics=False). Journal the verdict the moment it is
+        # authoritative — BEFORE deciding whether to keep firing — so that a
+        # stop or a kill can never leave it as un-attempted work a resume
+        # would re-judge. The entry stays fail-closed and is reported for
+        # remediation either way.
+        judged_block = code == 1 and action.kind in _JUDGE_GATED_KINDS
+        if judged_block:
+            blocked.add(index)
+            manifest["blocked_actions"] = sorted(blocked)
+        manifest["running_action"] = None
+        commit_action_state(tx_path, manifest)
+        if judged_block and continue_on_block:
+            return None
+        return SignBundleRunResult(
+            code,
+            len(completed),
+            failed_index=index,
+            failed_kind=action.kind,
+            failed_key=action.key,
+            blocked_count=len(blocked),
+            blocked_keys=tuple(bundle.actions[i].key for i in sorted(blocked)),
+        )
+    if not _action_is_complete(
+        action,
+        verification=verification,
+        repair_keys_by_stale_key=repair_keys_by_stale_key,
+        args=candidate_args,
+        tx_path=tx_path,
+        authoritative=False,
+    ):
+        raise SignBundleTransactionError(
+            f"action reported success but its transaction result did not re-verify: {action.kind} {action.key}"
+        )
+    completed.add(index)
+    manifest["completed_actions"] = sorted(completed)
+    manifest["running_action"] = None
+    commit_action_state(tx_path, manifest)
+    return None
+
+
+def _publish_transaction(
+    *,
+    bundle: Any,
+    args: argparse.Namespace,
+    tx_path: Path,
+    manifest: dict[str, Any],
+    completed: set[int],
+    blocked: set[int],
+) -> SignBundleRunResult:
+    """Re-verify the bindings, then exchange the candidate into the active directory."""
     from elspeth_lints.core.bundle_verify import verify_bundle_against_tree
 
     final_verification = verify_bundle_against_tree(

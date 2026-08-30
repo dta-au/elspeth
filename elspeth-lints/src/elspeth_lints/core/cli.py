@@ -951,6 +951,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_judge_transport_arg(sign_bundle)
     _add_judge_tools_arg(sign_bundle)
+    sign_bundle.add_argument(
+        "--judge-concurrency",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Run up to N judge calls at once for new_judgment (justify) actions. Only the judge "
+            "subprocess overlaps: every candidate write, decision event, and journal entry is "
+            "still performed by one writer in bundle order, so crash/resume semantics are "
+            "unchanged. drift_repair, rotation, and stale_delete always run one at a time. "
+            f"1..{_SIGN_BUNDLE_MAX_JUDGE_CONCURRENCY}; default 1."
+        ),
+    )
 
     rekey = subparsers.add_parser(
         "rekey",
@@ -1838,6 +1851,7 @@ def _run_justify(
     *,
     allow_hits_entry_index: int | None = None,
     defer_override_rate_counter_snapshot: bool = False,
+    before_write: Callable[[], None] | None = None,
 ) -> int:
     """Drive the cicd-judge gate for one proposed allowlist entry.
 
@@ -2076,12 +2090,17 @@ def _run_justify(
         )
         return 2
     try:
-        rationale_duplicate_count, similar_entries = _find_similar_allowlist_entries(
-            allowlist_dir=allowlist_dir,
-            rationale=args.rationale,
-            valid_rule_ids=valid_rule_ids,
-            exclude_key=finding_key,
-        )
+        # Under sign-bundle --judge-concurrency this runs in a worker thread
+        # while the main thread may be appending the previous action's entry;
+        # the (re-entrant, thread-aware) mutation lock makes the read see a
+        # whole directory, never a half-written file.
+        with allowlist_mutation_lock(allowlist_dir):
+            rationale_duplicate_count, similar_entries = _find_similar_allowlist_entries(
+                allowlist_dir=allowlist_dir,
+                rationale=args.rationale,
+                valid_rule_ids=valid_rule_ids,
+                exclude_key=finding_key,
+            )
     except (OSError, ValueError) as exc:
         sys.stderr.write(f"allowlist similarity scan failed: {exc}\n")
         return 2
@@ -2129,6 +2148,13 @@ def _run_justify(
         scrubbed_rationale = scrub_secrets(response.judge_rationale)
         if scrubbed_rationale.redactions:
             response = dataclass_replace(response, judge_rationale=scrubbed_rationale.text)
+
+    if before_write is not None:
+        # The write gate (sign-bundle --judge-concurrency): everything above is
+        # reads plus the judge call and may have run ahead of the transaction's
+        # serial write loop; nothing below — decision event, YAML append,
+        # verdict output — happens until the loop says this action is current.
+        before_write()
 
     # Resolve the verdict the entry will carry. If the operator
     # supplied --operator-override, the entry records
@@ -4097,6 +4123,9 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
     if args.judge_tools == "readonly" and _CLI_TRANSPORT_CHOICES[args.judge_transport] not in _READONLY_TOOL_TRANSPORTS:
         sys.stderr.write(_READONLY_TOOLS_TRANSPORT_ERROR)
         return 2
+    if not 1 <= args.judge_concurrency <= _SIGN_BUNDLE_MAX_JUDGE_CONCURRENCY:
+        sys.stderr.write(f"sign-bundle: --judge-concurrency must be between 1 and {_SIGN_BUNDLE_MAX_JUDGE_CONCURRENCY}.\n")
+        return 2
 
     from elspeth_lints.core.allowlist import _judge_metadata_hmac_key
     from elspeth_lints.core.bundle_verify import verify_bundle_against_tree
@@ -4295,6 +4324,11 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
 
 _SIGN_BUNDLE_LANES = ("new_judgment", "resign")
 
+# Ceiling for ``--judge-concurrency``: each in-flight judge is one ``codex
+# exec`` subprocess plus its own read-only MCP server, and the provider's
+# rate limit — not the CPU — is the real bound. Kept small on purpose.
+_SIGN_BUNDLE_MAX_JUDGE_CONCURRENCY = 8
+
 # Published, but some judged BLOCKs were skipped under --continue-on-block: the
 # signed subset is live and the blocked entries stay fail-closed. Distinct from
 # 0 so a partial run never reads as clean, and from 1/2 so it is not mistaken
@@ -4464,6 +4498,15 @@ def _execute_sign_bundle(
             args=action_args,
         ),
         continue_on_block=args.continue_on_block,
+        judge_concurrency=args.judge_concurrency,
+        prefetch_execute_action=lambda action, action_args, before_write: _execute_one_sign_bundle_action(
+            action,
+            verification=verification,
+            specs_by_stale_key=specs_by_stale_key,
+            stale_delete_sources=stale_delete_sources,
+            args=action_args,
+            before_write=before_write,
+        ),
     )
     if result.exit_code != 0:
         if result.failed_key is None and result.blocked_count:
@@ -4528,8 +4571,17 @@ def _execute_one_sign_bundle_action(
     specs_by_stale_key: dict[str, Any],
     stale_delete_sources: dict[str, str],
     args: argparse.Namespace,
+    before_write: Callable[[], None] | None = None,
 ) -> int:
-    """Execute one already-verified bundle action against the private copy."""
+    """Execute one already-verified bundle action against the private copy.
+
+    ``before_write`` is the transaction's write gate for a prefetched action
+    (see ``sign_bundle_transaction._JudgePrefetcher``). Only ``justify`` defers
+    its writes behind it; any other kind handed a gate takes it up front so the
+    contract "no candidate write before the gate opens" holds regardless.
+    """
+    if before_write is not None and action.kind != "justify":
+        before_write()
     if action.kind == "drift_repair":
         return _execute_drift_repair_action(
             action,
@@ -4538,7 +4590,14 @@ def _execute_one_sign_bundle_action(
             defer_override_rate_counter_snapshot=True,
         )
     if action.kind == "justify":
-        return _execute_new_judgment_action(action, args=args, defer_override_rate_counter_snapshot=True)
+        if before_write is None:
+            return _execute_new_judgment_action(action, args=args, defer_override_rate_counter_snapshot=True)
+        return _execute_new_judgment_action(
+            action,
+            args=args,
+            defer_override_rate_counter_snapshot=True,
+            before_write=before_write,
+        )
     if action.kind == "rotation":
         return _execute_rotation_action(action, rotation_plan=verification.rotation_plan, args=args)
     if action.kind == "stale_delete":
@@ -4587,6 +4646,8 @@ def _emit_sign_bundle_recovery(args: argparse.Namespace, tx_path: Path, *, reaso
         command.append("--continue-on-block")
     if args.lanes is not None:
         command.extend(("--lanes", ",".join(args.lanes)))
+    if args.judge_concurrency != 1:
+        command.extend(("--judge-concurrency", str(args.judge_concurrency)))
     sys.stderr.write(
         f"sign-bundle: {reason}; private decisions preserved at {tx_path}.\n"
         f"sign-bundle: re-verify and resume with:\n  {shlex.join(command)}\n"
@@ -4649,6 +4710,7 @@ def _execute_new_judgment_action(
     *,
     args: argparse.Namespace,
     defer_override_rate_counter_snapshot: bool,
+    before_write: Callable[[], None] | None = None,
 ) -> int:
     """Run the real judge for a brand-new finding inside the keyed step.
 
@@ -4679,6 +4741,7 @@ def _execute_new_judgment_action(
     return _run_justify(
         namespace,
         defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+        before_write=before_write,
     )
 
 

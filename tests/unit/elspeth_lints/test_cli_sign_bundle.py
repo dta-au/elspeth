@@ -3782,3 +3782,141 @@ def test_reaudit_sidecar_writer_blocks_publish_and_is_not_stranded(
     assert "publish precondition failed" in str(publish_error[0])
     assert sidecar.is_file()
     assert not (candidate / ".reaudit-state").exists()
+
+
+# --- --judge-concurrency: judge ahead, write in order -------------------------
+
+
+def _transaction_manifest(allowlist_dir: Path) -> tuple[Path, dict[str, Any]]:
+    tx_root = allowlist_dir.parent / ".sign-bundle-transactions"
+    tx_dirs = [p for p in tx_root.iterdir() if p.is_dir()]
+    assert len(tx_dirs) == 1, tx_dirs
+    return tx_dirs[0], json.loads((tx_dirs[0] / "transaction.json").read_text(encoding="utf-8"))
+
+
+def test_sign_bundle_judge_concurrency_overlaps_judge_calls_and_writes_in_bundle_order(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Up to N judge calls run at once; every write still lands one at a time in bundle order.
+
+    The fake judge blocks each call until N-1 others are also in flight, so the
+    test proves the overlap rather than hoping for it; the verdict output on
+    stdout (written after the gate) must come out in bundle order.
+    """
+    import time
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    names = ("alpha", "beta", "gamma", "delta")
+    for name in names:
+        _write_source(root, f"{name}/mod.py", name)
+    findings = {name: _live_finding(root, f"{name}/mod.py") for name in names}
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, tuple(_new_judgment_action(findings[name], f"{name}/mod.py") for name in names)),
+    )
+
+    lock = threading.Lock()
+    in_flight = 0
+    peak = 0
+
+    def _verdict(_file_path: str) -> JudgeVerdict:
+        nonlocal in_flight, peak
+        with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        # Hold the call long enough for the other workers to arrive.
+        time.sleep(0.3)
+        with lock:
+            in_flight -= 1
+        return JudgeVerdict.ACCEPTED
+
+    with _patch_judge(_verdict) as calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--judge-concurrency", "3")))
+
+    assert rc == 0
+    assert sorted(calls) == sorted(f"{name}/mod.py" for name in names)
+    assert peak >= 2, f"judge calls never overlapped (peak in flight = {peak})"
+    assert peak <= 3
+    for name in names:
+        assert (allowlist_dir / f"{name}.yaml").is_file()
+    out = capsys.readouterr().out
+    positions = [out.index(_canonical_key(findings[name])) for name in names]
+    assert positions == sorted(positions), "verdict output (post-gate writes) left bundle order"
+
+
+def test_sign_bundle_judge_concurrency_stop_on_block_discards_prefetched_verdicts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A BLOCK without --continue-on-block stops the loop; a verdict already fetched for a later action is dropped.
+
+    gamma's judge call is forced to complete BEFORE beta's BLOCK returns, so the
+    transaction holds an ACCEPT for gamma in memory when it stops. That verdict
+    must never reach the candidate: only alpha is journalled complete, beta is
+    journalled blocked, and gamma is left un-attempted for a resume to re-judge.
+    """
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    for name in ("alpha", "beta", "gamma"):
+        _write_source(root, f"{name}/mod.py", name)
+    gamma = _live_finding(root, "gamma/mod.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+                _new_judgment_action(gamma, "gamma/mod.py"),
+            ),
+        ),
+    )
+    gamma_judged = threading.Event()
+
+    def _verdict(file_path: str) -> JudgeVerdict:
+        if file_path.startswith("gamma/"):
+            gamma_judged.set()
+            return JudgeVerdict.ACCEPTED
+        if file_path.startswith("beta/"):
+            assert gamma_judged.wait(timeout=30), "gamma was never prefetched"
+            return JudgeVerdict.BLOCKED
+        return JudgeVerdict.ACCEPTED
+
+    with _patch_judge(_verdict):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--judge-concurrency", "3")))
+
+    assert rc == 1
+    assert gamma_judged.is_set()
+    assert _tree_bytes(allowlist_dir) == before
+    _tx_path, manifest = _transaction_manifest(allowlist_dir)
+    assert manifest["completed_actions"] == [0]
+    assert manifest["blocked_actions"] == [1]
+    assert manifest["running_action"] is None
+    candidate = Path(manifest["candidate_dir"])
+    assert (candidate / "alpha.yaml").is_file()
+    assert not (candidate / "gamma.yaml").exists()
+    captured = capsys.readouterr()
+    assert _canonical_key(gamma) not in captured.out
+    assert _RECOVERY_GUIDANCE in captured.err
+    assert "--judge-concurrency 3" in captured.err
+
+
+@pytest.mark.parametrize("value", ["0", "9"])
+def test_sign_bundle_judge_concurrency_out_of_range_is_refused(tmp_path: Path, value: str) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),)),
+    )
+
+    with _patch_judge(_accept_all) as calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--judge-concurrency", value)))
+
+    assert rc == 2
+    assert calls == []
+    assert _tree_bytes(allowlist_dir) == before

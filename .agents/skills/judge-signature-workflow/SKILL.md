@@ -139,9 +139,16 @@ the tree and abort before the first write on any mismatch.
 ```
 elspeth-lints sign-bundle <bundle.json> --owner <operator-id> \
   --judge-transport codex-cli --judge-tools readonly --dry-run \
-  [--lanes resign|new_judgment[,...]] [--continue-on-block]
+  [--lanes resign|new_judgment[,...]] [--continue-on-block] [--judge-concurrency N]
 elspeth-lints rekey --in <bundle.json> --old-key-env <OLD_VAR> --new-key-env <NEW_VAR>
 ```
+
+- `--judge-concurrency N` (1–8) overlaps up to N judge subprocesses for
+  `justify` actions; writes stay single-threaded and in bundle order behind a
+  per-action write gate, so the transaction/resume contract is unchanged.
+  `drift_repair` (pops before judging), `rotation`, and `stale_delete` always
+  run one at a time. Suggest it for a large `new_judgment` lane; it is not part
+  of the signing policy.
 
 - `sign-bundle` is the **only** place a bundle's signature is minted. `drift_repair`
   + `new_judgment` re-judge (a contradicting BLOCK is surfaced and *not* signed;
