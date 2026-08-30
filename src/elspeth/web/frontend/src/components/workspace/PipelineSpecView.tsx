@@ -1,11 +1,26 @@
-import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
+import {
+  pluginDisplayName,
+  titleCaseLabel,
+} from "@/components/catalog/pluginDisplayName";
 import { PipelineGloss } from "@/components/chat/guided/PipelineGloss";
 import { OptionRows } from "@/components/inspector/OptionRows";
+import { DISCARD_CONNECTION } from "@/lib/graphTopology";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { CompositionState } from "@/types/index";
+import {
+  buildConnectionIndex,
+  componentPhrase,
+  routingPhrase,
+  type ConnectionIndex,
+} from "./specRouting";
 
 interface SpecRow {
   id: string;
+  /** The component's reader-register name. For the routing <dd>s and any
+   *  future prose slot — NOT the <h4>, which title-cases the id: the
+   *  description already has its own <p> directly beneath the heading, so a
+   *  described structural node would print the same sentence twice. */
+  label: string;
   kind: string;
   plugin: string | null;
   pluginKind: "source" | "transform" | "sink";
@@ -17,6 +32,8 @@ interface SpecRow {
 interface SpecSectionProps {
   name: "Sources" | "Nodes" | "Outputs";
   rows: SpecRow[];
+  state: CompositionState;
+  index: ConnectionIndex;
 }
 
 function displayValue(value: unknown): string {
@@ -45,30 +62,48 @@ const ROUTING_LABELS: Record<string, string> = {
 };
 
 function routingLabel(field: string): string {
-  return ROUTING_LABELS[field] ?? field;
+  // A field absent from the map is still an author-visible <dt>; title-case
+  // it rather than printing bare snake_case. ROUTING_LABELS is believed
+  // exhaustive over the fields *Rows() projects today, so this is a guard
+  // against a future field being added to a builder and not to the map —
+  // exactly the drift the Wave 1 live check found on the <dd> side.
+  return ROUTING_LABELS[field] ?? titleCaseLabel(field);
 }
 
-function routingValue(field: string, value: unknown): string {
-  if (value === "discard") return "dropped (recorded in the audit trail)";
-  if (Array.isArray(value)) return value.map(String).join(", ");
-  // A coalesce/row_union's `branches` map and a gate's `routes` map are both
-  // alias→target objects; render both as prose, never as a JSON string
-  // outside <code>/<details> (elspeth-b9ebdf9011 live-check fix: `branches`
-  // was missing here, so a coalesce's fan-in map rendered as a raw
-  // `{"branch_a":"target_a",...}` string in a plain <dd>). `branches` can
-  // also arrive as a bare string[] (fan-in with no aliasing) — that shape is
-  // already handled by the Array.isArray branch above.
-  if ((field === "routes" || field === "branches") && typeof value === "object" && value !== null) {
-    const entries = Object.entries(value as Record<string, unknown>);
-    if (field === "routes" && entries.every(([, target]) => target === "fork")) {
-      return "every row continues to all branches";
-    }
-    return entries.map(([when, target]) => `${when} → ${String(target)}`).join("; ");
+/** Fields whose value is an author-chosen NAME (not a connection, not an
+ *  enum): rendered title-cased with the raw in `title`, same rule as ids. */
+const AUTHOR_NAME_FIELDS: ReadonlySet<string> = new Set(["scope_name"]);
+
+/**
+ * One routing <dd>. The reader-register phrase comes from specRouting, which
+ * resolves a connection name to the component on the other end (and carries
+ * the elspeth-b9ebdf9011 branches-as-prose fix: a `branches`/`routes` map
+ * renders as prose, never as a raw JSON string in a plain <dd>). A null
+ * phrase means the value is not a connection or an enum, and the rules below
+ * apply.
+ */
+function RoutingDd({
+  state,
+  index,
+  field,
+  value,
+}: {
+  state: CompositionState;
+  index: ConnectionIndex;
+  field: string;
+  value: unknown;
+}): JSX.Element {
+  if (value === DISCARD_CONNECTION) return <dd>dropped (recorded in the audit trail)</dd>;
+  const phrase = routingPhrase(state, index, field, value);
+  if (phrase !== null) return <dd title={phrase.raw}>{phrase.text}</dd>;
+  if (AUTHOR_NAME_FIELDS.has(field) && typeof value === "string") {
+    return <dd title={value}>{titleCaseLabel(value)}</dd>;
   }
-  return displayValue(value);
+  if (Array.isArray(value)) return <dd>{value.map(String).join(", ")}</dd>;
+  return <dd>{displayValue(value)}</dd>;
 }
 
-function SpecSection({ name, rows }: SpecSectionProps): JSX.Element {
+function SpecSection({ name, rows, state, index }: SpecSectionProps): JSX.Element {
   const singular = name.slice(0, -1);
   const headingId = `pipeline-spec-${name.toLowerCase()}-heading`;
   return (
@@ -92,7 +127,7 @@ function SpecSection({ name, rows }: SpecSectionProps): JSX.Element {
                 className="pipeline-spec-card"
                 aria-label={`${singular} ${row.id}`}
               >
-                <h4>{row.id}</h4>
+                <h4 title={row.id}>{titleCaseLabel(row.id)}</h4>
                 {row.description !== null && row.description.trim() !== "" && (
                   <p className="pipeline-spec-step-description">
                     {row.description}
@@ -101,7 +136,7 @@ function SpecSection({ name, rows }: SpecSectionProps): JSX.Element {
                 <dl>
                   <div>
                     <dt>Kind</dt>
-                    <dd>{row.kind}</dd>
+                    <dd title={row.kind}>{titleCaseLabel(row.kind)}</dd>
                   </div>
                   {row.plugin !== null && (
                     <div>
@@ -115,7 +150,7 @@ function SpecSection({ name, rows }: SpecSectionProps): JSX.Element {
                   {routingEntries.map(([field, value]) => (
                     <div key={field}>
                       <dt>{routingLabel(field)}</dt>
-                      <dd>{routingValue(field, value)}</dd>
+                      <RoutingDd state={state} index={index} field={field} value={value} />
                     </div>
                   ))}
                 </dl>
@@ -138,6 +173,7 @@ function sourceRows(state: CompositionState): SpecRow[] {
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([id, source]) => ({
       id,
+      label: componentPhrase(state, id),
       kind: "source",
       plugin: source.plugin,
       pluginKind: "source",
@@ -153,6 +189,7 @@ function sourceRows(state: CompositionState): SpecRow[] {
 function nodeRows(state: CompositionState): SpecRow[] {
   return state.nodes.map((node) => ({
     id: node.id,
+    label: componentPhrase(state, node.id),
     kind: node.node_type,
     plugin: node.plugin,
     pluginKind: "transform",
@@ -208,6 +245,7 @@ function nodeRows(state: CompositionState): SpecRow[] {
 function outputRows(state: CompositionState): SpecRow[] {
   return state.outputs.map((output) => ({
     id: output.name,
+    label: componentPhrase(state, output.name),
     kind: "output",
     plugin: output.plugin,
     pluginKind: "sink",
@@ -226,6 +264,9 @@ export function PipelineSpecView(): JSX.Element {
     return <p className="empty-state">No pipeline specification yet.</p>;
   }
 
+  // One index for the whole view: every routing <dd> resolves its connection
+  // through it, in the direction its field means.
+  const index = buildConnectionIndex(compositionState);
   const name = compositionState.metadata.name ?? "Untitled pipeline";
   const description =
     compositionState.metadata.description ?? "No description provided.";
@@ -236,9 +277,24 @@ export function PipelineSpecView(): JSX.Element {
         <p>{description}</p>
         <PipelineGloss compositionState={compositionState} />
       </header>
-      <SpecSection name="Sources" rows={sourceRows(compositionState)} />
-      <SpecSection name="Nodes" rows={nodeRows(compositionState)} />
-      <SpecSection name="Outputs" rows={outputRows(compositionState)} />
+      <SpecSection
+        name="Sources"
+        rows={sourceRows(compositionState)}
+        state={compositionState}
+        index={index}
+      />
+      <SpecSection
+        name="Nodes"
+        rows={nodeRows(compositionState)}
+        state={compositionState}
+        index={index}
+      />
+      <SpecSection
+        name="Outputs"
+        rows={outputRows(compositionState)}
+        state={compositionState}
+        index={index}
+      />
     </div>
   );
 }
