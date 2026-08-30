@@ -394,43 +394,6 @@ describe("preferencesStore", () => {
     expect(selectTutorialCompleted(usePreferencesStore.getState())).toBe(true);
   });
 
-  it("resetTutorial clears tutorial_completed_at through the PATCH contract", async () => {
-    usePreferencesStore.setState({
-      loaded: true,
-      defaultMode: "guided",
-      tutorialCompletedAt: "2026-05-19T12:00:00Z",
-      tutorialCompleted: true,
-    });
-    mockUpdate.mockResolvedValueOnce({
-      default_mode: "guided",
-      banner_dismissed_at: null,
-      freeform_intro_dismissed_at: null,
-      tutorial_completed_at: null,
-      tutorial_stage: null,
-      tutorial_session_id: null,
-      tutorial_run_id: null,
-      tutorial_source_data_hash: null,
-      show_advanced: false,
-      updated_at: "2026-05-19T12:30:00Z",
-    });
-
-    await usePreferencesStore.getState().resetTutorial();
-
-    // Completion AND the resume fields clear in one PATCH: Reset is also
-    // offered mid-tutorial (the wedged-resume escape hatch), where a stale
-    // stage/session surviving the reset would resume straight back into the
-    // state being escaped.
-    expect(mockUpdate).toHaveBeenCalledWith({
-      tutorial_completed_at: null,
-      tutorial_stage: null,
-      tutorial_session_id: null,
-      tutorial_run_id: null,
-      tutorial_source_data_hash: null,
-    });
-    expect(usePreferencesStore.getState().tutorialCompletedAt).toBeNull();
-    expect(selectTutorialCompleted(usePreferencesStore.getState())).toBe(false);
-  });
-
   it("dismissDefaultChangedBanner persists timestamp", async () => {
     const stamp = "2026-05-15T12:00:00Z";
     usePreferencesStore.setState({ loaded: true, defaultMode: "freeform" });
@@ -1013,6 +976,43 @@ describe("preferencesStore — tutorial resume state (elspeth-918f4434b3)", () =
     expect(state.showAdvanced).toBe(false);
     expect(state.writeError).toMatch(/Couldn't save your preference/);
     expect(mockUpdate).toHaveBeenCalledWith({ show_advanced: true });
+  });
+
+  it("resetTutorial clears tutorial_completed_at through the PATCH contract", async () => {
+    usePreferencesStore.setState({
+      loaded: true,
+      defaultMode: "guided",
+      tutorialCompletedAt: "2026-05-19T12:00:00Z",
+      tutorialCompleted: true,
+    });
+    mockUpdate.mockResolvedValueOnce({
+      default_mode: "guided",
+      banner_dismissed_at: null,
+      freeform_intro_dismissed_at: null,
+      tutorial_completed_at: null,
+      tutorial_stage: null,
+      tutorial_session_id: null,
+      tutorial_run_id: null,
+      tutorial_source_data_hash: null,
+      show_advanced: false,
+      updated_at: "2026-05-19T12:30:00Z",
+    });
+
+    await usePreferencesStore.getState().resetTutorial();
+
+    // Completion AND the resume fields clear in one PATCH: Reset is also
+    // offered mid-tutorial (the wedged-resume escape hatch), where a stale
+    // stage/session surviving the reset would resume straight back into the
+    // state being escaped.
+    expect(mockUpdate).toHaveBeenCalledWith({
+      tutorial_completed_at: null,
+      tutorial_stage: null,
+      tutorial_session_id: null,
+      tutorial_run_id: null,
+      tutorial_source_data_hash: null,
+    });
+    expect(usePreferencesStore.getState().tutorialCompletedAt).toBeNull();
+    expect(selectTutorialCompleted(usePreferencesStore.getState())).toBe(false);
   });
 });
 
