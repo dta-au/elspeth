@@ -250,7 +250,26 @@ function connectionPhrase(
   direction: "downstream" | "upstream",
 ): string {
   const ids = (direction === "downstream" ? index.consumers : index.producers).get(connection);
-  if (ids === undefined || ids.length === 0) return titleCaseLabel(connection);
+  if (ids === undefined || ids.length === 0) {
+    // A DANGLING connection: nothing at the far end. Title-cased alone it is
+    // indistinguishable from a resolved one — "Then: Nowhere Yet" reads as a
+    // step actually named "Nowhere Yet" — so the card asserted a connection
+    // that does not exist, on the surface this wave asks non-engineers to
+    // review instead of the YAML. Plain-language suffix, not a <code>
+    // register: it matches the phrase register around it and serves the
+    // reader this tab is for.
+    //
+    // The two SENTINELS are excluded because they are not connections at all
+    // (_producer_resolver.py), so nothing ever registers them and they would
+    // otherwise be permanently marked: `fork` reaches here from a partly-fork
+    // routes map, and `discard` from a map entry (the scalar arm returns null
+    // earlier). "Every → Fork (not connected)" would be a false statement
+    // about a deliberately-routed branch.
+    if (connection === FORK_CONNECTION || connection === DISCARD_CONNECTION) {
+      return titleCaseLabel(connection);
+    }
+    return `${titleCaseLabel(connection)} (not connected)`;
+  }
   return ids.map((id) => componentPhrase(state, id)).join(", ");
 }
 

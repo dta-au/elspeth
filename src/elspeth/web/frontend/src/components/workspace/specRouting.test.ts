@@ -126,11 +126,39 @@ describe("routingPhrase", () => {
     });
   });
 
-  it("title-cases a dangling connection instead of leaking it", () => {
+  it("marks a dangling connection so it cannot pass for a wired one", () => {
+    // Title case alone made "Then: Nowhere Yet" read as a step actually named
+    // "Nowhere Yet" — same register and shape as a resolved connection, on the
+    // surface this wave asks non-engineers to review instead of the YAML.
+    // `raw` is unchanged: the marker is reader-register prose, not part of the
+    // value the `title` attribute carries.
     expect(routingPhrase(state, index, "on_success", "nowhere_yet")).toEqual({
-      text: "Nowhere Yet",
+      text: "Nowhere Yet (not connected)",
       raw: "nowhere_yet",
     });
+  });
+
+  it("does NOT mark a resolved connection", () => {
+    // The other half of the pin: if the marker leaked onto the resolved arm it
+    // would be noise on every healthy card, and the distinction it exists to
+    // draw would be gone in the other direction.
+    expect(routingPhrase(state, index, "on_success", "raw_rows").text).not.toContain(
+      "not connected",
+    );
+  });
+
+  it("never marks the fork/discard sentinels, which are not connections at all", () => {
+    // Nothing registers a sentinel as a producer or consumer
+    // (_producer_resolver.py), so both reach the unresolved arm permanently. A
+    // deliberately-forked branch is not dangling, and saying so would be false.
+    // `discard` reaches this path only through a map entry — the scalar arm
+    // returns null before `connectionPhrase` is ever called.
+    expect(routingPhrase(state, index, "routes", { every: "fork" })?.text).not.toContain(
+      "not connected",
+    );
+    expect(
+      routingPhrase(state, index, "routes", { dropped: "discard" })?.text,
+    ).not.toContain("not connected");
   });
 
   it("resolves a branch map UPSTREAM — the producer feeding the branch, never the fan-in node itself", () => {
@@ -143,7 +171,12 @@ describe("routingPhrase", () => {
         branch_invest_cs2: "invest_cs2_done",
       }),
     ).toEqual({
-      text: "Branch Invest Cs1 → Extract Invoice; Branch Invest Cs2 → Invest Cs2 Done",
+      // The marker earns its keep inside one sentence here: `invest_cs1_done`
+      // resolves to a real producer, `invest_cs2_done` is unwired in this
+      // fixture. Before the marker both arms read as ordinary Title Case step
+      // names and the reader had no way to tell the wired branch from the
+      // dangling one — the coalesce-branch half of the same defect.
+      text: "Branch Invest Cs1 → Extract Invoice; Branch Invest Cs2 → Invest Cs2 Done (not connected)",
       raw: "branch_invest_cs1 → invest_cs1_done; branch_invest_cs2 → invest_cs2_done",
     });
   });

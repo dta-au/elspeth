@@ -295,8 +295,11 @@ describe("PipelineSpecView", () => {
 
     const node = screen.getByRole("article", { name: "Node merge_invest" });
     expect(node).not.toHaveTextContent('{"');
+    // Both branches are unwired in this fixture (nothing produces either
+    // connection), so both carry the dangling marker. The assertion is about
+    // prose-vs-JSON; the marker is what keeps that prose honest.
     expect(node).toHaveTextContent(
-      "Branch Invest Cs1 → Invest Cs1 Done; Branch Invest Cs2 → Invest Cs2 Done",
+      "Branch Invest Cs1 → Invest Cs1 Done (not connected); Branch Invest Cs2 → Invest Cs2 Done (not connected)",
     );
     // The raw map stays one hover away.
     expect(within(node).getByText(/^Branch Invest Cs1/)).toHaveAttribute(
