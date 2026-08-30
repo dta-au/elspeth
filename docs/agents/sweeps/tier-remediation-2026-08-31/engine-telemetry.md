@@ -143,27 +143,39 @@ residual:
 
 ## 8. engine/orchestrator/audit_export_effects.py:R4:_contain_cleanup_failure:fp=db4e685915f5912d
 
-**fixed** — f5350fd66 — with a restageable residual. The genuine violation
-was the call topology, not the helper: the `finally` arm ran
-`_contain_cleanup_failure(spool.close, ...)` on the SUCCESS path, so a close
-failure could be swallowed behind a successful return. Containment now runs
-only inside `except BaseException` branches (audit_export_effects.py:365,
-429-434) while a primary exception is propagating, and the success path
-closes the spool directly so its failure surfaces; the helper's docstring
-now states the propagation-only contract. The helper's `except Exception` at
-audit_export_effects.py:81 still fires R4; proposed rationale for the
-residual:
+**fixed** — f5350fd66, corrected by the follow-up commit
+"spool close after registration: contain and record (ratified pin)" on this
+branch after the tree gate flagged the ratified corpus pin
+tests/integration/pipeline/test_audit_export_effect_recovery.py::test_spool_close_failure_does_not_fail_a_registered_export
+(elspeth-1c31195f26). The R4 defect was under-specified containment
+descriptions and topology, not containment itself: the ratified semantic is
+that a spool-close failure after successful registration is CONTAINED and
+RECORDED — an already-registered export (audit record durably written) never
+fails on temp-resource teardown, and the loss is never silent. Final shape:
+exception-path containments unchanged (:375, :439-443, during primary
+propagation); the success path routes through the same
+`_contain_cleanup_failure` channel with an identity-bearing description
+(candidate id + run id, :452-455); the helper's docstring names both
+legitimate topologies and requires an identifying description on every
+call. The helper's `except Exception` at audit_export_effects.py:81 still
+fires R4; proposed rationale for the residual:
 
-> audit_export_effects.py:78-83: `_contain_cleanup_failure` is called only
-> from `except BaseException` branches (:365, :429-434, verified by grep)
-> while the primary export/cancellation exception is propagating; its
-> docstring forbids success-path use and the success path closes the spool
-> uncontained (:437-441). The broad catch records the secondary cleanup
-> failure (`logger.exception`) and preserves the primary exception as the
-> outcome — the same secondary-failure-during-propagation form already
+> audit_export_effects.py:78-96: `_contain_cleanup_failure` records every
+> contained failure at ERROR with traceback and an identifying description —
+> containment is never silent. Its two call topologies are the two the
+> docstring prescribes and the tree witnesses: (1) inside
+> `except BaseException` branches (:375, :439-443) while the primary
+> export/cancellation exception is propagating — the secondary cleanup
+> failure is recorded and the primary preserved, the same form already
 > accepted for `SinkExecutor._best_effort_cleanup` (both call sites
-> immediately followed by bare `raise`). KeyboardInterrupt/SystemExit raised
-> by the cleanup itself still propagate (Exception, not BaseException).
+> immediately followed by bare `raise`); (2) post-registration spool
+> teardown on the success path (:452-455), where the export's audit record
+> is already durably registered and the ratified corpus pin
+> test_audit_export_effect_recovery.py::test_spool_close_failure_does_not_fail_a_registered_export
+> (elspeth-1c31195f26) witnesses the semantic: contain, record with export
+> identity, return the registered winner. KeyboardInterrupt/SystemExit
+> raised by the cleanup itself still propagate (Exception, not
+> BaseException).
 
 ## 9. engine/orchestrator/cleanup.py:R4:_safe_cleanup_error_text:fp=f678cf61a66db302
 
