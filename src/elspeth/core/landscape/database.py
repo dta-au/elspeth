@@ -16,7 +16,7 @@ from typing import Any, Literal, NewType, Self, cast
 from urllib.parse import quote
 from weakref import WeakKeyDictionary
 
-from sqlalchemy import Connection, Table, create_engine, event, text
+from sqlalchemy import Connection, create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.reflection import Inspector
 from sqlalchemy.engine.url import make_url
@@ -1468,19 +1468,12 @@ class LandscapeDB:
         allowed_missing_tables = frozenset() if self._require_existing_schema else _ADDITIVE_TABLE_NAMES
         missing_tables = sorted((expected_tables - existing_tables) - allowed_missing_tables) if present_landscape_tables else []
 
-        # Some focused guard tests replace metadata with a name-only sentinel
-        # so they can isolate the legacy high-signal diagnostics. Real
-        # application metadata always contains SQLAlchemy Table objects.
-        shape_issues = (
-            collect_metadata_shape_issues(
-                inspector,
-                validation_metadata,
-                dialect=self.engine.dialect,
-                present_tables=present_landscape_tables,
-                allowed_missing_index_names=_ADDITIVE_INDEX_NAMES,
-            )
-            if all(isinstance(table, Table) for table in validation_metadata.tables.values())
-            else ()
+        shape_issues = collect_metadata_shape_issues(
+            inspector,
+            validation_metadata,
+            dialect=self.engine.dialect,
+            present_tables=present_landscape_tables,
+            allowed_missing_index_names=_ADDITIVE_INDEX_NAMES,
         )
 
         # Full shape validation already covers every predecessor column. The
