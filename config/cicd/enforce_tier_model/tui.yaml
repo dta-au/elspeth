@@ -18,81 +18,346 @@ allow_hits:
   judge_transport: claude_agent_sdk
   ast_path: 'body[16]/body[7]/value/args[0]'
   judge_metadata_signature: 'hmac-sha256:v2:c7216e97b555babfeeaca6c9f8d56a57b8269dcf3708cc346145db2e5cede72f'
-- key: tui/screens/explain_screen.py:R1:ExplainScreen:_artifact_for_lineage:fp=e6ffb4d9fa3b5b56
-  owner: john
-  reason: |-
-    `tui/screens/explain_screen.py:205-208` constructs `artifacts_by_state_id` as an intentionally sparse presentation index: `"artifacts_by_state_id: dict[str, list[Artifact]] = {}"` and only states with persisted artifacts are inserted via `"artifacts_by_state_id.setdefault(artifact.produced_by_state_id, []).append(artifact)"`. `_artifact_for_lineage` then walks every lineage state and treats absence from that sparse index as the expected “this state produced no artifact” case: at `tui/screens/explain_screen.py:309`, `"artifacts = artifacts_by_state_id.get(state.state_id, ())"`, followed by `if artifacts: return artifacts[-1]` and `return None`. This is not a Tier-1 audit-data invariant lookup where a missing key indicates corruption; it is an optional reverse-index lookup in the TUI display path, and the function’s return type is explicitly `Artifact | None`.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T22:39:33.480645+00:00'
-  judge_model: 'claude-opus-4-8[1m]'
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.86
-  judge_rationale: |-
-    RULE MISFIRES. R1's premise is that a missing key signals a schema/contract bug that direct indexing should surface as KeyError, but the code at explain_screen.py:205-208 constructs `artifacts_by_state_id` as a deliberately partial index — it starts `{}` and only `setdefault(...).append`s entries for states that actually produced an artifact, so the vast majority of lineage states are legitimately absent. `_artifact_for_lineage` (309-312) walks every reversed state and treats absence as the expected 'this state produced no artifact' case, returning the declared `Artifact | None`; direct `artifacts_by_state_id[state.state_id]` would KeyError on the normal path. No first-party contract guarantees every state_id is a key, so this is an optional sparse-index lookup, not a defensive suppression on Tier-1 audit data. The decorator does not apply: the function takes only first-party-constructed arguments, and the subject is not rooted at an external parameter.
-  judge_signature_version: 2
-  scope_fingerprint: a87f578703bb3a17cb931a0dbdc50be76a6ee45a76b0b95addd63ecd0ed8a34a
-  judge_transport: claude_agent_sdk
-  ast_path: 'body[23]/body[9]/body[1]/body[0]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:e9e099da3a269705482f9128d1d892bf64f1ef399bd5a5e2c6b2351453357789'
 - key: tui/screens/explain_screen.py:R1:ExplainScreen:on_tree_select:fp=01464caccfb7b1d5
   owner: john
   reason: |-
     `tui/screens/explain_screen.py:346` is an intentional optional cache lookup for display enrichment, not a Tier-1 audit-data read that must crash. The loaded-state caches are deliberately partial: `tui/screens/explain_screen.py:218-219` sets `latest_state_by_node_id` to `{}` when a focused lineage exists, so selecting a node outside the focused token path legitimately has no cached execution state. The call then passes that optional value as `state_for_display=state_for_display` with `scan_for_state=False` (`tui/screens/explain_screen.py:347-352`), and `_load_node_state` treats absence as a prescribed display-only condition: it only adds execution fields when `state_for_display is not None` (`tui/screens/explain_screen.py:471-473`) and otherwise returns the structural node detail (`tui/screens/explain_screen.py:480`). The suppression is therefore bound to the current two-cache fallback expression: `state_for_display = self._state.focused_state_by_node_id.get(node_id) or self._state.latest_state_by_node_id.get(node_id)`.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T22:40:17.212431+00:00'
-  judge_model: 'claude-opus-4-8[1m]'
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.86
+  judge_recorded_at: '2026-08-30T10:48:25.283682+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES. The `.get(node_id)` is a membership lookup on two deliberately partial in-memory caches, not a defensive read of guaranteed-present Tier-1 audit data. I verified the cited structure: `latest_state_by_node_id` is set to `{}` whenever a focused lineage exists (explain_screen.py:218-219), and `focused_state_by_node_id` holds only states along the focused token path (line 210), so selecting a node outside that path legitimately has no cached entry. Absence is an in-band, designed condition handled honestly — `_load_node_state` adds execution fields only when `state_for_display is not None` (line 471-473) and otherwise returns the structural node detail (line 480), so None means "display-only," not a fabricated default. Direct `[node_id]` access would raise KeyError on a valid "no state for this node" selection, which is not a schema bug; the rule's premise that a missing key indicates a contract violation is false here. The subject is rooted at `self._state`, not the `selection` parameter, so no @trust_boundary nudge applies.
+    RULE MISFIRES — these mappings are explicitly partial display caches, so an absent key represents unavailable optional enrichment rather than a malformed required record. The cache construction at tui/screens/explain_screen.py:229-230 deliberately leaves `latest_state_by_node_id` empty when focused states exist, while `_load_node_state` at tui/screens/explain_screen.py:506-515 adds execution details only when cached state exists and otherwise returns the required structural detail. The lookup neither fabricates audit data nor conceals a fixed-contract failure. The decorator does not apply because the lookup is rooted in internal screen state, not an external function parameter.
   judge_signature_version: 2
-  scope_fingerprint: f3ab79e14205dba03bd22f871c8cccbbd79177151612198bc33c3c3552027473
-  judge_transport: claude_agent_sdk
+  scope_fingerprint: 527017a2b8a2405020cc3a0a99a3f82921094a65ef3bc2b024ce1d00fe051ee8
+  judge_transport: codex_cli
   ast_path: 'body[23]/body[11]/body[4]/body[0]/value/values[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:668095a697e8a4fe1ae238406c8ca9dc1802600418bfd149ecdc7dc4defa1f81'
+  judge_metadata_signature: 'hmac-sha256:v2:db5f6bc3faee83757df19e264305d5379ab6e6c8fc7761fff84b00adffc1dc7a'
 - key: tui/screens/explain_screen.py:R1:ExplainScreen:on_tree_select:fp=d9de8781b120fafc
   owner: john
   reason: |-
     This is an intentional partial-cache lookup for TUI display enrichment, not a defensive read of required Tier-1 audit data. In `src/elspeth/tui/screens/explain_screen.py:186-220`, both maps are built as optional node-state indexes: `focused_state_by_node_id = {state.node_id: state for state in lineage_result.node_states}` only covers the focused token path, and `latest_state_by_node_id` is only populated from recorded node states when there is no focused token. The selected node itself is still validated through the node table at `src/elspeth/tui/screens/explain_screen.py:456-461` via `node = factory.data_flow.get_node(node_id, run_id)` followed by `if node is None: return None`. The `.get()` at `src/elspeth/tui/screens/explain_screen.py:346` only decides whether optional execution-state fields should be added; `src/elspeth/tui/screens/explain_screen.py:471-480` explicitly treats `state_for_display is None` as a valid structure-only detail result. Future drift that made `focused_state_by_node_id` or `latest_state_by_node_id` total over every selectable node, or made missing execution state impossible, would invalidate this suppression.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:13:37.289295+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.82
+  judge_recorded_at: '2026-08-30T10:49:04.058121+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES. The two dicts are partial indexes by design — `focused_state_by_node_id` only covers the focused token path, `latest_state_by_node_id` is populated only when no focused token exists — so a missing key is a normal, expected outcome for a selectable node, not a broken invariant. The `.get()` here is not a defensive re-check of a shape our code guarantees; it's the intended lookup semantics (absent → None → structure-only detail), and downstream code at 471-480 explicitly treats None as valid. Direct subscript would spuriously KeyError on legitimate selections. The rationale identifies the maps' partiality, points to the downstream None-tolerant consumer, and names the drift conditions that would invalidate the suppression.
+    RULE MISFIRES — these `.get()` calls query deliberately partial display-enrichment indexes, so key absence is a valid state rather than a hidden schema failure. Verified at src/elspeth/tui/screens/explain_screen.py:221 and :229-238 that the maps contain only recorded focused/latest node states, while `_load_node_state` independently validates the selected node through `factory.data_flow.get_node` at :491-515 and explicitly permits structure-only output when no execution state exists. The decorator does not apply because the lookup is rooted in internal `LoadedState` caches, not an external function parameter.
   judge_signature_version: 2
-  scope_fingerprint: f3ab79e14205dba03bd22f871c8cccbbd79177151612198bc33c3c3552027473
-  judge_transport: openrouter
+  scope_fingerprint: 527017a2b8a2405020cc3a0a99a3f82921094a65ef3bc2b024ce1d00fe051ee8
+  judge_transport: codex_cli
   ast_path: 'body[23]/body[11]/body[4]/body[0]/value/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:2331ac8f7d65a88130c92a1ee5a2565f17257967dbbdf89e3ba353e4f8587f8b'
+  judge_metadata_signature: 'hmac-sha256:v2:53b9c2946f3297a29620eb866ffba00fe3677d44574342b3e14ec1af3170f324'
 - key: tui/widgets/lineage_tree.py:R1:LineageTree:_build_tree:fp=837c05db00cf931c
   owner: john
   reason: |-
     This site is a legitimate sparse-index lookup, not defensive access to required audit data. In `src/elspeth/tui/widgets/lineage_tree.py:120`, `_build_tree` creates a local derived map, `tokens_by_sink: dict[str, list[TreeNode]] = {}`. Lines 136-140 populate that map only for tokens whose `path` has a terminal node: `terminal_node_id = path[-1]` followed by `tokens_by_sink[terminal_node_id].append(token_node)`. The flagged line, `token_children = tuple(tokens_by_sink.get(sink_node_id, [])) if sink_node_id is not None else ()`, is then iterating all sinks and asking whether this sink has any token leaves. A sink with no terminal tokens is an expected empty-child case, not missing required Tier-1 lineage data. The surrounding required lineage fields still use crash-on-missing access, e.g. `token["token_id"]`, `token["row_id"]`, `token["path"]`, `sink["name"]`, and `sink["node_id"]`, so future drift that changes `tokens_by_sink` from this locally built sparse grouping into a raw audit/lineage payload lookup would invalidate this suppression.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:13:55.690027+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.88
+  judge_recorded_at: '2026-08-30T10:49:13.192874+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES. The `.get()` here is not defensive access to required Tier-1 audit data — `tokens_by_sink` is a locally-constructed sparse index built moments earlier in the same function (lines 120, 136-140), populated only for sinks that actually have terminal tokens. A missing key represents the legitimate 'sink has no tokens' case, and the empty-list default preserves meaning (no tokens → no children), not fabrication of absent audit data. The surrounding required lineage fields (`token['token_id']`, `sink['node_id']`, etc.) correctly use crash-on-missing direct subscript, confirming the author distinguished required from sparse access. R1's premise (hiding missing-key bugs in a required field) does not apply to a sparse local index.
+    RULE MISFIRES — the flagged dictionary is a locally constructed sparse grouping index, not required Tier-1 audit data or Tier-2 data whose schema guarantees every sink key. The visible code populates `tokens_by_sink` only for tokens with a non-empty path, then iterates all sinks, so an absent sink key legitimately means that sink has no token children and the empty list preserves that meaning. Required lineage fields are separately accessed directly, consistent with crash-on-missing semantics. The finding is rooted in the local derived map rather than an external function parameter, so the `@trust_boundary` decorator does not apply.
   judge_signature_version: 2
-  scope_fingerprint: 9f36874eded917b1d9a936b1fbb464490b76630d5b7781495041fcda378ed40b
-  judge_transport: openrouter
+  scope_fingerprint: ae2b5c5ccb710025fbbb448757f0f837324a52f3b796ff7994cb4bc46205a345
+  judge_transport: codex_cli
   ast_path: 'body[6]/body[2]/body[9]/body[2]/value/body/args[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:8a8bcc30943ea037ad723acfa902f40b233d091a6fad06f5121de3abd3afbfda'
-
+  judge_metadata_signature: 'hmac-sha256:v2:518a762dd50c4436afcac48c02dfb303aedaae877115768512808e97dd42a8ba'
+- key: tui/screens/explain_screen.py:R5:ExplainScreen:_add_execution_state:fp=0fd6580d80bb96f6
+  owner: john
+  reason: |-
+    R5 `isinstance(state, NodeStatePending)` in _add_execution_state — the second arm, positioned after the completion block (completed_at, duration_ms, context_after_json) but BEFORE the output_hash block. That placement is the whole content of the arm: a pending state has finished timing and may carry a context, but its output does not exist yet, so returning here is what keeps an absent output_hash out of the panel instead of rendering it as empty. Narrowing against our own concrete audit dataclass, per ADR-032. Invalidated if: pending states start carrying an output hash, or the panel's field order changes such that the return no longer sits between the two blocks it separates.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:21:39.825297+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the `isinstance(state, NodeStatePending)` check discriminates a concrete variant of the declared `NodeState` sum type so the renderer includes only fields that exist for that lifecycle state; it does not hide or recover from a contract violation. The surrounding exhaustive branches for `NodeStateOpen`, `NodeStateCompleted`, and `NodeStateFailed`, followed by an informative `TypeError` for unsupported variants, independently support the rationale’s site-specific account. This is internal variant dispatch rather than a Tier-3 boundary, so the decorator contract does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 918c8422023f0f2ee8f6a3accda2218cf16d0b0d3564c49dff5ff7e30d4ee3d9
+  judge_transport: codex_cli
+  ast_path: 'body[23]/body[16]/body[5]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:dd95b24ca75c6f35ef9c6a330eaf4ab6285e18d4fbc2b2dc31dd97ccdac1d3d2'
+- key: tui/screens/explain_screen.py:R5:ExplainScreen:_add_execution_state:fp=1775e976463e035a
+  owner: john
+  reason: |-
+    R5 `isinstance(state, NodeStateCompleted)` in _add_execution_state — the third arm, and the first that adds a field no other arm has: success_reason_json, the structured record of WHY a transform succeeded (the 'action' the plugin reported). It is emitted only when non-None, since a completed state need not carry a reason, and the arm returns so the failure arm below cannot also fire. Reached only after Open and Pending have returned, so the state here is known to have both a completion time and an output. Invalidated if: success_reason_json moves to a shared base, or completed and failed states are merged into one arm with an outcome discriminator field.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:21:44.593987+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    RULE MISFIRES — the visible code uses nominal `isinstance` checks to discriminate concrete node-state variants and serialize fields that exist only on those variants; it is not defensively revalidating a single fixed-contract shape or hiding a contract failure. The `NodeStateCompleted` arm conditionally records its variant-specific optional `success_reason_json` and returns, while the exhaustive dispatch ends with an informative `TypeError` for unsupported state types. This is internal variant dispatch rather than a Tier-3 parameter boundary, so the `@trust_boundary` decorator contract does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 918c8422023f0f2ee8f6a3accda2218cf16d0b0d3564c49dff5ff7e30d4ee3d9
+  judge_transport: codex_cli
+  ast_path: 'body[23]/body[16]/body[7]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:680a1730d891c581e500ec1fc33133b139c426ff0cf2d67eee07e7b6aadec417'
+- key: tui/screens/explain_screen.py:R5:ExplainScreen:_add_execution_state:fp=96246b24565346a3
+  owner: john
+  reason: |-
+    R5 `isinstance(state, NodeStateFailed)` in _add_execution_state — the fourth and final arm, adding error_json. Its significance is what follows it: the function ends in `raise TypeError(f"Unsupported node state type: {type(state).__name__}")`, so this chain has NO silent fall-through — a fifth NodeState arm added upstream fails loudly here instead of quietly rendering a detail panel missing the operator's error payload. That terminal raise is the reason each arm can safely be a narrow isinstance rather than a defensive hasattr probe. Invalidated if: the terminal raise is softened to a return or a log (the chain would then need exhaustiveness enforced some other way before this entry could be renewed).
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:21:42.155084+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    PRESCRIBED FORM — the visible code uses nominal `isinstance` checks to discriminate declared node-state variants, and the flagged final arm extracts `NodeStateFailed.error_json` before returning. The terminal `TypeError` proves that an unsupported variant cannot be silently ignored or rendered with fabricated/defaulted failure details, making this offensive crash-on-contract-violation handling rather than defensive masking. This is not an R5 Tier-3 parameter-boundary case suitable for the decorator, and the rationale is specific to the visible control flow.
+  judge_signature_version: 2
+  scope_fingerprint: 918c8422023f0f2ee8f6a3accda2218cf16d0b0d3564c49dff5ff7e30d4ee3d9
+  judge_transport: codex_cli
+  ast_path: 'body[23]/body[16]/body[8]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:f77a296e8efdb9e7b849a0ac23db0f68a20c5f112c69cc5b5ef3649b56c2099a'
+- key: tui/screens/explain_screen.py:R5:ExplainScreen:_add_execution_state:fp=b9090a24767b6d2a
+  owner: john
+  reason: |-
+    R5 `isinstance(state, NodeStateOpen)` in _add_execution_state — the first of four ordered arms projecting the NodeState union into a NodeStateInfo display dict. It runs AFTER the fields common to every arm (state_id, token_id, status, input_hash, started_at) are written and returns immediately, because an open state has no completion timestamp, no duration and no output: this early return is what lets the following block read state.completed_at and state.duration_ms unguarded. Order matters — the union is projected widest-first, each arm returning once its arm-specific fields are added. Invalidated if: NodeStateOpen gains completion fields, which would make this early return drop data rather than protect the block below it.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:21:44.328503+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — this `isinstance` is an ordered discriminator over the declared `NodeState` union, not a defensive revalidation that masks a contract violation. The `NodeStateOpen` arm records all fields valid for an open state and returns before accessing completion-only attributes, while subsequent arms add their variant-specific fields and the final `TypeError` rejects unsupported variants. The visible code therefore performs explicit exhaustive projection without coercion, fabrication, defaults, or silent recovery.
+  judge_signature_version: 2
+  scope_fingerprint: 918c8422023f0f2ee8f6a3accda2218cf16d0b0d3564c49dff5ff7e30d4ee3d9
+  judge_transport: codex_cli
+  ast_path: 'body[23]/body[16]/body[2]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:6c2a53bbf656db9bab3c773e4a3a889b14c21e9a2651563e12ff6f3d67af3f03'
+- key: tui/screens/explain_screen.py:R5:ExplainScreen:_select_node_state_for_display:fp=33b98e083d4d2ecf
+  owner: john
+  reason: |-
+    R5 `isinstance(state, (NodeStatePending, NodeStateCompleted, NodeStateFailed))` inside the max() key lambda in _select_node_state_for_display. NodeState (contracts/audit.py:401) is the closed union NodeStateOpen | NodeStatePending | NodeStateCompleted | NodeStateFailed, and only the latter three declare completed_at — NodeStateOpen has started_at alone. The isinstance is therefore an attribute-presence discriminator that keeps the sort key TOTAL: without it, choosing 'the most recent state' either crashes with AttributeError on an in-flight node or has to fall back to a getattr probe, which the whole-tree gate rightly forbids. Picking the wrong state here is not cosmetic: it is the row the operator reads as the node's outcome. Grouping the three arms in one tuple is exact, not lazy — they are precisely the arms that reached a completion timestamp. Invalidated if: NodeStateOpen gains completed_at (the union then has a uniform key and the isinstance goes), or a fifth arm is added without it — a parity sweep this entry should force.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:21:58.583329+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — the check discriminates among valid arms of the closed `NodeState` union; it does not revalidate the union contract or conceal a malformed value. The visible code uses `completed_at` only for the three variants that define it and uses `started_at` for `NodeStateOpen`, producing a total ordering key without fabrication or silent recovery. This is an explicit, exhaustive variant distinction under a fixed sum-type contract, and the rationale precisely identifies when that distinction would become stale. The method has no external-data parameter rooted at the finding, so the trust-boundary decorator does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 3e5ab4c994683e9eef97b83e5acdd42587953f8bb238c4cb5bacac71be50be5b
+  judge_transport: codex_cli
+  ast_path: 'body[23]/body[15]/body[1]/value/keywords[0]/value/body/elts[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:5209811f72f7a250352aba151c4bf0dd9923492985306f24256760175dc428c8'
+- key: tui/screens/explain_screen.py:R5:ExplainScreen:load:fp=a4041d8476a732c5
+  owner: john
+  reason: |-
+    R5 `not isinstance(self._state, UninitializedState)` in ExplainScreen.load — a state-machine transition PRECONDITION, not a data type check. load() is documented as the single legal UninitializedState -> LoadedState|LoadingFailedState edge, and this is the runtime enforcement of that edge: on violation it raises InvalidStateTransitionError carrying the method, the current state name and the allowed set, which is what makes 'call clear() first' actionable to a caller. Because ScreenState is a union of three distinct classes rather than one class with a tag field, the state's TYPE is its discriminator — isinstance is the only way to ask which state we are in. Allowing a second load would silently discard an already-loaded run's caches. Invalidated if: the screen adopts an explicit state tag (enum field) or a state-machine helper, so transitions are checked against a declared table rather than by type.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:22:01.307051+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — this isinstance check is a state-machine transition guard, not defensive shape validation of Tier-1/Tier-2 data or a hidden recovery from a contract violation. The visible load() contract permits only UninitializedState and the code offensively raises an informative InvalidStateTransitionError for every other state before replacing state or caches, exactly matching the site-specific rationale. The decorator alternative does not apply because the subject is self._state rather than external data rooted in a function parameter.
+  judge_signature_version: 2
+  scope_fingerprint: e5a2d0abc4f066bc0f2c60f9f38b49b4f401135d728389065f9e9c0696e79f27
+  judge_transport: codex_cli
+  ast_path: 'body[23]/body[18]/body[1]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:b842f600be616c9abafb864c235a6c2a158200f213118f064bf8d34202e99a0a'
+- key: tui/screens/explain_screen.py:R5:ExplainScreen:on_tree_select:fp=334086cb24f380d4
+  owner: john
+  reason: |-
+    R5 `isinstance(self._state, LoadedState)` in ExplainScreen.on_tree_select. ScreenState (explain_screen.py:97) is a closed discriminated union of three frozen dataclasses — UninitializedState | LoadingFailedState | LoadedState — and this narrowing is what makes the arm's body type-safe: LoadedState is the only arm carrying focused_state_by_node_id and latest_state_by_node_id, the caches the very next line reads, as well as the db/run_id the load call needs. These are ELSPETH's own concrete classes, so ADR-032 nominal discrimination applies and no structural impostor can pass. The arm is also the fast path: it deliberately calls _load_node_state with scan_for_state=False, because the cache already holds the state and a per-selection scan of every node state in the run is what this branch exists to avoid. Invalidated if: ScreenState gains a fourth arm that also carries the per-node caches, or the caches move onto a shared base class — either would make this test too narrow rather than merely unnecessary.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:21:59.720011+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — the `isinstance(self._state, LoadedState)` check is nominal discrimination among first-party state variants, not a defensive revalidation that hides a contract violation. The visible branches use variant-specific fields immediately afterward, and the adjacent `LoadingFailedState` branch confirms that the test selects behavior and enables type-safe narrowing over the closed state union described in the rationale. The subject is `self._state`, not external data rooted at the `selection` parameter, so the `@trust_boundary` structural alternative does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 527017a2b8a2405020cc3a0a99a3f82921094a65ef3bc2b024ce1d00fe051ee8
+  judge_transport: codex_cli
+  ast_path: 'body[23]/body[11]/body[4]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:529f8089165664643d6554d69cccc56a8e082b5954c01f5f67b048c7af4e937c'
+- key: tui/screens/explain_screen.py:R5:ExplainScreen:on_tree_select:fp=642e887c91c94beb
+  owner: john
+  reason: |-
+    R5 `isinstance(self._state, LoadingFailedState)` in ExplainScreen.on_tree_select — the second arm of the same ScreenState narrowing, reached only when the state is not LoadedState. It is not a duplicate of the LoadedState arm and not dead: LoadingFailedState deliberately preserves db and run_id after a failed structural load, so a node the operator selects can still be looked up LIVE (no cache exists, so _load_node_state runs with its default scan_for_state=True). Dropping this arm would turn a recoverable database hiccup into a permanently blank detail panel. Anything else — i.e. UninitializedState — falls through to update_state(None), which is the honest 'nothing selected' rendering, not a swallowed error. Invalidated if: LoadingFailedState stops carrying db/run_id, at which point there is nothing to look up and the arm should be deleted rather than justified.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:22:05.722253+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    RULE MISFIRES — the visible code uses `isinstance` to discriminate two distinct variants of `ScreenState`, not to mask a malformed value under a fixed contract. The `LoadedState` and `LoadingFailedState` branches visibly require different state-specific behavior and fields, while the remaining state deliberately renders no selection; the site is therefore legitimate union-state narrowing rather than a Tier-2 defensive re-check. This method does not take external data as a parameter rooted in the flagged expression, so the `@trust_boundary` structural alternative does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 527017a2b8a2405020cc3a0a99a3f82921094a65ef3bc2b024ce1d00fe051ee8
+  judge_transport: codex_cli
+  ast_path: 'body[23]/body[11]/body[5]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:194bed93d42dfcc8db10183da6f6db91a368bb3fb3a7a13c98593b2eafc756d9'
+- key: tui/screens/explain_screen.py:R5:ExplainScreen:render:fp=49160609ddf6a561
+  owner: john
+  reason: |-
+    R5 `isinstance(self._state, LoadedState)` in ExplainScreen.render — the same ScreenState narrowing as on_tree_select but selecting a different capability: LoadedState is the only arm carrying `.tree`, so this is the test that decides whether a lineage tree section can be rendered at all. The other two arms render their own sections (the run id line above comes from _get_run_id, which pattern-matches the union separately), so this is a section gate, not an error check, and there is nothing to raise. Invalidated if: the tree moves onto ScreenState generally, or render() is restructured to a single `match self._state` over the union like _get_run_id already uses.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:22:31.327692+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — this `isinstance` discriminates a valid arm of the first-party `ScreenState` union to decide whether the optional lineage-tree section exists; it does not mask a contract violation or malformed type. `tui/screens/explain_screen.py:57` through `:97` define three legitimate state variants with `tree` present only on `LoadedState`, while `render` at `:579` conditionally renders that capability and `_get_run_id` at `:340` independently pattern-matches the same union. The decorator alternative does not apply because `render` takes no external-data parameter.
+  judge_signature_version: 2
+  scope_fingerprint: f5fb7987d3bfd7a8c378f16a946548433583c9c02702d38bb00fe1e73e8d1db9
+  judge_transport: codex_cli
+  ast_path: 'body[23]/body[17]/body[7]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:8ffb2410f65d1a04f20969716e1628869e234bf09024fd06e58d5bf6aad01ac9'
+- key: tui/screens/explain_screen.py:R5:ExplainScreen:retry:fp=40a0f6dab9e35aac
+  owner: john
+  reason: |-
+    R5 `not isinstance(self._state, LoadingFailedState)` in ExplainScreen.retry — the mirror precondition to load(), and it names a different reason: LoadingFailedState is the ONLY arm that preserves the db handle and run_id needed to attempt the load again (the inline comment says so), so retry from any other state has no inputs and could only fabricate them. It raises the same InvalidStateTransitionError with its own allowed set, keeping the documented transition table enforceable rather than advisory. Invalidated if: db/run_id move onto the screen itself rather than the failed-state arm, which would make retry legal from more states and turn this guard into an over-restriction to fix, not renew.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:22:15.503036+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    PRESCRIBED FORM — the `isinstance` check offensively enforces `ExplainScreen.retry`'s documented state-transition precondition and raises a specific `InvalidStateTransitionError`; it does not suppress, coerce, or fabricate an internal contract violation. The visible code establishes that only `LoadingFailedState` carries the `db` and `run_id` consumed by `_load_pipeline_structure`, while the method documentation and exception metadata consistently restrict retry to that state. This is not a Tier-3 parameter-rooted boundary case, so the `@trust_boundary` decorator contract does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 97b988b93ea0d6bba69b478e3243fc066f37b9d5d81bdd982d4ea30200876ca3
+  judge_transport: codex_cli
+  ast_path: 'body[23]/body[19]/body[1]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:7162a8480281d9da50aba3dd56333e690367fe26e95f1ed189025ad06fa62443'
+- key: tui/widgets/lineage_tree.py:R5:TreeNode:__post_init__:fp=9bec72fbf325331b
+  owner: john
+  reason: |-
+    R5 `not isinstance(child, TreeNode)` in TreeNode.__post_init__. Like contracts/diversion.py:73 this sits in the exempt frame (frozen dataclass __post_init__) and is flagged only because the subject is bound by `for i, child in enumerate(self.children)`: _post_init_self_field_aliases_before tracks a loop variable only when the target is a plain ast.Name over self.<field>, and here the target is a tuple and the iterable a public builtin call. The sibling guard on self.label two lines up IS exempted, which isolates the cause to the loop form. What makes the check load-bearing rather than defensive: the very next statement is freeze_fields(self, 'children'), and the comment above it justifies skipping a type guard on the container precisely BECAUSE this loop has established that every element is an already frozen TreeNode — deep_freeze then returns identity. A non-TreeNode child would be deep-frozen into some other shape and handed out by get_node_by_id(), breaking the class docstring's promise that the tree cannot be mutated through it. The index feeds the error message. Invalidated if: children becomes a validated collection type that guarantees element type at construction, or freeze_fields starts type-checking elements itself.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:22:22.811790+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    PRESCRIBED FORM — `TreeNode.__post_init__` is the runtime-enforcement point for an otherwise unenforced dataclass annotation, and the visible `isinstance(child, TreeNode)` guard offensively raises an informative `TypeError` rather than suppressing, coercing, or fabricating a value. The rationale is site-specific and the code confirms that every child is checked before `freeze_fields` relies on the tuple containing already-frozen `TreeNode` instances. This is not an R5/R1 Tier-3 parameter boundary eligible for the decorator because the subject derives from `self.children`, not an external-data parameter.
+  judge_signature_version: 2
+  scope_fingerprint: 5753540e15c748f6b02e088ccc0aa6f0f20197383fc9c4fdb573963b4a412593
+  judge_transport: codex_cli
+  ast_path: 'body[5]/body[7]/body[2]/body[0]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:e72b0e3774c0c08baebfcc467d49a5413ad8c1d2f5b27ceece3832bba3e2f9d2'
+- key: tui/widgets/node_detail.py:R5:_format_json_value:fp=0893509d0253958e
+  owner: john
+  reason: |-
+    R5 `isinstance(value, list)` in _format_json_value — presentation dispatch, not validation. The input is one already-parsed value plucked out of an audit JSON blob, so Any is its honest type, and this arm renders a list as a comma-joined single line because the panel is a fixed-width terminal surface where a multi-line JSON array for something like fields_added would push the operator's other fields off screen. Nothing is rejected here and nothing should be: the function's contract is to render whatever the audit row legitimately holds. Invalidated if: audit reason payloads become typed records with per-field renderers, removing the runtime dispatch entirely.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:22:52.521076+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — `_format_json_value` performs presentation dispatch over an honestly heterogeneous JSON value, rather than revalidating or recovering from a violated fixed-shape contract. The visible parser returns `dict[str, object]`, and each branch only selects a compact rendering; it neither rejects malformed data nor supplies a default, coerces data for downstream trust, or hides an integrity failure. The value originates in Tier-1 audit data, but its declared field-value contract is deliberately heterogeneous, so distinguishing lists, dictionaries, and scalars for display is consistent with that contract.
+  judge_signature_version: 2
+  scope_fingerprint: f3996707c2eb32ca0940bbf531b7d41fe514ea4c8b44aa397bc5a4788f4b859b
+  judge_transport: codex_cli
+  ast_path: 'body[11]/body[1]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:996e0f5f950d59b7ba3b93664ff379d5b84cb482e5c3bb0501545715c34a0abf'
+- key: tui/widgets/node_detail.py:R5:_format_json_value:fp=e530ff6d82ece7a0
+  owner: john
+  reason: |-
+    R5 `isinstance(value, dict)` in _format_json_value — the second presentation arm, and the one with a determinism requirement: nested objects are rendered with json.dumps(..., sort_keys=True) so the same audit payload always produces the same panel text, which is what lets an operator diff two runs' detail output by eye. Everything that is neither list nor dict falls through to `str(value)`, the intended default for scalars rather than an unhandled case, so this chain has no silent-skip arm to fix. Invalidated if: rendering moves to a formatter that walks a typed structure, or sorted key order stops being the panel's contract.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:22:50.534337+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.96
+  judge_rationale: |-
+    RULE MISFIRES — `_format_json_value` uses `isinstance(value, dict)` for type-directed presentation within its declared JSON-compatible union, not to conceal a violation of an expected fixed shape. The visible branches deliberately render lists, dictionaries, and scalars differently, with dictionaries serialized deterministically via `sort_keys=True`; no malformed value is suppressed, coerced into a contractually expected type, or silently skipped. This is not a Tier-3 promotion boundary rooted in external input, so the structural decorator does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: f3996707c2eb32ca0940bbf531b7d41fe514ea4c8b44aa397bc5a4788f4b859b
+  judge_transport: codex_cli
+  ast_path: 'body[11]/body[2]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:b4165eed662185a9a7fd9f099af2ed85cf28596000e42a2e1b8a5671792f7261'
+- key: tui/widgets/node_detail.py:R5:_parse_json_object:fp=31d2650cac6556e0
+  owner: john
+  reason: |-
+    R5 `not isinstance(parsed, dict)` in _parse_json_object — the POST-parse half, and not redundant with the str check above it. json.loads legitimately returns any JSON type: '[]', '3' and 'null' all parse successfully from a perfectly valid str, so the pre-parse guard says nothing about the shape that comes back. The column's contract is a JSON OBJECT, and without this test the cast(dict[str, object], parsed) on the next line would be a lie that surfaces much later as an AttributeError inside json.dumps or a caller's .items(), with the state_id long out of scope. The two guards catch different corruptions and both name the field and state_id. Invalidated if: the audit columns gain a schema-validated decoder that guarantees object shape before this function is reached.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:22:52.694262+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    PRESCRIBED FORM: `json.loads` accepts any JSON value, so the `parsed` result has no first-party object-shape guarantee and the `isinstance(parsed, dict)` check is the runtime promotion point from an unguaranteed decoded shape to the required dictionary contract. The check does not suppress or coerce corruption: it raises an informative `TypeError` naming the field and `state_id`, while only the validated branch reaches the cast. The decorator alternative does not apply because the flagged subject is the result of parsing a Tier-1 audit value rather than data rooted directly in an external function parameter.
+  judge_signature_version: 2
+  scope_fingerprint: 8ef82425e21d3a589fa88afce76f1024ac35b2eedf8d880a699ea4891c41f4c1
+  judge_transport: codex_cli
+  ast_path: 'body[10]/body[3]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:bab416ee287164d435e8aac1205714b2181c63a6c9d4ab6de2c6cb2ac7929cd6'
+- key: tui/widgets/node_detail.py:R5:_parse_json_object:fp=622dd0516891fe63
+  owner: john
+  reason: |-
+    R5 `not isinstance(value, str)` in _parse_json_object — the PRE-parse half of a two-stage Tier-1 audit integrity check. The value arrives from a JSON audit column (context_after_json, success_reason_json) typed Any because it has been read back out of the audit store, and a non-str there means the row itself is corrupt. Raising here converts what would otherwise be a bare `TypeError: the JSON object must be str, bytes or bytearray` from json.loads into a message naming the field AND the state_id, which is the only way an operator can locate the bad audit row. Per the module's Tier-1 posture the response is to crash, not to substitute a default. Invalidated if: the audit reader returns a typed record whose JSON columns are guaranteed str at the read boundary, making this guard unreachable.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:22:50.154494+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    PRESCRIBED FORM — the `isinstance` check is offensive Tier-1 integrity enforcement: a non-string audit-column value immediately raises a correctly typed, contextual `TypeError` naming both the field and `state_id`. The visible code neither suppresses the anomaly nor coerces or fabricates a replacement, and it then separately enforces that the decoded JSON is an object. This is not a Tier-3 parameter boundary, so the `@trust_boundary` decorator does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 8ef82425e21d3a589fa88afce76f1024ac35b2eedf8d880a699ea4891c41f4c1
+  judge_transport: codex_cli
+  ast_path: 'body[10]/body[1]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:2577f838d2aab1432de2070aac69eca4077a72c2fe3f2f07b00c6270d0e13877'
 per_file_rules: []
