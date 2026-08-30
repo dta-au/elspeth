@@ -52,6 +52,16 @@ const EDITABLE_PROVENANCES: ReadonlySet<InlineSourceProvenance> = new Set([
   "llm-generated-then-amended",
 ]);
 
+/** Reader-register labels for the closed provenance enum; the raw value
+ *  stays in `title` (elspeth-d74ab492dd). Exhaustive by type: adding a
+ *  provenance without a label is a compile error. */
+export const INLINE_SOURCE_PROVENANCE_LABELS: Record<InlineSourceProvenance, string> = {
+  verbatim: "Typed by you",
+  "llm-generated": "Drafted by the composer",
+  disambiguated: "Chosen by you from the options offered",
+  "llm-generated-then-amended": "Drafted by the composer, then edited by you",
+};
+
 /** Max chars in the visible preview, INCLUDING the trailing ellipsis. */
 const PREVIEW_MAX_LENGTH = 280;
 const PREVIEW_ELLIPSIS = "…"; // single-char "…" so we don't bust the budget
@@ -189,7 +199,9 @@ export function InlineSourceCreatedTurn({
             </div>
             <div>
               <dt>Provenance</dt>
-              <dd>{summary.provenance}</dd>
+              <dd title={summary.provenance}>
+                {INLINE_SOURCE_PROVENANCE_LABELS[summary.provenance]}
+              </dd>
             </div>
           </dl>
         )}
