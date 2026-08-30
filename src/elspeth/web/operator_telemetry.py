@@ -554,7 +554,11 @@ def reset_operator_telemetry_for_tests() -> None:
         runtime = _runtime
         if runtime is None:
             return
-        provider_is_global = metrics.get_meter_provider() is runtime.provider
+        # Identity check on purpose: "did WE install this exact provider
+        # globally". Typed through `object` because the SDK annotates the
+        # global getter as MeterProvider while ours is the _Provider protocol.
+        global_provider: object = metrics.get_meter_provider()
+        provider_is_global = global_provider is runtime.provider
         with runtime._shutdown_state_lock:
             if runtime._shutdown_complete:
                 _runtime = None

@@ -461,20 +461,22 @@ def test_serialized_control_manifest_write_locks_the_complete_transaction(tmp_pa
     assert not [candidate for candidate in os.listdir(tmp_path) if candidate.endswith(".tmp")]
 
 
-def test_receipt_manifest_lock_retries_interrupted_flock(
+def test_receipt_manifest_lock_surfaces_interrupted_flock_as_check_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """CPython retries flock on EINTR internally (PEP 475), so an
+    InterruptedError reaching Python code means a signal handler raised it
+    deliberately — it must surface as the declared check failure via the
+    ``except OSError`` at the lock site, never be swallowed into a retry."""
     pytest.importorskip("fcntl")
     secure_documents = importlib.import_module("elspeth.web._aws_ecs_acceptance.secure_documents")
     real_fcntl = secure_documents._fcntl
     operations: list[int] = []
 
-    def interrupted_once(descriptor: int, operation: int) -> None:
+    def interrupted(descriptor: int, operation: int) -> None:
         operations.append(operation)
-        if operation == real_fcntl.LOCK_EX and operations.count(real_fcntl.LOCK_EX) == 1:
-            raise InterruptedError
-        real_fcntl.flock(descriptor, operation)
+        raise InterruptedError
 
     monkeypatch.setattr(
         secure_documents,
@@ -482,15 +484,18 @@ def test_receipt_manifest_lock_retries_interrupted_flock(
         SimpleNamespace(
             LOCK_EX=real_fcntl.LOCK_EX,
             LOCK_UN=real_fcntl.LOCK_UN,
-            flock=interrupted_once,
+            flock=interrupted,
         ),
     )
 
     path = tmp_path / "control.json"
-    with secure_documents._receipt_manifest_write_lock(path, check="control_manifest_file"):
+    with (
+        pytest.raises(acceptance.AcceptanceCheckError, match="control_manifest_file"),
+        secure_documents._receipt_manifest_write_lock(path, check="control_manifest_file"),
+    ):
         pass
 
-    assert operations == [real_fcntl.LOCK_EX, real_fcntl.LOCK_EX, real_fcntl.LOCK_UN]
+    assert operations == [real_fcntl.LOCK_EX]
 
 
 @pytest.mark.parametrize("content", ["[]", '"document"', "null", "7"])

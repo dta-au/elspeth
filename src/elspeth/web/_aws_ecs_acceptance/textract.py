@@ -32,6 +32,7 @@ from .contracts import (
     FORBIDDEN_AWS_OVERRIDE_ENV,
     AcceptanceCheckError,
     _resolve_acceptance_s3_location,
+    close_failure,
 )
 
 _TEXTRACT_TRANSFORM_NAME = "aws_textract_document_analysis"
@@ -170,7 +171,6 @@ def verify_textract(
     except Exception:
         raise AcceptanceCheckError("textract_client") from None
 
-    close_failed = False
     try:
         probe_key = f"{prefix}/verify-textract-{probe_suffix_factory()}.probe"
         if len(probe_key.encode("utf-8")) > 1024:
@@ -195,13 +195,14 @@ def verify_textract(
             region=region,
             probe_suffix_factory=probe_suffix_factory,
         )
-    finally:
-        try:
-            client.close()
-        except Exception:
-            close_failed = True
-    if close_failed:
-        raise AcceptanceCheckError("textract_resource_close")
+    except BaseException:
+        # Unwind path: the close failure is attached to the propagating
+        # exception as a PEP 678 note inside close_failure, never dropped.
+        close_failure(client, check="textract_resource_close")
+        raise
+    close_record = close_failure(client, check="textract_resource_close")
+    if close_record is not None:
+        raise AcceptanceCheckError("textract_resource_close", cause_class=close_record.exception_type)
 
     return {
         "transform_registered": True,

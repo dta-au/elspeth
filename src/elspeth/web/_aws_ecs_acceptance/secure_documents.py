@@ -114,17 +114,6 @@ def _publish_receipt_manifest_lock(lock_path: Path, flags: int, *, check: str) -
             Path(temporary_path).unlink(missing_ok=True)
 
 
-def _flock_retry_interrupted(descriptor: int, operation: int) -> None:
-    """Complete a flock operation across transient signal interruptions."""
-
-    while True:
-        try:
-            _fcntl.flock(descriptor, operation)
-        except InterruptedError:
-            continue
-        return
-
-
 @contextlib.contextmanager
 def _receipt_manifest_write_lock(path: Path, *, check: str) -> Iterator[None]:
     """Exclude cross-process receipt writers with one crash-released sidecar."""
@@ -148,14 +137,17 @@ def _receipt_manifest_write_lock(path: Path, *, check: str) -> Iterator[None]:
         ):
             raise AcceptanceCheckError(check)
         try:
-            _flock_retry_interrupted(descriptor, _fcntl.LOCK_EX)
+            # CPython retries flock on EINTR internally (PEP 475); an
+            # InterruptedError escapes only when a signal handler raised it
+            # deliberately, and then it must propagate like any OSError.
+            _fcntl.flock(descriptor, _fcntl.LOCK_EX)
         except OSError:
             raise AcceptanceCheckError(check) from None
         try:
             yield
         finally:
             try:
-                _flock_retry_interrupted(descriptor, _fcntl.LOCK_UN)
+                _fcntl.flock(descriptor, _fcntl.LOCK_UN)
             except OSError:
                 raise AcceptanceCheckError(check) from None
     finally:

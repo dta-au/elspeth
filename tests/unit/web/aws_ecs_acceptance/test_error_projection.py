@@ -392,6 +392,9 @@ def test_check_error_with_cause_redacts_operator_controlled_mapping_keys() -> No
 
 
 def test_check_error_with_cause_survives_an_exception_whose_str_raises() -> None:
+    """Introspection failure is surfaced as the static degradation token —
+    never silently dropped enrichment, and never message text."""
+
     class _UnrenderableError(Exception):
         def __str__(self) -> str:
             raise ValueError("cannot render")
@@ -400,7 +403,8 @@ def test_check_error_with_cause_survives_an_exception_whose_str_raises() -> None
 
     assert isinstance(error, contracts.AcceptanceCheckError)
     assert error.cause_class == "_UnrenderableError"
-    assert error.cause_fields is None
+    assert error.cause_fields == ("<cause-introspection-failed>",)
+    assert "cannot render" not in "".join(error.cause_fields or ())
 
 
 def test_check_error_without_cause_keeps_prior_envelope_shape() -> None:

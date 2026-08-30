@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import re
+import sys
 import typing
 import uuid
 from collections.abc import Iterator, Mapping
@@ -280,6 +281,7 @@ class AcceptanceCheckError(RuntimeError):
 
 _CAUSE_FIELD_TOKEN = re.compile(r"\bELSPETH_[A-Z0-9_]*[A-Z0-9]\b")
 _REDACTED_LOC_SEGMENT = "<redacted>"
+_CAUSE_INTROSPECTION_FAILED = "<cause-introspection-failed>"
 
 
 def _nested_models(annotation: object) -> Iterator[type[BaseModel]]:
@@ -343,7 +345,8 @@ def _safe_loc_segment(part: object) -> str:
     suppresses=("R1", "R5"),
     invariant=(
         "never raises on exc: evaluates str(exc) and probes errors() behind a sentinel getattr inside one "
-        "contextlib.suppress(Exception), admits only Mapping error entries, "
+        "typed try/except whose failure path returns the static <cause-introspection-failed> token, admits "
+        "only Mapping error entries, "
         "redacts every loc segment that is not a declared WebSettings field name, and falls back to static "
         "ELSPETH_* message tokens; returns a static AcceptanceCheckError carrying only the exception class "
         "name and redacted field identifiers, never message text or parsed values"
@@ -364,10 +367,13 @@ def check_error_with_cause(check: str, exc: BaseException) -> AcceptanceCheckErr
     are not themselves a declared schema field name (a mapping key, e.g. an
     ``llm_profiles`` alias) are redacted rather than emitted verbatim.
     """
-    fields: tuple[str, ...] = ()
-    with contextlib.suppress(Exception):
-        # str(exc) is third-party code too; a __str__ that raises leaves fields
-        # empty, and an errors() that raises keeps the token scan's result.
+    # str(exc) and errors() are third-party code. If either raises, the
+    # degradation is surfaced as the static ``<cause-introspection-failed>``
+    # token in cause_fields (operator-visible in the failure envelope) rather
+    # than silently dropping the enrichment. The token is static text, so the
+    # redaction contract — no message text, no parsed values — holds on the
+    # failure path too.
+    try:
         fields = tuple(dict.fromkeys(_CAUSE_FIELD_TOKEN.findall(str(exc))))
         errors = getattr(exc, "errors", None)
         if callable(errors):
@@ -383,11 +389,64 @@ def check_error_with_cause(check: str, exc: BaseException) -> AcceptanceCheckErr
                 )
                 or fields
             )
+    except Exception:
+        return AcceptanceCheckError(
+            check,
+            cause_class=type(exc).__name__,
+            cause_fields=(_CAUSE_INTROSPECTION_FAILED,),
+        )
     return AcceptanceCheckError(
         check,
         cause_class=type(exc).__name__,
         cause_fields=fields or None,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class CheckFailureRecord:
+    """One recorded acceptance-step failure: static check id plus cause class.
+
+    The exception class name is the only cause identity retained — message
+    text and values never enter operator-visible evidence (same redaction
+    discipline as :class:`AcceptanceCheckError`).
+    """
+
+    check: str
+    exception_type: str | None = None
+
+
+def check_failure_error(check: str, failures: typing.Sequence[CheckFailureRecord]) -> AcceptanceCheckError:
+    """Build the declared failure result for ``check`` from recorded failures."""
+
+    record = next((entry for entry in failures if entry.check == check and entry.exception_type is not None), None)
+    return AcceptanceCheckError(check, cause_class=record.exception_type if record is not None else None)
+
+
+class _SupportsClose(typing.Protocol):
+    """Typing-only shape for closeable probe resources (never used for dispatch)."""
+
+    def close(self) -> object: ...
+
+
+def close_failure(resource: _SupportsClose, *, check: str) -> CheckFailureRecord | None:
+    """Close one probe resource; report failure as a record instead of raising.
+
+    A close failure is never silently dropped: on the unwind path (an
+    exception already in flight) it is additionally attached to the
+    propagating exception as a PEP 678 note, and on the normal path the
+    caller converts the returned record into the probe's declared
+    ``AcceptanceCheckError``. Only the exception class name is retained.
+    """
+
+    try:
+        resource.close()
+    except Exception as exc:
+        record = CheckFailureRecord(check=check, exception_type=type(exc).__name__)
+        active = sys.exc_info()[1]
+        if active is not None:
+            active.add_note(f"acceptance resource close also failed during unwind: check={check} cause_class={record.exception_type}")
+        return record
+    return None
 
 
 class OperatorTelemetryAcceptanceError(RuntimeError):
