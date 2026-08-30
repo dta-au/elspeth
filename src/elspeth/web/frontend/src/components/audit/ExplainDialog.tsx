@@ -14,6 +14,7 @@
  */
 import { useEffect, useId, useRef } from "react";
 
+import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { Button } from "@/components/ui";
 import { useAuditReadinessStore } from "../../stores/auditReadinessStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
@@ -118,7 +119,9 @@ export function ExplainDialog({
           )}
 
           {explain && (
-            <pre className="explain-dialog-narrative">{explain.narrative}</pre>
+            <div className="explain-dialog-narrative">
+              <MarkdownRenderer content={explain.narrative} />
+            </div>
           )}
         </div>
       </div>
