@@ -9,9 +9,11 @@ allow_classes:
   owner: architecture
   reason: >-
     Permanent exception — PassThroughContractViolation overrides to_audit_dict
-    with structured fields, and its base class (PluginContractViolation) inherits
-    AuditEvidenceBase directly.  The scanner cannot follow transitive inheritance
-    from AST; the inheritance chain is correct at runtime (issubclass confirmed by
-    test_pass_through_violation_is_audit_evidence).  This is a legitimate override
-    in a known-good inheritance chain, not an accidental duck-type match.
+    with structured fields, and its base class DeclarationContractViolation
+    (src/elspeth/contracts/declaration_contracts.py) inherits AuditEvidenceBase
+    directly.  The scanner resolves only a class's own bases from AST and cannot
+    follow transitive inheritance; the chain is correct at runtime (isinstance
+    pinned by tests/unit/contracts/test_audit_evidence.py::
+    test_pass_through_violation_is_audit_evidence).  This is a legitimate
+    override in a known-good inheritance chain, not an accidental duck-type match.
   task: ADR-010 Task 4 (permanent — not a transitional entry)
