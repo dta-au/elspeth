@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
@@ -61,6 +61,7 @@ from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.sink_effect_attempt_results import decode_sink_effect_returned_result
 from elspeth.core.landscape.execution.sink_effect_identity import compute_pipeline_effect_identity, resolve_sink_effect_members
 from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.operations import _render_exception
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.declaration_dispatch import run_boundary_checks
@@ -78,14 +79,6 @@ if TYPE_CHECKING:
     import threading
 
     from elspeth.core.landscape.factory import RecorderFactory
-
-
-@runtime_checkable
-class _BulkBeginNodeStateRepository(Protocol):
-    def begin_node_states_many(
-        self,
-        entries: Sequence[tuple[str, str, str, int, Mapping[str, object]]],
-    ) -> list[NodeStateOpen]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,17 +417,13 @@ class SinkExecutor:
             operation_type="sink_write",
             input_data=scrub_payload_for_audit({"sink_plugin": sink_name}),
         )
-        # Mirrors track_operation's _render_exception: the violation text can
+        # track_operation's canonical renderer: the violation text can
         # interpolate row values, so it is scrubbed before it reaches the audit
         # trail, and an unrenderable message degrades to the (secret-free) type.
-        try:
-            error_message = scrub_text_for_audit(str(violation))
-        except BaseException:
-            error_message = type(violation).__name__
         self._execution.complete_operation(
             operation_id=operation.operation_id,
             status="failed",
-            error=error_message or type(violation).__name__,
+            error=_render_exception(violation),
             duration_ms=0.0,
         )
 
@@ -549,9 +538,11 @@ class SinkExecutor:
         """
         all_states: list[tuple[TokenInfo, NodeStateOpen]] = []
         try:
-            can_use_bulk_begin = isinstance(self._execution, _BulkBeginNodeStateRepository) and all(
-                token.resume_attempt_offset == 0 and token.resume_checkpoint_id is None for token in tokens
-            )
+            # ExecutionRepository declares begin_node_states_many directly, so the
+            # bulk path needs no capability probe (ADR-032: never dispatch on a
+            # structural Protocol). Resumed tokens still take the singular API,
+            # which alone carries per-token attempt/checkpoint provenance.
+            can_use_bulk_begin = all(token.resume_attempt_offset == 0 and token.resume_checkpoint_id is None for token in tokens)
             if can_use_bulk_begin:
                 opened_states = self._execution.begin_node_states_many(
                     tuple(

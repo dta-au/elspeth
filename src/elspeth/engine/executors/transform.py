@@ -8,7 +8,7 @@ from pydantic import ValidationError
 
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import (
-    BatchTransformRuntimeProtocol,
+    BatchTransformRuntime,
     ExecutionError,
     TokenInfo,
     TransformProtocol,
@@ -294,14 +294,14 @@ class TransformExecutor:
                 f"Original violation: {violation!s}"
             ) from record_failure
 
-    def _get_batch_adapter(self, transform: BatchTransformRuntimeProtocol) -> "SharedBatchAdapter":
+    def _get_batch_adapter(self, transform: BatchTransformRuntime) -> "SharedBatchAdapter":
         """Get or create shared batch adapter for a row-pipelined transform.
 
         Creates adapter once per transform and stores it in the executor's
         own dict (keyed by node_id). On first call, connects the adapter as
         the transform's output port.
 
-        Caller must verify ``isinstance(transform, BatchTransformRuntimeProtocol)``
+        Caller must verify ``isinstance(transform, BatchTransformRuntime)``
         before calling.
 
         Args:
@@ -459,7 +459,7 @@ class TransformExecutor:
         self,
         *,
         transform: TransformProtocol,
-        batch_runtime: BatchTransformRuntimeProtocol | None,
+        batch_runtime: BatchTransformRuntime | None,
         token: TokenInfo,
         ctx: PluginContext,
         state_id: str,
@@ -750,8 +750,11 @@ class TransformExecutor:
         # Detect row-pipelined concurrent transforms (accept/connect_output pattern).
         # ``is_batch_aware`` is intentionally not used here: that flag belongs to
         # aggregation via BatchTransformProtocol, a separate concept.
-        batch_runtime: BatchTransformRuntimeProtocol | None = (
-            transform if isinstance(transform, BatchTransformRuntimeProtocol) and transform.batch_runtime_enabled else None
+        # Nominal opt-in dispatch (ADR-032): a transform participates in the
+        # row-pipelined batch runtime by inheriting BatchTransformRuntime (via
+        # BatchTransformMixin) — never by structural shape.
+        batch_runtime: BatchTransformRuntime | None = (
+            transform if isinstance(transform, BatchTransformRuntime) and transform.batch_runtime_enabled else None
         )
 
         # NodeStateGuard guarantees the node state reaches terminal status.

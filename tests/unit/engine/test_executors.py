@@ -5649,21 +5649,25 @@ class TestReRaiseGuardPattern:
 class TestTransformExecutorBatchPath:
     """Tests for the row-pipelined batch runtime path in TransformExecutor.
 
-    The executor has an entirely separate branch for transforms that implement
-    BatchTransformRuntimeProtocol: adapter creation, register(), accept(),
-    waiter.wait(), and timeout-eviction. These tests verify that branch at the
-    executor level.
+    The executor has an entirely separate branch for transforms that inherit
+    the nominal BatchTransformRuntime contract: adapter creation, register(),
+    accept(), waiter.wait(), and timeout-eviction. These tests verify that
+    branch at the executor level.
     """
 
-    def test_transform_executor_uses_contract_protocol_not_plugin_mixin_import(self) -> None:
+    def test_transform_executor_uses_contract_class_not_plugin_mixin_import(self) -> None:
         source = Path("src/elspeth/engine/executors/transform.py").read_text(encoding="utf-8")
 
         assert "elspeth.plugins.infrastructure.batching.mixin" not in source
-        assert "BatchTransformRuntimeProtocol" in source
+        assert "BatchTransformRuntime" in source
 
-    def test_batch_transform_mixin_satisfies_runtime_protocol(self) -> None:
-        from elspeth.contracts import BatchTransformRuntimeProtocol
+    def test_batch_transform_mixin_is_nominal_runtime_subclass(self) -> None:
+        """Dispatch is nominal (ADR-032): the mixin inherits BatchTransformRuntime,
+        and a structural look-alike that does NOT inherit it is refused."""
+        from elspeth.contracts import BatchTransformRuntime
         from elspeth.plugins.infrastructure.batching.mixin import BatchTransformMixin
+
+        assert issubclass(BatchTransformMixin, BatchTransformRuntime)
 
         class _ConcreteBatchTransform(BatchTransformMixin):
             def __init__(self) -> None:
@@ -5679,9 +5683,28 @@ class TestTransformExecutorBatchPath:
 
         transform = _ConcreteBatchTransform()
 
-        assert isinstance(transform, BatchTransformRuntimeProtocol)
+        assert isinstance(transform, BatchTransformRuntime)
         assert transform.batch_pool_size == 4
         assert transform.batch_wait_timeout == 2.5
+
+        class _StructuralImpostor:
+            """Implements every member structurally without inheriting."""
+
+            node_id = "node_batch"
+            batch_runtime_enabled = True
+            batch_pool_size = 4
+            batch_wait_timeout = 2.5
+
+            def accept(self, row: PipelineRow, ctx: Any) -> None:
+                pass
+
+            def connect_output(self, output: Any, max_pending: int = 30) -> None:
+                pass
+
+            def evict_submission(self, token_id: str, state_id: str) -> bool:
+                return True
+
+        assert not isinstance(_StructuralImpostor(), BatchTransformRuntime)
 
     # --- Helpers ---
 
@@ -5693,10 +5716,10 @@ class TestTransformExecutorBatchPath:
         pool_size: int = 5,
         batch_wait_timeout: float = 10.0,
     ) -> MagicMock:
-        """Create a mock transform that satisfies BatchTransformRuntimeProtocol.
+        """Create a mock transform that inherits the nominal batch runtime contract.
 
-        Uses spec on a real mixin subclass so protocol checks succeed while
-        all methods remain mockable.
+        Built on a real mixin subclass so nominal isinstance dispatch succeeds
+        while all methods remain mockable.
         """
         from elspeth.plugins.infrastructure.batching.mixin import BatchTransformMixin
 

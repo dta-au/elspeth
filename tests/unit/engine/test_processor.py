@@ -7897,6 +7897,11 @@ class TestExecuteTransformWithRetry:
         assert is_retryable(CapacityError(429, "rate limited")) is True
         assert is_retryable(AttributeError("bug")) is False
         assert is_retryable(TypeError("bug")) is False
+        # Bare OSError is a plugin bug-class (FileNotFoundError, PermissionError)
+        # and must NOT be engine-classified retryable — only the canonical
+        # transport signals above are (see PluginRetryableError's contract).
+        assert is_retryable(FileNotFoundError("missing input")) is False
+        assert is_retryable(PermissionError("denied")) is False
 
     def test_shutdown_during_backoff_diverts_with_last_attempt_state_id(self) -> None:
         """InterruptedError born in RetryManager backoff carries no stamp; the

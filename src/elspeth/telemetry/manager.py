@@ -236,8 +236,17 @@ class TelemetryManager:
                 logger.error("Export loop failed unexpectedly", error_type=type(e).__name__)
                 self._stored_exception = e
             except TELEMETRY_TRANSPORT_ERRORS as e:
-                # Transport failure — log but don't crash
-                logger.error("Export loop failed unexpectedly", error_type=type(e).__name__)
+                # Transport failure escaping per-exporter isolation: the event
+                # is lost, so record it in the declared drop accounting
+                # (health_metrics events_dropped) — never a silent discard — and
+                # keep consuming; the loop itself is healthy.
+                with self._dropped_lock:
+                    self._events_dropped += 1
+                logger.error(
+                    "Telemetry export transport failure — event dropped",
+                    error_type=type(e).__name__,
+                    dropped_total=self._events_dropped,
+                )
             except Exception as e:
                 # Programming error — store for re-raise on flush()/close().
                 # Background thread can't raise to main thread directly.
