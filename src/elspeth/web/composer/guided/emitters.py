@@ -323,6 +323,10 @@ def _sink_knobs_with_write_failure(knobs: KnobSchema) -> KnobSchema:
                 "label": "On Write Failure",
                 "description": "Sink name for rows that cannot be written, or 'discard' for explicit drop",
                 "kind": "text",
+                # ``tier`` is a required KnobField key (elspeth-ca456d9d8d):
+                # the guided option summary reads it presentationally, so its
+                # absence here was a latent KeyError on this synthetic knob.
+                "tier": "common",
                 "required": False,
                 "nullable": False,
             }
