@@ -710,9 +710,24 @@ export function AcknowledgementCard({
             disabled={resolveInFlight}
           />
           {amendIsTooLong && (
+            // Characters, not bytes, in the sentence the writer reads. The
+            // byte overage is an UPPER bound on the characters to remove
+            // (multibyte text shortens faster), so "about" is honest.
+            //
+            // The exact figures go in an .sr-only span, NOT in `title` alone.
+            // This <p> is not focusable, so a keyboard user gets no hover and
+            // no focus tooltip; and `title` on a role="status" element is a
+            // naming fallback, not part of the live-region announcement, so a
+            // screen-reader user would hear only the approximate count. The
+            // .sr-only span is inside the live region and is announced with it.
             <p className="ack-card-amend-cap-warning" role="status">
-              Amendment is {amendByteLength} bytes; the maximum is{" "}
-              {INTERPRETATION_AMENDMENT_MAX_BYTES} bytes.
+              Shorten this by about{" "}
+              {amendByteLength - INTERPRETATION_AMENDMENT_MAX_BYTES} characters
+              to fit the {INTERPRETATION_AMENDMENT_MAX_BYTES / 1024} KB limit.
+              <span className="sr-only">
+                {" "}({amendByteLength} bytes; the maximum is{" "}
+                {INTERPRETATION_AMENDMENT_MAX_BYTES} bytes.)
+              </span>
             </p>
           )}
           <div className="ack-card-amend-actions">
