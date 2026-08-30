@@ -120,8 +120,10 @@ def _normalize_value(obj: Any) -> Any:
             return obj.tz_localize("UTC").isoformat()
         return obj.tz_convert("UTC").isoformat()
 
-    # Intentional missing values (NOT NaN - that's rejected above)
-    if obj is pd.NA or (isinstance(obj, type(pd.NaT)) and obj is pd.NaT):
+    # Intentional missing values (NOT NaN - that's rejected above).
+    # Both are singletons, so identity IS the type check: ``obj is pd.NaT``
+    # already implies ``isinstance(obj, type(pd.NaT))``.
+    if obj is pd.NA or obj is pd.NaT:
         return None
 
     # Standard library types
