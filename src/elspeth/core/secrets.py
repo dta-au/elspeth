@@ -18,6 +18,7 @@ from elspeth.contracts.secrets import (
     SecretScope,
     WebSecretResolver,
 )
+from elspeth.contracts.trust_boundary import trust_boundary
 
 _EXACT_ENV_VAR_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}")
 
@@ -120,6 +121,17 @@ def resolve_secret_refs(
     return result, resolutions
 
 
+@trust_boundary(
+    tier=3,
+    source="one node of a web-authored or YAML-authored config tree — an untyped value ELSPETH does not own",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns the (name, scope) marker tuple only for an exact well-formed {'secret_ref': ...} "
+        "mapping; every other shape returns None; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def parse_secret_ref_marker(value: Any) -> tuple[str, SecretScope | None] | None:
     """Return the typed deferred-secret marker, if *value* is exactly one."""
     if isinstance(value, Mapping) and set(value) in ({"secret_ref"}, {"secret_ref", "secret_scope"}):
@@ -159,6 +171,17 @@ def redact_secret_refs_for_validation(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+@trust_boundary(
+    tier=3,
+    source="one node of a deep-copied web-authored config tree — an untyped value ELSPETH does not own",
+    source_param="obj",
+    suppresses=("R5",),
+    invariant=(
+        "replaces wired secret-ref markers with the validation placeholder inside recognized "
+        "Mapping/list shapes and leaves every other node untouched; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _walk_redact(obj: Any) -> None:
     """Recursively replace ``{secret_ref: NAME}`` markers with the placeholder.
 
@@ -179,6 +202,17 @@ def _walk_redact(obj: Any) -> None:
                 _walk_redact(item)
 
 
+@trust_boundary(
+    tier=3,
+    source="one node of a web-authored or YAML-authored config tree — an untyped value ELSPETH does not own",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns the declared secret name only for an exact ${NAME} string whose NAME is in the "
+        "caller-supplied inventory; every other value returns None; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _is_secret_env_ref(value: Any, env_ref_names: Collection[str]) -> str | None:
     """If value is an exact ${NAME} string for a declared secret, return NAME."""
     if not isinstance(value, str) or not env_ref_names:
@@ -202,6 +236,17 @@ def is_secret_ref_marker(value: Any) -> bool:
     return parse_secret_ref_marker(value) is not None
 
 
+@trust_boundary(
+    tier=3,
+    source="one node of a web-authored or YAML-authored config tree — an untyped value ELSPETH does not own",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns True only for an exact secret-ref marker mapping or a declared exact ${NAME} string; "
+        "every other shape returns False; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def is_wired_secret_value(value: Any, env_ref_names: Collection[str] = frozenset()) -> bool:
     """Return True when value uses an approved deferred-secret syntax.
 
@@ -240,6 +285,20 @@ def collect_credential_field_violations(
     )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "a raw plugin-options tree from a pipeline author's settings YAML or a web-authored config "
+        "dict — an untyped value ELSPETH does not own"
+    ),
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "returns the credential field names holding literal strings; unrecognized shapes and non-str "
+        "keys are skipped, never coerced; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _collect_credential_field_violations(
     options: Any,
     env_ref_names: Collection[str],
@@ -311,6 +370,18 @@ def collect_secret_ref_marker_sites(
     return sites
 
 
+@trust_boundary(
+    tier=3,
+    source=("one node of a raw web-authored or YAML-authored config tree — an untyped value ELSPETH does not own"),
+    source_param="obj",
+    suppresses=("R5",),
+    invariant=(
+        "appends a site record for every wired marker or declared env ref and recurses through "
+        "recognized Mapping/list/tuple shapes; unrecognized nodes are skipped; never raises on "
+        "malformed input"
+    ),
+    non_raising=True,
+)
 def _collect_secret_ref_marker_sites(
     obj: Any,
     env_ref_names: Collection[str],
@@ -339,6 +410,18 @@ def _collect_secret_ref_marker_sites(
             _collect_secret_ref_marker_sites(item, env_ref_names, path=(*path, f"[{index}]"), sites=sites)
 
 
+@trust_boundary(
+    tier=3,
+    source=("one node of a deep-copied web-authored config tree being resolved — an untyped value ELSPETH does not own"),
+    source_param="obj",
+    suppresses=("R5",),
+    invariant=(
+        "resolves wired markers in-place inside recognized Mapping/list shapes; unresolvable refs are "
+        "accumulated in `missing` for the caller's SecretResolutionError; unrecognized nodes are left "
+        "untouched; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _walk(
     obj: Any,
     resolver: WebSecretResolver,

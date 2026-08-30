@@ -546,6 +546,32 @@ def test_get_resume_point_returns_none_if_checkpoint_missing_after_can_resume(
     assert recovery_manager.get_resume_point("run-race", _create_graph()) is None
 
 
+def test_get_resume_point_propagates_checkpoint_corruption(
+    db: LandscapeDB,
+    recovery_manager: RecoveryManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tier 1: persisted-checkpoint corruption CRASHES get_resume_point.
+
+    Pins the elspeth-ca0a7e71b1 fix: the dead ``except IncompatibleCheckpointError``
+    swallow around ``get_latest_checkpoint`` is gone — the raw persistence read
+    raises CheckpointCorruptionError on malformed data and nothing converts a
+    checkpoint-load failure into a silent "no resume point".
+    """
+    with db.write_connection() as conn:
+        _insert_run(conn, "run-corrupt", status=RunStatus.FAILED, with_contract=True)
+
+    monkeypatch.setattr(recovery_manager, "can_resume", lambda _run_id, _graph: type("Check", (), {"can_resume": True})())
+
+    def _corrupt(_run_id: str) -> None:
+        raise CheckpointCorruptionError("Corrupted checkpoint row")
+
+    monkeypatch.setattr(recovery_manager._checkpoint_manager, "get_latest_checkpoint", _corrupt)
+
+    with pytest.raises(CheckpointCorruptionError, match="Corrupted checkpoint row"):
+        recovery_manager.get_resume_point("run-corrupt", _create_graph())
+
+
 def test_get_resume_point_restores_barrier_scalars(
     db: LandscapeDB,
     checkpoint_manager: CheckpointManager,

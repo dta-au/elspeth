@@ -2978,3 +2978,83 @@ class TestResolvedPromptTemplateHashAnchor:
         )
         assert call.resolved_prompt_template_hash == "a" * 64
         assert self._calls_row_count(db) == 1
+
+
+class TestAggregationReceiptProbeOutcome:
+    """Post-failure idempotency probe: declared outcomes, integrity signal propagates.
+
+    Pins the mechanism of the elspeth-ca0a7e71b1 fix: the probe's handler
+    catches ONLY SQLAlchemyError (store unreadable → PROBE_UNAVAILABLE);
+    an AuditIntegrityError raised by receipt comparison is a detected Tier-1
+    divergence and must propagate, never be reclassified.
+    """
+
+    @staticmethod
+    def _bare_probe_self(db: object) -> ExecutionRepository:
+        probe_self = ExecutionRepository.__new__(ExecutionRepository)
+        probe_self._db = db  # type: ignore[attr-defined]
+        return probe_self
+
+    @staticmethod
+    def _stub_db(execute_result: object = None, raise_on_execute: Exception | None = None) -> object:
+        from contextlib import contextmanager
+
+        class _StubResult:
+            def one_or_none(self) -> object:
+                return execute_result
+
+        class _StubConn:
+            def execute(self, *_args: object, **_kwargs: object) -> _StubResult:
+                if raise_on_execute is not None:
+                    raise raise_on_execute
+                return _StubResult()
+
+        class _StubDB:
+            @contextmanager
+            def read_only_connection(self):  # type: ignore[no-untyped-def]
+                yield _StubConn()
+
+        return _StubDB()
+
+    def test_probe_unavailable_when_store_unreadable(self) -> None:
+        from sqlalchemy.exc import OperationalError
+
+        from elspeth.core.landscape.execution_repository import _ReceiptProbeOutcome
+
+        repo = self._bare_probe_self(self._stub_db(raise_on_execute=OperationalError("stmt", {}, Exception("down"))))
+        outcome = repo._probe_existing_aggregation_receipt(
+            state_id="s",
+            batch_id="b",
+            receipt_is_exact=lambda *_a, **_k: True,
+        )
+        assert outcome is _ReceiptProbeOutcome.PROBE_UNAVAILABLE
+
+    def test_no_match_when_rows_absent(self) -> None:
+        from elspeth.core.landscape.execution_repository import _ReceiptProbeOutcome
+
+        repo = self._bare_probe_self(self._stub_db(execute_result=None))
+        outcome = repo._probe_existing_aggregation_receipt(
+            state_id="s",
+            batch_id="b",
+            receipt_is_exact=lambda *_a, **_k: True,
+        )
+        assert outcome is _ReceiptProbeOutcome.NO_MATCH
+
+    def test_match_when_receipt_exact(self) -> None:
+        from elspeth.core.landscape.execution_repository import _ReceiptProbeOutcome
+
+        repo = self._bare_probe_self(self._stub_db(execute_result=object()))
+        outcome = repo._probe_existing_aggregation_receipt(
+            state_id="s",
+            batch_id="b",
+            receipt_is_exact=lambda *_a, **_k: True,
+        )
+        assert outcome is _ReceiptProbeOutcome.MATCH
+
+    def test_audit_integrity_error_propagates(self) -> None:
+        def diverged(*_a: object, **_k: object) -> bool:
+            raise AuditIntegrityError("aggregation receipt diverged")
+
+        repo = self._bare_probe_self(self._stub_db(execute_result=object()))
+        with pytest.raises(AuditIntegrityError, match="diverged"):
+            repo._probe_existing_aggregation_receipt(state_id="s", batch_id="b", receipt_is_exact=diverged)

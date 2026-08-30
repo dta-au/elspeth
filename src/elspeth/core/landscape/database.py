@@ -24,6 +24,7 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SENSITIVE_PARAMS, _scrub_odbc_connect_value
 from elspeth.core.landscape.journal import LandscapeJournal
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, metadata, schema_identity_table
@@ -158,6 +159,20 @@ def _query_base_param_name(key: str) -> str:
     return key.split("[", 1)[0].split(".", 1)[0]
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "an operator-supplied database connection string — external configuration whose parsed query "
+        "mapping carries SQLAlchemy's declared str | tuple[str, ...] value union"
+    ),
+    source_param="connection_string",
+    suppresses=("R5",),
+    invariant=(
+        "returns a credential-scrubbed diagnostic URL; an unparseable string returns the redacted "
+        "sentinel '<unparseable database URL redacted>'; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _safe_database_descriptor(connection_string: str) -> str:
     """Return a diagnostic database URL with credentials removed."""
     try:

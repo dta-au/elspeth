@@ -1030,6 +1030,24 @@ def _parse_raw_required_input_fields(
         raise ValueError(f"{owner} {exc}") from exc
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "raw plugin options from a pipeline author's settings YAML or a composer draft — an untyped "
+        "mapping whose 'column'/'queries'/'response_field' keys ELSPETH does not own"
+    ),
+    source_param="options",
+    suppresses=("R1",),
+    invariant=(
+        "raises ValueError (via get_raw_schema_config) on a malformed schema block; absent optional keys "
+        "yield no guarantee rather than a fabricated one, matching the runtime source-config twins"
+    ),
+    test_ref=(
+        "tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::"
+        "test_get_raw_producer_guaranteed_fields_rejects_malformed_schema_block"
+    ),
+    test_fingerprint="b13d59c9126a716ce9bc3aaf2cefcfd70b7edaf2451cb546c748f311a7e6a460",
+)
 def get_raw_producer_guaranteed_fields(
     plugin_name: str | None,
     options: Mapping[str, Any],

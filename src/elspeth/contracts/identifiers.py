@@ -6,6 +6,8 @@ import keyword
 from collections.abc import Sequence
 from typing import TypeGuard
 
+from elspeth.contracts.trust_boundary import trust_boundary
+
 
 def is_valid_field_name(name: object) -> TypeGuard[str]:
     """Whether ``name`` is ACCEPTED by the shared identifier policy.
@@ -69,6 +71,21 @@ def validate_field_name(
     raise ValueError(invalid_identifier_message or f"{context} '{value}' is not a valid Python identifier")
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "a field-name collection from a pipeline author's settings YAML, a web-authored config dict, or "
+        "a to_dict() audit round-trip — an untyped value ELSPETH does not own"
+    ),
+    source_param="names",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when names is a bare string/bytes or not a sequence, when any element fails "
+        "the shared identifier policy, and on disallowed empties/duplicates; never coerces silently"
+    ),
+    test_ref="tests/unit/core/test_identifiers.py::TestValidateFieldNames::test_non_sequence_names_raises",
+    test_fingerprint="bcca410db5963567b5272cb4c6357e5f4d9bc3d12e50f487e78c3a58bccc5f9d",
+)
 def validate_field_names(
     names: Sequence[object],
     context: str,

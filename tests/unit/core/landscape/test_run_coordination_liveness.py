@@ -516,3 +516,52 @@ class TestForeignLeaderFatalLatch:
         # Vacant seat is not foreign: latch must NOT be set.
         assert not thread._coordination_lost_event.is_set()
         thread.check_and_raise()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# best-effort event writer: declared outcome result (never a silent swallow)
+# ---------------------------------------------------------------------------
+
+
+class TestBestEffortEventOutcome:
+    """The best-effort writer records-and-surfaces its failure as a declared result."""
+
+    def test_recorded_outcome_on_healthy_store(self) -> None:
+        from elspeth.core.landscape.run_coordination_repository import (
+            BestEffortEventOutcome,
+            _record_best_effort_event,
+        )
+
+        engine = _make_engine()
+        _seed_run(engine)
+        outcome = _record_best_effort_event(
+            engine,
+            run_id=RUN_ID,
+            event_type="fence_refusal",
+            worker_id="worker-outcome-1",
+            leader_epoch=1,
+            recorded_at=NOW,
+            context={"verb": "test"},
+        )
+        assert outcome is BestEffortEventOutcome.RECORDED
+        assert len(_coordination_events(engine, "fence_refusal")) == 1
+
+    def test_db_fault_returns_lost_outcome_without_raising(self) -> None:
+        from elspeth.core.landscape.run_coordination_repository import (
+            BestEffortEventOutcome,
+            _record_best_effort_event,
+        )
+
+        engine = _make_engine()
+        _seed_run(engine)
+        run_coordination_events_table.drop(engine)
+        outcome = _record_best_effort_event(
+            engine,
+            run_id=RUN_ID,
+            event_type="fence_refusal",
+            worker_id="worker-outcome-2",
+            leader_epoch=1,
+            recorded_at=NOW,
+            context={"verb": "test"},
+        )
+        assert outcome is BestEffortEventOutcome.LOST_TO_DB_FAULT

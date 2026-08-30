@@ -1199,6 +1199,13 @@ class TestSchemaTrustBoundaryCharacterization:
         with pytest.raises(ValueError, match="schema config must be a mapping"):
             parse_raw_schema_config("mode: observed", owner="source:csv")
 
+    def test_get_raw_producer_guaranteed_fields_rejects_malformed_schema_block(self) -> None:
+        """``get_raw_producer_guaranteed_fields`` rejects malformed raw options with ValueError."""
+        from elspeth.contracts.schema import get_raw_producer_guaranteed_fields
+
+        with pytest.raises(ValueError, match="schema config must be a mapping"):
+            get_raw_producer_guaranteed_fields("llm", {"schema": "mode: observed"}, owner="source:llm")
+
     def test_get_aggregation_contract_options_rejects_non_mapping_nested_options(self) -> None:
         """A nested ``options`` wrapper of the wrong shape is rejected, not ignored."""
         from elspeth.contracts.schema import get_aggregation_contract_options

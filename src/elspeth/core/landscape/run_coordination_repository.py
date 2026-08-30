@@ -51,6 +51,7 @@ import socket
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 
 from sqlalchemy import insert, select, update
 from sqlalchemy.engine import Connection
@@ -168,6 +169,22 @@ def record_coordination_event(
     )
 
 
+class BestEffortEventOutcome(Enum):
+    """Declared result of a best-effort coordination-event write.
+
+    ``LOST_TO_DB_FAULT`` is the writer's recorded failure result: the event
+    row could not be written (logged at WARNING for transient lock
+    contention, ERROR otherwise). Losing the event is benign by design
+    (§A.2) — the refused transaction left no durable state needing
+    explanation — so callers may deliberately ignore the outcome, but the
+    failure is always recorded and surfaced as this declared result, never
+    silently discarded.
+    """
+
+    RECORDED = "recorded"
+    LOST_TO_DB_FAULT = "lost_to_db_fault"
+
+
 def _record_best_effort_event(
     engine: Tier1Engine,
     *,
@@ -177,7 +194,7 @@ def _record_best_effort_event(
     leader_epoch: int | None,
     recorded_at: datetime,
     context: Mapping[str, object] | None = None,
-) -> None:
+) -> BestEffortEventOutcome:
     """Write a ledger row on a FRESH connection; best-effort, never raises.
 
     For events whose triggering transaction rolled back (``fence_refusal``) or
@@ -190,8 +207,9 @@ def _record_best_effort_event(
     ``except RunLeadershipLostError: ... raise`` unwind: a raise here would
     REPLACE the recoverable leadership-lost signal with a crash-class error, and
     on the ``record_heartbeat_degraded`` path it would crash the heartbeat thread
-    before it latches coordination-lost. So every DB-layer write fault is
-    swallowed. Transient write contention ("database is locked") logs at WARNING;
+    before it latches coordination-lost. So every DB-layer write fault is recorded
+    (logged) and surfaced as the declared ``LOST_TO_DB_FAULT`` result instead of
+    raising. Transient write contention ("database is locked") logs at WARNING;
     any other DB fault (FK miss on a vanished run, ``event_id`` dedup collision,
     real corruption) logs at ERROR so it stays visible and alarmable without
     crashing the leader. Non-DB faults (e.g. a ``canonical_json`` ``TypeError``)
@@ -219,6 +237,8 @@ def _record_best_effort_event(
             type(exc).__name__,
             exc_info=True,
         )
+        return BestEffortEventOutcome.LOST_TO_DB_FAULT
+    return BestEffortEventOutcome.RECORDED
 
 
 def verify_and_extend_leader_fence(

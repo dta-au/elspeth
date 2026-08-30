@@ -33,6 +33,17 @@ class TestValidateFieldNames:
 
         assert validate_field_names(["user_id", "amount", "date"], "test_context") == ("user_id", "amount", "date")
 
+    def test_non_sequence_names_raises(self) -> None:
+        """A bare string, bytes, or non-sequence names value is rejected at the boundary."""
+        from elspeth.contracts.identifiers import validate_field_names
+
+        with pytest.raises(ValueError, match="sequence of field names"):
+            validate_field_names("user_id", "columns")
+        with pytest.raises(ValueError, match="sequence of field names"):
+            validate_field_names(b"user_id", "columns")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="sequence of field names"):
+            validate_field_names(42, "columns")  # type: ignore[arg-type]
+
     def test_invalid_identifier_raises(self) -> None:
         """Invalid identifier raises with context."""
         from elspeth.contracts.identifiers import validate_field_names

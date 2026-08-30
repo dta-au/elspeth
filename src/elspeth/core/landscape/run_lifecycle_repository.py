@@ -1358,32 +1358,37 @@ class RunLifecycleRepository:
                 f"failed to parse stored JSON — database corruption (Tier 1 violation). "
                 f"Parse error: {exc}"
             ) from exc
-        if not isinstance(resolution_data, dict):
-            raise AuditIntegrityError(
-                f"Corrupt field resolution data for run {run_id} in {location}: expected dict, got {type(resolution_data).__name__}"
-            )
-
-        # Tier 1: resolution_mapping MUST exist if JSON is stored
-        # record_source_field_resolution() always stores this key, so missing = corruption
-        if "resolution_mapping" not in resolution_data:
+        # Tier 1 (our data): record_source_field_resolution() always stores
+        # {"resolution_mapping": {str: str}}. Direct access — shape corruption
+        # crashes as AuditIntegrityError derived from the NATURAL failure
+        # (KeyError/TypeError/AttributeError), never from a defensive
+        # isinstance re-check of our own fixed contract (ADR-032).
+        try:
+            resolution_mapping = resolution_data["resolution_mapping"]
+        except KeyError as exc:
             raise AuditIntegrityError(
                 f"Corrupt field resolution data for run {run_id} in {location}: "
                 f"missing required key 'resolution_mapping'. "
                 f"This indicates database corruption — field resolution writers always store this key."
-            )
+            ) from exc
+        except TypeError as exc:
+            raise AuditIntegrityError(
+                f"Corrupt field resolution data for run {run_id} in {location}: expected dict, got {type(resolution_data).__name__}"
+            ) from exc
 
-        resolution_mapping = resolution_data["resolution_mapping"]
-        if not isinstance(resolution_mapping, dict):
+        try:
+            entries = resolution_mapping.items()
+        except AttributeError as exc:
             raise AuditIntegrityError(
                 f"Corrupt resolution_mapping for run {run_id} in {location}: expected dict, got {type(resolution_mapping).__name__}"
-            )
+            ) from exc
 
-        # Verify all keys and values are strings (Tier 1 — crash on corruption)
-        # Key type check is defense-in-depth: JSON keys are always strings after json.loads(),
-        # but guards against hypothetical non-JSON deserialization paths.
         validated_mapping: dict[str, str] = {}
-        for key, value in resolution_mapping.items():
-            if not isinstance(key, str) or not isinstance(value, str):
+        for key, value in entries:
+            # json.loads guarantees str keys; values must be exactly str per
+            # the writer's fixed contract — exact-type check, crash on
+            # corruption (no hypothetical-deserializer key re-check).
+            if type(value) is not str:
                 raise AuditIntegrityError(
                     f"Corrupt resolution_mapping entry for run {run_id} in {location}: "
                     f"expected str->str, got {type(key).__name__}->{type(value).__name__}"

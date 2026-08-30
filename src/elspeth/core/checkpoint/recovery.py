@@ -793,10 +793,11 @@ class RecoveryManager:
         if not check.can_resume:
             return None
 
-        try:
-            checkpoint = self._checkpoint_manager.get_latest_checkpoint(run_id)
-        except IncompatibleCheckpointError:
-            return None
+        # get_latest_checkpoint is a raw persistence read: it returns a
+        # checkpoint or None and raises CheckpointCorruptionError on malformed
+        # data — it never raises IncompatibleCheckpointError (compatibility is
+        # the validator's job, below). No handler: corruption propagates.
+        checkpoint = self._checkpoint_manager.get_latest_checkpoint(run_id)
         if checkpoint is None:
             return None
 

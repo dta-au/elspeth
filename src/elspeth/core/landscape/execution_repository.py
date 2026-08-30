@@ -16,9 +16,10 @@ delegators.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, overload
 
@@ -110,6 +111,21 @@ if TYPE_CHECKING:
     from elspeth.contracts.payload_store import PayloadStore
 
 __all__ = ["ExecutionRepository", "GroupRecord"]
+
+
+class _ReceiptProbeOutcome(Enum):
+    """Declared result of the post-failure idempotency probe.
+
+    ``PROBE_UNAVAILABLE`` is the probe's recorded failure result: the
+    read-back store could not be queried (it just failed a write, so an
+    unreadable store is expected there) — the caller then surfaces the
+    ORIGINAL write failure. An ``AuditIntegrityError`` raised by receipt
+    comparison is never converted into an outcome; it propagates.
+    """
+
+    MATCH = "match"
+    NO_MATCH = "no_match"
+    PROBE_UNAVAILABLE = "probe_unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -766,6 +782,47 @@ class ExecutionRepository:
             state_id=state_id,
         )
 
+    def _probe_existing_aggregation_receipt(
+        self,
+        *,
+        state_id: str,
+        batch_id: str,
+        receipt_is_exact: Callable[..., bool],
+    ) -> _ReceiptProbeOutcome:
+        """Post-failure idempotency probe for ``complete_aggregation_result``.
+
+        Returns ``MATCH`` when an exact receipt already exists (the failed
+        write was a replay), ``NO_MATCH`` when it does not, and
+        ``PROBE_UNAVAILABLE`` when the store cannot be read at all — the
+        declared failure result the caller answers by surfacing the ORIGINAL
+        write failure. ``AuditIntegrityError`` from ``receipt_is_exact``
+        (a detected receipt divergence) propagates; it is never an outcome.
+        """
+        try:
+            with self._db.read_only_connection() as conn:
+                state = conn.execute(
+                    select(
+                        node_states_table.c.status,
+                        node_states_table.c.output_hash,
+                        node_states_table.c.duration_ms,
+                        node_states_table.c.success_reason_json,
+                        node_states_table.c.context_after_json,
+                    ).where(node_states_table.c.state_id == state_id)
+                ).one_or_none()
+                batch = conn.execute(
+                    select(
+                        batches_table.c.status,
+                        batches_table.c.aggregation_state_id,
+                        batches_table.c.trigger_type,
+                        batches_table.c.trigger_reason,
+                    ).where(batches_table.c.batch_id == batch_id)
+                ).one_or_none()
+                if state is not None and batch is not None and receipt_is_exact(conn, state=state, batch=batch):
+                    return _ReceiptProbeOutcome.MATCH
+                return _ReceiptProbeOutcome.NO_MATCH
+        except SQLAlchemyError:
+            return _ReceiptProbeOutcome.PROBE_UNAVAILABLE
+
     def complete_aggregation_result(
         self,
         *,
@@ -1080,29 +1137,17 @@ class ExecutionRepository:
                             raise AuditIntegrityError("aggregation result member INSERT returned the wrong ordinal")
                 write_body_completed = True
         except SQLAlchemyError as exc:
-            try:
-                with self._db.read_only_connection() as conn:
-                    state = conn.execute(
-                        select(
-                            node_states_table.c.status,
-                            node_states_table.c.output_hash,
-                            node_states_table.c.duration_ms,
-                            node_states_table.c.success_reason_json,
-                            node_states_table.c.context_after_json,
-                        ).where(node_states_table.c.state_id == state_id)
-                    ).one_or_none()
-                    batch = conn.execute(
-                        select(
-                            batches_table.c.status,
-                            batches_table.c.aggregation_state_id,
-                            batches_table.c.trigger_type,
-                            batches_table.c.trigger_reason,
-                        ).where(batches_table.c.batch_id == batch_id)
-                    ).one_or_none()
-                    if state is not None and batch is not None and existing_receipt_is_exact(conn, state=state, batch=batch):
-                        return receipt
-            except (SQLAlchemyError, AuditIntegrityError):
-                pass
+            # AuditIntegrityError from the probe's receipt comparison is a
+            # detected Tier-1 divergence: it PROPAGATES (with this write
+            # failure as its context) instead of being reclassified into the
+            # generic record/post-commit error below.
+            probe = self._probe_existing_aggregation_receipt(
+                state_id=state_id,
+                batch_id=batch_id,
+                receipt_is_exact=existing_receipt_is_exact,
+            )
+            if probe is _ReceiptProbeOutcome.MATCH:
+                return receipt
             error_type = LandscapePostCommitError if write_body_completed else LandscapeRecordError
             raise error_type(f"complete_aggregation_result failed for batch_id={batch_id}: {type(exc).__name__}: {exc}") from exc
         try:

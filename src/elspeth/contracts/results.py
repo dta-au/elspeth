@@ -12,7 +12,7 @@ IMPORTANT:
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
@@ -163,7 +163,11 @@ def _require_artifact_metadata(value: object, field_name: str = "metadata") -> N
     for key, item in value.items():
         if type(key) is not str:
             raise TypeError(f"{field_name} key must be str, got {type(key).__name__}: {key!r}")
-        if isinstance(item, MappingProxyType):
+        # Recurse into EVERY nested mapping, not only already-frozen ones: a
+        # plain dict nested inside a MappingProxyType must FAIL the frozen
+        # check above, not be skipped by it (skipping was the deep-freeze hole
+        # where MappingProxyType({'a': {'b': 1}}) passed unchanged).
+        if isinstance(item, Mapping):
             _require_artifact_metadata(item, f"{field_name}[{key!r}]")
 
 

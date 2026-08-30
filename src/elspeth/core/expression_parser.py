@@ -23,6 +23,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import elspeth.contracts.errors as contract_errors
+from elspeth.contracts.trust_boundary import trust_boundary
 
 if TYPE_CHECKING:
     from elspeth.contracts import PipelineRow
@@ -192,9 +193,23 @@ class _ExpressionValidator(ast.NodeVisitor):
         self._allow_allowed_name_reference = 0
         self._allow_safe_builtin_reference = 0
 
+    @trust_boundary(
+        tier=3,
+        source="one node of the parsed AST of a user-authored pipeline expression — externally authored content",
+        source_param="node",
+        suppresses=("R5",),
+        invariant="returns True only for an ast.Constant carrying None; every other node returns False; never raises",
+        non_raising=True,
+    )
     def _is_none_constant(self, node: ast.expr) -> bool:
-        """Check if node is a None literal (ast.Constant or ast.Name)."""
-        return (isinstance(node, ast.Constant) and node.value is None) or (isinstance(node, ast.Name) and node.id == "None")
+        """Check if node is a None literal.
+
+        Since Python 3.8 the grammar represents ``None`` in source only as
+        ``ast.Constant(value=None)`` — there is no ``ast.Name(id="None")``
+        form, so no second arm exists here (a dormant Name arm would ADMIT a
+        hypothetical future representation instead of rejecting it).
+        """
+        return isinstance(node, ast.Constant) and node.value is None
 
     def _is_allowed_derived(self, node: ast.expr) -> bool:
         """Check if node is an allowed name or derived from allowed name access.
@@ -231,6 +246,14 @@ class _ExpressionValidator(ast.NodeVisitor):
             return
         self.errors.append(f"Forbidden name: {node.id!r}")
 
+    @trust_boundary(
+        tier=3,
+        source="one Subscript node of the parsed AST of a user-authored pipeline expression — externally authored content",
+        source_param="node",
+        suppresses=("R5",),
+        invariant="records a validation error in self.errors for slice syntax and non-allowed receivers; never raises on malformed input",
+        non_raising=True,
+    )
     def visit_Subscript(self, node: ast.Subscript) -> None:
         """Allow subscript access on allowed-name-derived data only."""
         # Reject slice syntax (defense-in-depth, also caught by visit_Slice)
@@ -348,6 +371,17 @@ class _ExpressionValidator(ast.NodeVisitor):
             self.errors.append(f"Forbidden unary operator: {type(node.op).__name__}")
         self.generic_visit(node)
 
+    @trust_boundary(
+        tier=3,
+        source="one Constant node of the parsed AST of a user-authored pipeline expression — externally authored content",
+        source_param="node",
+        suppresses=("R5",),
+        invariant=(
+            "records a validation error in self.errors for non-finite float literals and non-primitive "
+            "constant types; permitted literals return silently; never raises on malformed input"
+        ),
+        non_raising=True,
+    )
     def visit_Constant(self, node: ast.Constant) -> None:
         """Allow literals: strings, numbers, booleans, None."""
         if node.value is None:
