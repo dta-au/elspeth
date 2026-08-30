@@ -415,6 +415,22 @@ _STRUCTURAL_DIRECTIVE_PREFIXES: tuple[str, ...] = (
 )
 
 
+class _GuidedOperationEventValues(TypedDict):
+    """One immutable guided_operation_events row, built without owning DML."""
+
+    session_id: str
+    operation_id: str
+    sequence: int
+    event_kind: Literal["claimed", "renewed", "taken_over", "completed", "failed"]
+    actor: str
+    attempt: int
+    prior_attempt: int | None
+    lease_expires_at: datetime | None
+    request_hash: str
+    failure_audit_cohort: dict[str, object] | None
+    occurred_at: datetime
+
+
 class _PipelineCreatedEventPayload(TypedDict):
     schema: str
     tool_call_id: str
@@ -3982,7 +3998,7 @@ class SessionServiceImpl:
         request_hash: str,
         failure_audit_cohort: GuidedFailureAuditCohort | None,
         occurred_at: datetime,
-    ) -> dict[str, Any]:
+    ) -> _GuidedOperationEventValues:
         """Build one immutable event row without owning or executing DML."""
         if event_kind == "failed" and type(failure_audit_cohort) is not GuidedFailureAuditCohort:
             raise AuditIntegrityError("failed guided operation event must carry exactly one failure audit cohort commitment")
@@ -5974,10 +5990,7 @@ class SessionServiceImpl:
         sid = str(session_id)
 
         def decide_and_soft_archive(transaction: SessionOperationMutationTransaction) -> SessionArchiveDisposition:
-            disposition = transaction.session.decide_and_soft_archive(archived_at=self._now())
-            if disposition is SessionArchiveDisposition.SOFT_ARCHIVED:
-                transaction.composer_progress.retire_session_progress()
-            return disposition
+            return transaction.session.decide_and_soft_archive(archived_at=self._now())
 
         try:
             lease = await SessionOperationLease.acquire(

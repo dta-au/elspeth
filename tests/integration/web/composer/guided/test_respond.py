@@ -5274,6 +5274,106 @@ class TestStep2IntraStep:
         after_replay = _pending_prompt_events()
         assert len(after_replay) == 1, [(event.id, event.user_term, event.llm_draft) for event in after_replay]
 
+    def test_confirm_wiring_replay_repair_is_idempotent_across_a_lost_repair_lease(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The replay repair converges to one identical end state however often it runs.
+
+        ``_repair_replayed_surfacing_debt`` holds its own short COMPOSE lease
+        (the joiner released the operation lease before the after-verified
+        hook runs), so a replica can lose that lease mid-repair exactly as it
+        can lose any other. The debt is computed per site against durable
+        evidence, so: a repair that loses its lease writes nothing durable; the
+        next replay repairs the same single site; every further replay finds
+        nothing owed. Pinned end state: exactly one pending event for the
+        committed node, no extra composition-state version, identical event
+        identity across replays.
+        """
+        from elspeth.web.composer import service as composer_service_module
+        from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_repair_idempotent.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+        session_service = composer_test_client.app.state.session_service
+
+        def _pending_prompt_events() -> list:
+            events = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
+            return [event for event in events if event.affected_node_id == "summarize_rows"]
+
+        def _state_versions() -> dict[str, int]:
+            return asyncio.run(session_service.get_state_version_numbers(UUID(session_id)))
+
+        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+
+        def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
+            raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
+
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            _crash_between_settlement_and_surfacing,
+        )
+        with pytest.raises(_SurfacingWorkerCrash):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert _pending_prompt_events() == []
+        versions_after_settlement = _state_versions()
+
+        # First replay: the repair's own lease is lost mid-write. Nothing
+        # durable may survive that attempt.
+        async def _lose_repair_lease(*_args, **_kwargs):
+            raise SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
+
+        monkeypatch.setattr(composer_service_module, "surface_pending_interpretation_reviews_for_state", _lose_repair_lease)
+        # The leak-safe fence error escapes the route (a 500 to the client,
+        # never a fabricated success): the client retries, exactly as after
+        # the crash above.
+        with pytest.raises(SessionOperationFenceLost):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert _pending_prompt_events() == []
+        assert _state_versions() == versions_after_settlement
+
+        # Second replay: the repair runs to completion and surfaces the one owed site.
+        monkeypatch.setattr(composer_service_module, "surface_pending_interpretation_reviews_for_state", original_surface)
+        repaired = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert repaired.status_code == 200, repaired.json()
+        assert repaired.json()["terminal"]["kind"] == "completed"
+        after_repair = _pending_prompt_events()
+        assert len(after_repair) == 1, [(event.id, event.user_term, event.llm_draft) for event in after_repair]
+        assert _state_versions() == versions_after_settlement
+
+        # Third replay: nothing is owed; the end state is byte-identical.
+        again = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert again.status_code == 200, again.json()
+        assert again.json() == repaired.json()
+        after_again = _pending_prompt_events()
+        assert [(event.id, event.llm_draft, str(event.composition_state_id)) for event in after_again] == [
+            (event.id, event.llm_draft, str(event.composition_state_id)) for event in after_repair
+        ]
+        assert _state_versions() == versions_after_settlement
+
     def test_guided_respond_replay_without_a_proposal_surfaces_nothing(
         self,
         composer_test_client: TestClient,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypedDict
 
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.errors import AuditIntegrityError
@@ -11,6 +11,34 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.web.sessions.proposal_blob_refs import proposal_blob_reference_ids
 
 APPLIED_BLOB_PROPOSAL_TOOLS = frozenset({"update_blob", "delete_blob"})
+
+
+class BlobSnapshotPayload(TypedDict):
+    """The exact persisted blob fields a durable receipt or replacement ledger binds.
+
+    Every value is JSON-ready (ids and timestamps as strings, enums as their
+    values) so the same shape round-trips through the receipt columns and
+    compares byte-for-byte against a live row projection.
+    """
+
+    id: str
+    session_id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    content_hash: str | None
+    storage_path: str
+    created_at: str
+    created_by: str
+    source_description: str | None
+    status: str
+    creation_modality: str
+    created_from_message_id: str | None
+    creating_model_identifier: str | None
+    creating_model_version: str | None
+    creating_provider: str | None
+    creating_composer_skill_hash: str | None
+    creating_arguments_hash: str | None
 
 
 def proposal_blob_arguments_hash(
@@ -33,7 +61,7 @@ def proposal_blob_arguments_hash(
     return stable_hash(arguments)
 
 
-def blob_record_snapshot_payload(record: BlobRecord) -> dict[str, Any]:
+def blob_record_snapshot_payload(record: BlobRecord) -> BlobSnapshotPayload:
     """Project the exact persisted BlobRecord fields bound by a receipt."""
     if type(record) is not BlobRecord:
         raise TypeError("record must be an exact BlobRecord")
@@ -59,7 +87,7 @@ def blob_record_snapshot_payload(record: BlobRecord) -> dict[str, Any]:
     }
 
 
-def blob_row_snapshot_payload(row: Any) -> dict[str, Any]:
+def blob_row_snapshot_payload(row: Any) -> BlobSnapshotPayload:
     """Project a live blob row with the canonical BlobRecord snapshot shape."""
     created_at = row.created_at
     if type(created_at) is not datetime:

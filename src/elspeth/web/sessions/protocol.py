@@ -40,7 +40,6 @@ from elspeth.contracts.composer_interpretation import (
 )
 from elspeth.contracts.composer_llm_audit import ComposerChatTurn, ComposerLLMCall
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
-from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields, require_int
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
@@ -3268,36 +3267,6 @@ class SessionOperationBlobMutations(Protocol):
     ) -> None: ...
 
 
-class SessionOperationComposerProgressMutations(Protocol):
-    """Composer-progress mutations under one exact operation fence."""
-
-    def start_request(
-        self,
-        *,
-        request_id: str,
-        user_id: str,
-        event: ComposerProgressEvent,
-    ) -> datetime: ...
-
-    def publish_progress(
-        self,
-        *,
-        request_id: str,
-        user_id: str,
-        event: ComposerProgressEvent,
-    ) -> datetime: ...
-
-    def finish_request(
-        self,
-        *,
-        request_id: str,
-        user_id: str,
-        terminal_event: ComposerProgressEvent | None,
-    ) -> datetime: ...
-
-    def retire_session_progress(self) -> None: ...
-
-
 class SessionOperationComposerCompletionMutations(Protocol):
     """Completion-audit writes under one exact BLOB_READ operation fence."""
 
@@ -3340,9 +3309,6 @@ class SessionOperationMutationTransaction(Protocol):
 
     @property
     def blobs(self) -> SessionOperationBlobMutations: ...
-
-    @property
-    def composer_progress(self) -> SessionOperationComposerProgressMutations: ...
 
     @property
     def composer_completion(self) -> SessionOperationComposerCompletionMutations: ...

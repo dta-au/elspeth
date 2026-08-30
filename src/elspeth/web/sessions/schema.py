@@ -37,8 +37,6 @@ _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
     "run_start_permits": "ix_run_start_permits_retention_expires_at",
     "websocket_tickets": "ix_websocket_tickets_expires_at",
-    "composer_inflight_requests": "ix_composer_inflight_requests_expires_at",
-    "composer_progress_snapshots": "ix_composer_progress_snapshots_expires_at",
     "rate_limit_buckets": "ix_rate_limit_buckets_expires_at",
     "rate_limit_events": "ix_rate_limit_events_expires_at",
     "sessions_cleanup_claims": "ix_sessions_cleanup_claims_lease_expires_at",

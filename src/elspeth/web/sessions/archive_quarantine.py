@@ -444,8 +444,8 @@ def retire_archive_quarantine(
     _retire_empty_session_directory(data_dir, paths)
 
 
-def _reject_duplicate_fields(pairs: _JsonPairs) -> dict[str, Any]:
-    fields: dict[str, Any] = {}
+def _reject_duplicate_fields(pairs: _JsonPairs) -> dict[str, object]:
+    fields: dict[str, object] = {}
     for key, value in pairs:
         if key in fields:
             raise ValueError(f"manifest contains duplicate field {key!r}")

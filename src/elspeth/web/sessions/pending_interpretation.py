@@ -531,7 +531,7 @@ def _patch_structured_interpretation_prompt(
     accepted_value: str,
     event_id: str | None = None,
     llm_draft: str | None = None,
-) -> dict[str, Any] | None:
+) -> dict[str, object] | None:
     """Resolve structured interpretation metadata, returning patched options.
 
     ``None`` means the node does not carry structured interpretation state and

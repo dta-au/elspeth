@@ -28,8 +28,6 @@ from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.sessions.models import (
     blobs_table,
     composer_completion_events_table,
-    composer_inflight_requests_table,
-    composer_progress_snapshots_table,
     composition_states_table,
     guided_operations_table,
     session_operation_fences_table,
@@ -423,7 +421,6 @@ async def test_active_mutation_object_graph_has_no_database_handle_or_cross_sess
             transaction.composition_states,
             transaction.runs,
             transaction.blobs,
-            transaction.composer_progress,
             transaction.composer_completion,
         )
         reachable = tuple(value for capability in capabilities for value in _callback_instance_graph(capability))
@@ -431,7 +428,6 @@ async def test_active_mutation_object_graph_has_no_database_handle_or_cross_sess
 
         state = object.__getattribute__(transaction, "_RepositoryMutationTransaction__state")
         assert not hasattr(state, "_active_connection")
-        assert not hasattr(transaction.composer_progress, "_connection")
         captured_token.append(object.__getattribute__(state, "_connection_token"))
         with pytest.raises(AttributeError):
             leaked = object.__getattribute__(state, "_connection")
@@ -462,7 +458,6 @@ async def test_every_mutation_capability_is_confined_to_the_callback_thread(serv
             "composition_states": lambda: transaction.composition_states.append_state(object()),
             "runs": lambda: transaction.runs.list_run_events_after(run_id=uuid4(), after_sequence=0),
             "blobs": lambda: transaction.blobs.list_blob_run_links(blob_id=uuid4()),
-            "composer_progress": transaction.composer_progress.retire_session_progress,
             "composer_completion": lambda: transaction.composer_completion.record_yaml_export(
                 composition_state_id=uuid4(),
                 actor="alice",
@@ -675,18 +670,16 @@ async def test_mutation_facade_exposes_no_handle_and_closes_after_callback(servi
                 transaction.composition_states,
                 transaction.runs,
                 transaction.blobs,
-                transaction.composer_progress,
                 transaction.composer_completion,
             )
         )
 
     authority.mutate(context, capture_all_capabilities)
 
-    transaction, session, composition_states, runs, blobs, composer_progress, composer_completion = captured
+    transaction, session, composition_states, runs, blobs, composer_completion = captured
     assert {name for name in dir(transaction) if not name.startswith("_")} == {
         "blobs",
         "composer_completion",
-        "composer_progress",
         "composition_states",
         "database_now",
         "interpretations",
@@ -704,8 +697,6 @@ async def test_mutation_facade_exposes_no_handle_and_closes_after_callback(servi
     with pytest.raises(RuntimeError, match="closed"):
         blobs.list_blob_run_links(blob_id=uuid4())  # type: ignore[attr-defined]
     with pytest.raises(RuntimeError, match="closed"):
-        composer_progress.retire_session_progress()  # type: ignore[attr-defined]
-    with pytest.raises(RuntimeError, match="closed"):
         composer_completion.record_yaml_export(  # type: ignore[attr-defined]
             composition_state_id=uuid4(),
             actor="alice",
@@ -721,86 +712,6 @@ async def test_mutation_facade_exposes_no_handle_and_closes_after_callback(servi
     state = private_states[0]
     assert not hasattr(state, "_connection")
     assert state._connection_token not in coordination_repository._MUTATION_CONNECTION_REGISTRY
-
-
-@pytest.mark.asyncio
-async def test_composer_progress_facet_rejects_detached_thread_before_any_dml(service, engine) -> None:
-    """A callback cannot return between paired progress-table mutations."""
-    created = await service.create_session("alice", "Thread-bound progress", "local")
-    now = datetime.now(UTC)
-    with engine.begin() as connection:
-        connection.execute(
-            insert(composer_inflight_requests_table).values(
-                request_id="thread-bound-request",
-                session_id=str(created.id),
-                user_id="alice",
-                operation_id=str(uuid4()),
-                operation_epoch=2,
-                started_at=now,
-                updated_at=now,
-                completed_at=None,
-                expires_at=now + timedelta(days=1),
-            )
-        )
-        connection.execute(
-            insert(composer_progress_snapshots_table).values(
-                session_id=str(created.id),
-                request_id="thread-bound-request",
-                user_id="alice",
-                phase="starting",
-                headline="Starting",
-                evidence=[],
-                likely_next=None,
-                reason=None,
-                operation_id=str(uuid4()),
-                operation_epoch=2,
-                updated_at=now,
-                expires_at=now + timedelta(days=1),
-            )
-        )
-    authority = service.session_operation_authority
-    archive = authority.acquire(
-        session_id=created.id,
-        operation_kind=SessionOperationKind.ARCHIVE,
-        owner_instance_id="sqlite-test-instance",
-        lease_seconds=30,
-    )
-    worker_errors: list[BaseException] = []
-
-    def attempt_retirement(facet) -> None:
-        try:
-            facet.retire_session_progress()
-        except BaseException as error:
-            worker_errors.append(error)
-
-    def detach_worker(transaction) -> None:
-        worker = Thread(target=attempt_retirement, args=(transaction.composer_progress,))
-        worker.start()
-        worker.join(timeout=5)
-        assert not worker.is_alive()
-
-    authority.mutate(archive, detach_worker)
-
-    assert len(worker_errors) == 1
-    assert isinstance(worker_errors[0], RuntimeError)
-    assert "owning callback thread" in str(worker_errors[0])
-    with engine.connect() as connection:
-        assert (
-            connection.execute(
-                select(composer_inflight_requests_table.c.request_id).where(
-                    composer_inflight_requests_table.c.session_id == str(created.id)
-                )
-            ).scalar_one()
-            == "thread-bound-request"
-        )
-        assert (
-            connection.execute(
-                select(composer_progress_snapshots_table.c.request_id).where(
-                    composer_progress_snapshots_table.c.session_id == str(created.id)
-                )
-            ).scalar_one()
-            == "thread-bound-request"
-        )
 
 
 @pytest.mark.asyncio

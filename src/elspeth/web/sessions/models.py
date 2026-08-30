@@ -241,6 +241,10 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        state, bounded cleanup claims, monotonic user-secret row versions, and
 #        durable proposal blob-effect receipts. Epoch 47 cannot represent these
 #        authorities or receipts and is rejected outright; no migration exists.
+#        The composer_inflight_requests / composer_progress_snapshots tables
+#        drafted for cross-replica composer progress were removed before epoch
+#        48 shipped (John 2026-08-31: progress persistence is deferred to the
+#        cross-replica ticket work; the epoch number is unchanged).
 SESSION_SCHEMA_EPOCH = 48
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
@@ -2399,55 +2403,6 @@ websocket_tickets_table = Table(
     *_non_blank_text_constraints("run_id", name="ck_websocket_tickets_run_id_nonblank"),
     *_non_blank_text_constraints("user_id", name="ck_websocket_tickets_user_id_nonblank"),
     CheckConstraint(_AUTH_PROVIDER_TYPE_CHECK, name="ck_websocket_tickets_auth_provider_type"),
-)
-
-composer_inflight_requests_table = Table(
-    "composer_inflight_requests",
-    metadata,
-    Column("request_id", String, primary_key=True),
-    Column("session_id", String, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True),
-    Column("user_id", String, nullable=False),
-    Column("operation_id", String, nullable=False),
-    Column("operation_epoch", Integer, nullable=False),
-    Column("started_at", DateTime(timezone=True), nullable=False),
-    Column("updated_at", DateTime(timezone=True), nullable=False),
-    Column("completed_at", DateTime(timezone=True), nullable=True),
-    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
-    *_non_blank_text_constraints("request_id", name="ck_composer_inflight_requests_request_id_nonblank"),
-    *_non_blank_text_constraints("session_id", name="ck_composer_inflight_requests_session_id_nonblank"),
-    *_non_blank_text_constraints("user_id", name="ck_composer_inflight_requests_user_id_nonblank"),
-    *_non_blank_text_constraints("operation_id", name="ck_composer_inflight_requests_operation_id_nonblank"),
-    CheckConstraint("operation_epoch > 0", name="ck_composer_inflight_requests_positive_epoch"),
-)
-
-composer_progress_snapshots_table = Table(
-    "composer_progress_snapshots",
-    metadata,
-    Column("session_id", String, ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True),
-    Column("request_id", String, nullable=True),
-    Column("user_id", String, nullable=False),
-    Column("phase", String, nullable=False),
-    Column("headline", String, nullable=False),
-    Column("evidence", JSON, nullable=False),
-    Column("likely_next", JSON, nullable=True),
-    Column("reason", String, nullable=True),
-    Column("operation_id", String, nullable=False),
-    Column("operation_epoch", Integer, nullable=False),
-    Column("updated_at", DateTime(timezone=True), nullable=False),
-    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
-    *_non_blank_text_constraints("session_id", name="ck_composer_progress_snapshots_session_id_nonblank"),
-    *_non_blank_text_constraints(
-        "request_id",
-        name="ck_composer_progress_snapshots_request_id_nonblank",
-        nullable=True,
-    ),
-    *_non_blank_text_constraints("user_id", name="ck_composer_progress_snapshots_user_id_nonblank"),
-    *_non_blank_text_constraints("operation_id", name="ck_composer_progress_snapshots_operation_id_nonblank"),
-    CheckConstraint("operation_epoch > 0", name="ck_composer_progress_snapshots_positive_epoch"),
-    CheckConstraint(
-        "phase IN ('idle', 'starting', 'calling_model', 'using_tools', 'validating', 'saving', 'complete', 'failed', 'cancelled')",
-        name="ck_composer_progress_snapshots_phase",
-    ),
 )
 
 rate_limit_buckets_table = Table(

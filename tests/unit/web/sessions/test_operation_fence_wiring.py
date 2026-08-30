@@ -347,7 +347,6 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
     interpretation_protocol = getattr(sessions_protocol, "SessionOperationInterpretationMutations", None)
     run_protocol = getattr(sessions_protocol, "SessionOperationRunMutations", None)
     blob_protocol = getattr(sessions_protocol, "SessionOperationBlobMutations", None)
-    progress_protocol = getattr(sessions_protocol, "SessionOperationComposerProgressMutations", None)
     completion_protocol = getattr(sessions_protocol, "SessionOperationComposerCompletionMutations", None)
     assert archive_disposition is not None
     assert session_protocol is not None
@@ -355,7 +354,6 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
     assert interpretation_protocol is not None
     assert run_protocol is not None
     assert blob_protocol is not None
-    assert progress_protocol is not None
     assert completion_protocol is not None
 
     implementation_types = (
@@ -376,7 +374,6 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
         "interpretations": interpretation_protocol,
         "runs": run_protocol,
         "blobs": blob_protocol,
-        "composer_progress": progress_protocol,
         "composer_completion": completion_protocol,
     }
     for outer_owner in (sessions_protocol.SessionOperationMutationTransaction, implementation_types[0]):

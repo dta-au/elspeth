@@ -86,8 +86,6 @@ _TABLE_POLICIES: tuple[TablePolicy, ...] = (
         ),
     ),
     TablePolicy("composer_completion_events", "session", "SessionComposerMutationAuthority"),
-    TablePolicy("composer_inflight_requests", "session", "SessionComposerProgressAuthority"),
-    TablePolicy("composer_progress_snapshots", "session", "SessionComposerProgressAuthority"),
     TablePolicy(
         "composition_proposals",
         "session",
@@ -333,26 +331,6 @@ _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
         "src/elspeth/web/coordination/run_recovery_authority.py",
         "RepositoryGlobalRunRecoveryAuthority.mark_landscape_reconciliation_outcomes",
         "GlobalRunRecoveryAuthority",
-    ),
-    AuthoritySymbol(
-        "src/elspeth/web/coordination/composer_progress_mutations.py",
-        "RepositoryComposerProgressMutations.start_request",
-        "SessionComposerProgressAuthority",
-    ),
-    AuthoritySymbol(
-        "src/elspeth/web/coordination/composer_progress_mutations.py",
-        "RepositoryComposerProgressMutations.publish_progress",
-        "SessionComposerProgressAuthority",
-    ),
-    AuthoritySymbol(
-        "src/elspeth/web/coordination/composer_progress_mutations.py",
-        "RepositoryComposerProgressMutations.finish_request",
-        "SessionComposerProgressAuthority",
-    ),
-    AuthoritySymbol(
-        "src/elspeth/web/coordination/composer_progress_mutations.py",
-        "RepositoryComposerProgressMutations.retire_session_progress",
-        "SessionComposerProgressAuthority",
     ),
     AuthoritySymbol(
         "src/elspeth/web/sessions/service.py",
@@ -1155,106 +1133,6 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         1,
         "SessionForkParentGuidedMutations",
         line=3483,
-    ),
-    WriterIdentity(
-        "src/elspeth/web/coordination/composer_progress_mutations.py",
-        "RepositoryComposerProgressMutations.start_request",
-        "composer_inflight_requests",
-        "insert",
-        "56eb1a553056ab83",
-        1,
-        "SessionComposerProgressAuthority",
-        line=277,
-    ),
-    WriterIdentity(
-        "src/elspeth/web/coordination/composer_progress_mutations.py",
-        "RepositoryComposerProgressMutations.start_request",
-        "composer_inflight_requests",
-        "update",
-        "56eb1a553056ab83",
-        1,
-        "SessionComposerProgressAuthority",
-        line=284,
-    ),
-    WriterIdentity(
-        "src/elspeth/web/coordination/composer_progress_mutations.py",
-        "RepositoryComposerProgressMutations.start_request",
-        "composer_progress_snapshots",
-        "insert",
-        "4397a63b112f5d23",
-        1,
-        "SessionComposerProgressAuthority",
-        line=302,
-    ),
-    WriterIdentity(
-        "src/elspeth/web/coordination/composer_progress_mutations.py",
-        "RepositoryComposerProgressMutations.start_request",
-        "composer_progress_snapshots",
-        "update",
-        "4397a63b112f5d23",
-        1,
-        "SessionComposerProgressAuthority",
-        line=309,
-    ),
-    WriterIdentity(
-        "src/elspeth/web/coordination/composer_progress_mutations.py",
-        "RepositoryComposerProgressMutations.publish_progress",
-        "composer_inflight_requests",
-        "update",
-        "8883bc7e3f74724f",
-        1,
-        "SessionComposerProgressAuthority",
-        line=339,
-    ),
-    WriterIdentity(
-        "src/elspeth/web/coordination/composer_progress_mutations.py",
-        "RepositoryComposerProgressMutations.publish_progress",
-        "composer_progress_snapshots",
-        "update",
-        "fc96529526c55da5",
-        1,
-        "SessionComposerProgressAuthority",
-        line=349,
-    ),
-    WriterIdentity(
-        "src/elspeth/web/coordination/composer_progress_mutations.py",
-        "RepositoryComposerProgressMutations.finish_request",
-        "composer_inflight_requests",
-        "update",
-        "6c7edc31abbf6a81",
-        1,
-        "SessionComposerProgressAuthority",
-        line=386,
-    ),
-    WriterIdentity(
-        "src/elspeth/web/coordination/composer_progress_mutations.py",
-        "RepositoryComposerProgressMutations.finish_request",
-        "composer_progress_snapshots",
-        "update",
-        "4741ea78e4077bd6",
-        1,
-        "SessionComposerProgressAuthority",
-        line=403,
-    ),
-    WriterIdentity(
-        "src/elspeth/web/coordination/composer_progress_mutations.py",
-        "RepositoryComposerProgressMutations.retire_session_progress",
-        "composer_inflight_requests",
-        "delete",
-        "55bace25d65b2344",
-        1,
-        "SessionComposerProgressAuthority",
-        line=415,
-    ),
-    WriterIdentity(
-        "src/elspeth/web/coordination/composer_progress_mutations.py",
-        "RepositoryComposerProgressMutations.retire_session_progress",
-        "composer_progress_snapshots",
-        "delete",
-        "4992985ad093271a",
-        1,
-        "SessionComposerProgressAuthority",
-        line=418,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -4088,9 +3966,6 @@ def test_named_authority_registry_is_explicit_extensible_and_exact() -> None:
     assert _authority_for(path, "_ForkChildSessionMutations.insert_child_state") == "SessionForkChildMutations"
     assert _authority_for(path, "_ForkChildSessionMutations.append_child_messages") == "SessionForkChildMutations"
     assert _authority_for(path, "_ForkParentGuidedMutations.bind_guided_fork") == "SessionForkParentGuidedMutations"
-    progress_path = "src/elspeth/web/coordination/composer_progress_mutations.py"
-    for method in ("start_request", "publish_progress", "finish_request", "retire_session_progress"):
-        assert _authority_for(progress_path, f"RepositoryComposerProgressMutations.{method}") == "SessionComposerProgressAuthority"
     assert _authority_for(path, "_ForkCreationTransaction.read_parent_session") is None
     assert _authority_for(path, "_RepositoryRunMutationsReplacement.append_run_event") is None
     assert _authority_for(path, "_RepositorySessionMutations.future_method") is None
@@ -4105,9 +3980,6 @@ def test_named_authority_registry_is_explicit_extensible_and_exact() -> None:
     assert _authority_for(path, "_RepositoryRunMutations.create_pending_runner") is None
     assert _authority_for(path, "_RepositoryRunMutations.future_method") is None
     assert _authority_for(path, "_RepositoryComposerCompletionMutations.future_method") is None
-    assert _authority_for(progress_path, "RepositoryComposerProgressMutations.start_request.helper") == ("SessionComposerProgressAuthority")
-    assert _authority_for(progress_path, "RepositoryComposerProgressMutations.start_request_replacement") is None
-    assert _authority_for(progress_path, "RepositoryComposerProgressMutations.future_method") is None
     assert _authority_for(path, "RepositoryComposerProgressMutations.start_request") is None
     policies = {policy.table: policy for policy in _TABLE_POLICIES}
     assert policies["chat_messages"].operation_authorities == (
@@ -4296,23 +4168,16 @@ def test_simple_interpretation_facet_identities_are_exact_and_replace_legacy_ser
     assert authority_policy_violations(live, _TABLE_POLICIES) == ([], [])
 
 
-def test_existing_run_and_composer_progress_facet_writer_identities_are_exact_and_bidirectional() -> None:
+def test_run_facet_writer_identities_are_exact_and_bidirectional() -> None:
     root = _repo_root()
-    paths = [
-        root / "src/elspeth/web/coordination/repository.py",
-        root / "src/elspeth/web/coordination/composer_progress_mutations.py",
-    ]
+    paths = [root / "src/elspeth/web/coordination/repository.py"]
     symbols = {
         "_RepositoryRunMutations.create_pending_run",
         "_RepositoryRunMutations.transition_run_status",
-        "RepositoryComposerProgressMutations.start_request",
-        "RepositoryComposerProgressMutations.publish_progress",
-        "RepositoryComposerProgressMutations.finish_request",
-        "RepositoryComposerProgressMutations.retire_session_progress",
     }
     live = [site for site in scan_production_writers(paths, anchor=root) if site.symbol in symbols]
     reviewed = [site for site in _REVIEWED_WRITERS if site.symbol in symbols]
-    assert len(live) == len(reviewed) == 12
+    assert len(live) == len(reviewed) == 2
     assert inventory_drift(live, reviewed) == ([], [])
 
 

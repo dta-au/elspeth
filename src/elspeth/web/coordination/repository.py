@@ -50,7 +50,6 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
 from elspeth.web.coordination import mutation_connection_registry as _mutation_connection_registry
-from elspeth.web.coordination.composer_progress_mutations import RepositoryComposerProgressMutations
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
     ArchiveManifestRelation,
@@ -87,7 +86,7 @@ from elspeth.web.sessions.models import (
     sessions_table,
     web_instances_table,
 )
-from elspeth.web.sessions.proposal_blob_effects import blob_record_snapshot_payload, proposal_blob_arguments_hash
+from elspeth.web.sessions.proposal_blob_effects import BlobSnapshotPayload, blob_record_snapshot_payload, proposal_blob_arguments_hash
 from elspeth.web.sessions.proposal_blob_refs import pending_proposal_reference_id
 from elspeth.web.sessions.protocol import (
     GUIDED_OPERATION_KIND_VALUES,
@@ -116,7 +115,6 @@ from elspeth.web.sessions.protocol import (
     SessionGuidedOperationInProgressError,
     SessionNotFoundError,
     SessionOperationBlobMutations,
-    SessionOperationComposerProgressMutations,
     SessionOperationCompositionMutations,
     SessionOperationInterpretationMutations,
     SessionOperationMutationTransaction,
@@ -315,25 +313,23 @@ _ACTIVE_RUN_COMPOSITION_COLUMNS = (
 )
 
 
-def _active_run_pipeline_dict(active_run: Any) -> dict[str, Any]:
-    """Convert one active-run join row to canonical runtime/YAML shape."""
-    return pipeline_dict_from_record(
-        CompositionStateRecord(
-            id=UUID(str(active_run.state_id)),
-            session_id=UUID(str(active_run.state_session_id)),
-            version=active_run.state_version,
-            source=active_run.source,
-            sources=active_run.sources,
-            nodes=active_run.nodes,
-            edges=active_run.edges,
-            outputs=active_run.outputs,
-            metadata_=active_run.metadata_,
-            is_valid=bool(active_run.is_valid),
-            validation_errors=active_run.validation_errors,
-            created_at=active_run.created_at,
-            derived_from_state_id=(UUID(str(active_run.derived_from_state_id)) if active_run.derived_from_state_id is not None else None),
-            composer_meta=active_run.composer_meta,
-        )
+def _active_run_state_record(active_run: Any) -> CompositionStateRecord:
+    """Project one active-run join row onto its exact composition-state record."""
+    return CompositionStateRecord(
+        id=UUID(str(active_run.state_id)),
+        session_id=UUID(str(active_run.state_session_id)),
+        version=active_run.state_version,
+        source=active_run.source,
+        sources=active_run.sources,
+        nodes=active_run.nodes,
+        edges=active_run.edges,
+        outputs=active_run.outputs,
+        metadata_=active_run.metadata_,
+        is_valid=bool(active_run.is_valid),
+        validation_errors=active_run.validation_errors,
+        created_at=active_run.created_at,
+        derived_from_state_id=(UUID(str(active_run.derived_from_state_id)) if active_run.derived_from_state_id is not None else None),
+        composer_meta=active_run.composer_meta,
     )
 
 
@@ -400,7 +396,10 @@ def _composition_references_blob(composition_state: Any, blob_id: str, storage_p
     return False
 
 
-def _ensure_utc(value: datetime) -> datetime:
+def _ensure_utc(value: object) -> datetime:
+    """Normalise one exact datetime row value to UTC; anything else is a malformed row."""
+    if not isinstance(value, datetime):
+        raise AuditIntegrityError("expected a datetime row value")
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
@@ -1526,27 +1525,10 @@ class _RepositoryBlobMutations:
         return self._blob_record(state._require_blob(blob_id))
 
     @staticmethod
-    def _blob_replacement_snapshot(record: BlobRecord) -> dict[str, Any]:
-        return {
-            "id": str(record.id),
-            "session_id": str(record.session_id),
-            "filename": record.filename,
-            "mime_type": record.mime_type,
-            "size_bytes": record.size_bytes,
-            "content_hash": record.content_hash,
-            "storage_path": record.storage_path,
-            "created_at": record.created_at.isoformat(),
-            "created_by": record.created_by,
-            "source_description": record.source_description,
-            "status": record.status,
-            "creation_modality": record.creation_modality.value,
-            "created_from_message_id": record.created_from_message_id,
-            "creating_model_identifier": record.creating_model_identifier,
-            "creating_model_version": record.creating_model_version,
-            "creating_provider": record.creating_provider,
-            "creating_composer_skill_hash": record.creating_composer_skill_hash,
-            "creating_arguments_hash": record.creating_arguments_hash,
-        }
+    def _blob_replacement_snapshot(record: BlobRecord) -> BlobSnapshotPayload:
+        # One projection for receipts and the replacement ledger: a divergent
+        # copy here would let the two snapshots disagree about the same row.
+        return blob_record_snapshot_payload(record)
 
     @staticmethod
     def _blob_replacement_snapshot_record(value: Any) -> BlobRecord:
@@ -2579,7 +2561,7 @@ class _RepositoryBlobMutations:
         ).all()
         for active_run in active_runs:
             try:
-                pipeline = _active_run_pipeline_dict(active_run)
+                pipeline = pipeline_dict_from_record(_active_run_state_record(active_run))
             except AuditIntegrityError:
                 raise
             except (KeyError, TypeError, ValueError) as exc:
@@ -3146,7 +3128,6 @@ class _RepositoryMutationTransaction:
     __slots__ = (
         "__blobs",
         "__composer_completion",
-        "__composer_progress",
         "__composition_states",
         "__interpretations",
         "__runs",
@@ -3175,7 +3156,6 @@ class _RepositoryMutationTransaction:
             self.__interpretations = _RepositoryInterpretationMutations(state)
             self.__runs = _RepositoryRunMutations(state)
             self.__blobs = _RepositoryBlobMutations(state)
-            self.__composer_progress = RepositoryComposerProgressMutations(state)
             self.__composer_completion = _RepositoryComposerCompletionMutations(state)
         except BaseException:
             state._close()
@@ -3210,11 +3190,6 @@ class _RepositoryMutationTransaction:
     def blobs(self) -> SessionOperationBlobMutations:
         self.__state._require_active()
         return self.__blobs
-
-    @property
-    def composer_progress(self) -> SessionOperationComposerProgressMutations:
-        self.__state._require_active()
-        return self.__composer_progress
 
     @property
     def composer_completion(self) -> _RepositoryComposerCompletionMutations:
@@ -3368,7 +3343,7 @@ class _ForkParentGuidedMutations:
         connection_token: str,
         *,
         fork_authority: SessionForkAuthority,
-        guided_operation: dict[str, Any],
+        guided_operation: dict[str, object],
         database_now: datetime,
     ) -> None:
         self.__connection_token = connection_token
@@ -3378,7 +3353,7 @@ class _ForkParentGuidedMutations:
         self.__guided_operation = guided_operation
         self.__database_now = database_now
 
-    def _require_exact_guided_authority(self) -> tuple[Connection, GuidedOperationFence, dict[str, Any]]:
+    def _require_exact_guided_authority(self) -> tuple[Connection, GuidedOperationFence, dict[str, object]]:
         connection = _resolve_fork_mutation_connection(
             self.__connection_token,
             parent_session_id=self.__parent_session_id,
