@@ -3762,12 +3762,12 @@ class SessionServiceImpl:
             raise AuditIntegrityError("Guided operation database clock returned a non-datetime value")
         return SessionServiceImpl._ensure_utc(value)
 
-    def _require_session_fork_authority_on_connection(
+    def _require_session_fork_session_fences_on_connection(
         self,
         conn: Connection,
         authority: SessionForkAuthority,
-    ) -> tuple[Any, datetime]:
-        """Validate parent, child, and guided authority under one pair lock."""
+    ) -> datetime:
+        """Validate the parent and adopted-child session-operation fences only."""
         if type(authority) is not SessionForkAuthority:
             raise TypeError("fork authority must be exact")
         now = self._guided_database_now(conn)
@@ -3789,10 +3789,62 @@ class SessionServiceImpl:
             ).one_or_none()
             if exact is None:
                 raise GuidedOperationFenceLostError(authority.parent.guided_fence)
+        return now
+
+    def _require_session_fork_authority_on_connection(
+        self,
+        conn: Connection,
+        authority: SessionForkAuthority,
+    ) -> tuple[Any, datetime]:
+        """Validate parent, child, and live guided authority under one pair lock."""
+        self._require_session_fork_session_fences_on_connection(conn, authority)
         return self.require_guided_operation_fence_on_connection(
             conn,
             authority.parent.guided_fence,
         )
+
+    def _require_settled_session_fork_authority_on_connection(
+        self,
+        conn: Connection,
+        authority: SessionForkAuthority,
+    ) -> datetime:
+        """Validate fork authority after this transaction terminalised the parent operation.
+
+        Settlement completes the parent guided row first so a later failure
+        rolls the terminal row back atomically. Writes that follow in the same
+        transaction therefore cannot demand a live guided lease; they require
+        the still-live session-operation fences plus a parent row that is
+        ``completed`` and bound to exactly this operation and adopted child.
+        """
+        now = self._require_session_fork_session_fences_on_connection(conn, authority)
+        guided_fence = authority.parent.guided_fence
+        sid = str(guided_fence.session_id)
+        self._assert_session_write_lock_held(conn, sid, caller="_require_settled_session_fork_authority_on_connection")
+        row = (
+            conn.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == sid,
+                    guided_operations_table.c.operation_id == guided_fence.operation_id,
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is not None:
+            self._validate_guided_operation_row(
+                row,
+                expected_session_id=sid,
+                expected_operation_id=guided_fence.operation_id,
+            )
+        if (
+            row is None
+            or row["kind"] != "session_fork"
+            or row["status"] != "completed"
+            or row["attempt"] != guided_fence.attempt
+            or row["result_session_id"] != authority.child_context.fence.session_id
+        ):
+            raise GuidedOperationFenceLostError(guided_fence)
+        return now
 
     def _require_session_operation_context_on_connection(
         self,
@@ -3966,19 +4018,25 @@ class SessionServiceImpl:
         failure_audit_cohort: None,
         occurred_at: datetime,
     ) -> None:
-        """Append the staged child's synthetic terminal event under fork authority."""
+        """Append the staged child's synthetic terminal event under settled fork authority.
+
+        Runs inside ``settle_guided_fork_operation`` after the parent fork row
+        has been completed in the same transaction, so the check is the
+        settled form: live session fences plus a completed parent bound to
+        this child, never a live guided lease.
+        """
         if type(authority) is not SessionForkAuthority:
             raise TypeError("authority must be an exact SessionForkAuthority")
         if session_id != authority.child_context.fence.session_id or event_kind != "completed":
             raise AuditIntegrityError("fork child guided event is not bound to the exact child authority")
-        self._require_session_fork_authority_on_connection(conn, authority)
+        self._require_settled_session_fork_authority_on_connection(conn, authority)
         next_sequence = conn.execute(
             select(func.coalesce(func.max(guided_operation_events_table.c.sequence), 0) + 1).where(
                 guided_operation_events_table.c.session_id == session_id,
                 guided_operation_events_table.c.operation_id == operation_id,
             )
         ).scalar_one()
-        self._require_session_fork_authority_on_connection(conn, authority)
+        self._require_settled_session_fork_authority_on_connection(conn, authority)
         conn.execute(
             insert(guided_operation_events_table).values(
                 **self._guided_operation_event_values(

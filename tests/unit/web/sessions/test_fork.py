@@ -32,6 +32,7 @@ from elspeth.web.sessions.models import (
     composition_states_table,
     guided_operations_table,
     proposal_events_table,
+    session_operation_fences_table,
     sessions_table,
 )
 from elspeth.web.sessions.protocol import (
@@ -2099,6 +2100,11 @@ class TestForkEndpoint:
                     ).scalar_one()
                     == 1
                 )
+            # A dead worker loses BOTH database-clocked leases: the guided
+            # operation row and its session-operation fence. Expire both so the
+            # takeover winner acquires the parent SESSION_FORK lease honestly
+            # instead of stealing a live one.
+            expired_at = datetime.now(UTC) - timedelta(seconds=1)
             with service._engine.begin() as conn:
                 conn.execute(
                     update(guided_operations_table)
@@ -2106,7 +2112,16 @@ class TestForkEndpoint:
                         guided_operations_table.c.session_id == str(parent.id),
                         guided_operations_table.c.operation_id == operation_id,
                     )
-                    .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+                    .values(lease_expires_at=expired_at)
+                )
+                conn.execute(
+                    update(session_operation_fences_table)
+                    .where(
+                        session_operation_fences_table.c.session_id == str(parent.id),
+                        session_operation_fences_table.c.operation_kind == SessionOperationKind.SESSION_FORK.value,
+                        session_operation_fences_table.c.released_at.is_(None),
+                    )
+                    .values(lease_expires_at=expired_at)
                 )
 
             winner_response = await asyncio.to_thread(
@@ -2322,6 +2337,14 @@ class TestForkEndpoint:
             "fork",
             writer_principal="route_user_message",
         )
+        parent_context = await service._run_sync(
+            lambda: service.session_operation_authority.acquire(
+                session_id=parent.id,
+                operation_kind=SessionOperationKind.SESSION_FORK,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
+            )
+        )
         claimed = await service.reserve_guided_operation(
             session_id=parent.id,
             operation_id=str(uuid.uuid4()),
@@ -2329,10 +2352,11 @@ class TestForkEndpoint:
             request_hash="a" * 64,
             actor="test",
             lease_seconds=300,
+            session_operation_context=parent_context,
         )
         assert isinstance(claimed, GuidedOperationClaimed)
         staged = await service.fork_session(
-            claimed.fence,
+            SessionForkParentAuthority(parent_context=parent_context, guided_fence=claimed.fence),
             fork_message_id=fork_message.id,
             new_message_content="edited",
         )

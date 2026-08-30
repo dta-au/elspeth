@@ -2457,13 +2457,17 @@ class BlobServiceImpl:
         stage = _stage_blob_deletion(storage)
 
         try:
+            registered_at = self._now()
             conn.execute(
                 blob_deletion_cleanups_table.insert().values(
                     blob_id=blob_id_str,
                     session_id=row.session_id,
                     storage_path=str(stage.storage),
                     tombstone_path=str(stage.tombstone) if stage.tombstone is not None else None,
-                    created_at=self._now(),
+                    created_at=registered_at,
+                    # The ledger keeps a monotonic (created_at, updated_at) pair;
+                    # a fresh registration has been updated exactly when created.
+                    updated_at=registered_at,
                 )
             )
             # Session qualification is required even though the UUID is

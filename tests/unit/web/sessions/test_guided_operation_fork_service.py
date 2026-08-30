@@ -29,6 +29,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     blobs_table,
     chat_messages_table,
+    guided_operation_events_table,
     guided_operations_table,
     session_operation_fences_table,
     sessions_table,
@@ -1828,3 +1829,143 @@ async def test_current_fence_and_concurrent_takeover_reuse_one_hidden_child(dura
             assert operation.result_session_id == str(initial.session.id)
     finally:
         _cleanup_race_user(durable_engine, user_id)
+
+
+async def _parent_with_guided_root_fork_message(service: SessionServiceImpl):
+    """A parent whose pre-send state carries a guided session bound to a root intent."""
+    from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
+    from elspeth.web.composer.guided.state_machine import GuidedSession, TurnRecord
+
+    parent = await service.create_session("alice", "Parent", "local")
+    root = await service.add_message(parent.id, "user", "root", writer_principal="route_user_message")
+    guided = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        history=(
+            TurnRecord(
+                step=GuidedStep.STEP_1_SOURCE,
+                turn_type=TurnType.INSPECT_AND_CONFIRM,
+                payload_hash="a" * 64,
+                response_hash=None,
+                emitter="server",
+            ),
+        ),
+        root_intent_message_id=str(root.id),
+    )
+    from tests.unit.web.sessions.test_fork import _complete_guided_start_authority
+
+    state_data = CompositionStateData(
+        sources={},
+        nodes=[],
+        edges=[],
+        outputs=[],
+        metadata_={"name": "Guided", "description": ""},
+        is_valid=True,
+        composer_meta={"guided_session": guided.to_dict()},
+    )
+    state = await _save_composition_state(service, parent.id, state_data, provenance="session_seed")
+    await _complete_guided_start_authority(
+        service,
+        session_id=parent.id,
+        root_message=root,
+        state=state,
+        state_data=state_data,
+    )
+    fork_message = await service.add_message(
+        parent.id,
+        "user",
+        "fork here",
+        composition_state_id=state.id,
+        writer_principal="route_user_message",
+    )
+    return parent, fork_message
+
+
+@pytest.mark.asyncio
+async def test_settled_fork_authority_requires_completed_parent_bound_to_child(
+    service: SessionServiceImpl,
+) -> None:
+    """The settled-authority check is the post-completion form: live session
+    fences plus a parent fork row already ``completed`` for exactly this child.
+
+    Before settlement the parent row is still ``in_progress``, so the settled
+    check must refuse (fail closed) even though the live-lease check accepts.
+    """
+    parent, fork_message = await _parent_with_guided_root_fork_message(service)
+    parent_authority = await _claim_dual_fenced_fork(service, parent.id)
+    staged = await service.fork_session(
+        parent_authority,
+        fork_message_id=fork_message.id,
+        new_message_content="edited",
+    )
+    try:
+        parent_id, child_id = str(parent.id), str(staged.session.id)
+
+        def _check_before_settlement() -> None:
+            with service._session_pair_locked_begin(parent_id, child_id) as conn:
+                service._require_session_fork_authority_on_connection(conn, staged.authority)
+                with pytest.raises(GuidedOperationFenceLostError):
+                    service._require_settled_session_fork_authority_on_connection(conn, staged.authority)
+
+        await service._run_sync(_check_before_settlement)
+    finally:
+        _release_fork_authority(service, staged.authority)
+
+
+@pytest.mark.asyncio
+async def test_settling_a_guided_root_fork_records_the_child_terminal_event_after_parent_completion(
+    service: SessionServiceImpl,
+    engine,
+) -> None:
+    """Settlement completes the parent fork row first (so a later failure rolls
+    it back atomically) and then records the child's synthetic ``guided_start``
+    completion under the settled form of the fork authority. Demanding a live
+    guided lease there refused every guided-root fork and left replay joiners
+    polling until lease expiry.
+    """
+    parent, fork_message = await _parent_with_guided_root_fork_message(service)
+    parent_authority = await _claim_dual_fenced_fork(service, parent.id)
+    staged = await service.fork_session(
+        parent_authority,
+        fork_message_id=fork_message.id,
+        new_message_content="edited",
+    )
+    assert staged.state is not None
+    try:
+        settled = await service.settle_guided_fork_operation(
+            GuidedForkSettlementCommand(
+                authority=staged.authority,
+                expected_current_state_id=staged.state.id,
+                edited_message_id=staged.messages[-1].id,
+                rewritten_state_id=None,
+                rewritten_state=None,
+                response_hash="b" * 64,
+                actor="composer_route",
+            )
+        )
+    finally:
+        _release_fork_authority(service, staged.authority)
+    assert settled.id == staged.session.id
+
+    with engine.connect() as conn:
+        parent_row = conn.execute(
+            select(guided_operations_table).where(
+                guided_operations_table.c.session_id == str(parent.id),
+                guided_operations_table.c.operation_id == parent_authority.guided_fence.operation_id,
+            )
+        ).one()
+        assert parent_row.status == "completed"
+        assert parent_row.result_session_id == str(settled.id)
+        child_start = conn.execute(
+            select(guided_operations_table).where(
+                guided_operations_table.c.session_id == str(settled.id),
+                guided_operations_table.c.kind == "guided_start",
+            )
+        ).one()
+        assert child_start.status == "completed"
+        events = conn.execute(
+            select(guided_operation_events_table.c.event_kind).where(
+                guided_operation_events_table.c.session_id == str(settled.id),
+                guided_operation_events_table.c.operation_id == child_start.operation_id,
+            )
+        ).all()
+        assert [event.event_kind for event in events] == ["completed"]
