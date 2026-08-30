@@ -827,10 +827,29 @@ def _is_gate_condition_authored_decision(*, user_term: str) -> bool:
     return user_term.strip() == GATE_CONDITION_AUTHORED_USER_TERM
 
 
-def _validated_mapping_pair(source_field: object, target_field: object, *, context: str, node_id: str) -> tuple[str, str]:
-    if not isinstance(source_field, str) or not isinstance(target_field, str):
+@trust_boundary(
+    tier=3,
+    source="one side of a node.options['mapping'] item on a field_mapper composer node — an "
+    "untyped authored value persisted through sessions.db storage, a composer LLM tool call, or "
+    "YAML import",
+    source_param="field",
+    suppresses=("R5",),
+    invariant="raises ValueError whenever the mapping side is not a str; never coerces, "
+    "stringifies, or substitutes a default for a malformed side",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_validated_mapping_field_rejects_non_string_mapping_sides",
+    test_fingerprint="dbd1cadb64e0020d540e8430f2ff1412f2bb097afe9d6b6754b21b8196746ac8",
+)
+def _validated_mapping_field(field: object, *, context: str, node_id: str) -> str:
+    if not isinstance(field, str):
         raise ValueError(f"{context}: field_mapper.mapping on node {node_id!r} must map string field names to string field names")
-    return (source_field, target_field)
+    return field
+
+
+def _validated_mapping_pair(source_field: object, target_field: object, *, context: str, node_id: str) -> tuple[str, str]:
+    return (
+        _validated_mapping_field(source_field, context=context, node_id=node_id),
+        _validated_mapping_field(target_field, context=context, node_id=node_id),
+    )
 
 
 def _looks_like_raw_html_field(field_name: str) -> bool:

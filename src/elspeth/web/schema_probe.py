@@ -15,6 +15,7 @@ from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.advisory_locks import ELSPETH_SCHEMA_INIT_LOCK_CLASSID
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape.database import (
     LandscapeSchemaShape,
     SchemaCompatibilityError,
@@ -96,6 +97,20 @@ def _target_error() -> DatabaseTargetConflictError:
     return DatabaseTargetConflictError(_TARGET_ERROR)
 
 
+@trust_boundary(
+    tier=3,
+    source="operator-supplied database URL (settings/env-authored connection string) whose query "
+    "string sqlalchemy parses into an unguaranteed mapping",
+    source_param="url",
+    suppresses=("R1", "R5"),
+    invariant="raises DatabaseTargetConflictError on every malformed or unprovable input: an "
+    "unparseable URL, a non-postgresql driver, a missing host or database, a connection-target "
+    "query override, a non-string or non-single-search-path options value, and an unstable or "
+    "oversized schema identifier; absence of the optional options key is the only tolerated gap "
+    "and never fabricates a schema",
+    test_ref="tests/unit/web/test_schema_probe.py::test_unprovable_target_is_rejected_with_static_message",
+    test_fingerprint="32df7ac5a595bab682693c7b20c9aeeacac93809fd5752f4e1fb6b34374f8092",
+)
 def postgres_logical_target_key(url: str | URL) -> PostgresLogicalTarget:
     """Parse only statically provable PostgreSQL logical-target attributes."""
     try:
@@ -172,6 +187,17 @@ def probe_landscape_schema(bind: Engine | Connection) -> SchemaState:
     }[probe_schema_shape(bind)]
 
 
+@trust_boundary(
+    tier=3,
+    source="a sqlalchemy OperationalError wrapping a third-party DBAPI driver exception whose "
+    "sqlstate/pgcode attributes are driver-specific and unguaranteed",
+    source_param="exc",
+    suppresses=("R5",),
+    invariant="never raises on exc: returns the SQLSTATE only when the driver exposes it as a "
+    "str (psycopg 'sqlstate', psycopg2 'pgcode'), and the None sentinel for an absent or "
+    "non-string value; never coerces or fabricates a code",
+    non_raising=True,
+)
 def _sqlstate(exc: OperationalError) -> str | None:
     original = exc.orig
     value = getattr(original, "sqlstate", None)

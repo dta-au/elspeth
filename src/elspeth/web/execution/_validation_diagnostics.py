@@ -59,9 +59,14 @@ def _reframe_settings_missing_parts(exc: PydanticValidationError) -> list[Valida
     """
     missing_parts: set[str] = set()
     for error in exc.errors():
-        if error.get("type") != "missing":
+        # pydantic's ErrorDetails is third-party data: read the two keys in
+        # the visible membership-then-subscript form. An absent key simply
+        # fails to match, and this reframe contributes nothing — the original
+        # pydantic error still surfaces through the caller.
+        error_type = error["type"] if "type" in error else None
+        if error_type != "missing":
             continue
-        loc = error.get("loc") or ()
+        loc = error["loc"] if "loc" in error else ()
         part = loc[0] if loc else None
         if isinstance(part, str) and part in _SETTINGS_MISSING_PART_REFRAMES:
             missing_parts.add(part)
