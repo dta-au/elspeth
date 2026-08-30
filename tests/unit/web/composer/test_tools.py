@@ -86,6 +86,11 @@ from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessio
 from elspeth.web.sessions.schema import initialize_session_schema
 
 
+def _enveloped(value):
+    """Store a composition_states JSON column exactly as production writes it."""
+    return {"_version": 1, "data": value}
+
+
 def _attached_notes(exc: BaseException) -> tuple[str, ...]:
     """Notes ``BaseException.add_note`` attached to ``exc``; empty when none were.
 
@@ -5673,11 +5678,11 @@ class TestDeleteBlobActiveRunGuard:
                     id=state_id,
                     session_id=self.session_id,
                     version=1,
-                    source=source,
-                    nodes=[],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
+                    source=_enveloped(source),
+                    nodes=_enveloped([]),
+                    edges=_enveloped([]),
+                    outputs=_enveloped([]),
+                    metadata_=_enveloped({"name": "Test", "description": ""}),
                     is_valid=False,
                     validation_errors=None,
                     # Plan §2294: composer-tools test fixture; provenance
@@ -14966,11 +14971,11 @@ class TestUpdateBlobActiveRunGuard:
                     id=state_id,
                     session_id=self.session_id,
                     version=1,
-                    source=source,
-                    nodes=[],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
+                    source=_enveloped(source),
+                    nodes=_enveloped([]),
+                    edges=_enveloped([]),
+                    outputs=_enveloped([]),
+                    metadata_=_enveloped({"name": "Test", "description": ""}),
                     is_valid=False,
                     validation_errors=None,
                     # Plan §2294: composer-tools test fixture; provenance

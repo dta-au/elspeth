@@ -23,6 +23,7 @@ from elspeth.web.execution.schemas import (
     RunAccountingTokens,
     RunStatusResponse,
 )
+from elspeth.web.sessions.archive_quarantine import archive_quarantine_paths, list_archive_quarantine_manifests
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import (
@@ -254,8 +255,6 @@ class TestSessionCRUD:
         blob_file = blob_dir / "some-blob_data.csv"
         blob_file.write_text("col1\nval1")
 
-        quarantine_dir = data_dir / ".archive_quarantine" / sid
-
         def fail_rmtree(_path: object) -> None:
             raise OSError("permission denied removing staged blob directory")
 
@@ -287,8 +286,15 @@ class TestSessionCRUD:
             await service_with_dir.get_session(session.id)
 
         assert not blob_dir.exists()
-        assert quarantine_dir.is_dir()
-        assert (quarantine_dir / blob_file.name).read_text() == "col1\nval1"
+        # The archive quarantine is an exact per-operation obligation
+        # (.archive_quarantine/v1/<session>/<epoch>-<operation>/payload); the
+        # staged payload must survive the failed purge byte-for-byte.
+        (manifest,) = list_archive_quarantine_manifests(data_dir, session.id)
+        assert manifest.identity.session_id == session.id
+        assert manifest.source_present is True
+        payload_dir = archive_quarantine_paths(data_dir, manifest.identity).payload
+        assert payload_dir.is_dir()
+        assert (payload_dir / blob_file.name).read_text() == "col1\nval1"
 
 
 class TestRunEvents:

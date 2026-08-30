@@ -47,6 +47,7 @@ from elspeth.web.blobs.protocol import (
     BlobInProgressForkError,
     BlobIntegrityError,
     BlobNotFoundError,
+    BlobPendingProposalError,
     BlobQuotaExceededError,
     fork_blob_id,
 )
@@ -70,6 +71,11 @@ from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServi
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+def _enveloped(value):
+    """Store a composition_states JSON column exactly as production writes it."""
+    return {"_version": 1, "data": value}
 
 
 @pytest.fixture()
@@ -614,7 +620,14 @@ class TestDeleteBlob:
             await blob_service.get_blob(record.id)
 
     @pytest.mark.asyncio
-    async def test_pending_delete_proposal_does_not_retain_its_own_target(self, blob_service, session_id, db_engine) -> None:
+    async def test_pending_delete_proposal_retains_its_target_from_a_direct_delete(self, blob_service, session_id, db_engine) -> None:
+        """A staged delete_blob proposal is reviewed evidence over its target.
+
+        Until that proposal settles, a direct (non-proposal) delete of the same
+        blob is refused exactly like any other pending reference; only the
+        accepting tool path may exclude its own proposal, and it must name it
+        (``pending_proposal_reference_id(accepting_proposal_id=...)``).
+        """
         record = await blob_service.create_blob(
             session_id=session_id,
             filename="delete-target.csv",
@@ -644,9 +657,9 @@ class TestDeleteBlob:
                 )
             )
 
-        await blob_service.delete_blob(record.id)
-        with pytest.raises(BlobNotFoundError):
-            await blob_service.get_blob(record.id)
+        with pytest.raises(BlobPendingProposalError):
+            await blob_service.delete_blob(record.id)
+        assert (await blob_service.get_blob(record.id)).id == record.id
 
     @pytest.mark.asyncio
     async def test_unrelated_nested_blob_id_does_not_create_pending_retention(self, blob_service, session_id, db_engine) -> None:
@@ -958,16 +971,18 @@ class TestDeleteBlob:
                     version=1,
                     # Source references this blob via blob_ref — the run is
                     # about to link it once link_blob_to_run() fires.
-                    source={
-                        "plugin": "csv",
-                        "on_success": "output",
-                        "on_validation_failure": "quarantine",
-                        "options": {"blob_ref": str(record.id), "path": str(record.storage_path)},
-                    },
-                    nodes=[],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
+                    source=_enveloped(
+                        {
+                            "plugin": "csv",
+                            "on_success": "output",
+                            "on_validation_failure": "quarantine",
+                            "options": {"blob_ref": str(record.id), "path": str(record.storage_path)},
+                        }
+                    ),
+                    nodes=_enveloped([]),
+                    edges=_enveloped([]),
+                    outputs=_enveloped([]),
+                    metadata_=_enveloped({"name": "Test", "description": ""}),
                     is_valid=True,
                     # Plan §2294: every test-side direct composition_states
                     # insert must supply provenance after Task 3's CHECK
@@ -1028,16 +1043,18 @@ class TestDeleteBlob:
                     version=1,
                     # Source uses file path, NOT blob_ref — run is unrelated
                     # to the blob being deleted.
-                    source={
-                        "plugin": "csv",
-                        "on_success": "output",
-                        "on_validation_failure": "quarantine",
-                        "options": {"path": "/data/external/other.csv"},
-                    },
-                    nodes=[],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
+                    source=_enveloped(
+                        {
+                            "plugin": "csv",
+                            "on_success": "output",
+                            "on_validation_failure": "quarantine",
+                            "options": {"path": "/data/external/other.csv"},
+                        }
+                    ),
+                    nodes=_enveloped([]),
+                    edges=_enveloped([]),
+                    outputs=_enveloped([]),
+                    metadata_=_enveloped({"name": "Test", "description": ""}),
                     is_valid=True,
                     # Plan §2294: every test-side direct composition_states
                     # insert must supply provenance after Task 3's CHECK
@@ -1092,32 +1109,36 @@ class TestDeleteBlob:
                     id=state_id,
                     session_id=session_id_str,
                     version=1,
-                    source={
-                        "plugin": "csv",
-                        "on_success": "classify",
-                        "on_validation_failure": "quarantine",
-                        "options": {"path": "/data/external/other.csv"},
-                    },
-                    nodes=[
+                    source=_enveloped(
                         {
-                            "id": "classify",
-                            "node_type": "transform",
-                            "plugin": "llm",
-                            "input": "source_out",
-                            "on_success": "output",
-                            "on_error": "discard",
-                            "options": {
-                                "system_prompt": {
-                                    "blob_ref": str(record.id),
-                                    "mode": "inline_content",
-                                    "sha256": record.content_hash,
-                                }
-                            },
+                            "plugin": "csv",
+                            "on_success": "classify",
+                            "on_validation_failure": "quarantine",
+                            "options": {"path": "/data/external/other.csv"},
                         }
-                    ],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
+                    ),
+                    nodes=_enveloped(
+                        [
+                            {
+                                "id": "classify",
+                                "node_type": "transform",
+                                "plugin": "llm",
+                                "input": "source_out",
+                                "on_success": "output",
+                                "on_error": "discard",
+                                "options": {
+                                    "system_prompt": {
+                                        "blob_ref": str(record.id),
+                                        "mode": "inline_content",
+                                        "sha256": record.content_hash,
+                                    }
+                                },
+                            }
+                        ]
+                    ),
+                    edges=_enveloped([]),
+                    outputs=_enveloped([]),
+                    metadata_=_enveloped({"name": "Test", "description": ""}),
                     is_valid=True,
                     provenance="session_seed",
                     created_at=datetime(2026, 1, 1, tzinfo=UTC),
@@ -1170,16 +1191,18 @@ class TestDeleteBlob:
                     session_id=session_id_str,
                     version=1,
                     # Source references this blob via path, NOT blob_ref.
-                    source={
-                        "plugin": "csv",
-                        "on_success": "output",
-                        "on_validation_failure": "quarantine",
-                        "options": {"path": record.storage_path},
-                    },
-                    nodes=[],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
+                    source=_enveloped(
+                        {
+                            "plugin": "csv",
+                            "on_success": "output",
+                            "on_validation_failure": "quarantine",
+                            "options": {"path": record.storage_path},
+                        }
+                    ),
+                    nodes=_enveloped([]),
+                    edges=_enveloped([]),
+                    outputs=_enveloped([]),
+                    metadata_=_enveloped({"name": "Test", "description": ""}),
                     is_valid=True,
                     # Plan §2294: every test-side direct composition_states
                     # insert must supply provenance after Task 3's CHECK

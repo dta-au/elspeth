@@ -82,6 +82,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.proposal_blob_refs import pending_proposal_reference_id
 from elspeth.web.sessions.protocol import CompositionStateRecord
+from elspeth.web.sessions.state_envelope import unwrap_state_column
 
 _T = TypeVar("_T")
 
@@ -159,6 +160,7 @@ _ACTIVE_RUN_COMPOSITION_COLUMNS = (
     composition_states_table.c.session_id.label("state_session_id"),
     composition_states_table.c.version.label("state_version"),
     composition_states_table.c.source,
+    composition_states_table.c.sources,
     composition_states_table.c.nodes,
     composition_states_table.c.edges,
     composition_states_table.c.outputs,
@@ -176,22 +178,28 @@ def _uuid_from_db(value: Any) -> UUID:
 
 
 def _active_run_pipeline_dict(active_run: Any) -> dict[str, Any]:
-    """Convert an active-run join row to canonical runtime/YAML shape."""
+    """Convert an active-run join row to canonical runtime/YAML shape.
+
+    The JSON columns arrive in their on-disk envelope; reading them raw
+    misread every production row (the guard raised KeyError instead of
+    refusing the mutation), so each column goes through the one envelope rule.
+    """
     return pipeline_dict_from_record(
         CompositionStateRecord(
             id=_uuid_from_db(active_run.state_id),
             session_id=_uuid_from_db(active_run.state_session_id),
             version=active_run.state_version,
-            source=active_run.source,
-            nodes=active_run.nodes,
-            edges=active_run.edges,
-            outputs=active_run.outputs,
-            metadata_=active_run.metadata_,
+            source=unwrap_state_column(active_run.source),
+            sources=unwrap_state_column(active_run.sources),
+            nodes=unwrap_state_column(active_run.nodes),
+            edges=unwrap_state_column(active_run.edges),
+            outputs=unwrap_state_column(active_run.outputs),
+            metadata_=unwrap_state_column(active_run.metadata_),
             is_valid=bool(active_run.is_valid),
             validation_errors=active_run.validation_errors,
             created_at=active_run.created_at,
             derived_from_state_id=_uuid_from_db(active_run.derived_from_state_id) if active_run.derived_from_state_id is not None else None,
-            composer_meta=active_run.composer_meta,
+            composer_meta=unwrap_state_column(active_run.composer_meta),
         )
     )
 

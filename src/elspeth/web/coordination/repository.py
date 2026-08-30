@@ -129,6 +129,7 @@ from elspeth.web.sessions.protocol import (
     SessionRunEventType,
     SessionRunStatus,
 )
+from elspeth.web.sessions.state_envelope import envelope_state_column, unwrap_state_column
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -319,17 +320,17 @@ def _active_run_state_record(active_run: Any) -> CompositionStateRecord:
         id=UUID(str(active_run.state_id)),
         session_id=UUID(str(active_run.state_session_id)),
         version=active_run.state_version,
-        source=active_run.source,
-        sources=active_run.sources,
-        nodes=active_run.nodes,
-        edges=active_run.edges,
-        outputs=active_run.outputs,
-        metadata_=active_run.metadata_,
+        source=unwrap_state_column(active_run.source),
+        sources=unwrap_state_column(active_run.sources),
+        nodes=unwrap_state_column(active_run.nodes),
+        edges=unwrap_state_column(active_run.edges),
+        outputs=unwrap_state_column(active_run.outputs),
+        metadata_=unwrap_state_column(active_run.metadata_),
         is_valid=bool(active_run.is_valid),
         validation_errors=active_run.validation_errors,
         created_at=active_run.created_at,
         derived_from_state_id=(UUID(str(active_run.derived_from_state_id)) if active_run.derived_from_state_id is not None else None),
-        composer_meta=active_run.composer_meta,
+        composer_meta=unwrap_state_column(active_run.composer_meta),
     )
 
 
@@ -404,8 +405,7 @@ def _ensure_utc(value: object) -> datetime:
 
 
 def _composition_state_column(value: Any) -> Any:
-    raw = deep_thaw(value)
-    return None if raw is None else {"_version": 1, "data": raw}
+    return envelope_state_column(value)
 
 
 def _validate_owner(owner_instance_id: str) -> None:
@@ -730,11 +730,7 @@ class _RepositoryInterpretationMutations:
 
     @staticmethod
     def _state_column(value: Any) -> Any:
-        if value is None:
-            return None
-        if type(value) is not dict or value.get("_version") != 1 or "data" not in value:
-            raise AuditIntegrityError("composition state column has no supported version envelope")
-        return value["data"]
+        return unwrap_state_column(value)
 
     @classmethod
     def _state_record(cls, row: Row[Any]) -> CompositionStateRecord:

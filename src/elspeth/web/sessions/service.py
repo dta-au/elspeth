@@ -279,6 +279,7 @@ from elspeth.web.sessions.skill_markdown_history import (
     RepositorySkillMarkdownHistoryAuthority,
     SkillMarkdownHistoryAuthority,
 )
+from elspeth.web.sessions.state_envelope import envelope_state_column, unwrap_state_column
 from elspeth.web.sessions.telemetry import _SessionsTelemetry
 from elspeth.web.validation import _validate_accepted_value_content
 
@@ -1353,22 +1354,8 @@ def _validate_tool_call_id_set_equality(
 
 
 def _enveloped_state_column(value: Any) -> Any:
-    """Return the JSON envelope stored by composition_states JSON columns.
-
-    Existing ``save_composition_state`` and ``fork_session`` each carried a
-    local ``_enveloped`` helper. ``_insert_composition_state`` is module/class
-    scope, so the envelope rule must be extracted before the helper can
-    call it. Do not duplicate the helper back into individual methods.
-
-    The envelope shape ``{"_version": 1, "data": <raw>}`` is the on-disk
-    format for ``composition_states``' JSON columns; the ``_version``
-    field is reserved for schema evolution. ``deep_thaw()`` handles
-    ``MappingProxyType``/``frozenset``/tuple unwrap from ``freeze_fields()``.
-    """
-    raw = deep_thaw(value)
-    if raw is None:
-        return None
-    return {"_version": 1, "data": raw}
+    """Wrap one composition_states JSON column through the single envelope rule."""
+    return envelope_state_column(value)
 
 
 def _strip_guided_profile_in_meta(
@@ -8792,20 +8779,8 @@ class SessionServiceImpl:
 
     @staticmethod
     def _unwrap_envelope(val: Any) -> Any:
-        """Unwrap _version envelope from a JSON column value.
-
-        Seam contract A: JSON columns are stored with {"_version": 1, "data": ...}.
-        Raises ValueError on unknown versions. Returns None for NULL columns.
-        """
-        if val is None:
-            return None
-        if isinstance(val, dict) and "_version" in val:
-            if val["_version"] != 1:
-                raise ValueError(f"Unknown composition state envelope version: {val['_version']}")
-            return val["data"]
-        raise ValueError(
-            f"Composition state column has no _version envelope: {val!r}. This indicates a bug in the write path or database corruption."
-        )
+        """Unwrap one composition_states JSON column through the single envelope rule."""
+        return unwrap_state_column(val)
 
     def _row_to_state_record(self, row: Any) -> CompositionStateRecord:
         """Convert a SQLAlchemy row to a CompositionStateRecord.
