@@ -1593,3 +1593,19 @@ def test_redact_guided_snapshot_degrade_value_sweeps_planted_private_paths() -> 
     assert _PRIVATE_A not in projected
     assert sources_out["a"]["options"]["glob"] == REDACTED_BLOB_SOURCE_PATH
     assert meta_out["guided_session"]["custody_unavailable"] is True
+
+
+def test_redact_guided_snapshot_degrade_value_sweeps_snapshot_and_pending_carrier_values() -> None:
+    """Fix round 2 F-B1b: the degrade sweep's needles also include the reviewed-
+    snapshot and pending-intent carrier string values, so a private path known
+    only to a pending intent (absent from every live source) cannot ride out
+    under a non-carrier label."""
+    sources, composer_meta = _two_guided_committed_sources_repointed_after_exit(_EXITED_TERMINAL)
+    assert _PRIVATE_B not in json.dumps(sources), "the adversarial value must be pending-intent-only"
+    composer_meta["implicit_decisions"]["entries"].append({"path": "note", "value": _PRIVATE_B, "category": "source"})
+
+    sources_out, meta_out = _project(sources, composer_meta)
+
+    projected = json.dumps((sources_out, meta_out))
+    assert _PRIVATE_B not in projected
+    assert meta_out["guided_session"]["custody_unavailable"] is True

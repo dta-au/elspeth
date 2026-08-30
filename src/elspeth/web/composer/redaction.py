@@ -4302,9 +4302,9 @@ def _degrade_guided_snapshot_storage_paths(
 
     Every live-source, reviewed-snapshot, and pending-intent path carrier is
     masked unconditionally and never stamped with a sentinel; then every
-    string anywhere in the projection equal to a raw live carrier value is
-    masked too, so a private path planted under a non-carrier key cannot ride
-    out. The projected ``guided_session`` gains ``custody_unavailable: true``.
+    string anywhere in the projection equal to a raw live, reviewed-snapshot,
+    or pending-intent carrier value is masked too, so a private path planted
+    under a non-carrier key cannot ride out. The projected ``guided_session`` gains ``custody_unavailable: true``.
     Projection-only: ``GuidedSession.from_dict`` rejects the key, so it can
     never persist.
     """
@@ -4371,16 +4371,23 @@ def _degrade_guided_snapshot_storage_paths(
         masked_report["entries"] = masked_entries
         meta_out["implicit_decisions"] = masked_report
 
-    live_carrier_values = frozenset(
+    carrier_values = frozenset(
         value
-        for live_source in (raw_sources or {}).values()
-        if type(live_source) is dict and "options" in live_source and type(live_source["options"]) is dict
+        for options in (
+            *(
+                live_source["options"]
+                for live_source in (raw_sources or {}).values()
+                if type(live_source) is dict and "options" in live_source and type(live_source["options"]) is dict
+            ),
+            *(snapshot["options"] for snapshot in guided["reviewed_sources"].values()),
+            *(intent["options"] for intent in guided["pending_source_intents"].values() if intent["options"] is not None),
+        )
         for key in GUIDED_REVIEWED_BLOB_PATH_KEYS
-        if key in live_source["options"] and type(value := live_source["options"][key]) is str
+        if key in options and type(value := options[key]) is str
     )
-    if live_carrier_values:
-        sources_out = _sweep_equal_strings(sources_out, live_carrier_values)
-        meta_out = _sweep_equal_strings(meta_out, live_carrier_values)
+    if carrier_values:
+        sources_out = _sweep_equal_strings(sources_out, carrier_values)
+        meta_out = _sweep_equal_strings(meta_out, carrier_values)
     return sources_out, meta_out
 
 
