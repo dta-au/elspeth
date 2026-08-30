@@ -8,6 +8,7 @@ import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { resetStore } from "@/test/store-helpers";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import { unavailablePluginDisplayName } from "./UnavailableComponentRow";
 
 vi.mock("@/api/client", () => ({
@@ -790,5 +791,17 @@ describe("CatalogDrawer — unavailable-components notice placement", () => {
       name: "Unavailable saved components",
     });
     expect(screen.getByRole("tabpanel")).toContainElement(banner);
+  });
+
+  it("default DOM of the unavailable-components section passes the shared pin with the button names exempted", async () => {
+    const { container } = render(<CatalogDrawer isOpen onClose={() => {}} />);
+    // Present FIRST. The notice is gated on catalog load AND on the finding's
+    // snapshot_fingerprint matching, so a synchronous pin would scan an empty
+    // DOM and pass vacuously — the same trap the sibling tests in this
+    // describe guard against.
+    await screen.findByRole("region", { name: "Unavailable saved components" });
+    expectNoIdentifiersInDefaultDom(container, {
+      allowAriaLabelSelectors: [".import-yaml-actions"],
+    });
   });
 });

@@ -5,6 +5,9 @@
 // (elspeth-aa39cffb16). The authored component id is the actionable name and
 // stays; the plugin renders by display name with the raw id demoted to a
 // title attribute (copy register). Callers supply `key` on this element.
+// The authored component id is the actionable name and stays — in <code>,
+// the identifier register, because the user matches it against their own
+// YAML (elspeth-59631ec7f7 ruling).
 // ============================================================================
 
 import type { ReactNode } from "react";
@@ -42,7 +45,7 @@ export function UnavailableComponentRow({
   return (
     <li className="validation-banner-error-item">
       <div>
-        <strong>{finding.component_id}</strong>{" "}
+        <strong><code>{finding.component_id}</code></strong>{" "}
         <span title={finding.plugin_id}>{unavailablePluginDisplayName(finding.plugin_id)}</span>{" "}
         — {reasonLabel}
       </div>
