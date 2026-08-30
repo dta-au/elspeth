@@ -3709,3 +3709,38 @@ def test_a_session_still_mid_review_still_gets_its_repairable_rejection() -> Non
     # Only the REVIEWED name is offered: a pending component has no reviewed
     # name to name, and inventing one would be a fact the operator never set.
     assert raised.value.connectivity == {"component_kind": "sources", "reviewed_source_names": ["source"]}
+
+
+@pytest.mark.parametrize(
+    "malformed_entry",
+    [
+        "not a node dict",
+        {"node_type": "transform", "plugin": "passthrough", "input": "in", "on_success": "out"},
+        {"id": 7, "node_type": "transform", "plugin": "passthrough", "input": "in", "on_success": "out"},
+    ],
+    ids=["non_dict", "missing_id", "non_string_id"],
+)
+def test_bind_prose_amend_records_unidentifiable_node_entry_as_malformed(malformed_entry: object) -> None:
+    """A node entry without a string ``id`` cannot be adjudicated against the amend contract.
+
+    It must be recorded as ``node_entry_malformed`` (and the candidate
+    rejected), never silently classified as an added node — the silent
+    classification laundered id-less dicts past the amend contract.
+    """
+    candidate = _minimal_amend_reconstruction()
+    nodes = candidate["nodes"]
+    assert isinstance(nodes, list)
+    nodes.append(malformed_entry)
+
+    result = guided_planning.bind_guided_prose_revision_candidate(
+        candidate,
+        _guided(),
+        authority=_amend_authority(),
+    )
+
+    assert result.rejection_code == "guided_amend_contract_violation"
+    assert {"violation": "node_entry_malformed"} in list(result.violations)
+    # The malformed entry never reaches the deterministic rejected-candidate
+    # topology either: it is neither an existing reconstruction nor an
+    # admissible added node.
+    assert malformed_entry not in result.pipeline["nodes"]

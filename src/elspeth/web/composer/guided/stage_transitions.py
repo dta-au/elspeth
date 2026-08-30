@@ -18,6 +18,7 @@ from uuid import UUID
 from pydantic import JsonValue
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.core.secrets import collect_credential_field_violations
 from elspeth.web.catalog.knob_schema import KnobSchema, validate_knob_schema
@@ -806,6 +807,22 @@ def remove_reviewed_component(session: GuidedSession, target: ComponentTarget) -
     return replace(session, output_order=next_order, reviewed_outputs=next_reviewed_outputs)
 
 
+@trust_boundary(
+    tier=3,
+    source=("a client-submitted reorder request's stable-id collection, arriving as untyped wire input from the guided review routes"),
+    source_param="stable_ids",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError for a non-sequence value, for the str/bytes/bytearray character-sequence trap, and "
+        "for any member that is not an exact UUID; raises ValueError unless the submitted ids are an exact "
+        "permutation of the reviewed component ids; never reorders on a partial or defaulted collection"
+    ),
+    test_ref=(
+        "tests/unit/web/composer/guided/test_stage_transitions.py::"
+        "test_reorder_reviewed_components_rejects_non_sequence_and_non_uuid_stable_ids"
+    ),
+    test_fingerprint="31d6b383fe1fdf39d9c474a1960db71e17e9ddd23e3f49aa28fec9bb35801236",
+)
 def reorder_reviewed_components(
     session: GuidedSession,
     component_kind: Literal["source", "output"],

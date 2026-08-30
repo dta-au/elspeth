@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import Any, Final, cast
 
 from elspeth.contracts.freeze import FrozenJsonArray, deep_thaw, freeze_fields
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.bounded_json import (
     JSON_MAX_DEPTH,
@@ -46,6 +47,26 @@ class GuidedJsonBudget:
             raise InvariantError(f"{field_name} exceeds the {GUIDED_JSON_MAX_TOTAL_UTF8_BYTES}-byte aggregate JSON UTF-8 limit at {path}")
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "one strict-JSON value from an externally submitted guided payload (LLM tool-call output or "
+        "client-submitted wire value), recursively re-entered for every child container and leaf"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises InvariantError for every value outside the bounded strict-JSON domain — excess depth, a "
+        "recursive container, a non-str mapping key, an over-limit string/key/item count, a number outside "
+        "the canonical JSON domain, or any non-JSON leaf type — and never coerces or defaults; the Mapping "
+        "ABC check is the parse (replay values arrive deep-frozen as MappingProxyType, which an exact-dict "
+        "test would reject) while lists are held to exact list/FrozenJsonArray"
+    ),
+    test_ref=(
+        "tests/unit/web/composer/guided/test_resolved_freeze_boundaries.py::test_validate_and_freeze_guided_json_rejects_non_json_leaf"
+    ),
+    test_fingerprint="26d4283f0ea786a2d3feaf5f27cab5ba262d28ccfce1b6b74edf572c305fdbcc",
+)
 def _validate_and_freeze_guided_json(
     value: object,
     field_name: str,
@@ -127,6 +148,22 @@ def _validate_and_freeze_guided_json(
     raise InvariantError(f"{field_name} value at {path} must be an exact JSON leaf, list, or mapping; got {type(value).__name__}")
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "an externally submitted guided JSON object (LLM tool-call output or client-submitted wire value) "
+        "being promoted to a detached frozen mapping"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError for any non-mapping value before promotion — the Mapping ABC check is the parse, "
+        "since replay values arrive deep-frozen as MappingProxyType — and delegates every interior value to "
+        "the bounded strict-JSON freezer, which raises InvariantError instead of coercing"
+    ),
+    test_ref=("tests/unit/web/composer/guided/test_resolved_freeze_boundaries.py::test_freeze_guided_json_mapping_rejects_non_mapping"),
+    test_fingerprint="9c395b3188c421683e9f51a67098142498d3647162796bb92a411283477c8436",
+)
 def freeze_guided_json_mapping(value: object, field_name: str, *, budget: GuidedJsonBudget | None = None) -> Mapping[str, Any]:
     """Return a detached immutable strict-JSON object with repository bounds."""
     if not isinstance(value, Mapping):
@@ -142,6 +179,22 @@ def freeze_guided_json_mapping(value: object, field_name: str, *, budget: Guided
     return cast(Mapping[str, Any], frozen)
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "an externally submitted guided sequence of strings (LLM tool-call output or client-submitted wire "
+        "value) being promoted to a bounded owned tuple"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError for a non-sequence value, for the str/bytes/bytearray character-sequence trap, and "
+        "for any non-str member; raises InvariantError for item-count or string-length bound violations; "
+        "never coerces or defaults"
+    ),
+    test_ref=("tests/unit/web/composer/guided/test_resolved_freeze_boundaries.py::test_freeze_guided_str_sequence_rejects_non_sequence"),
+    test_fingerprint="5216fdb2a0b805ff4807ff8782f99e58525782f30f9ac5737aa8369443c91a78",
+)
 def freeze_guided_str_sequence(
     value: object,
     field_name: str,

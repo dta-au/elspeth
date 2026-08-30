@@ -871,6 +871,42 @@ def resolve_guided_correction_target(
     )
 
 
+class _GuidedCorrectionWirePayload(TypedDict):
+    """Closed wire-review envelope normalized from a Step-3 proposal projection."""
+
+    sources: list[Any]
+    nodes: list[Any]
+    connections: list[Any]
+    outputs: list[Any]
+
+
+def _guided_proposal_correction_wire_payload(proposal_payload: Mapping[str, Any]) -> _GuidedCorrectionWirePayload:
+    """Normalize the Step-3 proposal envelope to the wire-review collection names.
+
+    ``proposal_payload`` is the server-built PROPOSE_PIPELINE projection — a
+    first-party turn payload built by ``build_guided_proposal_projection`` and
+    passed either directly or from durable custody (``current_turn["payload"]``)
+    — so its envelope is a fixed Tier-1 contract. Required keys are read
+    directly and any deviation crashes as an audit-integrity break instead of
+    being defaulted around.
+    """
+    if "graph" not in proposal_payload or "nodes" not in proposal_payload or "outputs" not in proposal_payload:
+        raise AuditIntegrityError("guided proposal correction projection is malformed")
+    graph = proposal_payload["graph"]
+    nodes = proposal_payload["nodes"]
+    outputs = proposal_payload["outputs"]
+    if type(graph) is not dict or "sources" not in graph or "edges" not in graph:
+        raise AuditIntegrityError("guided proposal correction projection is malformed")
+    if type(graph["sources"]) is not list or type(graph["edges"]) is not list or type(nodes) is not list or type(outputs) is not list:
+        raise AuditIntegrityError("guided proposal correction projection is malformed")
+    return {
+        "sources": graph["sources"],
+        "nodes": nodes,
+        "connections": graph["edges"],
+        "outputs": outputs,
+    }
+
+
 def resolve_guided_proposal_correction_target(
     *,
     requested: ComponentTarget,
@@ -886,25 +922,9 @@ def resolve_guided_proposal_correction_target(
     is added to the provider-visible target.
     """
 
-    graph = proposal_payload.get("graph")
-    nodes = proposal_payload.get("nodes")
-    outputs = proposal_payload.get("outputs")
-    if (
-        type(graph) is not dict
-        or type(graph.get("sources")) is not list
-        or type(graph.get("edges")) is not list
-        or type(nodes) is not list
-        or type(outputs) is not list
-    ):
-        raise AuditIntegrityError("guided proposal correction projection is malformed")
     return resolve_guided_correction_target(
         requested=requested,
-        wire_payload={
-            "sources": graph["sources"],
-            "nodes": nodes,
-            "connections": graph["edges"],
-            "outputs": outputs,
-        },
+        wire_payload=_guided_proposal_correction_wire_payload(proposal_payload),
         predecessor=predecessor,
     )
 
@@ -982,24 +1002,8 @@ def require_guided_proposal_correction_target_changed(
 ) -> None:
     """Apply the exact correction-change proof to a Step-3 proposal projection."""
 
-    graph = proposal_payload.get("graph")
-    nodes = proposal_payload.get("nodes")
-    outputs = proposal_payload.get("outputs")
-    if (
-        type(graph) is not dict
-        or type(graph.get("sources")) is not list
-        or type(graph.get("edges")) is not list
-        or type(nodes) is not list
-        or type(outputs) is not list
-    ):
-        raise AuditIntegrityError("guided proposal correction projection is malformed")
     require_guided_correction_target_changed(
-        {
-            "sources": graph["sources"],
-            "nodes": nodes,
-            "connections": graph["edges"],
-            "outputs": outputs,
-        },
+        _guided_proposal_correction_wire_payload(proposal_payload),
         target,
         successor,
     )
@@ -1218,6 +1222,22 @@ def guided_redacted_current_state_context(state: CompositionState) -> dict[str, 
     }
 
 
+@observation_boundary(
+    tier=3,
+    source=(
+        "reviewed sink options carried on SinkOutputResolved: free-form plugin configuration authored through "
+        "the composer (planner tool calls or the schema_form), stored verbatim and never schema-validated by "
+        "the composer, so the 'schema' block's interior shape is not guaranteed here"
+    ),
+    source_param="options",
+    suppresses=("R1",),
+    invariant=(
+        "merges declared output fields into options['schema'].required_fields only when the authored schema "
+        "block and its required_fields are the expected dict/list-of-str shapes; returns the options unchanged "
+        "(still externally authored, for candidate validation to reject as contract_config_invalid) for any "
+        "malformed schema block, and never raises on malformed source_param shape"
+    ),
+)
 def _sink_options_with_declared_required_fields(
     options: dict[str, JsonValue],
     declared_fields: Sequence[str],
@@ -1246,12 +1266,15 @@ def _sink_options_with_declared_required_fields(
     schema_key = "schema" if "schema" in options else ("schema_config" if "schema_config" in options else "schema")
     raw_schema = options.get(schema_key)
     if raw_schema is None:
+        # A fresh server-seeded block: "required_fields" is absent by
+        # construction, so the authored-fields read below starts from None.
         schema: dict[str, JsonValue] = {"mode": "observed"}
+        existing: JsonValue | None = None
     elif type(raw_schema) is dict:
         schema = raw_schema
+        existing = raw_schema.get("required_fields")
     else:
         return options
-    existing = schema.get("required_fields")
     if existing is None:
         authored: list[str] = []
     elif type(existing) is list and all(type(item) is str for item in existing):
@@ -2309,7 +2332,7 @@ def materialize_guided_authorized_candidate(
         "this reads them"
     ),
     source_param="bound",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "returns only the node ids, connection names, and branch connection names actually present in "
         "well-formed list/dict entries under bound['nodes']; a candidate whose 'nodes' (or a node's "
@@ -3043,6 +3066,27 @@ def bind_guided_reviewed_components(
     return cast(GuidedBoundPipeline, bound)
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "guided-planner LLM-authored prose-revision candidate pipeline (the terminal set_pipeline tool call's "
+        "topology), after server-side deep_thaw and before reviewed source/output authority is restored"
+    ),
+    source_param="pipeline",
+    suppresses=("R1",),
+    invariant=(
+        "raises GuidedCandidateBindingRejected for a candidate that cannot be bound to reviewed authority — a "
+        "non-list 'nodes' collection here, or any inner-binder rejection (unknown route target, unbindable "
+        "source/output identity) — and in amend mode returns a GuidedRevisionBindingResult whose closed "
+        "rejection_code and per-breach violations record every malformed node entry (non-dict, or missing a "
+        "string 'id'), removal, duplication, substitution, protected-field change, or rewiring outside the "
+        "insertion ports; never silently drops a candidate node or invents authority"
+    ),
+    test_ref=(
+        "tests/unit/web/composer/guided/test_bind_reviewed_components.py::test_prose_binder_non_list_nodes_names_the_predecessor_node_ids"
+    ),
+    test_fingerprint="9ca0daf1336e8f654240420ef2eea9a421a8bd2692ddb8bbea53afec21cb24c7",
+)
 def bind_guided_prose_revision_candidate(
     pipeline: Mapping[str, Any],
     guided: GuidedSession,
@@ -3101,28 +3145,34 @@ def bind_guided_prose_revision_candidate(
             },
         )
 
-    candidate_nodes = [node for node in raw_nodes if type(node) is dict]
+    # A node entry that is not a dict carrying a string ``id`` cannot be
+    # adjudicated against predecessor authority at all; classifying it as
+    # "added" would silently launder it past the amend contract, so it is
+    # excluded here and recorded below as ``node_entry_malformed``.
+    candidate_nodes = [node for node in raw_nodes if type(node) is dict and type(node.get("id")) is str]
     malformed_node = len(candidate_nodes) != len(raw_nodes)
     added_nodes = [node for node in candidate_nodes if node.get("id") not in predecessor_by_id]
 
     def connection_values(node: Mapping[str, Any]) -> set[str]:
-        values: set[str] = set()
-        node_id = node.get("id")
-        if type(node_id) is str:
-            values.add(node_id)
-        for key in ("input", "on_success"):
-            value = node.get(key)
-            if type(value) is str:
-                values.add(value)
-        for key in ("routes", "branches"):
-            value = node.get(key)
-            if isinstance(value, Mapping):
-                values.update(item for item in value.values() if type(item) is str)
-            elif type(value) is list:
-                values.update(item for item in value if type(item) is str)
-        fork_to = node.get("fork_to")
-        if type(fork_to) is list:
-            values.update(item for item in fork_to if type(item) is str)
+        """Routing names of one serialized predecessor node.
+
+        ``predecessor_dict`` is ``CompositionState.to_dict()`` output — an
+        owned Tier-1 contract: ``id`` and ``input`` are always-present
+        strings, ``on_success`` is ``str | None``, and ``routes`` /
+        ``branches`` / ``fork_to`` are serialized (with string members) only
+        when authored. Every read is therefore direct, so corruption of owned
+        state crashes instead of silently shrinking the harvested set.
+        """
+        values: set[str] = {node["id"], node["input"]}
+        if node["on_success"] is not None:
+            values.add(node["on_success"])
+        if "routes" in node:
+            values.update(node["routes"].values())
+        if "branches" in node:
+            branches = node["branches"]
+            values.update(branches.values() if type(branches) is dict else branches)
+        if "fork_to" in node:
+            values.update(node["fork_to"])
         return values
 
     predecessor_connections = {
@@ -3174,9 +3224,13 @@ def bind_guided_prose_revision_candidate(
             rebuilt_by_id[node_id] = cast(dict[str, Any], deep_thaw(private_node))
             continue
         candidate_node = matches[0]
-        if candidate_node.get("node_type") != private_node.get("node_type"):
+        # Owned side reads directly: ``node_type`` and ``plugin`` are always
+        # present on a serialized predecessor node, so a candidate that omits
+        # either compares unequal and is recorded instead of two absences
+        # silently agreeing.
+        if candidate_node.get("node_type") != private_node["node_type"]:
             _record("node_type_changed", node_id=node_id)
-        if "plugin" in candidate_node and candidate_node.get("plugin") != private_node.get("plugin"):
+        if "plugin" in candidate_node and candidate_node.get("plugin") != private_node["plugin"]:
             _record("node_plugin_changed", node_id=node_id)
         unexpected_keys = set(candidate_node) - set(private_node)
         if unexpected_keys:
@@ -3193,7 +3247,7 @@ def bind_guided_prose_revision_candidate(
             if rewiring_key not in candidate_node:
                 continue
             candidate_value = candidate_node[rewiring_key]
-            if candidate_value == private_node.get(rewiring_key):
+            if candidate_value == private_node[rewiring_key]:
                 continue
             if type(candidate_value) is str and candidate_value in insertion_connections:
                 rebuilt[rewiring_key] = candidate_value
@@ -3279,10 +3333,21 @@ def require_guided_prose_revision_successor(
     predecessor = authority.predecessor
     if authority.mode == "amend":
         successor_nodes = {node["id"]: node for node in successor.to_dict()["nodes"]}
-        bound_nodes = {node["id"]: node for node in binding.pipeline["nodes"] if type(node) is dict and type(node.get("id")) is str}
+        # A successful amend binding guarantees every emitted node is a dict
+        # carrying a string ``id``: the binder excludes and records anything
+        # else as ``node_entry_malformed``, and the rejection_code gate above
+        # has already raised for such a candidate. Index directly so residual
+        # corruption crashes instead of being filtered out of the comparison.
+        bound_nodes = {node["id"]: node for node in binding.pipeline["nodes"]}
         for predecessor_node in predecessor.to_dict()["nodes"]:
             node_id = predecessor_node["id"]
-            if successor_nodes.get(node_id) != bound_nodes.get(node_id):
+            # A clean amend binding proves every predecessor node id resolves
+            # in both indexes: the binder records a missing or duplicated
+            # emission as a violation (raised above), and its reconstruction
+            # re-emits every predecessor node. Absence here is corruption of
+            # owned state and crashes as KeyError rather than comparing two
+            # silent Nones equal.
+            if successor_nodes[node_id] != bound_nodes[node_id]:
                 raise AuditIntegrityError("guided prose revision successor differs from bound node authority")
     if set(successor.sources) != set(predecessor.sources):
         raise AuditIntegrityError("guided prose revision successor changed reviewed source identity")

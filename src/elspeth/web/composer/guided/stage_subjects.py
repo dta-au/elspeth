@@ -144,7 +144,12 @@ def subject_from_dict(value: object) -> DeferredSubject:
 
     if type(value) is not dict:
         raise InvariantError("Deferred subject must be an exact dict")
-    kind = value.get("kind")
+    if "kind" not in value:
+        # First-party persisted record: serialization does not demote the
+        # ELSPETH-authored ``to_dict`` output, so a missing discriminator is
+        # an invariant break, never a default.
+        raise InvariantError("Deferred subject record is missing 'kind'")
+    kind = value["kind"]
     if kind == "stable":
         record = _require_exact_dict(value, frozenset({"kind", "component_kind", "stable_id"}), "StableSubject.from_dict")
         component_kind = record["component_kind"]
@@ -551,7 +556,12 @@ def constraint_from_dict(value: object) -> DeferredConstraint:
 
     if type(value) is not dict:
         raise InvariantError("Deferred constraint must be an exact dict")
-    kind = value.get("kind")
+    if "kind" not in value:
+        # First-party persisted record: serialization does not demote the
+        # ELSPETH-authored ``to_dict`` output, so a missing discriminator is
+        # an invariant break, never a default.
+        raise InvariantError("Deferred constraint record is missing 'kind'")
+    kind = value["kind"]
     if kind == "subject_presence":
         record = _require_exact_dict(value, frozenset({"kind", "subject", "present"}), "SubjectPresenceConstraint.from_dict")
         if type(record["present"]) is not bool:

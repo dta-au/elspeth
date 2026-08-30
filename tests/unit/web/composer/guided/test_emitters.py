@@ -456,6 +456,8 @@ class TestBuildSchemaFormTurns:
             "label": "On Write Failure",
             "description": "Sink name for rows that cannot be written, or 'discard' for explicit drop",
             "kind": "text",
+            # KnobField requires a tier; the synthesized wrapper knob carries
+            # "common" like the catalog's own wrapper-synthesized knobs.
             "tier": "common",
             "required": False,
             "nullable": False,
