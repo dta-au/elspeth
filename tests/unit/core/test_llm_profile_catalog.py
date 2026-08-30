@@ -51,6 +51,7 @@ from pydantic import ValidationError
 
 from elspeth.core.config import (
     ElspethSettings,
+    _lower_llm_component,
     _lower_llm_profile_node_options,
     _lower_llm_profile_nodes,
     load_settings_from_config_dict,
@@ -194,6 +195,36 @@ class TestBatchProfileNodeLowering:
         dangling_default: dict[str, Any] = {"llm_profiles": {}, "default_llm_profile": "nope"}
         with pytest.raises(ValueError, match="default_llm_profile 'nope' does not name a configured llm_profiles entry"):
             _lower_llm_profile_nodes(dangling_default, materialize=False)
+
+    def test_lower_llm_component_rejects_non_string_profile_alias(self) -> None:
+        """``_lower_llm_component`` is the per-component trust boundary.
+
+        Pins the ``@trust_boundary`` honesty contract: a raw llm component
+        whose 'profile' option is not a string alias, or that names both
+        'profile' and 'provider', or that references an unknown profile, is
+        refused with ValueError.
+        """
+        with pytest.raises(ValueError, match="'profile' option must be a string alias"):
+            _lower_llm_component(
+                {"plugin": "llm", "options": {"profile": 42}},
+                location="transforms[0]",
+                profiles={},
+                materialize=False,
+            )
+        with pytest.raises(ValueError, match="specifies both 'profile' and 'provider'"):
+            _lower_llm_component(
+                {"plugin": "llm", "options": {"profile": "gw", "provider": "gateway"}},
+                location="transforms[0]",
+                profiles={},
+                materialize=False,
+            )
+        with pytest.raises(ValueError, match="references unknown llm profile"):
+            _lower_llm_component(
+                {"plugin": "llm", "options": {"profile": "nope"}},
+                location="transforms[0]",
+                profiles={},
+                materialize=False,
+            )
 
     def test_profile_node_lowers_to_executable_provider_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("LLM_GATEWAY_BEARER_TOKEN", "sk-test-value")

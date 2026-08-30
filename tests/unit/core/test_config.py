@@ -5591,3 +5591,115 @@ coalesce:
         branches = settings.coalesce[0].branches
         assert "sentiment_path" in branches
         assert "entity_path" in branches
+
+
+class TestExpandEnvValueBoundary:
+    """Direct raising characterization for the ``_expand_env_value`` trust boundary."""
+
+    def test_missing_env_var_without_default_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A ${VAR} reference to an unset variable with no default is refused."""
+        from elspeth.core.config import _expand_env_value
+
+        monkeypatch.delenv("ELSPETH_TEST_UNSET_ENV_VAR", raising=False)
+        with pytest.raises(ValueError, match="Required environment variable 'ELSPETH_TEST_UNSET_ENV_VAR' is not set"):
+            _expand_env_value({"api": ["${ELSPETH_TEST_UNSET_ENV_VAR}"]})
+
+    def test_default_and_passthrough_shapes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Defaults expand; unrecognized scalar shapes pass through unchanged."""
+        from elspeth.core.config import _expand_env_value
+
+        monkeypatch.delenv("ELSPETH_TEST_UNSET_ENV_VAR", raising=False)
+        assert _expand_env_value("${ELSPETH_TEST_UNSET_ENV_VAR:-fallback}") == "fallback"
+        assert _expand_env_value(7) == 7
+        assert _expand_env_value(None) is None
+
+
+class TestFingerprintSecretsBoundary:
+    """Direct raising characterization for the fingerprinting trust boundaries."""
+
+    def test_secret_without_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A string secret field with no fingerprint key is refused (fail-closed)."""
+        from elspeth.core.config import SecretFingerprintError, _fingerprint_process_value
+
+        monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
+        with pytest.raises(SecretFingerprintError, match="Secret field 'api_key' found"):
+            _fingerprint_process_value("api_key", value="raw-secret-value", have_key=False, fail_if_no_key=True)
+
+    def test_secret_without_key_dev_mode_passthrough(self) -> None:
+        """Dev mode (fail_if_no_key=False) keeps the original value, declared not silent."""
+        from elspeth.core.config import _fingerprint_process_value
+
+        key, value, was_secret = _fingerprint_process_value("api_key", value="raw-secret-value", have_key=False, fail_if_no_key=False)
+        assert (key, value, was_secret) == ("api_key", "raw-secret-value", False)
+
+    def test_fingerprint_collision_raises(self) -> None:
+        """A secret field plus its pre-supplied _fingerprint counterpart is refused."""
+        from elspeth.core.config import SecretFingerprintError, _recurse
+
+        d = {"api_key": "raw", "api_key_fingerprint": "attacker-supplied"}
+        with pytest.raises(SecretFingerprintError, match="Config contains both 'api_key' and 'api_key_fingerprint'"):
+            _recurse(d, have_key=True, fail_if_no_key=True)
+
+
+class TestSanitizeDsnOptionBoundary:
+    """Direct raising characterization for the ``_sanitize_dsn_option_for_audit`` boundary."""
+
+    def test_dsn_password_without_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A DSN option carrying a password with no fingerprint key is refused (fail-closed)."""
+        from elspeth.core.config import SecretFingerprintError, _sanitize_dsn_option_for_audit
+
+        monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
+        with pytest.raises(SecretFingerprintError, match="contains a password"):
+            _sanitize_dsn_option_for_audit(
+                options={"url": "postgresql://user:secretpass@host/db"},  # secret-scan: allow-this-line
+                option_name="url",
+                fingerprint_name="url_password_fingerprint",
+                redacted_name="url_password_redacted",
+                fail_if_no_key=True,
+            )
+
+    def test_non_string_dsn_option_is_left_for_plugin_validation(self) -> None:
+        """Absent or non-string DSN values are skipped, never coerced."""
+        from elspeth.core.config import _sanitize_dsn_option_for_audit
+
+        options: dict[str, Any] = {"url": 42}
+        _sanitize_dsn_option_for_audit(
+            options=options,
+            option_name="url",
+            fingerprint_name="url_password_fingerprint",
+            redacted_name="url_password_redacted",
+            fail_if_no_key=True,
+        )
+        assert options == {"url": 42}
+
+
+class TestLoadSettingsFromYamlStringBoundary:
+    """Direct raising characterization for the ``load_settings_from_yaml_string`` boundary."""
+
+    def test_non_mapping_yaml_document_raises(self) -> None:
+        """A YAML document that is not a mapping is refused, never coerced."""
+        from elspeth.core.config import load_settings_from_yaml_string
+
+        with pytest.raises(ValueError, match="must be a YAML mapping"):
+            load_settings_from_yaml_string("- just\n- a\n- list\n")
+        with pytest.raises(ValueError, match="must be a YAML mapping"):
+            load_settings_from_yaml_string("just a scalar")
+
+
+class TestLoadSettingsYamlDocumentShape:
+    """Non-mapping YAML documents are rejected — falsy ones included.
+
+    Pins the elspeth-ca0a7e71b1 fix: ``yaml.safe_load(...) or {}`` silently
+    converted falsy non-mapping documents (false, 0, [], "") into a
+    valid-looking empty mapping; only an EMPTY document (None) may mean
+    "no keys".
+    """
+
+    @pytest.mark.parametrize("doc", ["false\n", "0\n", "[]\n"])
+    def test_falsy_non_mapping_yaml_file_rejected(self, tmp_path: Path, doc: str) -> None:
+        from elspeth.core.config import load_settings
+
+        config_file = tmp_path / "settings.yaml"
+        config_file.write_text(doc)
+        with pytest.raises(ValueError, match="must be a YAML mapping"):
+            load_settings(config_file)
