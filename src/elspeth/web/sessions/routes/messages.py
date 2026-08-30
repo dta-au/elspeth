@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace as _replace_dataclass
 
+from elspeth.contracts.errors import GuidedCustodyIntegrityError
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerResult
 from elspeth.web.sessions.titles import is_default_session_title
 
@@ -897,14 +898,14 @@ def register_message_routes(router: APIRouter) -> None:
                 )
                 terminal_status = "completed"
                 return response
-            except AuditIntegrityError as exc:
-                # An audit guard raised AFTER the compose loop returned — the
-                # pre-persist custody gate refusing the post-compose tip
-                # (elspeth-4c442aaaa8), or a settlement guard. The user row is
-                # committed and the tip did not advance, so this is a failed
-                # turn: describe it from the compose result rather than let the
-                # app-level handler emit the no-metadata 500. A raise before the
-                # loop returned keeps its own (already annotated) surface.
+            except GuidedCustodyIntegrityError as exc:
+                # The pre-persist custody gate refused the post-compose tip
+                # (elspeth-4c442aaaa8): the user row is committed and the tip
+                # did not advance, so this is a failed turn — describe it from
+                # the compose result rather than let the app-level handler emit
+                # the no-metadata 500. Custody-only by design: every gate raise
+                # is Guided*, and any other AuditIntegrityError keeps the
+                # app-level handler surface with its own diagnostics.
                 if exc.failed_turn is None and _compose_result is not None:
                     exc.failed_turn = FailedTurnMetadata(
                         assistant_message_id=_compose_result.persisted_assistant_message_id,

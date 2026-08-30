@@ -32,6 +32,7 @@ from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.enums import CreationModality, TerminalOutcome, TerminalPath
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.core.landscape.database import LandscapeDB
@@ -13587,3 +13588,25 @@ async def test_guided_reenter_refuses_an_unbindable_exited_tip(tmp_path) -> None
     degraded = client.get(f"/api/sessions/{session.id}/state")
     assert degraded.status_code == 200
     assert degraded.json()["composer_meta"]["guided_session"]["custody_unavailable"] is True
+
+
+def test_send_message_post_persist_plain_audit_integrity_error_keeps_the_app_handler_surface(tmp_path) -> None:
+    """Only GuidedCustodyIntegrityError takes the failed-turn arm (fix round 1
+    F-A1): a plain AuditIntegrityError raised after the compose loop returned
+    falls through to the app-level handler exactly as at base, so non-custody
+    Tier-1 refusals keep their own diagnostics instead of a custody-shaped body."""
+    mock_composer = _make_composer_mock(response_text="Done.")
+    app, _service = _make_app(tmp_path)
+    app.state.composer_service = mock_composer
+    client = TestClient(app)
+    session_id = client.post("/api/sessions", json={"title": "Chat"}).json()["id"]
+
+    with (
+        patch(
+            "elspeth.web.sessions.routes.messages._pending_proposal_responses",
+            side_effect=AuditIntegrityError("post-persist non-custody refusal"),
+        ),
+        pytest.raises(AuditIntegrityError, match="post-persist non-custody refusal") as excinfo,
+    ):
+        client.post(f"/api/sessions/{session_id}/messages", json={"content": "Hello"})
+    assert excinfo.value.failed_turn is None
