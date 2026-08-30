@@ -717,8 +717,6 @@ I edited no allowlist/baseline file. The hub needs to apply:
    - `web/sessions/routes/_helpers.py:R5:_guided_source_commit_failure_detail:fp=c2e307ce9f51d64a`
    - `web/sessions/routes/_helpers.py:R5:_guided_source_commit_failure_detail:fp=de0839b7c3868a67`
    - `web/sessions/service.py:R5:_matching_pending_requirement_index:fp=96b0f97fc7203617`
-   - `web/sessions/service.py:R5:SessionServiceImpl:_prepare_or_create_pending_interpretation_event:_sync:fp=bf942aa71347c107`
-   - `web/sessions/service.py:R5:SessionServiceImpl:_prepare_or_create_pending_interpretation_event:_sync:fp=f6f2e4b5681150af`
    - `web/sessions/service.py:R5:_value_references_parent_blob:fp=dc57b9620e814e6b`
    - `web/sessions/service.py:R7:SessionServiceImpl:archive_session:_sync:fp=e358d8cf0fb2db78`
 2. **Drift-repair (sidecar-WINS / re-stage) the remaining signed entries
@@ -739,7 +737,17 @@ I edited no allowlist/baseline file. The hub needs to apply:
    `_helpers.py:R7:_cancel_on_client_disconnect:fp=5571…`,
    `schema.py:R5:probe_current_schema:fp=8563…`,
    `service.py` (`R4 _run_sync_with_post_commit_projection 64c4…`,
-   `R6 archive_session 4ad8…`).
+   `R6 archive_session 4ad8…`, and the two `_sync` invented-source
+   boundary entries `bf94…`/`f6f2…` — verified by their ast_paths to bind
+   the `isinstance(source_options, Mapping)` /
+   `isinstance(source_authoring, Mapping)` checks in
+   `create_pending_interpretation_event._sync`, NOT the
+   decorator-covered `_patch_structured_interpretation_prompt` sites;
+   their measured-population reasons still hold, so they re-bind rather
+   than delete. The sibling `sources`/`source` checks in the same arm
+   remain the honest per-line form: `state_row.sources` is
+   composer-authored persisted JSON parsed offensively with typed
+   ValueError raises at the interpretation-event writer boundary).
 3. **Stage new/fresh per-line entries** for every restage above plus the
    § New sites list, using the proposed rationale texts.
 4. **No masquerade / dynamic-attribute / wire-shape pinned-set changes**:
