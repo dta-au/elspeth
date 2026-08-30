@@ -3534,6 +3534,20 @@ class ComposerServiceImpl:
             progress=progress,
         )
 
+    @staticmethod
+    def _require_guided_planner_operation_context(
+        session_operation_context: SessionOperationContext,
+        *,
+        session_id: str,
+    ) -> None:
+        """A guided planner call runs under the route's live COMPOSE authority."""
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+            raise TypeError("guided planner calls require a COMPOSE session operation context")
+        if session_operation_context.fence.session_id != session_id:
+            raise TypeError("guided planner session_operation_context is bound to a different session")
+
     async def plan_guided_full_pipeline(
         self,
         *,
@@ -3545,6 +3559,7 @@ class ComposerServiceImpl:
         plugin_snapshot: PluginAvailabilitySnapshot,
         recorder: BufferingRecorder,
         operation_fence: GuidedOperationFence,
+        session_operation_context: SessionOperationContext,
         progress: ComposerProgressSink | None = None,
     ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
         """Plan one ordinary guided-full proposal through the canonical core."""
@@ -3553,6 +3568,10 @@ class ComposerServiceImpl:
 
         if type(recorder) is not BufferingRecorder:
             raise TypeError("recorder must be an exact BufferingRecorder")
+        self._require_guided_planner_operation_context(
+            session_operation_context,
+            session_id=originating_message.session_id,
+        )
         if type(operation_fence) is not GuidedOperationFence:
             raise TypeError("operation_fence must be an exact GuidedOperationFence")
         if str(operation_fence.session_id) != originating_message.session_id:
@@ -3694,11 +3713,17 @@ class ComposerServiceImpl:
         supersedes_draft_hash: str | None,
         recorder: BufferingRecorder,
         operation_fence: GuidedOperationFence,
+        session_operation_context: SessionOperationContext,
         progress: ComposerProgressSink | None = None,
         correction_target: GuidedCorrectionTarget | None = None,
         revision_authority: GuidedRevisionAuthority | None = None,
     ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
         """Run one shared planner call for the current guided checkpoint."""
+
+        self._require_guided_planner_operation_context(
+            session_operation_context,
+            session_id=originating_message.session_id,
+        )
 
         from elspeth.web.composer.guided.deferred_intents import evaluate_deferred_intent_coverage
         from elspeth.web.composer.guided.planning import (
@@ -6971,6 +6996,7 @@ class ComposerServiceImpl:
             current_state_id=current_state_id,
             tool_call_id=tool_call_id,
             composer_model_version=composer_model_version,
+            session_operation_context=session_operation_context,
         )
 
         try:
@@ -7099,6 +7125,7 @@ class ComposerServiceImpl:
         current_state_id: str,
         tool_call_id: str,
         composer_model_version: str,
+        session_operation_context: SessionOperationContext | None,
     ) -> dict[str, Any]:
         """Build the kwarg dict for a session-aware tool handler.
 
@@ -7109,6 +7136,12 @@ class ComposerServiceImpl:
         """
         if tool_name == "request_interpretation_review":
             sessions_service = self._require_sessions_service()
+            if type(session_operation_context) is not SessionOperationContext:
+                raise AuditIntegrityError("request_interpretation_review requires the compose loop's exact session operation authority")
+            create_pending = functools.partial(
+                sessions_service.create_pending_interpretation_event,
+                session_operation_context=session_operation_context,
+            )
             return {
                 "arguments": arguments,
                 "state": state,
@@ -7130,7 +7163,7 @@ class ComposerServiceImpl:
                 "model_version": composer_model_version,
                 "provider": self._availability.provider or "unknown",
                 "composer_skill_hash": self._composer_skill_hash,
-                "create_pending_interpretation_event": sessions_service.create_pending_interpretation_event,
+                "create_pending_interpretation_event": create_pending,
                 "list_interpretation_events": sessions_service.list_interpretation_events,
             }
         # Defensive: a session-aware tool registered without a kwarg

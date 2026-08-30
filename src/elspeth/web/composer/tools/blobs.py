@@ -1861,13 +1861,17 @@ def _execute_delete_blob_locked(
             # ``reconcile_blob_storage_versions`` on the next
             # custody-locked read or mutation.
             stage = _stage_blob_deletion(storage_path)
+            registered_at = datetime.now(UTC)
             conn.execute(
                 blob_deletion_cleanups_table.insert().values(
                     blob_id=blob_id,
                     session_id=session_id,
                     storage_path=str(stage.storage),
                     tombstone_path=str(stage.tombstone) if stage.tombstone is not None else None,
-                    created_at=datetime.now(UTC),
+                    created_at=registered_at,
+                    # The lane ledger keeps a monotonic (created_at, updated_at)
+                    # pair; a fresh registration was updated when created.
+                    updated_at=registered_at,
                 )
             )
             _remove_blob_temp_artifacts(storage_path)

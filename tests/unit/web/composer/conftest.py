@@ -1191,11 +1191,29 @@ def _fenced_compose_for_legacy_tests(monkeypatch):
                 lease_seconds=sessions.session_operation_lease_seconds,
             )
         except SessionOperationFenceLost:
-            # No durable session row to fence (fixture-minted ids): run the
-            # call exactly as the legacy test wrote it.
-            return await call(**kwargs)
+            from tests.helpers.session_fences import ensure_session_fence
+
+            session_uuid = session_id if not isinstance(session_id, str) else __import__("uuid").UUID(session_id)
+            engine = getattr(sessions, "_engine", None)
+            seeded = engine is not None and ensure_session_fence(
+                engine,
+                session_uuid,
+                owner_instance_id=sessions.session_operation_owner_instance_id,
+            )
+            if not seeded:
+                # No durable session row to fence (fixture-minted ids): run
+                # the call exactly as the legacy test wrote it.
+                return await call(**kwargs)
+            lease = await SessionOperationLease.acquire(
+                authority,
+                session_id=session_uuid,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=sessions.session_operation_owner_instance_id,
+                lease_seconds=sessions.session_operation_lease_seconds,
+            )
         try:
-            return await call(session_operation_context=lease.context, **kwargs)
+            forwarded = {name: value for name, value in kwargs.items() if name != "session_operation_context"}
+            return await call(session_operation_context=lease.context, **forwarded)
         finally:
             await lease.close()
 

@@ -138,17 +138,33 @@ class DualFencedSessionServiceHarness(SessionServiceImpl):
                 if cached.operation_kind is kind:
                     yield cached
                     return
-        context = cast(
-            SessionOperationContext,
-            await self._run_sync(
-                lambda: self.session_operation_authority.acquire(
-                    session_id=session_id,
-                    operation_kind=kind,
-                    owner_instance_id=self.session_operation_owner_instance_id,
-                    lease_seconds=self.session_operation_lease_seconds,
-                )
-            ),
-        )
+
+        def _acquire() -> SessionOperationContext:
+            return self.session_operation_authority.acquire(
+                session_id=session_id,
+                operation_kind=kind,
+                owner_instance_id=self.session_operation_owner_instance_id,
+                lease_seconds=self.session_operation_lease_seconds,
+            )
+
+        try:
+            context = cast(SessionOperationContext, await self._run_sync(_acquire))
+        except SessionOperationFenceLost:
+            # Legacy tests insert sessions_table rows directly, which never
+            # mints the retained epoch-1 fence the production lifecycle
+            # creates. Seed exactly that fence and retry once; any other
+            # cause propagates.
+            from tests.helpers.session_fences import ensure_session_fence
+
+            seeded = await self._run_sync(
+                ensure_session_fence,
+                self._engine,
+                session_id,
+                owner_instance_id=self.session_operation_owner_instance_id,
+            )
+            if not seeded:
+                raise
+            context = cast(SessionOperationContext, await self._run_sync(_acquire))
         try:
             yield context
         finally:

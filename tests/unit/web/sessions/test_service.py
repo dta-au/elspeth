@@ -52,6 +52,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import QuarantineCleanupError
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import seed_session_operation_fence
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
@@ -260,7 +261,8 @@ class TestSessionCRUD:
 
         class _FailingRmtreeShutil:
             """Stand-in for the ``shutil`` name as seen from inside
-            ``elspeth.web.sessions.service``, scoped to that module only.
+            ``elspeth.web.sessions.archive_quarantine`` (where the purge now
+            lives), scoped to that module only.
 
             ``monkeypatch.setattr("...service.shutil.rmtree", ...)`` would
             resolve ``...service.shutil`` to the *real* ``shutil`` module
@@ -274,9 +276,9 @@ class TestSessionCRUD:
 
             rmtree = staticmethod(fail_rmtree)
 
-        monkeypatch.setattr("elspeth.web.sessions.service.shutil", _FailingRmtreeShutil())
+        monkeypatch.setattr("elspeth.web.sessions.archive_quarantine.shutil", _FailingRmtreeShutil())
 
-        with pytest.raises(QuarantineCleanupError, match=r"delete committed.*quarantine cleanup failed") as exc_info:
+        with pytest.raises(QuarantineCleanupError, match=r"archive committed.*quarantine cleanup remains pending") as exc_info:
             await service_with_dir.archive_session(session.id)
         assert isinstance(exc_info.value.__cause__, OSError)
         assert "permission denied removing staged blob directory" in str(exc_info.value.__cause__)
@@ -306,6 +308,7 @@ class TestRunEvents:
                     updated_at=created_at,
                 )
             )
+            seed_session_operation_fence(conn, session_id, owner_instance_id=service.session_operation_owner_instance_id)
             conn.execute(
                 insert(composition_states_table).values(
                     id=str(state_id),
