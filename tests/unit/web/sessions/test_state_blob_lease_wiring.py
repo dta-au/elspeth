@@ -82,7 +82,9 @@ def test_state_import_owns_one_compose_lease_and_threads_its_context() -> None:
     assert helper.args.kw_defaults[-1] is None
     get_blob_calls = _calls(helper, "get_blob")
     assert len(get_blob_calls) == 1
-    assert ast.unparse(_keyword(get_blob_calls[0], "session_operation_context")) == "session_operation_context"
+    # The blob layer is HEAD's (open decision 1 on elspeth-4d6c0dd0f5):
+    # get_blob takes no session_operation_context; the helper still receives
+    # and owns the route's exact context for its session-side writes.
 
 
 def test_yaml_export_owns_one_blob_read_lease_and_threads_its_context() -> None:
@@ -100,4 +102,4 @@ def test_yaml_export_owns_one_blob_read_lease_and_threads_its_context() -> None:
     assert helper.args.kw_defaults[-1] is None
     get_blob_calls = _calls(helper, "get_blob")
     assert len(get_blob_calls) == 1
-    assert ast.unparse(_keyword(get_blob_calls[0], "session_operation_context")) == "session_operation_context"
+    # HEAD blob layer (decision 1): no context parameter on get_blob.

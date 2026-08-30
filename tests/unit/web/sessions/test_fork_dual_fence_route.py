@@ -20,8 +20,13 @@ def test_fork_route_acquires_parent_before_guided_and_uses_composite_everywhere(
     assert "session_operation_context=parent_operation_lease.context" in source
     assert "staged.authority," in source
     assert "fail_guided_fork_operation" in source
-    assert "cleanup_blobs_for_fork(\n                            staged.authority" in source
-    assert "BlobForkWriteFence(" not in source
+    # Merged custody shape: blob copy/cleanup run through HEAD's blob layer
+    # under an exact BlobForkWriteFence derived from the guided fence, while
+    # settlement and failure still consume the lane's composite authority
+    # (open decision 1 on elspeth-4d6c0dd0f5 tracks re-deriving the lane's
+    # authority-routed blob ledger).
+    assert "cleanup_blobs_for_fork(" in source
+    assert "BlobForkWriteFence(" in source
 
 
 def test_fork_route_reverse_close_preserves_primary_retry_or_cancellation() -> None:

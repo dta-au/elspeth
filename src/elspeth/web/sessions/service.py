@@ -6156,8 +6156,11 @@ class SessionServiceImpl:
                     data_dir,
                     identity,
                 )
-            except BaseException:
-                raise QuarantineCleanupError("Session archive committed, but quarantine cleanup remains pending.") from None
+            except BaseException as cleanup_exc:
+                # Keep the operator-facing message stable and redacted, but
+                # carry the causal exception: the recovery runbook needs the
+                # OSError (permissions, missing mount) that stalled cleanup.
+                raise QuarantineCleanupError("Session archive committed, but quarantine cleanup remains pending.") from cleanup_exc
 
         async def compensate_precommit() -> None:
             """Restore only while exact authority remains provably current."""
