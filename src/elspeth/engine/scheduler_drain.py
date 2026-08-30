@@ -171,7 +171,7 @@ def with_scheduler_pending_sink_handoffs(
         )
     if not token_ids:
         return result
-    if isinstance(result, tuple):
+    if _is_result_tuple(result):
         tagged: list[RowResult] = []
         matched_token_ids: set[str] = set()
         for item in result:
@@ -721,7 +721,7 @@ class SchedulerDrainCoordinator:
                         queue_key=None,
                         barrier_key=self.barrier_key_for_live_hold(claimed.token_id),
                     )
-                    if isinstance(result, tuple):
+                    if _is_result_tuple(result):
                         results.extend(result)
                     else:
                         results.append(result)
@@ -826,7 +826,7 @@ class SchedulerDrainCoordinator:
                         )
 
                 if result is not None:
-                    if isinstance(result, tuple):
+                    if _is_result_tuple(result):
                         results.extend(result)
                     else:
                         results.append(result)
