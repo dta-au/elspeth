@@ -688,6 +688,7 @@ async def test_mutation_facade_exposes_no_handle_and_closes_after_callback(servi
         "composer_progress",
         "composition_states",
         "database_now",
+        "interpretations",
         "runs",
         "session",
     }

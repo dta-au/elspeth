@@ -267,12 +267,12 @@ def test_blob_reservation_rejects_partial_or_invalid_custody(
             conn.execute(insert(blobs_table).values(**values))
 
 
-def test_current_schema_includes_epoch_44_coordination_tables_and_expiry_indexes() -> None:
+def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes() -> None:
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
     inspector = inspect(eng)
 
-    assert SESSION_SCHEMA_EPOCH == 44
+    assert SESSION_SCHEMA_EPOCH == 48
     expected_tables = frozenset(
         {
             "web_instances",
@@ -313,7 +313,7 @@ def test_current_schema_includes_epoch_44_coordination_tables_and_expiry_indexes
     assert {"ix_runs_owner_lease_expires_at", "ix_runs_saga_state"} <= run_indexes
 
 
-def test_epoch_44_coordination_check_constraints_are_exact() -> None:
+def test_coordination_hard_cut_check_constraints_are_exact() -> None:
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
     inspector = inspect(eng)
