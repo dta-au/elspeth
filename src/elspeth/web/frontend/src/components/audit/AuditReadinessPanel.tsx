@@ -18,6 +18,7 @@ import { useAuditReadinessStore } from "../../stores/auditReadinessStore";
 import { useExecutionStore } from "../../stores/executionStore";
 import { useInlineSourceStore } from "../../stores/inlineSourceStore";
 import { useInterpretationEventsStore } from "../../stores/interpretationEventsStore";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { hasCompositionContent } from "../../utils/compositionState";
 import { relativeTime } from "../../utils/time";
 import type {
@@ -296,6 +297,7 @@ export function AuditReadinessPanel({
   );
   const loadSnapshot = useAuditReadinessStore((s) => s.loadSnapshot);
   const setValidationResult = useExecutionStore((s) => s.setValidationResult);
+  const showAdvanced = useShowAdvanced();
 
   // Phase 5a Task 7: when an inline_blob source is bound to the active
   // composition, the Provenance row's summary text is replaced with an
@@ -518,28 +520,33 @@ export function AuditReadinessPanel({
             </p>
           </div>
           <div className="audit-readiness-actions">
-            <Button
-              type="button"
-              className="audit-readiness-action-btn audit-readiness-action-btn--ghost"
-              onClick={() =>
-                void loadSnapshot(
-                  activeSessionId,
-                  compositionState.version,
-                  {
-                    force: true,
-                  },
-                ).then(() =>
-                  projectMatchingSnapshotToExecution(
+            {/* The panel refetches on every composition version (useEffect
+                above); a manual Refresh is a debugging affordance
+                (elspeth-f1394307e3). Explain and Collapse stay. */}
+            {showAdvanced && (
+              <Button
+                type="button"
+                className="audit-readiness-action-btn audit-readiness-action-btn--ghost"
+                onClick={() =>
+                  void loadSnapshot(
                     activeSessionId,
                     compositionState.version,
-                    setValidationResult,
-                  ),
-                )
-              }
-              aria-label="Refresh audit check now"
-            >
-              Refresh
-            </Button>
+                    {
+                      force: true,
+                    },
+                  ).then(() =>
+                    projectMatchingSnapshotToExecution(
+                      activeSessionId,
+                      compositionState.version,
+                      setValidationResult,
+                    ),
+                  )
+                }
+                aria-label="Refresh audit check now"
+              >
+                Refresh
+              </Button>
+            )}
             <Button
               variant="primary"
               type="button"
