@@ -30,6 +30,7 @@ from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.node_state_context import GateEvaluationContext
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.canonical import stable_hash
 from elspeth.core.config import GateSettings
@@ -71,6 +72,13 @@ def _classify_handled_gate_evaluation_error(exc: ExpressionEvaluationError) -> s
     return "gate expression evaluation failed"
 
 
+@observation_boundary(
+    tier=3,
+    source="row-derived gate expression result (ExpressionParser output over untrusted row data)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="Always returns bounded, scrubbed audit metadata for any value; never raises.",
+)
 def _describe_untrusted_gate_value(value: Any) -> str:
     """Return bounded metadata for row-derived gate expression results."""
     if isinstance(value, str):

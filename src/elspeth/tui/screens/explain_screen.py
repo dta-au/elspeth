@@ -345,16 +345,17 @@ class ExplainScreen:
             case _:
                 return None
 
-    def on_tree_select(self, selection: TreeSelection | str | None) -> None:
+    def on_tree_select(self, selection: TreeSelection | None) -> None:
         """Handle tree row selection.
 
         Args:
-            selection: Selected tree row payload, or a legacy node ID string.
+            selection: Selected tree row payload, or ``None`` to clear the
+                detail panel. Every caller reads the payload straight off the
+                tree row (``Tree[TreeSelection]``), so there is no untyped
+                identifier form to accept.
         """
         if selection is None:
             node_id = None
-        elif isinstance(selection, str):
-            node_id = selection
         elif selection["kind"] == "node":
             node_id = selection["node_id"]
         else:

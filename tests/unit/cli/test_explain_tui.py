@@ -24,10 +24,16 @@ from elspeth.tui.screens.explain_screen import (
     LoadingFailedState,
     UninitializedState,
 )
+from elspeth.tui.types import TreeSelection
 
 
 def _fake_db() -> LandscapeDB:
     return cast(LandscapeDB, object())
+
+
+def _node_selection(node_id: str, *, run_id: str) -> TreeSelection:
+    """Build the node-row payload the lineage tree hands to ``on_tree_select``."""
+    return {"kind": "node", "run_id": run_id, "node_id": node_id}
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,7 +495,7 @@ class TestExplainScreenNodeSelection:
         node = self._make_node(node_id="tfm-1", plugin_name="filter", node_type=NodeType.TRANSFORM)
         factory = FakeRecorderFactory(data_flow=FakeDataFlow(node_by_id={"tfm-1": node}))
         with patch("elspeth.tui.screens.explain_screen.RecorderFactory", autospec=True, return_value=factory):
-            screen.on_tree_select("tfm-1")
+            screen.on_tree_select(_node_selection("tfm-1", run_id="run-sel"))
 
         content = screen.detail_panel.render_content()
         assert "filter" in content
@@ -523,7 +529,7 @@ class TestExplainScreenNodeSelection:
 
         with patch("elspeth.tui.screens.explain_screen.RecorderFactory", autospec=True, return_value=factory):
             screen = ExplainScreen(db=db, run_id="run-sel")
-            screen.on_tree_select("tfm-1")
+            screen.on_tree_select(_node_selection("tfm-1", run_id="run-sel"))
 
         content = screen.detail_panel.render_content()
         assert "state-success" in content
@@ -540,7 +546,7 @@ class TestExplainScreenNodeSelection:
         factory = FakeRecorderFactory(data_flow=FakeDataFlow())
 
         with patch("elspeth.tui.screens.explain_screen.RecorderFactory", autospec=True, return_value=factory):
-            screen.on_tree_select("nonexistent-node")
+            screen.on_tree_select(_node_selection("nonexistent-node", run_id="run-sel"))
 
         content = screen.detail_panel.render_content()
         assert "No node selected" in content
@@ -550,7 +556,7 @@ class TestExplainScreenNodeSelection:
         screen = ExplainScreen()
         assert isinstance(screen.state, UninitializedState)
 
-        screen.on_tree_select("any-node")
+        screen.on_tree_select(_node_selection("any-node", run_id="run-any"))
 
         content = screen.detail_panel.render_content()
         assert "No node selected" in content
@@ -572,7 +578,7 @@ class TestExplainScreenNodeSelection:
         node = self._make_node(node_id="tfm-1", plugin_name="filter", node_type=NodeType.TRANSFORM)
         loaded_factory = FakeRecorderFactory(data_flow=FakeDataFlow(node_by_id={"tfm-1": node}))
         with patch("elspeth.tui.screens.explain_screen.RecorderFactory", autospec=True, return_value=loaded_factory):
-            screen.on_tree_select("tfm-1")
+            screen.on_tree_select(_node_selection("tfm-1", run_id="run-failed"))
 
         content = screen.detail_panel.render_content()
         assert "filter" in content
@@ -580,8 +586,6 @@ class TestExplainScreenNodeSelection:
 
     def test_select_non_node_payloads_show_details_without_node_lookup(self) -> None:
         """Non-node selections show explicit details without node lookup."""
-        from elspeth.tui.types import TreeSelection
-
         db = _fake_db()
         screen = self._make_loaded_screen(db)
         data_flow = FakeDataFlow(node_by_id={})
@@ -657,8 +661,8 @@ class TestExplainScreenNodeSelection:
 
         with patch("elspeth.tui.screens.explain_screen.RecorderFactory", autospec=True, return_value=factory):
             screen = ExplainScreen(db=db, run_id="run-sel")
-            screen.on_tree_select("tfm-1")
-            screen.on_tree_select("tfm-1")
+            screen.on_tree_select(_node_selection("tfm-1", run_id="run-sel"))
+            screen.on_tree_select(_node_selection("tfm-1", run_id="run-sel"))
 
         assert query.get_all_node_states_calls == 1
         content = screen.detail_panel.render_content()
@@ -688,7 +692,7 @@ class TestExplainScreenNodeSelection:
             patch("elspeth.tui.screens.explain_screen.explain_lineage", autospec=True, return_value=lineage_result),
         ):
             screen = ExplainScreen(db=db, run_id="run-sel", token_id="token-focused")
-            screen.on_tree_select("tfm-1")
+            screen.on_tree_select(_node_selection("tfm-1", run_id="run-sel"))
 
         assert query.get_all_node_states_calls == 0
         content = screen.detail_panel.render_content()

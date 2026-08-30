@@ -100,12 +100,6 @@ per_file_rules:
   reason: Type discrimination for nested field path traversal
   expires: null
   max_hits: 1
-- pattern: plugins/sinks/database_sink.py
-  rules:
-  - R5
-  reason: Type discrimination for JSON serialization of complex values
-  expires: null
-  max_hits: 1
 - pattern: plugins/sinks/json_sink.py
   rules:
   - R5

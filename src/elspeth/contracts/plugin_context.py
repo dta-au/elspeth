@@ -22,6 +22,7 @@ from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.contexts import RateLimitRegistryProtocol
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.node_state_context import AggregationBatchContext
+from elspeth.contracts.trust_boundary import observation_boundary
 
 if TYPE_CHECKING:
     from elspeth.contracts import Call, CallStatus, CallType, TransformErrorReason
@@ -429,6 +430,31 @@ class PluginContext:
 
         return recorded_call
 
+    @observation_boundary(
+        tier=3,
+        source=(
+            "the row that failed source validation — external file/API content ELSPETH does not own, "
+            "explicitly not required to be a dict (a JSON array of primitives quarantines its "
+            "elements here) and not required to be canonically serializable"
+        ),
+        source_param="row",
+        suppresses=("R5",),
+        invariant=(
+            "never raises on the row: a Mapping carrying 'id' yields that id, anything else is "
+            "identified by its canonical hash, and a row that canonical_json rejects (NaN, Infinity, "
+            "a non-serializable object) falls back to a repr() hash so the quarantine still gets an "
+            "audit row. Recording what was actually seen outranks recording it canonically — the "
+            "only failures this method raises on are missing node_id/landscape, which are framework "
+            "bugs in the caller, not properties of the row. The landscape writer this delegates to "
+            "is non-raising on the same input class by construction: "
+            "core/landscape/data_flow/errors.py::record_validation_error routes row_data through "
+            "canonical_or_recorded_hash / canonical_or_recorded_json, which return an explicit "
+            "repr/NonCanonicalMetadata fallback rather than propagating. Pinned end-to-end against a "
+            "real recorder by tests/unit/contracts/test_plugin_context_recording.py::"
+            "TestRecordValidationErrorHappyPath::"
+            "test_non_canonical_row_does_not_leak_row_content_to_logger"
+        ),
+    )
     def record_validation_error(
         self,
         row: Any,
