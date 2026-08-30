@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, act, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { RunsHistoryDrawer } from "./RunsHistoryDrawer";
 import { useExecutionStore } from "@/stores/executionStore";
@@ -403,8 +403,12 @@ describe("RunsHistoryDrawer", () => {
       "title",
       "transform_textract_93c6c46b8b72",
     );
-    expect(failure).toHaveTextContent("Reason: submit_failed");
-    expect(failure).toHaveTextContent("Cause: s3_object_unreadable");
+    expect(failure).toHaveTextContent("Reason: the request could not be submitted");
+    expect(failure).toHaveTextContent("Cause: the S3 object could not be read");
+    // Known enums read as prose with the raw value recoverable from `title`.
+    expect(
+      within(failure).getByText("the request could not be submitted"),
+    ).toHaveAttribute("title", "submit_failed");
     expect(failure).toHaveTextContent(TEXTRACT_S3_UNREADABLE_HINT);
     expect(failure).not.toHaveTextContent("service_error");
   });
@@ -429,7 +433,7 @@ describe("RunsHistoryDrawer", () => {
     expect(failure).toHaveTextContent(
       "content_safety failed - guardrail_service_error",
     );
-    expect(failure).toHaveTextContent("Cause: provider_rejected");
+    expect(failure).toHaveTextContent("Cause: the provider rejected the request");
     expect(failure).not.toHaveTextContent("Invalid S3 Object");
     expect(failure).not.toHaveTextContent("forged");
   });

@@ -15,6 +15,7 @@ import { makePhraseFor } from "@/lib/validationHumaniser";
 import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/guided/pipelineGloss";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { RunOutputsPanel } from "@/components/inspector/RunOutputsPanel";
+import { DIAGNOSTIC_CAUSE_PHRASES, DIAGNOSTIC_REASON_PHRASES } from "./diagnosticPhrases";
 import { Button, StatusBadge } from "@/components/ui";
 import { isTerminalRunStatus } from "@/types/index";
 import type { Run, RunDiagnostics, RunDiagnosticsWorkingView } from "@/types/index";
@@ -206,6 +207,20 @@ function visibleStateFailure(error: unknown): VisibleStateFailure | null {
   };
 }
 
+/** One diagnostic enum value: prose when this wave has phrased it (raw value
+ *  in `title`), otherwise the identifier register. An unphrased value is never
+ *  dressed up as a sentence (elspeth-d74ab492dd). */
+function DiagnosticValue({
+  value,
+  phrases,
+}: {
+  value: string;
+  phrases: ReadonlyMap<string, string>;
+}): JSX.Element {
+  const phrase = phrases.get(value);
+  return phrase === undefined ? <code>{value}</code> : <span title={value}>{phrase}</span>;
+}
+
 function RunStateFailureDetail({
   error,
   nodeId,
@@ -251,12 +266,12 @@ function RunStateFailureDetail({
       </div>
       {failure.reason && (
         <div>
-          Reason: <code>{failure.reason}</code>
+          Reason: <DiagnosticValue value={failure.reason} phrases={DIAGNOSTIC_REASON_PHRASES} />
         </div>
       )}
       {failure.cause && (
         <div>
-          Cause: <code>{failure.cause}</code>
+          Cause: <DiagnosticValue value={failure.cause} phrases={DIAGNOSTIC_CAUSE_PHRASES} />
         </div>
       )}
       {failure.hint && <div>{failure.hint}</div>}

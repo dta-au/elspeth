@@ -143,8 +143,9 @@
   font-weight: 600;
 }
 
-/* Per-STATE failure provenance inside the diagnostics disclosure — the same
-   error family as .run-failure-detail (header.css), one register quieter
+/* Per-STATE failure provenance, rendered at one site regardless of the detail
+   level (hoisted out of the disclosure by elspeth-34e810312c) — the same
+   error family as .run-failure-detail (header.css:783), one register quieter
    because it nests under the per-run detail. Previously rule-less, so the
    recorded failure read as ordinary diagnostics prose. */
 .run-diagnostics-state-failure {
