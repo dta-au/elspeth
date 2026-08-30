@@ -34,6 +34,7 @@ from elspeth.contracts.config.protocols import (
 from elspeth.contracts.engine import RetryPolicy
 from elspeth.contracts.enums import _IMPLEMENTED_BACKPRESSURE_MODES, BackpressureMode, TelemetryGranularity
 from elspeth.contracts.freeze import freeze_fields, require_bool, require_int
+from elspeth.contracts.trust_boundary import trust_boundary
 
 
 def _rate_limit_state_dir(state_dir: str | Path | None = None) -> Path:
@@ -83,6 +84,26 @@ def _merge_policy_with_defaults(policy: RetryPolicy) -> dict[str, Any]:
     return {**POLICY_DEFAULTS, **policy}
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "one field of a plugin RetryPolicy merged from POLICY_DEFAULTS and the plugin's own policy "
+        "dict — RetryPolicy is a total=False TypedDict, so at runtime this is whatever the pipeline "
+        "author wrote in settings YAML, untyped and unvalidated (see RuntimeRetryConfig.from_policy: "
+        "'This is a trust boundary — plugin config (user YAML) may have invalid values')"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError naming the field and the offending value for None, a non-numeric string, "
+        "a non-finite or non-integral float, a bool, and every other non-numeric type; an out-of-range "
+        "but numeric value is passed through for __post_init__ to reject. There is NO silent clamping "
+        "and no default substitution — a misconfigured retry policy fails at startup, never quietly "
+        "runs with a different value than the author wrote"
+    ),
+    test_ref="tests/unit/contracts/config/test_runtime_retry.py::TestRetryPolicyValidatorTrustBoundary::test_validate_int_field_rejects_non_numeric_string",
+    test_fingerprint="f945387339beca153058b4eb08f2843281b8c40d85da67f145c187c27b949075",
+)
 def _validate_int_field(field_name: str, value: Any) -> int:
     """Validate and convert a policy field to int.
 
@@ -124,6 +145,26 @@ def _validate_int_field(field_name: str, value: Any) -> int:
     raise ValueError(f"Invalid retry policy: {field_name} must be numeric, got {type_name}")
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "one field of a plugin RetryPolicy merged from POLICY_DEFAULTS and the plugin's own policy "
+        "dict — RetryPolicy is a total=False TypedDict, so at runtime this is whatever the pipeline "
+        "author wrote in settings YAML, untyped and unvalidated (see RuntimeRetryConfig.from_policy: "
+        "'This is a trust boundary — plugin config (user YAML) may have invalid values')"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError naming the field and the offending value for None, a non-numeric string, "
+        "a bool, and every other non-numeric type, and for NaN/Infinity whether it arrives as a float "
+        "or as a string that float() accepts — non-finite delays cannot be represented in RFC 8785 "
+        "canonical JSON and must never reach the audit trail. No silent clamping, no default "
+        "substitution"
+    ),
+    test_ref="tests/unit/contracts/config/test_runtime_retry.py::TestRetryPolicyValidatorTrustBoundary::test_validate_float_field_rejects_non_finite_string",
+    test_fingerprint="60c94e4fec3bc8b64d04e2242b0a5f9e91a0482cd1c6f5f66ec814916c8c2210",
+)
 def _validate_float_field(field_name: str, value: Any) -> float:
     """Validate and convert a policy field to float.
 

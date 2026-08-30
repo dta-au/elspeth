@@ -34,6 +34,7 @@ from pydantic import Field
 
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.identifiers import is_valid_field_name, validate_field_name, validate_field_names
+from elspeth.contracts.trust_boundary import trust_boundary
 
 # Supported field types for schema definitions
 SUPPORTED_TYPES = frozenset({"str", "int", "float", "bool", "any"})
@@ -121,6 +122,24 @@ class FieldDefinition:
     nullable: bool = False
 
     @classmethod
+    @trust_boundary(
+        tier=3,
+        source=(
+            "one entry of a pipeline schema's `fields:` list, as written by a pipeline author in "
+            "settings YAML or replayed from a to_dict() audit round-trip — an untyped str | Mapping "
+            "ELSPETH does not own"
+        ),
+        source_param="spec",
+        suppresses=("R5",),
+        invariant=(
+            "raises ValueError on every malformed spec — a dict missing 'name'/'type'/'required'/"
+            "'nullable', a non-str 'name' or 'type', a non-bool 'required'/'nullable', an unsupported "
+            "type token, or a string that does not match the 'name: type' grammar; never defaults a "
+            "missing round-trip key and never coerces a wrong-typed one"
+        ),
+        test_ref="tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::test_field_definition_parse_rejects_non_string_dict_name",
+        test_fingerprint="7a511ea4ac92eabdf1cd47b609326cff4294fff686810aece8ed9b287a8d274b",
+    )
     def parse(cls, spec: str | Mapping[str, Any]) -> FieldDefinition:
         """Parse a field specification string or dict.
 
@@ -237,6 +256,22 @@ class FieldDefinition:
         }
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "the raw `guaranteed_fields` / `required_fields` / `audit_fields` / `required_input_fields` "
+        "value from a pipeline author's settings YAML — an untyped object ELSPETH does not own"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when the value is neither None nor a list/tuple, and (via "
+        "validate_field_names) when any element is not a valid field-name string; None means "
+        "'unspecified' and is the only absence this boundary accepts"
+    ),
+    test_ref="tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::test_parse_field_names_list_rejects_non_sequence",
+    test_fingerprint="32d10607bdd94422928209219afb99200f0fa3dd1b2e378e85993e318dabfcf9",
+)
 def _parse_field_names_list(value: Any, field_name: str, *, empty_as_none: bool = True) -> tuple[str, ...] | None:
     """Parse a list of field names for guaranteed_fields/required_fields.
 
@@ -295,6 +330,24 @@ def _validate_contract_fields_subset(
         )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "one entry of a pipeline schema's `fields:` list in settings YAML, a to_dict() audit "
+        "round-trip, or the JSON-Schema authoring shape advertised by get_plugin_schema() — an "
+        "untyped object ELSPETH does not own"
+    ),
+    source_param="spec",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises ValueError on every spec that is not a str, not a Mapping, a multi-key YAML dict, a "
+        "round-trip dict missing 'required'/'nullable' or carrying a non-str name/type or non-bool "
+        "flag, or a JSON-Schema dict with unsupported keys; only the JSON-Schema authoring shape "
+        "defaults required=True/nullable=False, and that default is the shape's published contract"
+    ),
+    test_ref="tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::test_normalize_field_spec_rejects_non_string_non_mapping",
+    test_fingerprint="e3484089a912b9caa5232140ab611ba3ae13bbf4110c7f84115b00a94e3c8e79",
+)
 def _normalize_field_spec(spec: Any, *, index: int) -> str | Mapping[str, Any]:
     """Normalize a field spec for parsing.
 
@@ -490,6 +543,25 @@ class SchemaConfig:
         return self.mode == "observed"
 
     @classmethod
+    @trust_boundary(
+        tier=3,
+        source=(
+            "a plugin's `schema:` / `schema_config:` block as written by a pipeline author in "
+            "settings YAML, or the same block replayed from a to_dict() audit round-trip — an "
+            "untyped mapping ELSPETH does not own"
+        ),
+        source_param="config",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "raises ValueError on non-Mapping input, on a missing or unrecognised 'mode', on an "
+            "observed schema carrying explicit field definitions, on a fixed/flexible schema with a "
+            "missing, non-list or empty 'fields', on duplicate field names, and on contract fields "
+            "that name undeclared or optional fields; the optional contract keys are the only ones "
+            "whose absence is accepted, and absence means 'unspecified', never an empty guarantee"
+        ),
+        test_ref="tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::test_schema_config_from_dict_rejects_non_mapping",
+        test_fingerprint="89e5b13f4e6056ad990aadee2994eec235812df0c6d9f1e68a3985dbf150fd98",
+    )
     def from_dict(cls, config: Mapping[str, Any]) -> SchemaConfig:
         """Parse schema configuration from dict.
 
@@ -806,6 +878,22 @@ def _get_raw_schema_value(options: Mapping[str, Any]) -> object | None:
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "the value stored under a plugin's `schema:` / `schema_config:` option in settings YAML, "
+        "read before any Pydantic model has typed it — an untyped object ELSPETH does not own"
+    ),
+    source_param="raw_schema",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError, owner-prefixed so it surfaces as a pipeline validation error, when the "
+        "value is present but not a Mapping or when SchemaConfig.from_dict rejects it; only None "
+        "means 'this plugin declares no schema'"
+    ),
+    test_ref="tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::test_parse_raw_schema_config_rejects_non_mapping",
+    test_fingerprint="b79e69c3df098d18b47fdcf850a48ec5c68eb0bbe73f778f849240cc3873aeed",
+)
 def parse_raw_schema_config(raw_schema: object, *, owner: str) -> SchemaConfig | None:
     """Parse raw schema config for contract validation.
 
@@ -861,6 +949,23 @@ def node_type_nests_contract_options(node_type: str | None) -> bool:
     return node_type in NESTED_CONTRACT_OPTIONS_NODE_TYPES
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "the raw options mapping of an aggregation or collector node as written by a pipeline author "
+        "in settings YAML, where the input contract may sit flat or under a nested `options:` "
+        "wrapper — untyped YAML ELSPETH does not own"
+    ),
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when an `options` key is present but its value is not a Mapping; a nested "
+        "wrapper of the wrong shape is a misconfiguration, never silently ignored in favour of the "
+        "flat mapping — that fallback would validate the node's contract against the wrong options"
+    ),
+    test_ref="tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::test_get_aggregation_contract_options_rejects_non_mapping_nested_options",
+    test_fingerprint="23e1dc35f43062b0b37961503a3e2825c0419a04b262cc00f7d5b0e71cd1ddac",
+)
 def get_aggregation_contract_options(
     options: Mapping[str, Any],
     *,
@@ -891,6 +996,19 @@ def get_aggregation_contract_options(
     return nested_options, f"{owner} options"
 
 
+@trust_boundary(
+    tier=3,
+    source=("the raw `required_input_fields` value from a node's options in settings YAML — an untyped object ELSPETH does not own"),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError, owner-prefixed for pipeline validation, on a bare string (the common "
+        "YAML slip where one field name is written unbracketed) and on anything else "
+        "_parse_field_names_list rejects; only None means 'no declared input requirement'"
+    ),
+    test_ref="tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::test_parse_raw_required_input_fields_rejects_bare_string",
+    test_fingerprint="eb33636fd8b3f96ed07b0eef09cd2cfcf47457d847781a7772f2e77c0efd9fd9",
+)
 def _parse_raw_required_input_fields(
     value: object,
     *,
