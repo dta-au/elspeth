@@ -1459,3 +1459,35 @@ class TestServerOwnedMetadataProjection:
         assert carried["event_id"] == "event-1"
         note = result.data["server_owned_metadata_note"]
         assert "interpretation_requirements" in note
+
+
+class TestReplyRegisterRule:
+    """The freeform brief tells the model to summarise in the reader's terms
+    (elspeth-4bf65fe149). Observed live (session 39578c6f): the final reply
+    echoed ``is_valid: true``, ``options.profile`` and ``require_all/union``.
+    That is a brief defect — the fix is instruction, never server-side
+    rewriting (Composer invariant 1) and never a tutorial branch (ADR-031)."""
+
+    def test_brief_carries_the_reply_register_section(self) -> None:
+        assert "## Reply Register" in SYSTEM_PROMPT
+
+    def test_brief_names_the_three_identifier_classes_it_forbids_in_prose(self) -> None:
+        section = SYSTEM_PROMPT.split("## Reply Register", 1)[1].split("\n## ", 1)[0]
+        for phrase in (
+            "tool-argument keys",
+            "validation payload fields",
+            "enum values",
+            "Spec and YAML tabs",
+            "display label",
+            # The failure half. A rule that supplies a replacement phrase for
+            # the SUCCESS case only ("validation passed", not is_valid: true)
+            # leaves the model no instructed form for a failure, and the
+            # nearest compliant behaviour is vagueness. Pin the clause that
+            # forbids that, not just the ones that forbid the tokens.
+            "whether validation passed or failed",
+        ):
+            assert phrase in section, phrase
+
+    def test_termination_checklist_includes_the_register_line(self) -> None:
+        checklist = SYSTEM_PROMPT.split("## Termination States", 1)[1]
+        assert "no tool-argument keys, validation fields, or enum values in prose" in checklist
