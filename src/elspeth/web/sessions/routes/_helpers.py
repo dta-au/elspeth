@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 import json
 import sys
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as _replace
 from datetime import UTC, datetime
@@ -42,6 +42,7 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerP
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.landscape.database import LandscapeDB
@@ -228,6 +229,22 @@ from elspeth.web.sessions.schemas import (
 
 slog = structlog.get_logger()
 
+
+def _log_last_resort_diagnostic(log_call: Callable[..., object], event: str, /, **fields: object) -> None:
+    """Emit a structured diagnostic on the last-resort logging channel.
+
+    Callers evaluate every field eagerly (they are ordinary call arguments),
+    so a first-party bug in diagnostic assembly crashes in the caller frame
+    instead of being swallowed alongside the emission. Only the emission
+    itself is guarded: logging is the channel of last resort — a
+    logging-stack failure has no lower channel to surface through, and it
+    must never displace the primary outcome the caller is about to raise or
+    return.
+    """
+    with contextlib.suppress(Exception):
+        log_call(event, **fields)
+
+
 _REDACTED_SECRET_DETAIL = "<redacted-secret>"
 _PROVIDER_DETAIL_REDACTED = "Provider detail redacted because it may contain secrets."
 _GUIDED_SOURCE_PATH_ALLOWLIST_DETAIL = (
@@ -236,6 +253,25 @@ _GUIDED_SOURCE_PATH_ALLOWLIST_DETAIL = (
 )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "ToolResult.data payload from the guided source-commit tool path — plugin/tool-produced "
+        "content whose nested shape no first-party contract promotes before this egress sanitizer"
+    ),
+    source_param="tool_result",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises TypeError when the carrier is not an exact ToolResult; any unrecognized "
+        "ToolResult.data shape yields the closed generic detail string, never a raw repr "
+        "(the raw tool_result repr can dump CompositionState with Tier-3 row data and must "
+        "not reach the HTTP body)"
+    ),
+    test_ref=(
+        "tests/unit/web/sessions/routes/test_trust_boundary_helpers.py::test_guided_source_commit_failure_detail_rejects_non_tool_result"
+    ),
+    test_fingerprint="30d4ed69702aa3b786449e221203286bc29047cdc9a9318d42800affdd64abe2",
+)
 def _guided_source_commit_failure_detail(tool_result: object) -> str:
     if type(tool_result) is not ToolResult:
         raise TypeError(f"guided source commit failure detail requires ToolResult, got {type(tool_result).__name__}")
@@ -478,15 +514,18 @@ def _tool_call_outcomes_by_call_id(
             # The per-call delta lives one level DOWN, under ``invocation``:
             # the fallback writer stores exactly
             # ``redacted_tool_invocation_content_and_envelope(...)[1]``, which
-            # is ``{"_kind": "audit", "invocation": {...}}``. Reading these
-            # keys off the top level found nothing on every real row, so an
-            # applied mutation fell through to COMPLETED and rendered as a
-            # lookup (elspeth-f5e6723133's own failure mode). ``Mapping``, not
-            # ``type() is dict``: ``ChatMessageRecord.__post_init__`` freezes
-            # ``tool_calls``, so a row read back from the DB hands us
-            # ``mappingproxy`` at BOTH levels.
-            invocation = envelope["invocation"] if "invocation" in envelope else None
-            delta: Mapping[str, Any] = invocation if isinstance(invocation, Mapping) else {}
+            # is ``{"_kind": "audit", "invocation": {...}}`` — a first-party
+            # fixed contract, and the only writer that sets ``tool_calls`` on
+            # a tool row. Reading these keys off the top level found nothing
+            # on every real row, so an applied mutation fell through to
+            # COMPLETED and rendered as a lookup (elspeth-f5e6723133's own
+            # failure mode). The DB round-trip does not demote authorship
+            # (rows come back as ``mappingproxy`` after the freeze in
+            # ``ChatMessageRecord.__post_init__``), so this is a Tier-1
+            # direct read: a missing or non-mapping ``invocation`` is
+            # corruption and crashes here instead of defaulting to an empty
+            # delta that would silently reclassify the call.
+            delta: Mapping[str, Any] = envelope["invocation"]
             # Absence is a legitimate envelope shape, not a damaged row, so the
             # membership read is the honest form.
             version_before = delta["version_before"] if "version_before" in delta else None
@@ -507,10 +546,16 @@ def _tool_call_outcomes_by_call_id(
             if status in (ComposerToolStatus.ARG_ERROR.value, ComposerToolStatus.PLUGIN_CRASH.value):
                 outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.FAILED, applied_state_version=None)
                 continue
+        # Tool-row ``content`` is first-party JSON on BOTH writer paths: the
+        # compose loop ``json.dumps``'s every tool message it persists and the
+        # fallback drain writes canonical JSON (``ChatMessageRecord.content``
+        # is a non-nullable ``str``, so a ``TypeError`` cannot fire honestly
+        # either). An undecodable tool row is Tier-1 corruption and crashes
+        # rather than defaulting to a fabricated COMPLETED classification.
         try:
             content = json.loads(row.content)
-        except (TypeError, ValueError):
-            content = None
+        except json.JSONDecodeError as exc:
+            raise AuditIntegrityError("tool-row content is not the first-party JSON both tool-row writers guarantee") from exc
         # ``content`` is freshly decoded by ``json.loads`` above — never a value
         # read off a ``deep_freeze``d owner — so a JSON object is an exact
         # ``dict`` here and the exact-type form is the accurate check.
@@ -932,6 +977,25 @@ def _interpretation_event_response(event: InterpretationEventRecord) -> Interpre
     )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "composer-authored node options persisted inside composition_states — "
+        "CompositionStateRecord freezes its containers but does not promote the nested, "
+        "LLM-authored option shapes it couriers"
+    ),
+    source_param="state",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AuditIntegrityError when a node's options is not a mapping or a present "
+        "model/model_version value is not an exact str; absent model/model_version keys are "
+        "the documented no-runtime-pin case and project as None, never a fabricated default"
+    ),
+    test_ref=(
+        "tests/unit/web/sessions/routes/test_trust_boundary_helpers.py::test_extract_runtime_model_snapshot_rejects_non_string_model"
+    ),
+    test_fingerprint="4cad4f243c81c71785c876e0ef12a5cce8aa306981361fbf7b23fbcf3405c16f",
+)
 def _extract_runtime_model_snapshot(
     state: CompositionStateRecord,
     node_id: str | None,
@@ -940,20 +1004,22 @@ def _extract_runtime_model_snapshot(
 
     ``state.nodes`` is typed ``Sequence[Mapping[str, Any]] | None`` so the
     Mapping shape is guaranteed; ``id`` and ``options`` are structurally
-    required keys (Tier-1 read — KeyError on absence is correct behaviour).
-    ``options.model`` and ``options.model_version`` are *optional* keys by
-    design — an LLM transform without an explicit pin uses an LLM-pack
-    default at runtime. The audit row's columns are nullable; recording
-    ``None`` accurately reflects "no runtime model pinned in composition
-    state" without fabricating a default.
+    required keys (KeyError on absence is correct behaviour). The nested
+    option values are composer-authored Tier-3 content couriered by the
+    record — this function is their declared parse boundary (see the
+    ``@trust_boundary`` metadata above). ``options.model`` and
+    ``options.model_version`` are *optional* keys by design — an LLM
+    transform without an explicit pin uses an LLM-pack default at runtime.
+    The audit row's columns are nullable; recording ``None`` accurately
+    reflects "no runtime model pinned in composition state" without
+    fabricating a default.
 
-    A non-string value at one of the optional keys is a Tier-1 anomaly
-    (the composition_state JSON came from our own writer). It is raised
-    as :class:`AuditIntegrityError` rather than coerced or returned as
-    NULL — a coerce would put garbage into the audit row, a NULL would
-    hide the writer-side bug. ``type(value) is str`` is used rather
-    than ``isinstance`` so callers (and the tier-model gate) can see
-    the offensive check is exact-type, not duck-typed.
+    A non-string value at one of the optional keys is malformed content.
+    It is raised as :class:`AuditIntegrityError` rather than coerced or
+    returned as NULL — a coerce would put garbage into the audit row, a
+    NULL would hide the writer-side bug. ``type(value) is str`` is used
+    rather than ``isinstance`` so callers (and the tier-model gate) can
+    see the offensive check is exact-type, not duck-typed.
     """
     if node_id is None or state.nodes is None:
         return None, None
@@ -1999,10 +2065,20 @@ async def _cancel_on_client_disconnect(request: Request) -> AsyncIterator[None]:
         while True:
             try:
                 message = await request.receive()
-            except Exception:
+            except Exception as receive_exc:
                 # A broken receive channel means we cannot observe the
                 # client any more — stop watching rather than risk
-                # cancelling a healthy compose on a transport quirk.
+                # cancelling a healthy compose on a transport quirk. This is
+                # a third-party ASGI transport boundary, and the degradation
+                # is recorded rather than silent: a dead watcher re-opens
+                # the zombie-compose window this watcher exists to close
+                # (elspeth-e08063c3a5), so "watcher stopped" must not look
+                # identical to "no disconnect ever arrived".
+                _log_last_resort_diagnostic(
+                    slog.warning,
+                    "compose.disconnect_watcher_receive_failed",
+                    exc_class=type(receive_exc).__name__,
+                )
                 return
             if message["type"] == "http.disconnect":
                 triggered = True
@@ -3354,6 +3430,7 @@ __all__ = [
     "_is_composer_llm_audit_tool_message",
     "_litellm_error_detail",
     "_llm_calls_from_exception",
+    "_log_last_resort_diagnostic",
     "_message_response",
     "_pending_proposal_responses",
     "_persist_llm_calls",
