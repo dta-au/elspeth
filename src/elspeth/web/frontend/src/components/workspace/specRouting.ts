@@ -10,6 +10,14 @@
 // Every phrase carries `raw` so the renderer can put the wire form in
 // `title`. Pure: reads a CompositionState, never mutates.
 //
+// `componentPhrase` has a SECOND consumer outside this tab: the run-consent
+// dialog (sidebar/ExecuteButton.tsx) names each component in its egress
+// disclosure through it, so a described source cannot read one way on the
+// Spec tab and another on the surface the user actually consents from
+// (ux M-4). Its cautions below therefore bind on a CONSENT surface, not just
+// a review one — weigh that before "simplifying" it. `routingPhrase` is
+// PipelineSpecView's alone.
+//
 // The topology rules — what a node publishes, and what a fan-in node reads —
 // are NOT decided here. They live in lib/graphTopology.ts, lifted out
 // of GraphView so the Spec tab and the Graph tab cannot disagree about the
@@ -254,6 +262,10 @@ export function buildConnectionIndex(state: CompositionState): ConnectionIndex {
  *  the description. There is no inverse of `sourceComponentId`, so the source
  *  is found by matching the helper's own output over the composition's
  *  sources — never by splitting the prefix off the string.
+ *
+ *  Callers: PipelineSpecView's routing <dd>s, and ExecuteButton's run-consent
+ *  egress lines. Both pass COMPONENT ids; neither may pass a bare non-default
+ *  source key (see above).
  *
  *  Never "Removed": this is called with ids the index already resolved, and
  *  with connection names, where absence means dangling rather than deleted.

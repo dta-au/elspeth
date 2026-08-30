@@ -1247,6 +1247,93 @@ describe("buildRunEgressSummary", () => {
     },
   );
 
+  it("names a described source and output the way the Spec tab does (ux M-4)", () => {
+    // The consent dialog resolved components through `stepLabelForNodeId`
+    // alone, which consults a description for NODES only — so a source
+    // described "Quarterly invoices from finance" read that way on the Spec
+    // tab and in validation prose, but "Intake (CSV)" here, on the surface
+    // where recognition matters most. Both now go through the shared
+    // description-first ladder (specRouting.componentPhrase).
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          intake: {
+            plugin: "csv",
+            options: {},
+            on_success: "rows",
+            description: "Quarterly invoices from finance",
+          },
+        },
+        outputs: [
+          {
+            name: "results",
+            plugin: "csv",
+            options: {},
+            description: "Approved invoice ledger",
+          },
+        ],
+      } as unknown as Partial<CompositionState>),
+      [],
+    );
+
+    expect(lines.map((line) => line.text)).toEqual([
+      "Reads source data: Quarterly invoices from finance (CSV).",
+      "Writes output: Approved invoice ledger (CSV).",
+    ]);
+    // The identifier register is untouched: it still names every component
+    // and plugin by id (R2-F7).
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Reads source data: source:intake (csv).",
+      "Writes output: results (csv).",
+    ]);
+  });
+
+  it("emits every disclosure line, in order, in both registers", () => {
+    // The refactor's residual risk is a DROPPED or REORDERED emission — one
+    // walk now decides both registers, so a mistake takes a whole line out of
+    // both at once and no per-line test would notice. Every other test here
+    // drives one or two lines; this one drives all six (ordinary source, LLM
+    // source, LLM node with a model, network transform, unverifiable
+    // transform, output) and pins the full ordered array in both registers.
+    // The catalog-load-failure path is what makes the uncertainty line
+    // reachable alongside the confident one.
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          intake: { plugin: "csv", options: {}, on_success: "rows" },
+          drafts: { plugin: "llm", options: { profile: "approved-generation" }, on_success: "rows" },
+        },
+        nodes: [
+          { id: "classify", node_type: "transform", plugin: "llm", input: "rows", on_success: "scored", on_error: null, options: { model: "claude-sonnet" } },
+          { id: "fetch_pages", node_type: "transform", plugin: "web_scrape", input: "scored", on_success: "fetched", on_error: null, options: {} },
+          { id: "map_fields", node_type: "transform", plugin: "field_mapper", input: "fetched", on_success: "results", on_error: null, options: {} },
+        ],
+        outputs: [{ name: "results", plugin: "csv", options: {} }],
+      } as unknown as Partial<CompositionState>),
+      null,
+      true,
+      null,
+      false,
+    );
+
+    expect(lines.map((line) => line.text)).toEqual([
+      "Reads source data: Intake (CSV).",
+      "Sends one authored prompt to the configured LLM: Drafts (profile approved-generation).",
+      "Sends rows to the configured LLM: Classify (model Claude Sonnet).",
+      "Fetches over the network: Fetch Pages (Web Scrape).",
+      "Plugin catalog unavailable — external-service effects could not be fully enumerated for: Map Fields (Field Mapper).",
+      "Writes output: Results (CSV).",
+    ]);
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Reads source data: source:intake (csv).",
+      "Sends one authored prompt to the configured LLM: source:drafts (profile approved-generation).",
+      "Sends rows to the configured LLM: classify (model claude-sonnet).",
+      "Fetches over the network: fetch_pages (web_scrape).",
+      "Plugin catalog unavailable — external-service effects could not be fully enumerated for: map_fields (field_mapper).",
+      "Writes output: results (csv).",
+    ]);
+  });
+
   it("uses a current source catalog to classify a capability-tagged LLM source", () => {
     const lines = buildRunEgressSummary(
       makeComposition({
