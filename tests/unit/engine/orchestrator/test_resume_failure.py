@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -2890,3 +2891,55 @@ class TestResumeLoopCoordinationLatch:
         assert processing_order == ["process_existing_row", "latch"], (
             f"process_existing_row must complete before latch fires; got: {processing_order}"
         )
+
+
+# ---------------------------------------------------------------------------
+# _derive_resume_failure_counter_baseline: typed degradation, recorded
+# ---------------------------------------------------------------------------
+
+
+class TestResumeFailureCounterBaselineDegradation:
+    """The baseline read degrades ONLY on transient OperationalError — recorded
+    at WARNING with the None sentinel the caller handles — while audit
+    corruption/invariant signals propagate untouched."""
+
+    def test_operational_error_returns_none_and_is_recorded(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from sqlalchemy.exc import OperationalError
+
+        from elspeth.engine.orchestrator import resume as resume_mod
+
+        def _raise_operational(factory: Any, run_id: str) -> Any:
+            raise OperationalError("stmt", None, Exception("database is locked"))
+
+        monkeypatch.setattr(resume_mod, "derive_resume_terminal_status_from_audit", _raise_operational)
+
+        with caplog.at_level(logging.WARNING, logger="elspeth.engine.orchestrator.resume"):
+            result = resume_mod._derive_resume_failure_counter_baseline(MagicMock(), "run-baseline")
+
+        assert result is None
+        assert any("degrade to resume-local partials" in record.getMessage() for record in caplog.records)
+
+    def test_audit_integrity_error_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.contracts.errors import AuditIntegrityError
+        from elspeth.engine.orchestrator import resume as resume_mod
+
+        def _raise_integrity(factory: Any, run_id: str) -> Any:
+            raise AuditIntegrityError("terminal outcome ledger corrupt")
+
+        monkeypatch.setattr(resume_mod, "derive_resume_terminal_status_from_audit", _raise_integrity)
+
+        with pytest.raises(AuditIntegrityError):
+            resume_mod._derive_resume_failure_counter_baseline(MagicMock(), "run-baseline")
+
+    def test_orchestration_invariant_error_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.engine.orchestrator import resume as resume_mod
+
+        def _raise_invariant(factory: Any, run_id: str) -> Any:
+            raise OrchestrationInvariantError("non-terminal counters for FAILED resume")
+
+        monkeypatch.setattr(resume_mod, "derive_resume_terminal_status_from_audit", _raise_invariant)
+
+        with pytest.raises(OrchestrationInvariantError):
+            resume_mod._derive_resume_failure_counter_baseline(MagicMock(), "run-baseline")
