@@ -38,6 +38,7 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, CompositionStateData
+from tests.helpers.session_fences import seed_live_compose_context
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
 
 
@@ -47,9 +48,15 @@ async def _run_one_turn(
     llm: Any,
     session_id: str,
     current_state_id: str | None = None,
+    session_operation_context: Any = None,
 ) -> Any:
     driver = cast(Any, service)
-    return await driver._run_one_turn_for_test(llm=llm, session_id=session_id, current_state_id=current_state_id)
+    return await driver._run_one_turn_for_test(
+        llm=llm,
+        session_id=session_id,
+        current_state_id=current_state_id,
+        session_operation_context=session_operation_context,
+    )
 
 
 def _patch_auto_commit_preferences(monkeypatch: pytest.MonkeyPatch, sessions_service: Any) -> None:
@@ -2218,6 +2225,7 @@ async def test_step2_audit_integrity_error_carries_failed_turn_metadata(
     # persist_compose_turn_async commit (the test's actual target), not
     # the audit-archive upsert that fires once per service instance.
     composer_service_with_real_sessions._skill_markdown_history_upserted = True  # type: ignore[attr-defined]
+    compose_context = seed_live_compose_context(sessions_service._engine, result_session_id)  # before injection: acquiring is a write
     inject_commit_OperationalError(sessions_service._engine)  # type: ignore[attr-defined]
 
     with pytest.raises(AuditIntegrityError) as excinfo:
@@ -2225,6 +2233,7 @@ async def test_step2_audit_integrity_error_carries_failed_turn_metadata(
             composer_service_with_real_sessions,
             llm=fake_llm_two_tool_calls,
             session_id=result_session_id,
+            session_operation_context=compose_context,
         )
 
     assert excinfo.value.failed_turn is not None
@@ -2256,6 +2265,7 @@ async def test_plugin_crash_unwind_commit_failure_remains_unpersisted_and_retain
         return outcome
 
     monkeypatch.setattr(composer_service_with_real_sessions, "_persist_turn_audit", _capture_persist_outcome)
+    compose_context = seed_live_compose_context(sessions_service._engine, result_session_id)  # before injection: acquiring is a write
     inject_commit_OperationalError(sessions_service._engine)  # type: ignore[attr-defined]
 
     with pytest.raises(ComposerPluginCrashError) as excinfo:
@@ -2263,6 +2273,7 @@ async def test_plugin_crash_unwind_commit_failure_remains_unpersisted_and_retain
             composer_service_with_real_sessions,
             llm=fake_llm_runtime_error_on_second,
             session_id=result_session_id,
+            session_operation_context=compose_context,
         )
 
     assert persisted_flags == [False]

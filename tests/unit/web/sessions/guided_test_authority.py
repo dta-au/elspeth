@@ -128,6 +128,8 @@ class DualFencedSessionServiceHarness(SessionServiceImpl):
     # ------------------------------------------------------------------
     @contextlib.asynccontextmanager
     async def _call_context(self, session_id: UUID, kind: SessionOperationKind):
+        if isinstance(session_id, str):
+            session_id = UUID(session_id)
         cached = self._contexts_by_engine.setdefault(self._engine, {}).get(session_id)
         if cached is not None:
             try:

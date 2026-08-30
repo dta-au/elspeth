@@ -19016,13 +19016,15 @@ class TestDeleteBlobDurableJournal:
         tombstone = self.storage_path.with_name(f".{self.storage_path.name}.delete-{'a' * 32}")
         self.storage_path.rename(tombstone)
         with self.engine.begin() as conn:
+            journal_registered_at = datetime.now(UTC)
             conn.execute(
                 blob_deletion_cleanups_table.insert().values(
                     blob_id=self.blob_id,
                     session_id=self.session_id,
                     storage_path=str(self.storage_path),
                     tombstone_path=str(tombstone),
-                    created_at=datetime.now(UTC),
+                    updated_at=journal_registered_at,
+                    created_at=journal_registered_at,
                 )
             )
             conn.execute(blobs_table.delete().where(blobs_table.c.id == self.blob_id))

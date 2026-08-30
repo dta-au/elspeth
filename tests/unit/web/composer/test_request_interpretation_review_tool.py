@@ -82,13 +82,14 @@ from elspeth.web.interpretation_state import (
 )
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import session_operation_fences_table, sessions_table
-from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord
-from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import (
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    CompositionStateRecord,
     InterpretationDraftMismatchError,
     InterpretationPlaceholderConsumedError,
-    SessionServiceImpl,
 )
+from elspeth.web.sessions.schema import initialize_session_schema
+from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 

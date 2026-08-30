@@ -39,6 +39,7 @@ from sqlalchemy import Engine
 from sqlalchemy.exc import OperationalError
 
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import RecordingSessionOperationAuthority, seed_live_compose_context
 
 # Shared ``engine`` fixture and ``_make_session`` helper come from
 # ``tests/unit/web/conftest.py`` — the parent-package conftest that
@@ -116,6 +117,7 @@ def test_audit_fail_no_plugin_crash_raises_audit_integrity_error(service):
     from elspeth.web.sessions.telemetry import observed_value
 
     _make_session(service, "p1")
+    compose_context = seed_live_compose_context(service._engine, "p1")
     starting = observed_value(service._telemetry.tool_row_tier1_violation_total)
 
     with (
@@ -124,6 +126,7 @@ def test_audit_fail_no_plugin_crash_raises_audit_integrity_error(service):
     ):
         service.persist_compose_turn(
             session_id="p1",
+            session_operation_context=compose_context,
             assistant_content="hi",
             redacted_assistant_tool_calls=(),
             redacted_tool_rows=(),
@@ -159,11 +162,13 @@ def test_audit_fail_during_plugin_crash_records_unwind_failure(service):
     from elspeth.web.sessions.telemetry import observed_value
 
     _make_session(service, "p2")
+    compose_context = seed_live_compose_context(service._engine, "p2")
     starting = observed_value(service._telemetry.tool_row_persist_failed_during_unwind_total)
 
     with _force_commit_failure(service._engine):
         outcome = service.persist_compose_turn(
             session_id="p2",
+            session_operation_context=compose_context,
             assistant_content="hi",
             redacted_assistant_tool_calls=(),
             redacted_tool_rows=(),
@@ -244,6 +249,7 @@ def test_audit_fail_non_integrity_non_operational_raises_audit_integrity_error(s
     from elspeth.web.sessions.telemetry import observed_value
 
     _make_session(service, "p3")
+    compose_context = seed_live_compose_context(service._engine, "p3")
     starting_tier1 = observed_value(service._telemetry.tool_row_tier1_violation_total)
     starting_unwind = observed_value(service._telemetry.tool_row_persist_failed_during_unwind_total)
 
@@ -253,6 +259,7 @@ def test_audit_fail_non_integrity_non_operational_raises_audit_integrity_error(s
     ):
         service.persist_compose_turn(
             session_id="p3",
+            session_operation_context=compose_context,
             assistant_content="hi",
             redacted_assistant_tool_calls=(),
             redacted_tool_rows=(),
@@ -293,6 +300,7 @@ def test_audit_fail_non_integrity_non_operational_raises_even_on_unwind_path(ser
     from elspeth.contracts.errors import AuditIntegrityError
 
     _make_session(service, "p4")
+    compose_context = seed_live_compose_context(service._engine, "p4")
 
     with (
         _force_non_integrity_non_operational_sqlalchemy_error(service._engine),
@@ -300,6 +308,7 @@ def test_audit_fail_non_integrity_non_operational_raises_even_on_unwind_path(ser
     ):
         service.persist_compose_turn(
             session_id="p4",
+            session_operation_context=compose_context,
             assistant_content="hi",
             redacted_assistant_tool_calls=(),
             redacted_tool_rows=(),
@@ -325,6 +334,10 @@ async def test_compose_loop_rejects_unwind_audit_failure_without_plugin_crash(
     from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord
 
     class _ImpossibleOutcomeSessionsService:
+        session_operation_authority = RecordingSessionOperationAuthority()
+        session_operation_owner_instance_id = "primacy-test-owner"
+        session_operation_lease_seconds = 60
+
         async def get_composer_preferences(self, session_id: Any) -> ComposerSessionPreferencesRecord:
             return ComposerSessionPreferencesRecord(
                 session_id=session_id,

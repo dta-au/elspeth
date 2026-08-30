@@ -86,6 +86,7 @@ from elspeth.web.sessions.protocol import GuidedOperationFence
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import make_compose_context
 from tests.unit.web.composer._helpers import (
     FakeChoice,
     FakeFunction,
@@ -173,6 +174,7 @@ async def test_guided_service_routes_step3_through_the_planner_only_capability_p
         attempt=1,
     )
     result, _catalog_ids = await composer_service_with_real_sessions.plan_guided_pipeline(
+        session_operation_context=make_compose_context(str(session_id)),
         intent="Build the reviewed pipeline.",
         current_state=current_state,
         guided=guided,
@@ -289,6 +291,7 @@ async def test_guided_service_keeps_amend_contract_and_noop_inside_candidate_rep
     monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", capture_plan_pipeline)
     session_id = uuid4()
     await composer_service_with_real_sessions.plan_guided_pipeline(
+        session_operation_context=make_compose_context(str(session_id)),
         intent="Add a normalization transform.",
         current_state=predecessor,
         guided=guided,
@@ -354,6 +357,7 @@ async def test_guided_service_keeps_amend_contract_and_noop_inside_candidate_rep
 
     captured.clear()
     await composer_service_with_real_sessions.plan_guided_pipeline(
+        session_operation_context=make_compose_context(str(session_id)),
         intent="Replace the current transform topology.",
         current_state=predecessor,
         guided=guided,
@@ -458,6 +462,7 @@ async def test_actual_step3_staged_and_tutorial_adapters_render_identical_provid
     for guided in (ordinary, replace(ordinary, profile=TUTORIAL_PROFILE)):
         with pytest.raises(AuditIntegrityError, match="planner call inputs changed"):
             await actual_service.plan_guided_pipeline(
+                session_operation_context=make_compose_context(str(session.id)),
                 intent="Build the reviewed pipeline.",
                 current_state=_empty_state(),
                 guided=guided,

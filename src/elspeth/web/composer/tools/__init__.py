@@ -168,7 +168,6 @@ __all__ = [
     "_persist_prepared_blob_create",
     "_prepare_blob_create",
     "_prevalidate_plugin_options",
-    "_resolve_source_blob",
     "_session_blob_lock",
     "_sync_list_blobs",
     "_utc_day_start",
