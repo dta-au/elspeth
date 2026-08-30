@@ -1629,3 +1629,34 @@ class TestCircuitBreakerCorrectness:
             assert manager.health_metrics["events_emitted"] == 10, "Expected 10 emitted events (healthy exporter succeeded)"
         finally:
             manager.close()
+
+
+# =============================================================================
+# Export loop: transport failure escaping dispatch is recorded, never silent
+# =============================================================================
+
+
+class TestExportLoopTransportFailureAccounting:
+    def test_transport_failure_is_counted_dropped_and_loop_survives(self) -> None:
+        """A TELEMETRY_TRANSPORT_ERRORS member escaping _dispatch_to_exporters
+        must land in the declared drop accounting (health_metrics events_dropped)
+        and leave the export loop consuming — recorded loss, not silent discard
+        and not a stored crash."""
+        config = MockTelemetryConfig()
+        manager = TelemetryManager(config, exporters=[TelemetryTestExporter()])
+        try:
+            with patch.object(
+                manager,
+                "_dispatch_to_exporters",
+                side_effect=ConnectionError("collector unreachable"),
+            ):
+                manager.handle_event(_lifecycle_event())
+                _wait_until(lambda: manager.health_metrics["events_dropped"] >= 1)
+
+            assert manager._export_thread.is_alive()
+            assert manager._stored_exception is None
+            # Loop still consumes: a post-failure event drains normally.
+            manager.handle_event(_lifecycle_event())
+            manager.flush()
+        finally:
+            manager.close()
