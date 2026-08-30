@@ -556,3 +556,23 @@ def test_broken_litellm_install_propagates_rather_than_reading_as_absent(monkeyp
         model_catalog.read_litellm_model_list()
 
     assert excinfo.value.name == "tokenizers"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param({"gpt-4": {}}, id="dict-not-list"),
+        pytest.param("gpt-4", id="str-not-list"),
+        pytest.param(None, id="none-not-list"),
+        pytest.param(["gpt-4", 7], id="non-str-entry"),
+        pytest.param([b"gpt-4"], id="bytes-entry"),
+    ],
+)
+def test_parse_litellm_model_list_rejects_malformed_shapes(raw: Any) -> None:
+    """A model_list that is not a list of str raises instead of narrowing the catalog."""
+    with pytest.raises(TypeError):
+        neutral_model_catalog._parse_litellm_model_list(raw)
+
+
+def test_parse_litellm_model_list_sorts_valid_entries() -> None:
+    assert neutral_model_catalog._parse_litellm_model_list(["b", "a"]) == ("a", "b")

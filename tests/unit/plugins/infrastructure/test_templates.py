@@ -75,3 +75,24 @@ def _unbound(template: str) -> frozenset[str]:
 )
 def test_find_runtime_unbound_variables(template: str, expected: set[str]) -> None:
     assert _unbound(template) == frozenset(expected)
+
+
+@pytest.mark.parametrize(
+    "malformed_entry",
+    [
+        pytest.param(3, id="non-str-non-tuple"),
+        pytest.param(("f",), id="short-tuple"),
+        pytest.param(("f", 7), id="non-str-alias"),
+        pytest.param(("f", "g", "h"), id="long-tuple"),
+    ],
+)
+def test_from_import_binding_rejects_malformed_names(malformed_entry: object) -> None:
+    """A FromImport names entry that is neither str nor (name, alias) of str raises."""
+    from jinja2 import nodes
+
+    from elspeth.plugins.infrastructure.templates import _DefiniteBindingAnalyzer
+
+    analyzer = _DefiniteBindingAnalyzer(frozenset())
+    node = nodes.FromImport(nodes.Const("x"), [malformed_entry], False)
+    with pytest.raises(TemplateError):
+        analyzer.visit_FromImport(node, frozenset())

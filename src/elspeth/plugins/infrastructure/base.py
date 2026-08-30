@@ -53,6 +53,7 @@ from elspeth.contracts.plugin_capabilities import (
     WebConfigAuthority,
 )
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.trust_boundary import trust_boundary
 
 if TYPE_CHECKING:
     from elspeth.contracts.contexts import LifecycleContext, SinkContext, SourceContext, TransformContext
@@ -97,6 +98,38 @@ def is_column_naming_config_option(key: str) -> bool:
     That classification is the plugin's job via ``output_naming_config_keys``.
     """
     return key in ("field", "fields", "group_by") or key.endswith(("_field", "_fields"))
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "one authored plugin config option value — settings YAML or a Web Composer "
+        "proposal — read either raw or through a per-plugin validated model whose "
+        "field types the base class does not own"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns exactly the column names the option value spells: a str is one name, "
+        "a list/tuple contributes only its str items, and every other shape yields (); "
+        "never raises and never coerces a non-str into a name"
+    ),
+    non_raising=True,
+)
+def _column_names_in_option_value(value: Any) -> tuple[str, ...]:
+    """Column names one column-naming config option value points at.
+
+    Plural options hold a LIST of column names (``keyword_filter.fields``,
+    ``batch_data_quality_report.inspect_fields``); skipping non-str values
+    inside them once made every one invisible to demotion, so list/tuple
+    items are admitted individually. Non-name shapes contribute nothing:
+    per-plugin config validation, not this helper, owns rejecting them.
+    """
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (list, tuple)):
+        return tuple(item for item in value if isinstance(item, str))
+    return ()
 
 
 def _demote_required_model_fields(
@@ -596,7 +629,13 @@ class BaseTransform(ABC):
         # return None and defer the failure to `None.model_validate(...)`.
         if "input_schema" in cls.__dict__:
             declared_schema = cls.__dict__["input_schema"]
-            if not hasattr(type(declared_schema), "__get__"):
+            # Descriptor-ness exactly as class-attribute lookup decides it: a
+            # descriptor's `__get__` lives in a class dict on its TYPE's MRO
+            # (instance state never participates). This is the same search the
+            # attribute machinery performs when `cls.input_schema` is read, so
+            # the guard cannot disagree with the runtime behavior it protects.
+            is_descriptor = any("__get__" in klass.__dict__ for klass in type(declared_schema).__mro__)
+            if not is_descriptor:
                 delattr(cls, "input_schema")
                 cls._declared_input_schema = declared_schema
 
@@ -740,10 +779,8 @@ class BaseTransform(ABC):
         for key, value in self.config.items():
             if key in self.output_naming_config_keys or not is_column_naming_config_option(key):
                 continue
-            values = [value] if isinstance(value, str) else list(value) if isinstance(value, (list, tuple)) else []
-            for item in values:
-                if isinstance(item, str):
-                    authored_by.setdefault(item, []).append(key)
+            for item in _column_names_in_option_value(value):
+                authored_by.setdefault(item, []).append(key)
         # PROVENANCE, honestly. ``declared_input_fields`` is multi-provenance:
         # the author's own ``required_input_fields`` list, and — for the plugins
         # whose config derives it (web_scrape's ``url_field``, blob_fetch's
@@ -1173,13 +1210,7 @@ class BaseTransform(ABC):
         for key, value in options.items():
             if key in self.output_naming_config_keys or not is_column_naming_config_option(key):
                 continue
-            if isinstance(value, str):
-                named.add(value)
-            elif isinstance(value, (list, tuple)):
-                # Plural options hold a LIST of column names (keyword_filter.fields,
-                # batch_data_quality_report.inspect_fields). Skipping non-str values
-                # made every one of them invisible to demotion.
-                named.update(item for item in value if isinstance(item, str))
+            named.update(_column_names_in_option_value(value))
         resolved = frozenset(named)
         # Config is fixed once construction finishes, so this is recompute-once
         # work; without the memo it was rebuilt on EVERY input_schema read, i.e.

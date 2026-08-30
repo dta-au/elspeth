@@ -50,23 +50,27 @@ def emit_resource_cleanup_failed(
 
     Tier-1 invariant failures and process-control exceptions remain
     unsuppressible; callers must never turn those into best-effort warnings.
+    Event construction happens BEFORE the try, and programming errors from the
+    callback re-raise, so the residual catch is limited to genuine
+    telemetry-delivery failures — a first-party bug crashes.
     """
+    event = ResourceCleanupFailed(
+        timestamp=datetime.now(UTC),
+        run_id=run_id,
+        component=component,
+        resource=resource,
+        error_type=type(error).__name__,
+        suppressed=suppressed,
+        state_id=state_id,
+        operation_id=operation_id,
+        token_id=token_id,
+    )
     try:
-        telemetry_emit(
-            ResourceCleanupFailed(
-                timestamp=datetime.now(UTC),
-                run_id=run_id,
-                component=component,
-                resource=resource,
-                error_type=type(error).__name__,
-                suppressed=suppressed,
-                state_id=state_id,
-                operation_id=operation_id,
-                token_id=token_id,
-            )
-        )
+        telemetry_emit(event)
     except contract_errors.TIER_1_ERRORS:
         raise
+    except (TypeError, AttributeError, KeyError, NameError):
+        raise  # Programming errors must crash
     except Exception as telemetry_error:
         logger.warning(
             "resource_cleanup_telemetry_failed",
