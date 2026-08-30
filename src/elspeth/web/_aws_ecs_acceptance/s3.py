@@ -29,8 +29,11 @@ from .contracts import (
     _SHA256_PATTERN,
     FORBIDDEN_AWS_OVERRIDE_ENV,
     AcceptanceCheckError,
+    CheckFailureRecord,
     _resolve_acceptance_s3_location,
     _sha256,
+    check_failure_error,
+    close_failure,
 )
 
 _S3_ACCEPTANCE_ROW: dict[str, object] = {"id": 1, "name": "elspeth-s3-acceptance"}
@@ -259,6 +262,10 @@ def verify_s3(
     collision_sink: Any | None = None
     probe_sink: Any | None = None
     failure_check: str | None = None
+    # Every exception-driven step failure is recorded here (check id + cause
+    # class only) so the terminal AcceptanceCheckError can carry the cause
+    # class instead of discarding the caught exception's identity.
+    failures: list[CheckFailureRecord] = []
     resource_close_failed = False
     cleanup_failed = False
     cleanup_owned = False
@@ -279,8 +286,10 @@ def verify_s3(
             cleanup_owned = True
         except _S3EffectFailure as exc:
             cleanup_owned = exc.cleanup_owned
+            failures.append(CheckFailureRecord(check="s3_sink_write", exception_type=type(exc).__name__))
             failure_check = "s3_sink_write"
-        except Exception:
+        except Exception as exc:
+            failures.append(CheckFailureRecord(check="s3_sink_write", exception_type=type(exc).__name__))
             failure_check = "s3_sink_write"
         if failure_check is None:
             sink_hash = primary_descriptor.content_hash
@@ -293,8 +302,10 @@ def verify_s3(
                 source = source_factory(dict(source_config))
                 rows = list(source.load(source_context))
             except AcceptanceCheckError as exc:
+                failures.append(CheckFailureRecord(check=exc.check, exception_type=exc.cause_class))
                 failure_check = exc.check
-            except Exception:
+            except Exception as exc:
+                failures.append(CheckFailureRecord(check="s3_source_read", exception_type=type(exc).__name__))
                 failure_check = "s3_source_read"
             else:
                 source_hash = _s3_source_hash(source_context)
@@ -315,7 +326,8 @@ def verify_s3(
                     expected_hash=expected_hash,
                     require_existing=True,
                 )
-            except Exception:
+            except Exception as exc:
+                failures.append(CheckFailureRecord(check="s3_collision", exception_type=type(exc).__name__))
                 failure_check = "s3_collision"
             else:
                 if not reconciled or collision_descriptor != primary_descriptor:
@@ -339,7 +351,8 @@ def verify_s3(
                 )
             except S3ConditionalWriteRejectedError:
                 collision_rejected = True
-            except Exception:
+            except Exception as exc:
+                failures.append(CheckFailureRecord(check="s3_collision", exception_type=type(exc).__name__))
                 failure_check = "s3_collision"
             else:
                 failure_check = "s3_collision"
@@ -347,40 +360,44 @@ def verify_s3(
         for resource in (source, collision_sink, probe_sink, primary_sink):
             if resource is None:
                 continue
-            try:
-                resource.close()
-            except Exception:
+            close_record = close_failure(resource, check="s3_resource_close")
+            if close_record is not None:
+                failures.append(close_record)
                 resource_close_failed = True
 
         cleanup_client: Any | None = None
         if cleanup_owned:
             try:
                 cleanup_client = s3_client_factory(region, None)
-            except Exception:
+            except Exception as exc:
+                failures.append(CheckFailureRecord(check="s3_cleanup", exception_type=type(exc).__name__))
                 cleanup_failed = True
         if cleanup_client is not None:
             try:
                 cleanup_client.delete_object(Bucket=bucket, Key=key)
-            except Exception:
+            except Exception as exc:
+                failures.append(CheckFailureRecord(check="s3_cleanup", exception_type=type(exc).__name__))
                 cleanup_failed = True
             try:
                 cleanup_client.head_object(Bucket=bucket, Key=key)
             except Exception as exc:
                 if not _s3_not_found(exc):
+                    failures.append(CheckFailureRecord(check="s3_cleanup", exception_type=type(exc).__name__))
                     cleanup_failed = True
             else:
+                # head_object succeeded: the object survived deletion.
                 cleanup_failed = True
-            try:
-                cleanup_client.close()
-            except Exception:
+            client_close_record = close_failure(cleanup_client, check="s3_cleanup")
+            if client_close_record is not None:
+                failures.append(client_close_record)
                 cleanup_failed = True
 
     if cleanup_failed:
-        raise AcceptanceCheckError("s3_cleanup")
+        raise check_failure_error("s3_cleanup", failures)
     if resource_close_failed:
-        raise AcceptanceCheckError("s3_resource_close")
+        raise check_failure_error("s3_resource_close", failures)
     if failure_check is not None:
-        raise AcceptanceCheckError(failure_check)
+        raise check_failure_error(failure_check, failures)
     assert source_hash is not None
     return {
         "object_count": 1,

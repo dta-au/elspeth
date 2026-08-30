@@ -12,6 +12,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any
 
 from elspeth.contracts import (
@@ -61,6 +62,8 @@ from .contracts import (
     _resolve_aws_region,
     _sha256,
     _utc_timestamp,
+    check_error_with_cause,
+    close_failure,
     plugin_policy_binding_sha256,
 )
 
@@ -86,47 +89,82 @@ _GUARDRAIL_INPUTS = (
 )
 
 
+def _fd_step_failure(step: str, action: Callable[[], object]) -> str | None:
+    """Run one fd/stream operation; report failure as a static step token.
+
+    The token carries only the step name and exception class name, so it is
+    safe for operator-visible evidence. Non-IO exceptions (a programming
+    error in the action) propagate.
+    """
+
+    try:
+        action()
+    except (OSError, ValueError) as exc:
+        return f"{step}:{type(exc).__name__}"
+    return None
+
+
 @contextlib.contextmanager
 def _suppress_process_output() -> Iterator[None]:
-    """Redirect process file descriptors 1 and 2 to a non-persistent sink."""
+    """Redirect process file descriptors 1 and 2 to a non-persistent sink.
+
+    Boundary failures are never silently dropped: every flush/rebind/close
+    failure is collected as a static step token. When the body completed,
+    any collected failure raises ``AcceptanceCheckError("bedrock_output_boundary")``
+    carrying the tokens; when an exception is already in flight, the tokens
+    are attached to it as a PEP 678 note (a failed stderr rebind must not
+    replace the primary failure, but must still be visible).
+    """
 
     saved_stdout: int | None = None
     saved_stderr: int | None = None
     null_fd: int | None = None
 
-    def restore() -> None:
-        if saved_stdout is not None:
-            with contextlib.suppress(OSError):
-                os.dup2(saved_stdout, 1)
-        if saved_stderr is not None:
-            with contextlib.suppress(OSError):
-                os.dup2(saved_stderr, 2)
-        for descriptor in (null_fd, saved_stdout, saved_stderr):
-            if descriptor is not None:
-                with contextlib.suppress(OSError):
-                    os.close(descriptor)
+    def flush_streams(prefix: str) -> tuple[str, ...]:
+        results = (
+            _fd_step_failure(f"{prefix}_stdout", sys.stdout.flush),
+            _fd_step_failure(f"{prefix}_stderr", sys.stderr.flush),
+        )
+        return tuple(token for token in results if token is not None)
 
-    with contextlib.suppress(Exception):
-        sys.stdout.flush()
-    with contextlib.suppress(Exception):
-        sys.stderr.flush()
+    def restore() -> tuple[str, ...]:
+        steps: list[tuple[str, Callable[[], object]]] = []
+        if saved_stdout is not None:
+            steps.append(("restore_stdout", partial(os.dup2, saved_stdout, 1)))
+        if saved_stderr is not None:
+            steps.append(("restore_stderr", partial(os.dup2, saved_stderr, 2)))
+        for label, descriptor in (("null_fd", null_fd), ("saved_stdout", saved_stdout), ("saved_stderr", saved_stderr)):
+            if descriptor is not None:
+                steps.append((f"close_{label}", partial(os.close, descriptor)))
+        results = tuple(_fd_step_failure(step, action) for step, action in steps)
+        return tuple(token for token in results if token is not None)
+
+    problems: list[str] = list(flush_streams("preflush"))
     try:
         saved_stdout = os.dup(1)
         saved_stderr = os.dup(2)
         null_fd = os.open(os.devnull, os.O_WRONLY)
         os.dup2(null_fd, 1)
         os.dup2(null_fd, 2)
-    except OSError:
-        restore()
-        raise AcceptanceCheckError("bedrock_output_boundary") from None
+    except OSError as exc:
+        problems.extend(restore())
+        raise AcceptanceCheckError(
+            "bedrock_output_boundary",
+            cause_class=type(exc).__name__,
+            cause_fields=tuple(problems) or None,
+        ) from None
     try:
         yield
-    finally:
-        with contextlib.suppress(Exception):
-            sys.stdout.flush()
-        with contextlib.suppress(Exception):
-            sys.stderr.flush()
-        restore()
+    except BaseException as primary:
+        problems.extend(flush_streams("flush"))
+        problems.extend(restore())
+        if problems:
+            primary.add_note("bedrock output boundary restore also failed: " + ", ".join(problems))
+        raise
+    problems.extend(flush_streams("flush"))
+    problems.extend(restore())
+    if problems:
+        raise AcceptanceCheckError("bedrock_output_boundary", cause_fields=tuple(problems))
 
 
 @trust_boundary(
@@ -657,7 +695,6 @@ def run_bedrock_guardrails_live(
     except Exception:
         raise AcceptanceCheckError("guardrails_settings") from None
 
-    manager_failed = False
     result: dict[str, object] | None = None
     try:
         try:
@@ -728,7 +765,28 @@ def run_bedrock_guardrails_live(
                         manager.handle_event(event)
 
                 started = time.monotonic()
-                failure: AcceptanceCheckError | None = None
+                token_ref = TokenRef(token_id=token.token_id, run_id=run.run_id)
+
+                def record_guardrails_failure() -> None:
+                    duration_ms = max(0.0, (time.monotonic() - started) * 1000)
+                    error_hash = _sha256(b"bedrock-guardrails-acceptance-failed")
+                    repositories.execution.complete_node_state(
+                        state.state_id,
+                        NodeStateStatus.FAILED,
+                        error=ExecutionError(
+                            exception="acceptance check failed",
+                            exception_type="AcceptanceCheckError",
+                        ),
+                        duration_ms=duration_ms,
+                    )
+                    repositories.data_flow.record_token_outcome(
+                        token_ref,
+                        TerminalOutcome.FAILURE,
+                        TerminalPath.UNROUTED,
+                        error_hash=error_hash,
+                    )
+                    repositories.run_lifecycle.complete_run(run.run_id, RunStatus.FAILED)
+
                 try:
                     guardrail_result = verify_bedrock_guardrails(
                         env,
@@ -751,56 +809,45 @@ def run_bedrock_guardrails_live(
                     manager.flush()
                     if audit_proofs != [True, True, True, True]:
                         raise AcceptanceCheckError("guardrails_audit_order")
-                except AcceptanceCheckError as exc:
-                    failure = exc
-                except Exception:
-                    failure = AcceptanceCheckError("guardrails_live_check")
+                except AcceptanceCheckError:
+                    # The failure is recorded to Landscape (FAILED node state,
+                    # FAILURE token outcome, FAILED run) and then surfaces as
+                    # itself — record-and-report, never silent tolerance.
+                    record_guardrails_failure()
+                    raise
+                except Exception as exc:
+                    # A non-acceptance exception (provider fault or first-party
+                    # defect) is recorded the same way and surfaces as the
+                    # declared check failure carrying the cause class name
+                    # (redaction-safe); `from None` keeps message text out of
+                    # operator-visible tracebacks per this module's discipline.
+                    record_guardrails_failure()
+                    raise check_error_with_cause("guardrails_live_check", exc) from None
                 duration_ms = max(0.0, (time.monotonic() - started) * 1000)
-                token_ref = TokenRef(token_id=token.token_id, run_id=run.run_id)
-                if failure is None:
-                    repositories.execution.complete_node_state(
-                        state.state_id,
-                        NodeStateStatus.COMPLETED,
-                        output_data={"check": "bedrock-guardrails", "ok": True},
-                        duration_ms=duration_ms,
-                    )
-                    repositories.data_flow.record_token_outcome(
-                        token_ref,
-                        TerminalOutcome.SUCCESS,
-                        TerminalPath.DEFAULT_FLOW,
-                        sink_name="acceptance",
-                    )
-                    repositories.run_lifecycle.complete_run(run.run_id, RunStatus.COMPLETED)
-                else:
-                    error_hash = _sha256(b"bedrock-guardrails-acceptance-failed")
-                    repositories.execution.complete_node_state(
-                        state.state_id,
-                        NodeStateStatus.FAILED,
-                        error=ExecutionError(
-                            exception="acceptance check failed",
-                            exception_type="AcceptanceCheckError",
-                        ),
-                        duration_ms=duration_ms,
-                    )
-                    repositories.data_flow.record_token_outcome(
-                        token_ref,
-                        TerminalOutcome.FAILURE,
-                        TerminalPath.UNROUTED,
-                        error_hash=error_hash,
-                    )
-                    repositories.run_lifecycle.complete_run(run.run_id, RunStatus.FAILED)
-                    raise failure
+                repositories.execution.complete_node_state(
+                    state.state_id,
+                    NodeStateStatus.COMPLETED,
+                    output_data={"check": "bedrock-guardrails", "ok": True},
+                    duration_ms=duration_ms,
+                )
+                repositories.data_flow.record_token_outcome(
+                    token_ref,
+                    TerminalOutcome.SUCCESS,
+                    TerminalPath.DEFAULT_FLOW,
+                    sink_name="acceptance",
+                )
+                repositories.run_lifecycle.complete_run(run.run_id, RunStatus.COMPLETED)
         except AcceptanceCheckError:
             raise
         except Exception:
             raise AcceptanceCheckError("guardrails_landscape") from None
     finally:
-        try:
-            manager.close()
-        except Exception:
-            manager_failed = True
-    if manager_failed:
-        raise AcceptanceCheckError("guardrails_telemetry")
+        # On the unwind path close_failure attaches the failure to the
+        # propagating exception as a PEP 678 note; on the normal path the
+        # record below becomes the declared telemetry check failure.
+        manager_close_record = close_failure(manager, check="guardrails_telemetry")
+    if manager_close_record is not None:
+        raise AcceptanceCheckError("guardrails_telemetry", cause_class=manager_close_record.exception_type)
     if result is None:
         raise AcceptanceCheckError("guardrails_live_check")
     return result

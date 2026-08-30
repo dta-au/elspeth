@@ -2738,3 +2738,13 @@ def test_raw_html_cleanup_artifact_hash_rejects_malformed_mapping_shape() -> Non
 
     with pytest.raises(ValueError, match=r"requires field_mapper\.mapping to be a mapping"):
         _raw_html_cleanup_artifact_hash(node, ())
+
+
+@pytest.mark.parametrize("bad_field", [123, None, b"content", ["content"], {"content": 1}])
+def test_validated_mapping_field_rejects_non_string_mapping_sides(bad_field: object) -> None:
+    """Tier-3 boundary honesty: a non-string side of an authored
+    field_mapper mapping raises ValueError, never coerces or stringifies."""
+    from elspeth.web.interpretation_state import _validated_mapping_field
+
+    with pytest.raises(ValueError, match="must map string field names"):
+        _validated_mapping_field(bad_field, context="raw-html cleanup review contract", node_id="drop-raw")

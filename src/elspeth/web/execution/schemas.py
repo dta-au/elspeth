@@ -705,8 +705,11 @@ class RunEvent(_StrictResponse):
         matching runs.
         """
         if isinstance(values, dict):
-            event_type = values.get("event_type")
-            data = values.get("data")
+            # Tier-3 pre-validation payload: membership-then-subscript keeps
+            # the absent->None decision visible. Anything unrecognized is
+            # left untouched for pydantic's own validators to reject.
+            event_type = values["event_type"] if "event_type" in values else None
+            data = values["data"] if "data" in values else None
             if isinstance(data, dict) and event_type in cls._EVENT_TYPE_TO_DATA_TYPE:
                 values = {**values, "data": cls._EVENT_TYPE_TO_DATA_TYPE[event_type](**data)}
         return values

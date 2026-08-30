@@ -17,7 +17,7 @@ from botocore.exceptions import ClientError
 
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 
-from .contracts import AcceptanceCheckError, _sha256, _task_definition_family, _utc_timestamp
+from .contracts import AcceptanceCheckError, CheckFailureRecord, _sha256, _task_definition_family, _utc_timestamp, close_failure
 from .manifest_schema import _load_retained_evidence, _read_control_manifest
 from .receipt_contracts import _validate_bounded_receipt_document
 from .scenario_inventory import _ORPHAN_MAX_ITEMS, _load_bound_scenario_inventory
@@ -634,14 +634,16 @@ def orphan_sweep(
     retained_traces = 0
     observed_retained_metrics = 0
     observed_retained_traces = 0
-    resource_close_failed = False
+    # Client close failures are recorded here (cause class only). On the
+    # unwind path close_failure additionally attaches a PEP 678 note to the
+    # in-flight exception, so an ExitStack teardown fault is never dropped
+    # even when the sweep itself is already failing.
+    failures: list[CheckFailureRecord] = []
 
     def close_client(client: Any) -> None:
-        nonlocal resource_close_failed
-        try:
-            client.close()
-        except Exception:
-            resource_close_failed = True
+        record = close_failure(client, check="orphan_sweep_resource_close")
+        if record is not None:
+            failures.append(record)
 
     with contextlib.ExitStack() as stack:
         for client in clients:
@@ -1158,6 +1160,6 @@ def orphan_sweep(
     _validate_bounded_receipt_document(receipt)
     if total_survivors:
         raise AcceptanceCheckError("orphan_sweep_survivors")
-    if resource_close_failed:
-        raise AcceptanceCheckError("orphan_sweep_resource_close")
+    if failures:
+        raise AcceptanceCheckError("orphan_sweep_resource_close", cause_class=failures[0].exception_type)
     return receipt

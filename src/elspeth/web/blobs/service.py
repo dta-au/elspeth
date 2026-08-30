@@ -11,7 +11,7 @@ import re
 import stat
 import threading
 from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -2034,6 +2034,33 @@ class _ForkCopyWriteAuthority:
             raise BlobForkFenceLostError(self._fence.operation_id, attempt=self._fence.attempt)
 
 
+@dataclass(frozen=True, slots=True)
+class _DrainOutcome:
+    """Terminal state observed while draining a cancelled fork-copy worker."""
+
+    cancelled: bool = False
+    failure_class: str | None = None
+
+
+async def _drained_worker_outcome(task: asyncio.Future[Any]) -> _DrainOutcome:
+    """Await a cancelled worker to completion, reporting instead of suppressing.
+
+    The callers cancel the worker and must then wait for it to stop before
+    discarding temporary bytes. Its CancelledError is the expected terminal
+    state; any OTHER terminal exception was previously erased by a
+    ``suppress(BaseException)`` — now its class is reported so the caller can
+    attach it to the primary failure as a PEP 678 note.
+    """
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        return _DrainOutcome(cancelled=True)
+    except BaseException as exc:
+        return _DrainOutcome(failure_class=type(exc).__name__)
+    return _DrainOutcome()
+
+
 async def _await_fork_copy_io_with_checkpoints[ResultT](
     operation: Awaitable[ResultT],
     *,
@@ -2054,12 +2081,13 @@ async def _await_fork_copy_io_with_checkpoints[ResultT](
                 {operation_task},
                 timeout=_FORK_COPY_LEASE_CHECKPOINT_INTERVAL_SECONDS,
             )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as primary:
             if write_authority is not None:
                 write_authority.lose()
             operation_task.cancel()
-            with suppress(BaseException):
-                await operation_task
+            drained = await _drained_worker_outcome(operation_task)
+            if drained.failure_class is not None:
+                primary.add_note(f"fork-copy worker also failed during cancellation drain: {drained.failure_class}")
             raise
         if done:
             return operation_task.result()
@@ -2067,20 +2095,22 @@ async def _await_fork_copy_io_with_checkpoints[ResultT](
             write_authority.checkpoint_started()
         try:
             await checkpoint()
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as primary:
             if write_authority is not None:
                 write_authority.lose()
             operation_task.cancel()
-            with suppress(BaseException):
-                await operation_task
+            drained = await _drained_worker_outcome(operation_task)
+            if drained.failure_class is not None:
+                primary.add_note(f"fork-copy worker also failed during cancellation drain: {drained.failure_class}")
             raise
-        except BaseException:
+        except BaseException as primary:
             if write_authority is not None:
                 write_authority.lose()
             else:
                 operation_task.cancel()
-            with suppress(BaseException):
-                await operation_task
+            drained = await _drained_worker_outcome(operation_task)
+            if drained.failure_class is not None:
+                primary.add_note(f"fork-copy worker also failed during checkpoint-failure drain: {drained.failure_class}")
             raise
         else:
             if write_authority is not None:
