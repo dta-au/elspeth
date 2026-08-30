@@ -1528,7 +1528,16 @@ class SinkEffectCoordinator:
             artifact = artifacts_by_effect[predecessor.effect_id]
             if not artifact.publication_performed:
                 plan = self._load_plan(predecessor)
-                if plan.safe_evidence.get("publication_kind") != "reaffirmed":
+                # A finalized no-publication predecessor's plan carries
+                # publication_kind by contract (SinkEffectPlan.__post_init__
+                # rejects NO_PUBLICATION evidence without it, and
+                # _finalize_no_publication refused to finalize without it) —
+                # absence here is audit corruption, not "not reaffirmed".
+                try:
+                    publication_kind = plan.safe_evidence["publication_kind"]
+                except KeyError as exc:
+                    raise LandscapeRecordError("finalized no-publication sink effect predecessor is missing publication evidence") from exc
+                if publication_kind != "reaffirmed":
                     # A virtual or inherited predecessor did not establish new
                     # remote identity: walk back to the most recent real
                     # publication in the stream (elspeth-fac5260c6a).
