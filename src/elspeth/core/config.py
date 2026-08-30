@@ -44,6 +44,7 @@ from elspeth.contracts.enums import OutputMode, RunMode
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.security import SecretFingerprintError as SecretFingerprintError
 from elspeth.contracts.sink import FAILSINK_ELIGIBLE_PLUGIN_TEXT
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core import dynaconf_normalization, template_materialization
 from elspeth.core.dependency_config import CollectionProbeConfig, CommencementGateConfig, DependencyConfig
 from elspeth.core.llm_profiles import (
@@ -2462,9 +2463,8 @@ def _expand_env_vars(config: dict[str, Any]) -> dict[str, Any]:
         def replacer(match: re.Match[str]) -> str:
             var_name = match.group(1)
             default = match.group(2)  # None if no default specified
-            env_value = os.environ.get(var_name)
-            if env_value is not None:
-                return env_value
+            if var_name in os.environ:
+                return os.environ[var_name]
             if default is not None:
                 return default
             # No env var and no default - fail fast with clear error
@@ -2519,6 +2519,22 @@ def _lower_llm_profile_node_options(
     )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "raw pipeline configuration mapping — operator YAML via Dynaconf (load_settings) or a "
+        "web-authored dict (load_settings_from_config_dict) — before ElspethSettings validation"
+    ),
+    source_param="raw_config",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises ValueError when an llm_profiles entry is not a mapping or default_llm_profile names "
+        "no configured profile; absent or non-mapping/list llm_profiles, sources and transforms "
+        "sections are left for ElspethSettings validation to classify, never coerced"
+    ),
+    test_ref="tests/unit/core/test_llm_profile_catalog.py::TestBatchProfileNodeLowering::test_lowering_rejects_malformed_raw_config_shapes",
+    test_fingerprint="638e36b28984450aad0ac42ea13c76dc64a775f1870c800fe2c7d31529f6ab9c",
+)
 def _lower_llm_profile_nodes(raw_config: dict[str, Any], *, materialize: bool) -> dict[str, Any]:
     """Rewrite ``llm`` source and transform components that select an operator profile.
 
@@ -2611,13 +2627,20 @@ def _lower_llm_profile_nodes(raw_config: dict[str, Any], *, materialize: bool) -
         if not materialize:
             return
         executable, _audit_safe = _lower_llm_profile_node_options(alias, profile_settings, options)
-        api_key = executable.get("api_key")
-        if isinstance(api_key, dict) and "secret_ref" in api_key:
+        if "api_key" in executable:
+            # ``lower_llm_profile_options`` is the only writer of this key and
+            # always writes the ``{"secret_ref", "secret_scope"}`` marker:
+            # ``api_key`` is a private profile field, so an authored value
+            # never reaches ``executable``. Anything else here is a lowering
+            # bug in owned data, not an input shape to tolerate.
+            api_key_marker = executable["api_key"]
+            if type(api_key_marker) is not dict:
+                raise TypeError(f"{location} llm profile {alias!r} lowered a non-marker api_key: {type(api_key_marker).__name__}")
             # Batch/CLI never gains the web secret-store resolver; it
             # materializes the profile's credential the same way an
             # explicitly-authored `api_key: ${VAR}` node always has, via the
             # existing _expand_env_vars pass run right after this one.
-            executable["api_key"] = f"${{{api_key['secret_ref']}}}"
+            executable["api_key"] = f"${{{api_key_marker['secret_ref']}}}"
         # Retain the ALIAS ONLY (never endpoint/credential_ref) in the
         # executable options so it survives into ElspethSettings and is
         # therefore recoverable from the run's audit trail — both
@@ -2731,6 +2754,22 @@ def _declared_emitted_options(plugin_name: str) -> dict[str, list[tuple[str, str
     return declared
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "raw pipeline configuration mapping — operator YAML via Dynaconf or a web-authored dict — "
+        "before env expansion and ElspethSettings validation"
+    ),
+    source_param="raw_config",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when any plugin-bearing entry holds an environment-variable placeholder in an "
+        "option its plugin declares EmittedToOutput; entries whose plugin name or options are not the "
+        "expected scalar/mapping shape are skipped here and rejected by ElspethSettings validation"
+    ),
+    test_ref="tests/unit/core/test_config.py::TestEnvPlaceholderGuardIsDerived::test_rejection_message_names_the_declaring_kind",
+    test_fingerprint="9652da87ae0e45512fe4a3930e051c885157bf68475824f7be22a67765204789",
+)
 def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mapping[str, object]) -> None:
     """Reject env placeholders in plugin options whose value is written to output.
 
@@ -3058,7 +3097,9 @@ def _sanitize_dsn_option_for_audit(
     secrets. Those fields must be sanitized by placement, not by key-name
     heuristics, before settings are written to Landscape audit storage.
     """
-    value = options.get(option_name)
+    if option_name not in options:
+        return
+    value = options[option_name]
     if not isinstance(value, str):
         return
 
@@ -3092,7 +3133,7 @@ def sanitize_node_config_for_audit(
     if type(thawed) is not dict:
         raise TypeError(f"Node config must thaw to dict[str, object], got {type(thawed).__name__}: {thawed!r}")
 
-    allow_raw = os.environ.get("ELSPETH_ALLOW_RAW_SECRETS", "").lower() == "true"
+    allow_raw = "ELSPETH_ALLOW_RAW_SECRETS" in os.environ and os.environ["ELSPETH_ALLOW_RAW_SECRETS"].lower() == "true"
     sanitized = _fingerprint_secrets(thawed, fail_if_no_key=not allow_raw)
     if plugin_name == "database":
         # Node config is flat: the DSN sits at top-level `url`.
@@ -3132,7 +3173,7 @@ def _fingerprint_config_for_audit(
     below; the pin, not the docstring, is the guarantee.
 
     Processes:
-    - sources.*.options (and the legacy singular source.options)
+    - sources.*.options
     - sinks.*.options
     - database sink options.url (DSN password)
     - transforms[*].options
@@ -3156,14 +3197,14 @@ def _fingerprint_config_for_audit(
     import os
 
     # Check dev mode override
-    allow_raw = os.environ.get("ELSPETH_ALLOW_RAW_SECRETS", "").lower() == "true"
+    allow_raw = "ELSPETH_ALLOW_RAW_SECRETS" in os.environ and os.environ["ELSPETH_ALLOW_RAW_SECRETS"].lower() == "true"
     fail_if_no_key = not allow_raw
 
     # Deep copy to avoid mutating the original
     config = copy.deepcopy(config_dict)
 
     # === Landscape URL (DSN password) ===
-    if "landscape" in config and isinstance(config["landscape"], dict):
+    if "landscape" in config and type(config["landscape"]) is dict:
         _sanitize_dsn_option_for_audit(
             config["landscape"],
             option_name="url",
@@ -3178,17 +3219,12 @@ def _fingerprint_config_for_audit(
             if type(source) is dict and "options" in source and type(source["options"]) is dict:
                 source["options"] = _fingerprint_secrets(source["options"], fail_if_no_key=fail_if_no_key)
 
-    if "source" in config and isinstance(config["source"], dict):
-        ds = config["source"]
-        if "options" in ds and isinstance(ds["options"], dict):
-            ds["options"] = _fingerprint_secrets(ds["options"], fail_if_no_key=fail_if_no_key)
-
     # === Sink options ===
-    if "sinks" in config and isinstance(config["sinks"], dict):
+    if "sinks" in config and type(config["sinks"]) is dict:
         for sink in config["sinks"].values():
-            if isinstance(sink, dict) and "options" in sink and isinstance(sink["options"], dict):
+            if type(sink) is dict and "options" in sink and type(sink["options"]) is dict:
                 options = _fingerprint_secrets(sink["options"], fail_if_no_key=fail_if_no_key)
-                if sink.get("plugin") == "database":
+                if "plugin" in sink and sink["plugin"] == "database":
                     # Database sink URLs are a plugin-specific secret-ref placement:
                     # the field is named "url" rather than a heuristic secret name.
                     _sanitize_dsn_option_for_audit(
@@ -3201,32 +3237,32 @@ def _fingerprint_config_for_audit(
                 sink["options"] = options
 
     # === Transform plugin options ===
-    if "transforms" in config and isinstance(config["transforms"], list):
+    if "transforms" in config and type(config["transforms"]) is list:
         for plugin in config["transforms"]:
-            if isinstance(plugin, dict) and "options" in plugin and isinstance(plugin["options"], dict):
+            if type(plugin) is dict and "options" in plugin and type(plugin["options"]) is dict:
                 plugin["options"] = _fingerprint_secrets(plugin["options"], fail_if_no_key=fail_if_no_key)
 
     # === Collector plugin options ===
     # Collectors reuse the batch-transform plugin contract, so their options
     # are the same arbitrary secret-bearing shape as a transform's.
-    if "collectors" in config and isinstance(config["collectors"], list):
+    if "collectors" in config and type(config["collectors"]) is list:
         for collector in config["collectors"]:
-            if isinstance(collector, dict) and "options" in collector and isinstance(collector["options"], dict):
+            if type(collector) is dict and "options" in collector and type(collector["options"]) is dict:
                 collector["options"] = _fingerprint_secrets(collector["options"], fail_if_no_key=fail_if_no_key)
 
     # === Aggregation options ===
-    if "aggregations" in config and isinstance(config["aggregations"], list):
+    if "aggregations" in config and type(config["aggregations"]) is list:
         for agg in config["aggregations"]:
-            if isinstance(agg, dict) and "options" in agg and isinstance(agg["options"], dict):
+            if type(agg) is dict and "options" in agg and type(agg["options"]) is dict:
                 agg["options"] = _fingerprint_secrets(agg["options"], fail_if_no_key=fail_if_no_key)
 
     # === Telemetry exporter options ===
-    if "telemetry" in config and isinstance(config["telemetry"], dict):
+    if "telemetry" in config and type(config["telemetry"]) is dict:
         telemetry = config["telemetry"]
-        exporters = telemetry.get("exporters")
-        if isinstance(exporters, list):
+        exporters = telemetry["exporters"]
+        if type(exporters) is list:
             for exporter in exporters:
-                if isinstance(exporter, dict) and "options" in exporter and isinstance(exporter["options"], dict):
+                if type(exporter) is dict and "options" in exporter and type(exporter["options"]) is dict:
                     exporter["options"] = _fingerprint_secrets(exporter["options"], fail_if_no_key=fail_if_no_key)
 
     # === Collection probe provider config ===
@@ -3235,9 +3271,9 @@ def _fingerprint_config_for_audit(
     # is carried into the audit copy. The provider model's own extra="forbid"
     # is NOT containment here — it applies at probe construction, downstream of
     # the settings validation that admits the value.
-    if "collection_probes" in config and isinstance(config["collection_probes"], list):
+    if "collection_probes" in config and type(config["collection_probes"]) is list:
         for probe in config["collection_probes"]:
-            if isinstance(probe, dict) and "provider_config" in probe and isinstance(probe["provider_config"], dict):
+            if type(probe) is dict and "provider_config" in probe and type(probe["provider_config"]) is dict:
                 probe["provider_config"] = _fingerprint_secrets(probe["provider_config"], fail_if_no_key=fail_if_no_key)
 
     return config
