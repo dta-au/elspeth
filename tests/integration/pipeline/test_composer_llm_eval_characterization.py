@@ -65,6 +65,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from tests.fixtures.factories import make_context
+from tests.helpers.session_fences import acquire_compose_context, seed_session_operation_fence
 from tests.integration.web.conftest import _make_session
 
 pytestmark = pytest.mark.composer_llm_eval
@@ -239,6 +240,11 @@ def _session_service_for_characterization(
     )
     with engine.begin() as conn:
         _make_session(conn, session_id=session_id, user_id=EVAL_USER_ID)
+        # Production sessions are born with their released epoch-1 fence;
+        # a hand-inserted row needs the same so the compose lease can be
+        # acquired without a repair write (which the commit-failure
+        # characterizations below would otherwise trip on).
+        seed_session_operation_fence(conn, session_id, owner_instance_id=service.session_operation_owner_instance_id)
         conn.execute(text("UPDATE sessions SET trust_mode = 'auto_commit' WHERE id = :session_id"), {"session_id": session_id})
     return service
 
@@ -270,13 +276,16 @@ async def _run_one_turn_for_characterization(
     llm: _ReplayLLM,
     session_id: str,
     initial_state: CompositionState | None = None,
+    session_operation_context: Any = None,
 ) -> Any:
     driver = cast(Any, service)
-    return await driver._run_one_turn_for_test(
-        llm=llm,
-        session_id=session_id,
-        initial_state=initial_state,
-    )
+    kwargs: dict[str, Any] = {"llm": llm, "session_id": session_id, "initial_state": initial_state}
+    if session_operation_context is not None:
+        # Tests that arm a commit failure acquire their COMPOSE lease first so
+        # the failure lands on the compose-loop commit under test, not on the
+        # lease acquisition the autouse adapter would otherwise perform.
+        kwargs["session_operation_context"] = session_operation_context
+    return await driver._run_one_turn_for_test(**kwargs)
 
 
 def _chat_rows(sessions_service: SessionServiceImpl, *, session_id: str) -> list[Any]:
@@ -504,11 +513,17 @@ async def test_cl_pp_10a_commit_failure_without_plugin_crash_raises_audit_integr
         )
     )
 
-    with (
-        _force_commit_failure(sessions_service._engine),
-        pytest.raises(AuditIntegrityError) as exc_info,
-    ):
-        await _run_one_turn_for_characterization(service, llm=llm, session_id=session_id)
+    async with acquire_compose_context(sessions_service, session_id) as compose_context:
+        with (
+            _force_commit_failure(sessions_service._engine),
+            pytest.raises(AuditIntegrityError) as exc_info,
+        ):
+            await _run_one_turn_for_characterization(
+                service,
+                llm=llm,
+                session_id=session_id,
+                session_operation_context=compose_context,
+            )
 
     assert isinstance(exc_info.value.__cause__, OperationalError)
     assert observed_value(telemetry.tool_row_tier1_violation_total) == 1
@@ -568,12 +583,18 @@ async def test_cl_pp_10b_commit_failure_during_plugin_crash_preserves_plugin_err
         )
     )
 
-    with (
-        _force_commit_failure(sessions_service._engine),
-        capture_logs() as cap_logs,
-        pytest.raises(ComposerPluginCrashError) as exc_info,
-    ):
-        await _run_one_turn_for_characterization(service, llm=llm, session_id=session_id)
+    async with acquire_compose_context(sessions_service, session_id) as compose_context:
+        with (
+            _force_commit_failure(sessions_service._engine),
+            capture_logs() as cap_logs,
+            pytest.raises(ComposerPluginCrashError) as exc_info,
+        ):
+            await _run_one_turn_for_characterization(
+                service,
+                llm=llm,
+                session_id=session_id,
+                session_operation_context=compose_context,
+            )
 
     assert isinstance(exc_info.value.__cause__, RuntimeError)
     assert exc_info.value.failed_turn is not None

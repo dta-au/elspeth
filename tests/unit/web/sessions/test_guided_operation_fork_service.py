@@ -281,44 +281,49 @@ async def _blob_delete_first_contention(
     delete_first: Callable[[], Awaitable[Any]],
     reserve_second: Callable[[], Awaitable[Any]],
 ) -> tuple[Any, Any]:
-    """Hold blob deletion's source lock while fork reservation contends on it."""
+    """Hold blob deletion's custody lock while fork reservation contends on it.
+
+    ``delete_blob`` holds ``_blob_custody_session_lock`` across its phase
+    transaction; on SQLite that is the same-session process mutex every other
+    same-session writer (the operation authority's reservation, fork staging)
+    must take first. The contender must be observed asking for that mutex and
+    must hold it only after the delete releases.
+    """
 
     from elspeth.web.blobs import service as blob_service_module
+    from elspeth.web.sessions import locking as session_locking
 
+    del reserve_service  # the contender is observed at the lock, not on a service seam
     original_blob_lock = blob_service_module._blob_custody_session_lock
-    original_service_begin = reserve_service._session_process_locked_begin
-    original_service_lock = reserve_service._session_write_lock
+    original_mutex = session_locking.sqlite_session_mutex
     held = threading.Barrier(2)
     release = threading.Barrier(2)
     reserve_waiting = threading.Event()
     reserve_acquired = threading.Event()
+    delete_thread: list[threading.Thread] = []
 
     @contextlib.contextmanager
     def controlled_blob_lock(engine: Any, locked_session_id: str):
         with original_blob_lock(engine, locked_session_id) as conn:
             if locked_session_id == str(session_id):
+                delete_thread.append(threading.current_thread())
                 held.wait(timeout=5)
                 release.wait(timeout=5)
             yield conn
 
     @contextlib.contextmanager
-    def observed_service_begin(locked_session_id: str):
-        if locked_session_id == str(session_id):
+    def observed_mutex(engine: Any, locked_session_id: str):
+        contender = locked_session_id == str(session_id) and delete_thread and threading.current_thread() is not delete_thread[0]
+        if contender:
             reserve_waiting.set()
-        with original_service_begin(locked_session_id) as conn:
-            yield conn
-
-    @contextlib.contextmanager
-    def observed_service_lock(conn: Any, locked_session_id: str):
-        with original_service_lock(conn, locked_session_id):
-            if locked_session_id == str(session_id):
+        with original_mutex(engine, locked_session_id):
+            if contender:
                 reserve_acquired.set()
             yield
 
     with (
         patch.object(blob_service_module, "_blob_custody_session_lock", new=controlled_blob_lock),
-        patch.object(reserve_service, "_session_process_locked_begin", new=observed_service_begin),
-        patch.object(reserve_service, "_session_write_lock", new=observed_service_lock),
+        patch.object(session_locking, "sqlite_session_mutex", new=observed_mutex),
     ):
         delete_task = asyncio.create_task(delete_first())
         await asyncio.to_thread(held.wait, 5)
@@ -337,12 +342,13 @@ async def _fork_first_blob_contention(
     fork_first: Callable[[], Awaitable[Any]],
     delete_second: Callable[[], Awaitable[Any]],
 ) -> tuple[Any, Any]:
-    """Hold fork reservation's source lock while blob deletion contends on it."""
+    """Hold fork staging's custody transaction while blob deletion contends on it."""
 
     from elspeth.web.blobs import service as blob_service_module
+    from elspeth.web.coordination import repository as coordination_repository
 
     original_blob_lock = blob_service_module._blob_custody_session_lock
-    original_service_lock = fork_service._session_write_lock
+    original_transaction_lock = coordination_repository.transaction_session_lock
     held = threading.Barrier(2)
     release = threading.Barrier(2)
     delete_waiting = threading.Event()
@@ -350,9 +356,9 @@ async def _fork_first_blob_contention(
     paused = False
 
     @contextlib.contextmanager
-    def controlled_service_lock(conn: Any, locked_session_id: str):
+    def controlled_transaction_lock(conn: Any, engine: Any, locked_session_id: str):
         nonlocal paused
-        with original_service_lock(conn, locked_session_id):
+        with original_transaction_lock(conn, engine, locked_session_id):
             if locked_session_id == str(session_id) and not paused:
                 paused = True
                 held.wait(timeout=5)
@@ -369,7 +375,7 @@ async def _fork_first_blob_contention(
             yield conn
 
     with (
-        patch.object(fork_service, "_session_write_lock", new=controlled_service_lock),
+        patch.object(coordination_repository, "transaction_session_lock", new=controlled_transaction_lock),
         patch.object(blob_service_module, "_blob_custody_session_lock", new=observed_blob_lock),
     ):
         fork_task = asyncio.create_task(fork_first())
@@ -1505,7 +1511,8 @@ async def test_source_blob_delete_and_planned_copy_serialize_under_lock_contenti
     user_id = f"fork-blob-race-{uuid4()}"
     parent = await race_service.create_session(user_id, "Parent", "local")
     source_blob = await blob_service.create_blob(parent.id, "source.csv", b"a,b\n1,2\n", "text/csv")
-    state = await race_service.save_composition_state(
+    state = await _save_composition_state(
+        race_service,
         parent.id,
         CompositionStateData(
             sources={
@@ -1544,9 +1551,9 @@ async def test_source_blob_delete_and_planned_copy_serialize_under_lock_contenti
             BlobForkWriteFence(
                 source_session_id=parent.id,
                 target_session_id=staged.session.id,
-                operation_id=fence.operation_id,
-                lease_token=fence.lease_token,
-                attempt=fence.attempt,
+                operation_id=fence.guided_fence.operation_id,
+                lease_token=fence.guided_fence.lease_token,
+                attempt=fence.guided_fence.attempt,
             ),
             checkpoint=checkpoint,
         )
@@ -1575,9 +1582,10 @@ async def test_source_blob_delete_and_planned_copy_serialize_under_lock_contenti
                     child_session_id=staged.session.id,
                 )
             await race_service.fail_guided_operation(
-                fence,
+                fence.guided_fence,
                 failure_code="integrity_error",
                 actor="composer_route",
+                session_operation_context=fence.parent_context,
             )
             await blob_service.cleanup_blobs_for_fork(parent.id, staged.session.id, operation_id)
             assert [item.id for item in await race_service.list_sessions(user_id, "local")] == [parent.id]
@@ -1602,8 +1610,7 @@ async def test_source_blob_delete_and_planned_copy_serialize_under_lock_contenti
             response_hash = "b" * 64
             settled = await race_service.settle_guided_fork_operation(
                 GuidedForkSettlementCommand(
-                    fence=fence,
-                    child_session_id=staged.session.id,
+                    authority=staged.authority,
                     expected_current_state_id=staged.state.id,
                     edited_message_id=staged.messages[-1].id,
                     rewritten_state_id=uuid4(),
