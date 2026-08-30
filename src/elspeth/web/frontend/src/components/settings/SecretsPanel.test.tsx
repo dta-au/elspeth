@@ -51,6 +51,17 @@ describe("SecretsPanel", () => {
     ).toBeInTheDocument();
   });
 
+  it("names secret scopes in the reader register with the raw scope in title (elspeth-d74ab492dd)", () => {
+    render(<SecretsPanel onClose={vi.fn()} />);
+    expect(screen.getByText("Yours")).toHaveAttribute("title", "user");
+    expect(screen.getByText("Deployment")).toHaveAttribute("title", "server");
+    // Anchored: `^user$` rather than a substring, because the same fixture
+    // also carries `source_kind: "user"` on the secret. An unanchored
+    // queryByText("user") would fail for an unrelated reason if source_kind
+    // ever reached visible text — a negative that reports the wrong defect.
+    expect(screen.queryByText(/^user$/)).not.toBeInTheDocument();
+  });
+
   it("gives every inventory row the same trailing action slot", () => {
     // Rows whose secret is not user-scoped render no delete button. Without a
     // slot of its own, the scope badge on those rows ran a whole control-width
