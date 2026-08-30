@@ -1818,3 +1818,13 @@ def test_source_resolved_from_dict_accepts_legacy_records_without_anchor() -> No
         "on_validation_failure": "discard",
     }
     assert SourceResolved.from_dict(legacy).content_hash_prefix is None
+
+
+def test_reorder_reviewed_components_rejects_non_sequence_and_non_uuid_stable_ids() -> None:
+    """The wire-facing stable_ids parse rejects, never coerces or partially reorders."""
+    session = _review_session(step=GuidedStep.STEP_1_SOURCE)
+
+    with pytest.raises(TypeError, match="sequence of UUID"):
+        reorder_reviewed_components(session, "source", "a-str-is-a-character-sequence-trap")
+    with pytest.raises(TypeError, match="exact UUID"):
+        reorder_reviewed_components(session, "source", (UUID(SOURCE_A), "not-a-uuid"))
