@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from uuid import uuid4
 
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, GuidedCustodyIntegrityError
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
@@ -43,6 +43,7 @@ from elspeth.web.composer.guided.state_machine import (
 )
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.redaction import assert_guided_custody_persistable
 from elspeth.web.composer.source_inspection import (
     SOURCE_INSPECTION_INTEGRITY_ERRORS,
     SourceInspectionBlobLifecycleError,
@@ -1154,6 +1155,25 @@ async def post_guided_reenter(
                 status_code=409,
                 detail="Guided session cannot be re-entered because no current turn record exists.",
             )
+        # Re-entry makes the retained review ACTIVE authoring authority again
+        # (on both the restored-COMPLETED and the active branch below), so it
+        # must bind to the tip's sources exactly as the write gate demands of
+        # an active session; a degraded (custody_unavailable) projection is
+        # never re-entered. Reviewed sources stay intact on refusal — a
+        # /state/revert to a bindable version re-enables re-entry.
+        custody_probe = guided.to_dict()
+        custody_probe["terminal"] = None
+        try:
+            assert_guided_custody_persistable(deep_thaw(state_record.sources), {"guided_session": custody_probe})
+        except GuidedCustodyIntegrityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_type": "guided_reenter_custody_unbindable",
+                    "detail": "This guided session's retained source review no longer binds to its sources; "
+                    "revert to an earlier version before re-entering guided mode.",
+                },
+            ) from exc
         existing_meta: dict[str, Any] = {}
         if state_record.composer_meta is not None:
             existing_meta = dict(deep_thaw(state_record.composer_meta))

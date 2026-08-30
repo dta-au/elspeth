@@ -13537,3 +13537,53 @@ async def test_legacy_exited_unbindable_tip_projects_degraded(tmp_path) -> None:
     assert body["composer_meta"]["guided_session"]["custody_unavailable"] is True
     assert body["sources"]["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
     assert _LEGACY_PRIVATE_PATH not in response.text
+
+
+@pytest.mark.asyncio
+async def test_guided_reenter_refuses_an_unbindable_exited_tip(tmp_path) -> None:
+    """Re-entry turns the retained review back into ACTIVE authoring authority,
+    so a tip whose review cannot bind (incident v13, exited) must be refused
+    before settlement (adversary Critical 2): 409 with a stable error_type, no
+    new version, reviewed_sources intact (a /state/revert to a bindable version
+    re-enables re-entry), and GET /state still serves the degraded projection."""
+    from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
+    from elspeth.web.composer.guided.state_machine import TurnRecord
+
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    exited = TerminalState(kind=TerminalKind.EXITED_TO_FREEFORM, reason=TerminalReason.USER_PRESSED_EXIT, pipeline_yaml=None)
+    state_data = _legacy_unbindable_guided_state(terminal=exited)
+    guided_d = deep_thaw(state_data.composer_meta)["guided_session"]
+    guided = replace(
+        GuidedSession.from_dict(guided_d),
+        history=(
+            TurnRecord(
+                step=GuidedStep.STEP_1_SOURCE,
+                turn_type=TurnType.INSPECT_AND_CONFIRM,
+                payload_hash="a" * 64,
+                response_hash=None,
+                emitter="server",
+            ),
+        ),
+    )
+    tip = await service.save_composition_state(
+        session.id,
+        replace(state_data, composer_meta={"guided_session": guided.to_dict()}),
+        provenance="post_compose",
+    )
+
+    response = client.post(f"/api/sessions/{session.id}/guided/reenter", json={"operation_id": str(uuid.uuid4())})
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["error_type"] == "guided_reenter_custody_unbindable"
+    assert _LEGACY_PRIVATE_PATH not in response.text
+    current = await service.get_current_state(session.id)
+    assert current is not None
+    assert current.id == tip.id
+    persisted = GuidedSession.from_dict(deep_thaw(current.composer_meta)["guided_session"])
+    assert persisted.reviewed_sources == guided.reviewed_sources
+    assert persisted.terminal == exited
+    degraded = client.get(f"/api/sessions/{session.id}/state")
+    assert degraded.status_code == 200
+    assert degraded.json()["composer_meta"]["guided_session"]["custody_unavailable"] is True
