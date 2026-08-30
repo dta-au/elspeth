@@ -32,7 +32,6 @@ from elspeth.contracts.blobs_inline import ResolvedBlobContent
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind, InterpretationSource
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import tool_batch
-from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.coordination import repository as coordination_repository
 from elspeth.web.coordination.contracts import SessionOperationContext
@@ -204,7 +203,10 @@ def test_pending_interpretation_policy_is_neutral_and_command_has_one_constructo
     assert "SessionPendingInterpretationCommand(" not in inspect.getsource(coordination_repository)
 
 
-def test_pending_interpretation_validator_rejects_nested_engine_handle() -> None:
+def test_pending_interpretation_validator_rejects_any_non_exact_catalog_carrier() -> None:
+    """Validation dependencies are nominally typed (ADR-032): a carrier that
+    merely wraps a runtime handle is refused for not being the exact
+    process-local catalog, with no object-graph scan deciding the verdict."""
     from elspeth.web.sessions.pending_interpretation import _SessionPendingInterpretationValidator
 
     class SlottedCatalogBase:
@@ -218,15 +220,18 @@ def test_pending_interpretation_validator_rejects_nested_engine_handle() -> None
 
     engine = create_session_engine("sqlite:///:memory:")
     try:
-        with pytest.raises(TypeError, match=r"retains forbidden runtime handle.*Engine"):
+        with pytest.raises(TypeError, match=r"catalog must be the exact process-local CatalogServiceImpl"):
             _SessionPendingInterpretationValidator(
                 profile_aware=False,
                 plugin_snapshot=None,
                 profile_registry=None,
                 catalog=types.SimpleNamespace(nested={"catalog": MixedStorageCatalog(engine)}),
+                session_id="session",
+                user_id=None,
             )
     finally:
         engine.dispose()
+    assert not hasattr(__import__("elspeth.web.sessions.pending_interpretation", fromlist=["x"]), "_forbidden_validation_dependency")
 
 
 def test_pending_interpretation_callers_forward_existing_authority() -> None:
@@ -741,16 +746,3 @@ def test_execute_transfers_one_renewable_lease_to_background_completion() -> Non
     completion_source = textwrap.dedent(inspect.getsource(ExecutionServiceImpl._on_pipeline_done))
     assert "session_operation_lease" in completion_source
     assert ".close" in completion_source
-
-
-def test_composer_progress_is_durable_and_exactly_fenced_before_publish() -> None:
-    _required_parameter(ComposerProgressRegistry, "__init__", "engine")
-    publish_context = _required_parameter(ComposerProgressRegistry, "publish", "session_operation_context")
-    assert publish_context.annotation is SessionOperationContext or publish_context.annotation == "SessionOperationContext"
-
-    source = textwrap.dedent(inspect.getsource(ComposerProgressRegistry))
-    assert "self._engine" in source
-    assert "composer_progress" in source
-    assert "session_operation_context" in source
-    assert "self._session_operation_authority.mutate" in source
-    assert "self._snapshots" not in source

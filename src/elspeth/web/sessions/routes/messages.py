@@ -296,7 +296,7 @@ def register_message_routes(router: APIRouter) -> None:
                 # gets re-titled. Tighten to a separate auto_titled_at
                 # column if this becomes annoying.
                 if len(records) == 1 and is_default_session_title(session.title):
-                    auto_title_task = asyncio.create_task(
+                    auto_title_task = compose_operation_lease.create_task(
                         maybe_auto_title_session(
                             service=service,
                             session_id=session.id,

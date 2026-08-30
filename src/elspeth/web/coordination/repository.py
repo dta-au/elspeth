@@ -192,8 +192,8 @@ def _build_fork_mutation_connection_controls() -> tuple[
     ) -> Connection:
         connection = _resolve_mutation_connection(connection_token)
         with registry_lock:
-            registered_pair = registered_pairs.get(connection_token)
-        if registered_pair != (parent_session_id, child_session_id):
+            bound = connection_token in registered_pairs and registered_pairs[connection_token] == (parent_session_id, child_session_id)
+        if not bound:
             raise AuditIntegrityError("fork mutation token is not bound to the exact fork pair")
         return connection
 
@@ -3820,7 +3820,8 @@ class _SessionOperationAuthorityRepository:
         ) -> None:
             semantic_pair = (parent_session_id, child_session_id)
             with registry_lock:
-                entry = active_pairs.get(id(connection))
+                active = id(connection) in active_pairs
+                entry = active_pairs[id(connection)] if active else None
             if entry is None or entry[0] is not connection or entry[1] != semantic_pair:
                 raise AuditIntegrityError("fork transaction construction requires the exact active locked fork pair")
 

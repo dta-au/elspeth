@@ -33,9 +33,9 @@ def _register_mutation_connection(connection: Connection) -> str:
 
 def _resolve_mutation_connection(token: str) -> Connection:
     with _MUTATION_CONNECTION_REGISTRY_LOCK:
-        entry = _MUTATION_CONNECTION_REGISTRY.get(token)
-    if entry is None:
-        raise RuntimeError("session operation mutation transaction is closed")
+        if token not in _MUTATION_CONNECTION_REGISTRY:
+            raise RuntimeError("session operation mutation transaction is closed")
+        entry = _MUTATION_CONNECTION_REGISTRY[token]
     if entry.owner_thread_id != get_ident():
         raise RuntimeError("session operation mutation used outside its owning callback thread")
     return entry.connection

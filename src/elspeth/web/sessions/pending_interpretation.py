@@ -8,12 +8,8 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import suppress
-from dataclasses import dataclass, fields, is_dataclass, replace
-from datetime import datetime
-from enum import Enum
-from inspect import isfunction, ismethod
-from types import MappingProxyType, MemberDescriptorType
+from dataclasses import dataclass, replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, TypedDict, cast, final
 from uuid import UUID
 
@@ -1443,65 +1439,6 @@ def _pending_interpretation_validation_candidate_digest(
     )
 
 
-def _forbidden_validation_dependency(value: object) -> str | None:
-    """Find runtime/authority handles hidden in a validation dependency graph."""
-    seen: set[int] = set()
-
-    def _walk(current: object) -> str | None:
-        current_id = id(current)
-        if current_id in seen:
-            return None
-        seen.add(current_id)
-        current_type = type(current)
-        lineage = {(base.__module__, base.__name__) for base in current_type.__mro__}
-        for module_name, class_name in lineage:
-            if module_name.startswith("sqlalchemy.engine") and class_name in {"Connection", "Engine"}:
-                return f"{module_name}.{class_name}"
-            if module_name == "elspeth.web.sessions.service" and class_name == "SessionServiceImpl":
-                return f"{module_name}.{class_name}"
-        if current_type.__module__.startswith("elspeth.web.coordination") and all(
-            callable(getattr(current, method_name, None)) for method_name in ("acquire", "mutate", "release")
-        ):
-            return f"{current_type.__module__}.{current_type.__name__}"
-        if current is None or current_type in {bool, bytes, datetime, float, int, str, UUID} or isinstance(current, Enum):
-            return None
-        if isinstance(current, type):
-            return None
-        nested_values: list[object] = []
-        if isinstance(current, Mapping):
-            nested_values.extend(current.keys())
-            nested_values.extend(current.values())
-        if isinstance(current, (tuple, list, set, frozenset)):
-            nested_values.extend(current)
-        if ismethod(current):
-            nested_values.extend((current.__self__, current.__func__))
-        if isfunction(current):
-            for cell in current.__closure__ or ():
-                with suppress(ValueError):
-                    nested_values.append(cell.cell_contents)
-            nested_values.extend(current.__defaults__ or ())
-            nested_values.extend((current.__kwdefaults__ or {}).values())
-        if is_dataclass(current):
-            nested_values.extend(getattr(current, field.name) for field in fields(current))
-        with suppress(TypeError):
-            nested_values.extend(vars(current).values())
-        for base in current_type.__mro__:
-            for descriptor in vars(base).values():
-                if not isinstance(descriptor, MemberDescriptorType):
-                    continue
-                try:
-                    nested_values.append(descriptor.__get__(current, current_type))
-                except (AttributeError, TypeError):
-                    continue
-        for nested in nested_values:
-            forbidden = _walk(nested)
-            if forbidden is not None:
-                return forbidden
-        return None
-
-    return _walk(value)
-
-
 # Runtime-equivalent preflight for interpretation-resolution state writes:
 # ``(patched_state, user_id, session_id, plugin_snapshot) -> ValidationResult``.
 # Bound at app wiring over ``validate_pipeline`` with the app's settings and
@@ -1575,11 +1512,14 @@ class _SessionPendingInterpretationValidator:
             ("profile_registry", profile_registry, OperatorProfileRegistry),
             ("catalog", catalog, CatalogServiceImpl),
         ):
+            # Exact nominal typing is the whole guard (ADR-032): any other
+            # object, including one that merely wraps a runtime or authority
+            # handle, is refused here. The retired object-graph scanner that
+            # used to name the hidden handle was rejected by review (hidden
+            # carriers, pre-rejection traversal, unbounded work) and its
+            # replacement is the closed per-principal validation DTO.
             if dependency is None or type(dependency) is allowed_type:
                 continue
-            forbidden = _forbidden_validation_dependency(dependency)
-            if forbidden is not None:
-                raise TypeError(f"pending interpretation {field_name} retains forbidden runtime handle {forbidden}")
             raise TypeError(f"pending interpretation {field_name} must be the exact process-local {allowed_type.__name__}")
         if type(session_id) is not str or not session_id:
             raise TypeError("pending interpretation session_id must be a nonblank exact string")
