@@ -988,7 +988,10 @@ class AuditIntegrityError(Exception):
         self.failed_turn = failed_turn
 
 
-# TIER-1: Guided reviewed-source custody could not be bound to the live sources — a Tier-1 refusal that route arms may NAME, never soften.
+@tier_1_error(
+    reason="ADR-008: guided reviewed-source custody cannot bind to the live sources — the audit trail's source provenance is unprovable",
+    caller_module=__name__,
+)
 class GuidedCustodyIntegrityError(AuditIntegrityError):
     """Raised when a guided session's retained source review cannot bind.
 
