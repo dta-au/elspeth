@@ -24,7 +24,13 @@ import { expect } from "vitest";
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 const HEX32_RE = /\b[0-9a-f]{32,}\b/i;
-const SNAKE_RE = /\b[a-z]+_[a-z_]+\b/;
+// Digits are part of the shape, not an edge case: the composer auto-suffixes a
+// duplicate plugin (`llm_2`, `classify_2`) and authors write `step_1_extract`,
+// so the pre-2026-08-31 form /\b[a-z]+_[a-z_]+\b/ was blind to the MOST
+// common production id and every call was a false certificate for it. Still
+// requires an underscore, and still starts on a letter, so hyphenated prose
+// ("well-formed") and bare numbers ("2 of 3") do not match.
+const SNAKE_RE = /\b[a-z][a-z0-9]*_[a-z0-9_]*[a-z0-9]\b/;
 
 const IDENTIFIER_SURFACES = [
   "code",

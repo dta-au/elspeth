@@ -36,10 +36,11 @@ describe("AuditCharacteristicIcon", () => {
   });
 
   it("renders nothing for a flag outside the closed vocabulary — drift is the parity test's job, not a chip's (elspeth-0bfd019f68)", () => {
-    // future_characteristic, not the deleted tests' future_flag_2027: the
-    // digit-free form is what the rest of this wave's fixtures use, because
-    // SNAKE_RE admits no digits (Global Constraints). It makes no difference
-    // to toBeEmptyDOMElement here, and it keeps one flag spelling in the wave.
+    // future_characteristic, not the deleted tests' future_flag_2027. The
+    // digit-free rationale is RETIRED (2026-08-31): SNAKE_RE admits digits
+    // now, so either spelling is equally visible to the pin. The name stays
+    // as it is to keep one flag spelling across the wave; it makes no
+    // difference to toBeEmptyDOMElement here either way.
     const { container } = render(<AuditCharacteristicIcon flag="future_characteristic" />);
     expect(container).toBeEmptyDOMElement();
   });

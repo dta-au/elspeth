@@ -89,3 +89,33 @@ describe("expectNoIdentifiersInDefaultDom — allowAriaLabelSelfSelectors", () =
     ).toThrow();
   });
 });
+
+describe("expectNoIdentifiersInDefaultDom — SNAKE_RE admits digits", () => {
+  it("FAILS on a digit-bearing id in visible text", () => {
+    // RED before the widening: SNAKE_RE was /\b[a-z]+_[a-z_]+\b/, which admits
+    // no digits, so this case PASSED — the pin certified a DOM that was
+    // leaking an identifier. `llm_2` is not an exotic shape: it is what the
+    // composer's own planner generates when a pipeline uses a plugin twice.
+    const container = mount(`<p>Sends rows to llm_2 for classification.</p>`);
+    expect(() => expectNoIdentifiersInDefaultDom(container)).toThrow();
+  });
+
+  it("FAILS on the digit-infixed and digit-suffixed shapes the planner emits", () => {
+    for (const id of ["invest_cs1_done", "step_1_extract", "classify_2"]) {
+      const container = mount(`<p>${id}</p>`);
+      expect(() => expectNoIdentifiersInDefaultDom(container), id).toThrow();
+    }
+  });
+
+  it("does NOT fire on prose or hyphenated tokens", () => {
+    // The widening's cost is false positives on reader-register text, so the
+    // negative side is pinned too: English prose carries no underscores, and
+    // hyphens are word breaks, not identifier joins. A regex that matched
+    // these would make every reader-register assertion in the suite unusable.
+    const container = mount(
+      `<p>Reads source data: Source (CSV). Claude Sonnet 4.6 via openrouter/anthropic.
+        A well-formed run-confirm dialog, 2 of 3 steps, state-of-the-art.</p>`,
+    );
+    expect(() => expectNoIdentifiersInDefaultDom(container)).not.toThrow();
+  });
+});

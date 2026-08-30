@@ -718,9 +718,11 @@ describe("PipelineSpecView", () => {
       compositionState: makeComposition(11, {
         sources: { source: { plugin: "csv", options: {}, on_success: "raw_rows", on_validation_failure: "discard" } },
         nodes: [
-          // Digit-FREE identifiers: SNAKE_RE is /\b[a-z]+_[a-z_]+\b/ and admits
-          // no digits, so `invest_cs1_done` would produce a pin that cannot
-          // fail on either the `input` dd or the branches prose.
+          // The digit-free constraint on these ids is RETIRED (2026-08-31):
+          // SNAKE_RE now admits digits, so `invest_cs1_done` would produce a
+          // pin that fails honestly. The ids are left as they are — renaming
+          // them would churn the assertions below without testing anything
+          // new; the pin's reach no longer depends on the spelling.
           { id: "merge_invest", node_type: "coalesce", plugin: null, input: "invest_first_done", on_success: "tidy_output", on_error: null, branches: { branch_invest_first: "invest_first_done" }, policy: "require_all", merge: "union", options: {} },
           { id: "collect_pages", node_type: "collector", plugin: null, input: "tidy_output", on_success: "tidy_output", on_error: null, scope_name: "doc_pages", scope_opener: "merge_invest", scope_policy: "require_all", output_mode: "passthrough", timeout_seconds: 300, options: {} },
         ],
