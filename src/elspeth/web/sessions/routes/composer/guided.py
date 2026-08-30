@@ -8,6 +8,7 @@ from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.validation import get_sink_config_model, get_source_config_model
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -133,6 +134,7 @@ from .._helpers import (
     _get_session_compose_lock_registry,
     _initial_composition_state_with_guided_session,
     _inspect_latest_ready_session_blob,
+    _log_last_resort_diagnostic,
     _replace,
     _request_plugin_policy_context,
     _safe_frame_strings,
@@ -180,6 +182,14 @@ _COMPLETED_TERMINAL_BEFORE_EXIT_META_KEY = "guided_completed_terminal_before_use
 # unchanged. Scrub first, then truncate: truncation is a bound, never a
 # redaction mechanism (mirrors execution.service's operator diagnostic).
 _CONTRACT_REJECTION_EXC_MESSAGE_CHARS = 500
+
+# Upper bound on consecutive fence-loss rejoin attempts in the guided START
+# settlement loop. A lost fence is an expected concurrency signal (another
+# worker won, or our lease expired under load) and one rejoin normally
+# resolves it by joining the winner; losing the fence this many times in a
+# row is pathological lease churn and terminates in AuditIntegrityError
+# instead of an unbounded retry.
+_GUIDED_FENCE_REJOIN_ATTEMPTS = 5
 
 
 def _resolve_shield_available(snapshot: PluginAvailabilitySnapshot) -> bool:
@@ -1533,7 +1543,13 @@ async def post_guided_start(
         else:
             observed_head = None
 
-    while True:
+    # Bounded fence-loss rejoin (was ``while True``): every iteration either
+    # returns a durable result, raises, or observes a lost fence and retries
+    # through ``reserve_or_replay_guided_operation`` (which joins the winner
+    # or performs the sole takeover). Repeated losses mean pathological lease
+    # churn, and the loop must terminate in an explicit integrity failure
+    # rather than retry forever.
+    for _fence_rejoin_attempt in range(_GUIDED_FENCE_REJOIN_ATTEMPTS):
         if pending is None:
             reserved = await reserve_or_replay_guided_operation(
                 service=service,
@@ -1723,6 +1739,7 @@ async def post_guided_start(
             except GuidedOperationFenceLostError:
                 continue
             raise_guided_operation_failure(failed)
+    raise AuditIntegrityError("Guided START lost its operation fence on every rejoin attempt without a joinable winner")
 
 
 @router.post("/{session_id}/guided/convert", response_model=GetGuidedResponse)
@@ -2051,7 +2068,10 @@ def _schema8_permitted_plugins(turn: Turn) -> tuple[str, ...]:
         raise InvariantError("single-select turn has no server-held option list")
     plugins: list[str] = []
     for option in options:
-        if not isinstance(option, Mapping) or "id" not in option or type(option["id"]) is not str:
+        # Exact ``dict``, matching the producers' recursive thaw named above:
+        # a Mapping-tolerant read here would be latent recovery from a
+        # first-party producer bug, not a live population.
+        if type(option) is not dict or "id" not in option or type(option["id"]) is not str:
             raise InvariantError("single-select turn contains a malformed option")
         plugins.append(option["id"])
     return tuple(plugins)
@@ -2159,7 +2179,13 @@ def _schema8_schema_authority(
     payload = turn["payload"]
     knobs = payload["knobs"]
     prefilled = payload["prefilled"]
-    if not isinstance(knobs, Mapping) or not isinstance(prefilled, Mapping):
+    # Exact ``dict``: both Turn producers (``_finalize_guided_turn`` and
+    # ``_load_durable_current_turn``) build the payload as
+    # ``dict(deep_thaw(...))`` with recursive thaw, so the server-held form
+    # authority is an exact dict on live and replay paths alike. A
+    # Mapping-tolerant read would be latent recovery from a first-party
+    # producer bug; anything but an exact dict is corruption and crashes.
+    if type(knobs) is not dict or type(prefilled) is not dict:
         raise InvariantError("schema-form turn is missing server-held form authority")
     server_options = _schema8_server_options(prefilled)
     merged = dict(deep_thaw(options))
@@ -2227,6 +2253,19 @@ class SinkAdmissionRejectedError(HTTPException):
         super().__init__(status_code=400, detail=detail)
 
 
+@trust_boundary(
+    tier=3,
+    source="client-authored GuidedRespondRequest.edited_values from the guided RESPOND HTTP body",
+    source_param="body",
+    suppresses=("R5",),
+    invariant=(
+        "returns without admission judgment when edited_values is not the closed "
+        "{plugin, options} shape for this plugin — closed-shape violations are the "
+        "schema transition contract's to reject; only well-shaped submissions are "
+        "forwarded to the deployment sink admission gate"
+    ),
+    non_raising=True,
+)
 def _schema8_require_runnable_sink_form(
     body: GuidedRespondRequest,
     *,
@@ -3243,28 +3282,23 @@ async def post_guided_respond(
             # rejection code — without it the operator sees only
             # "invalid_guided_response ValueError" and never learns that
             # policy, not the author, refused the selection.
-            with contextlib.suppress(Exception):
-                if isinstance(exc, WebSurfacePolicyRejectedError):
-                    slog.warning(
-                        "guided.respond_turn_contract_rejected",
-                        session_id=str(session_id),
-                        user_id=user.user_id,
-                        step=observed_guided.step.value,
-                        turn_type=current_turn["type"],
-                        rejection_code=WebSurfacePolicyRejectedError.rejection_code,
-                        exc_class=type(exc).__name__,
-                        exc_message=scrub_text_for_audit(str(exc))[:_CONTRACT_REJECTION_EXC_MESSAGE_CHARS],
-                    )
-                else:
-                    slog.warning(
-                        "guided.respond_turn_contract_rejected",
-                        session_id=str(session_id),
-                        user_id=user.user_id,
-                        step=observed_guided.step.value,
-                        turn_type=current_turn["type"],
-                        rejection_code="invalid_guided_response",
-                        exc_class=type(exc).__name__,
-                    )
+            # Field assembly runs un-suppressed (the branch, the owned reads
+            # like ``observed_guided.step.value`` / ``current_turn["type"]``,
+            # and the scrubber all crash honestly on first-party bugs); only
+            # the last-resort emission is guarded inside the helper.
+            rejection_fields: dict[str, object] = {
+                "session_id": str(session_id),
+                "user_id": user.user_id,
+                "step": observed_guided.step.value,
+                "turn_type": current_turn["type"],
+                "exc_class": type(exc).__name__,
+            }
+            if isinstance(exc, WebSurfacePolicyRejectedError):
+                rejection_fields["rejection_code"] = WebSurfacePolicyRejectedError.rejection_code
+                rejection_fields["exc_message"] = scrub_text_for_audit(str(exc))[:_CONTRACT_REJECTION_EXC_MESSAGE_CHARS]
+            else:
+                rejection_fields["rejection_code"] = "invalid_guided_response"
+            _log_last_resort_diagnostic(slog.warning, "guided.respond_turn_contract_rejected", **rejection_fields)
             raise HTTPException(
                 status_code=400,
                 detail="Guided response does not satisfy the current turn contract.",
@@ -3282,15 +3316,15 @@ async def post_guided_respond(
         try:
             return await _preflight_attempt(attempt_stable_id)
         except (AuditIntegrityError, *SOURCE_INSPECTION_INTEGRITY_ERRORS, InvariantError) as exc:
-            with contextlib.suppress(Exception):
-                slog.error(
-                    "guided.invariant_violated",
-                    session_id=str(session_id),
-                    user_id=user.user_id,
-                    exc_class=type(exc).__name__,
-                    site="post_guided_respond.preflight",
-                    frames=_safe_frame_strings(exc),
-                )
+            _log_last_resort_diagnostic(
+                slog.error,
+                "guided.invariant_violated",
+                session_id=str(session_id),
+                user_id=user.user_id,
+                exc_class=type(exc).__name__,
+                site="post_guided_respond.preflight",
+                frames=_safe_frame_strings(exc),
+            )
             raise HTTPException(
                 status_code=500,
                 detail={
@@ -5212,19 +5246,19 @@ async def post_guided_respond(
                     if isinstance(exc, PipelinePlannerError)
                     else "operation_failed"
                 )
-                with contextlib.suppress(Exception):
-                    slog.error(
-                        "guided.operation_terminal_failure",
-                        session_id=str(session_id),
-                        user_id=user.user_id,
-                        exc_class=type(exc).__name__,
-                        site="post_guided_respond",
-                        frames=_safe_frame_strings(exc),
-                        # See the post_guided_start site (R2-F16b): correlates
-                        # this log line to the response's X-Request-ID; lenient
-                        # read so a missing middleware cannot break the error path.
-                        request_id=_failure_log_request_id(request),
-                    )
+                _log_last_resort_diagnostic(
+                    slog.error,
+                    "guided.operation_terminal_failure",
+                    session_id=str(session_id),
+                    user_id=user.user_id,
+                    exc_class=type(exc).__name__,
+                    site="post_guided_respond",
+                    frames=_safe_frame_strings(exc),
+                    # See the post_guided_start site (R2-F16b): correlates
+                    # this log line to the response's X-Request-ID; lenient
+                    # read so a missing middleware cannot break the error path.
+                    request_id=_failure_log_request_id(request),
+                )
                 try:
                     failed = await service.fail_guided_operation_with_audit(
                         GuidedOperationFailureCommand(
@@ -5243,16 +5277,16 @@ async def post_guided_respond(
                 except GuidedOperationFenceLostError:
                     rejoin_after_lock = True
                 except Exception as failure_exc:
-                    with contextlib.suppress(Exception):
-                        slog.error(
-                            "guided.operation_failure_record_failed",
-                            session_id=str(session_id),
-                            user_id=user.user_id,
-                            exc_class=type(failure_exc).__name__,
-                            site="post_guided_respond.fail_guided_operation",
-                            frames=_safe_frame_strings(failure_exc),
-                        )
-                    raise AuditIntegrityError("Guided RESPOND could not record its terminal failure") from None
+                    _log_last_resort_diagnostic(
+                        slog.error,
+                        "guided.operation_failure_record_failed",
+                        session_id=str(session_id),
+                        user_id=user.user_id,
+                        exc_class=type(failure_exc).__name__,
+                        site="post_guided_respond.fail_guided_operation",
+                        frames=_safe_frame_strings(failure_exc),
+                    )
+                    raise AuditIntegrityError("Guided RESPOND could not record its terminal failure") from failure_exc
                 else:
                     # R2-F4: when the planner exhausted its budget on a request
                     # that carried a known unproducible-output-field gap, name
