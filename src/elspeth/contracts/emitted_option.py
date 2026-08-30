@@ -69,6 +69,8 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from elspeth.contracts.trust_boundary import trust_boundary
+
 if TYPE_CHECKING:
     from pydantic import BaseModel
 
@@ -130,6 +132,20 @@ def emitted_option_fields(model: type[BaseModel] | None) -> dict[str, str]:
     return declared
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "the raw value of one plugin option from a pipeline author's settings YAML or a web-authored "
+        "config dict — an untyped str | dict | list tree ELSPETH does not own"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns True only when a recognized str/dict/list-tuple shape contains an env reference; every "
+        "unsupported shape returns False; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def env_placeholders_in(value: object) -> bool:
     """Does ``value`` contain an env reference anywhere inside it?
 

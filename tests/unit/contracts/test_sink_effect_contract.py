@@ -1250,3 +1250,38 @@ def test_member_refuses_noncanonical_or_divergent_lineage_and_payload_hashes() -
             operation_id="operation-1",
             sink_node_id="sink-1",
         )
+
+
+class TestSinkEffectIdentityMemberIdTypes:
+    """member_ids is Tier-1 owned data: a wrong-type element crashes as TypeError.
+
+    Pins the elspeth-ca0a7e71b1 fix: the defensive ``isinstance(member_id, str)``
+    that converted a wrong-type contract violation into the malformed-digest
+    ValueError is gone — the natural TypeError from ``fullmatch`` surfaces the
+    bug class honestly, while malformed string digests still raise ValueError.
+    """
+
+    @staticmethod
+    def _identity_kwargs() -> dict:
+        return {
+            "effect_id": "a" * 64,
+            "artifact_id": "b" * 64,
+            "artifact_idempotency_key": "c" * 64,
+            "stream_id": "d" * 64,
+            "config_hash": "e" * 64,
+            "requested_target_hash": "f" * 64,
+            "membership_or_manifest_hash": "0" * 64,
+            "group_payload_hash": "1" * 64,
+            "input_kind": SinkEffectInputKind.PIPELINE_MEMBERS,
+            "members": (),
+            "snapshot_hash": None,
+            "final_manifest_identity_hash": None,
+        }
+
+    def test_non_str_member_id_raises_type_error(self) -> None:
+        with pytest.raises(TypeError):
+            SinkEffectIdentity(member_ids=(42,), **self._identity_kwargs())  # type: ignore[arg-type]
+
+    def test_malformed_string_digest_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="lowercase SHA-256 digests"):
+            SinkEffectIdentity(member_ids=("NOT-A-DIGEST",), **self._identity_kwargs())
