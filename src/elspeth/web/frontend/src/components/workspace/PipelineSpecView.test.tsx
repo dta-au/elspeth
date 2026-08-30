@@ -7,6 +7,7 @@ import { usePreferencesStore } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { resetStore } from "@/test/store-helpers";
 import { makeComposition } from "@/test/composerFixtures";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import { PipelineSpecView } from "./PipelineSpecView";
 
 describe("PipelineSpecView", () => {
@@ -231,16 +232,24 @@ describe("PipelineSpecView", () => {
 
     const node = screen.getByRole("article", { name: "Node merge_branches" });
     expect(within(node).getByText("Merges branches")).toBeInTheDocument();
-    // Both aliases, including the one `input` does not name.
-    expect(node).toHaveTextContent("branch_a");
-    expect(node).toHaveTextContent("hex_done");
+    // Both aliases, including the one `input` does not name. Neither
+    // connection has a producer in this fixture — its only source publishes
+    // `colours_raw` and the coalesce publishes `final_out` — so the upstream
+    // lookup falls through to titleCaseLabel, which is the correct reading of
+    // a fixture whose upstream arms are not modelled.
+    expect(node).toHaveTextContent("Branch A → Pairing Done");
+    expect(node).toHaveTextContent("Branch B → Hex Done");
     expect(within(node).getByText("Merge policy")).toBeInTheDocument();
-    expect(node).toHaveTextContent("require_all");
+    expect(node).toHaveTextContent("wait for every branch");
+    expect(within(node).getByText("wait for every branch")).toHaveAttribute(
+      "title",
+      "require_all",
+    );
     // Exact match: "Merge" is a prefix of "Merges branches" and "Merge
     // policy", both present on this same card, so a substring check here
     // would pass regardless of whether this row rendered at all.
     expect(within(node).getByText("Merge")).toBeInTheDocument();
-    expect(node).toHaveTextContent("union");
+    expect(node).toHaveTextContent("combine every branch's fields");
   });
 
   // Live-check finding (session 39578c6f, Spec tab, show_advanced off):
@@ -286,7 +295,15 @@ describe("PipelineSpecView", () => {
 
     const node = screen.getByRole("article", { name: "Node merge_invest" });
     expect(node).not.toHaveTextContent('{"');
+    // Both branches are unwired in this fixture (nothing produces either
+    // connection), so both carry the dangling marker. The assertion is about
+    // prose-vs-JSON; the marker is what keeps that prose honest.
     expect(node).toHaveTextContent(
+      "Branch Invest Cs1 → Invest Cs1 Done (not connected); Branch Invest Cs2 → Invest Cs2 Done (not connected)",
+    );
+    // The raw map stays one hover away.
+    expect(within(node).getByText(/^Branch Invest Cs1/)).toHaveAttribute(
+      "title",
       "branch_invest_cs1 → invest_cs1_done; branch_invest_cs2 → invest_cs2_done",
     );
   });
@@ -311,6 +328,20 @@ describe("PipelineSpecView", () => {
           source: { plugin: "csv", options: {}, on_success: "docs" },
         },
         nodes: [
+          // The opener the collector's scope binds to. Before Wave 3 this
+          // fixture named `explode_pages` in scope_opener without the node
+          // existing anywhere in the composition; scope_opener is the one
+          // routing field that resolves a COMPONENT, so an absent opener
+          // renders "Removed" — which is not what this test is about.
+          {
+            id: "explode_pages",
+            node_type: "transform",
+            plugin: "json_explode",
+            input: "docs",
+            on_success: "pages",
+            on_error: null,
+            options: {},
+          },
           {
             id: "gather_pages",
             node_type: "collector",
@@ -343,15 +374,57 @@ describe("PipelineSpecView", () => {
     // Exact match: "Scope" is a prefix of "Scope opened by" and "Scope
     // policy", both present on this same card.
     expect(within(node).getByText("Scope")).toBeInTheDocument();
-    expect(node).toHaveTextContent("doc_pages");
+    // A scope NAME is neither a connection nor an enum, so it renders through
+    // the author-name rule: title-cased, raw in `title`.
+    const scopeName = within(node).getByText("Scope").nextElementSibling;
+    expect(scopeName).toHaveTextContent("Doc Pages");
+    expect(scopeName).toHaveAttribute("title", "doc_pages");
     expect(within(node).getByText("Scope opened by")).toBeInTheDocument();
-    expect(node).toHaveTextContent("explode_pages");
+    const opener = within(node).getByText("Scope opened by").nextElementSibling;
+    expect(opener).toHaveTextContent("Explode Pages");
+    expect(opener).toHaveAttribute("title", "explode_pages");
     expect(within(node).getByText("Scope policy")).toBeInTheDocument();
-    expect(node).toHaveTextContent("require_all");
+    expect(node).toHaveTextContent("wait for every row in the group");
     expect(node).toHaveTextContent("Output mode");
-    expect(node).toHaveTextContent("passthrough");
+    expect(node).toHaveTextContent("pass rows through unchanged");
     expect(node).toHaveTextContent("Waits up to (seconds)");
     expect(node).toHaveTextContent("300");
+  });
+
+  it("says Removed for a collector whose scope opener was deleted (elspeth-93f5621f18)", () => {
+    // The other arm of the scope_opener ruling: every OTHER routing value
+    // names a connection, where a missing far end is dangling rather than
+    // removed. scope_opener names a COMPONENT, so a deleted opener is the
+    // one place "Removed" is the honest word.
+    useSessionStore.setState({
+      compositionState: makeComposition(14, {
+        sources: { source: { plugin: "csv", options: {}, on_success: "raw_rows" } },
+        nodes: [
+          {
+            id: "gather_pages",
+            node_type: "collector",
+            plugin: null,
+            input: "raw_rows",
+            on_success: "final_out",
+            on_error: null,
+            scope_name: "doc_pages",
+            scope_opener: "explode_pages",
+            scope_policy: "require_all",
+            output_mode: "passthrough",
+            timeout_seconds: 300,
+            options: {},
+          },
+        ],
+        outputs: [{ name: "final_out", plugin: "csv", options: {} }],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node gather_pages" });
+    const dd = within(node).getByText("Scope opened by").nextElementSibling;
+    expect(dd).toHaveTextContent("Removed");
+    expect(dd).toHaveAttribute("title", "explode_pages");
   });
 
   it("omits branches, policy and merge on nodes that carry none", () => {
@@ -563,6 +636,196 @@ describe("PipelineSpecView", () => {
   // humanising must fail closed on `field_mapping` (a reader-keyed
   // column→target map, not ELSPETH's own schema vocabulary) through THIS
   // integration path too, not only in OptionRows' own unit tests.
+  it("renders node ids and kinds in the reader register with the raw id in title (elspeth-93f5621f18 / elspeth-d74ab492dd)", () => {
+    useSessionStore.setState({
+      compositionState: makeComposition(10, {
+        sources: { source: { plugin: "csv", options: {}, on_success: "raw_rows" } },
+        nodes: [
+          { id: "extract_invoice", node_type: "transform", plugin: "llm", input: "raw_rows", on_success: "results", on_error: null, options: {} },
+          { id: "split_rows", node_type: "row_union", plugin: null, input: "results", on_success: "results", on_error: null, options: {} },
+        ],
+        outputs: [{ name: "results", plugin: "csv", on_write_failure: "discard", options: {} }],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node extract_invoice" });
+    expect(within(node).getByRole("heading", { level: 4 })).toHaveTextContent("Extract Invoice");
+    expect(within(node).getByRole("heading", { level: 4 })).toHaveAttribute("title", "extract_invoice");
+    expect(within(node).getByText("Reads from").nextElementSibling).toHaveTextContent("Source");
+    expect(within(node).getByText("Then").nextElementSibling).toHaveTextContent("Results");
+    expect(within(node).getByText("Then").nextElementSibling).toHaveAttribute("title", "results");
+    const union = screen.getByRole("article", { name: "Node split_rows" });
+    expect(within(union).getByText("Kind").nextElementSibling).toHaveTextContent("Row Union");
+  });
+
+  it("reveals the raw id and the raw connection name in <code> with Advanced on (elspeth-f49e1611ab)", () => {
+    // The wave's premise is that the Advanced toggle reveals the identifiers
+    // the default level hides. It did not: the raw id lived in `title` at BOTH
+    // levels, which is mouse-only recovery and no recovery at all on touch.
+    // The default-level half of this rule is the sibling test above and the
+    // pin below; this one is the ON half, and it must assert the ELEMENT —
+    // the pin strips <code>, so it can never witness this content either way.
+    useSessionStore.setState({
+      compositionState: makeComposition(10, {
+        sources: { source: { plugin: "csv", options: {}, on_success: "raw_rows" } },
+        nodes: [
+          { id: "extract_invoice", node_type: "transform", plugin: "llm", input: "raw_rows", on_success: "results", on_error: null, options: {} },
+        ],
+        outputs: [{ name: "results", plugin: "csv", on_write_failure: "discard", options: {} }],
+      }),
+    });
+    usePreferencesStore.setState({ showAdvanced: true });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node extract_invoice" });
+    const heading = within(node).getByRole("heading", { level: 4 });
+    // The reader-register phrase is still the name; the raw id joins it as a
+    // secondary rather than replacing it, and `title` stays as the mouse
+    // convenience beside both.
+    expect(heading).toHaveTextContent("Extract Invoice");
+    expect(heading).toHaveAttribute("title", "extract_invoice");
+    expect(within(heading).getByText("extract_invoice").tagName).toBe("CODE");
+
+    const then = within(node).getByText("Then").nextElementSibling as HTMLElement;
+    expect(then).toHaveTextContent("Results");
+    expect(within(then).getByText("results").tagName).toBe("CODE");
+  });
+
+  it("renders no identifier secondary at the default detail level (elspeth-f49e1611ab)", () => {
+    // The other half of the toggle: with Advanced off the card is byte-for-
+    // byte what it was before the secondary existed. Asserted as the ABSENCE
+    // of the element, because the shared pin strips <code> and so cannot see
+    // a regression here at all.
+    useSessionStore.setState({
+      compositionState: makeComposition(10, {
+        sources: { source: { plugin: "csv", options: {}, on_success: "raw_rows" } },
+        nodes: [
+          { id: "extract_invoice", node_type: "transform", plugin: "llm", input: "raw_rows", on_success: "results", on_error: null, options: {} },
+        ],
+        outputs: [{ name: "results", plugin: "csv", on_write_failure: "discard", options: {} }],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node extract_invoice" });
+    expect(within(node).queryByText("extract_invoice")).toBeNull();
+    expect(within(node).getByRole("heading", { level: 4 })).toHaveAttribute(
+      "title",
+      "extract_invoice",
+    );
+  });
+
+  it("names the component feeding each branch of a wired coalesce (elspeth-93f5621f18)", () => {
+    // The direction pin. A fan-in node's own `input` is one of its own branch
+    // connections, so resolving `branches` through consumers rather than
+    // producers renders "Branch Invest Cs1 → Merge Invest" — the node naming
+    // itself. This fixture WIRES the upstream arm so the two directions give
+    // visibly different answers and the wrong one cannot pass.
+    useSessionStore.setState({
+      compositionState: makeComposition(13, {
+        sources: { source: { plugin: "csv", options: {}, on_success: "raw_rows" } },
+        nodes: [
+          { id: "extract_invoice", node_type: "transform", plugin: "llm", input: "raw_rows", on_success: "invest_cs1_done", on_error: null, options: {} },
+          { id: "merge_invest", node_type: "coalesce", plugin: null, input: "invest_cs1_done", on_success: "tidy_output", on_error: null, branches: { branch_invest_cs1: "invest_cs1_done", branch_invest_cs2: "invest_cs2_done" }, policy: "require_all", merge: "union", options: {} },
+        ],
+        outputs: [{ name: "tidy_output", plugin: "csv", on_write_failure: "discard", options: {} }],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node merge_invest" });
+    expect(within(node).getByText("Merges branches").nextElementSibling).toHaveTextContent(
+      "Branch Invest Cs1 → Extract Invoice; Branch Invest Cs2 → Invest Cs2 Done",
+    );
+    expect(node).not.toHaveTextContent("Branch Invest Cs1 → Merge Invest");
+  });
+
+  it("does not repeat a structural node's description as its heading (elspeth-93f5621f18)", () => {
+    // componentPhrase resolves a plugin-less node to
+    // descriptionLabel(node.description), and the card already renders that
+    // description as the paragraph directly under the heading. Using
+    // componentPhrase for the <h4> therefore prints the same sentence twice
+    // and leaves the card unnamed.
+    useSessionStore.setState({
+      compositionState: makeComposition(15, {
+        sources: { source: { plugin: "csv", options: {}, on_success: "raw_rows" } },
+        nodes: [
+          { id: "merge_assessments", node_type: "coalesce", plugin: null, input: "raw_rows",
+            on_success: "final_out", on_error: null,
+            description: "Merge the two assessment branches",
+            branches: { branch_a: "raw_rows", branch_b: "second_pass" },
+            policy: "require_all", merge: "union", options: {} },
+        ],
+        outputs: [{ name: "final_out", plugin: "csv", options: {} }],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node merge_assessments" });
+    const heading = within(node).getByRole("heading", { level: 4 });
+    expect(heading).toHaveTextContent("Merge Assessments");
+    expect(heading).toHaveAttribute("title", "merge_assessments");
+    // The description keeps its own slot and is NOT the heading.
+    expect(within(node).getByText("Merge the two assessment branches")).not.toBe(heading);
+  });
+
+  it("shows an unknown scope_policy as code rather than dressing it as prose", () => {
+    // The renderer half of specRouting's open-map rule. Asserted on the
+    // ELEMENT: the shared pin strips <code>, so it cannot tell a value that
+    // moved INTO the identifier register from one that was never there.
+    useSessionStore.setState({
+      compositionState: makeComposition(16, {
+        sources: { source: { plugin: "csv", options: {}, on_success: "raw_rows" } },
+        nodes: [
+          { id: "collect_pages", node_type: "collector", plugin: null, input: "raw_rows",
+            on_success: "tidy_output", on_error: null, scope_name: "doc_pages",
+            scope_policy: "someday_maybe", options: {} },
+        ],
+        outputs: [{ name: "tidy_output", plugin: "csv", options: {} }],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node collect_pages" });
+    const dd = within(node).getByText("Scope policy").nextElementSibling as HTMLElement;
+    expect(within(dd).getByText("someday_maybe").tagName).toBe("CODE");
+    expect(dd).not.toHaveTextContent("Someday Maybe");
+  });
+
+  it("default DOM of the Spec tab passes the shared identifier pin (card names exempted by design)", () => {
+    useSessionStore.setState({
+      compositionState: makeComposition(11, {
+        sources: { source: { plugin: "csv", options: {}, on_success: "raw_rows", on_validation_failure: "discard" } },
+        nodes: [
+          // The digit-free constraint on these ids is RETIRED (2026-08-31):
+          // SNAKE_RE now admits digits, so `invest_cs1_done` would produce a
+          // pin that fails honestly. The ids are left as they are — renaming
+          // them would churn the assertions below without testing anything
+          // new; the pin's reach no longer depends on the spelling.
+          { id: "merge_invest", node_type: "coalesce", plugin: null, input: "invest_first_done", on_success: "tidy_output", on_error: null, branches: { branch_invest_first: "invest_first_done" }, policy: "require_all", merge: "union", options: {} },
+          { id: "collect_pages", node_type: "collector", plugin: null, input: "tidy_output", on_success: "tidy_output", on_error: null, scope_name: "doc_pages", scope_opener: "merge_invest", scope_policy: "require_all", output_mode: "passthrough", timeout_seconds: 300, options: {} },
+        ],
+        outputs: [{ name: "tidy_output", plugin: "csv", on_write_failure: "discard", options: {} }],
+      }),
+    });
+
+    const { container } = render(<PipelineSpecView />);
+
+    expectNoIdentifiersInDefaultDom(container, {
+      // SELF-only: both labels are ON these elements, so a control added
+      // inside a spec card later is still scanned. `closest()` would exempt
+      // the aria half of the pin for the whole Spec tab, permanently.
+      allowAriaLabelSelfSelectors: ["article.pipeline-spec-card", "div.option-rows"],
+    });
+  });
+
   it("renders field_mapping's reader-authored keys verbatim through the Spec tab", () => {
     useSessionStore.setState({
       compositionState: makeComposition(9, {

@@ -2,6 +2,7 @@
 import { useMemo, useState } from "react";
 import { previewBlobContentSnippet } from "@/api/client";
 import { Button, Icon, StructuredJsonPreview, type IconName } from "@/components/ui";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import type { BlobMetadata } from "@/types/api";
 import {
   describeStructuralSummary,
@@ -142,7 +143,14 @@ export function BlobRow({
     if (previewContent === null) return null;
     return summarizeContentStructure(normalizedMimeType, previewContent, { truncated });
   }, [previewContent, truncated, normalizedMimeType]);
-  const structuralSummaryLine = structuralSummary
+  const showAdvanced = useShowAdvanced();
+  // The row/column counts are structural introspection — engineer register,
+  // gated (elspeth-f1394307e3). structuralSummary.caveat is NOT gated: a
+  // ragged/unterminated-quote/oversized/unparseable body must disclose that at
+  // every detail level, because nothing else in the row says so. (Truncation
+  // is the one case the preview <pre> already covers with its own
+  // "... (truncated)" span at :286-290; the rest have no counterpart.)
+  const structuralSummaryLine = showAdvanced && structuralSummary
     ? describeStructuralSummary(structuralSummary)
     : null;
 
@@ -263,7 +271,8 @@ export function BlobRow({
           {structuralSummary &&
             structuralSummary.format !== "unsupported" &&
             !previewLoading &&
-            !previewError && (
+            !previewError &&
+            (structuralSummary.caveat !== null || structuralSummaryLine !== null) && (
               <div className="blob-row-structure" data-testid="blob-row-structure">
                 {structuralSummary.caveat && (
                   <p className="blob-row-structure-caveat">{structuralSummary.caveat}</p>

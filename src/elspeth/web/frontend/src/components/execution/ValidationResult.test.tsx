@@ -6,7 +6,8 @@ import { ValidationResultBanner } from "./ValidationResult";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
-import type { ValidationResult } from "@/types/index";
+import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/guided/pipelineGloss";
+import type { NodeSpec, ValidationResult } from "@/types/index";
 
 const READY_READINESS = {
   authoring_valid: true,
@@ -420,6 +421,72 @@ describe("ValidationResultBanner detail level (elspeth-27efd1e801)", () => {
       .map((node) => node.textContent)
       .join("");
     expect(headline).not.toMatch(/Schema contract violation/);
-    expect(headline).toMatch(/assess/i);
+    // No nodes/componentNames context is passed, so "assess" cannot resolve
+    // to anything nicer — the honest fallback is the shared generic phrase,
+    // never the raw id itself (elspeth-93f5621f18: this line used to assert
+    // the opposite, pinning the bug this ticket fixes).
+    expect(headline).not.toMatch(/\bassess\b/);
+    expect(headline).toMatch(/this step/i);
+  });
+
+  it("never renders a bare component id when the banner has no nodes list (elspeth-93f5621f18)", () => {
+    useSessionStore.setState({ compositionState: null });
+    render(
+      <ValidationResultBanner
+        result={{ is_valid: false, errors: [{ message: "Field missing", component_id: "select_columns", component_type: "transform" }], warnings: [], checks: [] } as unknown as ValidationResult}
+      />,
+    );
+    expect(screen.queryByText(/select_columns/)).not.toBeInTheDocument();
+    // The name is the author's own word for the step, title-cased — NOT
+    // UNKNOWN_COMPONENT_PHRASE, which is identical for every component and so
+    // collapsed two distinct errors into one indistinguishable pair (ux M-1).
+    // The raw id stays out of visible text and lives in the identifier
+    // channels instead.
+    const prefix = screen.getByText("Select Columns:");
+    expect(prefix).not.toHaveTextContent(UNKNOWN_COMPONENT_PHRASE);
+    expect(prefix).toHaveAttribute("data-component-id", "select_columns");
+    expect(prefix).toHaveAttribute("title", "select_columns");
+  });
+
+  it("keeps two errored components distinguishable and the type:id pair out of prose (ux M-1 / final-review M6)", () => {
+    // Two halves of one rule. Without a nodes list both components resolved to
+    // UNKNOWN_COMPONENT_PHRASE, so the banner said "this step" twice and the
+    // reader could not tell which failed. WITH a nodes list a wired component
+    // rendered its raw structural pair, "transform:select_columns", straight
+    // into the bold prefix — the engineer register in the reader's slot.
+    useSessionStore.setState({ compositionState: null });
+    render(
+      <ValidationResultBanner
+        nodes={[
+          { id: "select_columns", node_type: "transform", plugin: null, input: "raw_rows", on_success: null, on_error: null, options: {} },
+          { id: "merge_results", node_type: "coalesce", plugin: null, input: "scored", on_success: null, on_error: null, options: {} },
+        ] as unknown as NodeSpec[]}
+        result={{
+          is_valid: false,
+          errors: [
+            { message: "Field missing", component_id: "select_columns", component_type: "transform" },
+            { message: "Branch missing", component_id: "merge_results", component_type: "coalesce" },
+          ],
+          warnings: [],
+          checks: [],
+        } as unknown as ValidationResult}
+      />,
+    );
+
+    const alert = screen.getByRole("alert");
+    // Distinct, and each names the component AND its kind in the reader
+    // register — the `Name (Kind)` shape the consent dialog and Spec card use.
+    const selectPrefix = within(alert).getByText("Select Columns (Transform):");
+    const mergePrefix = within(alert).getByText("Merge Results (Coalesce):");
+    // Pinned against the sentinel itself, not against the two names: the
+    // defect was that BOTH collapsed to this one phrase.
+    for (const prefix of [selectPrefix, mergePrefix]) {
+      expect(prefix).not.toHaveTextContent(UNKNOWN_COMPONENT_PHRASE);
+    }
+    // The raw pair is reachable, but only through the identifier channels.
+    expect(selectPrefix).toHaveAttribute("title", "transform:select_columns");
+    expect(alert.querySelector('[data-component-id="coalesce:merge_results"]')).not.toBeNull();
+    expect(alert).not.toHaveTextContent("transform:select_columns");
+    expect(alert).not.toHaveTextContent("coalesce:merge_results");
   });
 });

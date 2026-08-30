@@ -261,7 +261,17 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
 
   it("falls back to the static split when the schema is not cached (regression pin — green before this task)", () => {
     const { container } = render(<OptionRows options={OPTIONS} ariaLabel="assess options" plugin={{ kind: "transform", name: "llm" }} />);
-    expectNoIdentifiersInDefaultDom(container);
+    // The value cells are an identifier surface BY DESIGN at this component:
+    // `prompt_template` is in FALLBACK_VISIBLE_OPTION_KEYS under the reader
+    // label "Prompt", so the wave deliberately renders authored prompt text —
+    // `Rate {{ row['case_study1'] }}` here — to the reader. An underscore
+    // inside content the USER wrote is not ELSPETH leaking an identifier, and
+    // the pin cannot tell the two apart. Scanning the <dt> labels is what this
+    // call is for: no raw option key reaches a visible label, and the internal
+    // keys (blob_ref, interpretation_requirements) stay hidden entirely.
+    // The blob-path sentinel rule is NOT weakened by this exemption — it
+    // carries its own direct `region.textContent` assertions above.
+    expectNoIdentifiersInDefaultDom(container, { allowSelectors: ["dl.graph-config-rows dd"] });
     const region = screen.getByRole("region", { name: "assess options" });
     const visibleTerms = within(region).getAllByRole("term").filter((t) => t.closest("details") === null && t.closest(".graph-config-nested") === null).map((t) => t.textContent);
     expect(visibleTerms).toEqual(["Prompt", "Model profile", "Row schema"]);

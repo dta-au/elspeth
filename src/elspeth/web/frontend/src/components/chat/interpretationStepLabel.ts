@@ -111,6 +111,25 @@ export function resolveNodePlugin(
 }
 
 /**
+ * True when `nodeId` names a node, source or output of a LOADED composition.
+ * Distinguishes "absent" (the component was removed) from "present but
+ * unlabelable" (a plugin-less structural node with no description) — the
+ * two cases `humaniseStepLabel` words differently. Unloaded state is never
+ * "present".
+ */
+export function isComponentPresent(
+  state: CompositionState | null,
+  nodeId: string | null,
+): boolean {
+  if (state === null || nodeId === null) return false;
+  return (
+    state.nodes.some((candidate) => candidate.id === nodeId) ||
+    Object.prototype.hasOwnProperty.call(state.sources, nodeId) ||
+    state.outputs.some((candidate) => candidate.name === nodeId)
+  );
+}
+
+/**
  * Step label for a composition node id, or null when the id does not resolve
  * (component absent from the composition). THE single choke point for the
  * node-name preference: an id that is trivially just its own plugin's name
@@ -118,10 +137,12 @@ export function resolveNodePlugin(
  * the author's own name for the step and is title-cased as-is.
  *
  * Returns null (not the raw id) on an unresolved id so callers can choose
- * their own "unknown" phrasing — `humaniseStepLabel` below falls back to the
- * raw id; `validationHumaniser`'s callers (PipelineValidationSummary,
- * ReadinessRowDetail) fall back to a generic phrase instead, since an
- * internal id must never leak into that prose.
+ * their own "unknown" phrasing. No caller renders the raw id any more
+ * (elspeth-93f5621f18): `humaniseStepLabel` below names an absent component
+ * "Removed" and title-cases a present-but-unlabelable one; the
+ * validationHumaniser callers (PipelineValidationSummary, ReadinessRowDetail,
+ * ValidationResult) fall back to a generic phrase. The raw id lives in
+ * `data-affected-node-id` / `title` for forensics, never in prose.
  */
 export function stepLabelForNodeId(
   state: CompositionState | null,
@@ -147,15 +168,55 @@ export function stepLabelForNodeId(
 }
 
 /**
- * Humanised step label for an affected_node_id. Falls back to the raw id
- * when the node is absent, and to a generic phrase when there is no id at
- * all. See `stepLabelForNodeId` for the node-name preference this builds on.
+ * Humanised step label for an affected_node_id. NEVER the raw id
+ * (elspeth-93f5621f18): an id the loaded composition no longer has reads
+ * "Removed" (consumers append "step", giving "Removed step · prompt"); an
+ * id the composition has but cannot label, or any id before the
+ * composition has loaded, is title-cased as the author's own name — the same
+ * result a loaded state gives an author-chosen id. "this step" only when
+ * there is no id at all. See `stepLabelForNodeId` for the preference ladder.
  */
 export function humaniseStepLabel(
   state: CompositionState | null,
   nodeId: string | null,
 ): string {
-  return stepLabelForNodeId(state, nodeId) ?? nodeId ?? "this step";
+  if (nodeId === null) return "this step";
+  const label = stepLabelForNodeId(state, nodeId);
+  if (label !== null) return label;
+  if (state !== null && !isComponentPresent(state, nodeId)) return "Removed";
+  return titleCaseLabel(nodeId);
+}
+
+/**
+ * The card-TITLE form of the same name: "Summarise step", and — for a node the
+ * loaded composition no longer has — "Removed step (was Extract Invoice)".
+ *
+ * Why this is not `${humaniseStepLabel(...)} step`: that produced the literal
+ * word "Removed" for EVERY deleted node, so two acknowledgement cards
+ * referencing two different removed steps carried identical titles with no
+ * visible or hoverable disambiguator at either detail level — the raw id lived
+ * only in `data-affected-node-id`, which the plan itself calls a forensic home
+ * invisible to every audience (ux M-2). Title-casing the ghost id is not an
+ * identifier leak under this wave's own rule: a node id is author/LLM-chosen,
+ * so it IS the author's own name for the step (see this module's header).
+ *
+ * The resolution ladder is `humaniseStepLabel`'s, structurally — never a
+ * comparison against the string "Removed", which a node genuinely named
+ * `removed` would satisfy while still being present.
+ *
+ * The no-id case is "this step", not "this step step".
+ */
+export function humaniseStepTitle(
+  state: CompositionState | null,
+  nodeId: string | null,
+): string {
+  if (nodeId === null) return "this step";
+  const label = stepLabelForNodeId(state, nodeId);
+  if (label !== null) return `${label} step`;
+  if (state !== null && !isComponentPresent(state, nodeId)) {
+    return `Removed step (was ${titleCaseLabel(nodeId)})`;
+  }
+  return `${titleCaseLabel(nodeId)} step`;
 }
 
 /**

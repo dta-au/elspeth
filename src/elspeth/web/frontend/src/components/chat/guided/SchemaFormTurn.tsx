@@ -4,6 +4,7 @@ import { Button, Input } from "@/components/ui";
 import type { GuidedRespondAction, GuidedSourceBlobCandidate, KnobField, SchemaFormPayload } from "@/types/guided";
 import { TUTORIAL_VALIDATION_FAILURE_CAVEAT } from "@/components/tutorial/copy";
 import { useShowAdvanced } from "@/stores/preferencesStore";
+import { DISCARD_CONNECTION } from "@/lib/graphTopology";
 import { CodeBlock } from "../CodeBlock";
 
 // Advanced-tier knobs (Task 4's `KnobField.tier`) are grouped behind a
@@ -71,7 +72,7 @@ export function SchemaFormTurn({
         hasValidationFailureKnob &&
         (currentFailure === undefined || currentFailure === null || currentFailure === "")
       ) {
-        next["on_validation_failure"] = "discard";
+        next["on_validation_failure"] = DISCARD_CONNECTION;
       }
       return next;
     });

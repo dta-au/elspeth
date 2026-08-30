@@ -1,3 +1,4 @@
+import { COALESCE_MERGES, COALESCE_POLICIES } from "@/lib/graphTopology";
 import type { CompositionState } from "@/types/index";
 import type {
   ChatTurn,
@@ -72,8 +73,8 @@ const FLOW_KINDS = new Set([
   "row_union_success", "output_write_failure",
 ]);
 const TRIGGER_KINDS = ["count", "timeout", "condition"] as const;
-const COALESCE_POLICIES = new Set(["require_all", "quorum", "best_effort", "first"]);
-const COALESCE_MERGES = new Set(["union", "nested", "select"]);
+const COALESCE_POLICY_SET = new Set<string>(COALESCE_POLICIES);
+const COALESCE_MERGE_SET = new Set<string>(COALESCE_MERGES);
 const COMPOSITION_NODE_TYPES = new Set([
   "transform",
   "gate",
@@ -464,8 +465,8 @@ function validateProposalBehavior(value: unknown, nodeType: string, path: string
     ["kind", "branch_aliases", "policy", "merge", "timeout_seconds"],
   );
   const branchAliases = aliasArray(exact.branch_aliases, "branch", `${behaviorPath}.branch_aliases`, 2);
-  if (!COALESCE_POLICIES.has(stringValue(exact.policy, `${behaviorPath}.policy`))) invalid(`${behaviorPath}.policy`, "unknown policy");
-  if (!COALESCE_MERGES.has(stringValue(exact.merge, `${behaviorPath}.merge`))) invalid(`${behaviorPath}.merge`, "unknown merge");
+  if (!COALESCE_POLICY_SET.has(stringValue(exact.policy, `${behaviorPath}.policy`))) invalid(`${behaviorPath}.policy`, "unknown policy");
+  if (!COALESCE_MERGE_SET.has(stringValue(exact.merge, `${behaviorPath}.merge`))) invalid(`${behaviorPath}.merge`, "unknown merge");
   if (exact.timeout_seconds !== null) {
     finitePositiveNumber(
       exact.timeout_seconds,

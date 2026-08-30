@@ -61,9 +61,10 @@ describe("AppHeader", () => {
     const { container } = render(
       <AppHeader onOpenSettings={() => {}} onSignOut={() => {}} />,
     );
-    expect(
-      screen.getByLabelText("Composer model: anthropic/claude-sonnet-4.6"),
-    ).toBeInTheDocument();
+    // The chip carries no aria-label: it reads "Composer: Claude Sonnet 4.6"
+    // as ordinary text, with the raw id in `title` (elspeth-d74ab492dd).
+    expect(screen.getByTitle("anthropic/claude-sonnet-4.6")).toBeInTheDocument();
+    expect(screen.getByText("Claude Sonnet 4.6")).toBeInTheDocument();
     expect(container.querySelector(".app-header-left .chat-model-chip")).not.toBeNull();
   });
 });

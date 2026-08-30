@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { ModelChip } from "./ModelChip";
 import { useSessionStore } from "@/stores/sessionStore";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import { resetStore } from "@/test/store-helpers";
 
 // The chip is a pure store reader: App's health poll is the app's single
@@ -15,21 +16,35 @@ describe("ModelChip", () => {
     resetStore(useSessionStore);
   });
 
-  it("shows the composer model from the store with an accessible label", () => {
+  it("shows the composer model's display name with the raw id in title", () => {
     useSessionStore.setState({
       composerModel: "anthropic/claude-sonnet-4.6",
     });
 
     render(<ModelChip />);
 
-    expect(
-      screen.getByLabelText("Composer model: anthropic/claude-sonnet-4.6"),
-    ).toBeInTheDocument();
-    expect(screen.getByText("anthropic/claude-sonnet-4.6")).toBeInTheDocument();
     // The visible label says "Composer:", not "Model:" — the chip names the
     // composing model, which must stay distinguishable from LLM models
-    // configured inside the pipeline being authored.
+    // configured inside the pipeline being authored. It is no longer
+    // aria-hidden: the chip carries no ARIA, so this word is the only thing
+    // saying what the model name names (elspeth-37293a3b7c).
     expect(screen.getByText("Composer:")).toBeInTheDocument();
+    expect(screen.getByText("Claude Sonnet 4.6")).toBeInTheDocument();
+    expect(
+      screen.getByTitle("anthropic/claude-sonnet-4.6"),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the raw model id out of visible text", () => {
+    useSessionStore.setState({
+      composerModel: "openrouter/anthropic/claude-sonnet-5",
+    });
+
+    const { container } = render(<ModelChip />);
+
+    expectNoIdentifiersInDefaultDom(container);
+    expect(screen.getByText("Claude Sonnet 5")).toBeInTheDocument();
+    expect(container).not.toHaveTextContent("openrouter");
   });
 
   it("renders nothing while no model is known", () => {

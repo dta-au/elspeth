@@ -18,6 +18,8 @@
 import { useMemo, useState } from "react";
 
 import { Button, Icon } from "@/components/ui";
+import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
+import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/guided/pipelineGloss";
 import { stepLabelForNodeId } from "@/components/chat/interpretationStepLabel";
 import { humaniseValidationMessage, makePhraseFor } from "@/lib/validationHumaniser";
 import { useShowAdvanced } from "@/stores/preferencesStore";
@@ -50,35 +52,66 @@ interface ValidationResultProps {
   onComponentClick?: (componentId: string) => void;
 }
 
+/** The two registers of one errored component's name. */
+interface ComponentLabel {
+  /** Reader register — what the banner shows. Never a raw id, never a
+   *  `type:id` pair. */
+  name: string;
+  /** Identifier register — the exact wire form, for `title`/`data-*` only.
+   *  The structural `type:id` pair for a component still wired into the
+   *  composition, else the bare component id. Null when there is no id at
+   *  all. */
+  raw: string | null;
+}
+
 /**
- * Resolve a component_id to a human-readable display name.
+ * Resolve a component_id to the two registers above.
  *
- * Ladder: an explicit componentNames map (built from the live composition,
- * SideRailValidationBanner's buildValidationComponentNames) wins outright.
- * Absent that, with no nodes list at all there is nothing to resolve against
- * except the id itself — the caller passed no context, so the raw id is the
- * only honest thing to show. With a nodes list, a component that IS still
- * wired keeps its structural `type:id` label; one that's vanished from the
- * composition (or was never in it) falls through to `phraseFor`, the shared
- * plain-language resolver (elspeth-27efd1e801) — never a bare raw id when a
- * nicer phrase is available.
+ * Ladder for the NAME: an explicit componentNames map (built from the live
+ * composition, SideRailValidationBanner's buildValidationComponentNames) wins
+ * outright. Otherwise the shared plain-language resolver `phraseFor`
+ * (elspeth-27efd1e801) — never a bare raw id.
+ *
+ * Two corrections this wave's review found:
+ *
+ *  * A component that IS still wired used to render its structural
+ *    `type:id` pair verbatim ("transform:extract_invoice") — the engineer
+ *    register leaking straight into the banner's bold prefix. The pair moves
+ *    to `raw`; the visible name is the resolved phrase with the humanised
+ *    node kind beside it, the `Name (Kind)` shape the run-consent dialog and
+ *    the Spec card already use.
+ *
+ *  * `phraseFor`'s no-context answer is UNKNOWN_COMPONENT_PHRASE ("this
+ *    step"), which is the SAME for every component — two errors on two
+ *    different components read identically, where pre-wave the raw ids were
+ *    ugly but distinct (ux M-1). Discriminated on the sentinel exactly as
+ *    RunsHistoryDrawer's RunStateFailureDetail does, falling back to
+ *    `titleCaseLabel` — `humaniseStepLabel`'s own unloaded-composition rung,
+ *    so an unresolvable id still names the author's own word for the step
+ *    rather than collapsing into a generic phrase.
  */
-function resolveComponentName(
+function resolveComponentLabel(
   componentId: string | null,
   nodes: NodeSpec[] | undefined,
   componentNames: Record<string, string> | undefined,
   phraseFor: (componentId: string | null) => string,
-): string {
-  if (!componentId) return "unknown";
+): ComponentLabel {
+  if (!componentId) return { name: "unknown", raw: null };
   if (
     componentNames &&
     Object.prototype.hasOwnProperty.call(componentNames, componentId)
   ) {
-    return componentNames[componentId];
+    return { name: componentNames[componentId], raw: componentId };
   }
-  if (!nodes) return componentId;
-  const node = nodes.find((n) => n.id === componentId);
-  return node ? `${node.node_type}:${node.id}` : phraseFor(componentId);
+  const phrase = phraseFor(componentId);
+  const named =
+    phrase === UNKNOWN_COMPONENT_PHRASE ? titleCaseLabel(componentId) : phrase;
+  const node = nodes?.find((n) => n.id === componentId);
+  if (node === undefined) return { name: named, raw: componentId };
+  return {
+    name: `${named} (${titleCaseLabel(node.node_type)})`,
+    raw: `${node.node_type}:${node.id}`,
+  };
 }
 
 function isNavigableComponent(
@@ -235,15 +268,23 @@ export function ValidationResultBanner({
                 // The warning TEXT is what the button navigates from; the
                 // suggestion is a sibling note. See the error list below for
                 // why the two must not share one element (elspeth-7bcc3d5233).
+                const label = resolveComponentLabel(
+                  warn.component_id,
+                  nodes,
+                  componentNames,
+                  phraseFor,
+                );
+                // The identifier register lives on the prefix element, never
+                // in its text: `title` is the sighted-mouse channel and
+                // `data-component-id` the forensic one a support export or a
+                // test can read without a hover.
                 const warningText = (
                   <>
-                    <strong>
-                      {resolveComponentName(
-                        warn.component_id,
-                        nodes,
-                        componentNames,
-                        phraseFor,
-                      )}:
+                    <strong
+                      title={label.raw ?? undefined}
+                      data-component-id={label.raw ?? undefined}
+                    >
+                      {label.name}:
                     </strong>{" "}
                     {finding.headline}
                   </>
@@ -309,10 +350,19 @@ export function ValidationResultBanner({
           // across the helper note, made a four-line block one hit target, and
           // pushed the list marker down beside the "Suggestion:" line. The
           // underline itself stays; only the thing it underlines changes.
+          const label = resolveComponentLabel(
+            err.component_id,
+            nodes,
+            componentNames,
+            phraseFor,
+          );
           const errorText = (
             <>
-              <strong>
-                {resolveComponentName(err.component_id, nodes, componentNames, phraseFor)}:
+              <strong
+                title={label.raw ?? undefined}
+                data-component-id={label.raw ?? undefined}
+              >
+                {label.name}:
               </strong>{" "}
               {finding.headline}
             </>

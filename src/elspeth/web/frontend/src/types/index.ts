@@ -416,8 +416,8 @@ export interface ComposerProgressSnapshot {
  * PluginSummary with a typo'd flag. Forward compatibility for unknown
  * wire values is preserved by the lookup boundary at
  * ``lookupAuditCharacteristic(flag: string)``, which still accepts
- * ``string`` and returns ``null`` (rendering the grey "unknown" chip)
- * for a flag outside the union.
+ * ``string`` and returns ``null`` (rendering nothing — PluginCard
+ * filters the flag out before render) for a flag outside the union.
  */
 export interface PluginSummary {
   name: string;

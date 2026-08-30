@@ -12,6 +12,8 @@ import { describe, it, expect } from "vitest";
 import {
   buildStepOrder,
   humaniseStepLabel,
+  humaniseStepTitle,
+  isComponentPresent,
   resolveNodePlugin,
   stepLabelForNodeId,
   stepLabelForPlugin,
@@ -109,13 +111,57 @@ describe("humaniseStepLabel — node-name preference (R2-F8b)", () => {
     );
   });
 
-  it("falls back to the raw id when the node is absent from the composition", () => {
+  it("names an absent node 'Removed' — never the raw id (elspeth-93f5621f18)", () => {
     const state = makeCompositionState([]);
-    expect(humaniseStepLabel(state, "ghost_node")).toBe("ghost_node");
+    expect(humaniseStepLabel(state, "ghost_node")).toBe("Removed");
+  });
+
+  it("title-cases the id while the composition is still unloaded (unknown, not removed)", () => {
+    expect(humaniseStepLabel(null, "extract_invoice")).toBe("Extract Invoice");
   });
 
   it("falls back to a generic phrase when there is no id at all", () => {
     expect(humaniseStepLabel(null, null)).toBe("this step");
+  });
+
+  it("keeps two removed steps distinguishable in the card title (ux M-2)", () => {
+    // "Removed" alone is identical for every deleted node, so two
+    // acknowledgement cards referencing two different removed steps carried
+    // the same title with nothing visible or hoverable to tell them apart.
+    // The ghost id is the author's own name for the step, so title-casing it
+    // is not an identifier leak under this wave's own rule.
+    const state = makeCompositionState([]);
+    expect(humaniseStepTitle(state, "extract_invoice")).toBe(
+      "Removed step (was Extract Invoice)",
+    );
+    expect(humaniseStepTitle(state, "rate_coolness")).toBe(
+      "Removed step (was Rate Coolness)",
+    );
+    expect(humaniseStepTitle(state, "extract_invoice")).not.toBe(
+      humaniseStepTitle(state, "rate_coolness"),
+    );
+  });
+
+  it("names a present step, an unloaded composition and a missing id in the title register", () => {
+    const state = makeCompositionState([makeNode("summarise_notes", "llm")]);
+    // A present step is unchanged: the label plus the word the card appended
+    // itself before this function existed.
+    expect(humaniseStepTitle(state, "summarise_notes")).toBe("Summarise Notes step");
+    // Unloaded is NOT removed — the same discrimination humaniseStepLabel makes.
+    expect(humaniseStepTitle(null, "extract_invoice")).toBe("Extract Invoice step");
+    // Not "this step step".
+    expect(humaniseStepTitle(state, null)).toBe("this step");
+  });
+
+  it("does not mistake a step genuinely NAMED removed for a deleted one", () => {
+    // The reason this resolves structurally rather than comparing against the
+    // string "Removed": this node IS present, and its author-chosen name
+    // title-cases to exactly the word a deleted step uses. A sentinel
+    // comparison would have reported "Removed step (was Removed)" — a false
+    // statement about the user's own pipeline.
+    const state = makeCompositionState([makeNode("removed", "llm")]);
+    expect(humaniseStepTitle(state, "removed")).toBe("Removed step");
+    expect(humaniseStepTitle(state, "removed")).not.toContain("(was");
   });
 });
 
@@ -247,10 +293,10 @@ describe("stepLabelForNodeId — structural-node description fallback (elspeth-9
     );
   });
 
-  it("still resolves null (raw-id fallback) for a plugin-less node without a description", () => {
+  it("title-cases a present plugin-less node with no description (present, so not 'Removed')", () => {
     const state = makeCompositionState([gateNode()]);
     expect(stepLabelForNodeId(state, "fan_out")).toBeNull();
-    expect(humaniseStepLabel(state, "fan_out")).toBe("fan_out");
+    expect(humaniseStepLabel(state, "fan_out")).toBe("Fan Out");
   });
 
   it("does not let a description override a plugin-resolvable node's own name", () => {
@@ -261,5 +307,21 @@ describe("stepLabelForNodeId — structural-node description fallback (elspeth-9
 
   it("returns null for an id absent from the composition entirely", () => {
     expect(stepLabelForNodeId(makeCompositionState([]), "ghost")).toBeNull();
+  });
+});
+
+describe("isComponentPresent", () => {
+  it("finds nodes, sources and outputs; false for an absent id or unloaded state", () => {
+    const state: CompositionState = {
+      ...makeCompositionState([makeNode("rater", "llm")]),
+      sources: { input: { plugin: "csv", options: {} } },
+      outputs: [{ name: "results", plugin: "csv", options: {} }],
+    };
+    expect(isComponentPresent(state, "rater")).toBe(true);
+    expect(isComponentPresent(state, "input")).toBe(true);
+    expect(isComponentPresent(state, "results")).toBe(true);
+    expect(isComponentPresent(state, "ghost")).toBe(false);
+    expect(isComponentPresent(null, "rater")).toBe(false);
+    expect(isComponentPresent(state, null)).toBe(false);
   });
 });
