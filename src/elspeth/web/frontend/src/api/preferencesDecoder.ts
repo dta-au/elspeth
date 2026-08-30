@@ -33,8 +33,19 @@ import type {
 // phrase-map ruling sets, applied to the same archetype.
 //
 // The backend carries a lockstep-extension covenant naming the call sites
-// that must move together (web/preferences/models.py:20-32, :44-51); this
-// decoder would otherwise become a silent fourth.
+// that must move together (the module docstring on web/preferences/models.py,
+// and the comment above its `TutorialStage` Literal); `MODES` and `STAGES`
+// below are the fourth site it names. Referenced by symbol, not by line
+// number — the earlier line-range citation went stale the first time that
+// docstring grew.
+//
+// The decoder's KEYS tuple is a SECOND, independent contract with the same
+// module: not which VALUES a field admits, but which FIELDS exist at all.
+// That one is gated executably by
+// tests/unit/web/composer/test_preferences_decoder_parity.py, which compares
+// KEYS against `ComposerPreferences.model_fields` — so a backend field
+// addition fails pytest rather than throwing `unexpected <key>` on every GET
+// in production.
 const MODES: Record<ComposerMode, true> = { guided: true, freeform: true };
 const STAGES: Record<PersistedTutorialStage, true> = {
   guided: true,
