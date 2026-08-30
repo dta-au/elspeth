@@ -718,7 +718,10 @@ describe("PipelineSpecView", () => {
       compositionState: makeComposition(11, {
         sources: { source: { plugin: "csv", options: {}, on_success: "raw_rows", on_validation_failure: "discard" } },
         nodes: [
-          { id: "merge_invest", node_type: "coalesce", plugin: null, input: "invest_cs1_done", on_success: "tidy_output", on_error: null, branches: { branch_invest_cs1: "invest_cs1_done" }, policy: "require_all", merge: "union", options: {} },
+          // Digit-FREE identifiers: SNAKE_RE is /\b[a-z]+_[a-z_]+\b/ and admits
+          // no digits, so `invest_cs1_done` would produce a pin that cannot
+          // fail on either the `input` dd or the branches prose.
+          { id: "merge_invest", node_type: "coalesce", plugin: null, input: "invest_first_done", on_success: "tidy_output", on_error: null, branches: { branch_invest_first: "invest_first_done" }, policy: "require_all", merge: "union", options: {} },
           { id: "collect_pages", node_type: "collector", plugin: null, input: "tidy_output", on_success: "tidy_output", on_error: null, scope_name: "doc_pages", scope_opener: "merge_invest", scope_policy: "require_all", output_mode: "passthrough", timeout_seconds: 300, options: {} },
         ],
         outputs: [{ name: "tidy_output", plugin: "csv", on_write_failure: "discard", options: {} }],

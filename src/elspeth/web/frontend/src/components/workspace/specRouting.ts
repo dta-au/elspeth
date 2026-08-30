@@ -209,12 +209,14 @@ export function buildConnectionIndex(state: CompositionState): ConnectionIndex {
  *  source would read "Invoices Csv" here and "Quarterly invoices" in the
  *  validation summary, the audit panel and the chat.
  *
- *  Sources arrive keyed by COMPONENT id (`source`, or `source:<name>`),
- *  because that is the vocabulary buildConnectionProducers registers. There
- *  is no inverse of `sourceComponentId`, so the source is found by matching
- *  the helper's own output over the composition's sources — never by
- *  splitting the prefix off the string. Both vocabularies resolve, since
- *  SpecRow.label passes a bare source key.
+ *  The accepted vocabulary is COMPONENT ids: `sourceComponentId(name)` for a
+ *  source (`source`, or `source:<name>`), a node id, an output name. That is
+ *  what buildConnectionProducers registers and what the index therefore
+ *  holds, and it is the only thing callers pass. A BARE non-default source
+ *  key is NOT accepted — it would resolve through the plugin rung and lose
+ *  the description. There is no inverse of `sourceComponentId`, so the source
+ *  is found by matching the helper's own output over the composition's
+ *  sources — never by splitting the prefix off the string.
  *
  *  Never "Removed": this is called with ids the index already resolved, and
  *  with connection names, where absence means dangling rather than deleted.
@@ -223,7 +225,7 @@ export function buildConnectionIndex(state: CompositionState): ConnectionIndex {
  *  print the same sentence twice. */
 export function componentPhrase(state: CompositionState, id: string): string {
   const sourceEntry = sortedSourceEntries(state).find(
-    ([name]) => name === id || sourceComponentId(name) === id,
+    ([name]) => sourceComponentId(name) === id,
   );
   if (sourceEntry !== undefined) {
     const [name, source] = sourceEntry;

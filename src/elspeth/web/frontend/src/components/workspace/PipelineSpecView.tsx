@@ -9,18 +9,12 @@ import { useSessionStore } from "@/stores/sessionStore";
 import type { CompositionState } from "@/types/index";
 import {
   buildConnectionIndex,
-  componentPhrase,
   routingPhrase,
   type ConnectionIndex,
 } from "./specRouting";
 
 interface SpecRow {
   id: string;
-  /** The component's reader-register name. For the routing <dd>s and any
-   *  future prose slot — NOT the <h4>, which title-cases the id: the
-   *  description already has its own <p> directly beneath the heading, so a
-   *  described structural node would print the same sentence twice. */
-  label: string;
   kind: string;
   plugin: string | null;
   pluginKind: "source" | "transform" | "sink";
@@ -173,7 +167,6 @@ function sourceRows(state: CompositionState): SpecRow[] {
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([id, source]) => ({
       id,
-      label: componentPhrase(state, id),
       kind: "source",
       plugin: source.plugin,
       pluginKind: "source",
@@ -189,7 +182,6 @@ function sourceRows(state: CompositionState): SpecRow[] {
 function nodeRows(state: CompositionState): SpecRow[] {
   return state.nodes.map((node) => ({
     id: node.id,
-    label: componentPhrase(state, node.id),
     kind: node.node_type,
     plugin: node.plugin,
     pluginKind: "transform",
@@ -245,7 +237,6 @@ function nodeRows(state: CompositionState): SpecRow[] {
 function outputRows(state: CompositionState): SpecRow[] {
   return state.outputs.map((output) => ({
     id: output.name,
-    label: componentPhrase(state, output.name),
     kind: "output",
     plugin: output.plugin,
     pluginKind: "sink",
