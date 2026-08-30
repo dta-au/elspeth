@@ -7,6 +7,12 @@ import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Button, Input } from "@/components/ui";
 import { sortedSourceEntries, sourceComponentId } from "@/utils/compositionState";
+import {
+  pluginDisplayName,
+  titleCaseLabel,
+} from "@/components/catalog/pluginDisplayName";
+import { stepLabelForNodeId } from "@/components/chat/interpretationStepLabel";
+import { modelDisplayName } from "@/components/chat/modelDisplayName";
 import type {
   CompositionState,
   NodeSpec,
@@ -175,17 +181,52 @@ function catalogFlagsLlmSource(
  * `llm` identity remains a bounded fallback while the catalog is loading,
  * failed, stale, or missing that entry, so its authored prompt is never
  * silently omitted from consent.
+ *
+ * Returns reader-register lines with the identifier-register sentence beside
+ * each, surfaced via `aria-describedby` (never `title` alone — see below).
  * Exported for tests.
  */
-export function buildRunEgressSummary(
+export interface RunEgressLine {
+  /** Reader register: step labels and plugin display names. */
+  text: string;
+  /** Identifier register — the exact sentence this dialog showed before
+   *  Wave 3, unchanged so every component and plugin is still named by id
+   *  (R2-F7). Surfaced via an `.sr-only` span wired with `aria-describedby`
+   *  on the line, NOT via `title` alone — `title` is not reliably announced
+   *  and an <li> is not focusable, so it is a mouse convenience beside the
+   *  span, never the only route (see the `.sr-only` block below). */
+  identifiers: string;
+}
+
+type EgressRegister = "reader" | "identifier";
+
+function egressSentences(
+  register: EgressRegister,
   compositionState: CompositionState | null,
-  catalogTransforms: readonly PluginSummary[] | null = null,
-  catalogLoadFailed = false,
-  catalogSources: readonly PluginSummary[] | null = null,
-  catalogIsLoading = false,
+  catalogTransforms: readonly PluginSummary[] | null,
+  catalogLoadFailed: boolean,
+  catalogSources: readonly PluginSummary[] | null,
+  catalogIsLoading: boolean,
 ): string[] {
   if (!compositionState) return [];
   const lines: string[] = [];
+
+  const component = (id: string): string =>
+    register === "identifier"
+      ? id
+      : (stepLabelForNodeId(compositionState, id) ?? titleCaseLabel(id));
+  const plugin = (pluginId: string): string =>
+    register === "identifier" ? pluginId : pluginDisplayName(pluginId);
+  const model = (modelId: string): string => {
+    if (register === "identifier") return modelId;
+    const cut = modelId.lastIndexOf("/");
+    // The provider path IS the egress destination on this surface. Phrase the
+    // model, keep the route (elspeth-59631ec7f7 / R2-F7). ModelChip keeps the
+    // leaf-only form; a header chip is not a consent surface.
+    return cut === -1
+      ? modelDisplayName(modelId)
+      : `${modelDisplayName(modelId)} via ${modelId.slice(0, cut)}`;
+  };
 
   const sourceEntries = sortedSourceEntries(compositionState);
   const catalogCurrent =
@@ -199,15 +240,20 @@ export function buildRunEgressSummary(
     )
     .map(
       ([sourceName, source]) =>
-        `${sourceComponentId(sourceName)} (${source.plugin})`,
+        `${register === "identifier" ? sourceComponentId(sourceName) : component(sourceName)} (${plugin(source.plugin)})`,
     );
   if (ordinarySources.length > 0) {
     lines.push(`Reads source data: ${ordinarySources.join(", ")}.`);
   }
 
+  // `llmSourceBindingLabel` is UNCHANGED in both registers by design: it
+  // establishes egress SAFETY (provider, model, endpoint and credential
+  // bindings stay operator-private), and the authored profile alias is the
+  // one binding the user may see. Phrasing it would title-case an
+  // operator-chosen token into something that looks like a product name.
   const llmSources = llmSourceEntries.map(
     ([sourceName, source]) =>
-      `${sourceComponentId(sourceName)} (${llmSourceBindingLabel(source)})`,
+      `${register === "identifier" ? sourceComponentId(sourceName) : component(sourceName)} (${llmSourceBindingLabel(source)})`,
   );
   if (llmSources.length > 0) {
     lines.push(
@@ -221,8 +267,8 @@ export function buildRunEgressSummary(
     .filter(isLlmNode)
     .map((node) =>
       typeof node.options?.model === "string"
-        ? `${node.id} (model ${node.options.model})`
-        : node.id,
+        ? `${component(node.id)} (model ${model(node.options.model)})`
+        : component(node.id),
     );
   if (llmNodes.length > 0) {
     lines.push(`Sends rows to the configured LLM: ${llmNodes.join(", ")}.`);
@@ -239,7 +285,7 @@ export function buildRunEgressSummary(
           node.plugin !== null &&
           catalogFlagsExternalCall(node.plugin, catalogTransforms),
       )
-      .map((node) => `${node.id} (${node.plugin})`);
+      .map((node) => `${component(node.id)} (${plugin(node.plugin as string)})`);
   } else if (catalogLoadFailed) {
     // Catalog failed to load — the hardcoded set still yields a confident
     // (if incomplete) line, but every other configured, non-LLM transform
@@ -250,10 +296,10 @@ export function buildRunEgressSummary(
     );
     networkNodes = nonLlmTransforms
       .filter((node) => NETWORK_FETCH_PLUGINS.has(node.plugin as string))
-      .map((node) => `${node.id} (${node.plugin})`);
+      .map((node) => `${component(node.id)} (${plugin(node.plugin as string)})`);
     unverifiableNodes = nonLlmTransforms
       .filter((node) => !NETWORK_FETCH_PLUGINS.has(node.plugin as string))
-      .map((node) => `${node.id} (${node.plugin})`);
+      .map((node) => `${component(node.id)} (${plugin(node.plugin as string)})`);
   } else {
     // Not loaded yet (transient) — same fallback behaviour as before
     // catalog-driven classification existed.
@@ -262,7 +308,7 @@ export function buildRunEgressSummary(
         (node) =>
           node.plugin !== null && NETWORK_FETCH_PLUGINS.has(node.plugin),
       )
-      .map((node) => `${node.id} (${node.plugin})`);
+      .map((node) => `${component(node.id)} (${plugin(node.plugin as string)})`);
   }
 
   if (networkNodes.length > 0) {
@@ -276,13 +322,34 @@ export function buildRunEgressSummary(
   }
 
   const outputs = compositionState.outputs.map(
-    (output) => `${output.name} (${output.plugin})`,
+    (output) => `${component(output.name)} (${plugin(output.plugin)})`,
   );
   if (outputs.length > 0) {
     lines.push(`Writes output: ${outputs.join(", ")}.`);
   }
 
   return lines;
+}
+
+export function buildRunEgressSummary(
+  compositionState: CompositionState | null,
+  catalogTransforms: readonly PluginSummary[] | null = null,
+  catalogLoadFailed = false,
+  catalogSources: readonly PluginSummary[] | null = null,
+  catalogIsLoading = false,
+): RunEgressLine[] {
+  const reader = egressSentences("reader", compositionState, catalogTransforms, catalogLoadFailed, catalogSources, catalogIsLoading);
+  const identifiers = egressSentences("identifier", compositionState, catalogTransforms, catalogLoadFailed, catalogSources, catalogIsLoading);
+  // Both passes walk the same composition in the same order, so the arrays
+  // align by construction — `register` only substitutes label TEXT, it never
+  // gates whether a sentence is emitted. That property could silently stop
+  // holding, so it is checked rather than asserted in prose: a thrown error on
+  // a run-confirm dialog is a loud, fixable failure; a silently misaligned
+  // identifier sentence on an audit-required egress line is not.
+  if (reader.length !== identifiers.length) {
+    throw new Error("egress registers disagreed on line count");
+  }
+  return reader.map((text, i) => ({ text, identifiers: identifiers[i] }));
 }
 
 /**
@@ -693,9 +760,25 @@ export function ExecuteButton(): JSX.Element | null {
         >
           {egressLines.length > 0 && (
             <ul className="run-disclosure-summary">
-              {egressLines.map((line) => (
-                <li key={line}>{line}</li>
-              ))}
+              {egressLines.map((line, index) => {
+                const identifiersId = `run-egress-ids-${index}`;
+                return (
+                  <li
+                    key={line.identifiers}
+                    aria-describedby={identifiersId}
+                    title={line.identifiers}
+                  >
+                    {line.text}
+                    {/* The identifier register, reachable by AT and by
+                        keyboard users. `title` is kept for sighted mouse
+                        hover; it is a convenience, never the only route
+                        (the run-button comment above records why). */}
+                    <span id={identifiersId} className="sr-only">
+                      {line.identifiers}
+                    </span>
+                  </li>
+                );
+              })}
             </ul>
           )}
           <label className="run-disclosure-opt-out">
