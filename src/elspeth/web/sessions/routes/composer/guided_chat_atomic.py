@@ -118,6 +118,7 @@ from .._helpers import (
 from ..guided_operations import (
     GuidedOperationExpired,
     GuidedOperationLease,
+    guided_operation_lease_guard,
     raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
@@ -914,7 +915,10 @@ async def _step_1_inline_source_inspection_facts(
     only exists after this operation settles. The LLM authorship breadcrumb
     lives in ``source_description`` instead.
     """
-    facts = await _inspect_latest_ready_session_blob(blob_service, session_id)
+    facts = await _inspect_latest_ready_session_blob(
+        blob_service,
+        session_id,
+    )
     if facts is None:
         content = resolution.content.encode("utf-8")
         record = await blob_service.create_blob(
@@ -1100,13 +1104,13 @@ async def post_guided_chat_schema8(
             if type(reserved) is not GuidedOperationLease:  # pragma: no cover
                 raise AuditIntegrityError("Guided Chat reservation returned no lease")
 
+            lease_guard = guided_operation_lease_guard(service=service, lease=reserved)
             recorder = BufferingRecorder()
             attempt_message_id = uuid4()
             originating_message = GuidedOriginatingUserMessageDraft(
                 message_id=attempt_message_id,
                 content=body.message,
             )
-            progress_started = False
             progress_registry = _get_composer_progress_registry(request)
             try:
                 progress_sink = _composer_progress_sink(
@@ -1124,7 +1128,6 @@ async def post_guided_chat_schema8(
                         likely_next="ELSPETH will prepare a bounded guided response.",
                     ),
                 )
-                progress_started = True
                 settings = request.app.state.settings
                 started_at = datetime.now(UTC)
                 async with _cancel_on_client_disconnect(request):
@@ -1154,6 +1157,7 @@ async def post_guided_chat_schema8(
                             ),
                             blob_service=request.app.state.blob_service,
                             session_id=session_id,
+                            session_operation_context=reserved.session_operation_context,
                         )
                     uploaded_mismatch_facts = (
                         uploaded_candidate[1] if uploaded_candidate is not None and uploaded_candidate[0] is None else None
@@ -1346,7 +1350,12 @@ async def post_guided_chat_schema8(
                         )
 
                 async with compose_lock:
-                    fence = await service.renew_guided_operation(reserved.fence, actor="composer_route", lease_seconds=300)
+                    fence = await service.renew_guided_operation(
+                        reserved.fence,
+                        actor="composer_route",
+                        lease_seconds=300,
+                        session_operation_context=reserved.session_operation_context,
+                    )
                     current_record = await service.get_current_state(session_id)
                     if (current_record is None) != (frozen.state_record is None):
                         raise GuidedOperationSettlementConflictError()
@@ -1981,6 +1990,7 @@ async def post_guided_chat_schema8(
                             invalidated_pending_proposal=invalidated_pending_proposal,
                         ),
                         payload_store=payload_store,
+                        session_operation_context=reserved.session_operation_context,
                     )
                     response = response_from_record(settlement.result_state)
 
@@ -2010,17 +2020,17 @@ async def post_guided_chat_schema8(
                                     llm_calls=recorder.llm_calls,
                                     chat_turns=recorder.chat_turns,
                                 ),
-                            )
+                            ),
+                            session_operation_context=reserved.session_operation_context,
                         )
                     )
-                if progress_started:
-                    with contextlib.suppress(Exception):
-                        await asyncio.shield(
-                            _publish_progress(
-                                progress_sink,
-                                event=client_cancelled_progress_event(),
-                            )
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(
+                        _publish_progress(
+                            progress_sink,
+                            event=client_cancelled_progress_event(),
                         )
+                    )
                 if _is_client_disconnect_cancel(exc):
                     raise HTTPException(status_code=499, detail="Client disconnected while the guided chat turn was running.") from exc
                 raise
@@ -2065,12 +2075,15 @@ async def post_guided_chat_schema8(
                                 llm_calls=recorder.llm_calls,
                                 chat_turns=recorder.chat_turns,
                             ),
-                        )
+                        ),
+                        session_operation_context=reserved.session_operation_context,
                     )
                 except GuidedOperationFenceLostError:
                     rejoin_after_lock = True
                 else:
                     raise_guided_operation_failure(failed)
+            finally:
+                await lease_guard.finish_active_exception()
         if rejoin_after_lock:
             joined = await reserve_or_replay_guided_operation(
                 service=service,
@@ -2079,6 +2092,7 @@ async def post_guided_chat_schema8(
                 request=body,
                 replay=replay,
                 reserve_if_absent=False,
+                takeover_expired=False,
             )
             if joined is None:
                 raise AuditIntegrityError("Guided Chat fence was lost without a joinable winner")

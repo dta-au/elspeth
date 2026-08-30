@@ -8,6 +8,7 @@ from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.validation import get_sink_config_model, get_source_config_model
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -49,6 +50,7 @@ from elspeth.web.composer.source_inspection import (
     SourceInspectionFacts,
     inspect_blob_content,
     inspect_selected_ready_session_blob,
+    resolve_source_inspection_blob_id,
 )
 from elspeth.web.composer.tools._common import validate_composer_file_sink_collision_policy
 from elspeth.web.composer.tutorial_sample import (
@@ -532,22 +534,24 @@ async def _step_1_unambiguous_compatible_blob_inspection(
     otherwise carry an empty ``path`` whose only practically legal web value is
     a ``blob:<id>`` sentinel the user cannot type.
 
-    Blob bytes are Tier 3 and ``inspect_blob_content`` is the source-boundary
-    validation point; listing is session-scoped, so another session's upload can
-    never be reached from here.
+    Blob bytes are Tier 3 and ``inspect_selected_ready_session_blob`` is the
+    source-boundary validation point. It retains only the bounded inspection
+    prefix while streaming the full-content integrity check, so a session's
+    ready uploads are never materialized in bulk under the operation lease.
+    Listing is session-scoped, so another session's upload can never be reached
+    from here.
     """
     match: SourceInspectionFacts | None = None
     for record in await blob_service.list_blobs(session_id, limit=None):
         if record.status != "ready":
             continue
-        content = await blob_service.read_blob_content(record.id)
-        facts = inspect_blob_content(
-            content=content,
-            filename=record.filename,
-            mime_type=record.mime_type,
-            blob_id=record.id,
-            content_hash=record.content_hash,
+        facts = await inspect_selected_ready_session_blob(
+            blob_service,
+            session_id,
+            selected_blob_id=record.id,
         )
+        if facts is None:
+            raise AuditIntegrityError("explicit ready blob inspection unexpectedly declined")
         if not _inspection_matches_source_plugin(plugin, facts):
             continue
         if match is not None:
@@ -563,6 +567,7 @@ async def _source_from_latest_uploaded_blob_for_step_1_chat(
     selectable_plugins: tuple[str, ...] = (),
     blob_service: BlobServiceProtocol,
     session_id: UUID,
+    session_operation_context: SessionOperationContext,
 ) -> tuple[SourceResolved | None, SourceInspectionFacts] | None:
     """Build a source resolution from the newest uploaded blob for upload-hint chat.
 
@@ -721,11 +726,10 @@ async def get_guided(
 ) -> GetGuidedResponse:
     """Return the current guided-mode state for a session.
 
-    Fresh sessions are non-mutating on first visit: if there is no
-    existing CompositionState, the initial GuidedSession and first turn are
-    built in memory and returned with ``composition_state=None``. This keeps
-    the version history from starting with an empty graph solely because
-    the frontend auto-loaded guided mode.
+    This read is non-mutating. If there is no existing CompositionState, the
+    initial GuidedSession and first turn are built in memory and returned with
+    ``composition_state=None``. This keeps the version history from starting
+    with an empty graph solely because the frontend auto-loaded guided mode.
 
     A missing occurrence is projected prospectively for both fresh and
     persisted sessions. GET never writes half of the state/evidence pair; the
@@ -756,6 +760,7 @@ async def get_guided(
         # (elspeth-4dc78b3897) contradicted the endpoint's
         # no-write-on-GET custody contract.
         state_record_out: CompositionStateRecord | None = None
+
         # Load or create CompositionState.
         state_record = await service.get_current_state(session_id)
         if state_record is None:
@@ -880,9 +885,10 @@ async def get_guided(
         payload_hash: str | None = guided_json_payload_id("turn", turn["payload"]) if turn is not None else None
 
         if existing_record_for_step is None and turn is not None:
-            # First fetch for this step AND a turn exists: record TurnRecord,
-            # persist, emit audit. When turn is None (terminal state or
-            # STEP_3) there is no turn to record.
+            # Project the missing TurnRecord into the response. The first
+            # fenced mutation persists the occurrence and its audit evidence.
+            # When turn is None (terminal state or STEP_3), there is no turn
+            # to project.
             # Guaranteed by the conditional assignments above: turn is not
             # None on this branch, so both turn_type and payload_hash were
             # populated from turn["type"] / stable_hash(turn["payload"]).
@@ -903,8 +909,8 @@ async def get_guided(
             )
             guided = new_guided
 
-        # Build response.  On re-fetch the same turn is returned (deterministic
-        # rebuild) and the payload_hash matches what was recorded on first visit.
+        # Build the deterministic response. A repeated read projects the same
+        # missing occurrence and payload hash until a fenced mutation persists it.
         terminal = guided.terminal
         shield_available = _resolve_shield_available(plugin_snapshot)
         return GetGuidedResponse(
@@ -1048,7 +1054,9 @@ async def post_guided_reenter(
     from elspeth.web.sessions.protocol import GuidedCompositionStateResult, GuidedOperationSettlementConflictError
 
     from ..guided_operations import (
+        GuidedOperationExpired,
         GuidedOperationLease,
+        guided_operation_lock_guard,
         raise_guided_operation_failure,
         reserve_or_replay_guided_operation,
     )
@@ -1066,8 +1074,9 @@ async def post_guided_reenter(
         request=body,
         replay=_replay,
         reserve_if_absent=False,
+        takeover_expired=False,
     )
-    if reserved is None:
+    if reserved is None or isinstance(reserved, GuidedOperationExpired):
         # Reject invalid mode transitions before allocating an operation row.
         # The immutable checkpoint is re-read under the lock after a claim, so
         # this is classification rather than the write authority boundary.
@@ -1110,7 +1119,11 @@ async def post_guided_reenter(
     if not isinstance(reserved, GuidedOperationLease):
         return reserved
 
-    async with compose_lock:
+    async with guided_operation_lock_guard(
+        service=service,
+        lease=reserved,
+        lock=compose_lock,
+    ):
         state_record = await service.get_current_state(session_id)
         if state_record is None:
             raise HTTPException(
@@ -1276,12 +1289,14 @@ async def post_guided_reenter(
                     audit_evidence=audit_evidence,
                 ),
                 payload_store=request.app.state.payload_store,
+                session_operation_context=reserved.session_operation_context,
             )
         except GuidedOperationSettlementConflictError:
             failed = await service.fail_guided_operation(
                 reserved.fence,
                 failure_code="stale_conflict",
                 actor="composer_route",
+                session_operation_context=reserved.session_operation_context,
             )
             raise_guided_operation_failure(failed)
         return _response_from_record(settlement.result_state)
@@ -1302,18 +1317,53 @@ async def reconcile_guided_start_operation(
     service: SessionServiceProtocol = request.app.state.session_service
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
     try:
-        async with compose_lock:
-            outcome = await service.reconcile_guided_start_operation(
-                session_id=session_id,
-                operation_id=str(operation_id),
-                actor="composer_route",
-            )
+        outcome = await service.get_guided_start_reconciliation(
+            session_id=session_id,
+            operation_id=str(operation_id),
+        )
+        if outcome is None or (type(outcome) is GuidedOperationActive and outcome.expired):
+            async with compose_lock:
+                # A read that required mutation is rechecked after local
+                # serialization. Ordinary active/terminal reads never wait on
+                # the compose lock or acquire session-operation authority.
+                outcome = await service.get_guided_start_reconciliation(
+                    session_id=session_id,
+                    operation_id=str(operation_id),
+                )
+                if outcome is not None and not (type(outcome) is GuidedOperationActive and outcome.expired):
+                    pass
+                else:
+                    from elspeth.web.coordination.contracts import SessionOperationKind
+                    from elspeth.web.coordination.lifecycle import SessionOperationLease
+                    from elspeth.web.sessions.routes.guided_operations import run_guided_reconciliation_mutation
+
+                    observed_attempt = outcome.attempt if type(outcome) is GuidedOperationActive else None
+                    session_lease = await SessionOperationLease.acquire(
+                        service.session_operation_authority,
+                        session_id=session_id,
+                        operation_kind=SessionOperationKind.COMPOSE,
+                        owner_instance_id=service.session_operation_owner_instance_id,
+                        lease_seconds=service.session_operation_lease_seconds,
+                    )
+                    outcome = await run_guided_reconciliation_mutation(
+                        session_lease,
+                        service.reconcile_guided_start_operation(
+                            session_id=session_id,
+                            operation_id=str(operation_id),
+                            observed_attempt=observed_attempt,
+                            actor="composer_route",
+                            lease_seconds=service.session_operation_lease_seconds,
+                            session_operation_context=session_lease.context,
+                        ),
+                    )
     except GuidedOperationConflictError as exc:
         raise HTTPException(
             status_code=409,
             detail="Operation id is already bound to a different guided action.",
         ) from exc
 
+    if outcome is None:
+        raise AuditIntegrityError("guided-start reconciliation lost its observed operation")
     if type(outcome) is GuidedOperationActive:
         return GuidedStartOperationInProgressResponse(status="in_progress")
     if type(outcome) is GuidedOperationFailed:
@@ -1405,7 +1455,9 @@ async def post_guided_start(
     )
 
     from ..guided_operations import (
+        GuidedOperationExpired,
         GuidedOperationLease,
+        guided_operation_lease_guard,
         guided_response_hash,
         raise_guided_operation_failure,
         reserve_or_replay_guided_operation,
@@ -1509,8 +1561,9 @@ async def post_guided_start(
         request=body,
         replay=_replay,
         reserve_if_absent=False,
+        takeover_expired=False,
     )
-    if pending is not None and not isinstance(pending, GuidedOperationLease):
+    if pending is not None and not isinstance(pending, (GuidedOperationLease, GuidedOperationExpired)):
         return pending
 
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
@@ -1520,7 +1573,7 @@ async def post_guided_start(
         observed_record = await service.get_current_state(session_id)
         if observed_record is not None:
             observed_state = _state_from_record(observed_record)
-            if observed_state.guided_session is None and pending is None:
+            if observed_state.guided_session is None:
                 raise HTTPException(
                     status_code=409,
                     detail=(
@@ -1534,7 +1587,7 @@ async def post_guided_start(
             observed_head = None
 
     while True:
-        if pending is None:
+        if pending is None or isinstance(pending, GuidedOperationExpired):
             reserved = await reserve_or_replay_guided_operation(
                 service=service,
                 session_id=session_id,
@@ -1550,6 +1603,7 @@ async def post_guided_start(
         if not isinstance(reserved, GuidedOperationLease):
             return reserved
 
+        lease_guard = guided_operation_lease_guard(service=service, lease=reserved)
         try:
             async with compose_lock:
                 # Waiting for the compose lock may consume most of a lease.
@@ -1559,6 +1613,7 @@ async def post_guided_start(
                     reserved.fence,
                     actor="composer_route",
                     lease_seconds=300,
+                    session_operation_context=reserved.session_operation_context,
                 )
                 current_record = await service.get_current_state(session_id)
                 if current_record is not None:
@@ -1578,6 +1633,7 @@ async def post_guided_start(
                             expected_current_state_version=current_record.version,
                             actor="composer_route",
                             response_hash_factory=lambda record: guided_response_hash(_response_from_record(record)),
+                            session_operation_context=reserved.session_operation_context,
                         )
                     )
                     return _response_from_record(settled_record)
@@ -1643,6 +1699,7 @@ async def post_guided_start(
                         audit_evidence=seed_evidence,
                         originating_message=root_message,
                         payload_store=request.app.state.payload_store,
+                        session_operation_context=reserved.session_operation_context,
                     )
                 )
                 return _response_from_record(seed_outcome.state)
@@ -1680,6 +1737,7 @@ async def post_guided_start(
                         reserved.fence,
                         failure_code=cancel_failure_code,
                         actor="composer_route",
+                        session_operation_context=reserved.session_operation_context,
                     )
                 )
             except GuidedOperationFenceLostError as fence_lost:
@@ -1719,10 +1777,13 @@ async def post_guided_start(
                     reserved.fence,
                     failure_code=failure_code,
                     actor="composer_route",
+                    session_operation_context=reserved.session_operation_context,
                 )
             except GuidedOperationFenceLostError:
                 continue
             raise_guided_operation_failure(failed)
+        finally:
+            await lease_guard.finish_active_exception()
 
 
 @router.post("/{session_id}/guided/convert", response_model=GetGuidedResponse)
@@ -1777,7 +1838,9 @@ async def post_guided_convert(
     )
 
     from ..guided_operations import (
+        GuidedOperationExpired,
         GuidedOperationLease,
+        guided_operation_lease_guard,
         guided_response_hash,
         raise_guided_operation_failure,
         reserve_or_replay_guided_operation,
@@ -1850,6 +1913,20 @@ async def post_guided_convert(
         replay_record = await service.get_state_in_session(result.state_id, session_id)
         return _response_from_record(replay_record)
 
+    compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
+    pending = await reserve_or_replay_guided_operation(
+        service=service,
+        session_id=session_id,
+        kind="guided_convert",
+        request=body,
+        replay=_replay,
+        reserve_if_absent=False,
+        takeover_expired=False,
+    )
+    if pending is not None and not isinstance(pending, (GuidedOperationLease, GuidedOperationExpired)):
+        return pending
+    async with compose_lock:
+        await service.get_current_state(session_id)
     reserved = await reserve_or_replay_guided_operation(
         service=service,
         session_id=session_id,
@@ -1862,7 +1939,7 @@ async def post_guided_convert(
     if not isinstance(reserved, GuidedOperationLease):
         return reserved
 
-    compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
+    lease_guard = guided_operation_lease_guard(service=service, lease=reserved)
     try:
         async with compose_lock:
             state_record = await service.get_current_state(session_id)
@@ -1878,6 +1955,7 @@ async def post_guided_convert(
                     expected_current_state_version=state_record.version,
                     actor="composer_route",
                     response_hash_factory=lambda record: guided_response_hash(_response_from_record(record)),
+                    session_operation_context=reserved.session_operation_context,
                 )
                 return _response_from_record(settled_record)
 
@@ -1939,6 +2017,7 @@ async def post_guided_convert(
                 payloads=(prepared_seed_turn,),
                 audit_evidence=seed_evidence,
                 payload_store=request.app.state.payload_store,
+                session_operation_context=reserved.session_operation_context,
             )
             return _response_from_record(state_record_out)
     except Exception as exc:
@@ -1966,8 +2045,11 @@ async def post_guided_convert(
             reserved.fence,
             failure_code=failure_code,
             actor="composer_route",
+            session_operation_context=reserved.session_operation_context,
         )
         raise_guided_operation_failure(failed)
+    finally:
+        await lease_guard.finish_active_exception()
 
 
 def _schema8_unsupported_stage(step: GuidedStep) -> HTTPException:
@@ -2684,6 +2766,7 @@ async def post_guided_respond(
         GuidedOperationExpired,
         GuidedOperationLease,
         bounded_admission_guard,
+        guided_operation_lease_guard,
         raise_guided_operation_failure,
         reserve_or_replay_guided_operation,
     )
@@ -2789,18 +2872,31 @@ async def post_guided_respond(
             raise AuditIntegrityError("Guided RESPOND replay result proposal has incomplete composer provenance")
         record = await service.get_state_in_session(result.state_id, session_id)
         from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+        from elspeth.web.coordination.contracts import SessionOperationKind
+        from elspeth.web.coordination.lifecycle import SessionOperationLease
 
-        await surface_pending_interpretation_reviews_for_state(
-            _state_from_record(record),
-            sessions_service=service,
-            session_id=str(session_id),
-            current_state_id=str(record.id),
-            model_identifier=row.composer_model_identifier,
-            model_version=row.composer_model_version,
-            provider=row.composer_provider,
-            composer_skill_hash=row.composer_skill_hash,
-            only_missing_evidence=True,
-        )
+        # The replay joiner released the operation's session lease before this
+        # post-verification repair runs, so the repair writes hold their own
+        # short COMPOSE authority (fenced by analogy with the settling attempt).
+        async with await SessionOperationLease.acquire(
+            service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        ) as repair_lease:
+            await surface_pending_interpretation_reviews_for_state(
+                _state_from_record(record),
+                sessions_service=service,
+                session_id=str(session_id),
+                current_state_id=str(record.id),
+                model_identifier=row.composer_model_identifier,
+                model_version=row.composer_model_version,
+                provider=row.composer_provider,
+                composer_skill_hash=row.composer_skill_hash,
+                only_missing_evidence=True,
+                session_operation_context=repair_lease.context,
+            )
 
     def _require_bound_revision_target(current_turn: Turn, *, public_error: bool) -> None:
         """Require the exact stable target advertised by the pending proposal."""
@@ -2856,6 +2952,7 @@ async def post_guided_respond(
         reviewed_facts: dict[str, object],
         prepared_response: PreparedGuidedJsonPayload,
         origin: Literal["proposal_review", "wire_review"],
+        session_operation_context: SessionOperationContext,
         correction_feedback: str | None = None,
     ) -> GuidedRespondResponse:
         """Reuse the atomic proposal back-edit seam from either review stage."""
@@ -2959,6 +3056,7 @@ async def post_guided_respond(
                 audit_evidence=GuidedAuditEvidence(invocations=recorder.invocations),
             ),
             payload_store=payload_store,
+            session_operation_context=session_operation_context,
         )
         return _response_from_record(rewound.result_state)
 
@@ -3171,18 +3269,17 @@ async def post_guided_respond(
                         status_code=400,
                         detail="source_blob_id is not valid for the selected source plugin.",
                     )
+                # Selection membership is cheap metadata validation and may
+                # reject before reservation. Reading Tier-3 bytes is a fenced
+                # effect and is deliberately deferred until the exact guided
+                # operation lease exists below.
                 if accepts_blob_inspection:
+                    records = await request.app.state.blob_service.list_blobs(session_id, limit=None)
                     try:
-                        inspection_facts = await inspect_selected_ready_session_blob(
-                            request.app.state.blob_service,
-                            session_id,
+                        resolve_source_inspection_blob_id(
                             selected_blob_id=body.source_blob_id,
+                            ready_blob_ids=tuple(record.id for record in records if record.status == "ready"),
                         )
-                    except SourceInspectionBlobLifecycleError as exc:
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Selected source blob is no longer a ready upload for this session.",
-                        ) from exc
                     except ValueError as exc:
                         raise HTTPException(
                             status_code=400,
@@ -3416,11 +3513,18 @@ async def post_guided_respond(
             if not isinstance(reserved, GuidedOperationLease):
                 return reserved
 
+            lease_guard = guided_operation_lease_guard(service=service, lease=reserved)
             recorder = BufferingRecorder()
             planner_recorder = BufferingRecorder()
             try:
+                progress_registry = _get_composer_progress_registry(request)
                 async with compose_lock:
-                    fence = await service.renew_guided_operation(reserved.fence, actor="composer_route", lease_seconds=300)
+                    fence = await service.renew_guided_operation(
+                        reserved.fence,
+                        actor="composer_route",
+                        lease_seconds=300,
+                        session_operation_context=reserved.session_operation_context,
+                    )
                     state_record = await service.get_current_state(session_id)
                     state = (
                         _state_from_record(state_record) if state_record is not None else _initial_composition_state_with_guided_session()
@@ -3441,6 +3545,7 @@ async def post_guided_respond(
                         current_state_record: CompositionStateRecord | None,
                         current_meta: Mapping[str, Any],
                         current_fence: GuidedOperationFence,
+                        session_operation_context: SessionOperationContext,
                         tool_recorder: BufferingRecorder,
                         llm_recorder: BufferingRecorder,
                         current_turn: Turn,
@@ -3563,6 +3668,7 @@ async def post_guided_respond(
                                 ),
                             ),
                             payload_store=payload_store,
+                            session_operation_context=session_operation_context,
                         )
                         return _response_from_record(nonproposal_settlement.result_state)
 
@@ -3638,7 +3744,8 @@ async def post_guided_respond(
                                         next_turn=None,
                                         assistant_turn_seq=None,
                                     ),
-                                )
+                                ),
+                                session_operation_context=reserved.session_operation_context,
                             )
                             return _response_from_record(rejected.result_state)
 
@@ -3717,6 +3824,7 @@ async def post_guided_respond(
                                     reviewed_facts=reviewed_facts,
                                     prepared_response=prepared_response,
                                     origin="proposal_review",
+                                    session_operation_context=reserved.session_operation_context,
                                     correction_feedback=body.correction_feedback,
                                 )
 
@@ -3835,7 +3943,7 @@ async def post_guided_respond(
                             # time with no phase text). Mirrors guided_plan.py's
                             # progress wiring.
                             planner_progress = _composer_progress_sink(
-                                _get_composer_progress_registry(request),
+                                progress_registry,
                                 session_id=str(session_id),
                                 request_id=body.operation_id,
                                 user_id=user.user_id,
@@ -3855,6 +3963,7 @@ async def post_guided_respond(
                                 supersedes_draft_hash=authority.proposal.draft_hash,
                                 recorder=planner_recorder,
                                 operation_fence=fence,
+                                session_operation_context=reserved.session_operation_context,
                                 progress=planner_progress,
                                 correction_target=correction_target,
                                 revision_authority=revision_authority,
@@ -3868,6 +3977,7 @@ async def post_guided_respond(
                                     current_state_record=state_record,
                                     current_meta=existing_meta,
                                     current_fence=fence,
+                                    session_operation_context=reserved.session_operation_context,
                                     tool_recorder=recorder,
                                     llm_recorder=planner_recorder,
                                     current_turn=current_turn,
@@ -4051,6 +4161,7 @@ async def post_guided_respond(
                                         ),
                                     ),
                                     payload_store=payload_store,
+                                    session_operation_context=reserved.session_operation_context,
                                 )
                             )
                             return _response_from_record(stage_settlement.result_state)
@@ -4180,6 +4291,7 @@ async def post_guided_respond(
                                 audit_evidence=GuidedAuditEvidence(invocations=recorder.invocations),
                             ),
                             payload_store=payload_store,
+                            session_operation_context=reserved.session_operation_context,
                         )
                         return _response_from_record(settlement.result_state)
                     elif not is_active_exit and guided.step is GuidedStep.STEP_4_WIRE:
@@ -4242,6 +4354,7 @@ async def post_guided_respond(
                                     reviewed_facts=reviewed_facts,
                                     prepared_response=prepared_response,
                                     origin="wire_review",
+                                    session_operation_context=reserved.session_operation_context,
                                     correction_feedback=body.correction_feedback,
                                 )
                             answered = _replace(
@@ -4286,7 +4399,7 @@ async def post_guided_respond(
                             # time with no phase text). Mirrors guided_plan.py's
                             # progress wiring.
                             planner_progress = _composer_progress_sink(
-                                _get_composer_progress_registry(request),
+                                progress_registry,
                                 session_id=str(session_id),
                                 request_id=body.operation_id,
                                 user_id=user.user_id,
@@ -4311,6 +4424,7 @@ async def post_guided_respond(
                                 supersedes_draft_hash=authority.proposal.draft_hash,
                                 recorder=planner_recorder,
                                 operation_fence=fence,
+                                session_operation_context=reserved.session_operation_context,
                                 progress=planner_progress,
                                 correction_target=correction_target,
                             )
@@ -4323,6 +4437,7 @@ async def post_guided_respond(
                                     current_state_record=state_record,
                                     current_meta=existing_meta,
                                     current_fence=fence,
+                                    session_operation_context=reserved.session_operation_context,
                                     tool_recorder=recorder,
                                     llm_recorder=planner_recorder,
                                     current_turn=current_turn,
@@ -4484,6 +4599,7 @@ async def post_guided_respond(
                                         ),
                                     ),
                                     payload_store=payload_store,
+                                    session_operation_context=reserved.session_operation_context,
                                 )
                             )
                             return _response_from_record(stage_settlement.result_state)
@@ -4509,7 +4625,8 @@ async def post_guided_respond(
                                     proposal_id=authority.row.id,
                                     draft_hash=authority.proposal.draft_hash,
                                     reviewed_facts=reviewed_facts,
-                                )
+                                ),
+                                session_operation_context=reserved.session_operation_context,
                             ),
                             state=cancellation_state,
                         )
@@ -4575,7 +4692,8 @@ async def post_guided_respond(
                                             draft_hash=authority.proposal.draft_hash,
                                             reviewed_facts=reviewed_facts,
                                             invocation=prepared.invocation,
-                                        )
+                                        ),
+                                        session_operation_context=reserved.session_operation_context,
                                     ),
                                     state=cancellation_state,
                                 )
@@ -4687,6 +4805,7 @@ async def post_guided_respond(
                                     audit_evidence=GuidedAuditEvidence(invocations=recorder.invocations),
                                 ),
                                 payload_store=payload_store,
+                                session_operation_context=reserved.session_operation_context,
                             ),
                             state=cancellation_state,
                         )
@@ -4719,6 +4838,7 @@ async def post_guided_respond(
                                 model_version=authority.row.composer_model_version or "guided-planner",
                                 provider=authority.row.composer_provider or "unknown",
                                 composer_skill_hash=authority.row.composer_skill_hash or "",
+                                session_operation_context=reserved.session_operation_context,
                             ),
                             state=cancellation_state,
                         )
@@ -4739,6 +4859,30 @@ async def post_guided_respond(
                         if body.turn_token != guided_turn_token(prospective):
                             raise AuditIntegrityError("Guided RESPOND turn custody changed after reservation")
                         prior_step = prospective.step
+                        if guided.step is GuidedStep.STEP_1_SOURCE:
+                            if current_turn["type"] == TurnType.SINGLE_SELECT.value:
+                                selected_source_plugin = body.chosen[0] if body.chosen is not None and len(body.chosen) == 1 else None
+                                if source_plugin_accepts_blob_inspection(selected_source_plugin):
+                                    try:
+                                        attempt_inspection_facts = await inspect_selected_ready_session_blob(
+                                            request.app.state.blob_service,
+                                            session_id,
+                                            selected_blob_id=body.source_blob_id,
+                                        )
+                                    except (SourceInspectionBlobLifecycleError, ValueError) as exc:
+                                        raise GuidedOperationSettlementConflictError() from exc
+                                    if attempt_inspection_facts is None and selected_source_plugin is not None:
+                                        attempt_fallback_blob_inspection = await _step_1_unambiguous_compatible_blob_inspection(
+                                            request.app.state.blob_service,
+                                            session_id,
+                                            plugin=selected_source_plugin,
+                                        )
+                            elif current_turn["type"] == TurnType.SCHEMA_FORM.value:
+                                attempt_inspection_facts = await _schema8_active_source_edit_inspection(
+                                    request.app.state.blob_service,
+                                    session_id,
+                                    guided,
+                                )
                         try:
                             new_state, planned_response, next_turn, prepared_next = _schema8_answer_and_project_next(
                                 state,
@@ -4887,7 +5031,7 @@ async def post_guided_respond(
                             # time with no phase text). Mirrors guided_plan.py's
                             # progress wiring.
                             planner_progress = _composer_progress_sink(
-                                _get_composer_progress_registry(request),
+                                progress_registry,
                                 session_id=str(session_id),
                                 request_id=body.operation_id,
                                 user_id=user.user_id,
@@ -4907,6 +5051,7 @@ async def post_guided_respond(
                                 supersedes_draft_hash=None,
                                 recorder=planner_recorder,
                                 operation_fence=fence,
+                                session_operation_context=reserved.session_operation_context,
                                 progress=planner_progress,
                             )
                             if isinstance(outcome, GuidedPlannerDecline):
@@ -4931,6 +5076,7 @@ async def post_guided_respond(
                                     current_state_record=state_record,
                                     current_meta=existing_meta,
                                     current_fence=fence,
+                                    session_operation_context=reserved.session_operation_context,
                                     tool_recorder=recorder,
                                     llm_recorder=planner_recorder,
                                     current_turn=current_turn,
@@ -5037,6 +5183,7 @@ async def post_guided_respond(
                                         ),
                                     ),
                                     payload_store=payload_store,
+                                    session_operation_context=reserved.session_operation_context,
                                 )
                             )
                             return _response_from_record(stage_settlement.result_state)
@@ -5106,6 +5253,7 @@ async def post_guided_respond(
                     settlement = await service.settle_guided_state_operation(
                         settlement_command,
                         payload_store=payload_store,
+                        session_operation_context=reserved.session_operation_context,
                     )
                     return _response_from_record(settlement.result_state)
             except GuidedOperationFenceLostError:
@@ -5146,6 +5294,7 @@ async def post_guided_respond(
                                         chat_turns=planner_recorder.chat_turns,
                                     ),
                                 ),
+                                session_operation_context=reserved.session_operation_context,
                             )
                         )
                     except GuidedOperationFenceLostError as fence_lost:
@@ -5185,6 +5334,7 @@ async def post_guided_respond(
                                     chat_turns=planner_recorder.chat_turns,
                                 ),
                             ),
+                            session_operation_context=reserved.session_operation_context,
                         )
                     )
                 except GuidedOperationFenceLostError as fence_lost:
@@ -5207,7 +5357,7 @@ async def post_guided_respond(
                     "stale_conflict"
                     if isinstance(exc, GuidedOperationSettlementConflictError)
                     else "integrity_error"
-                    if isinstance(exc, (AuditIntegrityError, InvariantError))
+                    if isinstance(exc, (AuditIntegrityError, *SOURCE_INSPECTION_INTEGRITY_ERRORS, InvariantError))
                     else _guided_full_failure_code(exc)
                     if isinstance(exc, PipelinePlannerError)
                     else "operation_failed"
@@ -5238,7 +5388,8 @@ async def post_guided_respond(
                                 chat_turns=planner_recorder.chat_turns,
                             ),
                             unproducible_output_fields=(exc.unproducible_output_fields if isinstance(exc, PipelinePlannerError) else ()),
-                        )
+                        ),
+                        session_operation_context=reserved.session_operation_context,
                     )
                 except GuidedOperationFenceLostError:
                     rejoin_after_lock = True
@@ -5254,13 +5405,12 @@ async def post_guided_respond(
                         )
                     raise AuditIntegrityError("Guided RESPOND could not record its terminal failure") from None
                 else:
-                    # R2-F4: when the planner exhausted its budget on a request
-                    # that carried a known unproducible-output-field gap, name
-                    # the gap instead of handing back a bare retry instruction.
-                    # Read off the escaping planner error rather than
-                    # recomputed from the guided session, which may not be
-                    # bound yet at this generic handler.
+                    # R2-F4: the exact lease persisted the planner's known
+                    # output gap in the closed failure envelope before this
+                    # response is raised, so replay returns the same detail.
                     raise_guided_operation_failure(failed)
+            finally:
+                await lease_guard.finish_active_exception()
 
         if rejoin_after_lock:
             joined = await reserve_or_replay_guided_operation(
@@ -5271,9 +5421,13 @@ async def post_guided_respond(
                 replay=_replay,
                 after_verified=_repair_replayed_surfacing_debt,
                 reserve_if_absent=False,
+                takeover_expired=False,
             )
             if joined is None:
                 raise AuditIntegrityError("Guided RESPOND fence was lost without a joinable winner")
+            if isinstance(joined, GuidedOperationExpired):
+                pending = joined
+                continue
             if isinstance(joined, GuidedOperationLease):
                 pending = joined
                 continue
@@ -5295,7 +5449,6 @@ async def post_guided_chat(
     body: GuidedChatRequest,
     request: Request,
     user: UserIdentity = Depends(get_current_user),  # noqa: B008
-    _inflight_tally: None = Depends(_track_compose_inflight),
 ) -> GuidedChatResponse:
     """Settle one current schema-8 Step-1/Step-2 chat operation atomically."""
 

@@ -37,6 +37,11 @@ from elspeth.web.shareable_reviews.models import (
     ShareableLinkResponse,
     SharedInspectResponse,
 )
+from elspeth.web.middleware.rate_limit import (
+    ComposerRateLimiter,
+    get_rate_limiter,
+    get_write_rate_limiter,
+)
 from elspeth.web.shareable_reviews.service import (
     CompositionNotRunnableError,
     ShareableReviewService,
@@ -174,10 +179,3 @@ def create_shareable_reviews_router() -> APIRouter:
         )
 
     return router
-
-
-from elspeth.web.middleware.rate_limit import (
-    ComposerRateLimiter,
-    get_rate_limiter,
-    get_write_rate_limiter,
-)

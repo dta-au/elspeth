@@ -80,6 +80,10 @@ from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon_router
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
+from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.coordination.repository import PostgresSessionOperationRepository, SessionOperationConflictError
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.deployment_contract import DEPLOYMENT_TARGET_AWS_ECS, resolve_deployment_state_mode
 from elspeth.web.execution.progress import ProgressBroadcaster
@@ -104,6 +108,7 @@ from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.middleware.request_id import RequestIdMiddleware
 from elspeth.web.operator_telemetry import bootstrap_operator_telemetry
 from elspeth.web.preferences.routes import create_preferences_router
+from elspeth.web.preferences.service import CorruptPreferencesError, PreferencesService
 from elspeth.web.readiness import (
     ReadinessCache,
     ReadinessProbeRunner,
@@ -115,6 +120,7 @@ from elspeth.web.schema_probe import postgres_engine_kwargs
 from elspeth.web.secrets.routes import create_secrets_router
 from elspeth.web.secrets.server_store import ServerSecretStore
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
+from elspeth.web.secrets.user_store import RepositoryUserSecretAuthority, UserSecretStore
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import (
@@ -128,6 +134,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
+from elspeth.web.sessions.skill_markdown_history import RepositorySkillMarkdownHistoryAuthority
 from elspeth.web.sessions.telemetry import _SessionsTelemetry, build_sessions_telemetry
 from elspeth.web.shareable_reviews.routes import create_shareable_reviews_router
 from elspeth.web.shareable_reviews.service import ShareableReviewService
@@ -138,24 +145,18 @@ if TYPE_CHECKING:
     from elspeth.web.execution.schemas import ValidationResult
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
-
+# Assigned by create_app only after the idempotent process MeterProvider
+# bootstrap. Keeping these names module-level preserves the existing lifespan
+# test seams without creating instruments as an import side effect.
 _COMPOSER_BOOT_CONFIG_COUNTER: Counter
-
-
 _COMPOSER_BOOT_CONFIG_PROBE_LATENCY: Histogram
-
-
 _COMPOSER_BOOT_PROBE_TIMEOUT_SECONDS = 5.0
-
-
 _FORBIDDEN_METRICS_LABEL_PATTERN = re.compile(rb"(?:\{|,)\s*(run_id|session_id|user_id)\s*=")
-
-
 _METRICS_NO_STORE_HEADERS = {"Cache-Control": "no-store"}
-
-
+# Reserve bounded headroom inside the public five-second readiness contract
+# for timeout finalization, redacted logging, JSON serialization, and ASGI
+# response dispatch. The shared cache task remains shielded from this waiter.
 _READINESS_ROUTE_COMPUTE_TIMEOUT_SECONDS = 4.5
-
 
 _RETRYABLE_STORAGE_ERRNOS: frozenset[int] = frozenset(
     {
@@ -388,6 +389,12 @@ async def _periodic_orphan_cleanup(
 
 
 _OPENROUTER_PROVIDER_ID = "openrouter"
+"""Provider discriminator for OpenRouter in ``WebSettings.llm_profiles``.
+
+This matches the ``provider`` field of a configured LLM profile (the
+discriminated-variant key ``WebLLMProfileSettings`` validates against),
+not the model-catalog id — the two happen to share a spelling.
+"""
 
 
 def _configured_llm_providers(settings: WebSettings) -> tuple[str, ...]:
@@ -1948,12 +1955,3 @@ def _create_app(
         app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="spa")
 
     return app
-
-
-from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
-from elspeth.web.coordination.contracts import SessionOperationFenceLost
-from elspeth.web.coordination.repository import PostgresSessionOperationRepository, SessionOperationConflictError
-from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
-from elspeth.web.preferences.service import CorruptPreferencesError, PreferencesService
-from elspeth.web.secrets.user_store import RepositoryUserSecretAuthority, UserSecretStore
-from elspeth.web.sessions.skill_markdown_history import RepositorySkillMarkdownHistoryAuthority

@@ -26,6 +26,7 @@ from elspeth.web.composer.protocol import ComposerServiceError
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.guided_replay import project_composition_proposal, project_guided_full_decline
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
@@ -59,7 +60,6 @@ from .._helpers import (
     _request_plugin_policy_context,
     _safe_frame_strings,
     _state_from_record,
-    _track_compose_inflight,
     _verify_session_ownership,
     get_current_user,
     get_rate_limiter,
@@ -255,7 +255,6 @@ async def post_guided_plan(
     request: Request,
     user: UserIdentity = Depends(get_current_user),  # noqa: B008
     rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
-    _inflight_tally: None = Depends(_track_compose_inflight),
 ) -> CompositionProposalResponse | GuidedPlanDeclinedResponse:
     """Plan and atomically stage one full guided proposal.
 
@@ -352,6 +351,7 @@ async def post_guided_plan(
         request_id=body.operation_id,
         user_id=user.user_id,
     )
+    joined_after_fence_loss = False
     try:
         catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
         compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
@@ -379,6 +379,7 @@ async def post_guided_plan(
                 reserved.fence,
                 actor="composer_route",
                 lease_seconds=300,
+                session_operation_context=reserved.session_operation_context,
             )
 
         state_dict = observed_state.to_dict()
@@ -411,6 +412,7 @@ async def post_guided_plan(
                 plugin_snapshot=plugin_snapshot,
                 recorder=recorder,
                 operation_fence=fence,
+                session_operation_context=reserved.session_operation_context,
                 progress=progress,
             )
 
@@ -428,6 +430,7 @@ async def post_guided_plan(
                     fence,
                     actor="composer_route",
                     lease_seconds=300,
+                    session_operation_context=reserved.session_operation_context,
                 )
                 decline_settlement = await _await_guided_atomic_settlement(
                     service.decline_guided_full_pipeline_proposal(
@@ -447,7 +450,8 @@ async def post_guided_plan(
                                 planner_attempts=recorder.planner_attempts,
                                 chat_turns=recorder.chat_turns,
                             ),
-                        )
+                        ),
+                        session_operation_context=reserved.session_operation_context,
                     )
                 )
             decline_response = project_guided_full_decline(decline_settlement.decline_message)
@@ -470,6 +474,7 @@ async def post_guided_plan(
                 fence,
                 actor="composer_route",
                 lease_seconds=300,
+                session_operation_context=reserved.session_operation_context,
             )
             settlement = await _await_guided_atomic_settlement(
                 service.stage_guided_full_pipeline_proposal(
@@ -497,7 +502,8 @@ async def post_guided_plan(
                         # Quota ceiling for the deferred inline-custody settle
                         # inside the staging transaction (elspeth-1e3ad83d89).
                         custody_max_storage_per_session=(request.app.state.settings.max_blob_storage_per_session_bytes),
-                    )
+                    ),
+                    session_operation_context=reserved.session_operation_context,
                 )
             )
         proposal_response = project_composition_proposal(settlement.proposal)
@@ -612,7 +618,8 @@ async def post_guided_plan(
                             planner_attempts=recorder.planner_attempts,
                             chat_turns=recorder.chat_turns,
                         ),
-                    )
+                    ),
+                    session_operation_context=reserved.session_operation_context,
                 )
             )
         except GuidedOperationFenceLostError as fence_lost:
@@ -688,7 +695,8 @@ async def post_guided_plan(
                         planner_attempts=recorder.planner_attempts,
                         chat_turns=recorder.chat_turns,
                     ),
-                )
+                ),
+                session_operation_context=reserved.session_operation_context,
             )
         except GuidedOperationFenceLostError as fence_lost:
             try:
@@ -736,6 +744,12 @@ async def post_guided_plan(
             raise_guided_operation_failure(GuidedOperationFailed(failure_code=failure_code))
         await progress(_guided_full_failed_progress_event(failure_code))
         raise_guided_operation_failure(failed)
+    finally:
+        try:
+            await reserved.close()
+        except SessionOperationFenceLost:
+            if not joined_after_fence_loss:
+                raise
 
 
 __all__ = ["router"]

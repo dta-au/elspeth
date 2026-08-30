@@ -1442,7 +1442,8 @@ def _execute_update_blob(
                         conn,
                         session_id=session_id,
                         blob_id=blob_id,
-                        exclude_proposal_id=context.executing_proposal_id,
+                        accepting_proposal_id=context.executing_proposal_id,
+                        accepting_tool_name="update_blob" if context.executing_proposal_id is not None else None,
                     )
                     if retaining_proposal_id is not None:
                         raise _BlobUpdateBlockedByRetentionGuard(

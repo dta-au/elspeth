@@ -56,6 +56,7 @@ from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.templates import extract_jinja2_fields
 from elspeth.plugins.transforms.llm.model_catalog import OPENROUTER_LITELLM_PREFIX
@@ -1681,6 +1682,7 @@ async def _auto_surface_prompt_template_reviews_for_state(
     model_version: str,
     provider: str,
     composer_skill_hash: str,
+    session_operation_context: SessionOperationContext,
     already_surfaced: frozenset[tuple[str, str, InterpretationKind]] = frozenset(),
     repair_mode: bool = False,
 ) -> None:
@@ -1730,6 +1732,7 @@ async def _auto_surface_prompt_template_reviews_for_state(
                 user_term=site.user_term,
                 kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
                 llm_draft=prompt_template,
+                session_operation_context=session_operation_context,
                 model_identifier=model_identifier,  # (D2)
                 model_version=model_version,  # (D2)
                 provider=provider,  # (D2)
@@ -1849,6 +1852,7 @@ async def surface_pending_interpretation_reviews_for_state(
     model_version: str,
     provider: str,
     composer_skill_hash: str,
+    session_operation_context: SessionOperationContext,
     only_missing_evidence: bool = False,
 ) -> None:
     """Kind-general pending-review surfacer over one persisted state (B1).
@@ -1895,6 +1899,7 @@ async def surface_pending_interpretation_reviews_for_state(
         composer_skill_hash=composer_skill_hash,
         already_surfaced=already_surfaced,
         repair_mode=only_missing_evidence,
+        session_operation_context=session_operation_context,
     )
     for site in interpretation_sites(state):
         if site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
@@ -1928,6 +1933,7 @@ async def surface_pending_interpretation_reviews_for_state(
                 user_term=user_term,
                 kind=site.kind,
                 llm_draft=llm_draft,
+                session_operation_context=session_operation_context,
                 model_identifier=model_identifier,
                 model_version=model_version,
                 provider=provider,
@@ -2410,6 +2416,7 @@ class ComposerServiceImpl:
         *,
         session_id: str | None,
         current_state_id: str | None,
+        session_operation_context: SessionOperationContext | None,
     ) -> None:
         """Surface a pending ``llm_prompt_template`` review EVENT, backend-derived.
 
@@ -2434,6 +2441,8 @@ class ComposerServiceImpl:
         # object to resolve a provider-reported model from, so we cannot use
         # the LLM-surfaced path's safe_response_model(response). This deliberate
         # divergence is the most audit-honest value available at this surface.
+        if session_operation_context is None:
+            raise RuntimeError("pending interpretation surfacing requires the compose operation context")
         await _auto_surface_prompt_template_reviews_for_state(
             state,
             sessions_service=self._require_sessions_service(),
@@ -2443,6 +2452,7 @@ class ComposerServiceImpl:
             model_version=self._model,  # (D2)
             provider=self._availability.provider or "unknown",  # (D2)
             composer_skill_hash=self._composer_skill_hash,  # (D2)
+            session_operation_context=session_operation_context,
         )
 
     @staticmethod
@@ -2490,6 +2500,7 @@ class ComposerServiceImpl:
         session_id: str | None,
         current_state_id: str | None,
         only_missing_evidence: bool = False,
+        session_operation_context: SessionOperationContext,
     ) -> None:
         """Kind-general backend surfacer for the GUIDED commit path (B1).
 
@@ -2538,6 +2549,7 @@ class ComposerServiceImpl:
             provider=self._availability.provider or "unknown",
             composer_skill_hash=self._composer_skill_hash,
             only_missing_evidence=only_missing_evidence,
+            session_operation_context=session_operation_context,
         )
 
     @staticmethod
@@ -3298,6 +3310,7 @@ class ComposerServiceImpl:
         progress: ComposerProgressSink | None = None,
         guided_terminal: TerminalState | None = None,
         user_message_id: str | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop with dual-counter budget.
 
@@ -3324,6 +3337,13 @@ class ComposerServiceImpl:
         """
         if not self._availability.available:
             raise ComposerServiceError(self._availability.reason or "Composer is unavailable.")
+        if session_operation_context is not None:
+            if type(session_operation_context) is not SessionOperationContext:
+                raise TypeError("session_operation_context must be an exact SessionOperationContext")
+            if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+                raise ValueError("composer custody requires COMPOSE session authority")
+            if session_id is None or session_operation_context.fence.session_id != session_id:
+                raise AuditIntegrityError("Composer session authority targets a different session")
 
         deadline = asyncio.get_event_loop().time() + self._timeout_seconds
         from litellm.exceptions import APIError as LiteLLMAPIError
@@ -3380,6 +3400,7 @@ class ComposerServiceImpl:
             ):
                 return await self._plan_and_stage_empty_pipeline(
                     message=message,
+                    session_operation_context=session_operation_context,
                     messages=messages,
                     state=state,
                     session_id=session_id,
@@ -3405,6 +3426,7 @@ class ComposerServiceImpl:
                 recorder=recorder,
                 plugin_snapshot=plugin_snapshot,
                 policy_catalog=policy_catalog,
+                session_operation_context=session_operation_context,
             )
         except ComposerConvergenceError as exc:
             await emit_progress(
@@ -4155,6 +4177,7 @@ class ComposerServiceImpl:
         current_state_id: UUID | None,
         user_message_id: UUID,
         user_id: str | None,
+        session_operation_context: SessionOperationContext,
         preferences: ComposerSessionPreferencesRecord,
         recorder: BufferingRecorder,
         planner_llm_calls: tuple[ComposerLLMCall, ...],
@@ -4259,6 +4282,7 @@ class ComposerServiceImpl:
                 composer_model_version=plan.model_version,
                 composer_provider=plan.provider,
                 user_message_id=user_message_id,
+                session_operation_context=session_operation_context,
             )
         )
         if deferred is not None:
@@ -4272,6 +4296,7 @@ class ComposerServiceImpl:
                         reason="request_cancelled",
                         dispatch=None,
                         actor="system:auto_reject_request_cancelled",
+                        session_operation_context=session_operation_context,
                     ),
                     deferred=deferred,
                 )
@@ -4329,6 +4354,7 @@ class ComposerServiceImpl:
         session_id: str,
         current_state_id: str | None,
         user_id: str | None,
+        session_operation_context: SessionOperationContext | None,
         progress: ComposerProgressSink | None,
         user_message_id: str,
         recorder: BufferingRecorder,
@@ -4485,10 +4511,13 @@ class ComposerServiceImpl:
                     raise
                 raise deferred from exc
             raise
+        if session_operation_context is None:
+            raise AuditIntegrityError("Pipeline planning requires exact session operation authority")
         return await self._stage_pipeline_plan(
             plan=plan,
             state=state,
             session_id=session_uuid,
+            session_operation_context=session_operation_context,
             current_state_id=state_uuid,
             user_message_id=message_uuid,
             user_id=user_id,
@@ -4601,6 +4630,7 @@ class ComposerServiceImpl:
         assistant_tool_calls: tuple[_AdmittedToolCall, ...],
         plugin_crash: ComposerPluginCrashError | None,
         session_id: str | None,
+        session_operation_context: SessionOperationContext | None,
         current_state_id: str | None,
         persisted_tool_call_turn: bool,
         persisted_assistant_message_id: str | None,
@@ -4626,6 +4656,7 @@ class ComposerServiceImpl:
             assistant_tool_calls=assistant_tool_calls,
             plugin_crash=plugin_crash,
             session_id=session_id,
+            session_operation_context=session_operation_context,
             current_state_id=current_state_id,
             persisted_tool_call_turn=persisted_tool_call_turn,
             persisted_assistant_message_id=persisted_assistant_message_id,
@@ -4644,6 +4675,7 @@ class ComposerServiceImpl:
         discovery_cache: dict[str, _CachedDiscoveryPayload],
         runtime_preflight_cache: _RuntimePreflightCache,
         session_id: str | None,
+        session_operation_context: SessionOperationContext | None,
         user_id: str | None,
         user_message_id: str | None,
         user_message_content: str | None,
@@ -4679,6 +4711,7 @@ class ComposerServiceImpl:
             discovery_cache=discovery_cache,
             runtime_preflight_cache=runtime_preflight_cache,
             session_id=session_id,
+            session_operation_context=session_operation_context,
             user_id=user_id,
             user_message_id=user_message_id,
             user_message_content=user_message_content,
@@ -4730,6 +4763,7 @@ class ComposerServiceImpl:
         composition_turns_used: int,
         discovery_turns_used: int,
         advisor_checkpoint_passes_used: int,
+        session_operation_context: SessionOperationContext | None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
     ) -> _ClassifyOutcome:
@@ -4826,10 +4860,13 @@ class ComposerServiceImpl:
             # template, ...) the downstream orphan gate assumes exist, it is
             # idempotent, and events match sites by (node, term, kind) — so a
             # repair turn after it composes fine.
+            if session_operation_context is None:
+                raise RuntimeError("pending interpretation surfacing requires the compose operation context")
             await self.surface_pending_interpretation_reviews(
                 state,
                 session_id=session_id,
                 current_state_id=persist.current_state_id,
+                session_operation_context=session_operation_context,
             )
             runtime_result: ValidationResult | None = last_runtime_preflight
             if state.version > initial_version:
@@ -4888,6 +4925,7 @@ class ComposerServiceImpl:
 
             if runtime_result is None or runtime_result.is_valid or _is_pending_interpretation_handoff(runtime_result):
                 result = await self._surface_and_finalize_no_tools(
+                    session_operation_context=session_operation_context,
                     assistant_message=_AdmittedAssistantMessage(content=dispatch.raw_assistant_content or ""),
                     state=state,
                     session_id=session_id,
@@ -4991,6 +5029,7 @@ class ComposerServiceImpl:
                     try:
                         advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
                             state=state,
+                            session_operation_context=session_operation_context,
                             session_id=session_id,
                             current_state_id=persist.current_state_id,
                             assistant_message=assistant_message,
@@ -5052,6 +5091,7 @@ class ComposerServiceImpl:
                     # holds. Thread the already-consumed repair budget through
                     # this alternate terminal return just as P2 does.
                     result = await self._surface_and_finalize_no_tools(
+                        session_operation_context=session_operation_context,
                         assistant_message=assistant_message,
                         state=state,
                         session_id=session_id,
@@ -5129,6 +5169,7 @@ class ComposerServiceImpl:
         persisted_assistant_message_id: str | None,
         persisted_tool_call_turn: bool,
         advisor_checkpoint_passes_used: int,
+        session_operation_context: SessionOperationContext | None = None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
         deadline: float | None = None,
@@ -5273,6 +5314,7 @@ class ComposerServiceImpl:
         try:
             advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
                 state=state,
+                session_operation_context=session_operation_context,
                 session_id=session_id,
                 current_state_id=current_state_id,
                 assistant_message=assistant_message,
@@ -5361,6 +5403,7 @@ class ComposerServiceImpl:
         # ``repair_turns_used`` (only it tracks repair turns) plus the persisted
         # ids onto the returned result.
         result = await self._surface_and_finalize_no_tools(
+            session_operation_context=session_operation_context,
             assistant_message=assistant_message,
             state=state,
             session_id=session_id,
@@ -5397,6 +5440,7 @@ class ComposerServiceImpl:
         state: CompositionState,
         session_id: str | None,
         current_state_id: str | None,
+        session_operation_context: SessionOperationContext | None,
         assistant_message: _AdmittedAssistantMessage,
         recorder: BufferingRecorder,
         progress: ComposerProgressSink | None,
@@ -5442,6 +5486,7 @@ class ComposerServiceImpl:
             state,
             session_id=session_id,
             current_state_id=current_state_id,
+            session_operation_context=session_operation_context,
         )
         orphaned_sites = await self._missing_pending_interpretation_review_sites(
             state,
@@ -5510,6 +5555,7 @@ class ComposerServiceImpl:
         message: str,
         mutation_success_seen: bool,
         repair_turns_used: int,
+        session_operation_context: SessionOperationContext | None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
     ) -> ComposerResult:
         """Auto-surface PT reviews, run the fail-closed orphan gate, finalize.
@@ -5529,6 +5575,7 @@ class ComposerServiceImpl:
 
         orphan_result = await self._surface_pt_and_gate_orphans_or_none(
             state=state,
+            session_operation_context=session_operation_context,
             session_id=session_id,
             current_state_id=current_state_id,
             assistant_message=assistant_message,
@@ -5644,6 +5691,7 @@ class ComposerServiceImpl:
         llm_messages: list[dict[str, Any]],
         recorder: BufferingRecorder,
         progress: ComposerProgressSink | None,
+        session_operation_context: SessionOperationContext | None,
         advisor_checkpoint_passes_used: int,
         repair_turns_used: int,
         persisted_assistant_message_id: str | None,
@@ -5762,6 +5810,7 @@ class ComposerServiceImpl:
         if terminal_block:
             orphan_result = await self._surface_pt_and_gate_orphans_or_none(
                 state=state,
+                session_operation_context=session_operation_context,
                 session_id=session_id,
                 current_state_id=current_state_id,
                 assistant_message=assistant_message,
@@ -5911,6 +5960,7 @@ class ComposerServiceImpl:
         *,
         plugin_snapshot: PluginAvailabilitySnapshot,
         policy_catalog: PolicyCatalogView,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ComposerResult:
         """Inner composition loop with dual-counter budget tracking.
 
@@ -6090,6 +6140,7 @@ class ComposerServiceImpl:
             if not call_model.completion.tool_batch.calls:
                 terminate = await self._try_terminate_no_tools(
                     assistant_message=call_model.completion.message,
+                    session_operation_context=session_operation_context,
                     message=message,
                     llm_messages=llm_messages,
                     state=state,
@@ -6166,6 +6217,7 @@ class ComposerServiceImpl:
             ) -> tuple[_DispatchOutcome, _PersistOutcome, int, bool, bool]:
                 dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
                     call_model=_call_model,
+                    session_operation_context=session_operation_context,
                     state=_state,
                     last_validation=_last_validation,
                     last_runtime_preflight=_last_runtime_preflight,
@@ -6225,6 +6277,7 @@ class ComposerServiceImpl:
                     assistant_tool_calls=dispatch_result.assistant_tool_calls,
                     plugin_crash=dispatch_result.plugin_crash,
                     session_id=session_id,
+                    session_operation_context=session_operation_context,
                     current_state_id=_current_state_id,
                     persisted_tool_call_turn=_persisted_tool_call_turn,
                     persisted_assistant_message_id=_persisted_assistant_message_id,
@@ -6388,6 +6441,7 @@ class ComposerServiceImpl:
 
             classify = await self._classify_and_budget_turn(
                 dispatch=dispatch,
+                session_operation_context=session_operation_context,
                 persist=persist,
                 llm_messages=llm_messages,
                 tools=tools,
@@ -6804,6 +6858,7 @@ class ComposerServiceImpl:
         audit: DispatchAudit,
         recorder: BufferingRecorder,
         session_id: str | None,
+        session_operation_context: SessionOperationContext | None,
         current_state_id: str | None,
         composer_model_version: str,
         llm_messages: list[dict[str, Any]],
@@ -6944,8 +6999,11 @@ class ComposerServiceImpl:
                 # the cap event. Exceptions here are NOT swallowed: a DB
                 # failure at this site is a Tier-1 audit anomaly.
                 sessions_service = self._require_sessions_service()
+                if type(session_operation_context) is not SessionOperationContext:
+                    raise AuditIntegrityError("Rate-cap interpretation persistence requires exact COMPOSE authority") from None
                 await sessions_service.record_auto_interpreted_no_surfaces_event(
                     session_id=UUID(session_id),
+                    session_operation_context=session_operation_context,
                     # ``audit.actor`` is the loop-local ``composer-web:user-…``
                     # actor string assembled at the top of ``_compose_loop``;
                     # it is the truthful caller identity for this dispatch

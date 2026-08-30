@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import replace as _replace_dataclass
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 
 from .._helpers import (
     _COMPOSER_REQUESTS_INFLIGHT,
@@ -101,7 +103,16 @@ async def recompose(
     _policy_catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
     profile_registry = request.app.state.operator_profile_registry
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
-    async with compose_lock:
+    async with (
+        compose_lock,
+        await SessionOperationLease.acquire(
+            service.session_operation_authority,
+            session_id=session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        ) as compose_operation_lease,
+    ):
         # Load current state
         state_record = await service.get_current_state(session.id)
         if state_record is None:
@@ -183,6 +194,7 @@ async def recompose(
                         progress=progress_sink,
                         guided_terminal=_guided_terminal_for_compose,
                         user_message_id=request_id,
+                        session_operation_context=compose_operation_lease.context,
                     )
             except ComposerConvergenceError as exc:
                 terminal_status = "timed_out" if exc.budget_exhausted == "timeout" else "failed"
@@ -205,6 +217,7 @@ async def recompose(
                     plugin_snapshot=plugin_snapshot,
                     profile_registry=profile_registry,
                     catalog=request.app.state.catalog_service,
+                    session_operation_context=compose_operation_lease.context,
                 )
                 raise HTTPException(status_code=422, detail=response_body) from exc
             except LiteLLMAuthError as exc:
@@ -311,6 +324,7 @@ async def recompose(
                     plugin_snapshot=plugin_snapshot,
                     profile_registry=profile_registry,
                     catalog=request.app.state.catalog_service,
+                    session_operation_context=compose_operation_lease.context,
                 )
                 await _publish_progress(
                     progress_sink,
@@ -358,6 +372,7 @@ async def recompose(
                     plugin_snapshot=plugin_snapshot,
                     profile_registry=profile_registry,
                     catalog=request.app.state.catalog_service,
+                    session_operation_context=compose_operation_lease.context,
                 )
                 raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
             except PipelinePlannerError as exc:
@@ -444,6 +459,7 @@ async def recompose(
             if result.pipeline_commit_intent is not None:
                 settlement_outcome = await settle_auto_commit_intent(
                     request=request,
+                    session_operation_context=compose_operation_lease.context,
                     user=user,
                     service=service,
                     session_id=session.id,
@@ -531,6 +547,7 @@ async def recompose(
                         plugin_snapshot=plugin_snapshot,
                         profile_registry=profile_registry,
                         catalog=request.app.state.catalog_service,
+                        session_operation_context=compose_operation_lease.context,
                     )
                     raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
                 await _publish_progress(
@@ -549,6 +566,7 @@ async def recompose(
                         state=state_data,
                         assistant_content=result.message,
                         raw_content=result.raw_assistant_content,
+                        session_operation_context=compose_operation_lease.context,
                     )
                     new_state_record = transition_settlement.state
                     assistant_msg = transition_settlement.message
@@ -559,6 +577,7 @@ async def recompose(
                         # Successful recompose state advance after the LLM
                         # composer returns a newer state version.
                         provenance="post_compose",
+                        session_operation_context=compose_operation_lease.context,
                     )
                 state_response = _state_response(new_state_record, live_validation=validation)
                 post_compose_state_id = new_state_record.id
@@ -588,6 +607,7 @@ async def recompose(
                     state=_transition_state_data,
                     assistant_content=result.message,
                     raw_content=result.raw_assistant_content,
+                    session_operation_context=compose_operation_lease.context,
                 )
                 _transition_record = transition_settlement.state
                 assistant_msg = transition_settlement.message

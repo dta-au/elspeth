@@ -1501,7 +1501,6 @@ def _fork_blob_plan_content(
                 {
                     "source_blob_id": str(entry.source_blob_id),
                     "target_blob_id": str(entry.target_blob_id),
-                    "source_storage_path": entry.source_storage_path,
                     "content_hash": entry.content_hash,
                     "size_bytes": entry.size_bytes,
                 }
@@ -1545,7 +1544,6 @@ def _fork_blob_plan_from_content(
         if type(item) is not dict or set(item) != {
             "source_blob_id",
             "target_blob_id",
-            "source_storage_path",
             "content_hash",
             "size_bytes",
         }:
@@ -1570,7 +1568,6 @@ def _fork_blob_plan_from_content(
             entry = BlobForkPlanEntry(
                 source_blob_id=source_blob_id,
                 target_blob_id=target_blob_id,
-                source_storage_path=item["source_storage_path"],
                 content_hash=item["content_hash"],
                 size_bytes=item["size_bytes"],
             )
@@ -12082,7 +12079,6 @@ class SessionServiceImpl:
                         target_session_id=new_session_id,
                         source_blob_id=UUID(row.id),
                     ),
-                    source_storage_path=row.storage_path,
                     content_hash=row.content_hash,
                     size_bytes=row.size_bytes,
                 )
@@ -12610,6 +12606,8 @@ class SessionServiceImpl:
         *,
         writer_principal: ChatMessageWriterPrincipal,
         composition_state_id: UUID | None = None,
+        session_operation_context: SessionOperationContext | None = None,
+        session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
     ) -> None:
         """Persist one audit cohort in a single transaction (elspeth-90231248dc).
 
@@ -12640,6 +12638,12 @@ class SessionServiceImpl:
         An empty ``drafts`` sequence is a no-op (the compose loop drains
         conditionally; an empty cohort must not bump ``updated_at``).
         """
+        if type(session_operation_kind) is not SessionOperationKind:
+            raise TypeError("session_operation_kind must be an exact SessionOperationKind")
+        if session_operation_kind not in {SessionOperationKind.COMPOSE, SessionOperationKind.PROPOSAL}:
+            raise ValueError("add_messages_atomic fenced writes require COMPOSE or PROPOSAL authority")
+        if session_operation_context is None and session_operation_kind is not SessionOperationKind.COMPOSE:
+            raise ValueError("non-COMPOSE add_messages_atomic writes require exact operation authority")
         if not drafts:
             return
         now = self._now()
@@ -12647,37 +12651,57 @@ class SessionServiceImpl:
         csid = str(composition_state_id) if composition_state_id else None
         effective_state_ids = tuple(draft.composition_state_id if draft.composition_state_id is not None else csid for draft in drafts)
 
+        def _write(conn: Connection) -> None:
+            self._assert_session_write_lock_held(
+                conn,
+                sid,
+                caller="add_messages_atomic._write",
+            )
+            for state_id in dict.fromkeys(effective_state_ids):
+                if state_id is not None:
+                    _assert_state_in_session(
+                        conn,
+                        state_id=state_id,
+                        expected_session_id=sid,
+                        caller="add_messages_atomic",
+                    )
+            base_seq = self._reserve_sequence_range(conn, sid, count=len(drafts))
+            for offset, draft in enumerate(drafts):
+                self._insert_chat_message(
+                    conn,
+                    session_id=sid,
+                    role=draft.role,
+                    content=draft.content,
+                    raw_content=None,
+                    # Same deep_thaw rationale as add_message: the
+                    # envelopes may carry MappingProxyType / tuple
+                    # shapes from frozen-dataclass round-trips.
+                    tool_calls=deep_thaw(draft.tool_calls) if draft.tool_calls else None,
+                    sequence_no=base_seq + offset,
+                    writer_principal=writer_principal,
+                    composition_state_id=effective_state_ids[offset],
+                    tool_call_id=draft.tool_call_id,
+                    parent_assistant_id=draft.parent_assistant_id,
+                    created_at=now,
+                )
+            conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+
         def _sync() -> None:
             with self._session_process_locked_begin(sid) as conn:
-                for state_id in dict.fromkeys(effective_state_ids):
-                    if state_id is not None:
-                        _assert_state_in_session(
-                            conn,
-                            state_id=state_id,
-                            expected_session_id=sid,
-                            caller="add_messages_atomic",
-                        )
-                with self._session_write_lock(conn, sid):
-                    base_seq = self._reserve_sequence_range(conn, sid, count=len(drafts))
-                    for offset, draft in enumerate(drafts):
-                        self._insert_chat_message(
-                            conn,
-                            session_id=sid,
-                            role=draft.role,
-                            content=draft.content,
-                            raw_content=None,
-                            # Same deep_thaw rationale as add_message: the
-                            # envelopes may carry MappingProxyType / tuple
-                            # shapes from frozen-dataclass round-trips.
-                            tool_calls=deep_thaw(draft.tool_calls) if draft.tool_calls else None,
-                            sequence_no=base_seq + offset,
-                            writer_principal=writer_principal,
-                            composition_state_id=effective_state_ids[offset],
-                            tool_call_id=draft.tool_call_id,
-                            parent_assistant_id=draft.parent_assistant_id,
-                            created_at=now,
-                        )
-                conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+                if session_operation_context is None:
+                    with self._session_write_lock(conn, sid):
+                        _write(conn)
+                    return
+                with (
+                    self._session_write_lock(conn, sid),
+                    self._session_composer_mutation_transaction(
+                        conn,
+                        session_id=sid,
+                        session_operation_context=session_operation_context,
+                        expected_kind=session_operation_kind,
+                    ),
+                ):
+                    _write(conn)
 
         def _project(_result: None) -> None:
             for draft in drafts:

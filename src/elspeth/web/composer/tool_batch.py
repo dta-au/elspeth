@@ -24,6 +24,7 @@ from uuid import UUID
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobQuotaExceededError
@@ -487,6 +488,7 @@ class ToolBatchContext:
     discovery_cache: dict[str, _CachedDiscoveryPayload]
     runtime_preflight_cache: _RuntimePreflightCache
     session_id: str | None
+    session_operation_context: SessionOperationContext | None
     user_id: str | None
     user_message_id: str | None
     user_message_content: str | None
@@ -1353,8 +1355,11 @@ async def run_tool_batch(
                         covered_deferred_intent_ids=(),
                         supersedes_draft_hash=None,
                     )
+                    if type(ctx.session_operation_context) is not SessionOperationContext:
+                        raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
                     proposal = await turn_sessions_service.create_pipeline_composition_proposal(
                         session_id=turn_session_uuid,
+                        session_operation_context=ctx.session_operation_context,
                         plan=PipelinePlanResult(
                             proposal=pipeline_proposal,
                             tool_call_id=tool_call.id,
@@ -1374,8 +1379,11 @@ async def run_tool_batch(
                         composer_provider=ctx.service._availability.provider or "unknown",
                     )
                 else:
+                    if type(ctx.session_operation_context) is not SessionOperationContext:
+                        raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
                     proposal = await turn_sessions_service.create_composition_proposal(
                         session_id=turn_session_uuid,
+                        session_operation_context=ctx.session_operation_context,
                         tool_call_id=tool_call.id,
                         tool_name=proposal_tool_name,
                         summary=proposal_summary.summary,
@@ -1796,6 +1804,7 @@ async def run_tool_batch(
                     audit=audit,
                     recorder=recorder,
                     session_id=session_id,
+                    session_operation_context=ctx.session_operation_context,
                     current_state_id=current_state_id,
                     composer_model_version=provider_model_version,
                     llm_messages=llm_messages,

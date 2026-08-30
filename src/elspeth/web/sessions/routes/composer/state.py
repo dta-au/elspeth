@@ -25,6 +25,7 @@ from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS, allowed_source_directories, managed_blob_directory, resolve_data_path
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
+from elspeth.web.interpretation_state import BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX, parse_interpretation_requirements
 from elspeth.web.sessions.protocol import GuidedCompositionStateResult, GuidedOperationSettlementConflictError
 from elspeth.web.sessions.routes.guided_operations import (
     GuidedOperationExpired,
@@ -324,10 +325,7 @@ async def _state_with_imported_source_blobs(
 
     for source_name, blob_id in requested_blobs:
         try:
-            blob = await blob_service.get_blob(
-                blob_id,
-                session_operation_context=session_operation_context,
-            )
+            blob = await blob_service.get_blob(blob_id)
         except BlobNotFoundError:
             raise HTTPException(status_code=404, detail="Blob not found") from None
         if blob.session_id != session_id:
@@ -957,10 +955,7 @@ async def _verified_yaml_export_blob_ids(
     blob_service: BlobServiceProtocol = request.app.state.blob_service
     for source, blob_id in parsed_blob_ids:
         try:
-            blob = await blob_service.get_blob(
-                blob_id,
-                session_operation_context=session_operation_context,
-            )
+            blob = await blob_service.get_blob(blob_id)
         except BlobNotFoundError:
             raise AuditIntegrityError("YAML export blob custody verification failed") from None
         # ``BlobServiceProtocol`` is structural, so an implementation could
@@ -1067,6 +1062,3 @@ async def get_state_yaml(
         return {"yaml": yaml_str}
     finally:
         await lease.close()
-
-
-from elspeth.web.interpretation_state import BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX, parse_interpretation_requirements

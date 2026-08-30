@@ -4094,6 +4094,8 @@ class SessionServiceProtocol(Protocol):
         *,
         writer_principal: ChatMessageWriterPrincipal,
         composition_state_id: UUID | None = None,
+        session_operation_context: SessionOperationContext | None = None,
+        session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
     ) -> None:
         """Persist one audit cohort all-or-nothing (elspeth-90231248dc).
 

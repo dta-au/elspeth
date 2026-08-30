@@ -31,6 +31,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from starlette.types import Receive, Scope, Send
 
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
@@ -39,6 +40,8 @@ from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.protocol import ComposerService, ComposerServiceError
 from elspeth.web.composer.service import _BadRequestLLMError
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
 from elspeth.web.execution.completion_gates import parse_completion_gates
 from elspeth.web.execution.diagnostics import (
@@ -123,6 +126,30 @@ async def _get_session_service(request: Request) -> SessionServiceProtocol:
 
 def _get_websocket_ticket_store(app: Any) -> WebSocketTicketStore:
     return cast(WebSocketTicketStore, app.state.websocket_ticket_store)
+
+
+async def _close_execute_lease_before_transfer(lease: SessionOperationLease) -> None:
+    """Join exact lease cleanup even when request cancellation repeats."""
+    close_task = asyncio.create_task(
+        lease.close(),
+        name="execution-pretransfer-lease-close",
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not close_task.done():
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+            continue
+    try:
+        close_task.result()
+    except BaseException as close_error:
+        if cancellation is None:
+            raise
+        cancellation.add_note(f"Execution pre-transfer lease close also failed with {type(close_error).__name__}.")
+    if cancellation is not None:
+        raise cancellation from None
 
 
 @dataclass(frozen=True)
@@ -724,7 +751,7 @@ def _run_event_from_record(record: RunEventRecord) -> RunEvent:
             "run_id": str(record.run_id),
             "timestamp": record.timestamp,
             "event_type": record.event_type,
-            "data": record.data,
+            "data": deep_thaw(record.data),
         }
     ).with_event_sequence(record.sequence)
 
@@ -876,37 +903,44 @@ def create_execution_router() -> APIRouter:
         """
         await verify_session_ownership(session_id, user, request)
         composer: ComposerService = request.app.state.composer_service
-        if state_id is None:
-            current_record = await session_service.get_current_state(session_id)
-            if current_record is not None:
-                await composer.surface_pending_interpretation_reviews(
-                    state_from_record(current_record),
-                    session_id=str(session_id),
-                    current_state_id=str(current_record.id),
-                    only_missing_evidence=True,
-                )
-            result = await service.validate(session_id, user_id=user.user_id)
-            return result
-        try:
-            state_record = await session_service.get_state(state_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail="State not found") from exc
-        if state_record.session_id != session_id:
-            raise HTTPException(status_code=404, detail="State not found")
-        composition_state = state_from_record(state_record)
-        await composer.surface_pending_interpretation_reviews(
-            composition_state,
-            session_id=str(session_id),
-            current_state_id=str(state_record.id),
-            only_missing_evidence=True,
-        )
-        result = await service.validate_state(
-            composition_state,
-            user_id=user.user_id,
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
             session_id=session_id,
-            completion_gates=parse_completion_gates(state_record.composer_meta),
+            operation_kind=SessionOperationKind.BLOB_READ,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
         )
-        return result
+        try:
+            if state_id is None:
+                current_record = await session_service.get_current_state(session_id)
+                if current_record is not None:
+                    await composer.surface_pending_interpretation_reviews(
+                        state_from_record(current_record),
+                        session_id=str(session_id),
+                        current_state_id=str(current_record.id),
+                        only_missing_evidence=True,
+                        session_operation_context=lease.context,
+                    )
+                return await service.validate(
+                    session_id,
+                    session_operation_context=lease.context,
+                    user_id=user.user_id,
+                )
+            try:
+                state_record = await session_service.get_state(state_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail="State not found") from exc
+            if state_record.session_id != session_id:
+                raise HTTPException(status_code=404, detail="State not found")
+            return await service.validate_state(
+                state_from_record(state_record),
+                session_operation_context=lease.context,
+                user_id=user.user_id,
+                session_id=session_id,
+                completion_gates=parse_completion_gates(state_record.composer_meta),
+            )
+        finally:
+            await lease.close()
 
     @router.post(
         "/api/sessions/{session_id}/execute",
@@ -919,6 +953,7 @@ def create_execution_router() -> APIRouter:
         execute_request: ExecuteRequest | None = Body(default=None),  # noqa: B008
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
+        session_service: SessionServiceProtocol = Depends(_get_session_service),  # noqa: B008
     ) -> dict[str, str]:
         """Start a background pipeline run. Returns run_id immediately.
 
@@ -930,15 +965,25 @@ def create_execution_router() -> APIRouter:
         settings: WebSettings = request.app.state.settings
         fanout_ack_token = execute_request.fanout_ack_token if execute_request is not None else None
         secret_ack_token = execute_request.secret_ack_token if execute_request is not None else None
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+        transferred = False
         try:
             run_id = await service.execute(
                 session_id,
                 state_id,
+                session_operation_lease=lease,
                 user_id=user.user_id,
                 auth_provider_type=settings.auth_provider,
                 fanout_ack_token=fanout_ack_token,
                 secret_ack_token=secret_ack_token,
             )
+            transferred = True
         except StateAccessError:
             # IDOR contract: the "state does not exist" and
             # "state belongs to another session" branches in the
@@ -1152,6 +1197,9 @@ def create_execution_router() -> APIRouter:
             # (path allowlist, malformed blob_ref) raise
             # ExecuteRequestValidationError above and return 400.
             raise HTTPException(status_code=404, detail=str(exc)) from None
+        finally:
+            if not transferred:
+                await _close_execute_lease_before_transfer(lease)
         return {"run_id": str(run_id)}
 
     # ── Run-scoped endpoints (status, cancel, results) ────────────────
