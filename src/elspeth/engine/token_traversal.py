@@ -1190,8 +1190,12 @@ class TokenTraversalEngine:
                 if gate_outcome.next_node_id is not None:
                     node_id = gate_outcome.next_node_id
                     continue
-
-            elif not isinstance(plugin, GateSettings):
+            else:
+                # Complementary arm: ``node_to_plugin`` is closed by
+                # construction, so "not a GateSettings" IS the transform.
+                # No third arm exists to guard — a `not isinstance(...)`
+                # re-test here would still admit any future third kind
+                # into this branch, so it guarded nothing.
                 row_transform = plugin
                 # Check if this is a batch-aware transform at an aggregation node
                 transform_node_id = row_transform.node_id
@@ -1249,11 +1253,6 @@ class TokenTraversalEngine:
                     return transform_outcome.result, child_items
                 current_token = transform_outcome.updated_token
                 last_on_success_sink = transform_outcome.updated_sink
-            else:
-                # Genuinely unreachable: the two arms above are complementary.
-                # This can no longer mean "failed protocol conformance" — kept
-                # as a tripwire against a future edit reintroducing a third arm.
-                raise TypeError(f"Malformed plugin dispatch for node {node_id!r}: {type(plugin).__name__} matched neither dispatch arm.")
 
             node_id = next_node_id
 
