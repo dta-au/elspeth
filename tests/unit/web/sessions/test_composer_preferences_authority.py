@@ -12,8 +12,8 @@ from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import proposal_events_table, session_operation_fences_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @pytest.mark.asyncio
@@ -24,7 +24,7 @@ async def test_update_composer_preferences_accepts_live_compose_context() -> Non
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-preferences-authority"),
@@ -70,13 +70,13 @@ async def test_stale_compose_predecessor_changes_no_preferences_or_events() -> N
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    first = SessionServiceImpl(
+    first = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-preferences-predecessor"),
         owner_instance_id="composer-preferences-first",
     )
-    second = SessionServiceImpl(
+    second = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-preferences-successor"),

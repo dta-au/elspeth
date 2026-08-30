@@ -51,6 +51,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry, observed_value
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 def _ready_readiness() -> ValidationReadiness:
@@ -78,7 +79,7 @@ def _make_app_with_telemetry(tmp_path: Path) -> tuple[FastAPI, SessionServiceImp
     )
     initialize_session_schema(engine)
     telemetry = build_sessions_telemetry()
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=telemetry,
         log=structlog.get_logger("test.phase8.subtask7c"),

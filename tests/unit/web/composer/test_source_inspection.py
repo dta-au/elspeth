@@ -828,7 +828,6 @@ class TestExplicitSelectionResolvesDirectly:
                 cast(Any, service),
                 session_id,
                 selected_blob_id=record.id,
-                session_operation_context=source_inspection_context,
             )
         )
 
@@ -853,7 +852,6 @@ class TestExplicitSelectionResolvesDirectly:
                     cast(Any, service),
                     session_id,
                     selected_blob_id=record.id,
-                    session_operation_context=source_inspection_context,
                 )
             )
 
@@ -876,7 +874,6 @@ class TestExplicitSelectionResolvesDirectly:
                     cast(Any, service),
                     session_id,
                     selected_blob_id=record.id,
-                    session_operation_context=source_inspection_context,
                 )
             )
 
@@ -894,7 +891,6 @@ class TestExplicitSelectionResolvesDirectly:
                     cast(Any, service),
                     session_id,
                     selected_blob_id=uuid4(),
-                    session_operation_context=source_inspection_context,
                 )
             )
 

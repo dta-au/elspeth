@@ -78,6 +78,7 @@ from tests.integration.web.composer.guided.conftest import (  # noqa: F401
     _GuidedTestExecutionService,
     composer_test_client,
 )
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
 # Deterministic completion double (lifted from test_pipeline_planner.py)       #
@@ -817,7 +818,7 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
     """Build the shared real production stack with the two false-green bypasses."""
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.sqlite3'}")
     initialize_session_schema(engine)
-    sessions = SessionServiceImpl(
+    sessions = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.parity"),

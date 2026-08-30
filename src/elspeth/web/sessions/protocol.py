@@ -318,19 +318,6 @@ class RunStartPermitRecord:
 
 @final
 @dataclass(frozen=True, slots=True)
-class RunExecutionInputRecord:
-    """Secret-reference-only immutable execution envelope substrate."""
-
-    run_id: str
-    schema_version: int
-    envelope: Mapping[str, Any]
-    compatibility_key: CompatibilityKey
-    deployment_generation: str
-    automatic_recovery_eligible: bool
-
-
-@final
-@dataclass(frozen=True, slots=True)
 class GuidedOperationFence:
     """Unforgeable lease identity required by every durable operation write."""
 

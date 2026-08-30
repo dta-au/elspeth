@@ -35,10 +35,10 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.integration.web.conftest import _make_session, _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 def _settings(tmp_path: Path) -> WebSettings:
@@ -73,7 +73,7 @@ def _app(tmp_path: Path) -> FastAPI:
     )
     initialize_session_schema(engine)
     settings = _settings(tmp_path)
-    session_service = SessionServiceImpl(
+    session_service = DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

@@ -64,8 +64,8 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -3197,7 +3197,7 @@ class TestCopyBlobsForFork:
                 )
             ).one_or_none()
         if operation is None:
-            session_service = SessionServiceImpl(
+            session_service = DualFencedSessionServiceHarness(
                 service._engine,
                 telemetry=build_sessions_telemetry(),
                 log=structlog.get_logger("test.blob-fork-custody"),
@@ -4025,7 +4025,7 @@ class TestCopyBlobsForFork:
         await self._copy(blob_service, session_id, target_session_id)
         operation_id = self._fail_fork(blob_service, session_id, target_session_id)
         before = await blob_service.list_blobs(target_session_id, limit=None)
-        session_service = SessionServiceImpl(
+        session_service = DualFencedSessionServiceHarness(
             blob_service._engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test.blob-fork-custody"),
@@ -4048,7 +4048,7 @@ class TestCopyBlobsForFork:
         await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv")
         await self._copy(blob_service, session_id, target_session_id)
         operation_id = self._fail_fork(blob_service, session_id, target_session_id)
-        session_service = SessionServiceImpl(
+        session_service = DualFencedSessionServiceHarness(
             blob_service._engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test.blob-fork-custody"),

@@ -182,9 +182,9 @@ class TestExecutionError:
         from elspeth.contracts import ExecutionError
 
         traceback = (
-            'Traceback (most recent call last):\n'
+            "Traceback (most recent call last):\n"
             '  File "worker.py", line 10, in run\n'
-            'RuntimeError: Authorization:\n'
+            "RuntimeError: Authorization:\n"
             'File "Bearer opaque-token"\n'
         )
 
@@ -195,10 +195,7 @@ class TestExecutionError:
         )
 
         assert error.traceback == (
-            'Traceback (most recent call last):\n'
-            '  File "worker.py", line 10, in run\n'
-            '<redacted-secret>\n'
-            '<redacted-secret>\n'
+            'Traceback (most recent call last):\n  File "worker.py", line 10, in run\n<redacted-secret>\n<redacted-secret>\n'
         )
         assert "Authorization" not in error.traceback
         assert "opaque-token" not in error.traceback

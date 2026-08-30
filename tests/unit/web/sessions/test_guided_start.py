@@ -143,10 +143,7 @@ def _make_app(tmp_path, user_id="alice", database_url: str | None = None):
     # None resolver means "shield unavailable" (a missing key is a wiring error).
     app.state.scoped_secret_resolver = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
-    app.state.composer_progress_registry = ComposerProgressRegistry(
-        engine=engine,
-        session_operation_authority=service.session_operation_authority,
-    )
+    app.state.composer_progress_registry = ComposerProgressRegistry()
     app.include_router(create_session_router())
     return app, service
 

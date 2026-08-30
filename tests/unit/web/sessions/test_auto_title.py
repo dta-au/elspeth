@@ -75,13 +75,15 @@ async def _run_auto_title(monkeypatch, response: object) -> tuple[_TitleService,
 
     monkeypatch.setattr(_auto_title, "_litellm_acompletion", _canned)
     service = _TitleService()
+    session_id = uuid4()
     await _auto_title.maybe_auto_title_session(
         service=service,
-        session_id=uuid4(),
+        session_id=session_id,
         user_message="Build a CSV pipeline",
         model="openai/test",
         temperature=None,
         seed=None,
+        session_operation_context=_compose_context(session_id),
     )
     return service, failed, rejected
 
@@ -278,13 +280,15 @@ async def test_auto_title_outbound_call_redacts_fences_and_truncates(monkeypatch
     monkeypatch.setattr(_auto_title, "_litellm_acompletion", _capture)
     service = _TitleService()
     secret = "AKIA" + "A" * 16
+    session_id = uuid4()
     await _auto_title.maybe_auto_title_session(
         service=service,
-        session_id=uuid4(),
+        session_id=session_id,
         user_message=f"Use key {secret} to build a CSV pipeline. " + "x" * 5000,
         model="openai/test",
         temperature=None,
         seed=None,
+        session_operation_context=_compose_context(session_id),
     )
     messages = captured["messages"]
     assert messages[0]["role"] == "system"

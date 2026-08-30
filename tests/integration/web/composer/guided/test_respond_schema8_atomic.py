@@ -57,11 +57,11 @@ from elspeth.web.sessions.routes._helpers import _initial_composition_state_with
 from elspeth.web.sessions.routes.composer import guided as guided_route
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import GuidedRespondRequest
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.integration.web.composer.guided.test_respond import TestStep2IntraStep as _Step2Journey
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -70,16 +70,13 @@ def file_composer_test_client(composer_test_client: TestClient, tmp_path: Path) 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'respond-races.db'}")
     initialize_session_schema(engine)
     composer_test_client.app.state.session_engine = engine
-    session_service = SessionServiceImpl(
+    session_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided.respond.races"),
     )
     composer_test_client.app.state.session_service = session_service
-    composer_test_client.app.state.composer_progress_registry = ComposerProgressRegistry(
-        engine=engine,
-        session_operation_authority=session_service.session_operation_authority,
-    )
+    composer_test_client.app.state.composer_progress_registry = ComposerProgressRegistry()
     try:
         yield composer_test_client
     finally:

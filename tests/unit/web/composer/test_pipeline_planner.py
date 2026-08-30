@@ -37,7 +37,6 @@ from elspeth.contracts.composer_planner_audit import (
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -108,7 +107,6 @@ from elspeth.web.composer.tools.generation import explain_validation_code, expla
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate, canonicalize_authored_node_review_requirements
 from elspeth.web.config import WebSettings
-from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -127,8 +125,8 @@ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeW
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, composition_proposals_table
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _TEST_SESSION_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -4514,7 +4512,7 @@ async def test_safe_candidate_argument_error_gets_closed_feedback_then_repairs_w
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    engine, origin, operation_lease = await _session_context()
+    engine, origin = await _session_context()
     raw_canary = "RAW_INVALID_FILENAME_CONTENT_CANARY"
     invalid = _inline_pipeline(tmp_path)
     invalid["source"]["inline_blob"]["filename"] = ""
@@ -4536,7 +4534,6 @@ async def test_safe_candidate_argument_error_gets_closed_feedback_then_repairs_w
             max_storage_per_session=1_000_000,
             secret_service=None,
             runtime_preflight=None,
-            session_operation_context=operation_lease.context,
         ),
     )
 
@@ -4558,7 +4555,6 @@ async def test_safe_candidate_argument_error_gets_closed_feedback_then_repairs_w
         assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
         assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
     assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
-    await operation_lease.close()
 
 
 @pytest.mark.asyncio
@@ -4566,7 +4562,7 @@ async def test_safe_candidate_argument_error_exhaustion_fails_without_custody(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    engine, origin, operation_lease = await _session_context()
+    engine, origin = await _session_context()
     invalid = _inline_pipeline(tmp_path)
     invalid["source"]["inline_blob"]["filename"] = ""
     completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": invalid})))
@@ -4584,7 +4580,6 @@ async def test_safe_candidate_argument_error_exhaustion_fails_without_custody(
                 max_storage_per_session=1_000_000,
                 secret_service=None,
                 runtime_preflight=None,
-                session_operation_context=operation_lease.context,
             ),
         )
 
@@ -4592,7 +4587,6 @@ async def test_safe_candidate_argument_error_exhaustion_fails_without_custody(
         assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
         assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
     assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
-    await operation_lease.close()
 
 
 @pytest.mark.asyncio
@@ -5476,17 +5470,14 @@ async def test_repeated_discovery_call_hits_explicit_cycle_guard_before_redispat
         assert no_gain_attempt.new_information == ()
 
 
-async def _session_context(
-    *,
-    content: str = "Use this CSV: name,score\nada,42\n",
-) -> tuple[Any, PlannerOriginatingMessage, SessionOperationLease]:
+async def _session_context(*, content: str = "Use this CSV: name,score\nada,42\n") -> tuple[Any, PlannerOriginatingMessage]:
     engine = create_session_engine(
         "sqlite:///:memory:",
         poolclass=StaticPool,
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.pipeline-planner-custody"),
@@ -5498,22 +5489,11 @@ async def _session_context(
         content,
         writer_principal="route_user_message",
     )
-    operation_lease = await SessionOperationLease.acquire(
-        service.session_operation_authority,
-        session_id=session.id,
-        operation_kind=SessionOperationKind.COMPOSE,
-        owner_instance_id=service.session_operation_owner_instance_id,
-        lease_seconds=service.session_operation_lease_seconds,
-    )
-    return (
-        engine,
-        PlannerOriginatingMessage(
-            session_id=str(session.id),
-            message_id=str(message.id),
-            content=content,
-            user_id="planner-user",
-        ),
-        operation_lease,
+    return engine, PlannerOriginatingMessage(
+        session_id=str(session.id),
+        message_id=str(message.id),
+        content=content,
+        user_id="planner-user",
     )
 
 
@@ -5522,7 +5502,7 @@ async def test_invalid_inline_draft_exhaustion_leaves_zero_pre_custody_residue(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    engine, origin, operation_lease = await _session_context()
+    engine, origin = await _session_context()
     completion = _ScriptedCompletion(
         _response(("emit_pipeline_proposal", {"pipeline": _inline_pipeline(tmp_path, output_name="not_rows")}))
     )
@@ -5542,7 +5522,6 @@ async def test_invalid_inline_draft_exhaustion_leaves_zero_pre_custody_residue(
                 max_storage_per_session=1_000_000,
                 secret_service=None,
                 runtime_preflight=None,
-                session_operation_context=operation_lease.context,
             ),
             current_state=state,
         )
@@ -5552,7 +5531,6 @@ async def test_invalid_inline_draft_exhaustion_leaves_zero_pre_custody_residue(
         assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
     assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
     assert state.to_dict() == before_state
-    await operation_lease.close()
 
 
 @pytest.mark.asyncio
@@ -5561,7 +5539,7 @@ async def test_cancellation_during_custody_settles_then_reraises_without_proposa
     tool_context: ToolContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    engine, origin, operation_lease = await _session_context()
+    engine, origin = await _session_context()
     entered = asyncio.Event()
     release = asyncio.Event()
     settled = asyncio.Event()
@@ -5587,7 +5565,6 @@ async def test_cancellation_during_custody_settles_then_reraises_without_proposa
                 max_storage_per_session=1_000_000,
                 secret_service=None,
                 runtime_preflight=None,
-                session_operation_context=operation_lease.context,
             ),
             lifecycle=_lifecycle(lifecycle_events),
         )
@@ -5602,7 +5579,6 @@ async def test_cancellation_during_custody_settles_then_reraises_without_proposa
     assert lifecycle_events[-1] == "settled:cancelled"
     with engine.begin() as conn:
         assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
-    await operation_lease.close()
 
 
 @pytest.mark.asyncio
@@ -5610,7 +5586,7 @@ async def test_real_inline_custody_returns_only_blob_id_and_ready_row(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    engine, origin, operation_lease = await _session_context()
+    engine, origin = await _session_context()
     raw_content = "name,score\nada,42\n"
     completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _inline_pipeline(tmp_path)})))
     recorder = BufferingRecorder()
@@ -5627,7 +5603,6 @@ async def test_real_inline_custody_returns_only_blob_id_and_ready_row(
             max_storage_per_session=1_000_000,
             secret_service=None,
             runtime_preflight=None,
-            session_operation_context=operation_lease.context,
         ),
     )
 
@@ -5642,7 +5617,6 @@ async def test_real_inline_custody_returns_only_blob_id_and_ready_row(
     assert Path(row["storage_path"]).read_text(encoding="utf-8") == raw_content
     assert raw_content not in canonical_json([call.to_dict() for call in recorder.llm_calls])
     assert raw_content not in canonical_json([invocation.to_dict() for invocation in recorder.invocations])
-    await operation_lease.close()
 
 
 @pytest.mark.asyncio
@@ -5762,7 +5736,7 @@ async def test_inline_custody_provenance_uses_terminal_audited_model_returned_or
     model_returned: str | None,
     expected_model_version: str,
 ) -> None:
-    engine, origin, operation_lease = await _session_context(content="Generate a fresh CSV for this pipeline.")
+    engine, origin = await _session_context(content="Generate a fresh CSV for this pipeline.")
     response = _response(("emit_pipeline_proposal", {"pipeline": _inline_pipeline(tmp_path)}))
     response.model = model_returned
     recorder = BufferingRecorder()
@@ -5779,7 +5753,6 @@ async def test_inline_custody_provenance_uses_terminal_audited_model_returned_or
             max_storage_per_session=1_000_000,
             secret_service=None,
             runtime_preflight=None,
-            session_operation_context=operation_lease.context,
         ),
     )
 
@@ -5790,7 +5763,6 @@ async def test_inline_custody_provenance_uses_terminal_audited_model_returned_or
     assert recorder.llm_calls[-1].model_returned == model_returned
     assert row["creating_model_identifier"] == "anthropic/claude-planner"
     assert row["creating_model_version"] == expected_model_version
-    await operation_lease.close()
 
 
 @pytest.mark.asyncio
@@ -6142,14 +6114,13 @@ async def test_blob_content_discovery_audit_projection_never_retains_content(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    engine, origin, operation_lease = await _session_context()
+    engine, origin = await _session_context()
     custody = PlannerCustodyConfig(
         data_dir=str(tmp_path),
         session_engine=engine,
         max_storage_per_session=1_000_000,
         secret_service=None,
         runtime_preflight=None,
-        session_operation_context=operation_lease.context,
     )
     first = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _inline_pipeline(tmp_path)})))
     proposal = await _plan(
@@ -6181,7 +6152,6 @@ async def test_blob_content_discovery_audit_projection_never_retains_content(
     invocation = recorder.invocations[0]
     assert invocation.tool_name == "get_blob_content"
     assert "name,score" not in (invocation.result_canonical or "")
-    await operation_lease.close()
     assert set(json.loads(invocation.result_canonical or "{}")) == {"success", "validation", "version"}
 
 
@@ -6470,7 +6440,7 @@ async def test_escape_hatch_provider_identity_reaches_inline_custody(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    engine, origin, operation_lease = await _session_context(content="Generate a fresh CSV after discovery.")
+    engine, origin = await _session_context(content="Generate a fresh CSV after discovery.")
     completion = _ScriptedCompletion(
         _response(("list_sources", {})),
         _response(("list_sinks", {})),
@@ -6490,7 +6460,6 @@ async def test_escape_hatch_provider_identity_reaches_inline_custody(
             max_storage_per_session=1_000_000,
             secret_service=None,
             runtime_preflight=None,
-            session_operation_context=operation_lease.context,
         ),
         model_overrides={
             "max_discovery_turns": 1,
@@ -6508,7 +6477,6 @@ async def test_escape_hatch_provider_identity_reaches_inline_custody(
     assert proposal.provider == "openrouter"
     assert row["creating_model_identifier"] == "openrouter/advisor-under-test"
     assert row["creating_provider"] == "openrouter"
-    await operation_lease.close()
 
 
 @pytest.mark.asyncio

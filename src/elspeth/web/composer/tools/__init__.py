@@ -79,6 +79,7 @@ from elspeth.web.composer.tools.blobs import (
     _execute_update_blob,
     _persist_prepared_blob_create,
     _prepare_blob_create,
+    _session_blob_lock,
     _sync_list_blobs,
 )
 from elspeth.web.composer.tools.discovery import (

@@ -732,7 +732,6 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
             "source.csv",
             b"a,b\n1,2\n",
             "text/csv",
-            session_operation_context=create_lease.context,
         )
     finally:
         await create_lease.close()
@@ -985,7 +984,6 @@ async def test_postgres_target_rename_holds_no_connection_and_release_cannot_dea
             "source.csv",
             b"x\n1\n",
             "text/csv",
-            session_operation_context=create_lease.context,
         )
     finally:
         await create_lease.close()

@@ -35,6 +35,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -50,7 +51,7 @@ def engine():
 
 @pytest.fixture
 def service(engine):
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -113,14 +114,13 @@ async def _create_test_blob(
     filename: str,
     content: bytes,
 ) -> BlobRecord:
-    async with _session_operation_context(service, session_id, SessionOperationKind.CREATE) as context:
+    async with _session_operation_context(service, session_id, SessionOperationKind.CREATE):
         return await blob_service.create_blob(
             session_id=session_id,
             filename=filename,
             content=content,
             mime_type="text/csv",
             created_by="assistant",
-            session_operation_context=context,
         )
 
 
@@ -745,7 +745,6 @@ async def test_create_composition_proposal_rejects_unusable_blob_reference(engin
         blob_service = BlobServiceImpl(
             engine,
             tmp_path,
-            session_operation_authority=service.session_operation_authority,
         )
         if failure_kind == "pending":
             record = await _create_pending_test_blob(
@@ -788,7 +787,6 @@ async def test_create_composition_proposal_accepts_owned_ready_blob(engine, serv
     blob_service = BlobServiceImpl(
         engine,
         tmp_path,
-        session_operation_authority=service.session_operation_authority,
     )
     record = await _create_test_blob(
         service,
@@ -822,7 +820,7 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
     """A deterministic barrier proves the lock closes both race outcomes."""
     engine = create_session_engine(f"sqlite:///{tmp_path / 'race.db'}")
     initialize_session_schema(engine)
-    session_service = SessionServiceImpl(
+    session_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -830,7 +828,6 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
     blob_service = BlobServiceImpl(
         engine,
         tmp_path,
-        session_operation_authority=session_service.session_operation_authority,
     )
     session_id = (await session_service.create_session("alice", "Composer UX", "local")).id
     blob = await _create_test_blob(

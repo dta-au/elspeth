@@ -86,6 +86,7 @@ from elspeth.web.sessions.service import (
     _patch_llm_transform_prompt,
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
 # Fixtures and helpers
@@ -105,7 +106,7 @@ def engine():
 
 @pytest.fixture
 def service(engine) -> SessionServiceImpl:
-    instance = SessionServiceImpl(
+    instance = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -1082,7 +1083,7 @@ def _runtime_preflight_result(*, is_valid: bool, messages: tuple[str, ...] = ())
 
 
 def _preflight_service(engine, runtime_preflight) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -1481,7 +1482,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
         selected_profile_aliases=((llm_id, "tutorial"),),
         binding_generation_fingerprint="profiled-interpretation-test-generation",
     )
-    policy_service = SessionServiceImpl(
+    policy_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),

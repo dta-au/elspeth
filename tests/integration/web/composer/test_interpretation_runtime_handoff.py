@@ -78,6 +78,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -152,7 +153,7 @@ def _make_session_service() -> tuple[SessionServiceImpl, Any]:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),

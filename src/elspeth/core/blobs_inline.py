@@ -115,10 +115,7 @@ async def _validate_blob_content_refs(
     not_ready_by_blob_id: dict[UUID, str] = {}
     for ref in refs:
         try:
-            record = await blob_service.get_blob(
-                ref.blob_id,
-                session_operation_context=session_operation_context,
-            )
+            record = await blob_service.get_blob(ref.blob_id)
         except BlobNotFoundError:
             continue
         except BlobStateError as exc:
@@ -342,13 +339,7 @@ async def _fetch_blob_contents(
     """Fetch content bytes for discovered refs, deduped by blob id."""
     unique_blob_ids = _unique_blob_ids(refs)
     results = await asyncio.gather(
-        *(
-            blob_service.read_blob_content(
-                blob_id,
-                session_operation_context=session_operation_context,
-            )
-            for blob_id in unique_blob_ids
-        ),
+        *(blob_service.read_blob_content(blob_id) for blob_id in unique_blob_ids),
         return_exceptions=True,
     )
     return _resolve_blob_content_results(refs, unique_blob_ids, results)

@@ -54,6 +54,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -107,7 +108,7 @@ def test_client(tmp_path: Path) -> TestClient:
         poolclass=StaticPool,
     )
     initialize_session_schema(eng)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         eng,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

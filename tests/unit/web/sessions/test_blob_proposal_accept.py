@@ -42,6 +42,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 class _ExecutionServiceFake:
@@ -65,7 +66,7 @@ def _make_app(tmp_path: Path, user_id: str = "alice") -> tuple[FastAPI, SessionS
     )
     initialize_session_schema(engine)
     telemetry = build_sessions_telemetry()
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=telemetry,
         log=structlog.get_logger("test"),
@@ -97,10 +98,7 @@ def _make_app(tmp_path: Path, user_id: str = "alice") -> tuple[FastAPI, SessionS
     app.state.composer_service = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.execution_service = _ExecutionServiceFake()
-    app.state.composer_progress_registry = ComposerProgressRegistry(
-        engine=engine,
-        session_operation_authority=service.session_operation_authority,
-    )
+    app.state.composer_progress_registry = ComposerProgressRegistry()
     app.state.scoped_secret_resolver = None
     app.include_router(create_session_router())
     return app, service
@@ -142,7 +140,6 @@ async def _create_test_blob(
             content=content,
             mime_type="text/plain",
             created_by="user",
-            session_operation_context=context,
         )
     finally:
         await service._run_sync(service.session_operation_authority.release, context)
@@ -203,7 +200,6 @@ def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp
     blob_service = BlobServiceImpl(
         service._engine,
         tmp_path,
-        session_operation_authority=service.session_operation_authority,
     )
     client = TestClient(app)
     session = asyncio.run(service.create_session("alice", "Blob approval", "local"))
@@ -273,7 +269,6 @@ def test_accept_update_blob_proposal_remains_blocked_by_second_pending_reference
     blob_service = BlobServiceImpl(
         service._engine,
         tmp_path,
-        session_operation_authority=service.session_operation_authority,
     )
     client = TestClient(app)
     session = asyncio.run(service.create_session("alice", "Blob approval conflict", "local"))
@@ -346,7 +341,6 @@ def test_accept_delete_blob_proposal_commits_without_composition_state_delta(tmp
     blob_service = BlobServiceImpl(
         service._engine,
         tmp_path,
-        session_operation_authority=service.session_operation_authority,
     )
     client = TestClient(app)
     session = asyncio.run(service.create_session("alice", "Blob deletion approval", "local"))
@@ -425,7 +419,6 @@ def test_retry_after_blob_effect_before_proposal_settlement_does_not_reexecute(
     blob_service = BlobServiceImpl(
         service._engine,
         tmp_path,
-        session_operation_authority=service.session_operation_authority,
     )
     client = TestClient(app)
     session = asyncio.run(service.create_session("alice", "Blob approval recovery", "local"))
@@ -593,7 +586,6 @@ async def test_accept_update_blob_proposal_serializes_against_reject(
     blob_service = BlobServiceImpl(
         service._engine,
         tmp_path,
-        session_operation_authority=service.session_operation_authority,
     )
     session = await service.create_session("alice", "Blob approval race", "local")
     session_id = session.id
@@ -701,7 +693,6 @@ async def test_cancelled_accept_update_blob_proposal_still_terminalizes_before_r
     blob_service = BlobServiceImpl(
         service._engine,
         tmp_path,
-        session_operation_authority=service.session_operation_authority,
     )
     session = await service.create_session("alice", "Blob approval cancellation", "local")
     session_id = session.id

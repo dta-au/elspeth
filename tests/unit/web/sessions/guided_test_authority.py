@@ -119,6 +119,111 @@ class DualFencedSessionServiceHarness(SessionServiceImpl):
         context = await self._command_context(command, session_operation_context)
         return await super().settle_guided_state_operation(command, session_operation_context=context, **kwargs)
 
+    # ------------------------------------------------------------------
+    # Per-call authority for the ordinary session writers. Legacy tests
+    # call these without a context; the harness holds an exact, short-lived
+    # lease of the required kind for the duration of the one call and
+    # releases it, reusing a live guided-test context when one already
+    # covers the session so the two never conflict.
+    # ------------------------------------------------------------------
+    @contextlib.asynccontextmanager
+    async def _call_context(self, session_id: UUID, kind: SessionOperationKind):
+        cached = self._contexts_by_engine.setdefault(self._engine, {}).get(session_id)
+        if cached is not None:
+            try:
+                await self._run_sync(self.session_operation_authority.compare_and_swap, cached)
+            except SessionOperationFenceLost:
+                self._contexts_by_engine[self._engine].pop(session_id, None)
+            else:
+                if cached.operation_kind is kind:
+                    yield cached
+                    return
+        context = cast(
+            SessionOperationContext,
+            await self._run_sync(
+                lambda: self.session_operation_authority.acquire(
+                    session_id=session_id,
+                    operation_kind=kind,
+                    owner_instance_id=self.session_operation_owner_instance_id,
+                    lease_seconds=self.session_operation_lease_seconds,
+                )
+            ),
+        )
+        try:
+            yield context
+        finally:
+            with contextlib.suppress(SessionOperationFenceLost):
+                await self._run_sync(self.session_operation_authority.release, context)
+
+    async def save_composition_state(self, session_id, state, *, session_operation_context=None, **kwargs):
+        if session_operation_context is not None:
+            return await super().save_composition_state(session_id, state, session_operation_context=session_operation_context, **kwargs)
+        async with self._call_context(session_id, SessionOperationKind.COMPOSE) as context:
+            return await super().save_composition_state(session_id, state, session_operation_context=context, **kwargs)
+
+    async def update_session_title(self, session_id, title, *, session_operation_context=None, **kwargs):
+        if session_operation_context is not None:
+            return await super().update_session_title(session_id, title, session_operation_context=session_operation_context, **kwargs)
+        async with self._call_context(session_id, SessionOperationKind.COMPOSE) as context:
+            return await super().update_session_title(session_id, title, session_operation_context=context, **kwargs)
+
+    async def add_message_with_transcript(self, session_id, *args, session_operation_context=None, **kwargs):
+        if session_operation_context is not None:
+            return await super().add_message_with_transcript(
+                session_id, *args, session_operation_context=session_operation_context, **kwargs
+            )
+        async with self._call_context(session_id, SessionOperationKind.COMPOSE) as context:
+            return await super().add_message_with_transcript(session_id, *args, session_operation_context=context, **kwargs)
+
+    def _kw_writer(name: str, kind: SessionOperationKind):  # type: ignore[misc]
+        async def _wrapped(self, *args, session_operation_context=None, **kwargs):
+            parent = getattr(super(), name)
+            if session_operation_context is not None:
+                return await parent(*args, session_operation_context=session_operation_context, **kwargs)
+            session_id = args[0] if args else kwargs["session_id"]
+            async with self._call_context(session_id, kind) as context:
+                return await parent(*args, session_operation_context=context, **kwargs)
+
+        _wrapped.__name__ = name
+        return _wrapped
+
+    create_pending_interpretation_event = _kw_writer("create_pending_interpretation_event", SessionOperationKind.COMPOSE)
+    commit_transition_response = _kw_writer("commit_transition_response", SessionOperationKind.COMPOSE)
+    create_composition_proposal = _kw_writer("create_composition_proposal", SessionOperationKind.COMPOSE)
+    create_pipeline_composition_proposal = _kw_writer("create_pipeline_composition_proposal", SessionOperationKind.COMPOSE)
+    record_auto_interpreted_no_surfaces_event = _kw_writer("record_auto_interpreted_no_surfaces_event", SessionOperationKind.COMPOSE)
+    reject_composition_proposal = _kw_writer("reject_composition_proposal", SessionOperationKind.PROPOSAL)
+    reject_pipeline_composition_proposal = _kw_writer("reject_pipeline_composition_proposal", SessionOperationKind.PROPOSAL)
+    accept_composition_proposal = _kw_writer("accept_composition_proposal", SessionOperationKind.PROPOSAL)
+    settle_pipeline_composition_proposal = _kw_writer("settle_pipeline_composition_proposal", SessionOperationKind.PROPOSAL)
+    create_run = _kw_writer("create_run", SessionOperationKind.EXECUTE)
+    update_composer_preferences = _kw_writer("update_composer_preferences", SessionOperationKind.COMPOSE)
+
+    def _run_writer(name: str):  # type: ignore[misc]
+        async def _wrapped(self, *args, session_operation_context=None, **kwargs):
+            parent = getattr(super(), name)
+            if session_operation_context is not None:
+                return await parent(*args, session_operation_context=session_operation_context, **kwargs)
+            run_id = args[0] if args else kwargs["run_id"]
+            run = await self.get_run(run_id)
+            async with self._call_context(run.session_id, SessionOperationKind.EXECUTE) as context:
+                return await parent(*args, session_operation_context=context, **kwargs)
+
+        _wrapped.__name__ = name
+        return _wrapped
+
+    update_run_status = _run_writer("update_run_status")
+    append_run_event = _run_writer("append_run_event")
+    record_blob_inline_resolutions = _run_writer("record_blob_inline_resolutions")
+    del _run_writer
+
+    async def record_audit_grade_view_async(self, *, auth_provider_type="local", **kwargs):
+        # The lane made the auth provider an explicit audit fact; legacy tests
+        # predate it and only ever exercised the local provider.
+        return await super().record_audit_grade_view_async(auth_provider_type=auth_provider_type, **kwargs)
+
+    del _kw_writer
+
     async def stage_guided_pipeline_proposal(self, command, *, session_operation_context=None, **kwargs):
         context = await self._command_context(command, session_operation_context)
         return await super().stage_guided_pipeline_proposal(command, session_operation_context=context, **kwargs)

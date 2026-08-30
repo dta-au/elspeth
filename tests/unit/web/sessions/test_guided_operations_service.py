@@ -295,7 +295,7 @@ def _expire_operation(engine, *, session_id: UUID, operation_id: str) -> None:
 
 @pytest.mark.asyncio
 async def test_guided_start_reconciliation_read_is_noncontending_and_zero_dml(file_engine) -> None:
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         file_engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided-start-reconciliation-read"),
@@ -342,7 +342,7 @@ async def test_guided_start_reconciliation_read_is_noncontending_and_zero_dml(fi
 
 @pytest.mark.asyncio
 async def test_expired_guided_start_reconciliation_mints_current_attempt_before_failing(file_engine) -> None:
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         file_engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided-start-reconciliation-dual-fence"),

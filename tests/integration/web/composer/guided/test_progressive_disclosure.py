@@ -58,6 +58,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # ---------------------------------------------------------------------------
 # Fake LLM response: pure-chat, no tool calls
@@ -115,7 +116,7 @@ def composer_freeform_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     )
     initialize_session_schema(engine)
 
-    session_service = SessionServiceImpl(
+    session_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided.progressive_disclosure"),
@@ -162,10 +163,7 @@ def composer_freeform_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     app.state.operator_profile_registry = profiles
     app.state.plugin_snapshot_factory = lambda _user: snapshot
     app.state.composer_recorder = BufferingRecorder()
-    app.state.composer_progress_registry = ComposerProgressRegistry(
-        engine=engine,
-        session_operation_authority=session_service.session_operation_authority,
-    )
+    app.state.composer_progress_registry = ComposerProgressRegistry()
 
     router = create_session_router()
     app.include_router(router)

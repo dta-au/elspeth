@@ -64,8 +64,8 @@ from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 SOURCE_ID = "00000000-0000-4000-8000-000000000101"
 OUTPUT_ID = "00000000-0000-4000-8000-000000000102"
@@ -1836,7 +1836,7 @@ async def test_guided_planner_request_carries_evidence_and_manifest_without_priv
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(session_engine)
-    sessions = SessionServiceImpl(
+    sessions = DualFencedSessionServiceHarness(
         session_engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.proposal-audit-projection"),

@@ -106,6 +106,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # Sentinel empty state for mock composer responses
 _EMPTY_STATE = CompositionState(
@@ -608,6 +609,7 @@ class _ProgressRouteSessionService:
         *,
         writer_principal: str,
         composition_state_id: uuid.UUID | None = None,
+        **_fenced_kwargs: object,
     ) -> None:
         # In-memory double: appending the cohort draft-by-draft is
         # trivially atomic, mirroring the production single-transaction
@@ -791,10 +793,7 @@ def _make_progress_route_app(
     app.state.composer_service = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.execution_service = _ExecutionServiceStub()
-    app.state.composer_progress_registry = ComposerProgressRegistry(
-        engine=service._engine,
-        session_operation_authority=service.session_operation_authority,
-    )
+    app.state.composer_progress_registry = ComposerProgressRegistry()
     app.state.scoped_secret_resolver = None
     _install_restricted_plugin_policy(app)
     app.include_router(create_session_router())
@@ -814,7 +813,7 @@ def _make_app(
     )
     initialize_session_schema(engine)
     telemetry = build_sessions_telemetry()
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=telemetry,
         log=structlog.get_logger("test"),
@@ -859,10 +858,7 @@ def _make_app(
     from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
-    app.state.composer_progress_registry = ComposerProgressRegistry(
-        engine=engine,
-        session_operation_authority=service.session_operation_authority,
-    )
+    app.state.composer_progress_registry = ComposerProgressRegistry()
     app.state.scoped_secret_resolver = None
     _install_restricted_plugin_policy(app)
 
@@ -3826,7 +3822,7 @@ class TestIDORProtection:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
-        service = SessionServiceImpl(
+        service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -3860,10 +3856,7 @@ class TestIDORProtection:
             from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
             app.state.rate_limiter = ComposerRateLimiter(limit=100)
-            app.state.composer_progress_registry = ComposerProgressRegistry(
-                engine=engine,
-                session_operation_authority=service.session_operation_authority,
-            )
+            app.state.composer_progress_registry = ComposerProgressRegistry()
             app.include_router(create_session_router())
             return app
 
@@ -4150,7 +4143,7 @@ class TestSendMessageStateIdValidation:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
-        service = SessionServiceImpl(
+        service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -4184,10 +4177,7 @@ class TestSendMessageStateIdValidation:
             from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
             app.state.rate_limiter = ComposerRateLimiter(limit=100)
-            app.state.composer_progress_registry = ComposerProgressRegistry(
-                engine=engine,
-                session_operation_authority=service.session_operation_authority,
-            )
+            app.state.composer_progress_registry = ComposerProgressRegistry()
             app.include_router(create_session_router())
             return app
 
@@ -5702,9 +5692,7 @@ class TestMessageRoutes:
             mime_type,
             created_by="user",
             source_description=None,
-            session_operation_context=None,
         ):
-            assert session_operation_context is not None
             return BlobRecord(
                 id=uuid.uuid4(),
                 session_id=session_uuid,
@@ -7424,7 +7412,7 @@ class TestRevertEndpoint:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
-        service = SessionServiceImpl(
+        service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -7451,10 +7439,7 @@ class TestRevertEndpoint:
             from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
             app.state.rate_limiter = ComposerRateLimiter(limit=100)
-            app.state.composer_progress_registry = ComposerProgressRegistry(
-                engine=engine,
-                session_operation_authority=service.session_operation_authority,
-            )
+            app.state.composer_progress_registry = ComposerProgressRegistry()
             app.include_router(create_session_router())
             return app
 

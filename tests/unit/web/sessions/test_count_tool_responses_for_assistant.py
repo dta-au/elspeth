@@ -15,6 +15,7 @@ from elspeth.web.sessions.models import chat_messages_table
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web.conftest import _make_session
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +26,7 @@ class _PersistedAssistant:
 
 @pytest.fixture
 def sessions_service(engine, tmp_path: Path) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

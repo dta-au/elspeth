@@ -33,6 +33,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # ---------------------------------------------------------------------------
 # Test app factory
@@ -51,7 +52,7 @@ def _make_app(
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
-    session_service = SessionServiceImpl(
+    session_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -402,7 +403,7 @@ class TestIDORProtection:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
-        session_service = SessionServiceImpl(
+        session_service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),

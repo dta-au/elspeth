@@ -90,6 +90,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web.composer.guided.test_propose_pipeline_protocol import _payload as _advisory_proposal_payload
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 def _empty_composition_state() -> CompositionState:
@@ -1621,7 +1622,7 @@ def test_replay_requires_final_turn_to_be_current_and_unanswered(response_kind: 
 def service_and_engine(tmp_path: Path):
     engine = create_session_engine(f"sqlite:///{tmp_path / 'guided-atomic.db'}")
     initialize_session_schema(engine)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided-atomic"),

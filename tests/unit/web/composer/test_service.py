@@ -98,6 +98,7 @@ from tests.unit.web.composer._helpers import (
     _mock_catalog,
     _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
 )
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _REAL_RUN_ADVISOR_CHECKPOINT = ComposerServiceImpl._run_advisor_checkpoint
 
@@ -654,7 +655,7 @@ def _verbatim_blob_context(engine: Any, session_id: str, content: str) -> dict[s
 
 
 def _test_sessions_service(engine: Any, data_dir: Path | None = None) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         data_dir=data_dir,
         telemetry=build_sessions_telemetry(),

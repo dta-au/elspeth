@@ -45,9 +45,9 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.routes._helpers import _runtime_preflight_for_state
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 class _GuidedTestExecutionService:
@@ -416,7 +416,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
     # Session service — profile-aware, mirroring production create_app()
     # wiring: the guided proposal settlement independently re-derives wire
     # reviews through the session principal's snapshot.
-    session_service = SessionServiceImpl(
+    session_service = DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -435,10 +435,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
     # the create_app() production wiring at app.py:930. Without this the
     # guided/chat route's unconditional _get_composer_progress_registry(request)
     # call AttributeErrors against this hand-rolled minimal app.
-    app.state.composer_progress_registry = ComposerProgressRegistry(
-        engine=engine,
-        session_operation_authority=session_service.session_operation_authority,
-    )
+    app.state.composer_progress_registry = ComposerProgressRegistry()
 
     # Mount session router (sessions + guided endpoints)
     router = create_session_router()
@@ -491,7 +488,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
 
         restarted_app.state.plugin_snapshot_factory = lambda user: _restarted_principal_snapshot(user.user_id)
         restarted_app.state.execution_service = _GuidedTestExecutionService(restarted_app)
-        restarted_app.state.session_service = SessionServiceImpl(
+        restarted_app.state.session_service = DualFencedSessionServiceHarness(
             restarted_engine,
             data_dir=tmp_path,
             telemetry=build_sessions_telemetry(),
@@ -501,10 +498,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
             catalog=restarted_app.state.catalog_service,
         )
         restarted_app.state.composer_recorder = BufferingRecorder()
-        restarted_app.state.composer_progress_registry = ComposerProgressRegistry(
-            engine=restarted_engine,
-            session_operation_authority=restarted_app.state.session_service.session_operation_authority,
-        )
+        restarted_app.state.composer_progress_registry = ComposerProgressRegistry()
         restarted_app.state.restart_test_client = restart_test_client
         restarted_app.include_router(create_session_router())
         restarted_app.include_router(create_blobs_router())

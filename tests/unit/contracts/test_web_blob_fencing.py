@@ -2041,7 +2041,6 @@ async def create_blob_inline(session_id, body, request, user):
             mime_type=body.mime_type,
             created_by="user",
             source_description="created inline",
-            session_operation_context=lease.context,
         )
         return record
     finally:

@@ -53,6 +53,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # Distinctive token planted in every scripted provider payload / error so the
 # leak assertions can prove it never reaches the HTTP body or any persisted row.
@@ -195,7 +196,7 @@ def _build_app(
 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.sqlite3'}")
     initialize_session_schema(engine)
-    sessions = SessionServiceImpl(
+    sessions = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.freeform.planner.failure"),
@@ -273,10 +274,7 @@ def _build_app(
         secret_inventory=_EmptyInventory(),
         generation_key=b"freeform-planner-failure-policy-key",
     )
-    app.state.composer_progress_registry = ComposerProgressRegistry(
-        engine=engine,
-        session_operation_authority=sessions.session_operation_authority,
-    )
+    app.state.composer_progress_registry = ComposerProgressRegistry()
     app.include_router(create_session_router())
 
     # A truly unhandled route exception must surface as a 500 response (not be

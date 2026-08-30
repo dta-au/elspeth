@@ -2143,6 +2143,7 @@ class ComposerServiceImpl:
         initial_state: CompositionState | None = None,
         user_message_id: str | None = None,
         message: str = "one-turn compose-loop test driver",
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ComposeLoopTestResult:
         """Drive exactly one compose-loop turn for compose-loop tests.
 
@@ -2185,6 +2186,7 @@ class ComposerServiceImpl:
                 deadline=asyncio.get_event_loop().time() + self._timeout_seconds,
                 plugin_snapshot=plugin_snapshot,
                 policy_catalog=policy_catalog,
+                session_operation_context=session_operation_context,
             )
         finally:
             self._call_llm = original_call_llm  # type: ignore[method-assign]
@@ -2416,7 +2418,7 @@ class ComposerServiceImpl:
         *,
         session_id: str | None,
         current_state_id: str | None,
-        session_operation_context: SessionOperationContext | None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> None:
         """Surface a pending ``llm_prompt_template`` review EVENT, backend-derived.
 
@@ -4177,7 +4179,7 @@ class ComposerServiceImpl:
         current_state_id: UUID | None,
         user_message_id: UUID,
         user_id: str | None,
-        session_operation_context: SessionOperationContext,
+        session_operation_context: SessionOperationContext | None = None,
         preferences: ComposerSessionPreferencesRecord,
         recorder: BufferingRecorder,
         planner_llm_calls: tuple[ComposerLLMCall, ...],
@@ -4202,6 +4204,8 @@ class ComposerServiceImpl:
         the requested pipeline" having measured only the Stage-1 authoring
         pass. A non-green verdict now downgrades to the review arm and says so.
         """
+        if session_operation_context is None:
+            raise AuditIntegrityError("Pipeline planning requires exact session operation authority")
 
         await self._persist_pipeline_planner_audit(
             session_id=session_id,
@@ -4354,7 +4358,7 @@ class ComposerServiceImpl:
         session_id: str,
         current_state_id: str | None,
         user_id: str | None,
-        session_operation_context: SessionOperationContext | None,
+        session_operation_context: SessionOperationContext | None = None,
         progress: ComposerProgressSink | None,
         user_message_id: str,
         recorder: BufferingRecorder,
@@ -4511,8 +4515,6 @@ class ComposerServiceImpl:
                     raise
                 raise deferred from exc
             raise
-        if session_operation_context is None:
-            raise AuditIntegrityError("Pipeline planning requires exact session operation authority")
         return await self._stage_pipeline_plan(
             plan=plan,
             state=state,
@@ -4630,7 +4632,7 @@ class ComposerServiceImpl:
         assistant_tool_calls: tuple[_AdmittedToolCall, ...],
         plugin_crash: ComposerPluginCrashError | None,
         session_id: str | None,
-        session_operation_context: SessionOperationContext | None,
+        session_operation_context: SessionOperationContext | None = None,
         current_state_id: str | None,
         persisted_tool_call_turn: bool,
         persisted_assistant_message_id: str | None,
@@ -4675,7 +4677,7 @@ class ComposerServiceImpl:
         discovery_cache: dict[str, _CachedDiscoveryPayload],
         runtime_preflight_cache: _RuntimePreflightCache,
         session_id: str | None,
-        session_operation_context: SessionOperationContext | None,
+        session_operation_context: SessionOperationContext | None = None,
         user_id: str | None,
         user_message_id: str | None,
         user_message_content: str | None,
@@ -4763,7 +4765,7 @@ class ComposerServiceImpl:
         composition_turns_used: int,
         discovery_turns_used: int,
         advisor_checkpoint_passes_used: int,
-        session_operation_context: SessionOperationContext | None,
+        session_operation_context: SessionOperationContext | None = None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
     ) -> _ClassifyOutcome:
@@ -5440,7 +5442,7 @@ class ComposerServiceImpl:
         state: CompositionState,
         session_id: str | None,
         current_state_id: str | None,
-        session_operation_context: SessionOperationContext | None,
+        session_operation_context: SessionOperationContext | None = None,
         assistant_message: _AdmittedAssistantMessage,
         recorder: BufferingRecorder,
         progress: ComposerProgressSink | None,
@@ -5555,7 +5557,7 @@ class ComposerServiceImpl:
         message: str,
         mutation_success_seen: bool,
         repair_turns_used: int,
-        session_operation_context: SessionOperationContext | None,
+        session_operation_context: SessionOperationContext | None = None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
     ) -> ComposerResult:
         """Auto-surface PT reviews, run the fail-closed orphan gate, finalize.
@@ -5691,7 +5693,7 @@ class ComposerServiceImpl:
         llm_messages: list[dict[str, Any]],
         recorder: BufferingRecorder,
         progress: ComposerProgressSink | None,
-        session_operation_context: SessionOperationContext | None,
+        session_operation_context: SessionOperationContext | None = None,
         advisor_checkpoint_passes_used: int,
         repair_turns_used: int,
         persisted_assistant_message_id: str | None,
@@ -6858,7 +6860,7 @@ class ComposerServiceImpl:
         audit: DispatchAudit,
         recorder: BufferingRecorder,
         session_id: str | None,
-        session_operation_context: SessionOperationContext | None,
+        session_operation_context: SessionOperationContext | None = None,
         current_state_id: str | None,
         composer_model_version: str,
         llm_messages: list[dict[str, Any]],

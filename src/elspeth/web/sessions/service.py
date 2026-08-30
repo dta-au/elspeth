@@ -3505,7 +3505,7 @@ class SessionServiceImpl:
             raise ValueError("owner_instance_id must be a nonblank exact string")
         if type(session_operation_lease_seconds) is not int or not 1 <= session_operation_lease_seconds <= 3600:
             raise ValueError("session_operation_lease_seconds must be an exact integer from 1 through 3600")
-        self._owner_instance_id = owner_instance_id or f"{engine.dialect.name}-{uuid.uuid4()}"
+        self._owner_instance_id = owner_instance_id if owner_instance_id is not None else f"{engine.dialect.name}-{uuid.uuid4()}"
         self._session_operation_lease_seconds = session_operation_lease_seconds
         if session_operation_authority is None:
             if engine.dialect.name == "sqlite":

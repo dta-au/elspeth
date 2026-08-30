@@ -763,7 +763,6 @@ allowed_dict_patterns:
   # the check.
   # ═══════════════════════════════════════════════════════════════════════════
   - "src/elspeth/web/interpretation_state.py:strip_authoring_options:return"
-  - "src/elspeth/web/sessions/service.py:_patch_structured_interpretation_prompt:return"
 
   # ═══════════════════════════════════════════════════════════════════════════
   # WEB COMPOSER — Compose-loop helpers (Tier 3 LiteLLM API shapes)
@@ -998,9 +997,6 @@ allowed_dict_patterns:
   # from the dialect-specific excluded/inserted namespace.
   # ═══════════════════════════════════════════════════════════════════════════
   - "src/elspeth/web/secrets/user_store.py:_upsert_update_mapping:return"
-  - "src/elspeth/web/secrets/user_store.py:_sqlite_upsert:values"
-  - "src/elspeth/web/secrets/user_store.py:_pg_upsert:values"
-  - "src/elspeth/web/secrets/user_store.py:_mysql_upsert:values"
 
   # WEB COMPOSER — provider-bound LLM message lists. In-process persisted
   # history uses ComposerHistoryMessage; only the outbound provider shapes

@@ -11,6 +11,7 @@ import structlog
 from sqlalchemy import event, insert, select, update
 from sqlalchemy.engine import Connection, Engine, Transaction
 from tests.unit.web.conftest import _make_session
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.enums import CreationModality
@@ -41,7 +42,7 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 @pytest.fixture
 def service(engine, tmp_path) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

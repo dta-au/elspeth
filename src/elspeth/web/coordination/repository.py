@@ -1749,19 +1749,19 @@ class _RepositoryBlobMutations:
             raise AuditIntegrityError("ready blob metadata changed before replacement intent")
         if actual.status != "ready" or actual.content_hash is None:
             raise AuditIntegrityError("blob replacement requires ready metadata with a content hash")
-        immutable_fields = (
-            "id",
-            "session_id",
-            "filename",
-            "mime_type",
-            "storage_path",
-            "created_at",
-            "created_by",
-            "source_description",
-            "status",
+        immutable_projection = (
+            ("id", replacement.id, expected.id),
+            ("session_id", replacement.session_id, expected.session_id),
+            ("filename", replacement.filename, expected.filename),
+            ("mime_type", replacement.mime_type, expected.mime_type),
+            ("storage_path", replacement.storage_path, expected.storage_path),
+            ("created_at", replacement.created_at, expected.created_at),
+            ("created_by", replacement.created_by, expected.created_by),
+            ("source_description", replacement.source_description, expected.source_description),
+            ("status", replacement.status, expected.status),
         )
-        for field_name in immutable_fields:
-            if getattr(replacement, field_name) != getattr(expected, field_name):
+        for field_name, replacement_value, expected_value in immutable_projection:
+            if replacement_value != expected_value:
                 raise AuditIntegrityError(f"blob replacement changed immutable field {field_name}")
         if replacement.content_hash is None or type(replacement.size_bytes) is not int or replacement.size_bytes < 0:
             raise AuditIntegrityError("blob replacement requires exact proposed size and content hash")
@@ -2262,26 +2262,26 @@ class _RepositoryBlobMutations:
         lifecycle field. Every other public record field is identity-bearing
         for idempotent standalone creation.
         """
-        fields = (
-            "id",
-            "session_id",
-            "filename",
-            "mime_type",
-            "size_bytes",
-            "content_hash",
-            "storage_path",
-            "created_by",
-            "source_description",
-            "creation_modality",
-            "created_from_message_id",
-            "creating_model_identifier",
-            "creating_model_version",
-            "creating_provider",
-            "creating_composer_skill_hash",
-            "creating_arguments_hash",
+        identity_projection = (
+            ("id", actual.id, expected.id),
+            ("session_id", actual.session_id, expected.session_id),
+            ("filename", actual.filename, expected.filename),
+            ("mime_type", actual.mime_type, expected.mime_type),
+            ("size_bytes", actual.size_bytes, expected.size_bytes),
+            ("content_hash", actual.content_hash, expected.content_hash),
+            ("storage_path", actual.storage_path, expected.storage_path),
+            ("created_by", actual.created_by, expected.created_by),
+            ("source_description", actual.source_description, expected.source_description),
+            ("creation_modality", actual.creation_modality, expected.creation_modality),
+            ("created_from_message_id", actual.created_from_message_id, expected.created_from_message_id),
+            ("creating_model_identifier", actual.creating_model_identifier, expected.creating_model_identifier),
+            ("creating_model_version", actual.creating_model_version, expected.creating_model_version),
+            ("creating_provider", actual.creating_provider, expected.creating_provider),
+            ("creating_composer_skill_hash", actual.creating_composer_skill_hash, expected.creating_composer_skill_hash),
+            ("creating_arguments_hash", actual.creating_arguments_hash, expected.creating_arguments_hash),
         )
-        for field_name in fields:
-            if getattr(actual, field_name) != getattr(expected, field_name):
+        for field_name, actual_value, expected_value in identity_projection:
+            if actual_value != expected_value:
                 return field_name
         return None
 

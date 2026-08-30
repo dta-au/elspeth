@@ -122,7 +122,6 @@ async def _create_test_blob(
             filename,
             content,
             mime_type,
-            session_operation_context=context,
         )
     finally:
         await session_service._run_sync(session_service.session_operation_authority.release, context)

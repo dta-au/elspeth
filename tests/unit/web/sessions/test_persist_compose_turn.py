@@ -22,6 +22,7 @@ from elspeth.web.sessions.models import session_operation_fences_table
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web.conftest import _make_session as _make_session_row
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _TEST_FENCE_NAMESPACE = UUID("6794cf0c-4b9d-40b9-ad19-d6f9afff30dd")
 
@@ -108,7 +109,7 @@ def service(engine, tmp_path) -> SessionServiceImpl:
     fixture — without it, the fixture's untyped parameters poison the
     return type to ``Any`` and helper-method calls return ``Any``.
     """
-    instance = SessionServiceImpl(
+    instance = DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -375,7 +376,7 @@ def test_file_backed_sqlite_sequence_allocator_smoke(tmp_path):
     db_path = tmp_path / "sessions.db"
     engine = create_session_engine(f"sqlite:///{db_path}")
     initialize_session_schema(engine)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -405,7 +406,7 @@ def test_file_backed_sqlite_lock_serializes_independent_connections(tmp_path):
     db_path = tmp_path / "sessions.db"
     engine = create_session_engine(f"sqlite:///{db_path}")
     initialize_session_schema(engine)
-    service: SessionServiceImpl = SessionServiceImpl(
+    service: SessionServiceImpl = DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -762,7 +763,7 @@ def test_file_backed_sqlite_lock_serializes_same_session_state_version_allocatio
     db_path = tmp_path / "sessions.db"
     engine = create_session_engine(f"sqlite:///{db_path}")
     initialize_session_schema(engine)
-    service: SessionServiceImpl = SessionServiceImpl(
+    service: SessionServiceImpl = DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

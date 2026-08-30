@@ -88,6 +88,8 @@ import uvicorn
 from sqlalchemy import select
 from sqlalchemy.pool import StaticPool
 
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+
 # --- sys.path shim ------------------------------------------------------
 # ``gateway/`` is not on the default ELSPETH import path (see
 # tests/gateway_runtime/conftest.py and
@@ -311,7 +313,7 @@ def _build_sessions_service(tmp_path: Path) -> SessionServiceImpl:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

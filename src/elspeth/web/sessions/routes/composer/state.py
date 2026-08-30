@@ -22,10 +22,10 @@ from elspeth.web.composer.yaml_importer import (
     composition_state_from_runtime_yaml,
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.interpretation_state import BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX, parse_interpretation_requirements
 from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS, allowed_source_directories, managed_blob_directory, resolve_data_path
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
-from elspeth.web.interpretation_state import BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX, parse_interpretation_requirements
 from elspeth.web.sessions.protocol import GuidedCompositionStateResult, GuidedOperationSettlementConflictError
 from elspeth.web.sessions.routes.guided_operations import (
     GuidedOperationExpired,

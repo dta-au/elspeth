@@ -112,6 +112,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 def _dict_strategy(thing: type) -> st.SearchStrategy[dict[Any, Any]]:
@@ -650,7 +651,7 @@ def build_test_sessions_service(
     )
     if engine is None:
         initialize_session_schema(resolved_engine)
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         resolved_engine,
         data_dir=data_dir,
         telemetry=build_sessions_telemetry(),
@@ -1163,3 +1164,80 @@ def inject_IntegrityError_on_chat_messages(monkeypatch: pytest.MonkeyPatch) -> N
         return original_insert(self, *args, **kwargs)
 
     monkeypatch.setattr(SessionServiceImpl, "_insert_chat_message", _raise_for_chat_messages)
+
+
+@pytest.fixture(autouse=True)
+def _fenced_compose_for_legacy_tests(monkeypatch):
+    """Test adapter: compose() calls that name a session but carry no
+    session-operation context acquire an exact, short-lived COMPOSE lease on
+    the composer's sessions service for the duration of the call (mirrors
+    DualFencedSessionServiceHarness for the session writers)."""
+    from elspeth.contracts.session_operation import SessionOperationKind
+    from elspeth.web.composer.service import ComposerServiceImpl
+    from elspeth.web.coordination.contracts import SessionOperationFenceLost
+    from elspeth.web.coordination.lifecycle import SessionOperationLease
+
+    async def _with_lease(self, session_id, kwargs, call):
+        sessions = getattr(self, "_sessions_service", None)
+        authority = getattr(sessions, "session_operation_authority", None)
+        if session_id is None or kwargs.get("session_operation_context") is not None or authority is None:
+            return await call(**kwargs)
+        try:
+            lease = await SessionOperationLease.acquire(
+                authority,
+                session_id=session_id if not isinstance(session_id, str) else __import__("uuid").UUID(session_id),
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=sessions.session_operation_owner_instance_id,
+                lease_seconds=sessions.session_operation_lease_seconds,
+            )
+        except SessionOperationFenceLost:
+            # No durable session row to fence (fixture-minted ids): run the
+            # call exactly as the legacy test wrote it.
+            return await call(**kwargs)
+        try:
+            return await call(session_operation_context=lease.context, **kwargs)
+        finally:
+            await lease.close()
+
+    real_compose = ComposerServiceImpl.compose
+    real_turn = ComposerServiceImpl._run_one_turn_for_test
+
+    async def compose(
+        self,
+        message,
+        messages,
+        state,
+        session_id=None,
+        current_state_id=None,
+        user_id=None,
+        progress=None,
+        guided_terminal=None,
+        user_message_id=None,
+        session_operation_context=None,
+    ):
+        kwargs = {
+            "message": message,
+            "messages": messages,
+            "state": state,
+            "session_id": session_id,
+            "current_state_id": current_state_id,
+            "user_id": user_id,
+            "progress": progress,
+            "guided_terminal": guided_terminal,
+            "user_message_id": user_message_id,
+            "session_operation_context": session_operation_context,
+        }
+
+        async def call(**kw):
+            return await real_compose(self, **kw)
+
+        return await _with_lease(self, session_id, kwargs, call)
+
+    async def run_one_turn(self, **kwargs):
+        async def call(**kw):
+            return await real_turn(self, **kw)
+
+        return await _with_lease(self, kwargs.get("session_id"), kwargs, call)
+
+    monkeypatch.setattr(ComposerServiceImpl, "compose", compose)
+    monkeypatch.setattr(ComposerServiceImpl, "_run_one_turn_for_test", run_one_turn)

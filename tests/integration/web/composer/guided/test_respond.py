@@ -68,10 +68,10 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationClaimed, GuidedPipelineProposalBackEditCommand
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.routes._helpers import _SessionComposeLockRegistry
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -556,7 +556,7 @@ def _independent_guided_peer_app(primary: TestClient) -> FastAPI:
 
     app.dependency_overrides[get_current_user] = mock_user
     app.state.session_engine = engine
-    app.state.session_service = SessionServiceImpl(
+    app.state.session_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided.independent-peer"),
@@ -572,10 +572,7 @@ def _independent_guided_peer_app(primary: TestClient) -> FastAPI:
     app.state.operator_profile_registry = primary_app.state.operator_profile_registry
     app.state.plugin_snapshot_factory = primary_app.state.plugin_snapshot_factory
     app.state.composer_recorder = BufferingRecorder()
-    app.state.composer_progress_registry = ComposerProgressRegistry(
-        engine=engine,
-        session_operation_authority=app.state.session_service.session_operation_authority,
-    )
+    app.state.composer_progress_registry = ComposerProgressRegistry()
     app.state.session_compose_lock_registry = _SessionComposeLockRegistry()
     app.include_router(create_session_router())
     return app
