@@ -59,9 +59,12 @@ ComposerMode = Literal["guided", "freeform"]
 # Welcome bookend is never persisted (nothing has started; ``None`` is the
 # no-in-progress-tutorial state). Extending this set requires updating the
 # Literal here, the ``ck_user_preferences_tutorial_stage`` CHECK in
-# ``sessions/models.py``, and the Tier-1 read guard in
-# ``PreferencesService._row_to_prefs`` in lockstep — same rule as
-# ``ComposerMode`` above.
+# ``sessions/models.py``, the Tier-1 read guard in
+# ``PreferencesService._row_to_prefs``, and the ``STAGES`` Record in the
+# frontend's ``api/preferencesDecoder.ts`` in lockstep — same rule, and the
+# same four sites, as ``ComposerMode`` above. The decoder fails closed on an
+# unlisted stage, so adding a value here without it makes the frontend reject
+# a payload the server considers valid.
 TutorialStage = Literal["guided", "run", "audit", "graduation"]
 
 
