@@ -1274,6 +1274,20 @@ def _validate_inspect_payload(payload: Mapping[str, Any]) -> str | None:
     return _current_string_sequence(observed["warnings"], "payload.observed.warnings")[1]
 
 
+@trust_boundary(
+    tier=3,
+    source="guided single_select turn payload: LLM tool-call output or client-submitted wire payload, of unknown interior shape",
+    source_param="payload",
+    suppresses=("R1",),
+    invariant=(
+        "returns a path-rooted error string for a malformed question, options collection, allow_custom flag, "
+        "or source_blob_compatible_option_ids sequence, and None otherwise; never coerces, never raises. "
+        "``source_blob_compatible_option_ids`` is declared optional (absent from _REQUIRED_KEYS, present in "
+        "_ALLOWED_KEYS, both verified by validate_payload before dispatch), so the defaulted read preserves "
+        "the schema-defined absence semantics — an empty sequence — rather than fabricating an asserted value"
+    ),
+    non_raising=True,
+)
 def _validate_single_select_payload(payload: Mapping[str, Any]) -> str | None:
     if (error := _current_text_error(payload["question"], "payload.question", nonempty=True)) is not None:
         return error
@@ -1357,6 +1371,24 @@ def _validate_component_review_payload(payload: Mapping[str, Any]) -> str | None
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "a knob-schema fragment carried on a guided turn payload: LLM tool-call output or client-submitted "
+        "wire value, of unknown interior shape"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error string for any deviation from the closed field grammar — a non-mapping "
+        "schema or field entry, missing/unexpected keys, a kind outside the closed vocabulary, or malformed "
+        "per-kind attributes — and None otherwise; never coerces, never raises. The Mapping ABC checks are "
+        "the parse (durable-load and replay values arrive deep-frozen as MappingProxyType); the name pre-pass "
+        "drops malformed entries only for forward-reference collection, and the per-field loop below rejects "
+        "every one of them"
+    ),
+    non_raising=True,
+)
 def _validate_knob_schema(value: object, path: str) -> str | None:
     schema, error = _exact_nested_mapping(value, frozenset({"fields"}), path)
     if error is not None:
@@ -2063,6 +2095,20 @@ def _validate_proposal_flow(value: object, path: str) -> str | None:
     return _structural_alias_error(value["branch"], "branch", f"{path}.branch")
 
 
+@trust_boundary(
+    tier=3,
+    source="guided propose_pipeline turn payload: LLM tool-call output or client-submitted wire payload, of unknown interior shape",
+    source_param="payload",
+    suppresses=("R1",),
+    invariant=(
+        "returns a path-rooted error string for any deviation from the proposal projection grammar and None "
+        "otherwise; never coerces, never raises. The branch-lineage walk's node_by_id lookup treats a "
+        "producer id absent from the payload's node-only index as the meaningful result 'not exclusively "
+        "branch-derived' (sources are legal producers but are indexed separately), not as a hidden "
+        "missing-key default"
+    ),
+    non_raising=True,
+)
 def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None:
     if (error := _canonical_uuid_error(payload["proposal_id"], "payload.proposal_id")) is not None:
         return error
@@ -2374,9 +2420,12 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
 
         if producer_id in visiting:
             return False
-        node = node_by_id.get(producer_id)
-        if node is None:
+        if producer_id not in node_by_id:
+            # Sources are legal producers but are indexed separately from the
+            # node-only index, so absence here is the meaningful result "not
+            # exclusively branch-derived", made explicit as a membership test.
             return False
+        node = node_by_id[producer_id]
         predecessors = incoming_edges[producer_id]
         if not predecessors:
             return False
