@@ -39,7 +39,7 @@ from elspeth.contracts.sink import (
     FILE_SINK_PLUGINS,
     LOCAL_RECOVERY_SINK_PLUGINS,
 )
-from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.contracts.union_merge import UnionTypeConflictError, merge_union_field_flags
 from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
 from elspeth.core.config import (
@@ -112,6 +112,17 @@ _MIRRORED_COALESCE_MERGES: Final[frozenset[str]] = frozenset({"union", "nested"}
 _SCOPE_POLICY_VOCABULARY: Final[tuple[str, ...]] = get_args(ScopeSettings.model_fields["policy"].annotation)
 
 
+@observation_boundary(
+    tier=3,
+    source="a NodeSpec branches value re-read from a persisted session payload or authored by the web/LLM surface",
+    source_param="branches",
+    suppresses=("R5",),
+    invariant=(
+        "returns branches unchanged for non-row_union node types, for None, for mapping form, and for "
+        "duplicate-carrying lists (the invalid shape is preserved for validate() to reject); only a unique "
+        "row_union list normalizes to the runtime's ordered identity mapping; never raises"
+    ),
+)
 def _row_union_normalized_branches(node_type: str, branches: CoalesceBranches | None) -> CoalesceBranches | None:
     """Return ``row_union`` list branches as the runtime's identity mapping.
 
@@ -211,7 +222,13 @@ def _composer_node_id_validation_message(node_id: str, node_type: str) -> str | 
     Wording tracks the runtime's so a repair loop reads one message on both
     surfaces.
     """
-    label = _NODE_TYPE_NAME_LABELS.get(node_type, "Node name")
+    # Explicit membership rather than .get(default): _NODE_TYPE_NAME_LABELS
+    # covers every COMPOSER_NODE_TYPES member, so an unknown node_type here is
+    # an unvalidated web-authored value that validate()'s unknown_node_type
+    # check rejects in the SAME result set (it runs after this message pass).
+    # The generic label only words this pass's messages for that not-yet-
+    # rejected shape; it never substitutes for the rejection.
+    label = _NODE_TYPE_NAME_LABELS[node_type] if node_type in _NODE_TYPE_NAME_LABELS else "Node name"
     if not node_id or not node_id.strip():
         return f"{label} must not be empty"
     if node_type in _LOWERCASE_ONLY_NODE_TYPES and node_id != node_id.lower():
@@ -247,6 +264,19 @@ def _label_message(value: str, *, field_label: str) -> str | None:
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source="NodeSpec fields (branches, routes, fork_to, connections) admitted un-typed from persisted session payloads via NodeSpec.from_dict",
+    source_param="nodes",
+    suppresses=("R5",),
+    invariant=(
+        "returns label-rule ValidationEntry diagnostics for well-typed label values only; a non-string "
+        "branch name or connection yields no entry from this advisory rule and the value's shape rejection "
+        "is owned by the intrinsic node-shape checks in CompositionState.validate "
+        "(row_union_branch_invalid / coalesce_branches_invalid); never raises"
+    ),
+    non_raising=True,
+)
 def _routing_label_errors(
     *,
     sources: Mapping[str, SourceSpec],
@@ -275,6 +305,17 @@ def _routing_label_errors(
     def add(component: str, message: str, code: str = "connection_label_invalid") -> None:
         found.append(ValidationEntry(component, message, "high", code))
 
+    @trust_boundary(
+        tier=3,
+        source="a source/node label value (on_success, route, branch, connection) admitted un-typed from persisted session payloads",
+        source_param="value",
+        suppresses=("R5",),
+        invariant=(
+            "a non-string value yields no label entry (malformed shapes are owned by the intrinsic "
+            "node-shape checks); only well-typed labels are checked; never raises"
+        ),
+        non_raising=True,
+    )
     def label(component: str, value: object, field_label: str) -> None:
         # Malformed external values (a non-string branch value from a
         # persisted payload) are owned by the intrinsic node-shape checks;
@@ -3490,10 +3531,11 @@ def _parse_template_names(template: str) -> tuple[frozenset[str], frozenset[str]
     tier=3,
     source="node.options['queries'] (web-authored multi-query definitions)",
     source_param="queries",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "returns only well-formed (label, entry) pairs; malformed queries or entries are silently "
-        "dropped (QueryDefinition's contract is reported by plugin schema validation, not here), and "
+        "dropped (QueryDefinition's contract is reported by plugin schema validation, not here); a list "
+        "entry without a well-formed name is labelled positionally ('#<index>') for diagnostics, and "
         "this boundary never raises"
     ),
 )
@@ -7117,6 +7159,33 @@ class CompositionState:
                             "coalesce_branches_invalid",
                         )
                     )
+                if node.branches is not None:
+                    # Mirror of the row_union arm's per-branch type rejection
+                    # (row_union_branch_invalid below): a persisted payload can
+                    # carry a non-string branch name/connection that
+                    # NodeSpec.from_dict admits, _routing_label_errors abstains
+                    # on (well-typed labels only), and the runtime's
+                    # CoalesceSettings would reject at settings_load — so
+                    # without this check the shape validated green here and
+                    # died there (valid-but-not-runnable).
+                    for branch_name, connection_name in zip(
+                        _coalesce_branch_names(node.branches),
+                        _coalesce_branch_connections(node.branches),
+                        strict=True,
+                    ):
+                        for value, field_label in (
+                            (branch_name, "branch name"),
+                            (connection_name, f"branch '{branch_name}' input connection"),
+                        ):
+                            if type(value) is not str:
+                                errors.append(
+                                    _err(
+                                        f"node:{node.id}",
+                                        f"Coalesce {field_label} must be a string (got {type(value).__name__}).",
+                                        "high",
+                                        "coalesce_branches_invalid",
+                                    )
+                                )
                 # Mirror the engine's closed vocabularies (core/config.py
                 # CoalesceSettings) at composition time: a committed value
                 # outside them passes composer validation but fails engine
