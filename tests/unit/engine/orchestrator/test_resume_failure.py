@@ -2916,7 +2916,7 @@ class TestResumeFailureCounterBaselineDegradation:
         monkeypatch.setattr(resume_mod, "derive_resume_terminal_status_from_audit", _raise_operational)
 
         with caplog.at_level(logging.WARNING, logger="elspeth.engine.orchestrator.resume"):
-            result = resume_mod._derive_resume_failure_counter_baseline(MagicMock(), "run-baseline")
+            result = resume_mod._derive_resume_failure_counter_baseline(MagicMock(spec=RecorderFactory), "run-baseline")
 
         assert result is None
         assert any("degrade to resume-local partials" in record.getMessage() for record in caplog.records)
@@ -2931,7 +2931,7 @@ class TestResumeFailureCounterBaselineDegradation:
         monkeypatch.setattr(resume_mod, "derive_resume_terminal_status_from_audit", _raise_integrity)
 
         with pytest.raises(AuditIntegrityError):
-            resume_mod._derive_resume_failure_counter_baseline(MagicMock(), "run-baseline")
+            resume_mod._derive_resume_failure_counter_baseline(MagicMock(spec=RecorderFactory), "run-baseline")
 
     def test_orchestration_invariant_error_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from elspeth.engine.orchestrator import resume as resume_mod
@@ -2942,4 +2942,4 @@ class TestResumeFailureCounterBaselineDegradation:
         monkeypatch.setattr(resume_mod, "derive_resume_terminal_status_from_audit", _raise_invariant)
 
         with pytest.raises(OrchestrationInvariantError):
-            resume_mod._derive_resume_failure_counter_baseline(MagicMock(), "run-baseline")
+            resume_mod._derive_resume_failure_counter_baseline(MagicMock(spec=RecorderFactory), "run-baseline")

@@ -7,11 +7,12 @@ retention / back-edit, and describe the tutorial as a guided workflow profile.
 It must NOT tell users to switch to freeform because guided cannot express a
 supported topology. Where schema/epoch numbers are encoded, the runbook must use
 the current values (the live ``SESSION_SCHEMA_EPOCH``, guided schema 11,
-Landscape epoch 35), not the design doc's stale 8/28.
+the live Landscape epoch), not the design doc's stale 8/28.
 """
 
 from pathlib import Path
 
+from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -104,15 +105,16 @@ def test_runbook_uses_plan_05_epoch_and_schema_numbers() -> None:
     runbook = RUNBOOK.read_text(encoding="utf-8")
     current_cutover = runbook.split("## Current Cutover:", maxsplit=1)[1].split("## Historical Cutover:", maxsplit=1)[0]
 
-    # Current release values: the live session epoch, guided schema 11,
-    # Landscape 30. Bound to the constant so the doc cannot drift behind a bump.
+    # Current release values: the live session epoch, guided schema 11, and
+    # the live Landscape epoch. Bound to the constants so the doc cannot
+    # drift behind a bump.
     assert f"session epoch {SESSION_SCHEMA_EPOCH}" in current_cutover
-    assert "Landscape epoch 35" in current_cutover
+    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_cutover
     assert "guided schema 11" in current_cutover
 
     # The recreation/rollback record reference must name the live session epoch,
     # not the stale session epoch-30 the header-bump left behind (elspeth
-    # composer-parity fix). Landscape epoch 35 is the current boundary.
+    # composer-parity fix).
     assert f"session-epoch-{SESSION_SCHEMA_EPOCH}/Landscape-epoch-31 record" in current_cutover
     assert f"repair the epoch-{SESSION_SCHEMA_EPOCH} release forward" in current_cutover
     assert "session-epoch-30" not in current_cutover
