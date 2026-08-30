@@ -50,6 +50,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.schema import sidecar_journal_outbox_table
 from elspeth.core.landscape.serialization import serialize_datetime
@@ -722,6 +723,21 @@ class LandscapeJournal:
             ) from exc
 
     @staticmethod
+    @trust_boundary(
+        tier=3,
+        source=(
+            "the parameters value SQLAlchemy passes to the after_cursor_execute listener — a "
+            "third-party-shaped tuple/list/dict container ELSPETH does not construct"
+        ),
+        source_param="parameters",
+        suppresses=("R5",),
+        invariant=(
+            "normalizes recognized tuple/list/dict shapes recursively and raises AuditIntegrityError "
+            "(via serialize_datetime) for non-finite float values that may not enter audit data"
+        ),
+        test_ref="tests/unit/core/landscape/test_journal.py::TestNormalizeParameters::test_non_finite_float_parameter_raises",
+        test_fingerprint="f3f190a037435940629b286ee64f5b277e4fec4d6017be4c50c139e552cf4c54",
+    )
     def _normalize_parameters(parameters: Any) -> Any:
         if isinstance(parameters, list):
             return [LandscapeJournal._normalize_parameters(item) for item in parameters]
