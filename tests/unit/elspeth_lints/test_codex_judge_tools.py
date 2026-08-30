@@ -47,17 +47,24 @@ def test_read_file_denies_out_of_scope_path(scope: AgentToolScope, tmp_path: Pat
         _read_file(scope, {"file_path": str(outside)})
 
 
-def test_read_and_grep_skip_secret_scrubbed_source(scope: AgentToolScope) -> None:
+def test_read_and_grep_see_scrubbed_source_not_raw_bytes(scope: AgentToolScope) -> None:
     safe = scope.cwd / "safe.py"
     secret = scope.cwd / "secret.py"
     safe.write_text("def public_boundary():\n    pass\n", encoding="utf-8")
-    secret.write_text('API_KEY = "sk-' + ("A" * 48) + '"\n', encoding="utf-8")
+    secret.write_text('def before():\n    pass\nAPI_KEY = "sk-' + ("A" * 48) + '"\ndef after():\n    pass\n', encoding="utf-8")
 
-    with pytest.raises(ValueError, match="secret scrubber"):
-        _read_file(scope, {"file_path": str(secret)})
+    # The file stays readable — a redaction-bearing file must not go dark to
+    # the judge — but the matched line comes back as its marker, never as the
+    # raw bytes, and the surrounding lines keep their numbers.
+    rendered = _read_file(scope, {"file_path": str(secret)})
+    assert "sk-" not in rendered
+    assert "AAAA" not in rendered
+    assert "3: [REDACTED-SECRET-" in rendered
+    assert "1: def before():" in rendered
+    assert "4: def after():" in rendered
 
-    # Non-content Grep must not become an adaptive oracle over a file that the
-    # same boundary refuses to Read.
+    # Non-content Grep counts over the same scrubbed text, so it cannot become
+    # an adaptive oracle over the redacted bytes.
     result = _grep_files(
         scope,
         {

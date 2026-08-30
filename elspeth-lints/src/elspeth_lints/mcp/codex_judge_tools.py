@@ -4,7 +4,8 @@ This server is intentionally separate from the broader ``elspeth-judge`` MCP
 surface.  A Codex judge receives exactly three source-inspection tools and no
 staging, signing, shell, write, or network capability.  Every path is checked
 through :class:`AgentToolScope`; content reads additionally pass through the
-shared source-secret scrubber before any bytes are returned.
+shared source-secret scrubber before any bytes are returned (matched lines
+come back redacted; the file itself stays readable).
 """
 
 from __future__ import annotations
@@ -77,7 +78,9 @@ def _resolve(scope: AgentToolScope, raw: str) -> Path:
 
 
 def _guard(scope: AgentToolScope, tool: str, arguments: dict[str, Any]) -> None:
-    allowed, reason = _tool_scope_decision(scope, tool, arguments)
+    # Every content read on this server goes through ``_safe_text`` and
+    # returns scrubbed text, so a redaction-bearing file stays readable.
+    allowed, reason = _tool_scope_decision(scope, tool, arguments, scrubbed_reads=True)
     if not allowed:
         raise ValueError(reason)
 
@@ -87,11 +90,13 @@ def _safe_text(path: Path) -> str:
         raw = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError(f"cannot read {path}: {exc}") from exc
-    scrubbed = scrub_secrets(raw, path_hint=str(path))
-    if scrubbed.redactions:
-        patterns = sorted({record.pattern_name for record in scrubbed.redactions})
-        raise ValueError(f"read denied: {path} contains source bytes matched by the secret scrubber ({patterns})")
-    return raw
+    # Return the SCRUBBED text, never the raw bytes: a line the secret
+    # scrubber matches comes back as its ``[REDACTED-SECRET-<hash>]`` marker
+    # (line structure is preserved, so ``start_line`` stays exact) and the rest
+    # of the file stays visible to the judge. Denying the whole file here left
+    # 114 of 763 source files unreadable (2026-08-30 run co3z4sj0), almost all
+    # on false positives (a keyword argument passing a field named token).
+    return scrub_secrets(raw, path_hint=str(path)).text
 
 
 def _read_file(scope: AgentToolScope, arguments: dict[str, Any]) -> str:
@@ -171,10 +176,10 @@ def _grep_files(scope: AgentToolScope, arguments: dict[str, Any]) -> str:
         if not resolved.is_file():
             continue
         scanned += 1
-        # Reuse the stronger Read guard for every searched file.  This prevents
-        # adaptive Grep count queries from becoming an oracle over files the
-        # shared secret scrubber would redact.
-        allowed, _reason = _tool_scope_decision(scope, "Read", {"file_path": str(resolved)})
+        # Reuse the Read guard for every searched file, then count over the
+        # SCRUBBED text: a redacted line contributes only its marker, so a
+        # count query cannot become an oracle over the secret bytes.
+        allowed, _reason = _tool_scope_decision(scope, "Read", {"file_path": str(resolved)}, scrubbed_reads=True)
         if not allowed:
             continue
         try:

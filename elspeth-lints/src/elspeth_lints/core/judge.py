@@ -1420,12 +1420,25 @@ def _read_target_has_secret_redactions(path: Path) -> tuple[bool, str]:
     return True, f"{path} contains source bytes matched by secret scrubber pattern(s): {patterns}"
 
 
-def _tool_scope_decision(scope: AgentToolScope, tool_name: str, tool_input: dict[str, Any]) -> tuple[bool, str]:
+def _tool_scope_decision(
+    scope: AgentToolScope,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    scrubbed_reads: bool = False,
+) -> tuple[bool, str]:
     """Fail-closed allow/deny for one tool call. Pure logic; unit-testable.
 
     Allows ONLY a read-only tool whose realpath-resolved target sits inside an
     allowed root and is not a forbidden basename. Any uncertainty (unknown tool,
     unparseable input, out-of-root target, ``.env``) denies.
+
+    ``scrubbed_reads`` says the caller's Read returns ``scrub_secrets`` output,
+    never raw bytes (the Codex MCP server). A file that trips the scrubber is
+    then still readable — only the matched lines are redacted — instead of the
+    whole file going dark to the judge. The agent-SDK hook keeps the default:
+    its Read tool has no scrub point, so a redaction-bearing file is denied
+    outright there.
     """
     if tool_name not in _TOOL_SCOPE_READONLY_TOOLS:
         return False, (f"tool {tool_name!r} is not permitted in read-only judge-tools mode (allowed: {sorted(_TOOL_SCOPE_READONLY_TOOLS)})")
@@ -1445,7 +1458,7 @@ def _tool_scope_decision(scope: AgentToolScope, tool_name: str, tool_input: dict
             return False, f"{cand} is a forbidden file (basename denylist)"
         if not any(cand == r or cand.is_relative_to(r) for r in scope.allowed_roots):
             return False, (f"{cand} is outside the permitted roots {[str(r) for r in scope.allowed_roots]} (read-only judge-tools scope)")
-        if tool_name == "Read":
+        if tool_name == "Read" and not scrubbed_reads:
             has_redactions, reason = _read_target_has_secret_redactions(cand)
             if has_redactions:
                 return False, f"{reason}; Read denied so raw bytes cannot bypass source_excerpt.scrub_secrets"
