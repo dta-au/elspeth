@@ -27,7 +27,7 @@ def record_guided_shape_repair(
     outcome: GuidedShapeRepairOutcome,
     attempt_index: int,
 ) -> None:
-    """Best-effort event and metric for one shape-repair resolution.
+    """Event and best-effort metric for one shape-repair resolution.
 
     elspeth-79e66ff613 stage 2: ``repaired`` means a shape-rejected terminal
     tool call was corrected by the model within the same Send; ``exhausted``
@@ -41,14 +41,17 @@ def record_guided_shape_repair(
     Currently wired into the step-1 arm only; the step-2 backfill is a
     tracked follow-up, not a silent widening.
     """
-    with suppress(Exception):
-        slog.info(
-            "composer.guided_shape_repair",
-            step=step,
-            tool=tool,
-            outcome=outcome,
-            attempt_index=attempt_index,
-        )
+    # The event emission is the attribution record for this resolution, so a
+    # failing event sink propagates instead of being silently swallowed: the
+    # telemetry policy forbids silent failure at emission points, and only the
+    # aggregate counter below is best-effort.
+    slog.info(
+        "composer.guided_shape_repair",
+        step=step,
+        tool=tool,
+        outcome=outcome,
+        attempt_index=attempt_index,
+    )
     # Keep the metric independent from the event sink and off the correctness
     # path, matching the composer's telemetry policy.
     with suppress(Exception):
