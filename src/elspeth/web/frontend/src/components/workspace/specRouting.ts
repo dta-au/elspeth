@@ -40,6 +40,18 @@ import type { CompositionState, NodeSpec } from "@/types/index";
 export interface RoutingPhrase {
   text: string;
   raw: string;
+  /**
+   * Which register `text` is in. Absent (the default) means PHRASE: `text` is
+   * prose the renderer shows as prose, with `raw` demoted to `title`.
+   * "identifier" means `text` is a raw wire value nobody has phrased, and the
+   * renderer must show it as code — the diagnosticPhrases.ts rule ("an
+   * unknown identifier must never be dressed up as a sentence"), which this
+   * file's OPEN map now follows too.
+   *
+   * Optional rather than required on purpose: exactly one construction site
+   * sets it, and every other phrase in this module is prose by construction.
+   */
+  register?: "phrase" | "identifier";
 }
 
 export interface ConnectionIndex {
@@ -124,11 +136,35 @@ function closedPhrase(
   return Object.prototype.hasOwnProperty.call(map, value) ? map[value] : undefined;
 }
 
-const ENUM_FIELDS: ReadonlyMap<string, (value: string) => string | undefined> = new Map([
-  ["policy", (value: string) => closedPhrase(POLICY_PHRASES, value)],
-  ["merge", (value: string) => closedPhrase(MERGE_PHRASES, value)],
-  ["scope_policy", (value: string) => SCOPE_POLICY_PHRASES.get(value)],
-  ["output_mode", (value: string) => closedPhrase(OUTPUT_MODE_PHRASES, value)],
+/**
+ * How one enum field is phrased, and — the half that is NOT uniform — what to
+ * do with a value the map does not phrase.
+ *
+ * A CLOSED map (policy, merge, output_mode) closes against a compile-time
+ * union, so its unphrased arm is reachable only because types/index.ts still
+ * types the wire field as `string`; it keeps title case, which is what its
+ * own test pins. `scope_policy` is the ONE open map — no backend Literal, no
+ * frontend member set — so its unphrased arm is genuinely reachable in
+ * production, and title-casing it rendered fake prose: "Someday Maybe" reads
+ * as a phrase the product chose for a value nobody has phrased at all. That
+ * arm renders in the identifier register instead, matching
+ * diagnosticPhrases.ts (systems M-A).
+ *
+ * The two live in one map so the choice is stated beside the phrasing rather
+ * than in a second structure keyed by the same field.
+ */
+interface EnumFieldPhrasing {
+  /** The phrase for a known member, or undefined for a value outside the map. */
+  phrase: (value: string) => string | undefined;
+  /** The register an unphrased value renders in. */
+  unphrased: "title-case" | "identifier";
+}
+
+const ENUM_FIELDS: ReadonlyMap<string, EnumFieldPhrasing> = new Map([
+  ["policy", { phrase: (value) => closedPhrase(POLICY_PHRASES, value), unphrased: "title-case" }],
+  ["merge", { phrase: (value) => closedPhrase(MERGE_PHRASES, value), unphrased: "title-case" }],
+  ["scope_policy", { phrase: (value) => SCOPE_POLICY_PHRASES.get(value), unphrased: "identifier" }],
+  ["output_mode", { phrase: (value) => closedPhrase(OUTPUT_MODE_PHRASES, value), unphrased: "title-case" }],
 ]);
 
 function push(map: Map<string, string[]>, key: string, id: string): void {
@@ -302,12 +338,17 @@ export function routingPhrase(
   value: unknown,
 ): RoutingPhrase | null {
   if (value === DISCARD_CONNECTION || value === null || value === undefined) return null;
-  const enumLookup = ENUM_FIELDS.get(field);
-  if (enumLookup !== undefined && typeof value === "string") {
-    // The maps are closed at COMPILE time; this runtime fallback exists only
-    // because types/index.ts still types policy/merge/scope_policy as
-    // `string | null`, so a wire value outside the union is representable.
-    return { text: enumLookup(value) ?? titleCaseLabel(value), raw: value };
+  const enumField = ENUM_FIELDS.get(field);
+  if (enumField !== undefined && typeof value === "string") {
+    // This runtime arm exists because types/index.ts types policy, merge and
+    // scope_policy as `string | null`, so a wire value outside the union is
+    // representable. What an unphrased value BECOMES is the field's own
+    // choice — see EnumFieldPhrasing.
+    const phrased = enumField.phrase(value);
+    if (phrased !== undefined) return { text: phrased, raw: value };
+    return enumField.unphrased === "identifier"
+      ? { text: value, raw: value, register: "identifier" }
+      : { text: titleCaseLabel(value), raw: value };
   }
   if (field === "scope_opener" && typeof value === "string") {
     // The one routing field naming a COMPONENT rather than a connection, so

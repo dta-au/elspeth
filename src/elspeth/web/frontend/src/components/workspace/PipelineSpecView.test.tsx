@@ -775,6 +775,30 @@ describe("PipelineSpecView", () => {
     expect(within(node).getByText("Merge the two assessment branches")).not.toBe(heading);
   });
 
+  it("shows an unknown scope_policy as code rather than dressing it as prose", () => {
+    // The renderer half of specRouting's open-map rule. Asserted on the
+    // ELEMENT: the shared pin strips <code>, so it cannot tell a value that
+    // moved INTO the identifier register from one that was never there.
+    useSessionStore.setState({
+      compositionState: makeComposition(16, {
+        sources: { source: { plugin: "csv", options: {}, on_success: "raw_rows" } },
+        nodes: [
+          { id: "collect_pages", node_type: "collector", plugin: null, input: "raw_rows",
+            on_success: "tidy_output", on_error: null, scope_name: "doc_pages",
+            scope_policy: "someday_maybe", options: {} },
+        ],
+        outputs: [{ name: "tidy_output", plugin: "csv", options: {} }],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node collect_pages" });
+    const dd = within(node).getByText("Scope policy").nextElementSibling as HTMLElement;
+    expect(within(dd).getByText("someday_maybe").tagName).toBe("CODE");
+    expect(dd).not.toHaveTextContent("Someday Maybe");
+  });
+
   it("default DOM of the Spec tab passes the shared identifier pin (card names exempted by design)", () => {
     useSessionStore.setState({
       compositionState: makeComposition(11, {

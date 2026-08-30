@@ -223,9 +223,30 @@ describe("routingPhrase", () => {
       text: "use the plugin's own behaviour",
       raw: "default",
     });
+    // `policy` closes against a compile-time union, so this arm is reachable
+    // only because types/index.ts still types the wire field as `string`. It
+    // keeps title case; the OPEN map below is the one that changed.
     expect(routingPhrase(state, index, "policy", "someday_maybe")).toEqual({
       text: "Someday Maybe",
       raw: "someday_maybe",
+    });
+  });
+
+  it("renders an unknown scope_policy as an identifier, never as fake prose", () => {
+    // scope_policy is the ONE open map here — no backend Literal, no frontend
+    // member set — so its unknown arm is genuinely reachable, and title-casing
+    // it produced text that READS like a phrase the product chose
+    // ("Someday Maybe") for a value nobody has phrased at all. Aligned on the
+    // diagnosticPhrases register: an unphrased identifier renders as code.
+    expect(routingPhrase(state, index, "scope_policy", "someday_maybe")).toEqual({
+      text: "someday_maybe",
+      raw: "someday_maybe",
+      register: "identifier",
+    });
+    // A phrased member is unaffected and carries no register marker.
+    expect(routingPhrase(state, index, "scope_policy", "best_effort")).toEqual({
+      text: "close the group with whichever rows arrive",
+      raw: "best_effort",
     });
   });
 

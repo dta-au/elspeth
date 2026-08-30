@@ -117,6 +117,12 @@ function RoutingDd({
   if (value === DISCARD_CONNECTION) return <dd>dropped (recorded in the audit trail)</dd>;
   const phrase = routingPhrase(state, index, field, value);
   if (phrase !== null) {
+    // The identifier register: `text` IS the raw wire value, because nobody
+    // has phrased it (specRouting's open scope_policy map). It renders as
+    // code — the DiagnosticValue treatment — so it cannot read as a phrase
+    // the product chose, and it needs no Advanced secondary or `title`
+    // because the raw form is already what is on screen.
+    if (phrase.register === "identifier") return <dd><code>{phrase.text}</code></dd>;
     return (
       <dd title={phrase.raw}>
         {phrase.text}
