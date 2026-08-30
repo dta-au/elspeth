@@ -194,7 +194,14 @@ defaults:
     # carried forward from the pre-rename _requirement_matches_prompt_template
     # function). Two stale entries dropped: _requirement_matches_prompt_template
     # R1×2 (function renamed in this commit). Net 9 − 2 = +7.
-    max_allow_hits: 652
+    # 2026-08-30 blanket-migration wave 1: 652 → 1611 = 601 entries today
+    # − 188 stale_delete + 693 new_judgment carried from sign-2026-08-30
+    # + 505 new_judgment for the 602 findings that stood on the 45 deleted
+    # core/contracts/engine/tui/testing blankets (43 fixed, 54 decorated,
+    # 505 justified + 4 re-approvals of rotated signed entries). Honest
+    # accounting of one combined operator fire; plan
+    # docs/plans/2026-08-30-per-file-blanket-migration.md Task 2.
+    max_allow_hits: 1611
     # Bumped from 92 → 93 on 2026-05-19 to accommodate the Phase 8b-1a
     # per_file_rules entry for ``web/composer/telemetry_phase8.py`` (R4
     # — W5 load-bearing telemetry-only exemption per
@@ -250,7 +257,11 @@ defaults:
     # web/composer/tools/_common.py R1); no findings surfaced
     # (docs/plans/2026-08-30-per-file-blanket-migration-tools/blanket_census.py
     # unused_blankets). Plan: docs/plans/2026-08-30-per-file-blanket-migration.md.
-    max_per_file_rules: 82
+    # 2026-08-30 blanket-migration wave 1: 82 → 37 — deleted every
+    # per_file_rules block in core/contracts/engine/tui/testing (45); the
+    # 602 findings they covered are now fixed, decorated, or individually
+    # judge-signed (blanket_census.py: standing 974 → 372).
+    max_per_file_rules: 37
     # Bumped from 95 → 98 on 2026-05-30: collapsed 17 fragile per-fingerprint
     # allow_hits entries for web/composer/tools/_common.py into 3 durable
     # per_file_rules (R1/R5/R9) after an import addition rotated every one of
@@ -325,7 +336,9 @@ defaults:
     # new R5 pattern entry adds to the total-entry count. The pre-existing
     # total_entries overage (RC5.2's DECAYING cicd-allowlist-audit track) is
     # left visible, NOT absorbed by this bump.
-    max_total_entries: 745
+    # 2026-08-30 blanket-migration wave 1: 745 → 1648 = 1611 allow_hits + 37
+    # per_file_rules (see max_allow_hits / max_per_file_rules notes above).
+    max_total_entries: 1648
     # Permanent exemptions must be renewed or deliberately re-ratcheted during
     # quarterly allowlist review. New suggested entries default to a bounded
     # three-month expiry window instead of expires: null.
@@ -396,7 +409,9 @@ defaults:
     # the new web/composer/tool_batch.py R6 per_file_rule (expires: null) is
     # permanent, so it lands on this ceiling too. Same +1 file-split accounting
     # as the ``max_per_file_rules`` merge bump above.
-    max_permanent_per_file_rules: 99
+    # 2026-08-30 blanket-migration wave 1: 99 → 37 (every remaining blanket is
+    # permanent; the ceiling tracks the live count and only falls from here).
+    max_permanent_per_file_rules: 37
     # Bumped from 95 → 98 on 2026-05-30: the 3 new web/composer/tools/_common.py
     # per_file_rules are permanent (expires: null, matching the Tier-3-boundary
     # convention used by core/secrets.py et al.), so they also land on the

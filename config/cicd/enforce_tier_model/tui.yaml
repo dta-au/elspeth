@@ -95,22 +95,4 @@ allow_hits:
   ast_path: 'body[6]/body[2]/body[9]/body[2]/value/body/args[0]'
   judge_metadata_signature: 'hmac-sha256:v2:8a8bcc30943ea037ad723acfa902f40b233d091a6fad06f5121de3abd3afbfda'
 
-per_file_rules:
-- pattern: tui/screens/explain_screen.py
-  rules:
-  - R5
-  reason: ScreenState and NodeState detail projection guards, including explicit selection-state checks for CodeQL-visible initialization
-  expires: null
-  max_hits: 11
-- pattern: tui/widgets/node_detail.py
-  rules:
-  - R5
-  reason: Tier 1 audit data validation and JSON object display checks before parse/render
-  expires: null
-  max_hits: 5
-- pattern: tui/widgets/lineage_tree.py
-  rules:
-  - R5
-  reason: Offensive isinstance checks in __post_init__ — crash on invalid type per CLAUDE.md freeze_fields pattern
-  expires: null
-  max_hits: 2
+per_file_rules: []
