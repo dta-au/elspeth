@@ -254,7 +254,7 @@ class ExecutionGraph:
                 raise GraphValidationError(
                     f"Invalid schema config: {exc}",
                     component_id=node_id,
-                    component_type=node_type.value if isinstance(node_type, NodeType) else str(node_type),
+                    component_type=node_type.value,
                 ) from exc
 
         if node_type == NodeType.SINK and declared_required_fields is _EMPTY_DECLARED_REQUIRED_FIELDS and output_schema_config is not None:
@@ -291,8 +291,7 @@ class ExecutionGraph:
         """Deep-freeze mutable node configs after construction is complete."""
         for node_id, attrs in self._graph.nodes(data=True):
             info = cast(NodeInfo, attrs["info"])
-            if isinstance(info.config, dict):
-                self._graph.nodes[node_id]["info"] = replace(info, config=deep_freeze(info.config))
+            self._graph.nodes[node_id]["info"] = replace(info, config=deep_freeze(info.config))
 
     def add_edge(
         self,
