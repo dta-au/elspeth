@@ -95,6 +95,8 @@ import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
 
+from sqlalchemy.exc import IntegrityError, OperationalError
+
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_HEARTBEAT_SECONDS,
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
@@ -459,15 +461,24 @@ class FollowerProcessor:
         return run.status != RunStatus.RUNNING
 
     def _best_effort_depart(self) -> None:
-        """Call depart_worker, swallowing all exceptions (best-effort hygiene)."""
+        """Call depart_worker, containing only transient DB failures.
+
+        ``depart_worker`` is atomic (single ``begin_write`` CAS + event insert)
+        and reifies the benign "finalize already departed this row" race as a
+        normal return, so the only residual failures are transient operational
+        DB errors from a cross-connection depart race. Those are recorded at
+        WARNING and contained: coordination-event writes are loss-tolerant, and
+        a worker whose depart did not persist is reclaimed by lease expiry.
+        Anything else — including Tier-1 audit-integrity errors — propagates.
+        """
         try:
             self._run_coordination.depart_worker(
                 worker_id=self._token.worker_id,
                 now=self._now_fn(),
             )
-        except Exception:
-            logger.debug(
-                "follower %r: best-effort depart_worker raised (idempotent — finalize may have already departed this row)",
+        except (OperationalError, IntegrityError):
+            logger.warning(
+                "follower %r: depart_worker hit a transient DB failure; lease expiry will reclaim the seat",
                 self._token.worker_id,
                 exc_info=True,
             )
