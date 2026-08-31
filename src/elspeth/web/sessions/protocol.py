@@ -1532,6 +1532,46 @@ class PreparedGuidedInterpretationDraft:
 
 @final
 @dataclass(frozen=True, slots=True)
+class PreparedInterpretationEventDraft:
+    """One fully attributed review event for atomic state settlement.
+
+    Unlike the guided command-specific draft above, this DTO is the narrow
+    state-producing-route contract: the state id is allocated by the service
+    and every draft is validated and inserted in that same transaction.
+    """
+
+    event_id: UUID
+    affected_node_id: str
+    tool_call_id: str
+    user_term: str
+    kind: InterpretationKind
+    llm_draft: str
+    model_identifier: str
+    model_version: str
+    provider: str
+    composer_skill_hash: str
+
+    def __post_init__(self) -> None:
+        if type(self.event_id) is not UUID:
+            raise AuditIntegrityError("PreparedInterpretationEventDraft.event_id must be a UUID")
+        for field_name, value in (
+            ("affected_node_id", self.affected_node_id),
+            ("tool_call_id", self.tool_call_id),
+            ("user_term", self.user_term),
+            ("llm_draft", self.llm_draft),
+            ("model_identifier", self.model_identifier),
+            ("model_version", self.model_version),
+            ("provider", self.provider),
+            ("composer_skill_hash", self.composer_skill_hash),
+        ):
+            if type(value) is not str or not value:
+                raise AuditIntegrityError(f"PreparedInterpretationEventDraft.{field_name} must be a non-empty exact string")
+        if type(self.kind) is not InterpretationKind:
+            raise AuditIntegrityError("PreparedInterpretationEventDraft.kind must be an InterpretationKind")
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class GuidedPendingProposalInvalidation:
     """Exact pending proposal authority invalidated by a guided state mutation.
 
@@ -3178,6 +3218,22 @@ class SessionServiceProtocol(Protocol):
         MUST persist the value verbatim — no defaulting, no coercion: a
         confident wrong attribution is evidence-tampering-class harm under
         the auditability standard.
+        """
+        ...
+
+    async def save_composition_state_with_interpretations(
+        self,
+        session_id: UUID,
+        state: CompositionStateData,
+        *,
+        provenance: CompositionStateProvenance,
+        interpretations: tuple[PreparedInterpretationEventDraft, ...],
+    ) -> CompositionStateRecord:
+        """Atomically save one state and all review events it requires.
+
+        Implementations must return the final session head because an opted-
+        out session may auto-resolve a prepared event and derive a newer state
+        inside the settlement transaction.
         """
         ...
 

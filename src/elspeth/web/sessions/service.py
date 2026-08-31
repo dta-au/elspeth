@@ -231,6 +231,7 @@ from elspeth.web.sessions.protocol import (
     PipelineProposalSettlementResult,
     PreparedGuidedAuditRow,
     PreparedGuidedJsonPayload,
+    PreparedInterpretationEventDraft,
     ProposalEventRecord,
     ProposalLifecycleStatus,
     RunAlreadyActiveError,
@@ -9401,6 +9402,72 @@ class SessionServiceImpl:
             derived_from_state_id=None,
             composer_meta=state.composer_meta,
         )
+
+    async def save_composition_state_with_interpretations(
+        self,
+        session_id: UUID,
+        state: CompositionStateData,
+        *,
+        provenance: CompositionStateProvenance,
+        interpretations: tuple[PreparedInterpretationEventDraft, ...],
+    ) -> CompositionStateRecord:
+        """Commit one imported state and its review-event cohort atomically.
+
+        The prepared writer closures reuse the exact standalone event-writer
+        boundary, but execute under the state insert's transaction.  Any
+        writer rejection or storage failure therefore rolls back the state and
+        every earlier event in the cohort.  Opt-out auto-resolution may append
+        derived versions in the same transaction; return that final head.
+        """
+        if type(interpretations) is not tuple or any(type(draft) is not PreparedInterpretationEventDraft for draft in interpretations):
+            raise TypeError("interpretations must be an exact tuple of PreparedInterpretationEventDraft")
+        sid = str(session_id)
+        state_id = uuid.uuid4()
+        now = self._now()
+        writers: list[Callable[[Connection], InterpretationEventRecord]] = []
+        for index, draft in enumerate(interpretations):
+            writer = await self._prepare_or_create_pending_interpretation_event(
+                session_id=session_id,
+                composition_state_id=state_id,
+                affected_node_id=draft.affected_node_id,
+                tool_call_id=draft.tool_call_id,
+                user_term=draft.user_term,
+                kind=draft.kind,
+                llm_draft=draft.llm_draft,
+                model_identifier=draft.model_identifier,
+                model_version=draft.model_version,
+                provider=draft.provider,
+                composer_skill_hash=draft.composer_skill_hash,
+                # list_interpretation_events orders by created_at then id.
+                # Preserve the generic surfacer's deterministic call order
+                # without depending on random event UUID ordering.
+                created_at=now + timedelta(microseconds=index),
+                _event_id=draft.event_id,
+                _prepare_only=True,
+            )
+            writers.append(cast("Callable[[Connection], InterpretationEventRecord]", writer))
+
+        def _sync() -> CompositionStateRecord:
+            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+                self._insert_composition_state(
+                    conn,
+                    session_id=sid,
+                    payload=StatePayload(data=state),
+                    provenance=provenance,
+                    created_at=now,
+                    state_id=str(state_id),
+                )
+                for writer in writers:
+                    writer(conn)
+                result_row = conn.execute(
+                    select(composition_states_table)
+                    .where(composition_states_table.c.session_id == sid)
+                    .order_by(desc(composition_states_table.c.version))
+                    .limit(1)
+                ).one()
+                return self._row_to_state_record(result_row)
+
+        return cast(CompositionStateRecord, await self._run_sync(_sync))
 
     async def commit_transition_response(
         self,

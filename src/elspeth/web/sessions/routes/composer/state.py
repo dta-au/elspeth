@@ -13,6 +13,7 @@ from elspeth.core.secrets import collect_credential_field_violations
 from elspeth.web.blobs.protocol import BlobNotFoundError, BlobServiceProtocol
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
+from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.state import CompositionState, SourceSpec
 from elspeth.web.composer.yaml_generator import (
     PUBLIC_EXPORT_REBIND_GUIDANCE,
@@ -82,6 +83,37 @@ from .._helpers import (
 )
 
 router = APIRouter()
+
+_STATE_REVERT_SURFACE_PROVENANCE = "state_revert"
+_E2E_SEED_SURFACE_PROVENANCE = "e2e_seed"
+
+
+async def _surface_reverted_interpretation_reviews(
+    service: SessionServiceProtocol,
+    *,
+    session_id: UUID,
+    state_record: Any,
+) -> None:
+    """Repair review-card debt for a fresh or replayed revert result."""
+    # Historical minimal service-authored checkpoints can predate populated
+    # metadata and therefore cannot be promoted to CompositionState. They also
+    # predate structured interpretation requirements; preserve their existing
+    # revert compatibility instead of turning this additive repair into a 500.
+    if state_record.metadata_ is None:
+        return
+    from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+
+    await surface_pending_interpretation_reviews_for_state(
+        _state_from_record(state_record),
+        sessions_service=service,
+        session_id=str(session_id),
+        current_state_id=str(state_record.id),
+        model_identifier=_STATE_REVERT_SURFACE_PROVENANCE,
+        model_version=_STATE_REVERT_SURFACE_PROVENANCE,
+        provider=_STATE_REVERT_SURFACE_PROVENANCE,
+        composer_skill_hash=_STATE_REVERT_SURFACE_PROVENANCE,
+        only_missing_evidence=True,
+    )
 
 
 def _composition_plugin_policy_findings(
@@ -607,6 +639,11 @@ async def revert_state(
         if type(result) is not GuidedCompositionStateResult:
             raise AuditIntegrityError("State revert replay has a non-state result locator")
         replay_state = await service.get_state_in_session(result.state_id, session.id)
+        await _surface_reverted_interpretation_reviews(
+            service,
+            session_id=session.id,
+            state_record=replay_state,
+        )
         with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
             return _state_response(replay_state, policy_catalog=catalog)
 
@@ -642,6 +679,12 @@ async def revert_state(
                 actor="composer_route",
             )
             raise_guided_operation_failure(failure)
+
+    await _surface_reverted_interpretation_reviews(
+        service,
+        session_id=session.id,
+        state_record=new_state,
+    )
 
     with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
         return _state_response(new_state, policy_catalog=catalog)
@@ -693,9 +736,21 @@ async def import_state_yaml(
         # the generic Composer surfacer's own pure site-to-writer mapping so a
         # pending site that cannot become a consumable event is rejected before
         # the composition state is saved.
-        from elspeth.web.composer.service import unsurfaceable_pending_interpretation_review_sites
+        from elspeth.web.composer.service import (
+            prepare_pending_interpretation_event_drafts_for_state,
+            unsurfaceable_pending_interpretation_review_sites,
+        )
 
-        unsurfaceable_sites = unsurfaceable_pending_interpretation_review_sites(imported_state)
+        try:
+            unsurfaceable_sites = unsurfaceable_pending_interpretation_review_sites(imported_state)
+        except (InvariantError, KeyError, TypeError, ValueError) as exc:
+            # These remain invariant failures for internally persisted state.
+            # At this route the state is untrusted YAML, so reject statically
+            # without echoing its field names or values.
+            raise HTTPException(
+                status_code=400,
+                detail="Imported YAML contains malformed interpretation review metadata.",
+            ) from exc
         if unsurfaceable_sites:
             site_labels = ", ".join(f"{site.component_id}:{site.kind.value}" for site in unsurfaceable_sites)
             raise HTTPException(
@@ -721,25 +776,21 @@ async def import_state_yaml(
             initial_version=imported_state.version,
             telemetry_source="compose",
         )
-        state_record = await service.save_composition_state(
-            session.id,
-            state_data,
-            provenance="session_seed",
-        )
-        from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
-
-        await surface_pending_interpretation_reviews_for_state(
+        interpretation_drafts = prepare_pending_interpretation_event_drafts_for_state(
             imported_state,
-            sessions_service=service,
-            session_id=str(session.id),
-            current_state_id=str(state_record.id),
             model_identifier=_YAML_IMPORT_SURFACE_PROVENANCE,
             model_version=_YAML_IMPORT_SURFACE_PROVENANCE,
             provider=_YAML_IMPORT_SURFACE_PROVENANCE,
             composer_skill_hash=_YAML_IMPORT_SURFACE_PROVENANCE,
         )
+        response_state = await service.save_composition_state_with_interpretations(
+            session.id,
+            state_data,
+            provenance="session_seed",
+            interpretations=interpretation_drafts,
+        )
         with _named_guided_custody_projection():
-            return _state_response(state_record, policy_catalog=catalog)
+            return _state_response(response_state, policy_catalog=catalog)
 
 
 # Provenance sentinel for interpretation events surfaced by the YAML import
@@ -827,6 +878,18 @@ async def seed_state_for_e2e(
             secret_service=request.app.state.scoped_secret_resolver,
             user_id=str(user.user_id),
         )
+        _reject_malformed_interpretation_requirements(seeded_state)
+        from elspeth.web.composer.service import (
+            prepare_pending_interpretation_event_drafts_for_state,
+            unsurfaceable_pending_interpretation_review_sites,
+        )
+
+        try:
+            unsurfaceable_sites = unsurfaceable_pending_interpretation_review_sites(seeded_state)
+        except (InvariantError, KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid composition state JSON") from exc
+        if unsurfaceable_sites:
+            raise HTTPException(status_code=400, detail="Composition state contains review debt that cannot be surfaced")
 
         service: SessionServiceProtocol = request.app.state.session_service
         state_data, _validation = await _state_data_from_composer_state(
@@ -843,10 +906,18 @@ async def seed_state_for_e2e(
             initial_version=seeded_state.version,
             telemetry_source="state_seed",
         )
-        state_record = await service.save_composition_state(
+        interpretation_drafts = prepare_pending_interpretation_event_drafts_for_state(
+            seeded_state,
+            model_identifier=_E2E_SEED_SURFACE_PROVENANCE,
+            model_version=_E2E_SEED_SURFACE_PROVENANCE,
+            provider=_E2E_SEED_SURFACE_PROVENANCE,
+            composer_skill_hash=_E2E_SEED_SURFACE_PROVENANCE,
+        )
+        state_record = await service.save_composition_state_with_interpretations(
             session.id,
             state_data,
             provenance="session_seed",
+            interpretations=interpretation_drafts,
         )
         with _named_guided_custody_projection():
             return _state_response(state_record, policy_catalog=catalog)

@@ -470,6 +470,10 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         isValidating: false,
         validationError: null,
       });
+      // Validation is also the backend repair seam for review-event debt.
+      // Refresh the independent projection so a repaired card is visible
+      // without requiring a full session reload.
+      void useInterpretationEventsStore.getState().refreshAll(sessionId);
       return true;
     } catch (err) {
       if (requestSeq !== validationRequestSeq) return false;

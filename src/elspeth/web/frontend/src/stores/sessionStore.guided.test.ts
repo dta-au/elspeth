@@ -2194,6 +2194,22 @@ describe("sessionStore — guided-mode fields and actions", () => {
     expect(state.compositionState?.version).toBe(3);
   });
 
+  it("revertToVersion: refreshes review cards surfaced for the restored state", async () => {
+    const { revertToVersion, getGuided } = await import("@/api/client");
+    const refreshAll = vi.fn(async () => {});
+    useInterpretationEventsStore.setState({ refreshAll } as never);
+    (revertToVersion as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ...sampleCompositionState,
+      version: 3,
+    });
+    (getGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({ status: 400 });
+    useSessionStore.setState({ activeSessionId: RETRY_SESSION_ID });
+
+    await useSessionStore.getState().revertToVersion("state-with-review-debt");
+
+    expect(refreshAll).toHaveBeenCalledWith(RETRY_SESSION_ID);
+  });
+
   it("revertToVersion: reuses the operation id after an ambiguous network failure and clears it after success", async () => {
     const { revertToVersion, getGuided } = await import("@/api/client");
     const revertMock = revertToVersion as ReturnType<typeof vi.fn>;

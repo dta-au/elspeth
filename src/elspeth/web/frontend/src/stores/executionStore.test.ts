@@ -21,6 +21,7 @@ import type { InterpretationEvent } from "@/types/interpretation";
 // Mock the API client
 vi.mock("@/api/client", () => ({
   validatePipeline: vi.fn(),
+  listInterpretationEvents: vi.fn().mockResolvedValue([]),
   executePipeline: vi.fn(),
   cancelRun: vi.fn(),
   createRunWebSocketTicket: vi.fn(),
@@ -93,6 +94,25 @@ describe("executionStore.validate", () => {
     expect(state.isValidating).toBe(false);
   });
 
+  it("refreshes review cards repaired by backend validation", async () => {
+    const result: ValidationResult = {
+      is_valid: false,
+      summary: "Review required",
+      checks: [],
+      errors: [],
+      warnings: [],
+      readiness: BLOCKED_READINESS,
+    };
+    const { validatePipeline } = await import("@/api/client");
+    (validatePipeline as ReturnType<typeof vi.fn>).mockResolvedValue(result);
+    const refreshAll = vi.fn(async () => {});
+    useInterpretationEventsStore.setState({ refreshAll } as never);
+
+    await useExecutionStore.getState().validate("session-1");
+
+    expect(refreshAll).toHaveBeenCalledWith("session-1");
+  });
+
   it("stores validation result on failure without side effects", async () => {
     const failedResult: ValidationResult = {
       is_valid: false,
@@ -125,8 +145,9 @@ describe("executionStore.validate", () => {
 
     await useExecutionStore.getState().validate("session-1");
 
-    // validate() should only store the result — no cross-store side effects.
-    // Orchestration (system messages, LLM feedback) is handled by subscriptions.
+    // Validation stores the result; orchestration (system messages, LLM
+    // feedback) remains in subscriptions. The only cross-store action is the
+    // review-card refresh pinned separately above.
     const state = useExecutionStore.getState();
     expect(state.validationResult).toEqual(failedResult);
     expect(state.isValidating).toBe(false);

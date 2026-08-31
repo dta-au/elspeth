@@ -33,7 +33,12 @@ if TYPE_CHECKING:
     from elspeth.web.composer.guided.planning import GuidedCorrectionTarget, GuidedRevisionAuthority
     from elspeth.web.composer.guided.state_machine import TerminalState
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
-    from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, GuidedOperationFence, SessionServiceProtocol
+    from elspeth.web.sessions.protocol import (
+        ComposerSessionPreferencesRecord,
+        GuidedOperationFence,
+        PreparedInterpretationEventDraft,
+        SessionServiceProtocol,
+    )
     from elspeth.web.sessions.telemetry import _SessionsTelemetry
 
 import structlog
@@ -1811,7 +1816,14 @@ def _backend_surface_args_for_site(
     if node is None:
         return None
     options = node.options
+    # Prompt/model/vague cards share the event writer's LLM-transform
+    # discriminator.  Checking only the requirement draft is insufficient:
+    # an aggregation carrying copied LLM options, or a transform with no
+    # prompt, still enumerates a fail-closed site but the writer rejects it.
+    is_llm_transform = node.node_type == "transform" and node.plugin == "llm"
     if site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+        if not is_llm_transform:
+            return None
         prompt_template = options["prompt_template"] if "prompt_template" in options else None
         if type(prompt_template) is not str or not prompt_template:
             raise InvariantError(
@@ -1823,6 +1835,8 @@ def _backend_surface_args_for_site(
             return None
         return (node.id, site.user_term, prompt_template)
     if site.kind is InterpretationKind.LLM_MODEL_CHOICE:
+        if not is_llm_transform:
+            return None
         model = options["model"] if "model" in options else None
         if type(model) is not str or not model:
             return None
@@ -1861,6 +1875,11 @@ def _backend_surface_args_for_site(
         # Only authored/staged vague-term requirements are surfaced.
         # Bare legacy placeholders carry no requirement and are left
         # fail-closed at the run-time gate; never invent a draft.
+        if not is_llm_transform:
+            return None
+        prompt_template = options["prompt_template"] if "prompt_template" in options else None
+        if type(prompt_template) is not str or not prompt_template:
+            return None
         draft = ComposerServiceImpl._matching_requirement_draft(options, kind=site.kind, user_term=site.user_term)
         if draft is None:
             return None
@@ -1879,6 +1898,52 @@ def unsurfaceable_pending_interpretation_review_sites(
     """
 
     return tuple(site for site in interpretation_sites(state) if _backend_surface_args_for_site(state, site) is None)
+
+
+def prepare_pending_interpretation_event_drafts_for_state(
+    state: CompositionState,
+    *,
+    model_identifier: str,
+    model_version: str,
+    provider: str,
+    composer_skill_hash: str,
+) -> tuple[PreparedInterpretationEventDraft, ...]:
+    """Prepare the generic surfacer's event cohort for atomic settlement.
+
+    Prompt-template cards retain the established first-pass ordering; every
+    kind still delegates to ``_backend_surface_args_for_site``, the one pure
+    site-to-writer projection shared with asynchronous repair surfacing.
+    Callers must reject ``unsurfaceable_pending_interpretation_review_sites``
+    before invoking this function.
+    """
+    from elspeth.web.sessions.protocol import PreparedInterpretationEventDraft
+
+    sites = interpretation_sites(state)
+    ordered_sites = (
+        *(site for site in sites if site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE),
+        *(site for site in sites if site.kind is not InterpretationKind.LLM_PROMPT_TEMPLATE),
+    )
+    drafts: list[PreparedInterpretationEventDraft] = []
+    for site in ordered_sites:
+        surfaced = _backend_surface_args_for_site(state, site)
+        if surfaced is None:
+            raise InvariantError("atomic interpretation cohort contains an unsurfaceable pending site")
+        affected_node_id, user_term, llm_draft = surfaced
+        drafts.append(
+            PreparedInterpretationEventDraft(
+                event_id=uuid4(),
+                affected_node_id=affected_node_id,
+                tool_call_id=f"{BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}{uuid4()}",
+                user_term=user_term,
+                kind=site.kind,
+                llm_draft=llm_draft,
+                model_identifier=model_identifier,
+                model_version=model_version,
+                provider=provider,
+                composer_skill_hash=composer_skill_hash,
+            )
+        )
+    return tuple(drafts)
 
 
 async def surface_pending_interpretation_reviews_for_state(
@@ -2532,7 +2597,8 @@ class ComposerServiceImpl:
             if type(requirement) not in (dict, MappingProxyType):
                 raise InvariantError("_has_pending_prompt_template_requirement: interpretation requirement entries must be dict-shaped")
             requirement_map = cast(Mapping[str, Any], requirement)
-            if requirement_map["kind"] != InterpretationKind.LLM_PROMPT_TEMPLATE.value:
+            requirement_kind = requirement_map["kind"] if "kind" in requirement_map else InterpretationKind.VAGUE_TERM.value
+            if requirement_kind != InterpretationKind.LLM_PROMPT_TEMPLATE.value:
                 continue
             if requirement_map["status"] != "pending":
                 continue

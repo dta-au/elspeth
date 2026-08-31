@@ -7103,6 +7103,141 @@ class TestRevertEndpoint:
         assert [message.content for message in messages] == ["Pipeline reverted to version 1."]
 
     @pytest.mark.asyncio
+    async def test_revert_resurfaces_review_cards_for_restored_pending_state(self, tmp_path: Path) -> None:
+        """Reverting to a once-pending version creates fresh consumable cards
+        even when the original version's cards are already terminal."""
+        from elspeth.web.interpretation_state import InterpretationReviewPending, materialize_state_for_execution
+        from elspeth.web.sessions.routes._helpers import _state_from_record
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Review revert", "local")
+        yaml_text = """
+sources:
+  source:
+    plugin: csv
+    on_success: score
+    options:
+      schema:
+        mode: observed
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score this: {{ row.value }}'
+sinks:
+  main:
+    plugin: csv
+    options:
+      path: outputs/out.csv
+    on_write_failure: discard
+"""
+
+        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+            return ValidationResult(is_valid=True, checks=[], errors=[])
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
+            imported = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+        assert imported.status_code == 200, imported.text
+        imported_id = imported.json()["id"]
+
+        original_events = await service.list_interpretation_events(session.id, status="pending")
+        assert {event.kind for event in original_events} == {
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            InterpretationKind.LLM_MODEL_CHOICE,
+        }
+        for event in original_events:
+            resolved = client.post(
+                f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
+                json={"choice": "accepted_as_drafted"},
+            )
+            assert resolved.status_code == 200, resolved.text
+        assert await service.list_interpretation_events(session.id, status="pending") == []
+
+        reverted = client.post(
+            f"/api/sessions/{session.id}/state/revert",
+            json={"operation_id": str(uuid.uuid4()), "state_id": imported_id},
+        )
+
+        assert reverted.status_code == 200, reverted.text
+        fresh_events = await service.list_interpretation_events(session.id, status="pending")
+        assert {event.kind for event in fresh_events} == {
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            InterpretationKind.LLM_MODEL_CHOICE,
+        }
+        assert {str(event.composition_state_id) for event in fresh_events} == {reverted.json()["id"]}
+        for event in fresh_events:
+            resolved = client.post(
+                f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
+                json={"choice": "accepted_as_drafted"},
+            )
+            assert resolved.status_code == 200, resolved.text
+        head = await service.get_current_state(session.id)
+        assert head is not None
+        assert not isinstance(materialize_state_for_execution(_state_from_record(head)), InterpretationReviewPending)
+
+    @pytest.mark.asyncio
+    async def test_revert_replay_repairs_cards_after_post_commit_surface_failure(self, tmp_path: Path) -> None:
+        """A retry of the same completed operation repairs the interval where
+        revert committed but post-commit card surfacing failed."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app, raise_server_exceptions=False)
+        session = await service.create_session("alice", "Review revert replay", "local")
+        yaml_text = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score {{ row.value }}'
+"""
+        imported = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+        assert imported.status_code == 200, imported.text
+        for event in await service.list_interpretation_events(session.id, status="pending"):
+            resolved = client.post(
+                f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
+                json={"choice": "accepted_as_drafted"},
+            )
+            assert resolved.status_code == 200, resolved.text
+        operation_id = str(uuid.uuid4())
+
+        with patch(
+            "elspeth.web.sessions.routes.composer.state._surface_reverted_interpretation_reviews",
+            side_effect=RuntimeError("surface interrupted"),
+        ):
+            first = client.post(
+                f"/api/sessions/{session.id}/state/revert",
+                json={"operation_id": operation_id, "state_id": imported.json()["id"]},
+            )
+        assert first.status_code == 500
+        versions_after_first = await service.get_state_versions(session.id)
+
+        replay = client.post(
+            f"/api/sessions/{session.id}/state/revert",
+            json={"operation_id": operation_id, "state_id": imported.json()["id"]},
+        )
+
+        assert replay.status_code == 200, replay.text
+        versions_after_replay = await service.get_state_versions(session.id)
+        assert [record.id for record in versions_after_replay] == [record.id for record in versions_after_first]
+        replay_events = [
+            event
+            for event in await service.list_interpretation_events(session.id, status="pending")
+            if str(event.composition_state_id) == replay.json()["id"]
+        ]
+        assert {event.kind for event in replay_events} == {
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            InterpretationKind.LLM_MODEL_CHOICE,
+        }
+
+    @pytest.mark.asyncio
     async def test_revert_injects_system_message(self, tmp_path) -> None:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
@@ -7661,6 +7796,55 @@ sinks:
         assert mc.user_term == "llm_model_choice:score"
 
     @pytest.mark.asyncio
+    async def test_post_state_yaml_opt_out_returns_the_final_durable_head(self, tmp_path: Path) -> None:
+        """Auto-resolution may advance the head while cards are surfaced;
+        the import response must describe that final durable state."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Opt-out import", "local")
+        await service.record_session_interpretation_opt_out(
+            session_id=session.id,
+            actor="user:alice",
+        )
+        yaml_text = """
+sources:
+  source:
+    plugin: csv
+    on_success: score
+    options:
+      schema:
+        mode: observed
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score this: {{ row.value }}'
+sinks:
+  main:
+    plugin: csv
+    options:
+      path: outputs/out.csv
+    on_write_failure: discard
+"""
+
+        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+            return ValidationResult(is_valid=True, checks=[], errors=[])
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
+            response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert response.status_code == 200, response.text
+        current = await service.get_current_state(session.id)
+        assert current is not None
+        assert response.json()["id"] == str(current.id)
+        assert response.json()["version"] == current.version
+        assert await service.list_interpretation_events(session.id, status="pending") == []
+
+    @pytest.mark.asyncio
     async def test_post_state_yaml_surfaces_source_data_contract_review(self, tmp_path: Path) -> None:
         """A YAML-bound uploaded source uses the same source-site surfacer as
         Composer settlement, so its derived contract debt is visible and
@@ -7715,8 +7899,13 @@ sinks:
                 f"/api/sessions/{session.id}/state/yaml",
                 json={"yaml": yaml_text, "source_blob_ids": {"source": str(blob_id)}},
             )
+            reimported = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={"yaml": yaml_text, "source_blob_ids": {"source": str(blob_id)}},
+            )
 
         assert response.status_code == 200, response.text
+        assert reimported.status_code == 200, reimported.text
         record = await service.get_current_state(session.id)
         assert record is not None
         blocked = materialize_state_for_execution(_state_from_record(record))
@@ -7724,6 +7913,8 @@ sinks:
         assert [(site.component_id, site.kind) for site in blocked.sites] == [("source", InterpretationKind.SOURCE_DATA_CONTRACT)]
 
         events = await service.list_interpretation_events(session.id, status="pending")
+        # Same source contract on a new imported state reuses the live card;
+        # a twin would make the exactly-one resolver boundary unconsumable.
         assert [(event.affected_node_id, event.kind) for event in events] == [("source", InterpretationKind.SOURCE_DATA_CONTRACT)]
         event = events[0]
         assert event.llm_draft == build_source_data_contract_draft(["colour"], ("colour", "extra"))
@@ -7801,6 +7992,54 @@ sinks:
         assert all(event.model_identifier == "yaml_import" for event in events)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", [ValueError("writer refused"), RuntimeError("storage failed")])
+    async def test_post_state_yaml_rolls_back_state_and_event_prefix_when_event_cohort_fails(
+        self,
+        tmp_path: Path,
+        failure: Exception,
+    ) -> None:
+        """The state and every review card are one durability cohort."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app, raise_server_exceptions=False)
+        session = await service.create_session("alice", "Atomic import", "local")
+        yaml_text = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score this: {{ row.value }}'
+"""
+        original_prepare = service._prepare_or_create_pending_interpretation_event
+        prepared_count = 0
+
+        async def _inject_second_writer_failure(*args, **kwargs):
+            nonlocal prepared_count
+            writer = await original_prepare(*args, **kwargs)
+            prepared_count += 1
+            if prepared_count != 2:
+                return writer
+
+            def _fail(_connection):
+                raise failure
+
+            return _fail
+
+        with patch.object(
+            service,
+            "_prepare_or_create_pending_interpretation_event",
+            side_effect=_inject_second_writer_failure,
+        ):
+            response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert response.status_code == 500
+        assert await service.get_current_state(session.id) is None
+        assert await service.list_interpretation_events(session.id, status="all") == []
+
+    @pytest.mark.asyncio
     async def test_post_state_yaml_rejects_unsurfaceable_pending_site_atomically(self, tmp_path: Path) -> None:
         """Every persisted pending review site must have a consumable event.
 
@@ -7831,6 +8070,90 @@ transforms:
 
         assert response.status_code == 400, response.text
         assert "cannot be surfaced" in response.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+        assert await service.list_interpretation_events(session.id, status="all") == []
+
+    @pytest.mark.asyncio
+    async def test_post_state_yaml_rejects_vague_term_site_the_writer_cannot_surface(self, tmp_path: Path) -> None:
+        """The pure precheck must include the LLM-transform discriminator
+        enforced by the event writer, not just the requirement draft."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Writer mismatch", "local")
+        yaml_text = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    interpretation_requirements:
+    - id: vague:score
+      kind: vague_term
+      user_term: recent
+      status: pending
+      draft: last 30 days
+"""
+
+        response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert response.status_code == 400, response.text
+        assert "cannot be surfaced" in response.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+        assert await service.list_interpretation_events(session.id, status="all") == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "yaml_text",
+        [
+            pytest.param(
+                """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    prompt_template: [not, a, string]
+    interpretation_requirements:
+    - id: prompt:score
+      kind: llm_prompt_template
+      user_term: llm_prompt_template:score
+      status: pending
+      draft: a draft
+""",
+                id="malformed-prompt-template",
+            ),
+            pytest.param(
+                """
+sources:
+  source:
+    plugin: csv
+    on_success: main
+    options:
+      source_authoring:
+        content_hash: abc123
+""",
+                id="malformed-source-authoring",
+            ),
+        ],
+    )
+    async def test_post_state_yaml_sanitizes_malformed_review_metadata(
+        self,
+        tmp_path: Path,
+        yaml_text: str,
+    ) -> None:
+        """Untrusted review metadata is a named 400, never an invariant 500."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app, raise_server_exceptions=False)
+        session = await service.create_session("alice", "Malformed review metadata", "local")
+
+        response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"] == "Imported YAML contains malformed interpretation review metadata."
         assert await service.get_current_state(session.id) is None
         assert await service.list_interpretation_events(session.id, status="all") == []
 
