@@ -168,11 +168,17 @@ def _observed(*guaranteed: str) -> dict[str, Any]:
 def _fan_in_state(
     sources: dict[str, SourceSpec],
     nodes: tuple[NodeSpec, ...] = (),
+    *,
+    required: list[str] | None = None,
 ) -> CompositionState:
     return CompositionState(
         source=None,
         sources=sources,
-        nodes=(_queue_node(), _llm_node(input_name="q", required=["colour"]), *nodes),
+        nodes=(
+            _queue_node(),
+            _llm_node(input_name="q", required=required if required is not None else ["colour"]),
+            *nodes,
+        ),
         edges=(),
         outputs=(),
         metadata=PipelineMetadata(),
@@ -274,6 +280,26 @@ class TestFanInDemandAttribution:
         state = _fan_in_state({"src_a": _csv_source(_observed("colour", "id")), "src_b": _csv_source(_observed("id"))})
         assert backtraced_source_demand(state, "src_a", disregard_fields=frozenset({"colour"})) == ("colour",)
         assert backtraced_source_demand(state, "src_b") == ("colour",)
+
+    def test_disregarding_the_only_guarantee_preserves_fan_in_participation(self) -> None:
+        # A resolved card's accepted field is stripped before demand is
+        # recomputed.  Stripping the last field must leave an EXPLICIT empty
+        # vote, not turn the source into an abstainer: otherwise one abstaining
+        # arm makes the queue abstain wholesale, erases the Stage-1 miss, and
+        # hides both the accepted field and a newly required field.
+        state = _fan_in_state(
+            {
+                "src_a": _csv_source(_observed("colour")),
+                "src_b": _csv_source(_observed("colour")),
+            },
+            required=["colour", "size"],
+        )
+
+        assert backtraced_source_demand(
+            state,
+            "src_a",
+            disregard_fields=frozenset({"colour"}),
+        ) == ("colour", "size")
 
     def test_composer_authored_sibling_is_never_stamped_even_when_stampable(self) -> None:
         # src_b carries the composer-authored content marker: its guarantee

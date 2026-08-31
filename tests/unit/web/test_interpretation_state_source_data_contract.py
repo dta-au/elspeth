@@ -164,8 +164,12 @@ def _queue_node() -> NodeSpec:
     )
 
 
-def _fan_in_state(sources: dict[str, SourceSpec]) -> CompositionState:
-    node = _llm_node(required=["colour"])
+def _fan_in_state(
+    sources: dict[str, SourceSpec],
+    *,
+    required: list[str] | None = None,
+) -> CompositionState:
+    node = _llm_node(required=required if required is not None else ["colour"])
     return CompositionState(
         source=None,
         sources=sources,
@@ -235,6 +239,23 @@ class TestFanInSiteLifecycle:
         sites = _contract_sites(state)
         assert [site.component_id for site in sites] == ["source:src_b"]
         assert current_source_data_contract_demand(state, "src_b") == ("colour",)
+
+    def test_growth_after_sole_guarantees_reopens_every_source_card(self) -> None:
+        # Both sources previously promised their sole guaranteed field.  A
+        # later consumer grows the contract, so stripping each accepted field
+        # for recomputation must preserve that arm's explicit-empty vote and
+        # surface the full current demand on both resolvable cards.
+        state = _fan_in_state(
+            {
+                "src_a": _fan_in_source(_resolved_contract_options(["colour"], extra={"path": "/tmp/a.csv"})),
+                "src_b": _fan_in_source(_resolved_contract_options(["colour"], extra={"path": "/tmp/b.csv"})),
+            },
+            required=["colour", "size"],
+        )
+
+        assert current_source_data_contract_demand(state, "src_a") == ("colour", "size")
+        assert current_source_data_contract_demand(state, "src_b") == ("colour", "size")
+        assert sorted(site.component_id for site in _contract_sites(state)) == ["source:src_a", "source:src_b"]
 
 
 class TestReadinessBlocking:

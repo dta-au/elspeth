@@ -133,8 +133,11 @@ def _source_options_without_guaranteed_fields(
 
     Used to recompute demand as if a previous acknowledgement had not been
     stamped, so a demand-set change is measured against the graph, not
-    against the stamp the previous answer produced. Malformed shapes are
-    returned unchanged — the demand walk abstains on them anyway.
+    against the stamp the previous answer produced. An empty remainder stays
+    as an explicit empty list: ``SchemaConfig`` distinguishes that
+    participating vote from an absent-key abstention, which is material at a
+    fan-in. Malformed shapes are returned unchanged — the demand walk abstains
+    on them anyway.
     """
     if not fields:
         return options
@@ -149,10 +152,7 @@ def _source_options_without_guaranteed_fields(
         return options
     remaining = [field for field in existing if not (isinstance(field, str) and field in fields)]
     schema = dict(raw_schema)
-    if remaining:
-        schema["guaranteed_fields"] = remaining
-    else:
-        del schema["guaranteed_fields"]
+    schema["guaranteed_fields"] = remaining
     return {**options, schema_key: schema}
 
 
