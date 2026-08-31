@@ -293,6 +293,16 @@ async def _reconcile_pending_landscape_runs(
     )
 
 
+_ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES = 5
+"""Consecutive transient-failure bound for the periodic orphan sweeper.
+
+One or two ``OperationalError`` sweeps are DB contention and retry cleanly;
+this many in a row means the fault is standing, so the sweeper stops
+presuming transience and re-raises — terminating the task so the stored
+failure surfaces at lifespan shutdown instead of being absorbed every
+interval forever."""
+
+
 async def _periodic_orphan_cleanup(
     session_service: SessionServiceImpl,
     execution_service: ExecutionServiceImpl,
@@ -318,6 +328,7 @@ async def _periodic_orphan_cleanup(
     import structlog
 
     slog = structlog.get_logger()
+    consecutive_failures = 0
     while True:
         await asyncio.sleep(interval_seconds)
         cancelled = 0
@@ -342,32 +353,20 @@ async def _periodic_orphan_cleanup(
                     landscape_url,
                     create_tables=create_tables,
                 )
-        except (SQLAlchemyError, OSError) as cleanup_exc:
-            # Narrow catch — only recoverable audit/IO failures are
-            # absorbed so the loop retries on the next interval.
-            # SchemaCompatibilityError is deliberately NOT in the tuple:
-            # an incompatible Landscape schema is operator-actionable
-            # state, not a transient — retrying every interval can never
-            # fix it, so it propagates, terminates the task, and surfaces
-            # at lifespan shutdown (see the task-death note below).
-            # SQLAlchemyError covers DB-layer transients raised from
-            # cancel_all_orphaned_runs (engine.begin(), conn.execute());
-            # OSError covers SQLite file-level failures that can escape
-            # before SQLAlchemy wraps them.
-            #
-            # Programmer-bug exceptions (AttributeError from a drifted
-            # attribute on ExecutionServiceImpl, TypeError from a
-            # signature change, AssertionError from an invariant guard)
-            # are NOT caught: they propagate out of the while-loop,
-            # terminating the task. The dead task surfaces to the
-            # operator at lifespan shutdown because the outer await
-            # re-raises the stored exception (the surrounding
-            # contextlib.suppress narrows to CancelledError only).
-            # Consistent with the audit-cleanup narrow catch in
-            # ``ComposerServiceImpl.compose`` (web/composer/service.py)
-            # and the cleanup-rollback sites in the
-            # ``fork_from_message`` route handler
-            # (web/sessions/routes.py).
+            consecutive_failures = 0
+        except OperationalError as cleanup_exc:
+            # Only OperationalError is retried — the one DB failure class
+            # that models transient contention (lock timeout, dropped
+            # connection, sqlite-busy) rather than standing operator or
+            # programmer state. Every other SQLAlchemyError subclass
+            # (ProgrammingError, IntegrityError, ...), OSError, and
+            # SchemaCompatibilityError propagates, terminating the task
+            # so the fault surfaces at lifespan shutdown (the outer
+            # contextlib.suppress narrows to CancelledError only) —
+            # retrying those every interval can never fix them.
+            # The retry itself is bounded: past the consecutive-failure
+            # bound contention is no longer presumed transient and the
+            # exception re-raises through the same task-death route.
             #
             # exc_info deliberately omitted: SQLAlchemyError __cause__
             # chains routinely carry the DB connection URL, schema
@@ -376,9 +375,18 @@ async def _periodic_orphan_cleanup(
             # redaction pattern was standardised. Structured logs carry
             # exc_class only; operators reading logs get enough
             # correlation to triage without the traceback text.
+            consecutive_failures += 1
+            if consecutive_failures >= _ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES:
+                slog.error(
+                    "periodic_orphan_cleanup_escalating",
+                    exc_class=type(cleanup_exc).__name__,
+                    consecutive_failures=consecutive_failures,
+                )
+                raise
             slog.error(
                 "periodic_orphan_cleanup_failed",
                 exc_class=type(cleanup_exc).__name__,
+                consecutive_failures=consecutive_failures,
             )
         if cancelled:
             telemetry.orphaned_runs_cancelled_total.add(
@@ -501,32 +509,25 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         landscape_url = settings.get_landscape_url()
     session_service = app.state.session_service
-    cancelled_runs: list[RunRecord] = []
     # Inline custody stages are part of the blob integrity protocol, not
     # best-effort orphan bookkeeping. Do not serve until every stage has a
     # row-authoritative outcome.
     await app.state.blob_service.reconcile_inline_custody_publications()
-    try:
-        cancelled_runs = await session_service.cancel_all_orphaned_run_records(
-            reason=f"Orphaned by server restart — no active process {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}",
-        )
-        await _reconcile_pending_landscape_runs(
-            session_service,
-            landscape_url,
-            create_tables=create_landscape_tables,
-        )
-    except (SQLAlchemyError, OSError) as cleanup_exc:
-        # Transient DB/IO faults only: the startup sweep is retried with the
-        # same reconcile arm by _periodic_orphan_cleanup every
-        # orphan_run_check_interval_seconds, so booting degraded is bounded.
-        # SchemaCompatibilityError is deliberately NOT caught — an
-        # incompatible Landscape schema needs the operator and must fail
-        # startup rather than let the service run with unreconcilable audit
-        # state.
-        slog.error(
-            "lifespan_orphan_cleanup_failed",
-            exc_class=type(cleanup_exc).__name__,
-        )
+    # The startup orphan sweep fails startup on any SQL/IO fault, same as
+    # the inline-custody reconciliation above: a server that cannot settle
+    # orphaned runs would serve sessions still blocked by the active-run
+    # index and Landscape rows pending reconciliation, with no record that
+    # the sweep never ran. The process supervisor retries boot; a fault
+    # transient enough to boot through is transient enough to restart
+    # through.
+    cancelled_runs = await session_service.cancel_all_orphaned_run_records(
+        reason=f"Orphaned by server restart — no active process {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}",
+    )
+    await _reconcile_pending_landscape_runs(
+        session_service,
+        landscape_url,
+        create_tables=create_landscape_tables,
+    )
     cancelled = len(cancelled_runs)
     if cancelled:
         app.state.sessions_telemetry.orphaned_runs_cancelled_total.add(
