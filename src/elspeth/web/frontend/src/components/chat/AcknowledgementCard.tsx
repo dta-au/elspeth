@@ -81,6 +81,15 @@ interface DataContractDraft {
   missingFromSample: string[];
 }
 
+const DATA_CONTRACT_DRAFT_VERSION = 2;
+const DATA_CONTRACT_DRAFT_KEYS = [
+  "contract_version",
+  "kind",
+  "demanded_fields",
+  "sample_header",
+  "missing_from_sample",
+] as const;
+
 export function parseDataContractDraft(draft: string): DataContractDraft | null {
   let payload: unknown;
   try {
@@ -90,6 +99,15 @@ export function parseDataContractDraft(draft: string): DataContractDraft | null 
   }
   if (typeof payload !== "object" || payload === null) return null;
   const record = payload as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (
+    keys.length !== DATA_CONTRACT_DRAFT_KEYS.length ||
+    !DATA_CONTRACT_DRAFT_KEYS.every((key) => keys.includes(key)) ||
+    record["contract_version"] !== DATA_CONTRACT_DRAFT_VERSION ||
+    record["kind"] !== "source_data_contract"
+  ) {
+    return null;
+  }
   const demanded = record["demanded_fields"];
   if (
     !Array.isArray(demanded) ||
@@ -98,21 +116,25 @@ export function parseDataContractDraft(draft: string): DataContractDraft | null 
     return null;
   }
   const sample = record["sample_header"];
-  const sampleHeader =
-    sample === null || sample === undefined
-      ? null
-      : Array.isArray(sample) && sample.every((cell) => typeof cell === "string")
-        ? (sample as string[])
-        : null;
+  if (
+    sample !== null &&
+    (!Array.isArray(sample) ||
+      !sample.every((cell) => typeof cell === "string"))
+  ) {
+    return null;
+  }
   const missing = record["missing_from_sample"];
-  const missingFromSample =
-    Array.isArray(missing) && missing.every((field) => typeof field === "string")
-      ? (missing as string[])
-      : [];
+  if (
+    !Array.isArray(missing) ||
+    !missing.every((field) => typeof field === "string") ||
+    !missing.every((field) => demanded.includes(field))
+  ) {
+    return null;
+  }
   return {
     demandedFields: demanded as string[],
-    sampleHeader,
-    missingFromSample,
+    sampleHeader: sample as string[] | null,
+    missingFromSample: missing as string[],
   };
 }
 
@@ -430,8 +452,8 @@ export function AcknowledgementCard({
             )}
           </p>
           <p className="ack-card-data-contract-note">
-            A column only needs to be <em>present</em> on each row — it may be
-            empty. If a row that passed source validation is missing one of
+            Each valid row must carry the column in both its data and emitted
+            schema contract; the value may be empty. If either omits one of
             these columns, the run stops and records a source data-contract
             failure. Rows quarantined during source validation are handled
             separately and never reach this check.

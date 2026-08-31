@@ -456,10 +456,11 @@ user_term="source_data_contract")` and OMIT `llm_draft` — the server computes
 the demanded field set from the graph (never supply a field list; a supplied
 draft that disagrees is rejected). On acknowledgement the server stamps exactly
 those fields into the source's `schema.guaranteed_fields` and the runtime
-enforces them per row. A row that passed source validation but misses a
-promised column violates the producer declaration, records failed boundary
-evidence, and stops the run. Rows the source quarantines during its own
-validation never reach this check. Do not call it for composer-authored bound
+enforces them per row: every promised column must be present in both row data
+and the emitted row contract. Any valid row that omits a promised column from
+either location violates the producer declaration; ELSPETH records failed
+boundary evidence and stops the run. Rows the source quarantines during its
+own validation never reach this check. Do not call it for composer-authored bound
 blobs (the `invented_source` flow and bind-time auto-declare own those) or
 when validation reports no missing source fields.
 

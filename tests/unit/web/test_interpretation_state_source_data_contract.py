@@ -9,12 +9,14 @@ invented_source (materialize_state_for_execution returns the pending site).
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from typing import Any, Literal
 
 import pytest
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_USER_TERM,
     build_source_data_contract_draft,
@@ -104,6 +106,40 @@ def _resolved_contract_options(acknowledged: list[str], *, extra: dict[str, Any]
     return options
 
 
+def _legacy_v1_contract_options(acknowledged: list[str]) -> dict[str, Any]:
+    """Persisted v1 evidence: valid historically, but not v2 authority."""
+    payload = {
+        "contract_version": 1,
+        "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+        "demanded_fields": sorted(acknowledged),
+        "sample_header": None,
+        "missing_from_sample": [],
+    }
+    draft = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return {
+        "path": "/tmp/upload.csv",
+        "schema": {"mode": "observed", "guaranteed_fields": list(acknowledged)},
+        INTERPRETATION_REQUIREMENTS_KEY: [
+            {
+                "id": "source-data-contract-source",
+                "kind": InterpretationKind.SOURCE_DATA_CONTRACT.value,
+                "user_term": SOURCE_DATA_CONTRACT_USER_TERM,
+                "status": "resolved",
+                "draft": draft,
+                "event_id": "11111111-1111-1111-1111-111111111111",
+                "accepted_value": draft,
+                "accepted_artifact_hash": stable_hash(
+                    {
+                        "review_kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                        "demanded_fields": sorted(acknowledged),
+                    }
+                ),
+                "resolved_prompt_template_hash": None,
+            }
+        ],
+    }
+
+
 class TestSiteStaging:
     def test_uploaded_source_with_demand_stages_a_site(self) -> None:
         sites = _contract_sites(_state({"path": "/tmp/upload.csv"}, required=["colour"]))
@@ -131,6 +167,13 @@ class TestSiteStaging:
     def test_acknowledged_matching_demand_is_clean(self) -> None:
         state = _state(_resolved_contract_options(["colour"]), required=["colour"])
         assert _contract_sites(state) == []
+
+    def test_legacy_v1_acknowledgement_reopens_with_current_demand_and_blocks_execution(self) -> None:
+        state = _state(_legacy_v1_contract_options(["colour"]), required=["colour"])
+
+        assert current_source_data_contract_demand(state, "source") == ("colour",)
+        assert [site.component_id for site in _contract_sites(state)] == ["source"]
+        assert isinstance(materialize_state_for_execution(state), InterpretationReviewPending)
 
     def test_incoherent_accepted_value_and_hash_blocks_execution(self) -> None:
         options = _resolved_contract_options(["colour"])

@@ -764,7 +764,8 @@ class TestStep3MutationTierMigration:
             (Path(__file__).parents[4] / "src/elspeth/web/composer/skills/pipeline_composer.md").read_text(encoding="utf-8").split()
         )
 
-        assert "records failed boundary evidence, and stops the run" in skill
+        assert "records failed boundary evidence and stops the run" in skill
+        assert "both row data and the emitted row contract" in skill
         assert "Rows the source quarantines during its own validation never reach this check" in skill
         assert "rows missing a promised column quarantine; the run continues" not in skill
 

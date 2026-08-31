@@ -183,6 +183,7 @@ from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.skills import assert_skill_hash_unchanged_on_disk
 from elspeth.web.composer.source_demand import (
     build_source_data_contract_draft,
+    parse_legacy_source_data_contract_fields,
     sample_header_for_source,
 )
 from elspeth.web.composer.state import CompositionState, NodeSpec, ValidationSummary
@@ -1676,13 +1677,15 @@ async def _surfaced_evidence_keys(
 ) -> frozenset[tuple[str, str, InterpretationKind]]:
     """Per-site surfacing evidence on one state, in ANY resolution status.
 
-    The interpretation_events rows bound to a committed state ARE the durable
-    completion record for that state's surfacing debt: resolving or
-    abandoning a review updates its row, it never removes it, and the state
+    Current-version interpretation_events rows bound to a committed state ARE
+    the durable completion record for that state's surfacing debt: resolving
+    or abandoning a review updates its row, it never removes it, and the state
     the rows bind to is immutable. A pending-only check would therefore read
     an already-resolved site as still owed and recreate it against stale
     historical state — which the writer boundary rejects outright once the
-    placeholder has been consumed.
+    placeholder has been consumed. The deliberate exception is a v1
+    source_data_contract card: it proves the old consequence was shown, not
+    the corrected v2 consequence, so migration must surface current evidence.
     """
 
     events = await sessions_service.list_interpretation_events(
@@ -1690,11 +1693,22 @@ async def _surfaced_evidence_keys(
         status="all",
         composition_state_id=UUID(current_state_id),
     )
-    return frozenset(
-        (event.affected_node_id, event.user_term, event.kind)
-        for event in events
-        if event.affected_node_id is not None and event.user_term is not None and event.kind is not None
-    )
+    evidence: set[tuple[str, str, InterpretationKind]] = set()
+    for event in events:
+        if event.affected_node_id is None or event.user_term is None or event.kind is None:
+            continue
+        if (
+            event.kind is InterpretationKind.SOURCE_DATA_CONTRACT
+            and event.llm_draft is not None
+            and parse_legacy_source_data_contract_fields(event.llm_draft) is not None
+        ):
+            # A v1 row is durable evidence that the old card was surfaced, but
+            # it is not evidence that this state's corrected v2 consequence
+            # was shown. Let the repair surfacer supersede a pending v1 card or
+            # mint a current card beside resolved v1 history.
+            continue
+        evidence.add((event.affected_node_id, event.user_term, event.kind))
+    return frozenset(evidence)
 
 
 async def _auto_surface_prompt_template_reviews_for_state(

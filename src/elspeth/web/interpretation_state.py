@@ -27,6 +27,7 @@ from elspeth.web.composer.source_demand import (
     backtraced_source_demand,
     parse_source_data_contract_accepted_fields,
     source_data_contract_artifact_hash,
+    source_data_contract_fields_for_demand_recompute,
 )
 
 # ``SOURCE_AUTHORING_KEY`` is re-exported in the explicit ``X as X`` form on
@@ -1295,11 +1296,20 @@ def current_source_data_contract_demand(state: CompositionState, source_name: st
         return ()
     requirement = _source_data_contract_requirement(source.options)
     disregard: frozenset[str] = frozenset()
-    if requirement is not None and requirement["status"] == "resolved":
-        acknowledged = resolved_source_data_contract_fields(requirement)
-        # Invalid accepted-value/hash evidence strips nothing. The pending-site
-        # enumerator independently exposes that integrity failure even when a
-        # stale guarantee would otherwise make graph demand appear empty.
+    if (
+        requirement is not None
+        and requirement["status"] == "resolved"
+        and resolved_review_evidence_is_coherent(requirement, InterpretationKind.SOURCE_DATA_CONTRACT)
+        and requirement["accepted_value"] is not None
+    ):
+        acknowledged = source_data_contract_fields_for_demand_recompute(
+            requirement["accepted_value"],
+            requirement["accepted_artifact_hash"],
+        )
+        # Invalid evidence strips nothing. Coherent v1 evidence may strip its
+        # old guarantee ONLY here so the current demand resurfaces as a
+        # resolvable v2 card; resolved_source_data_contract_fields remains
+        # current-v2-only and therefore keeps execution fail-closed.
         if acknowledged is not None:
             disregard = frozenset(acknowledged)
     return backtraced_source_demand(state, source_name, disregard_fields=disregard)
@@ -1314,7 +1324,8 @@ def _pending_source_data_contract_sites(state: CompositionState) -> tuple[Interp
     existed at bind time or arose later from a node mutation. Mirrors the
     ``_pending_source_sites`` drift posture for invented_source: a resolved
     requirement is clean ONLY while its accepted artifact (here the
-    acknowledged FIELD SET, bound by ``source_data_contract_artifact_hash``)
+    acknowledged contract version, consequence, and FIELD SET, bound by
+    ``source_data_contract_artifact_hash``)
     still matches the current demand; a demand-set change falls through to a
     pending site, re-opening the card. A demand that shrinks to EMPTY closes
     the site without re-asking: there is nothing left to acknowledge, and
@@ -2501,19 +2512,38 @@ def _reconcile_source_options(
         shell = _pending_authoring_shell(proposed_requirement)
         previous_requirement = previous_index[identity] if identity in previous_index else None
         if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
-            # The acknowledged artifact binds the demand FIELD SET, which is a
-            # fact about the whole graph rather than about this source's own
-            # options, so this per-source reconciliation cannot judge graph
-            # drift. It can and must validate the accepted-value/hash pair and
-            # require the proposed source to retain the resolver-stamped
-            # guarantee before preserving that row's authority. The pending-
-            # site enumerator recomputes live graph demand on every read.
+            # The acknowledged artifact binds the contract semantics and
+            # demand FIELD SET, which are facts about the whole graph rather
+            # than about this source's own options, so this per-source
+            # reconciliation cannot judge graph drift. It can and must
+            # validate the accepted-value/hash pair and require the proposed
+            # source to retain the resolver-stamped guarantee before
+            # preserving current authority. The pending-site enumerator
+            # recomputes live graph demand on every read.
             if previous is None or previous_requirement is None or previous_requirement["status"] != "resolved":
                 reconciled.append(shell)
                 continue
             _require_resolved_review_coherence(previous_requirement)
             acknowledged_fields = resolved_source_data_contract_fields(previous_requirement)
             if acknowledged_fields is None:
+                accepted_value = previous_requirement["accepted_value"]
+                legacy_fields = (
+                    source_data_contract_fields_for_demand_recompute(
+                        accepted_value,
+                        previous_requirement["accepted_artifact_hash"],
+                    )
+                    if accepted_value is not None
+                    else None
+                )
+                if legacy_fields is not None:
+                    # Coherent v1 evidence is valid history but cannot carry
+                    # authority for v2's corrected consequence. Preserve the
+                    # historic row so its fields remain available to the
+                    # migration-only demand recompute; the site enumerator
+                    # still reopens it and the surfacer computes a current v2
+                    # draft from the live graph.
+                    reconciled.append(dict(previous_requirement))
+                    continue
                 raise ValueError(f"resolved interpretation requirement {requirement_id!r} evidence drifted")
             proposed_guaranteed_fields = _observed_source_guaranteed_fields(proposed.options)
             if proposed_guaranteed_fields is None or not frozenset(acknowledged_fields) <= proposed_guaranteed_fields:

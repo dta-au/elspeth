@@ -47,8 +47,21 @@ from elspeth.web.composer.state import SOURCE_AUTHORING_KEY, CompositionState, S
 # user-visible title ("Data contract") lives in the frontend renderer.
 SOURCE_DATA_CONTRACT_USER_TERM: Final[str] = "source_data_contract"
 
-# Wire/audit shape version for the canonical card draft JSON.
-SOURCE_DATA_CONTRACT_DRAFT_VERSION: Final[int] = 1
+# Wire/audit shape version for the canonical card draft JSON. Version 2
+# re-binds acknowledgement authority after the user-facing consequence was
+# corrected from quarantine-and-continue to ADR-016's fail-closed behaviour.
+SOURCE_DATA_CONTRACT_DRAFT_VERSION: Final[int] = 2
+
+# Stable semantic identity included in the acknowledgement artifact domain.
+# A future consequence change must choose a new token and draft version: field
+# equality alone cannot carry user authority across materially different
+# consequences.
+SOURCE_DATA_CONTRACT_ENFORCEMENT_SEMANTICS: Final[str] = "payload_and_emitted_contract_presence_fail_closed"
+
+_SOURCE_DATA_CONTRACT_DRAFT_KEYS: Final[frozenset[str]] = frozenset(
+    {"contract_version", "kind", "demanded_fields", "sample_header", "missing_from_sample"}
+)
+_LEGACY_SOURCE_DATA_CONTRACT_DRAFT_VERSION: Final[int] = 1
 
 # Bounded read for the ILLUSTRATIVE sample header: the sample is evidence
 # shown on the card, never the thing being ratified, so the read is
@@ -59,15 +72,28 @@ _SAMPLE_HEADER_MAX_CELL_CHARS: Final[int] = 512
 
 
 def source_data_contract_artifact_hash(fields: Iterable[str]) -> str:
-    """Canonical artifact hash binding an acknowledged demand FIELD SET.
+    """Canonical artifact hash binding current semantics and demand fields.
 
     Mirrors ``accepted_artifact_hash`` binding content for invented_source:
-    the acknowledgement attests exactly this set of field names, so a
-    demand-set change after acknowledgement re-opens the card. The sample
-    header is deliberately NOT part of the domain — it is illustrative
-    evidence, and a re-uploaded sample must not drift an accepted promise
-    whose demanded fields are unchanged.
+    the acknowledgement attests this contract kind, draft version,
+    fail-closed consequence, and exact field set. A consequence/version or
+    demand-set change after acknowledgement therefore re-opens the card. The
+    sample header is deliberately NOT part of the domain — it is illustrative
+    evidence, and a re-uploaded sample must not drift an otherwise identical
+    accepted promise.
     """
+    return stable_hash(
+        {
+            "review_kind": SOURCE_DATA_CONTRACT_USER_TERM,
+            "contract_version": SOURCE_DATA_CONTRACT_DRAFT_VERSION,
+            "enforcement_semantics": SOURCE_DATA_CONTRACT_ENFORCEMENT_SEMANTICS,
+            "demanded_fields": sorted(fields),
+        }
+    )
+
+
+def _legacy_source_data_contract_artifact_hash(fields: Iterable[str]) -> str:
+    """Reproduce the v1 field-only hash for migration checks only."""
     return stable_hash({"review_kind": SOURCE_DATA_CONTRACT_USER_TERM, "demanded_fields": sorted(fields)})
 
 
@@ -364,14 +390,103 @@ def build_source_data_contract_draft(
     "hash, never this parse, is the acknowledgement authority",
 )
 def parse_source_data_contract_accepted_fields(value: str) -> tuple[str, ...] | None:
-    """Parse the acknowledged demand set back out of a stored draft/accepted value."""
+    """Parse fields only from a complete, current contract draft."""
     try:
         payload = json.loads(value)
     except (TypeError, ValueError):
         return None
     if not isinstance(payload, Mapping):
         return None
-    demanded = payload["demanded_fields"] if "demanded_fields" in payload else None
+    return _validated_source_data_contract_fields(payload, version=SOURCE_DATA_CONTRACT_DRAFT_VERSION)
+
+
+def _validated_source_data_contract_fields(
+    payload: Mapping[str, Any],
+    *,
+    version: int,
+) -> tuple[str, ...] | None:
+    """Validate the complete canonical draft shape for one known version."""
+    if frozenset(payload) != _SOURCE_DATA_CONTRACT_DRAFT_KEYS:
+        return None
+    raw_version = payload["contract_version"]
+    if type(raw_version) is not int or raw_version != version:
+        return None
+    if payload["kind"] != SOURCE_DATA_CONTRACT_USER_TERM:
+        return None
+    demanded = payload["demanded_fields"]
     if not isinstance(demanded, list) or not all(isinstance(field, str) for field in demanded):
         return None
+    sample_header = payload["sample_header"]
+    if sample_header is not None and (not isinstance(sample_header, list) or not all(isinstance(field, str) for field in sample_header)):
+        return None
+    missing_from_sample = payload["missing_from_sample"]
+    if not isinstance(missing_from_sample, list) or not all(isinstance(field, str) for field in missing_from_sample):
+        return None
+    if not set(missing_from_sample) <= set(demanded):
+        return None
     return tuple(demanded)
+
+
+@observation_boundary(
+    tier=3,
+    source="a persisted pre-v2 source_data_contract event's immutable llm_draft",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="returns fields only for the complete legacy-v1 draft shape; malformed or current-version payloads "
+    "return None, and callers may use the result only to supersede the old pending card with a current review",
+)
+def parse_legacy_source_data_contract_fields(value: str) -> tuple[str, ...] | None:
+    """Parse exact v1 fields solely to migrate pending pre-v2 cards."""
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    return _validated_source_data_contract_fields(
+        payload,
+        version=_LEGACY_SOURCE_DATA_CONTRACT_DRAFT_VERSION,
+    )
+
+
+@observation_boundary(
+    tier=3,
+    source="a persisted resolved source_data_contract requirement's accepted_value and accepted_artifact_hash",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="returns fields only for a complete current-v2 artifact or an exact coherent legacy-v1 artifact; "
+    "legacy fields are used solely to remove the old stamp while recomputing a resolvable current review demand, "
+    "never to admit execution",
+)
+def source_data_contract_fields_for_demand_recompute(
+    value: str,
+    artifact_hash: str | None,
+) -> tuple[str, ...] | None:
+    """Recover current or coherent-v1 fields solely for demand recomputation.
+
+    V1 evidence remains historically valid evidence of what the user saw; it
+    is not corrupt and is not silently rewritten. Its field-only artifact did
+    not bind today's fail-closed consequence, however, so the execution
+    authority parser above rejects it. This migration-only parser lets the
+    demand walk remove the v1 guarantee stamp and re-derive a new v2 card the
+    user can actually resolve.
+    """
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    current_fields = _validated_source_data_contract_fields(
+        payload,
+        version=SOURCE_DATA_CONTRACT_DRAFT_VERSION,
+    )
+    if current_fields is not None:
+        return current_fields if artifact_hash == source_data_contract_artifact_hash(current_fields) else None
+    legacy_fields = _validated_source_data_contract_fields(
+        payload,
+        version=_LEGACY_SOURCE_DATA_CONTRACT_DRAFT_VERSION,
+    )
+    if legacy_fields is None:
+        return None
+    return legacy_fields if artifact_hash == _legacy_source_data_contract_artifact_hash(legacy_fields) else None

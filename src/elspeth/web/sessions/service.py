@@ -77,6 +77,8 @@ from elspeth.web.composer.redaction import (
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.source_demand import (
     build_source_data_contract_draft,
+    parse_legacy_source_data_contract_fields,
+    parse_source_data_contract_accepted_fields,
     sample_header_for_source,
     source_data_contract_artifact_hash,
     stamp_source_options_with_guarantees,
@@ -2776,13 +2778,14 @@ def _reviewed_content_identity(
         return stable_hash(domain)
 
     if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
-        # The reviewed artifact is the backtraced demand FIELD SET alone —
-        # recomputed server-side from the state record, never read from the
-        # event text. The sample header is illustrative card evidence and is
-        # deliberately outside the identity: a re-read sample must not abandon
-        # or unstick a card whose demanded fields are unchanged. No staged
-        # requirement row participates either — the card derives from graph
-        # demand, so there may legitimately be none at surfacing time.
+        # The reviewed artifact binds the current contract version,
+        # fail-closed consequence, and backtraced demand FIELD SET — the
+        # fields are recomputed server-side from the state record, never read
+        # from the event text. The sample header is illustrative card evidence
+        # and is deliberately outside the identity: a re-read sample must not
+        # abandon or unstick a card whose demanded fields are unchanged. No
+        # staged requirement row participates either — the card derives from
+        # graph demand, so there may legitimately be none at surfacing time.
         _source_name, demand = _source_data_contract_demand_from_state_record(
             state_record,
             affected_node_id=affected_node_id,
@@ -3597,6 +3600,12 @@ def _resolve_source_data_contract(
     and source-node state before the Tier-1 violation aborts the run. Rows
     quarantined during source validation never reach that boundary check.
     """
+    reviewed_fields = parse_source_data_contract_accepted_fields(llm_draft)
+    if reviewed_fields is None:
+        raise InterpretationPlaceholderConsumedError(
+            "resolve_interpretation_event: source_data_contract card uses a retired or malformed contract version; "
+            "reload the session and acknowledge the current review"
+        )
     source_name = source_name_from_component_id(affected_node_id)
     if source_name is None:
         raise InterpretationNodeMissingError(
@@ -3620,6 +3629,10 @@ def _resolve_source_data_contract(
         affected_node_id=affected_node_id,
         context="resolve_interpretation_event",
     )
+    if reviewed_fields != demand:
+        raise InterpretationPlaceholderConsumedError(
+            "resolve_interpretation_event: source_data_contract card fields no longer match the current demand"
+        )
     stamped_options = stamp_source_options_with_guarantees(options, demand)
     if stamped_options is None:
         raise InterpretationPlaceholderConsumedError(
@@ -7715,13 +7728,44 @@ class SessionServiceImpl:
                     ).one_or_none()
                     if surfacing_state_row is None:
                         raise AuditIntegrityError("create_pending_interpretation_event: pending review has no same-session surfacing state")
+                    pending_state_record = self._row_to_state_record(surfacing_state_row)
                     pending_review_identity = _reviewed_content_identity(
-                        self._row_to_state_record(surfacing_state_row),
+                        pending_state_record,
                         kind=kind,
                         affected_node_id=affected_node_id,
                         user_term=pending_user_term,
                         context="create_pending_interpretation_event",
                     )
+                    if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+                        pending_draft = pending_row.llm_draft
+                        if type(pending_draft) is not str:
+                            raise AuditIntegrityError(
+                                "create_pending_interpretation_event: pending source_data_contract review has no draft"
+                            )
+                        current_fields = parse_source_data_contract_accepted_fields(pending_draft)
+                        legacy_fields = parse_legacy_source_data_contract_fields(pending_draft)
+                        if current_fields is None and legacy_fields is None:
+                            raise AuditIntegrityError(
+                                "create_pending_interpretation_event: pending source_data_contract review has a malformed draft"
+                            )
+                        _pending_source_name, pending_demand = _source_data_contract_demand_from_state_record(
+                            pending_state_record,
+                            affected_node_id=affected_node_id,
+                            context="create_pending_interpretation_event",
+                        )
+                        pending_fields = current_fields if current_fields is not None else legacy_fields
+                        if pending_fields != pending_demand:
+                            raise AuditIntegrityError(
+                                "create_pending_interpretation_event: pending source_data_contract review draft disagrees "
+                                "with its immutable surfacing-state demand"
+                            )
+                        if legacy_fields is not None:
+                            # V1 showed a materially different consequence.
+                            # Preserve it as abandoned audit history and mint a
+                            # v2 card; field equality cannot reuse old copy as
+                            # current user authority.
+                            rows_to_abandon.append(pending_row.id)
+                            continue
                     if not review_disabled and matching_pending_row is None and pending_review_identity == current_review_identity:
                         matching_pending_row = pending_row
                     else:

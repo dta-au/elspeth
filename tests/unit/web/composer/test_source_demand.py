@@ -9,10 +9,15 @@ demand reaches the source through pass-through nodes), and honest abstention
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.source_demand import (
+    SOURCE_DATA_CONTRACT_DRAFT_VERSION,
     SOURCE_DATA_CONTRACT_USER_TERM,
     backtraced_source_demand,
     build_source_data_contract_draft,
@@ -363,6 +368,10 @@ class TestDraftAndArtifact:
         draft = build_source_data_contract_draft(["size", "colour"], ("colour", "extra"))
         assert parse_source_data_contract_accepted_fields(draft) == ("colour", "size")
 
+        payload = json.loads(draft)
+        assert payload["contract_version"] == SOURCE_DATA_CONTRACT_DRAFT_VERSION == 2
+        assert payload["kind"] == SOURCE_DATA_CONTRACT_USER_TERM
+
     def test_draft_warns_on_demanded_fields_the_sample_lacks(self) -> None:
         draft = build_source_data_contract_draft(["colour", "size"], ("colour", "extra"))
         assert '"missing_from_sample":["size"]' in draft
@@ -372,15 +381,78 @@ class TestDraftAndArtifact:
         assert '"sample_header":null' in draft
         assert '"missing_from_sample":[]' in draft
 
-    def test_artifact_hash_binds_the_field_set_only(self) -> None:
+    def test_artifact_hash_binds_current_contract_semantics_and_field_set(self) -> None:
         # Order-insensitive over fields; sample evidence never participates.
         assert source_data_contract_artifact_hash(["b", "a"]) == source_data_contract_artifact_hash(["a", "b"])
         assert source_data_contract_artifact_hash(["a"]) != source_data_contract_artifact_hash(["a", "b"])
+        legacy_v1_hash = stable_hash({"review_kind": SOURCE_DATA_CONTRACT_USER_TERM, "demanded_fields": ["a"]})
+        assert source_data_contract_artifact_hash(["a"]) != legacy_v1_hash
 
-    def test_parse_abstains_on_malformed_payloads(self) -> None:
-        assert parse_source_data_contract_accepted_fields("not json") is None
-        assert parse_source_data_contract_accepted_fields('{"demanded_fields": "colour"}') is None
-        assert parse_source_data_contract_accepted_fields('{"demanded_fields": [1]}') is None
+    @pytest.mark.parametrize(
+        "payload",
+        (
+            "not json",
+            {"demanded_fields": "colour"},
+            {"demanded_fields": [1]},
+            {
+                "contract_version": 1,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour"],
+                "sample_header": None,
+                "missing_from_sample": [],
+            },
+            {
+                "contract_version": 2,
+                "kind": "invented_source",
+                "demanded_fields": ["colour"],
+                "sample_header": None,
+                "missing_from_sample": [],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour"],
+                "sample_header": 42,
+                "missing_from_sample": [],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour"],
+                "sample_header": None,
+                "missing_from_sample": [1],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour"],
+                "sample_header": None,
+                "missing_from_sample": ["size"],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour"],
+                "sample_header": None,
+                "missing_from_sample": [],
+                "unexpected": True,
+            },
+        ),
+        ids=(
+            "not-json",
+            "missing-shape",
+            "non-string-demand",
+            "legacy-version",
+            "wrong-kind",
+            "malformed-sample",
+            "malformed-missing",
+            "missing-not-demanded",
+            "extra-key",
+        ),
+    )
+    def test_parse_abstains_on_malformed_or_non_current_payloads(self, payload: object) -> None:
+        value = payload if isinstance(payload, str) else json.dumps(payload)
+        assert parse_source_data_contract_accepted_fields(value) is None
 
     def test_user_term_constant(self) -> None:
         assert SOURCE_DATA_CONTRACT_USER_TERM == "source_data_contract"
