@@ -127,12 +127,18 @@ def test_text_only_final_turn_keeps_its_prose() -> None:
     B-4D-3 last-chance finalize — leaves the pair pointing at the earlier row.
     Stripping there would delete genuine model prose.
     """
-    later_prose = "Here is the finished pipeline."
+    # The later prose deliberately STARTS WITH the earlier row's content. The
+    # prefix test alone would strip here and hand the transcript
+    # " Here is the finished pipeline." with the model's opening deleted; only
+    # the raw==persisted equality declines, because this turn's own prose is
+    # not what that row holds.
+    earlier_row = "Working on it."
+    later_prose = f"{earlier_row} Here is the finished pipeline."
     draft = composer_turn_end_assistant_row(
         _result(
             message=later_prose,
             raw_assistant_content=None,
-            persisted_assistant_content="An earlier turn said something else.",
+            persisted_assistant_content=earlier_row,
         )
     )
 
@@ -155,6 +161,11 @@ def test_empty_persisted_content_does_not_swallow_the_message() -> None:
     )
 
     assert draft.content == "The pipeline is ready."
+    # And the row stays ordinary model prose. A prefix-only predicate would
+    # match the empty persisted content and rewrite raw_content to "",
+    # which tells ``_composer_history_content`` this whole turn is backend
+    # chrome — the model's own prose would vanish from prompt history.
+    assert draft.raw_content is None
 
 
 def test_advisor_repair_row_is_not_mistaken_for_the_turn_prose() -> None:
