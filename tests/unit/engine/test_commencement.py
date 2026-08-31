@@ -341,6 +341,38 @@ class TestCommencementGateCrashThrough:
             mock_cls.return_value.evaluate.side_effect = shutdown
             evaluate_commencement_gates([gate], context)
 
+    @pytest.mark.parametrize("process_control", [KeyboardInterrupt(), SystemExit(17)], ids=["keyboard-interrupt", "system-exit"])
+    def test_process_control_exceptions_are_never_caught(self, process_control: BaseException) -> None:
+        """The handler catches ``Exception``, so process-control exceptions
+        propagate without ever entering the wrap path — no membership re-check
+        is needed to keep them out of CommencementGateFailedError."""
+        from unittest.mock import patch
+
+        gate = CommencementGateConfig(name="g", condition="True")
+        context = self._make_context()
+
+        with (
+            patch("elspeth.engine.commencement.ExpressionParser") as mock_cls,
+            pytest.raises(type(process_control)),
+        ):
+            mock_cls.return_value.evaluate.side_effect = process_control
+            evaluate_commencement_gates([gate], context)
+
+    def test_ordinary_evaluand_failure_wraps_as_gate_failure(self) -> None:
+        """An ordinary Exception from evaluation is a user's failing gate: it
+        wraps as CommencementGateFailedError after the crash-through sieve."""
+        from unittest.mock import patch
+
+        gate = CommencementGateConfig(name="g", condition="collections['x']['count'] > 0")
+        context = self._make_context()
+
+        with (
+            patch("elspeth.engine.commencement.ExpressionParser") as mock_cls,
+            pytest.raises(CommencementGateFailedError, match="Expression raised ZeroDivisionError"),
+        ):
+            mock_cls.return_value.evaluate.side_effect = ZeroDivisionError("division by zero")
+            evaluate_commencement_gates([gate], context)
+
 
 class TestBuildPreflightContext:
     def test_includes_all_sections(self) -> None:

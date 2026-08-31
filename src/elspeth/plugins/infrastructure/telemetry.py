@@ -46,13 +46,14 @@ def emit_resource_cleanup_failed(
     token_id: str | None,
     logger: WarningLogger = _logger,
 ) -> None:
-    """Emit bounded cleanup health telemetry; log ordinary delivery failures.
+    """Emit bounded cleanup health telemetry; log typed delivery failures.
 
-    Tier-1 invariant failures and process-control exceptions remain
-    unsuppressible; callers must never turn those into best-effort warnings.
-    Event construction happens BEFORE the try, and programming errors from the
-    callback re-raise, so the residual catch is limited to genuine
-    telemetry-delivery failures — a first-party bug crashes.
+    Event construction happens BEFORE the try, and the only exception the
+    telemetry subsystem deliberately raises to an emitter is
+    ``TelemetryExporterError`` — that one failure is recorded on the
+    last-resort logger (both observability channels are down). Every other
+    exception, Tier-1 and process-control included, propagates: a first-party
+    bug crashes rather than being relabelled a delivery failure.
     """
     event = ResourceCleanupFailed(
         timestamp=datetime.now(UTC),
@@ -67,11 +68,7 @@ def emit_resource_cleanup_failed(
     )
     try:
         telemetry_emit(event)
-    except contract_errors.TIER_1_ERRORS:
-        raise
-    except (TypeError, AttributeError, KeyError, NameError):
-        raise  # Programming errors must crash
-    except Exception as telemetry_error:
+    except contract_errors.TelemetryExporterError as telemetry_error:
         logger.warning(
             "resource_cleanup_telemetry_failed",
             component=component,

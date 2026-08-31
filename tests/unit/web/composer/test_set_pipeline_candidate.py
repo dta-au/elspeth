@@ -1665,6 +1665,23 @@ _EXPECTED_WARNINGS = {
     ),
 }
 
+# S1 (elspeth-0aace271b4 I5): on_error="discard" no longer counts as error
+# routing, so every discard-only fixture (which is what set_pipeline's
+# default-fill produces) now carries the advisory retention nudge. Cases with
+# a gate (`fork_coalesce`, `gate`) stay quiet via the has_gate arm.
+_S1_RETENTION_SUGGESTION = {
+    "component": "pipeline",
+    "message": "Consider adding error routing to a retention output — failed rows are currently discarded rather than kept for review.",
+    "severity": "low",
+}
+_EXPECTED_SUGGESTIONS = {
+    "linear": (_S1_RETENTION_SUGGESTION,),
+    "named_multi_source_queue": (_S1_RETENTION_SUGGESTION,),
+    "aggregation": (_S1_RETENTION_SUGGESTION,),
+    "structured_llm": (_S1_RETENTION_SUGGESTION,),
+    "multi_output": (_S1_RETENTION_SUGGESTION,),
+}
+
 
 def _portable_state_content(value: Any, *, data_dir: Path) -> Any:
     if isinstance(value, dict):
@@ -1718,7 +1735,7 @@ def test_current_executor_normalizes_supported_pipeline_shapes(
     assert result.validation.is_valid is True
     assert result.validation.errors == ()
     assert tuple(item.to_dict() for item in result.validation.warnings) == _EXPECTED_WARNINGS.get(case, ())
-    assert result.validation.suggestions == ()
+    assert tuple(item.to_dict() for item in result.validation.suggestions) == _EXPECTED_SUGGESTIONS.get(case, ())
     assert result.validation.semantic_contracts == ()
     assert result.to_dict()["validation"]["is_valid"] is True
     assert result.to_dict()["validation"]["graph_repair_suggestions"] == []

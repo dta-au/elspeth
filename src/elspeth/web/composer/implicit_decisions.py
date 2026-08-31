@@ -451,8 +451,14 @@ def _provenance_for_path(path: str, value: object) -> DecisionProvenance:
 
 
 def _routing_provenance(value: object) -> DecisionProvenance:
+    # "discard" reaches NodeSpec/OutputSpec/SourceSpec through the composer
+    # tool layer's default-fill (tools/transforms.py, tools/outputs.py,
+    # tools/_common.py), which erases whether the planner asked for it — so
+    # the disclosure layer cannot claim the value was picked. "default" is
+    # the honest label until the default-fill is removed
+    # (elspeth-0aace271b4 I4); a named sink can only come from the planner.
     if value == "discard":
-        return "picked"
+        return "default"
     return "composer_selected"
 
 

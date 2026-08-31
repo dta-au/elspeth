@@ -225,6 +225,7 @@ from elspeth.web.interpretation_state import (
     InterpretationReviewSite,
     current_source_data_contract_demand,
     interpretation_sites,
+    pending_execution_interpretation_sites,
     source_name_from_component_id,
     vague_term_wiring_count,
 )
@@ -2271,11 +2272,25 @@ class ComposerServiceImpl:
         )
         return canonical_json(projection)
 
-    def _state_payload_for_compose_turn_for_test(
+    def _state_payload_for_compose_turn(
         self,
         response: Any,
     ) -> Any:
-        """Build a StatePayload for the current interim Step 2 redacted row."""
+        """Build a StatePayload for the current interim Step 2 redacted row.
+
+        The persisted ``is_valid`` here is the AUTHORING-ONLY lane: Stage-1
+        ``validate()`` (no plugin config instantiation, no runtime preflight)
+        narrowed by :func:`pending_execution_interpretation_sites` — a state
+        still carrying mandatory interpretation reviews must not persist
+        ``is_valid=True`` while the strict turn-end writer would refuse it
+        over the same content (elspeth-67c6fa691d; two writers, one column).
+        The strict lane stays with the turn-end writer
+        (``_composition_state_data_for_persist``); ``composer_meta``'s
+        ``validation_lane`` marker records which predicate produced each row.
+        The TOOL-RESULT validation surface deliberately keeps the bare
+        Stage-1 verdict — it drives the planner repair loop and is not
+        persisted here.
+        """
 
         del self
         from elspeth.web.sessions._persist_payload import StatePayload
@@ -2283,6 +2298,13 @@ class ComposerServiceImpl:
 
         result = cast(ToolResult, response)
         state_d = result.updated_state.to_dict()
+        pending_sites = pending_execution_interpretation_sites(result.updated_state)
+        validation_errors = tuple(error.message for error in result.validation.errors)
+        if pending_sites:
+            # Component id + kind only: user_term is user/planner-authored
+            # content and stays out of the persisted error strings (same
+            # non-content rule as the runtime placeholder telemetry).
+            validation_errors += tuple(f"interpretation_review_pending:{site.component_id}:{site.kind.value}" for site in pending_sites)
         return StatePayload(
             data=CompositionStateData(
                 sources=state_d["sources"],
@@ -2290,9 +2312,9 @@ class ComposerServiceImpl:
                 edges=state_d["edges"],
                 outputs=state_d["outputs"],
                 metadata_=state_d["metadata"],
-                is_valid=result.validation.is_valid,
-                validation_errors=tuple(error.message for error in result.validation.errors),
-                composer_meta=None,
+                is_valid=result.validation.is_valid and not pending_sites,
+                validation_errors=validation_errors,
+                composer_meta={"validation_lane": "authoring_only"},
             ),
             # persist_compose_turn inserts composition state rows under
             # the session write lock and re-derives

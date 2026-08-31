@@ -14,7 +14,7 @@ from structlog.testing import capture_logs
 
 from elspeth.contracts import Determinism, SourceRow
 from elspeth.contracts.chat_parts import ChatMessage
-from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.errors import FrameworkBugError, TelemetryExporterError
 from elspeth.contracts.events import ResourceCleanupFailed
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
 from elspeth.contracts.plugin_context import PluginContext
@@ -609,6 +609,32 @@ def test_shutdown_does_not_suppress_tier_one_generator_close_failure(
     rows.close.assert_called_once_with()
 
 
+def test_shutdown_does_not_suppress_ordinary_generator_close_failure(
+    source: LLMSource,
+    source_context: PluginContext,
+) -> None:
+    """The load generator is first-party code: an ordinary failure escaping
+    its teardown is a bug that propagates over the shutdown StopIteration —
+    resources are still released exactly once."""
+    provider = FakeProvider()
+    _install_provider(source, provider)
+    rows = MagicMock(spec_set=Generator)
+    rows.close.side_effect = RuntimeError("generator close bug")
+    shutdown_event = threading.Event()
+    shutdown_event.set()
+    source_context.shutdown_event = shutdown_event
+
+    with (
+        patch.object(source, "_load_once", return_value=cast("Generator[SourceRow, None, None]", rows)),
+        pytest.raises(RuntimeError, match="generator close bug"),
+    ):
+        list(source.load(source_context))
+
+    rows.close.assert_called_once_with()
+    assert provider.close_calls == 1
+    assert source._provider is None
+
+
 def test_generator_close_does_not_surface_cleanup_failure(
     source: LLMSource,
     source_context: PluginContext,
@@ -696,7 +722,7 @@ def test_cleanup_telemetry_and_fallback_logs_exclude_all_llm_source_payload_sent
     def capture_then_fail(event: object) -> None:
         assert isinstance(event, ResourceCleanupFailed)
         events.append(event)
-        raise RuntimeError("telemetry callback unavailable")
+        raise TelemetryExporterError("all", "telemetry callback unavailable")
 
     source_context.telemetry_emit = capture_then_fail
     source = LLMSource(
@@ -770,14 +796,14 @@ def test_cleanup_telemetry_and_fallback_logs_exclude_all_llm_source_payload_sent
             "log_level": "warning",
             "component": "llm_source",
             "resource": "provider",
-            "error_type": "RuntimeError",
+            "error_type": "TelemetryExporterError",
         },
         {
             "event": "resource_cleanup_telemetry_failed",
             "log_level": "warning",
             "component": "llm_source",
             "resource": "provider",
-            "error_type": "RuntimeError",
+            "error_type": "TelemetryExporterError",
         },
     ]
 
@@ -878,7 +904,7 @@ def test_cleanup_telemetry_failure_logs_last_resort_without_replacing_primary(
     _install_provider(source, provider)
 
     def broken_telemetry(_event: object) -> None:
-        raise RuntimeError("telemetry unavailable")
+        raise TelemetryExporterError("all", "telemetry unavailable")
 
     source._telemetry_emit = broken_telemetry
 
@@ -892,7 +918,7 @@ def test_cleanup_telemetry_failure_logs_last_resort_without_replacing_primary(
         "resource_cleanup_telemetry_failed",
         component="llm_source",
         resource="provider",
-        error_type="RuntimeError",
+        error_type="TelemetryExporterError",
     )
 
 

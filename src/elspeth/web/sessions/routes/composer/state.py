@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import TypedDict
+import re
+from typing import NotRequired, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -14,7 +15,13 @@ from elspeth.web.blobs.protocol import BlobNotFoundError, BlobServiceProtocol
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
 from elspeth.web.composer.state import CompositionState, SourceSpec
-from elspeth.web.composer.yaml_generator import reattach_guided_blob_refs_for_public_export
+from elspeth.web.composer.yaml_generator import (
+    PUBLIC_EXPORT_REBIND_GUIDANCE,
+    PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX,
+    public_export_redaction,
+    public_export_redaction_header,
+    reattach_guided_blob_refs_for_public_export,
+)
 from elspeth.web.composer.yaml_importer import (
     MAX_RUNTIME_YAML_IMPORT_CHARS,
     RuntimeYamlImportError,
@@ -121,8 +128,29 @@ def _reject_imported_plugin_policy(
     )
 
 
+class StateYamlRedaction(TypedDict):
+    """Structured account of the public export's custody redaction.
+
+    Mirrors the YAML header comment (``public_export_redaction_header``):
+    the export is deliberately redacted — this names exactly what was
+    stripped and how to re-bind it, instead of presenting the not-runnable
+    YAML bare (elspeth-06f92da0d9). Names only, never blob UUIDs: the
+    scrub ruling (2304d57fb, ``test_yaml_response_omits_source_blob_``
+    ``identity_sidecar``) forbids blob identity beside the scrubbed YAML,
+    which is why ``blob_linked_sources`` carries the sources whose
+    verified blob linkage was stripped rather than the ids themselves.
+    """
+
+    stripped_source_options: dict[str, list[str]]
+    stripped_output_options: dict[str, list[str]]
+    blob_linked_sources: list[str]
+    rebind_guidance: str
+
+
 class StateYamlResponse(TypedDict):
     yaml: str
+    # Omitted when the public projection stripped nothing.
+    redaction: NotRequired[StateYamlRedaction]
 
 
 class ImportStateYamlRequest(BaseModel):
@@ -160,6 +188,62 @@ def _source_options_reference_blob_storage(options: Mapping[str, Any], *, data_d
         if resolved.is_relative_to(blob_root):
             return True
     return False
+
+
+# Exporter-authored marker line (see yaml_generator's
+# PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX — the prefix bytes are the
+# shared authority). Source names are runtime-valid component ids, so the
+# bounded \S{1,64} capture admits every legitimate name and nothing
+# multi-token; anything else in the pasted text is ignored.
+_REDACTED_SOURCE_MARKER_RE = re.compile(
+    "^" + re.escape(PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX) + r"(\S{1,64}) stripped=",
+    re.MULTILINE,
+)
+
+
+def _redaction_marker_source_names(yaml_text: str) -> frozenset[str]:
+    """Source names the pasted document's own export marker declares redacted.
+
+    Tier-3 parse of untrusted pasted text, scoped to the exact marker lines
+    ELSPETH's public exporter emits. A document with no marker (hand-written
+    YAML, hand-stripped marker) yields the empty set and the import falls
+    back to the pre-existing behaviour: the strict preflight refuses the
+    degraded state and it persists ``is_valid=False``.
+    """
+    return frozenset(_REDACTED_SOURCE_MARKER_RE.findall(yaml_text))
+
+
+def _reject_redacted_sources_without_rebind(state: CompositionState, *, yaml_text: str) -> None:
+    """400 the path-ABSENT redacted-export shape with re-bind guidance.
+
+    The public export deliberately strips source path/blob linkage
+    (elspeth-06f92da0d9). Re-importing that shape without ``source_blob_ids``
+    used to sail through Stage-1 and strand the user with a raw Pydantic
+    "path Field required" from the strict lane; the export's own marker lets
+    this guard name the real remedy instead. Runs AFTER
+    ``_state_with_imported_source_blobs`` so a supplied re-bind counts, and
+    accepts a hand-re-added path option (the path guards downstream still
+    police its value).
+    """
+    marked = _redaction_marker_source_names(yaml_text)
+    if not marked:
+        return
+    for source_name, source in state.sources.items():
+        if source_name not in marked:
+            continue
+        if "blob_ref" in source.options:
+            continue
+        if any(key in source.options for key in SOURCE_LOCAL_PATH_OPTION_KEYS):
+            continue
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Source '{source_name}' was custody-redacted at export: its local path / blob linkage was "
+                "stripped, so this YAML is not runnable as-is. Upload the source data to this session and "
+                f'include source_blob_ids={{"{source_name}": "<blob id>"}} with the import, '
+                "or re-add an allowed path option to the source."
+            ),
+        )
 
 
 @trust_boundary(
@@ -590,6 +674,7 @@ async def import_state_yaml(
             request=request,
             session_id=session.id,
         )
+        _reject_redacted_sources_without_rebind(imported_state, yaml_text=body.yaml)
         _reject_unbound_blob_storage_sources(
             imported_state,
             data_dir=str(request.app.state.settings.data_dir),
@@ -973,12 +1058,18 @@ async def get_state_yaml(
     # reach plugin instantiation. Preflight ran on the raw `state`; export uses
     # the reattached copy.
     export_state = _reattach_guided_blob_refs(state)
-    await _verified_yaml_export_blob_ids(
+    source_blob_ids = await _verified_yaml_export_blob_ids(
         export_state,
         request=request,
         session_id=session.id,
     )
-    yaml_str = generate_public_yaml(export_state)
+    # elspeth-06f92da0d9: this route is the one consumer that hands the user a
+    # document to keep, so it is where the deliberate custody redaction stops
+    # being invisible — header first, then the bare projection. The marker
+    # lives here rather than in ``generate_public_yaml`` because the MCP,
+    # share, and acceptance-import consumers of that function must keep bare
+    # bytes (see its docstring).
+    yaml_str = public_export_redaction_header(export_state) + generate_public_yaml(export_state)
 
     # Phase 6A B3 — sessions-DB audit event for YAML export.
     #
@@ -1018,4 +1109,15 @@ async def get_state_yaml(
         completion_verb="export_yaml",
     )
 
-    return {"yaml": yaml_str}
+    response: StateYamlResponse = {"yaml": yaml_str}
+    export_redaction = public_export_redaction(export_state)
+    if export_redaction["sources"] or export_redaction["outputs"]:
+        response["redaction"] = {
+            "stripped_source_options": export_redaction["sources"],
+            "stripped_output_options": export_redaction["outputs"],
+            # Names from the custody-verified sidecar map; the UUID values
+            # stay server-side (scrub ruling 2304d57fb).
+            "blob_linked_sources": sorted(source_blob_ids),
+            "rebind_guidance": PUBLIC_EXPORT_REBIND_GUIDANCE,
+        }
+    return response

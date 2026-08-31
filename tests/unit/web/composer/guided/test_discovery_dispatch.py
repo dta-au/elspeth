@@ -67,6 +67,44 @@ def _dispatch_raw(
     )
 
 
+def test_execute_discovery_call_rejects_non_string_provider_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject a non-string provider ``arguments`` payload in place.
+
+    Direct-call honesty pin for the ``@trust_boundary`` on
+    ``_execute_discovery_call``: the tool protocol carries arguments as a JSON
+    *string*, so a provider that sends a bare object must be rejected at the
+    boundary rather than coerced into an empty argument mapping and dispatched.
+    """
+
+    def _explode(*args: object, **kwargs: object) -> ToolResult:
+        del args, kwargs
+        raise AssertionError("non-string provider arguments reached the handler")
+
+    monkeypatch.setattr(discovery_module, "execute_tool", _explode)
+    catalog, snapshot = _catalog()
+    recorder = BufferingRecorder()
+
+    with pytest.raises(GuidedSolverResponseShapeError):
+        _execute_discovery_call(
+            tool_call=SimpleNamespace(
+                id="guided-call-1",
+                function=SimpleNamespace(name="get_pipeline_state", arguments={"component": "source"}),
+            ),
+            state=_empty_state(),
+            catalog=catalog,
+            plugin_snapshot=snapshot,
+            secret_service=None,
+            user_id=None,
+            actor="guided-test",
+            recorder=recorder,
+        )
+
+    assert len(recorder.invocations) == 1
+    assert recorder.invocations[0].status == ComposerToolStatus.ARG_ERROR
+
+
 @pytest.mark.parametrize("raw_arguments", [{"component": "source"}, [], b"{}"])
 def test_non_string_provider_arguments_record_one_arg_error_without_handler(
     raw_arguments: object,

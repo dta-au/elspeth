@@ -666,7 +666,7 @@ class TransformErrorReason(TypedDict):
         response: Full response object for debugging
         response_keys: Keys present in response dict
         body_preview: HTTP body preview for errors
-        content_type: Content-Type header value
+        content_type: Raw Content-Type header value; None when the header was absent
 
     Type validation context:
         expected: Expected type or value
@@ -776,7 +776,7 @@ class TransformErrorReason(TypedDict):
     response: NotRequired[dict[str, Any]]
     response_keys: NotRequired[list[str] | None]
     body_preview: NotRequired[str]  # HTTP body preview; absent = empty/unavailable
-    content_type: NotRequired[str]
+    content_type: NotRequired[str | None]  # Raw Content-Type header; None = the server sent none
     body_size: NotRequired[int]  # Actual response body size in bytes (body_too_large errors)
     max_body_bytes: NotRequired[int]  # Configured limit in bytes (body_too_large errors)
     max_blob_bytes: NotRequired[int]  # Configured blob parser limit in bytes

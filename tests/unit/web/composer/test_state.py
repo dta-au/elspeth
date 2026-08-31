@@ -2981,14 +2981,29 @@ class TestStage1Validation:
 
     # --- Suggestion rules (S1-S3) ---
 
-    def test_validate_no_error_routing_suggests(self) -> None:
-        """S1: Transforms now require on_error (section 7), so a valid pipeline
-        always has explicit error routing and S1 cannot fire.  Verify S1 is
-        absent when on_error='discard' is set."""
+    def test_validate_discard_only_routing_suggests_retention(self) -> None:
+        """S1: on_error='discard' does NOT count as error routing
+        (elspeth-0aace271b4 I5) — the tool layer default-fills it, so counting
+        it made the one advisory nudge toward retention permanently
+        unreachable. A discard-only pipeline gets the retention suggestion."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="t1"))
         state = state.with_node(self._make_transform("t1", "t1", "main", on_error="discard"))
         state = state.with_output(self._make_output("main"))
+        state = state.with_edge(self._make_edge("e1", "source", "t1"))
+        state = state.with_edge(self._make_edge("e2", "t1", "main"))
+        result = state.validate()
+        assert result.is_valid
+        assert any("error routing" in s.message for s in result.suggestions)
+
+    def test_validate_named_sink_routing_suppresses_s1(self) -> None:
+        """S1 stays quiet when a node routes failures to a real output —
+        retaining routing is exactly what the suggestion asks for."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="t1"))
+        state = state.with_node(self._make_transform("t1", "t1", "main", on_error="errors"))
+        state = state.with_output(self._make_output("main"))
+        state = state.with_output(self._make_output("errors"))
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "main"))
         result = state.validate()
