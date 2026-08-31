@@ -365,16 +365,27 @@ _SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
     # Session 891b7b1e turn 2: the planner sent source: null intending
     # 'keep the existing source' and burned a repair turn on the rejection.
     "set_pipeline is a FULL replacement: source: null never means 'keep "
-    "the current source'. Re-supply the complete existing `source` "
-    "configuration or named `sources` map from "
-    "get_pipeline_state(component='set_pipeline_arguments'). If that reports "
-    "round_trip_unavailable, never fabricate or rebind source custody: use "
-    "narrow patch tools when the requested task permits, otherwise surface "
-    "the named gap. Plugin-backed sources must be preserved in that shape; "
+    "the current source'. Re-supply the source explicitly. Plugin-backed "
+    "sources must be preserved in that shape; "
     "do not assume the current source is blob-bound. Retain source.blob_id "
     "only for an existing singular blob-bound source whose block carries "
     "one; use source.inline_blob only when intentionally supplying new "
     "literal data.",
+    "ORDINARY/FREEFORM MUTATION SURFACE: when inspection and mutation tools "
+    "are advertised, re-supply the complete existing `source` configuration "
+    "or named `sources` map from "
+    "get_pipeline_state(component='set_pipeline_arguments'). If that reports "
+    "round_trip_unavailable, never fabricate or rebind source custody: use an "
+    "advertised narrow patch tool when the requested task permits, otherwise "
+    "surface the named gap.",
+    "PROPOSAL PLANNER SURFACE: read the current-state context and use only "
+    "tools advertised in this request. Re-supply an existing source only "
+    "when that context carries its exact authorable source binding. If the "
+    "authoritative binding is absent, redacted, diagnostic-only, or named/"
+    "multiple blob custody cannot round-trip, surface an exact-source/"
+    "round-trip gap and stop instead of guessing; never invoke an "
+    "unadvertised inspection or mutation tool, and never fabricate or rebind "
+    "source custody.",
     # Session 891b7b1e turn 1: the planner fabricated rows at the user's
     # request, then narrated its own content as 'the system auto-generated
     # placeholder content' — a provenance inversion in an audit-grade tool.

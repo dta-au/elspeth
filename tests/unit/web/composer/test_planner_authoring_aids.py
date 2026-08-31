@@ -2500,19 +2500,50 @@ class TestSession891b7b1eLiveReviewEdits:
         view, _snapshot = _trained_view()
         rules = build_planner_authoring_aids(view)["source_custody"]["rules"]
 
-        rebuild_rule = next(rule for rule in rules if rule.startswith("set_pipeline is a FULL replacement"))
-        assert "source: null never means" in rebuild_rule
-        assert "complete existing `source` configuration" in rebuild_rule
-        assert "named `sources` map" in rebuild_rule
-        assert "get_pipeline_state(component='set_pipeline_arguments')" in rebuild_rule
-        assert "Plugin-backed sources must be preserved" in rebuild_rule
-        assert "do not assume the current source is blob-bound" in rebuild_rule
-        assert "round_trip_unavailable" in rebuild_rule
-        assert "never fabricate or rebind source custody" in rebuild_rule
-        assert "use narrow patch tools when the requested task permits" in rebuild_rule
-        assert "surface the named gap" in rebuild_rule
-        assert "source.blob_id only for an existing singular blob-bound source whose block carries one" in rebuild_rule
-        assert "source.inline_blob only when intentionally supplying new literal data" in rebuild_rule
+        replacement_rule = next(rule for rule in rules if rule.startswith("set_pipeline is a FULL replacement"))
+        mutation_rule = next(rule for rule in rules if rule.startswith("ORDINARY/FREEFORM MUTATION SURFACE"))
+        proposal_rule = next(rule for rule in rules if rule.startswith("PROPOSAL PLANNER SURFACE"))
+
+        assert "source: null never means" in replacement_rule
+        assert "Plugin-backed sources must be preserved" in replacement_rule
+        assert "do not assume the current source is blob-bound" in replacement_rule
+        assert "source.blob_id only for an existing singular blob-bound source whose block carries one" in replacement_rule
+        assert "source.inline_blob only when intentionally supplying new literal data" in replacement_rule
+
+        assert "complete existing `source` configuration" in mutation_rule
+        assert "named `sources` map" in mutation_rule
+        assert "get_pipeline_state(component='set_pipeline_arguments')" in mutation_rule
+        assert "round_trip_unavailable" in mutation_rule
+        assert "never fabricate or rebind source custody" in mutation_rule
+        assert "advertised narrow patch tool" in mutation_rule
+        assert "surface the named gap" in mutation_rule
+
+        assert "current-state context" in proposal_rule
+        assert "only tools advertised in this request" in proposal_rule
+        assert "never invoke an unadvertised inspection or mutation tool" in proposal_rule
+        assert "exact authorable source binding" in proposal_rule
+        assert "exact-source/round-trip gap" in proposal_rule
+        assert "stop instead of guessing" in proposal_rule
+
+    def test_proposal_planner_custody_rule_names_no_unadvertised_tool(self) -> None:
+        """Shared aids must not teach proposal planners calls absent from their palette."""
+        from elspeth.web.composer.pipeline_planner import PlannerDiscoveryPolicy, planner_tool_definitions
+        from elspeth.web.composer.pipeline_proposal import PlannerSurface
+        from elspeth.web.composer.tools import get_tool_definitions
+
+        view, _snapshot = _trained_view()
+        rules = build_planner_authoring_aids(view)["source_custody"]["rules"]
+        proposal_rule = next(rule for rule in rules if rule.startswith("PROPOSAL PLANNER SURFACE"))
+        registered_names = {definition["name"] for definition in get_tool_definitions()}
+        named_tools = {name for name in registered_names if name in proposal_rule}
+
+        for surface in PlannerSurface:
+            policy = PlannerDiscoveryPolicy.initial(surface)
+            advertised_names = {definition["function"]["name"] for definition in planner_tool_definitions(policy)}
+            assert named_tools <= advertised_names
+
+        assert "get_pipeline_state" not in proposal_rule
+        assert "patch_source_options" not in proposal_rule
 
     def test_custody_verbatim_rule_names_the_user_requested_sample_exception(self) -> None:
         """Planner-authored samples must be an explicit, provenance-preserving exception."""

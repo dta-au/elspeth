@@ -243,6 +243,31 @@ def test_rejected_candidate_reports_only_the_real_error_not_stale_state(tmp_path
             True,
             id="named-blob-backed-round-trip-unavailable",
         ),
+        pytest.param(
+            {
+                "orders": SourceSpec(
+                    plugin="csv",
+                    on_success="order_rows",
+                    options={
+                        "path": "blobs/session/orders.csv",
+                        "blob_ref": "11111111-1111-4111-8111-111111111111",
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+                "customers": SourceSpec(
+                    plugin="csv",
+                    on_success="customer_rows",
+                    options={"path": "inputs/customers.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                ),
+            },
+            "named `sources` map",
+            False,
+            True,
+            id="multiple-sources-with-blob-round-trip-unavailable",
+        ),
     ],
 )
 def test_no_source_internal_defense_uses_prior_source_shape_for_repair_guidance(
