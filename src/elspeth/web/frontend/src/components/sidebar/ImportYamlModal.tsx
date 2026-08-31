@@ -62,11 +62,25 @@ export const IMPORT_YAML_422_MESSAGE =
 
 const IMPORT_YAML_GENERIC_ERROR_DETAIL = "Failed to import YAML. Please try again.";
 
+export const IMPORT_YAML_SECTION_KEYS = [
+  "sources",
+  "source",
+  "transforms",
+  "gates",
+  "row_unions",
+  "aggregations",
+  "coalesce",
+  "queues",
+  "collectors",
+  "scopes",
+  "sinks",
+] as const;
+
 // Client-side import preflight mirrors only the backend's first hard gates:
 // syntactically valid YAML, mapping root, and at least one runtime pipeline
 // section. Plugin/schema validation remains server-owned.
 export const IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE =
-  "Pipeline YAML must define at least one pipeline section: sources, source, transforms, gates, row_unions, aggregations, coalesce, queues, collectors, scopes, or sinks.";
+  `Pipeline YAML must define at least one pipeline section: ${IMPORT_YAML_SECTION_KEYS.slice(0, -1).join(", ")}, or ${IMPORT_YAML_SECTION_KEYS[IMPORT_YAML_SECTION_KEYS.length - 1]}.`;
 
 interface ImportErrorInfo {
   title: string;
@@ -167,44 +181,32 @@ export interface ImportYamlSourceBindingCandidate {
   path: string;
 }
 
-export const IMPORT_YAML_SECTION_KEYS = [
-  "aggregations",
-  "coalesce",
-  "collectors",
-  "gates",
-  "queues",
-  "row_unions",
-  "scopes",
-  "sinks",
-  "source",
-  "sources",
-  "transforms",
-] as const;
-
 type ImportYamlSection = (typeof IMPORT_YAML_SECTION_KEYS)[number];
 
-const IMPORT_YAML_SECTION_KEY_SET: ReadonlySet<string> = new Set(
-  IMPORT_YAML_SECTION_KEYS,
-);
-
 type ImportYamlSectionCountTarget = "source" | "step" | "output" | "metadata";
+type ImportYamlSectionContainerShape = "single_mapping" | "mapping" | "list";
 
-const IMPORT_YAML_SECTION_COUNT_TARGET = {
-  aggregations: "step",
-  coalesce: "step",
-  collectors: "step",
-  gates: "step",
-  queues: "step",
-  row_unions: "step",
-  scopes: "metadata",
-  sinks: "output",
-  source: "source",
-  sources: "source",
-  transforms: "step",
-} as const satisfies Readonly<Record<ImportYamlSection, ImportYamlSectionCountTarget>>;
+interface ImportYamlSectionMetadata {
+  countTarget: ImportYamlSectionCountTarget;
+  containerShape: ImportYamlSectionContainerShape;
+}
+
+const IMPORT_YAML_SECTION_METADATA = {
+  sources: { countTarget: "source", containerShape: "mapping" },
+  source: { countTarget: "source", containerShape: "single_mapping" },
+  transforms: { countTarget: "step", containerShape: "list" },
+  gates: { countTarget: "step", containerShape: "list" },
+  row_unions: { countTarget: "step", containerShape: "list" },
+  aggregations: { countTarget: "step", containerShape: "list" },
+  coalesce: { countTarget: "step", containerShape: "list" },
+  queues: { countTarget: "step", containerShape: "mapping" },
+  collectors: { countTarget: "step", containerShape: "list" },
+  scopes: { countTarget: "metadata", containerShape: "list" },
+  sinks: { countTarget: "output", containerShape: "mapping" },
+} as const satisfies Readonly<Record<ImportYamlSection, ImportYamlSectionMetadata>>;
 
 function importYamlSection(key: string): ImportYamlSection | undefined {
-  return IMPORT_YAML_SECTION_KEY_SET.has(key)
+  return Object.prototype.hasOwnProperty.call(IMPORT_YAML_SECTION_METADATA, key)
     ? (key as ImportYamlSection)
     : undefined;
 }
@@ -271,17 +273,19 @@ function countParsedSectionEntries(
   section: ImportYamlSection,
   value: unknown,
 ): number | string {
-  if (section === "source") {
-    return isRecord(value) ? 1 : 'Section "source" must be a mapping.';
+  const { containerShape } = IMPORT_YAML_SECTION_METADATA[section];
+  switch (containerShape) {
+    case "single_mapping":
+      return isRecord(value) ? 1 : `Section "${section}" must be a mapping.`;
+    case "mapping":
+      return countRecordEntries(value, section);
+    case "list":
+      return countSequenceEntries(value, section);
+    default: {
+      const exhaustiveShape: never = containerShape;
+      return exhaustiveShape;
+    }
   }
-  if (
-    section === "sources"
-    || section === "queues"
-    || section === "sinks"
-  ) {
-    return countRecordEntries(value, section);
-  }
-  return countSequenceEntries(value, section);
 }
 
 type ImportYamlParsedDocument = ReturnType<typeof parseDocument>;
@@ -429,7 +433,7 @@ function analyseImportYamlDraftFromParsed(
         validationMessage: count,
       };
     }
-    const target = IMPORT_YAML_SECTION_COUNT_TARGET[section];
+    const target = IMPORT_YAML_SECTION_METADATA[section].countTarget;
     switch (target) {
       case "source":
         parsedSourceCount += count;

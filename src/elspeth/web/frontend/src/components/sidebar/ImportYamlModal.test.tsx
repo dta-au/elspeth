@@ -12,6 +12,7 @@ import {
   findImportYamlSourceBindingCandidates,
   IMPORT_YAML_NOT_RUNNABLE_INTRO,
   IMPORT_YAML_422_MESSAGE,
+  IMPORT_YAML_SECTION_KEYS,
   IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE,
 } from "./ImportYamlModal";
 import { OPEN_IMPORT_YAML_MODAL_EVENT } from "@/lib/composer-events";
@@ -1351,6 +1352,67 @@ describe("ImportYamlModal", () => {
 });
 
 describe("analyseImportYamlDraft queue recognition", () => {
+  const expectedRequiredSectionsMessage = () => {
+    const finalSection =
+      IMPORT_YAML_SECTION_KEYS[IMPORT_YAML_SECTION_KEYS.length - 1];
+    const leadingSections = IMPORT_YAML_SECTION_KEYS.slice(0, -1).join(", ");
+    return `Pipeline YAML must define at least one pipeline section: ${leadingSections}, or ${finalSection}.`;
+  };
+
+  it("derives required-section guidance from the authoritative ordered tuple", () => {
+    expect(IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE).toBe(
+      expectedRequiredSectionsMessage(),
+    );
+  });
+
+  it.each([
+    {
+      section: "source",
+      yaml: "source:\n  plugin: csv\n",
+      expected: { sourceCount: 1, stepCount: 0, outputCount: 0 },
+    },
+    {
+      section: "sources",
+      yaml: "sources:\n  first: {}\n  second: {}\n",
+      expected: { sourceCount: 2, stepCount: 0, outputCount: 0 },
+    },
+    {
+      section: "queues",
+      yaml: "queues:\n  first: {}\n  second: {}\n",
+      expected: { sourceCount: 0, stepCount: 2, outputCount: 0 },
+    },
+    {
+      section: "sinks",
+      yaml: "sinks:\n  first: {}\n  second: {}\n",
+      expected: { sourceCount: 0, stepCount: 0, outputCount: 2 },
+    },
+    ...[
+      "transforms",
+      "gates",
+      "row_unions",
+      "aggregations",
+      "coalesce",
+      "collectors",
+    ].map((section) => ({
+      section,
+      yaml: `${section}:\n  - {}\n  - {}\n`,
+      expected: { sourceCount: 0, stepCount: 2, outputCount: 0 },
+    })),
+    {
+      section: "scopes",
+      yaml: "scopes:\n  - {}\n  - {}\n",
+      expected: { sourceCount: 0, stepCount: 0, outputCount: 0 },
+    },
+  ])("uses the canonical container shape and count role for $section", ({ yaml, expected }) => {
+    const analysis = analyseImportYamlDraft(yaml);
+
+    expect(analysis).toMatchObject({
+      sectionsParsed: true,
+      canImport: true,
+      ...expected,
+    });
+  });
+
   it("counts a queue section as a processing step, not a source or output", () => {
     const analysis = analyseImportYamlDraft(QUEUE_PIPELINE_YAML);
     expect(analysis.sectionsParsed).toBe(true);
