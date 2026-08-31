@@ -11331,6 +11331,11 @@ class TestSetPipeline:
         source_options = _default_source(result.updated_state).options
         assert source_options["column"] == "text"
         assert source_options["blob_ref"] == result.data["inline_blob"]["blob_id"]
+        # Self-authorship marker (elspeth-47eba5cced): the blob's bytes came
+        # from this call's own inline_blob argument, and mid-turn custody
+        # rewrites excise them from the live transcript — without the marker
+        # a later get_blob_content of this blob reads as discovery.
+        assert result.data["inline_blob"]["originated_in"] == "this_tool_call"
         assert "hello" not in str(result.to_dict())
 
         with engine.connect() as conn:

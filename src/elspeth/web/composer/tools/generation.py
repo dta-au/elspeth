@@ -837,7 +837,9 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"transform_missing_on_error|Transform '(.+)' is missing required field 'on_error'",
         "Every transform must declare where failed rows go.",
-        "Set the transform's on_error — 'discard' is the simplest safe choice, or route to a quarantine sink name.",
+        "Set the transform's on_error explicitly. 'discard' costs the failed row's CONTENT, not the record of it — the "
+        "audit trail keeps the drop's terminal outcome, but nothing reaches a sink to inspect later. Route to a declared "
+        "quarantine sink name instead when failed rows must stay inspectable.",
     ),
     (
         r"gate_missing_condition|Gate '(.+)' is missing required field 'condition'",
@@ -1046,8 +1048,11 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"no_source_configured|No source configured",
-        "The pipeline has no source; every pipeline reads rows from exactly one configured source (or named sources).",
-        "Include a source block in the set_pipeline call — plugin, on_success connection, and options with a schema.",
+        "The pipeline has no source; every pipeline reads rows from exactly one configured source (or named sources). "
+        "set_pipeline is a full replacement, so source: null never means 'keep the existing source'.",
+        "Include a source block in the set_pipeline call — plugin, on_success connection, and options with a schema. "
+        "Rebuilding an already-sourced pipeline: re-supply the existing source by copying its blob_id (from "
+        "get_pipeline_state or list_blobs) into source.blob_id, or resend inline_blob.",
     ),
     (
         r"no_sinks_configured|No sinks configured",
@@ -1108,7 +1113,9 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"aggregation_missing_on_error|Aggregation '(.+)' is missing required field 'on_error'",
         "Every aggregation must declare where failed rows go.",
-        "Set the aggregation's on_error — 'discard' is the simplest safe choice, or route to a quarantine sink name.",
+        "Set the aggregation's on_error explicitly. 'discard' costs the failed row's CONTENT, not the record of it — the "
+        "audit trail keeps the drop's terminal outcome, but nothing reaches a sink to inspect later. Route to a declared "
+        "quarantine sink name instead when failed rows must stay inspectable.",
     ),
     (
         r"aggregation_output_mode_invalid",

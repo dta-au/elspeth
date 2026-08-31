@@ -5626,6 +5626,33 @@ class TestEdgeContractFailureFormatting:
         # Steers toward (a) — most failures are consumer over-declaration.
         assert "Try option (a) first" in suggestion or "option (a) first" in suggestion
 
+    def test_suggestion_names_type_coerce_for_producer_any_mismatch(self) -> None:
+        """Declared-narrower-than-producer-any steers to type_coerce, not widening.
+
+        Session 891b7b1e (elspeth-8762d9b666): faced with an Any/str edge
+        mismatch, the planner widened the consumer AND the sink to 'any'
+        because the suggestion offered only consumer-side relaxation. When
+        the producer emits 'Any', the narrowing remedy must be named.
+        """
+        exc = self._make_edge_error(
+            type_mismatches=(("category", "str", "Any"),),
+        )
+        suggestion = _build_edge_contract_suggestion(exc)
+
+        assert "type_coerce" in suggestion
+        assert "'category'" in suggestion
+        # The remedy keeps the consumer's declared type rather than erasing it.
+        assert "narrower declared" in suggestion
+
+    def test_suggestion_omits_type_coerce_when_producer_type_is_concrete(self) -> None:
+        """A concrete-vs-concrete mismatch keeps the plain two-option menu."""
+        exc = self._make_edge_error(
+            type_mismatches=(("fetch_status", "str | None", "int"),),
+        )
+        suggestion = _build_edge_contract_suggestion(exc)
+
+        assert "type_coerce" not in suggestion
+
     def test_suggestion_maps_dag_transform_ids_to_composer_node_ids(self) -> None:
         exc = self._make_edge_error(
             from_node_id="source_csv_a1b2c3",

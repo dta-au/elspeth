@@ -859,6 +859,22 @@ class TestForkRowUnionExemplar:
         assert "policy" not in union
         assert "merge" not in union
 
+    def test_exemplar_carries_a_non_discard_failure_route_to_a_declared_sink(self) -> None:
+        """elspeth-0aace271b4 I2: the aids corpus must not be a discard monoculture.
+
+        Before this exemplar, every failure edge in every worked exemplar was
+        'discard' (15/15), teaching silent row loss as the house style. This
+        pins the one retention-shaped counter-exemplar: a transform on_error
+        naming a sink that the same exemplar declares in outputs.
+        """
+        view, _snapshot = _trained_view()
+        args = planner_authoring_aids.fork_row_union_exemplar_args(view)
+        assert args is not None
+        declared_sinks = {output["sink_name"] for output in args["outputs"]}
+        non_discard_routes = {node["on_error"] for node in args["nodes"] if "on_error" in node and node["on_error"] != "discard"}
+        assert non_discard_routes, "row_union exemplar lost its non-discard failure route"
+        assert non_discard_routes <= declared_sinks
+
     def test_authoring_aids_publish_row_union_rules_and_exemplar(self) -> None:
         view, _snapshot = _trained_view()
         payload = build_planner_authoring_aids(view)
@@ -2423,6 +2439,55 @@ class TestRun5PackEdits:
         digest = discovery_digest(view)
         llm_entry = next(e for e in digest["transforms"] if e["name"] == "llm")
         assert set(llm_entry["required_options"]) == {"schema", "provider", "prompt_template"}
+
+
+class TestSession891b7b1eLiveReviewEdits:
+    """Live-review session 891b7b1e closures (epic elspeth-cce536a2ba), pinned."""
+
+    def test_llm_output_rules_teach_enum_constrained_join_keys(self) -> None:
+        """elspeth-85df4312b7: exact-match consumers get enum output_fields.
+
+        A free-text 'reply with only the category word' prompt fed
+        reference_join key_field with on_error: discard — one off-vocabulary
+        reply silently drops the row. The API-native constraint existed and
+        was untaught, as was the single-prompt field-naming fact (top-level
+        output_fields land UNPREFIXED, named exactly by suffix).
+        """
+        view, _snapshot = _trained_view()
+        rendered = "\n".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        assert "'enum'" in rendered
+        assert "reference_join" in rendered
+        assert "UNPREFIXED" in rendered
+        assert "no normalization" in rendered
+
+    def test_llm_output_rules_steer_any_narrowing_to_type_coerce(self) -> None:
+        """elspeth-8762d9b666: narrow at type_coerce, never widen consumers."""
+        view, _snapshot = _trained_view()
+        rendered = "\n".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        assert "type_coerce" in rendered
+        assert "never by widening" in rendered
+
+    def test_custody_rules_state_full_replacement_source_resupply(self) -> None:
+        """elspeth-6cadbff05f: source: null never means 'keep the source'."""
+        view, _snapshot = _trained_view()
+        rendered = "\n".join(build_planner_authoring_aids(view)["source_custody"]["rules"])
+        assert "FULL replacement" in rendered
+        assert "source: null never means" in rendered
+
+    def test_custody_rules_demand_first_person_invented_source_narration(self) -> None:
+        """elspeth-47eba5cced: fabricated-at-user-request content is self-authored."""
+        view, _snapshot = _trained_view()
+        rendered = "\n".join(build_planner_authoring_aids(view)["source_custody"]["rules"])
+        assert "FIRST PERSON" in rendered
+        assert "invented_source" in rendered
+        assert "get_blob_content" in rendered
+
+    def test_review_registry_rule_states_turn_end_review_timing(self) -> None:
+        """elspeth-2251bcc0c3: mid-turn valid=True is not a completion signal."""
+        view, _snapshot = _trained_view()
+        rendered = "\n".join(build_planner_authoring_aids(view)["review_registry"]["rules"])
+        assert "TURN END" in rendered
+        assert "not a completion signal" in rendered
 
 
 class TestLlmOnErrorRuleGating:
