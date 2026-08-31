@@ -17,6 +17,7 @@
 
 import {
   buildPlainPhraseMap,
+  COLLECTOR_PHRASE,
   COALESCE_PHRASE,
   PROCESS_ROW_PHRASE,
   QUEUE_PHRASE,
@@ -36,7 +37,7 @@ import {
   isPluginDerivedId,
 } from "@/components/chat/interpretationStepLabel";
 import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
-import type { CompositionState, NodeSpec } from "@/types/index";
+import type { CompositionState, NodeSpec, NodeType } from "@/types/index";
 import {
   sortedSourceEntries,
   sourceComponentId,
@@ -253,6 +254,30 @@ const MIN_FUZZY_COMPONENT_TOKEN_LENGTH = 4;
 
 type GeneratedRole = "source" | "output" | "transform";
 
+const NODE_TYPE_ROLES = {
+  transform: "transform",
+  gate: "transform",
+  aggregation: "transform",
+  coalesce: "transform",
+  row_union: "transform",
+  queue: "transform",
+  collector: "transform",
+} as const satisfies Readonly<Record<NodeType, GeneratedRole>>;
+
+const NODE_TYPE_STRUCTURAL_PHRASES = {
+  transform: null,
+  gate: null,
+  aggregation: null,
+  coalesce: COALESCE_PHRASE,
+  row_union: ROW_UNION_PHRASE,
+  queue: QUEUE_PHRASE,
+  collector: COLLECTOR_PHRASE,
+} as const satisfies Readonly<Record<NodeType, string | null>>;
+
+function isNodeType(value: string): value is NodeType {
+  return Object.prototype.hasOwnProperty.call(NODE_TYPE_ROLES, value);
+}
+
 // Single source of truth for the role vocabulary (elspeth-20bb1c3ac4):
 // firstGeneratedRole() used to re-declare these same words as a parallel
 // regex alternation. COMPONENT_ROLE_TOKENS (which also filters role words
@@ -346,17 +371,8 @@ function roleFromComponentType(componentType: string | null | undefined): Genera
   const t = componentType.toLowerCase();
   if (t === "source") return "source";
   if (t === "sink" || t === "output") return "output";
-  if (
-    t === "transform"
-    || t === "node"
-    || t === "gate"
-    || t === "aggregation"
-    || t === "coalesce"
-    || t === "row_union"
-    || t === "queue"
-  ) {
-    return "transform";
-  }
+  if (t === "node") return "transform";
+  if (isNodeType(t)) return NODE_TYPE_ROLES[t];
   return null;
 }
 
@@ -364,10 +380,9 @@ function structuralPhraseFromComponentType(
   componentType: string | null | undefined,
 ): string | null {
   const type = componentType?.toLowerCase();
-  if (type === "row_union") return ROW_UNION_PHRASE;
-  if (type === "coalesce") return COALESCE_PHRASE;
-  if (type === "queue") return QUEUE_PHRASE;
-  return null;
+  return type !== undefined && isNodeType(type)
+    ? NODE_TYPE_STRUCTURAL_PHRASES[type]
+    : null;
 }
 
 function componentIdTokens(componentId: string): string[] {
