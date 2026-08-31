@@ -8,6 +8,20 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-09-01 — secret wiring is deny-by-default at three seams, and collectors use the transform policy vocabulary** (elspeth-f3c1aafd25; 9da1b39b8, c163b6366)
+  `WebSettings.secret_wiring_allowlist` authorizes only an exact
+  `(secret, component_type, plugin, option_key)` match; an empty policy denies every wiring. The policy vocabulary is
+  `source|transform|sink`: aggregation and collector nodes both match `transform`, consistently with secret-reference
+  placement and authored-state admission. Enforce this contract (1) in `wire_secret_ref`, before writing a marker; (2)
+  in `validate_secret_evidence`, over `policy.authored_state`, so authenticated executable web paths—with their required
+  secret-service and user context—admit markers from imports and every other entry path; and (3) in `/execute`, where
+  `secret_guard` returns a 428 challenge bound to the exact authored composition state before the fanout guard or run
+  creation. The validator explicitly reports a skipped check when that context is unavailable; do not describe that mode
+  as admission. Only the authenticated execute request may return the challenge token: an LLM or composer-tool argument
+  is never approval. Keep the admission and execute walks on authored state because server-side operator-profile lowering
+  may inject credentials after admission by design.
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
 - **2026-08-30 — `.agents/skills/` is the ONE canonical skills tree; every `.claude/skills/<name>` is a committed relative symlink (`git ls-files -s` mode 120000) into it, and the design pack lives at top-level `design/`** (elspeth-1e9d011295)
   Add or edit a skill under `.agents/skills/` only; a real directory under `.claude/skills/` is a regression. Pin paths in
   tests, scripts and `per-file-ignores` at `.agents/skills/...` and `design/...`. Git never sees a path *through* a

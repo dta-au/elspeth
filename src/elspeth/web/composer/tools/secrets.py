@@ -251,13 +251,14 @@ def _execute_wire_secret_ref(
         node = next((n for n in state.nodes if n.id == target_id), None)
         if node is None:
             return _failure_result(state, f"Node '{target_id}' not found.")
-        if node.node_type not in ("transform", "aggregation") or node.plugin is None:
+        if node.node_type not in ("transform", "aggregation", "collector") or node.plugin is None:
             return _failure_result(
                 state,
-                "Secret references can only be wired into source, transform, aggregation, or output plugin options.",
+                "Secret references can only be wired into source, transform, aggregation, collector, or output plugin options.",
             )
-        # ``"transform"`` covers aggregation nodes too — the same vocabulary
-        # ``_secret_ref_placement_error`` uses for this arm below.
+        # ``"transform"`` covers aggregation and collector nodes too — the
+        # same vocabulary ``_secret_ref_placement_error`` and centralized
+        # authored-state admission use for this arm below.
         authorization_error = secret_wiring_authorization_error(
             context.secret_wiring_policy,
             secret_name=name,
