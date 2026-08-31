@@ -2486,6 +2486,27 @@ class InterpretationPlaceholderConsumedError(InterpretationResolveError):
     """The affected LLM node no longer carries the expected placeholder."""
 
 
+class InterpretationSourceDataContractDriftError(InterpretationResolveError):
+    """The source demand changed after its data-contract card was shown."""
+
+    def __init__(
+        self,
+        *,
+        source_name: str,
+        reviewed_fields: tuple[str, ...],
+        current_fields: tuple[str, ...] | None,
+    ) -> None:
+        self.source_name = source_name
+        self.reviewed_fields = reviewed_fields
+        self.current_fields = current_fields
+        reviewed = f"[{', '.join(reviewed_fields)}]"
+        current = "no active demanded fields" if current_fields is None else f"[{', '.join(current_fields)}]"
+        super().__init__(
+            f"The demanded-field contract for source {source_name!r} changed from {reviewed} to {current} "
+            "after this review was shown. Reload the session and review the current source data contract."
+        )
+
+
 class InterpretationDraftMismatchError(InterpretationResolveError):
     """The pending requirement exists but its draft is not the surfaced draft.
 

@@ -18,6 +18,7 @@ schema as a full stack.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -31,6 +32,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.enums import CreationModality
+from elspeth.web.composer.source_demand import SOURCE_DATA_CONTRACT_USER_TERM, build_source_data_contract_draft
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY, SOURCE_COMPONENT_ID
 from elspeth.web.sessions.protocol import CompositionStateData
@@ -193,6 +195,47 @@ def _llm_generated_source() -> dict[str, Any]:
     source = state.to_dict()["sources"][SOURCE_COMPONENT_ID]
     assert source is not None
     return source
+
+
+def _uploaded_source_contract_state(csv_path: str, *, required_fields: list[str]) -> dict[str, Any]:
+    """Build a real uploaded-source graph whose LLM consumer owns demand."""
+    return CompositionState(
+        source=None,
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="source",
+                options={"path": csv_path},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="rate",
+                node_type="transform",
+                plugin="llm",
+                input="source",
+                on_success="rated",
+                on_error="discard",
+                options={
+                    "prompt_template": "Rate {{ row.colour }}",
+                    "model": "gpt-test",
+                    "schema": {"mode": "observed"},
+                    "required_input_fields": required_fields,
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(name="Data contract route test", description=""),
+        version=1,
+    ).to_dict()
 
 
 async def _seed_session_with_pending_event(
@@ -485,6 +528,73 @@ async def test_08b_resolve_existing_event_with_consumed_placeholder_returns_422(
 
     assert response.status_code == 422, response.text
     assert response.json()["detail"]["code"] == "interpretation_placeholder_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_resolve_source_data_contract_drift_names_source_and_field_change(
+    test_client: TestClient,
+    tmp_path: Path,
+) -> None:
+    csv_path = tmp_path / "upload.csv"
+    csv_path.write_text("colour,size\nred,10\n", encoding="utf-8")
+    session_id = uuid4()
+    service: SessionServiceImpl = test_client.app.state.session_service
+    with test_client.app.state.phase3_engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id), user_id="alice")
+
+    surfaced = _uploaded_source_contract_state(str(csv_path), required_fields=["colour"])
+    surfaced_state = await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            sources=surfaced["sources"],
+            nodes=surfaced["nodes"],
+            metadata_={"name": "Data contract route test", "description": ""},
+            is_valid=False,
+        ),
+        provenance="tool_call",
+    )
+    event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=surfaced_state.id,
+        affected_node_id="source",
+        tool_call_id="call_data_contract",
+        user_term=SOURCE_DATA_CONTRACT_USER_TERM,
+        kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+        llm_draft=build_source_data_contract_draft(["colour"], ("colour", "size")),
+        model_identifier="anthropic/test-model",
+        model_version="1",
+        provider="anthropic",
+        composer_skill_hash="0" * 64,
+    )
+
+    drifted = _uploaded_source_contract_state(str(csv_path), required_fields=["colour", "size"])
+    await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            sources=drifted["sources"],
+            nodes=drifted["nodes"],
+            metadata_={"name": "Data contract route test", "description": ""},
+            is_valid=False,
+        ),
+        provenance="tool_call",
+    )
+
+    response = await _post(
+        test_client,
+        f"/api/sessions/{session_id}/interpretations/{event.id}/resolve",
+        json={"choice": "accepted_as_drafted"},
+    )
+
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "interpretation_source_data_contract_drift"
+    assert detail["message"] == (
+        "The demanded-field contract for source 'source' changed from [colour] to [colour, size] "
+        "after this review was shown. Reload the session and review the current source data contract."
+    )
+    assert "LLM" not in detail["message"]
+    assert "prompt" not in detail["message"].lower()
+    assert "node" not in detail["message"].lower()
 
 
 @pytest.mark.asyncio

@@ -224,6 +224,7 @@ from elspeth.web.sessions.protocol import (
     InterpretationNodeMissingError,
     InterpretationNodePluginMutatedError,
     InterpretationPlaceholderConsumedError,
+    InterpretationSourceDataContractDriftError,
     InterpretationUnsupportedChoiceError,
     PipelineDispatchRecovery,
     PipelineProposalPublicMetadata,
@@ -8131,29 +8132,54 @@ class SessionServiceImpl:
                         surfacing_state_record = self._row_to_state_record(surfacing_state_row)
                 if surfacing_state_record is None:
                     raise AuditIntegrityError(f"resolve_interpretation_event: event {eid!r} has no same-session surfacing state")
-                surfacing_review_identity = _reviewed_content_identity(
-                    surfacing_state_record,
-                    kind=kind,
-                    affected_node_id=event_row.affected_node_id,
-                    user_term=event_row.user_term,
-                    context="resolve_interpretation_event",
-                )
-                live_review_identity = _reviewed_content_identity(
-                    state_record,
-                    kind=kind,
-                    affected_node_id=event_row.affected_node_id,
-                    user_term=event_row.user_term,
-                    context="resolve_interpretation_event",
-                )
-                if live_review_identity != surfacing_review_identity:
-                    if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-                        raise InterpretationPlaceholderConsumedError(
-                            "resolve_interpretation_event: llm_prompt_template prompt skeleton no longer matches "
-                            "the structure the review approved"
-                        )
-                    raise InterpretationPlaceholderConsumedError(
-                        "resolve_interpretation_event: reviewed content no longer matches the event's surfacing state"
+                if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+                    source_name, reviewed_fields = _source_data_contract_demand_from_state_record(
+                        surfacing_state_record,
+                        affected_node_id=event_row.affected_node_id,
+                        context="resolve_interpretation_event",
                     )
+                    try:
+                        _live_source_name, current_fields = _source_data_contract_demand_from_state_record(
+                            state_record,
+                            affected_node_id=event_row.affected_node_id,
+                            context="resolve_interpretation_event",
+                        )
+                    except InterpretationResolveError as exc:
+                        raise InterpretationSourceDataContractDriftError(
+                            source_name=source_name,
+                            reviewed_fields=reviewed_fields,
+                            current_fields=None,
+                        ) from exc
+                    if current_fields != reviewed_fields:
+                        raise InterpretationSourceDataContractDriftError(
+                            source_name=source_name,
+                            reviewed_fields=reviewed_fields,
+                            current_fields=current_fields,
+                        )
+                else:
+                    surfacing_review_identity = _reviewed_content_identity(
+                        surfacing_state_record,
+                        kind=kind,
+                        affected_node_id=event_row.affected_node_id,
+                        user_term=event_row.user_term,
+                        context="resolve_interpretation_event",
+                    )
+                    live_review_identity = _reviewed_content_identity(
+                        state_record,
+                        kind=kind,
+                        affected_node_id=event_row.affected_node_id,
+                        user_term=event_row.user_term,
+                        context="resolve_interpretation_event",
+                    )
+                    if live_review_identity != surfacing_review_identity:
+                        if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+                            raise InterpretationPlaceholderConsumedError(
+                                "resolve_interpretation_event: llm_prompt_template prompt skeleton no longer matches "
+                                "the structure the review approved"
+                            )
+                        raise InterpretationPlaceholderConsumedError(
+                            "resolve_interpretation_event: reviewed content no longer matches the event's surfacing state"
+                        )
                 final_sources: Mapping[str, Mapping[str, Any]] | None
                 final_nodes: list[Mapping[str, Any]]
                 resolved_prompt_template_hash: str | None

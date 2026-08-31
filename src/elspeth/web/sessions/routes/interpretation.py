@@ -18,6 +18,7 @@ from ._helpers import (
     InterpretationResolveRequest,
     InterpretationResolveResponse,
     InterpretationSource,
+    InterpretationSourceDataContractDriftError,
     InterpretationUnsupportedChoiceError,
     ListInterpretationEventsResponse,
     OptOutSummaryResponse,
@@ -159,6 +160,14 @@ def register_interpretation_routes(router: APIRouter) -> None:
                 detail={
                     "code": "interpretation_node_mutated",
                     "message": "The affected node is no longer an LLM transform.",
+                },
+            ) from exc
+        except InterpretationSourceDataContractDriftError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "interpretation_source_data_contract_drift",
+                    "message": str(exc),
                 },
             ) from exc
         except InterpretationPlaceholderConsumedError as exc:
