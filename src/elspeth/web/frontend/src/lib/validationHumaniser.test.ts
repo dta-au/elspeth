@@ -6,7 +6,10 @@ import {
   humaniseValidationMessage,
   makePhraseFor,
 } from "./validationHumaniser";
-import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/guided/pipelineGloss";
+import {
+  COLLECTOR_PHRASE,
+  UNKNOWN_COMPONENT_PHRASE,
+} from "@/components/chat/guided/pipelineGloss";
 import { makeComposition } from "@/test/composerFixtures";
 import type { NodeSpec } from "@/types/index";
 
@@ -316,6 +319,14 @@ describe("makePhraseFor", () => {
     const phraseFor = makePhraseFor(null);
     expect(phraseFor("output_guided_row_union_a1b2", "row_union")).toBe(
       "wait for every branch, then preserve every branch row",
+    );
+  });
+
+  it("prioritises an authoritative collector type over generated id-role heuristics", () => {
+    const phraseFor = makePhraseFor(null);
+
+    expect(phraseFor("output_guided_collector_a1b2", "collector")).toBe(
+      COLLECTOR_PHRASE,
     );
   });
 

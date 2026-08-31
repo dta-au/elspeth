@@ -1183,14 +1183,40 @@ export function ChatPanel({
   // indicator mounted indefinitely; docked as a sibling of the messages log
   // inside the composer's flex column, it held its full completed-turn
   // height in the input's space until the user sent again. A failed or
-  // cancelled turn lands no complete agent tail, so its outcome still shows.
-  const finalAssistantTurnLanded = useMemo(() => {
+  // cancelled turn lands no complete agent reply, so its outcome still shows.
+  const terminalComposerProgressRetired = useMemo(() => {
+    const requestId = composerProgress?.request_id;
+    if (requestId !== null && requestId !== undefined) {
+      // Freeform progress.request_id is the persisted user-message id. Bind
+      // retirement to that request rather than to whichever row happens to be
+      // the absolute tail: validation can append a standalone system notice
+      // after the reply, while an older assistant must not retire a newer
+      // failed/cancelled request that produced no reply.
+      const requestTurnIndex = chatTurns.findIndex(
+        (turn) => turn.kind === "user" && turn.id === requestId,
+      );
+      if (requestTurnIndex !== -1) {
+        for (let i = requestTurnIndex + 1; i < chatTurns.length; i++) {
+          const turn = chatTurns[i];
+          // A later user turn supersedes this snapshot. This can happen when a
+          // new request fails before publishing progress and its final
+          // one-shot load sees the previous request's terminal snapshot.
+          if (turn.kind === "user") return true;
+          if (turn.kind === "agent" && turn.isComplete) return true;
+        }
+        return false;
+      }
+    }
+    // request_id is nullable for the idle snapshot and for failures before a
+    // user row is persisted. Preserve the original tail-derived fallback for
+    // those uncorrelatable states.
     const tail = chatTurns[chatTurns.length - 1];
     return tail !== undefined && tail.kind === "agent" && tail.isComplete;
-  }, [chatTurns]);
+  }, [chatTurns, composerProgress?.request_id]);
   const shouldShowComposerProgress =
     isComposing ||
-    (isTerminalComposerPhase(composerProgress?.phase) && !finalAssistantTurnLanded);
+    (isTerminalComposerPhase(composerProgress?.phase) &&
+      !terminalComposerProgressRetired);
 
   // Auto-scroll to bottom when new messages arrive (unless user scrolled up).
   // Empty sessions render template cards above the sentinel; scrolling to the
