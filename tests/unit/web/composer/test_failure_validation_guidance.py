@@ -15,10 +15,13 @@ the explain-tool pointer when some entry resolved to nothing.
 
 from __future__ import annotations
 
+import json
 from typing import Any
+from unittest.mock import MagicMock
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer.redaction import redact_tool_call_response
 from elspeth.web.composer.state import (
     CompositionState,
     PipelineMetadata,
@@ -149,11 +152,16 @@ class TestValidationGuidanceBuilder:
     def test_every_value_is_verbatim_catalogue_text(self) -> None:
         """The field carries STATIC catalogue text and nothing else.
 
-        ``validation.errors[].message`` is summarized on persist by
-        ``redaction._ValidationEntryShadowModel``; this field is not. Splicing
-        any span of a validator message in here — ``_augment_with_expected_hint``
-        is the live temptation, since the explain TOOL applies it — would route
-        validator text past that boundary into ``chat_messages.tool_calls``.
+        ``_augment_with_expected_hint`` is the live temptation, since the
+        explain TOOL applies it. It must not be applied here: the mapping is
+        keyed BY error_code, so one entry serves every error sharing that
+        code, and a spliced per-entry message span would make N colliding
+        entries whose text depended on visit order. It also keeps these bytes
+        identical to the guided surface's.
+
+        Custody is NOT the reason — the field is ``_SafeResponseEnvelope`` in
+        the redaction manifest and collapses to ``<redacted-response-mapping>``
+        on persist, just as ``message`` does.
         """
         codes = [
             "no_source_configured",
@@ -168,6 +176,27 @@ class TestValidationGuidanceBuilder:
         for code in codes:
             explanation, suggested_fix = explain_validation_code(code)
             assert guidance["codes"][code] == {"explanation": explanation, "suggested_fix": suggested_fix}
+
+
+class TestValidationGuidanceCustody:
+    def test_provider_sees_the_text_but_persistence_sees_a_placeholder(self) -> None:
+        """Declared ``_SafeResponseEnvelope``, so the audit projection collapses it.
+
+        The provider payload (``ToolResult.to_dict``) carries the full
+        catalogue text — that is the whole point of the field. The audit
+        projection that reaches ``chat_messages.tool_calls`` must not: it
+        collapses to a value-free placeholder, the same treatment
+        ``validation.errors[].message`` gets. If a later manifest edit drops
+        the ``_SafeResponseEnvelope`` declaration this fails, and the
+        redaction snapshot's ``sensitive_path_count`` drops with it.
+        """
+        payload = _sourceless_set_pipeline(_mock_catalog())
+        assert "no source" in json.dumps(payload["validation_guidance"]).lower()
+
+        persisted = redact_tool_call_response("set_pipeline", payload, telemetry=MagicMock())
+
+        assert persisted["validation_guidance"] == "<redacted-response-mapping>"
+        assert persisted["validation"]["errors"][0]["message"] == "<redacted-response-text>"
 
 
 class TestValidationGuidanceSeesTheNormalizedErrorSet:

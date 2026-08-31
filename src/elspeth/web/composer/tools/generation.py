@@ -1501,11 +1501,19 @@ def build_validation_guidance(codes: Iterable[str | None]) -> ValidationGuidance
 
     Every value is STATIC catalogue text — a public constant, never
     per-request data. :func:`_augment_with_expected_hint` is deliberately NOT
-    applied: it splices a span of the validator's message, and unlike
-    ``validation.errors[].message`` (summarized by
-    ``redaction._ValidationEntryShadowModel``) this field is persisted as
-    written. Keeping it static is what keeps it out of the redaction
-    boundary's way.
+    applied, for the reason :func:`explain_validation_code` gives: there is
+    no ``error_text`` here to mine an ``Expected …`` hint from, only the bare
+    code. The mapping is also keyed BY code, so one entry serves every error
+    sharing it; splicing a per-entry message span into a per-code entry would
+    make N colliding entries whose text depended on which one was visited
+    last. Static text keeps the freeform and guided surfaces reading
+    identical catalogue bytes.
+
+    Custody: this rides ``ToolResult.validation_guidance``, declared
+    ``_SafeResponseEnvelope`` in the redaction manifest, so the audit
+    projection collapses it to ``<redacted-response-mapping>`` exactly as it
+    collapses ``validation.errors[].message``. The provider sees the full
+    text; persistence sees a placeholder.
 
     ``explain_tool`` is advertised only while some code arrived WITHOUT inline
     guidance, which is exactly when the call can still add something: for an
