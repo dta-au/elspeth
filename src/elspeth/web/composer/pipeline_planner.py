@@ -129,6 +129,7 @@ from elspeth.web.composer.tools._dispatch import (
 )
 from elspeth.web.composer.tools.generation import (
     _CLOSED_VALIDATION_ERROR_CODES,
+    EXPLAIN_VALIDATION_ERROR_GUIDANCE,
     explain_validation_code,
     explain_withheld_validation_code,
 )
@@ -2319,12 +2320,10 @@ def _withheld_component_count(result: ToolResult) -> int:
     return withheld
 
 
-# Static usage line, never per-request data. Live planners called
-# explain_validation_error with junk ({"error_text": "ValidationError"})
-# because nothing said the exact code string is the lookup key. Kept
-# deliberately free of topology hints — mid-repair suggestions have derailed
-# otherwise-converging repairs.
-_EXPLAIN_VALIDATION_ERROR_GUIDANCE: Final[str] = "To expand any code, call explain_validation_error with the exact code string."
+# The freeform tool envelope advertises the same tool with the same bytes
+# (tools.generation.build_validation_guidance), so the string lives once in
+# the module that owns the catalogue it points at.
+_EXPLAIN_VALIDATION_ERROR_GUIDANCE: Final[str] = EXPLAIN_VALIDATION_ERROR_GUIDANCE
 
 
 def _explain_tool_advertisement_earns_its_turn(errors: Sequence[Mapping[str, Any]]) -> bool:

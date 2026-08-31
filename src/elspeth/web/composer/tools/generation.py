@@ -8,10 +8,10 @@ import hmac
 import io
 import re
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Literal, TypedDict, final
+from typing import Any, Final, Literal, NotRequired, TypedDict, final
 from uuid import UUID
 
 from opentelemetry import metrics
@@ -1456,6 +1456,87 @@ def explain_validation_code(code: str) -> tuple[str, str] | None:
         if re.search(pattern, code):
             return explanation, fix
     return None
+
+
+# Static usage line, never per-request data. Live planners called
+# explain_validation_error with junk ({"error_text": "ValidationError"})
+# because nothing said the exact code string is the lookup key. Kept
+# deliberately free of topology hints — mid-repair suggestions have derailed
+# otherwise-converging repairs.
+#
+# Public because BOTH repair surfaces advertise the tool with these exact
+# bytes: the planner's redacted feedback (pipeline_planner) and the freeform
+# tool envelope (tools._dispatch). Two copies would drift, and the parity
+# suite pins the string.
+EXPLAIN_VALIDATION_ERROR_GUIDANCE: Final[str] = "To expand any code, call explain_validation_error with the exact code string."
+
+
+class ValidationCodeGuidance(TypedDict):
+    """The catalogue's ``(explanation, suggested_fix)`` for one closed code."""
+
+    explanation: str
+    suggested_fix: str
+
+
+class ValidationGuidance(TypedDict):
+    """Inline repair guidance for one failed mutation envelope.
+
+    ``codes`` is keyed by the closed ``error_code`` so N entries sharing a
+    code cost the text once. ``explain_tool`` rides only when some entry got
+    no inline guidance — see :func:`build_validation_guidance`.
+    """
+
+    codes: dict[str, ValidationCodeGuidance]
+    explain_tool: NotRequired[str]
+
+
+def build_validation_guidance(codes: Iterable[str | None]) -> ValidationGuidance | None:
+    """Resolve a failed envelope's error codes to inline catalogue guidance.
+
+    The freeform twin of the planner's ``_allowlisted_candidate_feedback``
+    enrichment: the two surfaces read the SAME closed catalogue, so a model
+    on either one gets the repair text without spending a turn on
+    ``explain_validation_error``. Same rationale as the ``plugin_schemas``
+    augmentation that already rides these envelopes.
+
+    Every value is STATIC catalogue text — a public constant, never
+    per-request data. :func:`_augment_with_expected_hint` is deliberately NOT
+    applied: it splices a span of the validator's message, and unlike
+    ``validation.errors[].message`` (summarized by
+    ``redaction._ValidationEntryShadowModel``) this field is persisted as
+    written. Keeping it static is what keeps it out of the redaction
+    boundary's way.
+
+    ``explain_tool`` is advertised only while some code arrived WITHOUT inline
+    guidance, which is exactly when the call can still add something: for an
+    already-enriched code the tool returns byte-equivalent text and the turn
+    is wasted (elspeth-41b406c9fc). An unresolved code is still worth the
+    call on this surface — the tool also matches on the full validator
+    message, which this envelope carries and the code lookup cannot use.
+
+    Returns ``None`` for an envelope with no error entries at all, so a
+    success carries no key.
+    """
+    resolved: dict[str, ValidationCodeGuidance] = {}
+    saw_entry = False
+    any_unresolved = False
+    for code in codes:
+        saw_entry = True
+        if code is None:
+            any_unresolved = True
+            continue
+        guidance = explain_validation_code(code)
+        if guidance is None:
+            any_unresolved = True
+            continue
+        explanation, suggested_fix = guidance
+        resolved[code] = ValidationCodeGuidance(explanation=explanation, suggested_fix=suggested_fix)
+    if not saw_entry:
+        return None
+    payload = ValidationGuidance(codes=resolved)
+    if any_unresolved:
+        payload["explain_tool"] = EXPLAIN_VALIDATION_ERROR_GUIDANCE
+    return payload
 
 
 # Static text, never per-request data — the same public-constant posture as
