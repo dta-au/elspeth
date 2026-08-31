@@ -3112,6 +3112,21 @@ def test_llm_safe_schema_preserves_explicit_empty_guarantee_vote() -> None:
     assert projected == {"mode": "observed", "guaranteed_fields": []}
 
 
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"mode": "observed"},
+        {"mode": "observed", "guaranteed_fields": "not-a-sequence"},
+        {"mode": "observed", "guaranteed_fields": [7]},
+        {"mode": "observed", "guaranteed_fields": ["unknown"]},
+    ],
+)
+def test_llm_safe_schema_does_not_mint_an_empty_vote_from_absent_or_unprojectable_guarantees(
+    schema: dict[str, object],
+) -> None:
+    assert _llm_safe_schema_option(schema, field_aliases={}) == {"mode": "observed"}
+
+
 def test_context_block_reports_blob_binding_from_the_guided_path_sentinel() -> None:
     """The guided-native binding shape is the path sentinel, not ``blob_ref``.
 

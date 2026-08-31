@@ -1575,7 +1575,8 @@ def _llm_safe_schema_option(
     guaranteed_fields = schema.get("guaranteed_fields")
     if isinstance(guaranteed_fields, (list, tuple)):
         safe_guaranteed_fields = [field_aliases[field] for field in guaranteed_fields if isinstance(field, str) and field in field_aliases]
-        safe["guaranteed_fields"] = safe_guaranteed_fields
+        if not guaranteed_fields or safe_guaranteed_fields:
+            safe["guaranteed_fields"] = safe_guaranteed_fields
     # An explicit schema's declared fields are its field inventory (and are
     # implicitly guaranteed); without them a fixed-schema source reaches the
     # provider as a mode with no fields, which reads as "this source has no
