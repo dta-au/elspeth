@@ -1630,6 +1630,50 @@ describe("guided collector proposals (WS6 lift, ruling 7878)", () => {
     });
   });
 
+  it("preserves every collector scope binding on the current composition state", () => {
+    const response = singleSelectWireResponse();
+    response.composition_state = {
+      id: "state-collector",
+      session_id: "session-collector",
+      version: 1,
+      sources: {},
+      nodes: [
+        {
+          id: "collect_pages",
+          node_type: "collector",
+          plugin: "batch_stats",
+          input: "expanded_pages",
+          on_success: "documents",
+          on_error: null,
+          options: {},
+          scope_name: "document_pages",
+          scope_opener: "expand_pages",
+          scope_policy: "best_effort",
+        },
+      ],
+      edges: [],
+      outputs: [],
+      metadata: { name: null, description: null },
+      is_valid: true,
+      validation_errors: null,
+      validation_warnings: null,
+      validation_suggestions: null,
+      derived_from_state_id: null,
+      created_at: "2026-09-01T00:00:00Z",
+      composer_meta: null,
+      plugin_policy_findings: [],
+    };
+
+    const decoded = decodeGetGuidedResponse(response);
+
+    expect(decoded.composition_state?.nodes[0]).toMatchObject({
+      node_type: "collector",
+      scope_name: "document_pages",
+      scope_opener: "expand_pages",
+      scope_policy: "best_effort",
+    });
+  });
+
   it("rejects a collector whose opener does not name a payload node", () => {
     expect(() => decodeGetGuidedResponse(collectorProposalWireResponse((payload) => {
       const nodes = payload.nodes as Array<Record<string, unknown>>;

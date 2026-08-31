@@ -66,7 +66,7 @@ const IMPORT_YAML_GENERIC_ERROR_DETAIL = "Failed to import YAML. Please try agai
 // syntactically valid YAML, mapping root, and at least one runtime pipeline
 // section. Plugin/schema validation remains server-owned.
 export const IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE =
-  "Pipeline YAML must define at least one pipeline section: sources, source, transforms, gates, row_unions, aggregations, coalesce, queues, or sinks.";
+  "Pipeline YAML must define at least one pipeline section: sources, source, transforms, gates, row_unions, aggregations, coalesce, queues, collectors, scopes, or sinks.";
 
 interface ImportErrorInfo {
   title: string;
@@ -167,28 +167,47 @@ export interface ImportYamlSourceBindingCandidate {
   path: string;
 }
 
-type ImportYamlSection =
-  | "aggregations"
-  | "coalesce"
-  | "gates"
-  | "queues"
-  | "row_unions"
-  | "sinks"
-  | "source"
-  | "sources"
-  | "transforms";
+export const IMPORT_YAML_SECTION_KEYS = [
+  "aggregations",
+  "coalesce",
+  "collectors",
+  "gates",
+  "queues",
+  "row_unions",
+  "scopes",
+  "sinks",
+  "source",
+  "sources",
+  "transforms",
+] as const;
 
-const IMPORT_YAML_SECTION_ALIASES: Record<string, ImportYamlSection> = {
-  aggregations: "aggregations",
-  coalesce: "coalesce",
-  gates: "gates",
-  queues: "queues",
-  row_unions: "row_unions",
-  sinks: "sinks",
+type ImportYamlSection = (typeof IMPORT_YAML_SECTION_KEYS)[number];
+
+const IMPORT_YAML_SECTION_KEY_SET: ReadonlySet<string> = new Set(
+  IMPORT_YAML_SECTION_KEYS,
+);
+
+type ImportYamlSectionCountTarget = "source" | "step" | "output" | "metadata";
+
+const IMPORT_YAML_SECTION_COUNT_TARGET = {
+  aggregations: "step",
+  coalesce: "step",
+  collectors: "step",
+  gates: "step",
+  queues: "step",
+  row_unions: "step",
+  scopes: "metadata",
+  sinks: "output",
   source: "source",
-  sources: "sources",
-  transforms: "transforms",
-};
+  sources: "source",
+  transforms: "step",
+} as const satisfies Readonly<Record<ImportYamlSection, ImportYamlSectionCountTarget>>;
+
+function importYamlSection(key: string): ImportYamlSection | undefined {
+  return IMPORT_YAML_SECTION_KEY_SET.has(key)
+    ? (key as ImportYamlSection)
+    : undefined;
+}
 
 const IMPORT_YAML_SOURCE_PATH_KEYS = ["path", "file"] as const;
 
@@ -378,7 +397,7 @@ function analyseImportYamlDraftFromParsed(
   }
 
   const parsedSectionKeys = Object.keys(parsedRoot)
-    .map((key) => IMPORT_YAML_SECTION_ALIASES[key])
+    .map(importYamlSection)
     .filter((section): section is ImportYamlSection => section !== undefined);
   if (parsedSectionKeys.length === 0) {
     return {
@@ -396,7 +415,7 @@ function analyseImportYamlDraftFromParsed(
   let parsedStepCount = 0;
   let parsedOutputCount = 0;
   for (const [key, value] of Object.entries(parsedRoot)) {
-    const section = IMPORT_YAML_SECTION_ALIASES[key];
+    const section = importYamlSection(key);
     if (section === undefined) continue;
     const count = countParsedSectionEntries(section, value);
     if (typeof count === "string") {
@@ -410,12 +429,23 @@ function analyseImportYamlDraftFromParsed(
         validationMessage: count,
       };
     }
-    if (section === "source" || section === "sources") {
-      parsedSourceCount += count;
-    } else if (section === "sinks") {
-      parsedOutputCount += count;
-    } else {
-      parsedStepCount += count;
+    const target = IMPORT_YAML_SECTION_COUNT_TARGET[section];
+    switch (target) {
+      case "source":
+        parsedSourceCount += count;
+        break;
+      case "step":
+        parsedStepCount += count;
+        break;
+      case "output":
+        parsedOutputCount += count;
+        break;
+      case "metadata":
+        break;
+      default: {
+        const exhaustiveTarget: never = target;
+        return exhaustiveTarget;
+      }
     }
   }
 

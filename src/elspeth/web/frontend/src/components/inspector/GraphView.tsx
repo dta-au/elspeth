@@ -635,6 +635,9 @@ function selectedComponentConfig(
         policy: node.policy,
         merge: node.merge,
         timeout_seconds: node.timeout_seconds,
+        scope_name: node.scope_name,
+        scope_opener: node.scope_opener,
+        scope_policy: node.scope_policy,
       }),
       options: node.options,
     };

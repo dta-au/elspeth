@@ -159,6 +159,26 @@ const ROW_UNION_PIPELINE_YAML =
   "  results:\n" +
   "    plugin: json\n";
 
+const COLLECTOR_SCOPE_PIPELINE_YAML =
+  "collectors:\n" +
+  "  - name: collect_pages\n" +
+  "    plugin: batch_summary\n" +
+  "    input: page_rows\n" +
+  "    on_success: summaries\n" +
+  "    options: {}\n" +
+  "scopes:\n" +
+  "  - name: page_group\n" +
+  "    opener: expand_pages\n" +
+  "    closer: collect_pages\n" +
+  "    policy: require_all\n";
+
+const SCOPE_ONLY_PIPELINE_YAML =
+  "scopes:\n" +
+  "  - name: page_group\n" +
+  "    opener: expand_pages\n" +
+  "    closer: collect_pages\n" +
+  "    policy: require_all\n";
+
 function makeBlob(overrides: Partial<BlobMetadata> = {}): BlobMetadata {
   return {
     id: "22222222-2222-2222-2222-222222222222",
@@ -544,6 +564,18 @@ describe("ImportYamlModal", () => {
     // section, nor counted as a source/output.
     expect(
       screen.getByText("2 sources, 2 processing steps, 1 output"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Ready for server validation/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled();
+  });
+
+  it("previews a collector and its scope as one processing step", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(COLLECTOR_SCOPE_PIPELINE_YAML);
+
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+    expect(
+      screen.getByText("0 sources, 1 processing step, 0 outputs"),
     ).toBeInTheDocument();
     expect(screen.getByText(/Ready for server validation/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled();
@@ -1359,5 +1391,28 @@ describe("analyseImportYamlDraft queue recognition", () => {
     expect(analysis.stepCount).toBe(1);
     expect(analysis.outputCount).toBe(1);
     expect(IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE).toContain("row_unions");
+  });
+
+  it("counts collectors as processing steps without counting scope bindings as nodes", () => {
+    const analysis = analyseImportYamlDraft(COLLECTOR_SCOPE_PIPELINE_YAML);
+
+    expect(analysis.sectionsParsed).toBe(true);
+    expect(analysis.canImport).toBe(true);
+    expect(analysis.sourceCount).toBe(0);
+    expect(analysis.stepCount).toBe(1);
+    expect(analysis.outputCount).toBe(0);
+  });
+
+  it("recognises a scopes-only document for server validation without inventing a processing step", () => {
+    const analysis = analyseImportYamlDraft(SCOPE_ONLY_PIPELINE_YAML);
+
+    expect(analysis.sectionsParsed).toBe(true);
+    expect(analysis.canImport).toBe(true);
+    expect(analysis.stepCount).toBe(0);
+  });
+
+  it("names collectors and scopes in the required-section message", () => {
+    expect(IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE).toContain("collectors");
+    expect(IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE).toContain("scopes");
   });
 });

@@ -390,6 +390,47 @@ describe("GraphView", () => {
     expect(connections.closest("details")).not.toHaveAttribute("open");
   });
 
+  it("exposes every collector scope binding from the keyboard inspector", async () => {
+    const user = userEvent.setup();
+    useSessionStore.setState({
+      selectedNodeId: null,
+      selectNode: (nodeId: string | null) =>
+        useSessionStore.setState({ selectedNodeId: nodeId } as never),
+      compositionState: makeState({
+        nodes: [
+          makeNode({
+            id: "collect_pages",
+            node_type: "collector",
+            plugin: "batch_summary",
+            scope_name: "page_group",
+            scope_opener: "expand_pages",
+            scope_policy: "require_all",
+          }),
+        ],
+      }),
+    } as never);
+    render(<GraphView />);
+
+    const list = screen.getByRole("list", { name: /pipeline components/i });
+    const collector = within(list).getByRole("button", {
+      name: /collector: collect_pages/i,
+    });
+    collector.focus();
+    await user.keyboard("{Enter}");
+
+    const panel = screen.getByRole("complementary", {
+      name: /collect_pages configuration/i,
+    });
+    expect(panel).toHaveFocus();
+    await user.click(within(panel).getByText("Connections & schema"));
+    expect(within(panel).getByText("scope_name")).toBeInTheDocument();
+    expect(within(panel).getByText("page_group")).toBeInTheDocument();
+    expect(within(panel).getByText("scope_opener")).toBeInTheDocument();
+    expect(within(panel).getByText("expand_pages")).toBeInTheDocument();
+    expect(within(panel).getByText("scope_policy")).toBeInTheDocument();
+    expect(within(panel).getByText("require_all")).toBeInTheDocument();
+  });
+
   it("renders edge labels for on_success", () => {
     useSessionStore.setState({
       compositionState: makeState({
