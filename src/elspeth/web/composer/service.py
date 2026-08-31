@@ -2207,6 +2207,7 @@ class ComposerServiceImpl:
             assistant_message=result.message,
             raw_assistant_content=result.raw_assistant_content,
             persisted_assistant_content=result.persisted_assistant_content,
+            persisted_assistant_matches_terminal_model_turn=result.persisted_assistant_matches_terminal_model_turn,
             tool_outcomes=tuple(self._phase3_last_tool_outcomes),
             persisted_assistant_tool_calls=tuple(self._phase3_last_redacted_assistant_tool_calls),
             persisted_tool_row_content=tuple(row.content for row in self._phase3_last_redacted_tool_rows),
@@ -4994,6 +4995,7 @@ class ComposerServiceImpl:
                     persisted_assistant_message_id=persisted_assistant_message_id,
                     persisted_assistant_content=persisted_assistant_content,
                     persisted_tool_call_turn=persisted_tool_call_turn,
+                    persisted_assistant_matches_terminal_model_turn=(persist.persisted_assistant_message_id is not None),
                 )
                 return _ClassifyOutcome(
                     action="return",
@@ -8495,6 +8497,8 @@ class ComposeLoopTestResult:
     # to avoid re-emitting that row (elspeth-d581b3da7f) without reaching into
     # the route.
     persisted_assistant_content: str | None = None
+    # Whether that row was persisted from the terminal model turn itself.
+    persisted_assistant_matches_terminal_model_turn: bool = False
     persisted_assistant_tool_calls: tuple[Any, ...] = ()
     persisted_tool_row_content: tuple[Any, ...] = ()
     # Buffered per-call audit invocations so dispatch-branch tests can
