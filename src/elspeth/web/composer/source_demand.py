@@ -334,10 +334,11 @@ def build_source_data_contract_draft(
     Deterministic compact JSON (sorted keys) so draft equality checks at the
     tool boundary and the writer boundary compare the same bytes. The
     commitment wording — "whatever I feed this pipeline will carry these
-    columns" — and the honest consequence — "rows missing these columns will
-    be set aside (quarantined), the run continues" — are frontend card copy,
-    not draft payload: the draft carries the FACTS (demanded fields, sample
-    evidence, per-field sample misses), the renderer carries the prose.
+    columns" — and the fail-closed consequence of breaking that producer
+    guarantee are frontend card copy, not draft payload: the draft carries the
+    FACTS (demanded fields, sample evidence, per-field sample misses), the
+    renderer carries the prose. Source-validation quarantine is a distinct,
+    earlier path whose rows never reach ADR-016's boundary check.
     """
     demanded = sorted(demanded_fields)
     missing_from_sample = sorted(set(demanded) - set(sample_header)) if sample_header is not None else []

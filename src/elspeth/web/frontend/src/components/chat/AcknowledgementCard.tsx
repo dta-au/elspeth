@@ -381,7 +381,8 @@ export function AcknowledgementCard({
 
   // Data-contract body: the demanded columns with per-field sample warnings,
   // the illustrative sample note, and the honest consequence of acknowledging
-  // (rows missing a promised column QUARANTINE; the run continues). Falls back
+  // (a valid source row that breaks the producer guarantee stops the run).
+  // Source-validation quarantine is a separate, earlier path. Falls back
   // to the raw draft when the payload cannot be parsed — an attestation
   // surface must never silently render a degraded summary as the real one.
   const dataContract =
@@ -430,8 +431,10 @@ export function AcknowledgementCard({
           </p>
           <p className="ack-card-data-contract-note">
             A column only needs to be <em>present</em> on each row — it may be
-            empty. Rows missing one of these columns will be set aside
-            (quarantined) and the run continues.
+            empty. If a row that passed source validation is missing one of
+            these columns, the run stops and records a source data-contract
+            failure. Rows quarantined during source validation are handled
+            separately and never reach this check.
           </p>
         </div>
       ) : (

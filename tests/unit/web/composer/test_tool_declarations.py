@@ -758,6 +758,16 @@ class TestStep3MutationTierMigration:
         assert "Add or rewire a node in an existing pipeline" in skill
         assert "`upsert_node` / `upsert_edge`" in skill
 
+    def test_core_skill_teaches_the_fail_closed_source_data_contract(self) -> None:
+        """Planner guidance must not contradict ADR-016's runtime contract."""
+        skill = " ".join(
+            (Path(__file__).parents[4] / "src/elspeth/web/composer/skills/pipeline_composer.md").read_text(encoding="utf-8").split()
+        )
+
+        assert "records failed boundary evidence, and stops the run" in skill
+        assert "Rows the source quarantines during its own validation never reach this check" in skill
+        assert "rows missing a promised column quarantine; the run continues" not in skill
+
     def test_core_skill_keeps_the_full_rebuild_steer_scoped_to_new_builds(self) -> None:
         """The new edit row must not read as licence for tool-by-tool NEW builds.
 

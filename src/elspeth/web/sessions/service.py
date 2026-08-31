@@ -3592,8 +3592,10 @@ def _resolve_source_data_contract(
 
     Resolution stamps the demand into ``schema.guaranteed_fields`` (observed
     mode preserved — participate-but-open), which is what ADR-016's
-    ``SourceGuaranteedFieldsContract`` then enforces per-row at runtime: a
-    broken promise quarantines rows, it never aborts the run.
+    ``SourceGuaranteedFieldsContract`` then enforces per-row at runtime. A
+    valid source row that breaks the producer guarantee records a FAILED token
+    and source-node state before the Tier-1 violation aborts the run. Rows
+    quarantined during source validation never reach that boundary check.
     """
     source_name = source_name_from_component_id(affected_node_id)
     if source_name is None:

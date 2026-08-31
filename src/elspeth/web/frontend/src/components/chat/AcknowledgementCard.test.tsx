@@ -230,7 +230,7 @@ describe("AcknowledgementCard — source data contract", () => {
     });
   }
 
-  it("renders the demanded fields, the commitment framing, and the quarantine consequence", () => {
+  it("renders the demanded fields, the commitment framing, and the fail-closed consequence", () => {
     renderCard(
       makeDataContractEvent({
         contract_version: 1,
@@ -248,9 +248,11 @@ describe("AcknowledgementCard — source data contract", () => {
     expect(
       screen.getByText(/whatever you feed this pipeline/i),
     ).toBeTruthy();
-    // Honest consequence: quarantine, the run continues.
-    expect(screen.getByText(/set aside\s*\(quarantined\)/i)).toBeTruthy();
-    expect(screen.getByText(/the run continues/i)).toBeTruthy();
+    // A broken acknowledged producer guarantee is a Tier-1 declaration
+    // violation, distinct from Tier-3 source validation quarantine.
+    expect(screen.getByText(/the run stops/i)).toBeTruthy();
+    expect(screen.getByText(/source data-contract failure/i)).toBeTruthy();
+    expect(screen.queryByText(/the run continues/i)).toBeNull();
     expect(
       screen.getByRole("button", {
         name: /acknowledge the source data contract/i,
