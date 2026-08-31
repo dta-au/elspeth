@@ -5164,6 +5164,45 @@ def test_planner_rejects_duplicate_provider_tool_call_ids() -> None:
     assert caught.value.code == "MALFORMED_RESPONSE"
 
 
+@pytest.mark.parametrize(
+    "call_id",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("\u2003", id="whitespace"),
+    ],
+)
+def test_planner_rejects_invalid_provider_tool_call_ids(call_id: str) -> None:
+    response = _response_with_call_id(call_id, "list_sources", {})
+
+    with pytest.raises(PipelinePlannerError, match="tool call metadata") as caught:
+        _parse_response_tool_calls(response, max_tool_calls=3)
+
+    assert caught.value.code == "MALFORMED_RESPONSE"
+
+
+def test_planner_preserves_valid_distinct_provider_tool_call_order() -> None:
+    signed_call_id = "call_1__thought__" + "eA" * 150
+    response = _Response(
+        choices=[
+            _Choice(
+                message=_Message(
+                    content=None,
+                    tool_calls=[
+                        _ToolCall(id=signed_call_id, function=_Function("list_sources", "{}")),
+                        _ToolCall(id="second", function=_Function("list_sinks", "{}")),
+                    ],
+                )
+            )
+        ],
+        usage=_planner_usage(),
+    )
+
+    _message, calls = _parse_response_tool_calls(response, max_tool_calls=3)
+
+    assert len(signed_call_id) > 256
+    assert [call.call_id for call in calls] == [signed_call_id, "second"]
+
+
 @pytest.mark.asyncio
 async def test_exhausted_provider_error_is_wrapped_class_only_after_audit(
     tmp_path: Path,
