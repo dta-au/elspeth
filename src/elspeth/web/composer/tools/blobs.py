@@ -78,6 +78,7 @@ from elspeth.web.composer.state import (
     CompositionState,
 )
 from elspeth.web.composer.tools._common import (
+    _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE,
     ToolContext,
     ToolResult,
     _composition_canonical_interpretation_requirement_error,
@@ -711,7 +712,7 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
                 "type": "string",
                 "description": (
                     "Canonical path: source.options.<field>, source:<name>.options.<field>, "
-                    "node:<node_id>.options.<field>, or output:<name>.options.<field>."
+                    "node:<node_id>.options.<field>, or output:<name>.options.<field>." + _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
             "blob_id": {"type": "string", "format": "uuid", "description": "Ready blob ID to wire as inline content."},

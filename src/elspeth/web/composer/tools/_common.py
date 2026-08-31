@@ -136,6 +136,25 @@ _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozens
         "draft",
     }
 )
+_INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
+    " Inside interpretation_requirements, only kind, user_term, and draft are authorable. "
+    "Resolver-owned fields are not settable: "
+    + ", ".join(sorted(_RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS))
+    + ". Omit those fields; resolve_interpretation_event writes resolved review metadata."
+)
+_LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
+    " Runtime-owned LLM option fields are not settable: "
+    + ", ".join(sorted(_RUNTIME_OWNED_LLM_OPTION_KEYS))
+    + ". Omit them; ELSPETH re-derives them during review reconciliation or execution."
+    + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
+)
+_BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
+    " Runtime/resolver-owned option roots are not settable by this tool: "
+    + INTERPRETATION_REQUIREMENTS_KEY
+    + ", "
+    + ", ".join(sorted(_RUNTIME_OWNED_LLM_OPTION_KEYS))
+    + "."
+)
 _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "id",
@@ -2328,8 +2347,9 @@ def _resolver_owned_interpretation_requirement_error(
             return (
                 f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] includes "
                 "resolver-owned status 'resolved'. Composer tool input may stage pending "
-                "review requirements only; resolved review metadata may only be written by "
-                "resolve_interpretation_event."
+                f"review requirements only. Omit resolver-owned fields and retry {tool_name} "
+                "with exactly kind, user_term, and draft; only resolve_interpretation_event "
+                "can write resolved review metadata."
             )
         resolver_owned_fields = sorted(field for field in _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS if field in requirement)
         if resolver_owned_fields:
@@ -2337,8 +2357,8 @@ def _resolver_owned_interpretation_requirement_error(
             return (
                 f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] includes "
                 f"resolver-owned field(s): {field_names}. Composer tool input may supply "
-                "only kind, user_term, and draft; resolver-owned review metadata may only "
-                "be written by resolve_interpretation_event."
+                f"only kind, user_term, and draft. Omit resolver-owned fields and retry {tool_name}; "
+                "only resolve_interpretation_event can write resolved review metadata."
             )
         if set(requirement) != _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS:
             return malformed_error
@@ -2691,8 +2711,8 @@ def _runtime_owned_llm_option_error(
         field_names = ", ".join(supplied)
         return (
             f"{tool_name} options include runtime-owned LLM option(s): {field_names}. "
-            "These audit-link fields may only be written by resolve_interpretation_event, "
-            "not by composer tool input."
+            f"Omit {field_names} and retry {tool_name} with only the author-owned option change; "
+            "ELSPETH re-derives these audit-link fields during review reconciliation or execution."
         )
 
     return None

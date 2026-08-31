@@ -62,6 +62,8 @@ from elspeth.web.composer.tools._common import (
     _ECHOED_REVIEW_METADATA_NOTE,
     _ECHOED_SOURCE_AUTHORING_NOTE,
     _FULL_STATE_COMPONENT_ALIAS_SET,
+    _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
+    _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
     _STEP_DESCRIPTION_DESCRIPTION,
     ReviewedSourceAuthority,
@@ -1772,7 +1774,8 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     },
                     "options": {
                         "type": "object",
-                        "description": "Plugin-specific source config. Required by most file/data sources.",
+                        "description": "Plugin-specific source config. Required by most file/data sources."
+                        + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
                     },
                     "on_success": {
                         "type": "string",
@@ -1818,7 +1821,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     "type": "object",
                     "properties": {
                         "plugin": {"type": "string"},
-                        "options": {"type": "object"},
+                        "options": {
+                            "type": "object",
+                            "description": "Plugin-specific source config." + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
+                        },
                         "on_success": {"type": "string"},
                         "on_validation_failure": {
                             "type": ["string", "null"],
@@ -1866,7 +1872,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                                 "node, never as an edge; omit it to preserve fail-fast behavior."
                             ),
                         },
-                        "options": {"type": "object"},
+                        "options": {
+                            "type": "object",
+                            "description": "Plugin-specific node config." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+                        },
                         "condition": {"type": ["string", "null"]},
                         "routes": {
                             "type": ["object", "null"],

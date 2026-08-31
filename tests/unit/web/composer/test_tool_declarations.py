@@ -184,6 +184,7 @@ class TestSetSourceFromBlobMigration:
     def test_get_tool_definitions_emits_expected_set_source_from_blob_definition(self) -> None:
         from elspeth.web.composer.tools._common import (
             _DEFAULT_SOURCE_VALIDATION_FAILURE,
+            _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
             _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
         )
 
@@ -226,6 +227,7 @@ class TestSetSourceFromBlobMigration:
                         "description": (
                             "Plugin-specific config (merged with blob path). Required fields vary by plugin: "
                             "text sources need 'column' (output field name) and 'schema' (e.g., {mode: 'observed'})."
+                            + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
                         ),
                     },
                 },
@@ -657,6 +659,8 @@ class TestStep3MutationTierMigration:
         }
 
     def test_patch_source_options(self) -> None:
+        from elspeth.web.composer.tools._common import _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
+
         assert self._get("patch_source_options") == {
             "name": "patch_source_options",
             "description": "Apply a shallow merge-patch to a named source's options. "
@@ -668,7 +672,7 @@ class TestStep3MutationTierMigration:
                     "source_name": {"type": "string", "description": "Source root name to patch. Defaults to 'source'."},
                     "patch": {
                         "type": "object",
-                        "description": "Merge-patch to apply to source options.",
+                        "description": "Merge-patch to apply to source options." + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
                     },
                 },
                 "required": ["patch"],
@@ -922,6 +926,8 @@ class TestStep3BlobDiscoveryTierMigration:
         assert names == {"list_blobs", "list_composer_blobs", "get_blob_metadata", "get_blob_content", "inspect_source"}
 
     def test_wire_blob_inline_ref(self) -> None:
+        from elspeth.web.composer.tools._common import _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
+
         assert self._get("wire_blob_inline_ref") == {
             "name": "wire_blob_inline_ref",
             "description": (
@@ -935,7 +941,7 @@ class TestStep3BlobDiscoveryTierMigration:
                         "type": "string",
                         "description": (
                             "Canonical path: source.options.<field>, source:<name>.options.<field>, "
-                            "node:<node_id>.options.<field>, or output:<name>.options.<field>."
+                            "node:<node_id>.options.<field>, or output:<name>.options.<field>." + _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
                         ),
                     },
                     "blob_id": {

@@ -44,6 +44,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.composer.tools._common import (
     _DEFAULT_SOURCE_VALIDATION_FAILURE,
+    _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
     _STEP_DESCRIPTION_DESCRIPTION,
     PendingCustodyBlobView,
@@ -219,7 +220,10 @@ _SET_SOURCE_DECLARATION = ToolDeclaration(
                     "runtime matches strings, not graph topology."
                 ),
             },
-            "options": {"type": "object", "description": "Plugin-specific config."},
+            "options": {
+                "type": "object",
+                "description": "Plugin-specific config." + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
+            },
             "on_validation_failure": {
                 "type": "string",
                 "description": _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
@@ -1343,7 +1347,10 @@ _SET_SOURCE_FROM_BLOBS_DECLARATION = ToolDeclaration(
             },
             "options": {
                 "type": "object",
-                "description": ("Optional blob_rows config (e.g. schema). The 'blobs' list is resolver-owned and must not appear here."),
+                "description": (
+                    "Optional blob_rows config (e.g. schema). The 'blobs' list is resolver-owned and must not appear here."
+                    + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
+                ),
             },
         },
         "required": ["blob_ids", "on_success"],
@@ -1395,6 +1402,7 @@ _SET_SOURCE_FROM_BLOB_DECLARATION = ToolDeclaration(
                 "description": (
                     "Plugin-specific config (merged with blob path). Required fields vary by plugin: "
                     "text sources need 'column' (output field name) and 'schema' (e.g., {mode: 'observed'})."
+                    + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
         },
@@ -1842,7 +1850,7 @@ _PATCH_SOURCE_OPTIONS_DECLARATION = ToolDeclaration(
             },
             "patch": {
                 "type": "object",
-                "description": "Merge-patch to apply to source options.",
+                "description": "Merge-patch to apply to source options." + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
             },
         },
         "required": ["patch"],
