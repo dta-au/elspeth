@@ -39,7 +39,7 @@ _UNSUPPORTED_COALESCE_FIELDS = frozenset(
     }
 )
 _ROW_UNION_FIELDS = frozenset({"name", "branches", "on_success", "timeout_seconds", "input"})
-_COLLECTOR_FIELDS = frozenset({"name", "plugin", "input", "on_success", "on_error", "options"})
+_COLLECTOR_FIELDS = frozenset({"name", "plugin", "input", "on_success", "options"})
 _SCOPE_FIELDS = frozenset({"name", "opener", "closer", "policy"})
 # Recognised top-level pipeline sections. A parsed document that is a
 # mapping but shares none of these keys is not a pipeline export at all
@@ -604,6 +604,12 @@ def _collector_nodes_from_runtime_lists(collectors_section: Any, scopes_section:
         for index, raw_entry in enumerate(_require_sequence(collectors_section, "collectors")):
             path = f"collectors[{index}]"
             entry = _require_mapping(raw_entry, path)
+            if "on_error" in entry:
+                collector_name = _require_nonblank_str(entry, "name", path)
+                raise RuntimeYamlImportError(
+                    f"{path} collector '{collector_name}' does not accept on_error. Collector failures are "
+                    "whole-group verdicts settled through scope policy and nesting. Remove on_error."
+                )
             unknown = sorted(set(entry) - _COLLECTOR_FIELDS, key=lambda field: (type(field).__name__, repr(field)))
             if unknown:
                 raise RuntimeYamlImportError(f"{path} contains unknown or inapplicable field(s): {unknown}")
@@ -614,7 +620,7 @@ def _collector_nodes_from_runtime_lists(collectors_section: Any, scopes_section:
                     plugin=_require_str(entry, "plugin", path),
                     input=_require_str(entry, "input", path),
                     on_success=_require_str(entry, "on_success", path),
-                    on_error=_optional_str(entry, "on_error"),
+                    on_error=None,
                     options=dict(_optional_mapping(entry.get("options"), f"{path}.options")),
                     condition=None,
                     routes=None,

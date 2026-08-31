@@ -110,7 +110,8 @@ function guidedSession(step: string): Record<string, unknown> {
 // The propose_pipeline turn: a collector-bearing proposal in the exact closed
 // projection shape validate_payload emits. The collector behavior carries the
 // opener's stable id and the closed policy; no collector node_error edge is
-// present (on_error is OPTIONAL on a collector — group failure is structural).
+// present (on_error is inexpressible on a collector — group failure is a
+// structural whole-group verdict).
 const proposeTurn: Record<string, unknown> = {
   type: "propose_pipeline",
   step_index: 2,

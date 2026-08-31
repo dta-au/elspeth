@@ -281,6 +281,35 @@ frozen membership, wire values, and hold-payload shapes are untouched):**
   verified empty before landing: 0/496 stored composition states and 0/26
   proposals carried a collector node or the field.
 
+### 7. A collector has no `on_error` route — plugin failure is a whole-group verdict (2026-09-01)
+
+`CollectorSettings.on_error` is DELETED from the runtime config and every
+authoring schema. It was accepted, copied onto the plugin instance, and then
+never read by graph construction, preflight, or execution: an unknown sink
+survived a full run, while a valid sink received nothing when the collector
+plugin failed. The collector executor instead reports `_fail_group`, and the
+barrier coordinator settles or escalates that whole-group verdict according to
+scope policy and nesting.
+
+This is the same make-inexpressible decision as §6. Spec §7 rule 9 permits a
+*member node inside a bound region* to name its closer as `on_error`; it does
+not give the closer its own route. The sibling coalesce and row-union closers
+likewise have no error route. Giving a collector one would require new and
+currently undefined group-versus-member routing, audit, wire, and recovery
+semantics, not merely drawing an edge.
+
+Authored YAML carrying the field now gets a dedicated config/import rejection
+that names the collector, says to remove `on_error`, and explains the structural
+replacement; the field remains absent from the model schema. Composer Stage 1
+gives collectors the same removal diagnostic before edge lowering, and the
+guided proposal schema, projected flows, Python decoder, and frontend decoder
+expose exactly one success flow and no error flow. Deliberate witnesses pin
+field rejection, JSON-schema absence, YAML-import rejection, no collector
+error-edge lowering, and guided/frontend wire rejection. No database migration
+is required because the field was config and JSON state only; the current local
+session store contained no collector in 225 composition states or 12 proposal
+payloads when checked before landing.
+
 ## Consequences
 
 - **Positive:** a release context's `reason` now answers the operator's

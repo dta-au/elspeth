@@ -300,6 +300,16 @@ sites:
   disposition: not_authorable
   note: NodeSpec has no quorum_count field (state.py:240-257) and the generator never emits one (yaml_generator.py:324-338),
     so quorum_count is always None and config.py:1079 is unreachable from composer state.
+- key: 23fdd50121dd5afd
+  path: src/elspeth/core/config.py
+  qualname: CollectorSettings.reject_on_error
+  exception: ValueError
+  message: Collector '{}' does not accept on_error. Collector failures are whole-group verdicts settled
+    through scope policy and nesting. Remove on_error.
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - collector_has_on_error_invalid
 - key: 4a0c5c7b35e438e4
   path: src/elspeth/core/config.py
   qualname: CollectorSettings.validate_input
@@ -344,17 +354,6 @@ sites:
   - node_id_invalid
   note: A collector's name is its NodeSpec id; _composer_node_id_validation_message (label 'Collector
     name') mirrors the non-empty rule (WS2 Task 12).
-- key: 650ee306729c1490
-  path: src/elspeth/core/config.py
-  qualname: CollectorSettings.validate_on_error
-  exception: ValueError
-  message: Collector on_error must be a sink name, 'discard', or omitted
-  ordinal: 0
-  disposition: mirrored
-  counterpart:
-  - connection_label_invalid
-  note: Stage 1's collector arm in _routing_label_errors rejects a blank collector on_error and runs the
-    runtime label rules on any non-'discard' value (WS2 Task 12).
 - key: 96321101ced6ef42
   path: src/elspeth/core/config.py
   qualname: CollectorSettings.validate_on_success

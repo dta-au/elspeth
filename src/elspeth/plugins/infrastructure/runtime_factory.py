@@ -147,10 +147,6 @@ def instantiate_plugins_from_config(
             transform_cls = manager.get_transform_by_name(collector_config.plugin)
             transform = transform_cls(dict(collector_config.options))
             transform.on_success = collector_config.on_success
-            # May be None — the derives-from-structure default (spec §7 rule 9);
-            # transforms already type on_error as str | None, and WS4's executor
-            # realizes the structural route.
-            transform.on_error = collector_config.on_error
             if not transform.is_batch_aware:
                 raise ValueError(
                     f"Collector '{collector_config.name}' uses transform '{collector_config.plugin}' "

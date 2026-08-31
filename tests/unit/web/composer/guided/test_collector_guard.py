@@ -274,7 +274,7 @@ class TestProjectionArm:
 class TestProtocolVocabularies:
     def test_collector_is_in_the_node_and_flow_vocabularies(self) -> None:
         assert "collector" in _NODE_TYPES
-        assert _LEGAL_NODE_FLOWS["collector"] == frozenset({"node_success", "node_error"})
+        assert _LEGAL_NODE_FLOWS["collector"] == frozenset({"node_success"})
 
     def test_node_flow_vocabularies_cannot_drift_apart(self) -> None:
         assert set(_NODE_TYPES) == set(_LEGAL_NODE_FLOWS)
@@ -403,21 +403,21 @@ class TestProposePayloadContract:
     def test_collector_proposal_validates(self) -> None:
         assert validate_payload(TurnType.PROPOSE_PIPELINE, _collector_propose_payload()) is None
 
-    def test_collector_on_error_flow_is_optional_but_bounded(self) -> None:
-        # No node_error flow on the collector above: valid (the scope's group
-        # machinery owns the failure route, ADR-042 §6). A second success flow
-        # is not.
+    def test_collector_node_error_flow_is_rejected(self) -> None:
+        # Collector failure is a structural whole-group verdict. A node_error
+        # flow would falsely promise a per-row route that no runtime path owns.
         payload = _collector_propose_payload()
         payload["graph"]["edges"].append(
             {
                 "stable_id": "00000000-0000-4000-8000-000000000420",
                 "from_endpoint": {"kind": "node", "stable_id": COLLECTOR_ID},
-                "to_endpoint": {"kind": "output", "stable_id": P_OUTPUT_ID},
-                "flow": {"kind": "node_success", "branch": None},
+                "to_endpoint": {"kind": "discard"},
+                "flow": {"kind": "node_error"},
             }
         )
         payload["component_counts"]["edges"] = 7
-        assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is not None
+        error = validate_payload(TurnType.PROPOSE_PIPELINE, payload)
+        assert error is not None and "collector" in error
 
     def test_collector_opener_must_resolve_to_a_payload_node(self) -> None:
         payload = _collector_propose_payload()

@@ -183,7 +183,6 @@ class TestCrossTypeNameCollisions:
                         plugin="passthrough",
                         input="pages",
                         on_success="output",
-                        on_error="discard",
                     ),
                 ],
                 scopes=[

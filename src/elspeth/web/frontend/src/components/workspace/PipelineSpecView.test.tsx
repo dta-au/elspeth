@@ -59,6 +59,38 @@ describe("PipelineSpecView", () => {
     expect(container).toHaveTextContent("Outputs");
   });
 
+  it("does not expose malformed collector on_error routing", () => {
+    useSessionStore.setState({
+      compositionState: makeComposition(1, {
+        sources: {},
+        nodes: [{
+          id: "stitch",
+          node_type: "collector",
+          plugin: "batch_stats",
+          input: "pages",
+          on_success: "assembled",
+          on_error: "legacy_errors",
+          scope_name: "document_pages",
+          scope_opener: "explode",
+          scope_policy: "require_all",
+          options: {},
+        }],
+        outputs: [
+          { name: "assembled", plugin: "json", options: {} },
+          { name: "legacy_errors", plugin: "json", options: {} },
+        ],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const node = screen.getByRole("article", { name: "Node stitch" });
+    expect(within(node).getByText("Then")).toBeInTheDocument();
+    expect(within(node).queryByText("On error")).not.toBeInTheDocument();
+    expect(within(node).queryByText("legacy_errors")).not.toBeInTheDocument();
+    expect(within(node).getByText("Scope policy")).toBeInTheDocument();
+  });
+
   it("names a plugin in the human register and keeps the raw id in title", () => {
     // elspeth-ca456d9d8d: the Plugin row printed the raw catalog id as visible
     // text; the copy register puts the display name on the surface and the
