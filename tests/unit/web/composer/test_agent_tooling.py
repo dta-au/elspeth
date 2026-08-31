@@ -235,6 +235,10 @@ class TestCreateBlob:
         assert result.data["size_bytes"] == len(b"url\nhttps://example.com")
         assert result.data["blob_id"]
         assert result.data["content_hash"]
+        # Self-authorship marker (elspeth-47eba5cced): the blob's bytes came
+        # from this call's own content argument, so a later get_blob_content
+        # of this blob must be recognizable as reading self-authored data.
+        assert result.data["originated_in"] == "this_tool_call"
 
     def test_rejects_unsupported_mime_type(self, blob_env: dict[str, Any]) -> None:
         # _prepare_blob_create raises ToolArgumentError (CEC1 channel

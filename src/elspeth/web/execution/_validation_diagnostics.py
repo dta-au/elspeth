@@ -522,6 +522,20 @@ def _build_edge_contract_suggestion_with_resolver(
     parts.append(f"  (a) Relax the consumer's input schema on {consumer.display_name}. Either:")
     if has_type_mismatch:
         parts.append("      - Change the declared field type(s) to match what the producer emits (see Type mismatches above).")
+        # Declared-narrower-than-producer-any is the one mismatch where
+        # relaxing the consumer ERASES a real contract: the reachable
+        # narrowing lives upstream in type_coerce, and without naming it
+        # here planners widen every downstream consumer (and the sink) to
+        # 'any' instead (session 891b7b1e, elspeth-8762d9b666).
+        any_producer_fields = tuple(field for field, _expected, actual in result.type_mismatches if actual == "Any")
+        if any_producer_fields:
+            fields_text = ", ".join(repr(field) for field in any_producer_fields)
+            parts.append(
+                f"      - EXCEPTION for {fields_text}: the producer emits 'any'. To KEEP the consumer's narrower declared "
+                "type, insert a type_coerce transform between producer and consumer — options.conversions: "
+                "[{'field': <name>, 'to': <declared type>}] with schema mode 'observed' — which narrows the value with a "
+                "defined error path. Widening this consumer (or the sink) to 'any' erases the type contract instead."
+            )
     if has_missing:
         parts.append(
             "      - Drop the missing required fields from wherever the consumer declares them — its schema.required_fields "

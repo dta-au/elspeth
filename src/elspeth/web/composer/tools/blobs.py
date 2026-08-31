@@ -33,7 +33,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError as PydanticValidationError
@@ -133,13 +133,23 @@ class BlobToolRecord(TypedDict):
 
 
 class BlobCreatePayload(TypedDict):
-    """Closed dict shape for the create_blob tool's success result data."""
+    """Closed dict shape for the create_blob tool's success result data.
+
+    ``originated_in`` is the self-authorship marker (elspeth-47eba5cced):
+    both producers of this payload — create_blob and a set_pipeline
+    resolved inline_blob — describe a blob whose bytes came from the
+    calling LLM's OWN tool arguments, and mid-turn custody rewrites excise
+    those bytes from the live transcript, so without this marker a later
+    get_blob_content round trip is structurally indistinguishable from
+    discovering someone else's data.
+    """
 
     blob_id: str
     filename: str
     mime_type: str
     size_bytes: int
     content_hash: str
+    originated_in: Literal["this_tool_call"]
 
 
 def _blob_row_to_tool_dict(row: Any) -> BlobToolRecord:
@@ -1062,6 +1072,7 @@ def _blob_create_payload(prepared: _PreparedBlobCreate) -> BlobCreatePayload:
         "mime_type": prepared.mime_type,
         "size_bytes": len(prepared.content_bytes),
         "content_hash": prepared.content_hash,
+        "originated_in": "this_tool_call",
     }
 
 

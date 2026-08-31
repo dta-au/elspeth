@@ -2333,6 +2333,9 @@ async def test_current_executor_inline_blob_effects_are_single_settlement(tmp_pa
         "mime_type": "text/csv",
         "size_bytes": len(content.encode("utf-8")),
         "content_hash": content_hash(content.encode("utf-8")),
+        # Self-authorship marker (elspeth-47eba5cced): the blob's bytes came
+        # from this call's own inline_blob argument.
+        "originated_in": "this_tool_call",
     }
     assert deep_thaw(result.data) == {"inline_blob": expected_inline_payload}
     assert result.updated_state.to_dict()["sources"]["source"] == {

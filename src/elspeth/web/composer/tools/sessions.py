@@ -733,7 +733,14 @@ def build_set_pipeline_candidate(
         # repair feedback on every surface resolves to the "include a source
         # block" guidance (the stale-state riders themselves are withheld
         # from set_pipeline failure envelopes — elspeth-e89e6bf47a).
-        return _failure_result(state, "set_pipeline requires source or sources.", error_code="no_source_configured")
+        return _failure_result(
+            state,
+            "set_pipeline requires source or sources. This tool is a full replacement — "
+            "source: null does not mean 'keep the existing source'. Re-supply it: copy the "
+            "current blob_id (from get_pipeline_state or list_blobs) into source.blob_id, "
+            "or resend inline_blob.",
+            error_code="no_source_configured",
+        )
 
     source_specs: dict[str, SourceSpec] = {}
     resolved_source_blob: _ResolvedSourceBlob | None = None
@@ -1688,7 +1695,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                 "type": ["object", "null"],
                 "description": (
                     "Source configuration. Use blob_id to bind an already uploaded session blob, or "
-                    "inline_blob to materialize user-provided literal data atomically with the pipeline."
+                    "inline_blob to materialize user-provided literal data atomically with the pipeline. "
+                    "null carries NO meaning — it is not 'keep the existing source'. Every call must "
+                    "supply source or sources as a real object: on a full rebuild, re-supply the "
+                    "existing source by copying its blob_id."
                 ),
                 "properties": {
                     "plugin": {"type": "string"},
@@ -1737,7 +1747,8 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                 "type": ["object", "null"],
                 "description": (
                     "Named source roots keyed by stable source name; use instead of source for multi-source "
-                    "pipelines. Values share source's shape minus blob_id/inline_blob."
+                    "pipelines. Values share source's shape minus blob_id/inline_blob. null carries NO "
+                    "meaning; every call must supply source or sources as a real object."
                 ),
                 "additionalProperties": {
                     "type": "object",

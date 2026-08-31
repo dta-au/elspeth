@@ -908,25 +908,30 @@ def create_server(
             result_canonical: str | None
             result_hash: str | None
             version_after: int | None
+            result_canonicalization_failure: BaseException | None = None
 
             if status == ComposerToolStatus.SUCCESS and result_dict is not None:
                 # Result canonicalization happens AFTER state-mutation +
                 # redaction so the recorded result mirrors what was sent
-                # back to the LLM. Wrap in try/except per Solution-architect
-                # review H3: a non-finite float / non-serializable type in
-                # ``result_dict`` would otherwise raise from finally and
-                # mask the success return entirely. Fall back to a sentinel
-                # canonical so the audit row still lands.
+                # back to the LLM. Crash-on-anomaly, no sentinel fallback
+                # (see web.composer.audit.finish_dispatch): ``result_dict``
+                # is our own handler's output, so an un-canonicalizable
+                # value is a bug in our code — reclassify as PLUGIN_CRASH
+                # and re-raise after the audit row lands, never substitute
+                # synthesized evidence under a SUCCESS status. The sentinel
+                # form is reserved for the Tier-3 *arguments* path above.
                 try:
                     result_canonical = canonical_json(result_dict)
                     result_hash = stable_hash(result_dict)
+                    version_after = state_ref[0].version
                 except (ValueError, TypeError) as canon_result_exc:
-                    # Shared sentinel discipline — see
-                    # web.composer.audit.build_canonicalization_sentinel.
-                    sentinel = build_canonicalization_sentinel(canon_result_exc, result_dict)
-                    result_canonical = canonical_json(sentinel)
-                    result_hash = stable_hash(sentinel)
-                version_after = state_ref[0].version
+                    result_canonicalization_failure = canon_result_exc
+                    status = ComposerToolStatus.PLUGIN_CRASH
+                    error_class = type(canon_result_exc).__name__
+                    error_message = type(canon_result_exc).__name__
+                    result_canonical = None
+                    result_hash = None
+                    version_after = None
             elif status == ComposerToolStatus.ARG_ERROR and error_payload_for_audit is not None:
                 # ARG_ERROR: record the error payload that was returned to
                 # the LLM (Solution-architect H4 symmetry with web side).
@@ -964,6 +969,11 @@ def create_server(
                 if clear_session_after_audit:
                     session_id_ref[0] = None
                     session_checkout_ref[0] = None
+            if result_canonicalization_failure is not None:
+                # The client must not receive an unaudited success; the
+                # PLUGIN_CRASH row above is the durable record. Raising
+                # from ``finally`` discards the pending success return.
+                raise result_canonicalization_failure
 
     return server
 
