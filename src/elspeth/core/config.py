@@ -1335,7 +1335,7 @@ class CollectorSettings(BaseModel):
         """Reject the deleted collector route with its structural replacement."""
         if type(data) is not dict or "on_error" not in data:
             return data
-        raw_name = data.get("name")
+        raw_name = data["name"] if "name" in data else None
         name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else "<unnamed>"
         raise ValueError(
             f"Collector '{name}' does not accept on_error. Collector failures are whole-group "
