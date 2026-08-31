@@ -10,9 +10,10 @@ validation; tests for that surface live in test_step_tool_scope.py.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
@@ -992,6 +993,131 @@ def test_repair_thread_admission_parses_real_litellm_dynamic_tool_call() -> None
     assert admitted.calls[0].function.name == "retain_deferred_intent"
     assert admitted.calls[0].function.arguments == json.dumps({"target_stage": "topology"})
     assert admitted.calls[0].is_rejected is True
+
+
+@pytest.mark.parametrize(
+    "call_ids",
+    [
+        ("   ",),
+        ("duplicate", "duplicate"),
+    ],
+    ids=["blank", "duplicate"],
+)
+def test_repair_thread_admission_rejects_ambiguous_provider_call_ids(
+    call_ids: tuple[str, ...],
+) -> None:
+    calls = tuple(
+        SimpleNamespace(
+            id=call_id,
+            function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps({"target_stage": "topology"})),
+        )
+        for call_id in call_ids
+    )
+    message = SimpleNamespace(content=None)
+
+    admitted = chat_solver._admit_deferred_intent_repair_thread(
+        message,
+        calls,
+        rejected_calls=calls,
+    )
+
+    assert admitted is None
+
+
+def test_repair_thread_preserves_long_litellm_gemini_thought_signature_id_exactly() -> None:
+    from litellm.litellm_core_utils.prompt_templates.factory import _encode_tool_call_id_with_signature
+
+    signed_id = _encode_tool_call_id_with_signature("call_gemini", "c2ln" * 100)
+    assert len(signed_id) > 256
+    call = SimpleNamespace(
+        id=signed_id,
+        function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps({"target_stage": "topology"})),
+    )
+    admitted = chat_solver._admit_deferred_intent_repair_thread(
+        SimpleNamespace(content=None),
+        (call,),
+        rejected_calls=(call,),
+    )
+
+    assert admitted is not None
+    assert admitted.calls[0].id == signed_id
+    replay = chat_solver._deferred_intent_repair_thread(
+        admitted,
+        errors=(chat_solver.DeferredIntentActionShapeError("repair this call"),),
+    )
+    assert replay[0]["tool_calls"][0]["id"] == signed_id
+    assert replay[1]["tool_call_id"] == signed_id
+
+
+def test_deferred_intent_management_schema_survives_supported_provider_adapters() -> None:
+    """Anthropic/Bedrock must see the management fields, not an empty tool."""
+    from litellm.litellm_core_utils.prompt_templates.factory import _bedrock_tools_pt
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+    definition = deepcopy(chat_solver._DEFERRED_INTENT_MANAGEMENT_TOOL)
+    raw_schema = definition["function"]["parameters"]
+    anthropic_tool: Any
+    anthropic_tool, _ = AnthropicConfig()._map_tool_helper(definition)
+    bedrock_tools: Any = _bedrock_tools_pt(
+        [definition],
+        model="anthropic.claude-3-5-sonnet-20241022-v2:0",
+    )
+    transported = (
+        raw_schema,
+        anthropic_tool["input_schema"],
+        bedrock_tools[0]["toolSpec"]["inputSchema"]["json"],
+    )
+
+    assert raw_schema["additionalProperties"] is False
+    for schema in transported:
+        assert schema["type"] == "object"
+        assert set(schema["required"]) == {"action", "intent_id", "selection_token"}
+        assert set(schema["properties"]) == {"action", "intent_id", "selection_token", "replacement"}
+        assert schema["properties"]["action"]["enum"] == ["cancel", "edit"]
+        assert "oneOf" not in schema
+
+
+def test_multiple_rejected_retain_repair_prompt_requires_complete_ordered_replay() -> None:
+    calls = tuple(
+        chat_solver._RepairThreadToolCall(
+            id=f"call_{index}",
+            function=chat_solver._RepairThreadToolFunction(
+                name="retain_deferred_intent",
+                arguments=json.dumps({"target_stage": "topology"}),
+            ),
+            is_rejected=index > 0,
+        )
+        for index in range(3)
+    )
+    thread = chat_solver._deferred_intent_repair_thread(
+        chat_solver._DeferredIntentRepairThread(assistant_content=None, calls=calls),
+        errors=(
+            chat_solver.DeferredIntentActionShapeError("first rejection"),
+            chat_solver.DeferredIntentActionShapeError("second rejection"),
+        ),
+    )
+    tool_results = [message["content"] for message in thread if message["role"] == "tool"]
+
+    assert all("resend all original calls together in their original order" in content.lower() for content in tool_results)
+    assert all("resend only" not in content.lower() for content in tool_results)
+
+
+def test_retain_open_redisposition_does_not_create_a_self_referential_cause() -> None:
+    first_error = chat_solver.DeferredIntentActionShapeError("original retain rejection")
+    state = chat_solver._DeferredRetainOpen(
+        slots=(None,),
+        first_error=first_error,
+        held_resolution=None,
+    )
+
+    with pytest.raises(chat_solver.DeferredIntentActionShapeError) as raised:
+        try:
+            raise first_error
+        except chat_solver.DeferredIntentActionShapeError as exc:
+            chat_solver._deferred_repair_exception_outcome(state, exc)
+
+    assert raised.value is first_error
+    assert raised.value.__cause__ is not raised.value
 
 
 def test_record_llm_call_preserves_active_primary_when_secondary_audit_build_fails(
@@ -2116,6 +2242,945 @@ async def test_settled_retain_repair_allows_follow_on_sink_repair(
     assert outcome.sink.outputs[0].plugin == "json"
     assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
     assert calls_seen == 3
+
+
+def _resolution_open_first_reply(stage: str) -> list[SimpleNamespace]:
+    """Open resolution repair with two byte-identical retained actions."""
+
+    resolution_name = "resolve_source" if stage == "source" else "resolve_sink"
+    resolution_arguments = {} if stage == "source" else _PAIR_CONFIG_INVALID_SINK_ARGUMENTS
+    return [
+        SimpleNamespace(
+            id="c_resolution_initial",
+            function=SimpleNamespace(name=resolution_name, arguments=json.dumps(resolution_arguments)),
+        ),
+        SimpleNamespace(
+            id="c_retain_initial_1",
+            function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+        ),
+        SimpleNamespace(
+            id="c_retain_initial_2",
+            function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+        ),
+    ]
+
+
+def _resolution_open_exit_reply(stage: str, exit_kind: str) -> list[SimpleNamespace]:
+    resolution_name = "resolve_source" if stage == "source" else "resolve_sink"
+    if exit_kind == "management":
+        return [
+            SimpleNamespace(
+                id="c_management",
+                function=SimpleNamespace(
+                    name="manage_deferred_intent",
+                    arguments=json.dumps(
+                        {
+                            "action": "cancel",
+                            "intent_id": "00000000-0000-4000-8000-000000000801",
+                            "selection_token": "server-selection-token",
+                        }
+                    ),
+                ),
+            )
+        ]
+    if exit_kind == "retain_only":
+        return [
+            SimpleNamespace(
+                id="c_retain_replacement",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+            )
+        ]
+    if exit_kind == "hallucinated":
+        return [SimpleNamespace(id="c_unknown", function=SimpleNamespace(name="peek_secrets", arguments="{}"))]
+    if exit_kind in {"empty", "prose"}:
+        return []
+    if exit_kind == "cap":
+        return [
+            SimpleNamespace(
+                id=f"c_retain_cap_{index}",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            )
+            for index in range(chat_solver.GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY + 1)
+        ]
+    if exit_kind == "mismatched_full_replay":
+        resolution_arguments = _PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS
+        return [
+            SimpleNamespace(
+                id="c_resolution_replay",
+                function=SimpleNamespace(name=resolution_name, arguments=json.dumps(resolution_arguments)),
+            ),
+            SimpleNamespace(
+                id="c_retain_replay_1",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+            SimpleNamespace(
+                id="c_retain_replay_2",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+    raise AssertionError(f"unknown resolution-open exit kind: {exit_kind}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize(
+    "exit_kind",
+    ["management", "retain_only", "hallucinated", "empty", "prose", "cap", "mismatched_full_replay"],
+)
+async def test_resolution_open_exit_withholds_exact_ordered_actions(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    exit_kind: str,
+) -> None:
+    """No non-resolution exit may replace or discard a settled repair cohort."""
+
+    calls_seen = 0
+
+    async def resolution_then_exit(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        calls = _resolution_open_first_reply(stage) if calls_seen == 1 else _resolution_open_exit_reply(stage, exit_kind)
+        content = "I cannot complete that resolution." if calls_seen > 1 and exit_kind == "prose" else None
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", resolution_then_exit)
+    if stage == "source":
+        outcome = await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Create the source and retain the same future requirement twice.",
+            plugin_hint="json",
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+    else:
+        outcome = await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Create the sink and retain the same future requirement twice.",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            max_discovery_iters=2,
+        )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+    assert outcome.resolution_error_class == "PairedResolutionNotResent"
+    assert calls_seen == 2
+
+
+def _resolution_replay_calls(stage: str, retains: tuple[dict[str, Any], ...]) -> list[SimpleNamespace]:
+    resolution_name = "resolve_source" if stage == "source" else "resolve_sink"
+    resolution_arguments = _PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS
+    return [
+        SimpleNamespace(
+            id="c_resolution_replay",
+            function=SimpleNamespace(name=resolution_name, arguments=json.dumps(resolution_arguments)),
+        ),
+        *[
+            SimpleNamespace(
+                id=f"c_retain_replay_{index}",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(arguments)),
+            )
+            for index, arguments in enumerate(retains)
+        ],
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("replay_kind", ["corrected_resolution", "exact_full_replay"])
+async def test_resolution_open_accepts_only_a_corrected_resolution_or_exact_full_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    replay_kind: str,
+) -> None:
+    calls_seen = 0
+
+    async def resolution_repair(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = _resolution_open_first_reply(stage)
+        elif replay_kind == "corrected_resolution":
+            calls = _resolution_replay_calls(stage, ())
+        else:
+            calls = _resolution_replay_calls(stage, (_VALID_DEFERRED_ARGUMENTS, _VALID_DEFERRED_ARGUMENTS))
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", resolution_repair)
+    if stage == "source":
+        outcome = await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Create the source and retain the same future requirement twice.",
+            plugin_hint="json",
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+        assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
+    else:
+        outcome = await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Create the sink and retain the same future requirement twice.",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            max_discovery_iters=2,
+        )
+        assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize(
+    "replayed_retains",
+    [
+        (_SECOND_DEFERRED_ARGUMENTS, _VALID_DEFERRED_ARGUMENTS),
+        (_VALID_DEFERRED_ARGUMENTS,),
+        (_VALID_DEFERRED_ARGUMENTS, _SECOND_DEFERRED_ARGUMENTS, _VALID_DEFERRED_ARGUMENTS),
+    ],
+    ids=["reordered", "short", "long"],
+)
+async def test_resolution_open_rejects_replay_order_and_cardinality_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    replayed_retains: tuple[dict[str, Any], ...],
+) -> None:
+    calls_seen = 0
+
+    async def mismatched_replay(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            resolution_name = "resolve_source" if stage == "source" else "resolve_sink"
+            resolution_arguments = {} if stage == "source" else _PAIR_CONFIG_INVALID_SINK_ARGUMENTS
+            calls = [
+                SimpleNamespace(
+                    id="c_resolution_initial",
+                    function=SimpleNamespace(name=resolution_name, arguments=json.dumps(resolution_arguments)),
+                ),
+                *_resolution_replay_calls(stage, (_VALID_DEFERRED_ARGUMENTS, _SECOND_DEFERRED_ARGUMENTS))[1:],
+            ]
+        else:
+            calls = _resolution_replay_calls(stage, replayed_retains)
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", mismatched_replay)
+    if stage == "source":
+        outcome = await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Create the source and retain two ordered future requirements.",
+            plugin_hint="json",
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+    else:
+        outcome = await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Create the sink and retain two ordered future requirements.",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            max_discovery_iters=2,
+        )
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+
+
+@pytest.mark.asyncio
+async def test_resolution_open_source_reselection_withholds_exact_actions(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls_seen = 0
+
+    async def reselect_after_resolution_repair(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        calls = (
+            _resolution_open_first_reply("source")
+            if calls_seen == 1
+            else [
+                SimpleNamespace(
+                    id="c_reselect",
+                    function=SimpleNamespace(
+                        name="reselect_source_plugin",
+                        arguments=json.dumps(
+                            {
+                                "plugin": "csv",
+                                "assistant_message": "I changed the pending source type.",
+                            }
+                        ),
+                    ),
+                )
+            ]
+        )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", reselect_after_resolution_repair)
+    outcome = await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="Create the source and retain the same future requirement twice.",
+        plugin_hint="json",
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+        allow_plugin_reselection=True,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+async def test_resolution_open_malformed_resolution_withholds_exact_actions(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    calls_seen = 0
+
+    async def malformed_correction(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = _resolution_open_first_reply(stage)
+        else:
+            calls = [
+                SimpleNamespace(
+                    id="c_resolution_malformed",
+                    function=SimpleNamespace(
+                        name="resolve_source" if stage == "source" else "resolve_sink",
+                        arguments="{}",
+                    ),
+                )
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", malformed_correction)
+    if stage == "source":
+        outcome = await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Create the source and retain the same future requirement twice.",
+            plugin_hint="json",
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+    else:
+        outcome = await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Create the sink and retain the same future requirement twice.",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            max_discovery_iters=2,
+        )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+    assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("malformed_index", [0, 1, 2])
+async def test_retain_open_repairs_every_malformed_position_without_losing_duplicate_actions(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    malformed_index: int,
+) -> None:
+    calls_seen = 0
+
+    async def repair_one_position(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            resolution_name = "resolve_source" if stage == "source" else "resolve_sink"
+            resolution_arguments = _PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS
+            calls = [
+                SimpleNamespace(
+                    id="c_resolution_initial",
+                    function=SimpleNamespace(name=resolution_name, arguments=json.dumps(resolution_arguments)),
+                ),
+                *[
+                    SimpleNamespace(
+                        id=f"c_retain_initial_{index}",
+                        function=SimpleNamespace(
+                            name="retain_deferred_intent",
+                            arguments=json.dumps({"target_stage": "topology"} if index == malformed_index else _VALID_DEFERRED_ARGUMENTS),
+                        ),
+                    )
+                    for index in range(3)
+                ],
+            ]
+        else:
+            calls = [
+                SimpleNamespace(
+                    id="c_retain_corrected",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                )
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repair_one_position)
+    outcome = await _run_stage_solver(stage)
+
+    if stage == "source":
+        assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
+    else:
+        assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+    assert outcome.deferred_actions == (
+        _EXPECTED_DEFERRED_ACTION,
+        _EXPECTED_DEFERRED_ACTION,
+        _EXPECTED_DEFERRED_ACTION,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolution_open_sink_allows_read_only_discovery_then_corrected_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls_seen = 0
+    dispatched: list[str] = []
+
+    async def discover_then_resolve(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = [
+                SimpleNamespace(
+                    id="c_sink_initial",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_CONFIG_INVALID_SINK_ARGUMENTS)),
+                ),
+                *_resolution_replay_calls("sink", (_VALID_DEFERRED_ARGUMENTS, _SECOND_DEFERRED_ARGUMENTS))[1:],
+            ]
+        elif calls_seen == 2:
+            calls = [SimpleNamespace(id="c_list_sinks", function=SimpleNamespace(name="list_sinks", arguments="{}"))]
+        else:
+            calls = _resolution_replay_calls("sink", ())
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    def execute_discovery(**kwargs: Any) -> dict[str, Any]:
+        tool_call = kwargs["tool_call"]
+        dispatched.append(tool_call.function.name)
+        return {"role": "tool", "tool_call_id": tool_call.id, "content": json.dumps({"success": True, "data": []})}
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", discover_then_resolve)
+    monkeypatch.setattr(chat_solver, "_execute_discovery_call", execute_discovery)
+    catalog, snapshot = _sink_digest_catalog([])
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Inspect available sinks before correcting this output.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        state=_digest_composition_state(),
+        catalog=catalog,
+        plugin_snapshot=snapshot,
+        timeout_seconds=30.0,
+        max_discovery_iters=3,
+    )
+
+    assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert dispatched == ["list_sinks"]
+
+
+@pytest.mark.asyncio
+async def test_resolution_open_sink_discovery_cap_withholds_exact_actions(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls_seen = 0
+
+    async def discover_until_cap(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = [
+                SimpleNamespace(
+                    id="c_sink_initial",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_CONFIG_INVALID_SINK_ARGUMENTS)),
+                ),
+                *_resolution_replay_calls("sink", (_VALID_DEFERRED_ARGUMENTS, _SECOND_DEFERRED_ARGUMENTS))[1:],
+            ]
+        else:
+            calls = [SimpleNamespace(id="c_list_sinks", function=SimpleNamespace(name="list_sinks", arguments="{}"))]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", discover_until_cap)
+    monkeypatch.setattr(
+        chat_solver,
+        "_execute_discovery_call",
+        lambda **kwargs: {
+            "role": "tool",
+            "tool_call_id": kwargs["tool_call"].id,
+            "content": json.dumps({"success": True, "data": []}),
+        },
+    )
+    catalog, snapshot = _sink_digest_catalog([])
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Inspect available sinks but do not lose my future requirements.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        state=_digest_composition_state(),
+        catalog=catalog,
+        plugin_snapshot=snapshot,
+        timeout_seconds=30.0,
+        max_discovery_iters=2,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert outcome.resolution_error_class == "PairedResolutionConfigRejected"
+
+
+@pytest.mark.asyncio
+async def test_resolution_open_sink_discovery_batch_cap_withholds_exact_actions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls_seen = 0
+
+    async def oversized_discovery_batch(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = [
+                SimpleNamespace(
+                    id="c_sink_initial",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_CONFIG_INVALID_SINK_ARGUMENTS)),
+                ),
+                *_resolution_replay_calls("sink", (_VALID_DEFERRED_ARGUMENTS, _SECOND_DEFERRED_ARGUMENTS))[1:],
+            ]
+        else:
+            calls = [
+                SimpleNamespace(id=f"c_list_sinks_{index}", function=SimpleNamespace(name="list_sinks", arguments="{}"))
+                for index in range(2)
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", oversized_discovery_batch)
+    catalog, snapshot = _sink_digest_catalog([])
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Inspect sinks without losing my future requirements.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        state=_digest_composition_state(),
+        catalog=catalog,
+        plugin_snapshot=snapshot,
+        timeout_seconds=30.0,
+        max_discovery_iters=2,
+        max_tool_calls_per_turn=1,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert outcome.resolution_error_class == "PairedResolutionNotResent"
+
+
+def _retain_open_first_reply(stage: str) -> list[SimpleNamespace]:
+    resolution_name = "resolve_source" if stage == "source" else "resolve_sink"
+    resolution_arguments = _PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS
+    return [
+        SimpleNamespace(
+            id="c_resolution_initial",
+            function=SimpleNamespace(name=resolution_name, arguments=json.dumps(resolution_arguments)),
+        ),
+        SimpleNamespace(
+            id="c_retain_valid",
+            function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+        ),
+        SimpleNamespace(
+            id="c_retain_malformed",
+            function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps({"target_stage": "topology"})),
+        ),
+    ]
+
+
+def _replayed_resolution_call(stage: str, *, changed: bool) -> SimpleNamespace:
+    arguments = deepcopy(_PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS)
+    if changed and stage == "source":
+        arguments["filename"] = "different.json"
+        arguments["content"] = '[{"line": "changed"}]'
+        arguments["sample_rows"] = [{"line": "changed"}]
+    elif changed:
+        arguments["output"]["name"] = "different_results"
+        arguments["output"]["options"]["path"] = "different.jsonl"
+    return SimpleNamespace(
+        id="c_resolution_replayed",
+        function=SimpleNamespace(
+            name="resolve_source" if stage == "source" else "resolve_sink",
+            arguments=json.dumps(arguments),
+        ),
+    )
+
+
+async def _run_failure_state_solver(
+    stage: str,
+    *,
+    recorder: BufferingRecorder | None = None,
+    progress: Callable[[Any], Awaitable[None]] | None = None,
+    discovery: bool = False,
+) -> object:
+    if stage == "source":
+        return await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Create the source and retain future requirements.",
+            plugin_hint="json",
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            recorder=recorder,
+            timeout_seconds=30.0,
+        )
+    extra: dict[str, Any] = {}
+    if discovery:
+        catalog, snapshot = _sink_digest_catalog([])
+        extra = {
+            "state": _digest_composition_state(),
+            "catalog": catalog,
+            "plugin_snapshot": snapshot,
+        }
+    return await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Create the sink and retain future requirements.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        recorder=recorder,
+        timeout_seconds=30.0,
+        max_discovery_iters=2,
+        progress=progress,
+        **extra,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("open_state", ["retain", "resolution"])
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_status"),
+    [
+        ("timeout", ComposerLLMCallStatus.TIMEOUT),
+        ("malformed", ComposerLLMCallStatus.MALFORMED_RESPONSE),
+    ],
+)
+async def test_open_deferred_repair_state_survives_provider_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    open_state: str,
+    failure_kind: str,
+    expected_status: ComposerLLMCallStatus,
+) -> None:
+    calls_seen = 0
+
+    async def fail_second_provider_call(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = _retain_open_first_reply(stage) if open_state == "retain" else _resolution_open_first_reply(stage)
+            return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+        if failure_kind == "timeout":
+            raise TimeoutError
+        return _FakeLLMResponse(choices=[])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fail_second_provider_call)
+    recorder = BufferingRecorder()
+    if open_state == "retain":
+        with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+            await _run_failure_state_solver(stage, recorder=recorder)
+    else:
+        outcome = await _run_failure_state_solver(stage, recorder=recorder)
+        assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+        assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+        assert outcome.resolution_error_class == "PairedResolutionNotResent"
+    assert calls_seen == 2
+    assert recorder.llm_calls[-1].status is expected_status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("open_state", ["retain", "resolution"])
+async def test_open_deferred_repair_state_never_swallows_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    open_state: str,
+) -> None:
+    calls_seen = 0
+
+    async def cancel_second_provider_call(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = _retain_open_first_reply(stage) if open_state == "retain" else _resolution_open_first_reply(stage)
+            return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", cancel_second_provider_call)
+    recorder = BufferingRecorder()
+    with pytest.raises(asyncio.CancelledError):
+        await _run_failure_state_solver(stage, recorder=recorder)
+
+    assert calls_seen == 2
+    assert recorder.llm_calls[-1].status is ComposerLLMCallStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("open_state", ["retain", "resolution"])
+async def test_step_2_open_deferred_repair_state_survives_discovery_dispatch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    open_state: str,
+) -> None:
+    calls_seen = 0
+
+    async def request_discovery_after_opening_state(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        calls = (
+            _retain_open_first_reply("sink")
+            if calls_seen == 1 and open_state == "retain"
+            else _resolution_open_first_reply("sink")
+            if calls_seen == 1
+            else [SimpleNamespace(id="c_list_sinks", function=SimpleNamespace(name="list_sinks", arguments="{}"))]
+        )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    def fail_discovery_dispatch(**_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("discovery dispatch failed")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", request_discovery_after_opening_state)
+    monkeypatch.setattr(chat_solver, "_execute_discovery_call", fail_discovery_dispatch)
+    recorder = BufferingRecorder()
+    if open_state == "retain":
+        with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+            await _run_failure_state_solver("sink", recorder=recorder, discovery=True)
+    else:
+        outcome = await _run_failure_state_solver("sink", recorder=recorder, discovery=True)
+        assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+        assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+    assert recorder.llm_calls[-1].status is ComposerLLMCallStatus.API_ERROR
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("open_state", ["retain", "resolution"])
+async def test_step_2_open_deferred_repair_state_survives_progress_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    open_state: str,
+) -> None:
+    provider_calls = 0
+    progress_calls = 0
+
+    async def return_open_state(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            calls = _retain_open_first_reply("sink") if open_state == "retain" else _resolution_open_first_reply("sink")
+        else:
+            calls = [SimpleNamespace(id="c_list_sinks", function=SimpleNamespace(name="list_sinks", arguments="{}"))]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    async def fail_discovery_progress(_event: Any) -> None:
+        nonlocal progress_calls
+        progress_calls += 1
+        if progress_calls == 3:
+            raise RuntimeError("progress sink failed")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", return_open_state)
+    recorder = BufferingRecorder()
+    if open_state == "retain":
+        with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+            await _run_failure_state_solver("sink", recorder=recorder, progress=fail_discovery_progress, discovery=True)
+    else:
+        outcome = await _run_failure_state_solver("sink", recorder=recorder, progress=fail_discovery_progress, discovery=True)
+        assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+        assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+    assert provider_calls == 2
+    assert progress_calls == 3
+    assert recorder.llm_calls[-1].status is ComposerLLMCallStatus.API_ERROR
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("open_state", ["retain", "resolution"])
+async def test_step_2_open_deferred_repair_state_never_swallows_discovery_progress_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    open_state: str,
+) -> None:
+    provider_calls = 0
+    progress_calls = 0
+
+    async def request_discovery_after_opening_state(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            calls = _retain_open_first_reply("sink") if open_state == "retain" else _resolution_open_first_reply("sink")
+        else:
+            calls = [SimpleNamespace(id="c_list_sinks", function=SimpleNamespace(name="list_sinks", arguments="{}"))]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    async def cancel_discovery_progress(_event: Any) -> None:
+        nonlocal progress_calls
+        progress_calls += 1
+        if progress_calls == 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", request_discovery_after_opening_state)
+    recorder = BufferingRecorder()
+    with pytest.raises(asyncio.CancelledError):
+        await _run_failure_state_solver(
+            "sink",
+            recorder=recorder,
+            progress=cancel_discovery_progress,
+            discovery=True,
+        )
+
+    assert provider_calls == 2
+    assert progress_calls == 3
+    assert recorder.llm_calls[-1].status is ComposerLLMCallStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("replay_kind", ["targeted", "full"])
+async def test_multiple_rejected_retains_require_identity_anchored_full_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    replay_kind: str,
+) -> None:
+    calls_seen = 0
+
+    async def repair_multiple_rejections(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            resolution_name = "resolve_source" if stage == "source" else "resolve_sink"
+            resolution_arguments = _PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS
+            calls = [
+                SimpleNamespace(
+                    id="c_resolution_initial",
+                    function=SimpleNamespace(name=resolution_name, arguments=json.dumps(resolution_arguments)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_valid",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_malformed_1",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps({"target_stage": "topology"})),
+                ),
+                SimpleNamespace(
+                    id="c_retain_malformed_2",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps({"target_stage": "wire_review"})),
+                ),
+            ]
+        else:
+            replayed = (
+                (_SECOND_DEFERRED_ARGUMENTS, _VALID_DEFERRED_ARGUMENTS)
+                if replay_kind == "targeted"
+                else (_VALID_DEFERRED_ARGUMENTS, _SECOND_DEFERRED_ARGUMENTS, _VALID_DEFERRED_ARGUMENTS)
+            )
+            calls = ([] if replay_kind == "targeted" else [_replayed_resolution_call(stage, changed=False)]) + [
+                SimpleNamespace(
+                    id=f"c_retain_repair_{index}",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(arguments)),
+                )
+                for index, arguments in enumerate(replayed)
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repair_multiple_rejections)
+    if replay_kind == "targeted":
+        with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+            await _run_stage_solver(stage)
+    else:
+        outcome = await _run_stage_solver(stage)
+        expected_type = chat_solver.Step1SourceResolvedOutcome if stage == "source" else chat_solver.Step2SinkResolvedOutcome
+        assert type(outcome) is expected_type
+        assert outcome.deferred_actions == (
+            _EXPECTED_DEFERRED_ACTION,
+            _SECOND_EXPECTED_DEFERRED_ACTION,
+            _EXPECTED_DEFERRED_ACTION,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("changed_resolution", [False, True], ids=["same-resolution", "changed-resolution"])
+async def test_targeted_retain_repair_rejects_a_hybrid_resolution_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    changed_resolution: bool,
+) -> None:
+    calls_seen = 0
+
+    async def hybrid_retry(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        calls = (
+            _retain_open_first_reply(stage)
+            if calls_seen == 1
+            else [
+                _replayed_resolution_call(stage, changed=changed_resolution),
+                SimpleNamespace(
+                    id="c_retain_corrected",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+                ),
+            ]
+        )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", hybrid_retry)
+    with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+        await _run_stage_solver(stage)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+async def test_complete_retain_replay_rejects_a_changed_held_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    calls_seen = 0
+
+    async def changed_full_replay(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        calls = (
+            _retain_open_first_reply(stage)
+            if calls_seen == 1
+            else [
+                _replayed_resolution_call(stage, changed=True),
+                SimpleNamespace(
+                    id="c_retain_valid_replayed",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_corrected",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+                ),
+            ]
+        )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", changed_full_replay)
+    with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+        await _run_stage_solver(stage)
 
 
 @pytest.mark.asyncio

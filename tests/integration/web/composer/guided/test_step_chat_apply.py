@@ -444,3 +444,41 @@ def test_form_directed_stale_pair_keeps_retain_without_chat_rebuild_instruction(
     (retained,) = guided_after["deferred_intents"]
     assert retained["catalog_kind"] == "transform"
     assert retained["catalog_name"] == "passthrough"
+
+
+def test_route_settlement_preserves_resolution_open_duplicate_action_custody(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The solver's immutable tuple reaches durable settlement without deduping."""
+
+    client = composer_test_client
+    session_id = _create_session(client)
+    current = client.get(f"/api/sessions/{session_id}/guided").json()
+    assert current["guided_session"]["step"] == "step_1_source"
+    turn = current["next_turn"]
+    action = _retained_passthrough_action()
+
+    async def withheld_resolution_provider(**_kwargs: object) -> GuidedChatProviderOutcome:
+        return GuidedStepDeferredIntentWithheldResolutionResult(
+            chat=StepChatResult(
+                assistant_message="I did not apply the current-stage resolution.",
+                status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                latency_ms=1,
+                error_class="PairedResolutionNotResent",
+            ),
+            actions=(action, action),
+        )
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", withheld_resolution_provider)
+    response = client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(turn, "Later add passthrough for each of the two stated topology requirements."),
+    )
+
+    assert response.status_code == 200, response.json()
+    guided_after = guided_respond_tests._full_guided_session(response.json())
+    retained = guided_after["deferred_intents"]
+    assert len(retained) == 2
+    assert [intent["catalog_name"] for intent in retained] == ["passthrough", "passthrough"]
+    assert retained[0]["intent_id"] != retained[1]["intent_id"]
