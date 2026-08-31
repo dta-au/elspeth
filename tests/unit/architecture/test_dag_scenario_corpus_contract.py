@@ -653,7 +653,17 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "68837dc46eb087e82e00191d178f05781ab9f0a5016
 # -> 73c47a4d86c6606e80c405cdb0a7039921c60b255ced886ed5d390384b0822ee, captured
 # from test_checkpoint_reopen_resume_has_exact_restart_evidence's own failure
 # output), then this digest. No oracle_freeze snapshot moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "6a154845dfb79763e28b30b0e517b78d9b40b6f3739bf39b2181d45343e67736"
+# Rotated 2026-09-01 after 4a3657b7c: the json_explode plugin gained its
+# forwarding/extras contract and collision guard, so its declared
+# source_file_hash moved (8983dddbea054fe3 -> 36c7c718e2cee382, recomputed
+# with scripts/cicd/plugin_hash.py::compute_source_file_hash). A structural
+# comparison of the live json-explode-parent-child durable projection against
+# the declared projection found exactly this one audit-record material byte as
+# the difference. The manifest has one json_explode provenance pin and this
+# run-workflow case has no resumed_full_projection_sha256. The oracle_freeze
+# surface excludes audit_records, so no semantic snapshot moved; the manifest
+# pin was updated first, then this full case-registry digest.
+EXPECTED_CASE_REGISTRY_SHA256 = "40e2c8b1050b5d957db497f241256d16101e88d5f89332eb05b2c6d02f09e90d"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -5453,6 +5463,46 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("checkpoint-deterministic-resume", "recovery"),
         ),
     }
+
+
+def test_exact_case_plugin_provenance_pins_match_registered_classes(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = install_corpus_plugin_manager(monkeypatch)
+    transform_classes = {plugin.name: plugin for plugin in manager.get_transforms()}
+    plugin_classes = {
+        **{("source", plugin.name): plugin for plugin in manager.get_sources()},
+        **{
+            (node_type, plugin_name): plugin
+            for plugin_name, plugin in transform_classes.items()
+            for node_type in ("transform", "aggregation", "collector")
+        },
+        **{("sink", plugin.name): plugin for plugin in manager.get_sinks()},
+    }
+    declared_hashes: dict[str, str] = {}
+    live_hashes: dict[str, str | None] = {}
+    unhashed_plugin_nodes: set[tuple[str, str]] = set()
+
+    for scenario, case in iter_harness_cases(load_manifest()):
+        if not isinstance(case.expected, RunExpectation):
+            continue
+        for record in case.expected.projection.audit_records:
+            if record.record_type != "node":
+                continue
+            material = json.loads(record.material)
+            declared_hash = material["source_file_hash"]
+            if declared_hash is None:
+                unhashed_plugin_nodes.add((material["node_type"], material["plugin_name"]))
+                continue
+            pin_key = f"{scenario.id}:{case.id}:{record.key}"
+            plugin_class = plugin_classes[(material["node_type"], material["plugin_name"])]
+            declared_hashes[pin_key] = declared_hash
+            live_hashes[pin_key] = plugin_class.source_file_hash
+
+    assert declared_hashes
+    assert declared_hashes == live_hashes
+    assert plugin_classes[("aggregation", "batch_stats")] is transform_classes["batch_stats"]
+    assert plugin_classes[("collector", "batch_stats")] is transform_classes["batch_stats"]
+    assert plugin_classes[("sink", "dag_corpus_always_fail_sink")].source_file_hash == plugin_classes[("sink", "json")].source_file_hash
+    assert ("aggregation", "dag_corpus_eof_batch_sum") in unhashed_plugin_nodes
 
 
 def _corpus_rows() -> list[PipelineRow]:
