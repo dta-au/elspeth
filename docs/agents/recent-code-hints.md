@@ -8,6 +8,35 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-08-27 — secret WIRING is deny-by-default behind a server-authored
+  destination allowlist, with a THIRD execute-time 428 ack** (elspeth-f3c1aafd25).
+  The authority is `web/secrets/wiring_policy.py::secret_wiring_authorization_error`
+  (exact `(secret, component_type, plugin, option_key)` match;
+  `component_type` vocab is `source|transform|sink` — same as
+  `_secret_ref_placement_error`, aggregation nodes are `transform`); the
+  operator surface is `WebSettings.secret_wiring_allowlist` (default `()` =
+  deny everything). Enforced at THREE derived seams: (a) `wire_secret_ref`
+  (all three arms, before the marker write; `ToolContext.secret_wiring_policy`,
+  `None` = deny — a test whose wiring must SUCCEED, or that tests a LATER gate
+  like placement/endpoint policy, must pass an authorizing policy or it now
+  fails at authorization first); (b) `validate_secret_evidence` emits
+  `unauthorized_secret_ref` under the `secret_refs` blocker for markers from
+  ANY entry path — but the authorization walk runs over
+  `policy.authored_state`, NOT the lowered state: operator-profile lowering
+  injects credential markers server-side and those are exempt by design — do
+  not "fix" it to walk `policy.state`; (c) `/execute` raises
+  `ExecutionSecretApprovalRequired` → 428
+  `execution_secret_approval_required` + `secret_guard` payload
+  (`web/execution/secret_guard.py`, mirrors the fanout guard; evaluated over
+  the authored `composition_state` for the same exemption; fires BEFORE the
+  fanout guard, so a wired-secret + fanout test must acquire the secret ack
+  first and send BOTH tokens on the final execute). The composer repair loop
+  has a dedicated non-retryable notice for `unauthorized_secret_ref` — the
+  planner cannot repair operator policy; do not add advice telling it to
+  retry wiring. `_WebSettingsStub`-style settings fakes need
+  `secret_wiring_allowlist: tuple = ()` or service construction breaks.
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
 - **2026-08-30 — `.agents/skills/` is the ONE canonical skills tree; every `.claude/skills/<name>` is a committed relative symlink (`git ls-files -s` mode 120000) into it, and the design pack lives at top-level `design/`** (elspeth-1e9d011295)
   Add or edit a skill under `.agents/skills/` only; a real directory under `.claude/skills/` is a regression. Pin paths in
   tests, scripts and `per-file-ignores` at `.agents/skills/...` and `design/...`. Git never sees a path *through* a

@@ -645,6 +645,14 @@ promises are `preserves_input_values` (transform) and `observed_value_type`
 
 ### Convention: web composer and frontend
 
+- Secret wiring is deny-by-default. `WebSettings.secret_wiring_allowlist`
+  authorizes only exact `(secret, component_type, plugin, option_key)`
+  destinations; `wire_secret_ref` checks it before mutation, and
+  `validate_secret_evidence` rechecks authored markers so patch, YAML, and
+  other marker entry paths cannot bypass the policy. `/execute` separately
+  requires a state-bound out-of-band secret acknowledgement before fanout.
+  LLM or tool arguments are never approval, while credentials lowered from
+  server-authored operator profiles remain exempt.
 - Adding a field to `SourceSpec`/`NodeSpec`/`OutputSpec` or a composer tool
   argument fires three pins: the `canonical-field-inventory` table in
   `src/elspeth/web/composer/skills/pipeline_capabilities.md`, the redaction
