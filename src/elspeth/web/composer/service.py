@@ -864,6 +864,18 @@ def _resolvable_vague_term_count(
 # under its own code with ``completion_ready=False`` keeps the UI from enabling
 # "run"/"continue" on a composition that cannot run.
 _INTERPRETATION_REVIEW_ORPHANED_CODE: Final[str] = "interpretation_review_orphaned"
+_SOURCE_INTERPRETATION_KINDS: Final[frozenset[InterpretationKind]] = frozenset(
+    {
+        InterpretationKind.INVENTED_SOURCE,
+        InterpretationKind.SOURCE_DATA_CONTRACT,
+    }
+)
+_FINALIZATION_AUTO_SURFACEABLE_KINDS: Final[frozenset[InterpretationKind]] = frozenset(
+    {
+        InterpretationKind.LLM_PROMPT_TEMPLATE,
+        InterpretationKind.SOURCE_DATA_CONTRACT,
+    }
+)
 _INTERPRETATION_REVIEW_HANDOFF_KINDS: Final[frozenset[str]] = frozenset(
     {
         "interpretation_review_pending",
@@ -954,11 +966,11 @@ def _orphaned_interpretation_review_validation(
     wording, which would point the user at a card that does not exist.
 
     The gate fires for EVERY interpretation kind that
-    ``_missing_pending_interpretation_review_sites`` can surface — vague_term,
-    invented_source, and pipeline_decision — not just legacy vague_term tokens.
-    ``component_type`` is therefore derived per-site from the kind
-    (``INVENTED_SOURCE`` is a source-level handoff, every other kind is a
-    transform-level one) so the persisted ``ValidationError`` / readiness
+    ``_missing_pending_interpretation_review_sites`` can surface, not just
+    legacy vague-term tokens. ``component_type`` is therefore derived per-site
+    from the kind (``INVENTED_SOURCE`` and ``SOURCE_DATA_CONTRACT`` are
+    source-level handoffs; every other kind is transform-level) so the
+    persisted ``ValidationError`` / readiness
     blocker carries the correct component type into the audit trail; and
     ``affected_nodes`` excludes source sites, mirroring the runtime preflight's
     canonical handling (``execution/validation.py`` ``InterpretationReviewPending``
@@ -966,15 +978,15 @@ def _orphaned_interpretation_review_validation(
     """
 
     def _component_type_for_kind(kind: InterpretationKind) -> Literal["source", "transform"]:
-        return "source" if kind is InterpretationKind.INVENTED_SOURCE else "transform"
+        return "source" if kind in _SOURCE_INTERPRETATION_KINDS else "transform"
 
     site_detail = ", ".join(f"{kind.value}:{component_id}:{term}" for component_id, term, kind in missing_sites)
     detail = f"The pipeline carries an unresolvable interpretation handoff with no matching pending review and cannot run: {site_detail}."
     suggestion = (
         "For each listed site, call request_interpretation_review with the listed "
         "affected_node_id, kind, and user_term so the interpretation site becomes "
-        "resolvable, or remove the corresponding {{interpretation:<term>}} token / "
-        "invented-source from the pipeline."
+        "resolvable, or remove the corresponding interpretation token, invented "
+        "source, or downstream field demand from the pipeline."
     )
     affected_nodes = tuple(
         dict.fromkeys(component_id for component_id, _term, kind in missing_sites if _component_type_for_kind(kind) == "transform")
@@ -2543,7 +2555,7 @@ class ComposerServiceImpl:
         time with ``UnresolvedInterpretationPlaceholderError``. This pass runs
         after every site-creating guided commit (source / transform /
         recipe-apply) and surfaces a resolvable pending EVENT for every site
-        whose writer-boundary precondition holds — covering all five
+        whose writer-boundary precondition holds — covering all six
         ``InterpretationKind`` members, not just ``llm_prompt_template``.
 
         Each branch reads the site's ``draft``/``user_term`` from the node or
@@ -5243,14 +5255,15 @@ class ComposerServiceImpl:
                 session_id=session_id,
             )
             if missing_interpretation_sites:
-                # llm_prompt_template is surfaced by the backend at finalization
-                # (immediately before the orphan gate), NOT by the model — exclude
-                # it from the repair ask so we don't pester the model for a kind it
-                # rejects. The site tuple is (component_id, user_term, kind), so
-                # site[2] is the kind. The orphan gate below stays UNFILTERED so a
-                # still-missing PT after auto-surface remains fail-closed.
+                # Prompt-template and source-data-contract reviews are surfaced
+                # by the backend at finalization (immediately before the orphan
+                # gate), not authored by the model. Exclude them from the repair
+                # ask so a server-computable card does not spend the finite model
+                # repair budget. The site tuple is (component_id, user_term, kind),
+                # so site[2] is the kind. The orphan gate below stays UNFILTERED:
+                # any site still missing after backend surfacing fails closed.
                 model_repairable = tuple(
-                    site for site in missing_interpretation_sites if site[2] is not InterpretationKind.LLM_PROMPT_TEMPLATE
+                    site for site in missing_interpretation_sites if site[2] not in _FINALIZATION_AUTO_SURFACEABLE_KINDS
                 )
                 if model_repairable:
                     llm_messages.append(
@@ -5427,7 +5440,8 @@ class ComposerServiceImpl:
         # leaves the legitimate bare-token two-step flow (token written, review
         # staged within budget) untouched — that path clears
         # ``_missing_pending_interpretation_review_sites`` before reaching here.
-        # Auto-surface PT reviews + run the fail-closed orphan gate + finalize.
+        # Auto-surface backend-derived reviews + run the fail-closed orphan gate
+        # + finalize.
         # Shared with the B-4D-3 budget-exhaustion last-chance finalize in
         # ``_classify_and_budget_turn`` (Task 7 HIGH-1) so the orphan gate is
         # UNIVERSAL across BOTH no-tool finalize paths. This caller threads
@@ -5475,7 +5489,7 @@ class ComposerServiceImpl:
         recorder: BufferingRecorder,
         progress: ComposerProgressSink | None,
     ) -> ComposerResult | None:
-        """Auto-surface PT reviews + run the UNFILTERED orphan gate.
+        """Auto-surface backend-derived reviews + run the UNFILTERED orphan gate.
 
         Returns the fail-closed orphan ``ComposerResult`` (a bare result with no
         threaded ``repair_turns_used``/persisted ids — the caller threads those)
@@ -5503,7 +5517,7 @@ class ComposerServiceImpl:
         """
 
         # Backend-derived surfacing (elspeth-e51216d305 Case B): surface every
-        # LLM node's auto-staged llm_prompt_template review against the FINAL
+        # review whose writer-boundary precondition holds against the FINAL
         # frozen skeleton, immediately before the fail-closed orphan gate. On
         # every caller (CLEAN tail past every repair branch; the budget-exhaustion
         # bonus call that returned no tool calls; and the advisor-blocked terminal
@@ -5512,7 +5526,7 @@ class ComposerServiceImpl:
         # surface-early = Case B in the repair loop). The orphan gate below
         # (unfiltered) then sees the PT event present; if this helper ever no-ops,
         # it stays fail-closed.
-        await self._auto_surface_prompt_template_reviews(
+        await self.surface_pending_interpretation_reviews(
             state,
             session_id=session_id,
             current_state_id=current_state_id,
@@ -5586,7 +5600,7 @@ class ComposerServiceImpl:
         repair_turns_used: int,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
     ) -> ComposerResult:
-        """Auto-surface PT reviews, run the fail-closed orphan gate, finalize.
+        """Auto-surface backend-derived reviews, gate orphans, and finalize.
 
         Shared tail of ALL THREE no-tool finalize paths (Task 7 HIGH-1):
         ``_try_terminate_no_tools``, the B-4D-3 budget-exhaustion last-chance
@@ -5655,7 +5669,7 @@ class ComposerServiceImpl:
             #
             # Keying on the preflight SHAPE rather than on the tool batch is
             # sound here because ``_surface_pt_and_gate_orphans_or_none`` has
-            # already run above: PT reviews are surfaced and orphaned sites
+            # already run above: backend-derived reviews are surfaced and orphaned sites
             # returned fail-closed, so a surviving INTERPRETATION_REVIEW_PENDING
             # blocker means a resolvable card genuinely exists to announce.
             outstanding_findings = await self._pending_handoff_outstanding_findings(
@@ -5774,10 +5788,10 @@ class ComposerServiceImpl:
             state,
             session_id=session_id,
         )
-        # llm_prompt_template sites are AUTO-SURFACEABLE pseudo-orphans: the
+        # Backend-auto-surfaceable sites are pseudo-orphans: the
         # surface+unfiltered-gate pair runs on EVERY terminal no-tool return, so
-        # they must not suppress the advisor. Genuine non-PT orphans still do.
-        genuine_orphans = tuple(s for s in orphaned_precheck if s[2] is not InterpretationKind.LLM_PROMPT_TEMPLATE)
+        # they must not suppress the advisor. Genuine model-authored orphans do.
+        genuine_orphans = tuple(s for s in orphaned_precheck if s[2] not in _FINALIZATION_AUTO_SURFACEABLE_KINDS)
         if genuine_orphans:
             return _TerminalNoToolAdvisorGateOutcome(action="fall_through")
 

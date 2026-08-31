@@ -61,6 +61,7 @@ from elspeth.web.composer.service import (
     ComposerServiceImpl,
     _pending_interpretation_review_repair_message,
 )
+from elspeth.web.composer.source_demand import SOURCE_DATA_CONTRACT_USER_TERM
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -361,6 +362,48 @@ def _state_with_prompt_template_review_node() -> CompositionState:
                             "resolved_prompt_template_hash": None,
                         }
                     ],
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def _state_with_source_data_contract(csv_path: Path) -> CompositionState:
+    """Uploaded observed source whose graph demands one acknowledged field."""
+    csv_path.write_text("colour\nred\n", encoding="utf-8")
+    return CompositionState(
+        source=None,
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": str(csv_path), "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="select_colour",
+                node_type="transform",
+                plugin="field_mapper",
+                input="rows",
+                on_success="selected",
+                on_error="discard",
+                options={
+                    "mapping": {"colour": "colour"},
+                    "select_only": True,
+                    "required_input_fields": ["colour"],
+                    "schema": {"mode": "observed"},
                 },
                 condition=None,
                 routes=None,
@@ -841,8 +884,13 @@ async def test_pipeline_decision_draft_mismatch_returns_arg_error_not_crash(
     assert len(invocations) == 1
     assert invocations[0].tool_name == "request_interpretation_review"
     assert invocations[0].status.value == "arg_error"
-    # No pending row was minted for the mismatched echo.
-    assert await sessions_service.list_interpretation_events(session_id, status="all") == []
+    # The mismatched echo was not minted. Frozen-state finalization still
+    # publishes the exact staged requirement through the honest backend
+    # surfacer, so the user can review it without another model turn.
+    events = await sessions_service.list_interpretation_events(session_id, status="all")
+    assert len(events) == 1
+    assert events[0].llm_draft == "Drop the scraped raw HTML and fingerprint fields before saving the JSON output."
+    assert events[0].tool_call_id.startswith("backend_auto_surface:")
 
 
 @pytest.mark.asyncio
@@ -1729,9 +1777,9 @@ def test_orphaned_interpretation_validation_derives_component_type_per_kind() ->
     """The fail-closed orphan result labels component_type per interpretation kind.
 
     The gate fires for every kind ``_missing_pending_interpretation_review_sites``
-    can surface, not just legacy vague_term tokens. An ``INVENTED_SOURCE`` site is
-    a source-level handoff (component_id ``"source"``, component_type ``"source"``)
-    while every other kind is transform-level. The persisted ValidationError /
+    can surface, not just legacy vague_term tokens. ``INVENTED_SOURCE`` and
+    ``SOURCE_DATA_CONTRACT`` sites are source-level handoffs while every other
+    kind is transform-level. The persisted ValidationError /
     readiness blocker must carry the correct component_type into the audit trail,
     and ``affected_nodes`` must exclude source sites (mirroring the runtime
     preflight's ``InterpretationReviewPending`` handling).
@@ -1741,6 +1789,7 @@ def test_orphaned_interpretation_validation_derives_component_type_per_kind() ->
     result = _orphaned_interpretation_review_validation(
         (
             ("source", "inline_source_url_list", InterpretationKind.INVENTED_SOURCE),
+            ("source:uploaded", SOURCE_DATA_CONTRACT_USER_TERM, InterpretationKind.SOURCE_DATA_CONTRACT),
             ("rate_node", "cool", InterpretationKind.VAGUE_TERM),
         )
     )
@@ -1751,11 +1800,11 @@ def test_orphaned_interpretation_validation_derives_component_type_per_kind() ->
     assert result.readiness.completion_ready is False
     assert result.readiness.execution_ready is False
 
-    # component_type derived per-site: source for invented_source, transform otherwise.
+    # component_type derived per-site: source for source-level kinds, transform otherwise.
     error_by_component = {error.component_id: error.component_type for error in result.errors}
-    assert error_by_component == {"source": "source", "rate_node": "transform"}
+    assert error_by_component == {"source": "source", "source:uploaded": "source", "rate_node": "transform"}
     blocker_by_component = {blocker.component_id: blocker.component_type for blocker in result.readiness.blockers}
-    assert blocker_by_component == {"source": "source", "rate_node": "transform"}
+    assert blocker_by_component == {"source": "source", "source:uploaded": "source", "rate_node": "transform"}
     assert {blocker.code for blocker in result.readiness.blockers} == {"interpretation_review_orphaned"}
 
     # affected_nodes excludes the source site (transform-only, per validation.py).
@@ -3439,6 +3488,114 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
     assert advisor_mock.await_count >= 1, "END advisor gate must fire for a PT-only pipeline"
     # CLEAN verdict falls through to finalize; it did NOT advisor-block/continue.
     assert outcome.action == "return"
+
+
+@pytest.mark.asyncio
+async def test_no_tool_finalizer_auto_surfaces_source_data_contract_without_model_repair(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """A server-computable data-contract card must not consume a model repair turn.
+
+    The graph-derived review has the same frozen-final-state property as the
+    prompt-template card: the backend can derive and persist its exact draft.
+    Treating it as model-repairable delays the user-action handoff and spends
+    the finite repair budget without changing pipeline state.
+    """
+
+    from elspeth.web.composer.audit import BufferingRecorder
+
+    composer = _build_composer(tmp_path, sessions_service)
+    state = _state_with_source_data_contract(tmp_path / "uploaded.csv")
+    session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
+    sites = await composer._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
+    assert sites == (("source", SOURCE_DATA_CONTRACT_USER_TERM, InterpretationKind.SOURCE_DATA_CONTRACT),)
+
+    advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
+    composer._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
+
+    class _AssistantMessage:
+        content = "Done — the pipeline is ready for review."
+
+    llm_messages: list[dict[str, Any]] = []
+    outcome = await composer._try_terminate_no_tools(
+        assistant_message=_AssistantMessage(),
+        message="Select the colour column.",
+        llm_messages=llm_messages,
+        state=state,
+        session_id=str(session_id),
+        current_state_id=str(state_id),
+        initial_version=1,
+        user_id="alice",
+        last_runtime_preflight=None,
+        runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+        session_scope=str(session_id),
+        mutation_success_seen=True,
+        recorder=BufferingRecorder(),
+        progress=None,
+        repair_turns_used=0,
+        persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
+        persisted_tool_call_turn=False,
+        advisor_checkpoint_passes_used=0,
+    )
+
+    assert outcome.action == "return"
+    assert llm_messages == []
+    assert advisor_mock.await_count >= 1
+    events = await sessions_service.list_interpretation_events(session_id, status="pending")
+    contracts = [event for event in events if event.kind is InterpretationKind.SOURCE_DATA_CONTRACT]
+    assert len(contracts) == 1
+    assert contracts[0].affected_node_id == "source"
+    assert contracts[0].tool_call_id.startswith("backend_auto_surface:")
+
+
+@pytest.mark.asyncio
+async def test_advisor_final_flag_terminal_return_surfaces_source_data_contract(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """Advisor-blocked P2 still persists the server-computable data-contract card."""
+
+    from elspeth.web.composer.audit import BufferingRecorder
+
+    composer = _build_composer(tmp_path, sessions_service)
+    state = _state_with_source_data_contract(tmp_path / "uploaded.csv")
+    session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
+    composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
+        AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: review the source contract")
+    )
+
+    class _AssistantMessage:
+        content = "Done — the pipeline is ready for review."
+
+    outcome = await composer._try_terminate_no_tools(
+        assistant_message=_AssistantMessage(),
+        message="Select the colour column.",
+        llm_messages=[],
+        state=state,
+        session_id=str(session_id),
+        current_state_id=str(state_id),
+        initial_version=1,
+        user_id="alice",
+        last_runtime_preflight=None,
+        runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+        session_scope=str(session_id),
+        mutation_success_seen=True,
+        recorder=BufferingRecorder(),
+        progress=None,
+        repair_turns_used=2,
+        persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
+        persisted_tool_call_turn=False,
+        advisor_checkpoint_passes_used=composer._settings.composer_advisor_checkpoint_max_passes - 1,
+    )
+
+    assert outcome.action == "return"
+    events = await sessions_service.list_interpretation_events(session_id, status="pending")
+    contracts = [event for event in events if event.kind is InterpretationKind.SOURCE_DATA_CONTRACT]
+    assert len(contracts) == 1
+    assert contracts[0].tool_call_id.startswith("backend_auto_surface:")
 
 
 @pytest.mark.asyncio
