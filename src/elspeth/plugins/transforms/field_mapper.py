@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import Field, model_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
+from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
 from elspeth.contracts.schema_contract import PipelineRow
@@ -144,7 +145,10 @@ class FieldMapperConfig(TransformDataConfig):
     Use 'schema: {mode: observed}' for dynamic field handling.
     """
 
-    mapping: dict[str, str] = Field(
+    mapping: Annotated[
+        dict[str, str],
+        EmittedToOutput("field_mapper uses mapping values as output row keys and downstream artifact columns"),
+    ] = Field(
         default_factory=dict,
         description="Mapping from existing input field names to output field names.",
     )
@@ -282,7 +286,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:81d619809f29ad7b"
+    source_file_hash: str | None = "sha256:8afa75e2269331e8"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "

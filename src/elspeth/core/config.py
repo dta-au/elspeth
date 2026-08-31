@@ -2756,6 +2756,13 @@ def _plugin_bearing_sections() -> dict[str, str]:
 def _declared_emitted_options(plugin_name: str) -> dict[str, list[tuple[str, str]]]:
     """Return ``{option_name: [(plugin_kind, reason), ...]}`` declared for ``plugin_name``.
 
+    Literal values that reach output come from ``EmittedToOutput`` metadata on
+    plugin config fields. Transform options whose value names a field the
+    transform writes come from ``BaseTransform.output_naming_config_keys`` —
+    the existing authority whose declarations are checked against actual
+    created fields by the transform invariant suite. The union avoids a second
+    hand-maintained copy of every output-field option in config annotations.
+
     Unioned across all three registries, deliberately, because there is no
     name-to-kind lookup: the registries are three disjoint maps, and ``csv``,
     ``json``, ``aws_s3``, ``azure_blob``, ``dataverse``, ``text`` and ``llm``
@@ -2789,8 +2796,20 @@ def _declared_emitted_options(plugin_name: str) -> dict[str, list[tuple[str, str
         for plugin_class in plugin_classes:
             if plugin_class.name != plugin_name:
                 continue
-            for option_name, reason in emitted_option_fields(plugin_class.get_config_model()).items():
+            explicitly_emitted = emitted_option_fields(plugin_class.get_config_model())
+            for option_name, reason in explicitly_emitted.items():
                 declared.setdefault(option_name, []).append((kind, reason))
+            if kind == "transform":
+                for option_name in plugin_class.output_naming_config_keys:
+                    if option_name in explicitly_emitted:
+                        continue
+                    declared.setdefault(option_name, []).append(
+                        (
+                            kind,
+                            "this option names a field the transform writes, so its value becomes "
+                            "a key in row data and a column in downstream artifacts",
+                        )
+                    )
     return declared
 
 
@@ -2819,10 +2838,12 @@ def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mappi
     cannot be bypassed by handing it an already-expanded host value.
 
     DERIVED, NOT RESTATED. Both the sections and the forbidden fields come from
-    the system's own declarations: the sections from ``ElspethSettings``, and
-    the fields from the :class:`~elspeth.contracts.emitted_option.EmittedToOutput`
-    markers on each plugin's config model — the same declarations the plugin's
-    own validator enforces. This function names no plugin and no option.
+    the system's own declarations: the sections from ``ElspethSettings``;
+    literal output values from
+    :class:`~elspeth.contracts.emitted_option.EmittedToOutput` markers on each
+    plugin's config model; and transform output-field names from the
+    truth-tested ``BaseTransform.output_naming_config_keys`` authority. This
+    function names no plugin and no option.
 
     It replaced a hand-maintained ``{plugin: {field, ...}}`` map that held ONE
     plugin and two fields, and was therefore a no-op for every other plugin.

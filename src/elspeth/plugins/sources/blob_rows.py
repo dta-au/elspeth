@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
-from typing import Any, ClassVar
+from typing import Annotated, Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -30,6 +30,7 @@ from elspeth.contracts import Determinism, PluginSchema, SourceRow
 from elspeth.contracts.blobs import STORAGE_MIME_TYPES
 from elspeth.contracts.contexts import LifecycleContext, SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder
+from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.payload_store import PayloadStore
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
@@ -87,7 +88,10 @@ class BlobRowsSourceConfig(DataPluginConfig):
         ...,
         description="Sink name for non-conformant rows, or 'discard' for explicit drop",
     )
-    blobs: list[BlobRowsEntry] = Field(
+    blobs: Annotated[
+        list[BlobRowsEntry],
+        EmittedToOutput("blob_rows copies each configured blob entry's custody metadata into emitted source rows"),
+    ] = Field(
         min_length=1,
         max_length=_MAX_BLOBS,
         description="Authoritative blob references, in authoring order (becomes source-row order).",
@@ -121,7 +125,7 @@ class BlobRowsSource(BaseSource):
     name = "blob_rows"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:30fac7a29eeb8e48"
+    source_file_hash: str | None = "sha256:9dcd7c4dd2553d22"
     config_model = BlobRowsSourceConfig
     # DESIGN DEVIATION (recorded for adjudication): the approved design lists
     # ``creates_tokens = True``, but that attribute exists only on the

@@ -3955,6 +3955,132 @@ class TestEnvPlaceholderGuardIsDerived:
             f"exists to make impossible."
         )
 
+    @pytest.mark.parametrize(
+        ("section_name", "plugin_name", "option_name"),
+        [
+            ("transforms", "rag_retrieval", "output_prefix"),
+            ("transforms", "rag_retrieval", "context_separator"),
+            ("transforms", "batch_classifier_metrics", "actual_field"),
+            ("transforms", "batch_classifier_metrics", "predicted_field"),
+            ("transforms", "batch_outlier_annotator", "value_field"),
+            ("transforms", "batch_outlier_annotator", "z_threshold"),
+            ("transforms", "batch_outlier_annotator", "robust_z_threshold"),
+            ("transforms", "pdf_rasterize", "page_blob_ref_field"),
+            ("transforms", "pdf_rasterize", "page_number_field"),
+            ("transforms", "pdf_rasterize", "document_id_field"),
+            ("transforms", "pdf_rasterize", "page_mime_type_field"),
+            ("transforms", "pdf_rasterize", "page_size_bytes_field"),
+            ("transforms", "pdf_rasterize", "page_width_field"),
+            ("transforms", "pdf_rasterize", "page_height_field"),
+            ("transforms", "web_scrape", "content_field"),
+            ("transforms", "web_scrape", "fingerprint_field"),
+            ("transforms", "report_assemble", "output_field"),
+            ("transforms", "blob_csv_expand", "columns"),
+            ("transforms", "blob_csv_expand", "field_mapping"),
+            ("transforms", "blob_json_expand", "field_mapping"),
+            ("transforms", "field_mapper", "mapping"),
+            ("sources", "csv", "columns"),
+            ("sources", "csv", "field_mapping"),
+            ("sources", "aws_s3", "columns"),
+            ("sources", "aws_s3", "field_mapping"),
+            ("sources", "azure_blob", "columns"),
+            ("sources", "azure_blob", "field_mapping"),
+            ("sources", "json", "field_mapping"),
+            ("sources", "dataverse", "field_mapping"),
+            ("sources", "text", "column"),
+            ("sources", "llm", "response_field"),
+            ("sources", "blob_rows", "blobs"),
+        ],
+    )
+    def test_adjudicated_output_emitters_are_not_silently_undeclared(
+        self,
+        section_name: str,
+        plugin_name: str,
+        option_name: str,
+    ) -> None:
+        """Named pin for emitters the registry-derived sweep cannot discover.
+
+        ``test_every_declared_emitted_option_is_rejected_by_the_loader`` proves
+        that declarations are enforced, but deleting or forgetting a declaration
+        removes the case from that derived test. Each option here has an execution
+        path that writes its value into row data: directly as a separator or
+        metadata value, as a numeric value after config coercion, or as a field
+        name that becomes a row key and artifact column after env expansion.
+        """
+        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        option_value: object
+        if option_name == "columns":
+            option_value = [self.PLACEHOLDER]
+        elif option_name in {"field_mapping", "mapping"}:
+            option_value = {"observed": self.PLACEHOLDER}
+        elif option_name == "blobs":
+            option_value = [
+                {
+                    "blob_id": "11111111-1111-1111-1111-111111111111",
+                    "payload_ref": "a" * 64,
+                    "filename": self.PLACEHOLDER,
+                    "mime_type": "application/pdf",
+                    "size_bytes": 1,
+                }
+            ]
+        else:
+            option_value = self.PLACEHOLDER
+
+        entry = {
+            "name": "probe",
+            "plugin": plugin_name,
+            "options": {option_name: option_value},
+        }
+        raw_config = {section_name: {"probe": entry} if section_name == "sources" else [entry]}
+
+        with pytest.raises(ValueError, match="environment-variable placeholders"):
+            _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+
+    def test_every_output_naming_option_is_rejected_by_the_loader(self) -> None:
+        """Reuse the transform registry's truth-tested output-name authority.
+
+        ``BaseTransform.output_naming_config_keys`` already classifies options
+        whose value names a field the transform writes. The transform invariant
+        suite proves those declarations against the fields actually created, so
+        the env guard must derive from them rather than restating the same field
+        list as ``EmittedToOutput`` annotations on every config model.
+        """
+        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        manager = get_shared_plugin_manager()
+        declarations = [
+            (plugin_class.name, option_name)
+            for plugin_class in manager.get_transforms()
+            for option_name in plugin_class.output_naming_config_keys
+        ]
+
+        assert declarations, "Positive control: no transform declared an output-naming config option."
+
+        failed_open = []
+        for plugin_name, option_name in declarations:
+            raw_config = {
+                "transforms": [
+                    {
+                        "name": "probe",
+                        "plugin": plugin_name,
+                        "options": {option_name: self.PLACEHOLDER},
+                    }
+                ]
+            }
+            try:
+                _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+            except ValueError:
+                continue
+            failed_open.append(f"{plugin_name}.{option_name}")
+
+        assert not failed_open, (
+            f"Output-naming config options that accept an env placeholder: {sorted(failed_open)}. "
+            f"Their expanded host values become row keys and artifact columns; derive these restrictions "
+            f"from output_naming_config_keys instead of adding a second hand-maintained field list."
+        )
+
     def test_the_guard_is_not_a_one_plugin_map_in_disguise(self) -> None:
         """Mutation guard: enforcement must reach beyond the original entry.
 

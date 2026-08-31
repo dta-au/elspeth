@@ -22,7 +22,11 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
-from elspeth.plugins.infrastructure.config_base import TransformDataConfig
+from elspeth.plugins.infrastructure.config_base import (
+    NormalizedColumnsOption,
+    NormalizedFieldMappingOption,
+    TransformDataConfig,
+)
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources.field_normalization import ExternalHeaderError, resolve_field_names
@@ -73,8 +77,8 @@ class BlobCSVExpandConfig(TransformDataConfig):
     delimiter: str = Field(default=",", description="Single-character delimiter used to split CSV fields.")
     encoding: str = Field(default="utf-8", description="Encoding used to decode the CSV blob. Applies to source: blob only.")
     skip_rows: int = Field(default=0, ge=0, description="Number of leading CSV records to skip before reading headers or data.")
-    columns: list[str] | None = Field(default=None, description="Explicit normalized column names for headerless CSV blobs.")
-    field_mapping: dict[str, str] | None = Field(
+    columns: NormalizedColumnsOption = Field(default=None, description="Explicit normalized column names for headerless CSV blobs.")
+    field_mapping: NormalizedFieldMappingOption = Field(
         default=None, description="Optional mapping from observed CSV headers to normalized names."
     )
     include_row_index: bool = Field(default=True, description="Whether to emit the row index within the parsed CSV document.")
@@ -303,7 +307,7 @@ class BlobCSVExpand(BaseTransform):
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ae36b059ccabbfd3"
+    source_file_hash: str | None = "sha256:aff2ec2adf154d4e"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "

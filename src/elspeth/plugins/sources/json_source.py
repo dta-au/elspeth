@@ -22,7 +22,11 @@ from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLim
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.plugins.infrastructure.base import BaseSource
-from elspeth.plugins.infrastructure.config_base import SourceDataConfig, declared_source_schema_field_names
+from elspeth.plugins.infrastructure.config_base import (
+    NormalizedFieldMappingOption,
+    SourceDataConfig,
+    declared_source_schema_field_names,
+)
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
@@ -88,7 +92,7 @@ class JSONSourceConfig(SourceDataConfig):
         description="Optional top-level object key containing the array of records to read from a JSON document.",
     )
     encoding: str = Field(default="utf-8", description="Text encoding used to decode the JSON or JSONL file.")
-    field_mapping: dict[str, str] | None = Field(
+    field_mapping: NormalizedFieldMappingOption = Field(
         default=None,
         description="Optional mapping from observed JSON object keys to normalized pipeline field names.",
     )
@@ -172,7 +176,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8d6f47c2385ecd86"
+    source_file_hash: str | None = "sha256:9f0b0a653e365a0b"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
