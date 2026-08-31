@@ -9,7 +9,7 @@ import io
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Final, TypedDict
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -45,6 +45,9 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools._common import (
     _DEFAULT_SOURCE_VALIDATION_FAILURE,
     _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
+    _SERVER_OWNED_SOURCE_OPTION_KEYS,
+    _SOURCE_BLOB_REF_OPTION_KEY,
+    _SOURCE_BLOBS_OPTION_KEY,
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
     _STEP_DESCRIPTION_DESCRIPTION,
     PendingCustodyBlobView,
@@ -102,6 +105,12 @@ _INLINE_CSV_HEADER_READ_BYTES = 64 * 1024
 _CSV_FIELD_MAX_CHARS = 64 * 1024
 _CSV_MAX_COLUMNS = 4096
 _INLINE_CSV_CANDIDATE_SCAN_LIMIT = 50
+_SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
+    " Server/resolver-owned source option roots are not settable: "
+    + ", ".join(sorted(_SERVER_OWNED_SOURCE_OPTION_KEYS))
+    + ". Bind blobs through set_source_from_blob, set_source_from_blobs, source.blob_id, or source.inline_blob."
+    + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
+)
 
 
 class _CsvContentBoundaryError(ValueError):
@@ -222,7 +231,7 @@ _SET_SOURCE_DECLARATION = ToolDeclaration(
             },
             "options": {
                 "type": "object",
-                "description": "Plugin-specific config." + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
+                "description": "Plugin-specific config." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
             },
             "on_validation_failure": {
                 "type": "string",
@@ -598,10 +607,10 @@ def _reject_manual_source_blobs(
     the key is reserved everywhere except resolver output (run admission
     independently re-verifies modality and entry facts as the backstop).
     """
-    if "blobs" not in options:
+    if _SOURCE_BLOBS_OPTION_KEY not in options:
         return None
     return (
-        f"{tool_name} must not be called with 'blobs' in source options. "
+        f"{tool_name} must not be called with '{_SOURCE_BLOBS_OPTION_KEY}' in source options. "
         "The plural blob binding is resolved from session blob records by set_source_from_blobs; "
         "bind or rebind blobs through that tool instead of authoring the list directly."
     )
@@ -668,14 +677,20 @@ def _resolve_source_blob(
     existing_options: Mapping[str, Any] | None = None,
 ) -> _ResolvedSourceBlob | ToolResult:
     """Resolve an existing ready blob into authoritative source options."""
+    manual_authoring_error = _reject_manual_source_authoring(caller_options, tool_name=tool_name)
+    if manual_authoring_error is not None:
+        return _failure_result(state, manual_authoring_error)
+    manual_blob_ref_error = _reject_manual_source_blob_ref(caller_options, tool_name=tool_name)
+    if manual_blob_ref_error is not None:
+        return _failure_result(state, manual_blob_ref_error)
+    manual_blobs_error = _reject_manual_source_blobs(caller_options, tool_name=tool_name)
+    if manual_blobs_error is not None:
+        return _failure_result(state, manual_blobs_error)
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
     blob_id_error = _blob_id_uuid_validation_error(blob_id)
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
-    manual_authoring_error = _reject_manual_source_authoring(caller_options, tool_name=tool_name)
-    if manual_authoring_error is not None:
-        return _failure_result(state, manual_authoring_error)
     blob = _sync_get_blob(session_engine, blob_id, session_id)
     # Deferred inline custody (elspeth-282f392fae): the planner's custody-safe
     # revalidation runs BEFORE the atomic staging settlement materializes the
@@ -711,7 +726,7 @@ def _resolve_source_blob(
         **mime_extra,
         **_delimiter_extra_for_csv_blob(plugin, blob["filename"], caller_options),
         "path": blob["storage_path"],
-        "blob_ref": blob["id"],
+        _SOURCE_BLOB_REF_OPTION_KEY: blob["id"],
         "mode": "bind_source",
         **_source_authoring_options(creation_modality, blob["content_hash"]),
     }
@@ -803,7 +818,7 @@ def _manual_source_blob_ref_error(*, tool_name: str, inline_blob_supported: bool
         bind_path = "set_source_from_blob"
     return (
         f"Use {bind_path} to bind a blob to the source. "
-        f"{tool_name} must not be called with 'blob_ref' in source.options "
+        f"{tool_name} must not be called with '{_SOURCE_BLOB_REF_OPTION_KEY}' in source.options "
         "because it cannot enforce that 'path' equals the blob's canonical storage_path."
     )
 
@@ -815,7 +830,7 @@ def _reject_manual_source_blob_ref(
     inline_blob_supported: bool = False,
 ) -> str | None:
     """Reject caller-supplied blob_ref outside authoritative blob-binding tools."""
-    if "blob_ref" not in options:
+    if _SOURCE_BLOB_REF_OPTION_KEY not in options:
         return None
     return _manual_source_blob_ref_error(tool_name=tool_name, inline_blob_supported=inline_blob_supported)
 
@@ -1121,16 +1136,17 @@ def _resolve_source_blobs(
     UTF-8 decoded here; no content is read at all (run admission re-resolves
     the records and web execution stages the bytes for the payload store).
     """
-    if session_engine is None or session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
     manual_authoring_error = _reject_manual_source_authoring(caller_options, tool_name="set_source_from_blobs")
     if manual_authoring_error is not None:
         return _failure_result(state, manual_authoring_error)
-    if "blobs" in caller_options:
-        return _failure_result(
-            state,
-            "set_source_from_blobs resolves the 'blobs' list from session records; do not author or edit it directly.",
-        )
+    manual_blob_ref_error = _reject_manual_source_blob_ref(caller_options, tool_name="set_source_from_blobs")
+    if manual_blob_ref_error is not None:
+        return _failure_result(state, manual_blob_ref_error)
+    manual_blobs_error = _reject_manual_source_blobs(caller_options, tool_name="set_source_from_blobs")
+    if manual_blobs_error is not None:
+        return _failure_result(state, manual_blobs_error)
+    if session_engine is None or session_id is None:
+        return _failure_result(state, "Blob tools require session context.")
     seen_ids: set[str] = set()
     for blob_id in blob_ids:
         blob_id_error = _blob_id_uuid_validation_error(blob_id)
@@ -1185,7 +1201,7 @@ def _resolve_source_blobs(
         )
         payloads.append(_source_blob_payload(blob))
 
-    merged_options: dict[str, Any] = {**caller_options, "blobs": entries}
+    merged_options: dict[str, Any] = {**caller_options, _SOURCE_BLOBS_OPTION_KEY: entries}
     # A source guarantees what it knows: blob_rows fabricates EVERY row as a
     # literal dict of exactly the plugin's five fixed custody fields
     # (blob_rows.py load(), the row construction at :226-232 over _ROW_FIELDS)
@@ -1347,10 +1363,7 @@ _SET_SOURCE_FROM_BLOBS_DECLARATION = ToolDeclaration(
             },
             "options": {
                 "type": "object",
-                "description": (
-                    "Optional blob_rows config (e.g. schema). The 'blobs' list is resolver-owned and must not appear here."
-                    + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
-                ),
+                "description": ("Optional blob_rows config (e.g. schema)." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE),
             },
         },
         "required": ["blob_ids", "on_success"],
@@ -1402,7 +1415,7 @@ _SET_SOURCE_FROM_BLOB_DECLARATION = ToolDeclaration(
                 "description": (
                     "Plugin-specific config (merged with blob path). Required fields vary by plugin: "
                     "text sources need 'column' (output field name) and 'schema' (e.g., {mode: 'observed'})."
-                    + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
+                    + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
         },
@@ -1720,7 +1733,7 @@ def _execute_patch_source_options(
         source=True,
         existing_options=current_source.options,
     )
-    if "blob_ref" in patch:
+    if _SOURCE_BLOB_REF_OPTION_KEY in patch:
         return _failure_result(
             state,
             "Cannot patch 'blob_ref' on a source. Re-bind via set_source_from_blob "
@@ -1733,7 +1746,7 @@ def _execute_patch_source_options(
     # breaks runtime path resolution and composer/runtime agreement.
     # Replace the binding via a fresh set_source_from_blob (or
     # clear_source) instead of patching it.
-    if "blob_ref" in current_source.options:
+    if _SOURCE_BLOB_REF_OPTION_KEY in current_source.options:
         forbidden_keys = {"path"} & patch.keys()
         if forbidden_keys:
             return _failure_result(
@@ -1850,7 +1863,7 @@ _PATCH_SOURCE_OPTIONS_DECLARATION = ToolDeclaration(
             },
             "patch": {
                 "type": "object",
-                "description": "Merge-patch to apply to source options." + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
+                "description": "Merge-patch to apply to source options." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
             },
         },
         "required": ["patch"],

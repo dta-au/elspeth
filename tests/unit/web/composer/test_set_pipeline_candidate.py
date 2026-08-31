@@ -2052,8 +2052,10 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             stale_review,
             _trained_context(data_dir=tmp_path),
             "Node 'classify': set_pipeline options.interpretation_requirements[0] includes resolver-owned status "
-            "'resolved'. Composer tool input may stage pending review requirements only; resolved review metadata may "
-            "only be written by resolve_interpretation_event.",
+            "'resolved'. Composer tool input may stage pending review requirements only. Omit resolver-owned fields "
+            "and retry set_pipeline with exactly kind, user_term, and draft. Then call request_interpretation_review "
+            "for an authorable staged site; backend-owned review kinds are surfaced automatically. The user resolves "
+            "the card and ELSPETH writes resolved review metadata.",
             "interpretation_requirements_invalid",
         ),
     ]

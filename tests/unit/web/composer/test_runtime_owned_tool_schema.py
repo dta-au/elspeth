@@ -16,8 +16,11 @@ import pytest
 
 from elspeth.web.composer.tools import get_tool_definitions
 from elspeth.web.composer.tools._common import (
+    _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT,
     _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS,
     _RUNTIME_OWNED_LLM_OPTION_KEYS,
+    _SERVER_OWNED_SOURCE_OPTION_KEYS,
+    INTERPRETATION_REQUIREMENTS_KEY,
     _resolver_owned_interpretation_requirement_error,
     _runtime_owned_llm_option_error,
 )
@@ -51,12 +54,24 @@ def _node_option_schemas() -> dict[str, Mapping[str, Any]]:
     }
 
 
+def _output_option_schemas() -> dict[str, Mapping[str, Any]]:
+    definitions = _definitions()
+    set_pipeline = definitions["set_pipeline"]["parameters"]["properties"]
+    return {
+        "set_output.options": definitions["set_output"]["parameters"]["properties"]["options"],
+        "patch_output_options.patch": definitions["patch_output_options"]["parameters"]["properties"]["patch"],
+        "set_pipeline.outputs[].options": set_pipeline["outputs"]["items"]["properties"]["options"],
+    }
+
+
 @pytest.mark.parametrize("schema_name", sorted(_source_option_schemas()))
 def test_source_option_schema_discloses_every_resolver_owned_review_field(schema_name: str) -> None:
     description = _source_option_schemas()[schema_name]["description"]
 
     assert "not settable" in description
-    assert "kind, user_term, and draft" in description
+    assert _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT in description
+    for field_name in _SERVER_OWNED_SOURCE_OPTION_KEYS:
+        assert field_name in description
     for field_name in _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS:
         assert field_name in description
 
@@ -66,9 +81,18 @@ def test_node_option_schema_discloses_runtime_and_resolver_owned_fields(schema_n
     description = _node_option_schemas()[schema_name]["description"]
 
     assert "not settable" in description
-    assert "kind, user_term, and draft" in description
+    assert _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT in description
     for field_name in _RUNTIME_OWNED_LLM_OPTION_KEYS | _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS:
         assert field_name in description
+
+
+@pytest.mark.parametrize("schema_name", sorted(_output_option_schemas()))
+def test_output_option_schema_discloses_forbidden_review_root(schema_name: str) -> None:
+    description = _output_option_schemas()[schema_name]["description"]
+
+    assert "not settable" in description
+    assert INTERPRETATION_REQUIREMENTS_KEY in description
+    assert "source or node" in description
 
 
 def test_blob_inline_field_path_schema_discloses_forbidden_metadata_roots() -> None:
@@ -79,6 +103,11 @@ def test_blob_inline_field_path_schema_discloses_forbidden_metadata_roots() -> N
     assert "interpretation_requirements" in description
     for field_name in _RUNTIME_OWNED_LLM_OPTION_KEYS:
         assert field_name in description
+    for field_name in _SERVER_OWNED_SOURCE_OPTION_KEYS:
+        assert field_name in description
+    assert "LLM node" in description
+    assert "patch_node_options" in description
+    assert "upsert_node" in description
 
 
 @pytest.mark.parametrize("tool_name", ["patch_node_options", "upsert_node", "set_pipeline", "splice_transform"])
@@ -113,5 +142,6 @@ def test_resolver_owned_review_rejection_names_authoring_and_resolution_tools(to
 
     assert error is not None
     assert f"retry {tool_name}" in error
-    assert "kind, user_term, and draft" in error
-    assert "resolve_interpretation_event" in error
+    assert _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT in error
+    assert "request_interpretation_review" in error
+    assert "resolve_interpretation_event" not in error

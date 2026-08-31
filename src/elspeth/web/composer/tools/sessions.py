@@ -62,8 +62,8 @@ from elspeth.web.composer.tools._common import (
     _ECHOED_REVIEW_METADATA_NOTE,
     _ECHOED_SOURCE_AUTHORING_NOTE,
     _FULL_STATE_COMPONENT_ALIAS_SET,
-    _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
     _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+    _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
     _STEP_DESCRIPTION_DESCRIPTION,
     ReviewedSourceAuthority,
@@ -120,6 +120,7 @@ from elspeth.web.composer.tools.declarations import (
 )
 from elspeth.web.composer.tools.sources import (
     _MIME_TO_SOURCE,
+    _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _delimiter_extra_for_csv_blob,
     _drop_echoed_source_authoring,
     _header_only_inline_csv_conflict,
@@ -1775,7 +1776,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     "options": {
                         "type": "object",
                         "description": "Plugin-specific source config. Required by most file/data sources."
-                        + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
+                        + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
                     },
                     "on_success": {
                         "type": "string",
@@ -1823,7 +1824,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "plugin": {"type": "string"},
                         "options": {
                             "type": "object",
-                            "description": "Plugin-specific source config." + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
+                            "description": "Plugin-specific source config." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
                         },
                         "on_success": {"type": "string"},
                         "on_validation_failure": {
@@ -1986,7 +1987,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "plugin": {"type": "string"},
                         "options": {
                             "type": "object",
-                            "description": "Plugin-specific sink config.",
+                            "description": "Plugin-specific sink config." + _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
                         },
                         "on_write_failure": {"type": ["string", "null"]},
                         "description": {

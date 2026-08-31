@@ -3299,6 +3299,29 @@ class TestSetOutput:
         assert result.updated_state.version == 2
         assert "main" in result.affected_nodes
 
+    def test_set_output_rejects_interpretation_requirements_atomically(self) -> None:
+        state = _empty_state()
+        result = execute_tool(
+            "set_output",
+            {
+                "sink_name": "main",
+                "plugin": "csv",
+                "options": {
+                    "path": "/data/out.csv",
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [],
+                },
+                "on_write_failure": "discard",
+            },
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.data is not None
+        assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
+
     def test_data_dir_file_sink_requires_collision_policy(self) -> None:
         """Runnable web-composer file sinks must make output collision behavior explicit."""
         state = _empty_state()
@@ -5264,8 +5287,8 @@ class TestBlobTools:
         assert "blob_ref" in _default_source(result.updated_state).options
         assert _default_source(result.updated_state).options["blob_ref"] == self.blob_id
 
-    def test_set_source_from_blob_blob_options_override_caller(self) -> None:
-        """Blob-derived path and blob_ref cannot be overridden by caller.
+    def test_set_source_from_blob_path_overrides_caller(self) -> None:
+        """The blob-derived path cannot be overridden by caller.
 
         This is a security constraint: the blob's storage path is authoritative.
         Callers cannot inject an arbitrary path via the options parameter.
@@ -5280,7 +5303,6 @@ class TestBlobTools:
                 "on_success": "out",
                 "options": {
                     "path": "/etc/passwd",  # Attempted path injection
-                    "blob_ref": "malicious-ref",
                     "schema": {"mode": "observed"},
                 },
             },
@@ -5293,9 +5315,34 @@ class TestBlobTools:
 
         assert result.success is True
         assert _default_source(result.updated_state) is not None
-        # Blob's path and ref take precedence — caller cannot override
+        # Blob's path and ref are authoritative — caller cannot override path.
         assert _default_source(result.updated_state).options["blob_ref"] == self.blob_id
         assert _default_source(result.updated_state).options["path"] != "/etc/passwd"
+
+    def test_set_source_from_blob_rejects_caller_blob_ref(self) -> None:
+        """blob_ref is an authoritative resolver output, not a caller option."""
+        state = _empty_state()
+
+        result = execute_tool(
+            "set_source_from_blob",
+            {
+                "blob_id": self.blob_id,
+                "on_success": "out",
+                "options": {
+                    "blob_ref": "malicious-ref",
+                    "schema": {"mode": "observed"},
+                },
+            },
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert "blob_ref" in result.data["error"]
+        assert "set_source_from_blob" in result.data["error"]
 
     def test_set_source_from_blob_gets_prior_validation(self) -> None:
         """Blob mutation tools must populate prior_validation for validation delta."""
@@ -8256,6 +8303,20 @@ class TestPatchOutputOptions:
         opts = deep_thaw(output.options)
         assert opts["path"] == "/new.csv"
 
+    def test_patch_output_options_rejects_interpretation_requirements_atomically(self) -> None:
+        state = self._state_with_output({"path": "/old.csv"})
+        result = execute_tool(
+            "patch_output_options",
+            {"sink_name": "main", "patch": {INTERPRETATION_REQUIREMENTS_KEY: []}},
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.data is not None
+        assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
+
     def test_patch_output_options_rejects_literal_credential_value_without_mutating_state(self) -> None:
         state = self._state_with_output({"path": "/old.csv"})
         catalog = _mock_catalog()
@@ -9799,6 +9860,18 @@ class TestSetPipeline:
         assert "resolved_prompt_template_hash" in result.data["error"]
         assert "runtime-owned" in result.data["error"]
 
+    def test_set_pipeline_rejects_output_interpretation_requirements_without_mutating_state(self) -> None:
+        state = _empty_state()
+        args = _valid_pipeline_args()
+        args["outputs"][0]["options"][INTERPRETATION_REQUIREMENTS_KEY] = []
+
+        result = execute_tool("set_pipeline", args, state, _mock_catalog())
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.data is not None
+        assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
+
     def test_upsert_node_rejects_user_supplied_llm_runtime_hash_without_mutating_state(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
@@ -9881,7 +9954,8 @@ class TestSetPipeline:
         assert result.updated_state is state
         assert result.data is not None
         assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
-        assert "resolve_interpretation_event" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
 
     def test_upsert_node_rejects_user_supplied_resolved_llm_reviews_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -9906,7 +9980,8 @@ class TestSetPipeline:
         assert result.updated_state is state
         assert result.data is not None
         assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
-        assert "resolve_interpretation_event" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
 
     def test_patch_node_options_rejects_user_supplied_resolved_llm_reviews_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -9942,7 +10017,8 @@ class TestSetPipeline:
         assert result.updated_state is created.updated_state
         assert result.data is not None
         assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
-        assert "resolve_interpretation_event" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
 
     def test_patch_node_options_preserves_existing_resolved_llm_reviews_on_unrelated_patch(self) -> None:
         state = _empty_state()

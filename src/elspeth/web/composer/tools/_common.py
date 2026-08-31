@@ -119,6 +119,15 @@ _FULL_STATE_COMPONENT_ALIASES: Final[tuple[str, ...]] = ("", "full", "all", "pip
 _FULL_STATE_COMPONENT_ALIAS_SET: Final[frozenset[str]] = frozenset(_FULL_STATE_COMPONENT_ALIASES)
 _DATA_ERROR_KEY: Final[str] = "error"
 _RUNTIME_OWNED_LLM_OPTION_KEYS: Final[frozenset[str]] = frozenset({"resolved_prompt_template_hash"})
+_SOURCE_BLOB_REF_OPTION_KEY: Final[str] = "blob_ref"
+_SOURCE_BLOBS_OPTION_KEY: Final[str] = "blobs"
+_SERVER_OWNED_SOURCE_OPTION_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        SOURCE_AUTHORING_KEY,
+        _SOURCE_BLOB_REF_OPTION_KEY,
+        _SOURCE_BLOBS_OPTION_KEY,
+    }
+)
 _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "id",
@@ -129,18 +138,30 @@ _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = froze
         "resolved_prompt_template_hash",
     }
 )
-_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(
-    {
-        "kind",
-        "user_term",
-        "draft",
-    }
+_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER: Final[tuple[str, ...]] = (
+    "kind",
+    "user_term",
+    "draft",
+)
+_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER)
+_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT: Final[str] = ", ".join(
+    (
+        *_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER[:-1],
+        f"and {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER[-1]}",
+    )
+)
+_INTERPRETATION_REVIEW_FOLLOWUP: Final[str] = (
+    "Then call request_interpretation_review for an authorable staged site; "
+    "backend-owned review kinds are surfaced automatically. The user resolves "
+    "the card and ELSPETH writes resolved review metadata."
 )
 _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
-    " Inside interpretation_requirements, only kind, user_term, and draft are authorable. "
+    " Inside interpretation_requirements, only " + _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT + " are authorable. "
     "Resolver-owned fields are not settable: "
     + ", ".join(sorted(_RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS))
-    + ". Omit those fields; resolve_interpretation_event writes resolved review metadata."
+    + ". Omit those fields. Persist an authorable pending review with the current mutation tool, then call "
+    "request_interpretation_review for that staged site; backend-owned review kinds are surfaced automatically. "
+    "The user resolves the card and ELSPETH writes resolved review metadata."
 )
 _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
     " Runtime-owned LLM option fields are not settable: "
@@ -149,11 +170,18 @@ _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
     + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
 )
 _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
-    " Runtime/resolver-owned option roots are not settable by this tool: "
-    + INTERPRETATION_REQUIREMENTS_KEY
-    + ", "
+    f" The {INTERPRETATION_REQUIREMENTS_KEY} option root is not settable on any source, node, or output path. "
+    "On source paths, these server/resolver-owned roots are also not settable: "
+    + ", ".join(sorted(_SERVER_OWNED_SOURCE_OPTION_KEYS))
+    + ". Bind sources with set_source_from_blob or set_source_from_blobs instead. "
+    "When field_path targets an LLM node, its runtime-owned top-level option is also not settable: "
     + ", ".join(sorted(_RUNTIME_OWNED_LLM_OPTION_KEYS))
-    + "."
+    + ". For author-owned LLM option edits use patch_node_options, or upsert_node for a full node edit; "
+    "blob wiring cannot author those values."
+)
+_OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
+    f" The {INTERPRETATION_REQUIREMENTS_KEY} option root is not settable on outputs. "
+    "Stage an authorable review on its source or node instead."
 )
 _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(
     {
@@ -2320,9 +2348,10 @@ def _resolver_owned_interpretation_requirement_error(
     requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY]
     malformed_error = (
         f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY} must be a list of "
-        "review entry objects, each carrying non-empty string fields kind, user_term, "
-        "and draft. Omit the field entirely when no review is being staged; canonical "
-        "review metadata is written only by resolve_interpretation_event."
+        "review entry objects, each carrying non-empty string fields "
+        f"{_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT}. Omit the field entirely "
+        "when no review is being staged. "
+        f"{_INTERPRETATION_REVIEW_FOLLOWUP}"
     )
     if type(requirements_value) is not list:
         return malformed_error
@@ -2348,8 +2377,8 @@ def _resolver_owned_interpretation_requirement_error(
                 f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] includes "
                 "resolver-owned status 'resolved'. Composer tool input may stage pending "
                 f"review requirements only. Omit resolver-owned fields and retry {tool_name} "
-                "with exactly kind, user_term, and draft; only resolve_interpretation_event "
-                "can write resolved review metadata."
+                f"with exactly {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT}. "
+                f"{_INTERPRETATION_REVIEW_FOLLOWUP}"
             )
         resolver_owned_fields = sorted(field for field in _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS if field in requirement)
         if resolver_owned_fields:
@@ -2357,8 +2386,8 @@ def _resolver_owned_interpretation_requirement_error(
             return (
                 f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] includes "
                 f"resolver-owned field(s): {field_names}. Composer tool input may supply "
-                f"only kind, user_term, and draft. Omit resolver-owned fields and retry {tool_name}; "
-                "only resolve_interpretation_event can write resolved review metadata."
+                f"only {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT}. Omit resolver-owned "
+                f"fields and retry {tool_name}. {_INTERPRETATION_REVIEW_FOLLOWUP}"
             )
         if set(requirement) != _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS:
             return malformed_error

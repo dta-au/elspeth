@@ -184,9 +184,9 @@ class TestSetSourceFromBlobMigration:
     def test_get_tool_definitions_emits_expected_set_source_from_blob_definition(self) -> None:
         from elspeth.web.composer.tools._common import (
             _DEFAULT_SOURCE_VALIDATION_FAILURE,
-            _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
             _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
         )
+        from elspeth.web.composer.tools.sources import _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE
 
         expected = {
             "name": "set_source_from_blob",
@@ -227,7 +227,7 @@ class TestSetSourceFromBlobMigration:
                         "description": (
                             "Plugin-specific config (merged with blob path). Required fields vary by plugin: "
                             "text sources need 'column' (output field name) and 'schema' (e.g., {mode: 'observed'})."
-                            + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
+                            + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE
                         ),
                     },
                 },
@@ -659,7 +659,7 @@ class TestStep3MutationTierMigration:
         }
 
     def test_patch_source_options(self) -> None:
-        from elspeth.web.composer.tools._common import _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
+        from elspeth.web.composer.tools.sources import _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE
 
         assert self._get("patch_source_options") == {
             "name": "patch_source_options",
@@ -672,7 +672,7 @@ class TestStep3MutationTierMigration:
                     "source_name": {"type": "string", "description": "Source root name to patch. Defaults to 'source'."},
                     "patch": {
                         "type": "object",
-                        "description": "Merge-patch to apply to source options." + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
+                        "description": "Merge-patch to apply to source options." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
                     },
                 },
                 "required": ["patch"],

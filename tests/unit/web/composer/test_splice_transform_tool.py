@@ -133,6 +133,75 @@ def test_splice_transform_public_node_id_schema_matches_runtime_contract() -> No
     assert {key: node_id_schema[key] for key in runtime_schema} == runtime_schema
 
 
+def test_splice_transform_public_dispatch_rejects_llm_runtime_hash_atomically() -> None:
+    state = _state()
+    arguments = _arguments(
+        options={
+            "provider": "openrouter",
+            "model": "openai/gpt-4o-mini",
+            "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+            "prompt_template": "Summarise {{ row.text }}.",
+            "resolved_prompt_template_hash": None,
+            "schema": {"mode": "observed"},
+        }
+    )
+    arguments["node"]["plugin"] = "llm"  # type: ignore[index]
+
+    context = _context()
+    result = execute_tool(
+        "splice_transform",
+        arguments,
+        state,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+    )
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.data is not None
+    assert "resolved_prompt_template_hash" in result.data["error"]
+    assert "retry splice_transform" in result.data["error"]
+
+
+def test_splice_transform_public_dispatch_rejects_resolver_owned_review_atomically() -> None:
+    state = _state()
+    arguments = _arguments(
+        options={
+            "provider": "openrouter",
+            "model": "openai/gpt-4o-mini",
+            "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+            "prompt_template": "Summarise {{ row.text }}.",
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "kind": "llm_prompt_template",
+                    "user_term": "llm_prompt_template:inserted",
+                    "draft": "Summarise {{ row.text }}.",
+                    "status": "resolved",
+                }
+            ],
+            "schema": {"mode": "observed"},
+        }
+    )
+    arguments["node"]["plugin"] = "llm"  # type: ignore[index]
+    context = _context()
+
+    result = execute_tool(
+        "splice_transform",
+        arguments,
+        state,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+    )
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.data is not None
+    assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
+    assert "retry splice_transform" in result.data["error"]
+    assert "request_interpretation_review" in result.data["error"]
+    assert "resolve_interpretation_event" not in result.data["error"]
+
+
 def test_splice_transform_manifest_is_type_driven() -> None:
     entry = MANIFEST["splice_transform"]
 
