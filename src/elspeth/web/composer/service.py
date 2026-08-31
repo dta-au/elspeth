@@ -3965,7 +3965,9 @@ class ComposerServiceImpl:
                 # to satisfy a prediction rather than closing a named gap.
                 "unproducible_output_fields_usage": (
                     "No reviewed source declares or observes these fields; a pass-through has nothing to "
-                    "produce them from. Propose the transform(s) that do."
+                    "produce them from. Propose the transform(s) that do. The final candidate must also "
+                    "preserve or produce every other reviewed output required field; adding any transform "
+                    "or renaming these fields into place is not, by itself, proof of a satisfiable output contract."
                 ),
             }
 

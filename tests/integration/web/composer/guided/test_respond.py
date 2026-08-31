@@ -1014,17 +1014,17 @@ class TestStep2IntraStep:
         ]
         assert llm_audits, "a planned transition must leave llm_call_audit evidence"
 
-    @pytest.mark.parametrize("provider_heeds_gap", (True, False))
+    @pytest.mark.parametrize("provider_closes_contract", (True, False))
     def test_step_3_entry_with_unproducible_output_fields_names_the_gap_to_the_planner(
         self,
         composer_test_client: TestClient,
         monkeypatch: pytest.MonkeyPatch,
-        provider_heeds_gap: bool,
+        provider_closes_contract: bool,
     ) -> None:
         """R2-F4: an unsatisfiable zero-transform pipeline is never a complete answer.
 
         The reviewed source observes ``order_id, region``; step-2 field review
-        declares ``client`` and ``amount_aud`` on top of them. A pass-through
+        requires ``client`` and ``amount_aud`` instead. A pass-through
         has zero transforms, so nothing in it can ever produce those two
         fields. The provider planner is the only planning path
         (elspeth-b4a286d517 removed the server-synthesized sketch); what this
@@ -1078,13 +1078,11 @@ class TestStep2IntraStep:
         reviewed = _respond(
             composer_test_client,
             session_id,
-            chosen=["order_id", "region"],
+            chosen=[],
             custom_inputs=["client", "amount_aud"],
         )
         guided_facts = _full_guided_session(reviewed)
         assert next(iter(guided_facts["reviewed_outputs"].values()))["required_fields"] == [
-            "order_id",
-            "region",
             "client",
             "amount_aud",
         ]
@@ -1140,10 +1138,10 @@ class TestStep2IntraStep:
             "source_routes": [
                 {
                     "stable_id": source_stable_id,
-                    "on_success": "planner_rows" if provider_heeds_gap else reviewed_output_name,
+                    "on_success": "planner_rows" if provider_closes_contract else reviewed_output_name,
                 }
             ],
-            "nodes": gap_closing_nodes if provider_heeds_gap else [],
+            "nodes": gap_closing_nodes if provider_closes_contract else [],
             "edges": [],
             "output_targets": [{"stable_id": output_stable_id}],
         }
@@ -1182,7 +1180,7 @@ class TestStep2IntraStep:
                 component_action={"action": "finish", "component_kind": "output"},
             )
 
-        if provider_heeds_gap:
+        if provider_closes_contract:
             assert settled.status_code == 200, settled.json()
             assert settled.json()["next_turn"]["type"] == "propose_pipeline"
         else:
@@ -1230,6 +1228,7 @@ class TestStep2IntraStep:
         assert len(planner_contexts) == 1, "the unsatisfiable sketch must route to the provider planner"
         gap = planner_contexts[0]["unproducible_output_fields"]
         assert [entry["fields"] for entry in gap] == [["amount_aud", "client"]]
+        assert "preserve or produce every other reviewed output required field" in planner_contexts[0]["unproducible_output_fields_usage"]
         audit_messages = asyncio.run(app.state.session_service.get_messages(UUID(session_id), limit=None))
         planner_evidence_kinds = [
             envelope.get("_kind")
