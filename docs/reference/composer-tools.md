@@ -479,7 +479,7 @@ Wire a ready blob into a plugin option as audited inline content.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `field_path` | string | **Yes** | Canonical target path such as `source.options.<field>`, `node:<node_id>.options.<field>`, or `output:<name>.options.<field>` |
+| `field_path` | string | **Yes** | Canonical target path such as `source.options.<field>`, `node:<node_id>.options.<field>` for a transform, aggregation, or collector, or `output:<name>.options.<field>` |
 | `blob_id` | string | **Yes** | Ready blob ID to wire |
 | `encoding` | string | No | One of `utf-8`, `utf-8-sig`, `utf-16`, or `latin-1`; defaults to `utf-8` |
 

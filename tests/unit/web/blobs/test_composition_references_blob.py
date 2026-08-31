@@ -97,7 +97,7 @@ def _emitted_pipeline_with_every_node_kind(marker: dict[str, str]) -> dict[str, 
     latter IS `generate_pipeline_dict(state_from_record(record))`. One emitter,
     both entry points, so what it emits is the authority for what to walk.
     """
-    from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+    from elspeth.web.composer.state import COMPOSER_NODE_TYPES, CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
     from elspeth.web.composer.yaml_generator import generate_pipeline_dict
 
     def node(**overrides: Any) -> NodeSpec:
@@ -133,6 +133,11 @@ def _emitted_pipeline_with_every_node_kind(marker: dict[str, str]) -> dict[str, 
         outputs=(OutputSpec(name="out", plugin="json", options={"payload": dict(marker)}, on_write_failure=None, description=None),),
         metadata=PipelineMetadata(),
         version=1,
+    )
+    represented = {node.node_type for node in state.nodes}
+    assert represented == COMPOSER_NODE_TYPES, (
+        f"the coverage fixture no longer represents every Composer node kind; missing {sorted(COMPOSER_NODE_TYPES - represented)}, "
+        f"obsolete {sorted(represented - COMPOSER_NODE_TYPES)}"
     )
     return generate_pipeline_dict(state)
 
