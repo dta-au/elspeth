@@ -13868,3 +13868,70 @@ def test_send_message_does_not_re_emit_the_already_persisted_turn_prose(tmp_path
     # rows), which is why the duplicate was user-visible.
     conversation = _composer_conversation_messages(messages)
     assert sum(prose in message.content for message in conversation if message.role == "assistant") == 1
+
+
+def test_recompose_auto_commit_revoked_persists_the_post_rebind_message(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The recompose turn-end row must read the REBOUND result, not the pre-rebind one.
+
+    Mirror of ``test_send_message_auto_commit_lands_on_review_when_trust_revoked_before_settlement``
+    for the recompose route, which had no equivalent. Both handlers rebind
+    ``result`` on the auto-commit-revoked branch, so the turn-end
+    content/raw_content pair must be derived BELOW that branch
+    (elspeth-d581b3da7f). Hoisting ``composer_turn_end_assistant_row`` to the
+    top of the handler — the natural place for it — silently persists the
+    superseded message; send_message caught that, recompose did not.
+    """
+    from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE
+
+    app, service, _pipeline, session_id, row, _endpoint = asyncio.run(
+        _create_canonical_pipeline_route_proposal(tmp_path, monkeypatch, tool_call_id="recompose-auto-revoked")
+    )
+    asyncio.run(
+        service.add_message(
+            session_id,
+            "user",
+            "Build the pipeline.",
+            writer_principal="route_user_message",
+        )
+    )
+    assert row.pipeline_metadata is not None
+
+    async def _compose_then_downgrade(*_args, **_kwargs) -> ComposerResult:
+        # The downgrade becomes durable while the compose turn is in flight —
+        # after intent minting, before settlement.
+        await service.update_composer_preferences(
+            session_id,
+            trust_mode="explicit_approve",
+            density_default="high",
+            actor="user:alice",
+        )
+        assert row.pipeline_metadata is not None
+        return ComposerResult(
+            message="Pipeline prepared.",
+            state=_EMPTY_STATE,
+            pipeline_commit_intent=PipelineCommitIntent(
+                proposal_id=row.id,
+                draft_hash=row.pipeline_metadata.draft_hash,
+            ),
+        )
+
+    composer = SimpleNamespace()
+    composer.surface_pending_interpretation_reviews = AsyncMock(
+        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+    )
+    composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=_compose_then_downgrade)
+    app.state.composer_service = composer
+    client = TestClient(app)
+
+    response = client.post(f"/api/sessions/{session_id}/recompose")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["proposals"]) == 1
+    assert body["proposals"][0]["status"] == "pending"
+    # The superseded "Pipeline prepared." must not reach the transcript.
+    assert body["message"]["content"] == PIPELINE_STAGED_REVIEW_MESSAGE
+
+    messages = asyncio.run(service.get_messages(session_id, limit=None))
+    assistant_rows = [message for message in messages if message.role == "assistant"]
+    assert [message.content for message in assistant_rows] == [PIPELINE_STAGED_REVIEW_MESSAGE]
