@@ -4,7 +4,7 @@
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import UnionType
-from typing import Any, Union, get_args, get_origin
+from typing import Any, Union, cast, get_args, get_origin
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -3830,18 +3830,19 @@ class TestEnvPlaceholderGuardIsDerived:
     ``sources``/``sinks`` were not walked at all (elspeth-8f0a6b3391). The map
     and the plugin-side validators agreed only by luck.
 
-    Both halves now derive from one declaration: the sections from
-    ``ElspethSettings``, the fields from ``EmittedToOutput`` markers on the
-    plugin config models. These tests assert the DERIVATION holds end to end —
-    every declaration in the tree is enforced by the loader — rather than
-    checking a list of today's plugins, which is the shape that reproduced the
-    defect each time it was added to.
+    Both halves now derive from existing declarations: the sections from
+    ``ElspethSettings``; literal emitted values from ``EmittedToOutput``
+    markers on the plugin config models; and emitted row-key names from
+    ``BaseTransform.output_naming_config_keys``. These tests assert the
+    DERIVATION holds end to end — every declaration in the tree is enforced by
+    the loader — rather than checking a list of today's plugins, which is the
+    shape that reproduced the defect each time it was added to.
     """
 
     PLACEHOLDER = "${ELSPETH_TEST_HOST_VALUE}"
 
     @staticmethod
-    def _registered_plugins() -> list[tuple[str, str, type]]:
+    def _registered_plugins() -> list[tuple[str, str, Any]]:
         """Return ``(kind, name, plugin_class)`` for every registered plugin."""
         from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
@@ -3953,6 +3954,51 @@ class TestEnvPlaceholderGuardIsDerived:
             f"Options declared EmittedToOutput that the loader guard does NOT reject: {sorted(failed_open)}. "
             f"The declaration and the guard have come apart, which is the exact failure the derivation "
             f"exists to make impossible."
+        )
+
+    def test_every_output_naming_option_is_rejected_before_expansion(self) -> None:
+        """An env-expanded output-field name is emitted just as surely as a value.
+
+        ``BaseTransform.output_naming_config_keys`` is the existing registry-wide
+        authority for options whose authored values name columns the transform
+        writes.  Those values pass through env expansion before plugin validation,
+        so ``${VAR}`` can become a valid field name and reach row data and artifact
+        headers.  The pre-expansion guard must derive from this authority rather
+        than relying on a second hand-maintained set of field-name annotations.
+        """
+        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+        from elspeth.plugins.infrastructure.base import BaseTransform
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        manager = get_shared_plugin_manager()
+        declarations: list[tuple[str, str, object]] = []
+        for registered_class in manager.get_transforms():
+            plugin_class = cast(type[BaseTransform], registered_class)
+            config_model = plugin_class.get_config_model()
+            assert config_model is not None, f"{plugin_class.name} declares output naming options without a config model"
+            declarations.extend(
+                (plugin_class.name, option_name, config_model.model_fields[option_name].annotation)
+                for option_name in sorted(plugin_class.output_naming_config_keys)
+            )
+
+        assert len(declarations) > 20, (
+            f"Positive control: only {len(declarations)} output-naming options were discovered; "
+            "a partial registry walk would make the security sweep pass while testing little or nothing."
+        )
+
+        failed_open = []
+        for plugin_name, option_name, annotation in declarations:
+            value: object = [self.PLACEHOLDER] if get_origin(annotation) is list else self.PLACEHOLDER
+            raw_config = {"transforms": [{"name": "probe", "plugin": plugin_name, "options": {option_name: value}}]}
+            try:
+                _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+            except ValueError:
+                continue
+            failed_open.append(f"{plugin_name}.{option_name}")
+
+        assert not failed_open, (
+            f"Output-naming options that allow env expansion before plugin validation: {sorted(failed_open)}. "
+            "Their expanded values can become valid output row keys and artifact headers."
         )
 
     def test_the_guard_is_not_a_one_plugin_map_in_disguise(self) -> None:
@@ -4070,7 +4116,14 @@ class TestEnvPlaceholderGuardIsDerived:
         _reject_sensitive_plugin_env_placeholders_before_expansion(
             {
                 "sinks": {"out": {"plugin": "csv", "options": {"headers": {"body": "Body"}}}},
-                "transforms": [{"name": "t", "plugin": "truncate", "options": {"suffix": "..."}}],
+                "transforms": [
+                    {"name": "t", "plugin": "truncate", "options": {"suffix": "..."}},
+                    {
+                        "name": "report",
+                        "plugin": "report_assemble",
+                        "options": {"output_field": "report_body"},
+                    },
+                ],
             }
         )
 
