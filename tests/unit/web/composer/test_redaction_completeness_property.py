@@ -147,7 +147,12 @@ def test_redaction_replaces_every_sensitive_value(tool_name: str) -> None:
     @given(st.from_type(model))  # type: ignore[arg-type]
     @settings(max_examples=50, deadline=None)
     def check(payload: object) -> None:
-        raw_args = payload.model_dump()
+        # Preserve which optional fields were actually supplied. This matters
+        # for models such as SetPipelineArgumentsModel whose contract is an
+        # exclusive choice between two optional-typed fields: a plain dump
+        # materializes the unset arm as ``None`` and creates an argument shape
+        # that the model correctly rejects on the redactor's revalidation.
+        raw_args = payload.model_dump(exclude_unset=True)
         redacted_args = redact_tool_call_arguments(tool_name, raw_args, telemetry=NoopRedactionTelemetry())
 
         for node in sensitive_nodes:
