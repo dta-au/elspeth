@@ -3933,6 +3933,188 @@ class TestCopyBlobsForFork:
         assert await blob_service.list_blobs(target_session_id, limit=None) == []
 
     @pytest.mark.asyncio
+    async def test_live_fenced_cleanup_deletes_staged_child_before_terminal_settlement(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        target_session_id: UUID,
+    ) -> None:
+        source = await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv")
+        plan = await self._plan(blob_service, session_id, target_session_id)
+        write_fence = await self._authorize_copy(blob_service, session_id, target_session_id, plan)
+        copied = await blob_service.copy_blobs_for_fork(
+            session_id,
+            target_session_id,
+            plan,
+            write_fence,
+            checkpoint=self._checkpoint,
+        )
+
+        result = await blob_service.cleanup_blobs_for_fork(
+            session_id,
+            target_session_id,
+            write_fence.operation_id,
+            live_write_fence=write_fence,
+        )
+
+        assert tuple(result.deleted_ids) == (copied[source.id].id,)
+        assert tuple(result.errors) == ()
+        assert await blob_service.list_blobs(target_session_id, limit=None) == []
+
+    @pytest.mark.asyncio
+    async def test_live_fenced_cleanup_rejects_stale_lease_without_deleting_child(
+        self,
+        blob_service: BlobServiceImpl,
+        db_engine,
+        session_id: UUID,
+        target_session_id: UUID,
+    ) -> None:
+        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv")
+        plan = await self._plan(blob_service, session_id, target_session_id)
+        write_fence = await self._authorize_copy(blob_service, session_id, target_session_id, plan)
+        await blob_service.copy_blobs_for_fork(
+            session_id,
+            target_session_id,
+            plan,
+            write_fence,
+            checkpoint=self._checkpoint,
+        )
+        before = await blob_service.list_blobs(target_session_id, limit=None)
+        with db_engine.begin() as conn:
+            conn.execute(
+                guided_operations_table.update()
+                .where(
+                    guided_operations_table.c.session_id == str(session_id),
+                    guided_operations_table.c.operation_id == write_fence.operation_id,
+                )
+                .values(lease_token="replacement-lease", attempt=write_fence.attempt + 1)
+            )
+
+        with pytest.raises(BlobForkFenceLostError):
+            await blob_service.cleanup_blobs_for_fork(
+                session_id,
+                target_session_id,
+                write_fence.operation_id,
+                live_write_fence=write_fence,
+            )
+
+        assert await blob_service.list_blobs(target_session_id, limit=None) == before
+
+    @pytest.mark.asyncio
+    async def test_mid_cleanup_takeover_aborts_stale_worker_and_replays_exact_plan(
+        self,
+        blob_service: BlobServiceImpl,
+        db_engine,
+        session_id: UUID,
+        target_session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sources = [
+            await blob_service.create_blob(session_id, f"source-{index}.csv", f"value-{index}".encode(), "text/csv") for index in range(2)
+        ]
+        plan = await self._plan(blob_service, session_id, target_session_id)
+        stale_fence = await self._authorize_copy(blob_service, session_id, target_session_id, plan)
+        await blob_service.copy_blobs_for_fork(
+            session_id,
+            target_session_id,
+            plan,
+            stale_fence,
+            checkpoint=self._checkpoint,
+        )
+        original_finalize = blob_service._finalize_registered_blob_deletion
+        finalize_calls = 0
+        winner_lease_token = "takeover-lease"
+
+        def _take_over_after_committed_delete(*args, **kwargs):
+            nonlocal finalize_calls
+            finalize_calls += 1
+            if finalize_calls == 1:
+                with db_engine.begin() as conn:
+                    changed = conn.execute(
+                        guided_operations_table.update()
+                        .where(
+                            guided_operations_table.c.session_id == str(session_id),
+                            guided_operations_table.c.operation_id == stale_fence.operation_id,
+                            guided_operations_table.c.lease_token == stale_fence.lease_token,
+                            guided_operations_table.c.attempt == stale_fence.attempt,
+                        )
+                        .values(
+                            lease_token=winner_lease_token,
+                            attempt=stale_fence.attempt + 1,
+                            lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+                        )
+                    ).rowcount
+                assert changed == 1
+            return original_finalize(*args, **kwargs)
+
+        monkeypatch.setattr(blob_service, "_finalize_registered_blob_deletion", _take_over_after_committed_delete)
+
+        with pytest.raises(BlobForkFenceLostError):
+            await blob_service.cleanup_blobs_for_fork(
+                session_id,
+                target_session_id,
+                stale_fence.operation_id,
+                live_write_fence=stale_fence,
+            )
+
+        assert finalize_calls == 1
+        partial = await blob_service.list_blobs(target_session_id, limit=None)
+        assert len(partial) == 1
+        assert list((tmp_path.resolve() / "blobs" / str(target_session_id)).glob(".*.delete-*")) == []
+
+        winner_fence = BlobForkWriteFence(
+            source_session_id=session_id,
+            target_session_id=target_session_id,
+            operation_id=stale_fence.operation_id,
+            lease_token=winner_lease_token,
+            attempt=stale_fence.attempt + 1,
+        )
+        replayed = await blob_service.copy_blobs_for_fork(
+            session_id,
+            target_session_id,
+            plan,
+            winner_fence,
+            checkpoint=self._checkpoint,
+        )
+
+        assert set(replayed) == {source.id for source in sources}
+        assert {blob.id for blob in await blob_service.list_blobs(target_session_id, limit=None)} == {
+            entry.target_blob_id for entry in plan
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "integrity_failure",
+        (
+            BlobIntegrityError(str(uuid4()), expected="a" * 64, actual="b" * 64),
+            BlobContentMissingError(str(uuid4()), storage_path="/managed/blobs/missing"),
+        ),
+        ids=("hash_mismatch", "content_missing"),
+    )
+    async def test_cleanup_propagates_tier_one_blob_failure(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        target_session_id: UUID,
+        monkeypatch: pytest.MonkeyPatch,
+        integrity_failure: BlobIntegrityError | BlobContentMissingError,
+    ) -> None:
+        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv")
+        await self._copy(blob_service, session_id, target_session_id)
+        operation_id = self._fail_fork(blob_service, session_id, target_session_id)
+
+        def _fail_delete(*_args, **_kwargs):
+            raise integrity_failure
+
+        monkeypatch.setattr(blob_service, "_delete_blob_row_locked", _fail_delete)
+
+        with pytest.raises(type(integrity_failure)) as exc_info:
+            await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
+
+        assert exc_info.value is integrity_failure
+
+    @pytest.mark.asyncio
     async def test_cleanup_retries_committed_tombstone_after_unlink_failure(
         self,
         blob_service: BlobServiceImpl,

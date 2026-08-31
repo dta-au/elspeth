@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 from structlog.testing import capture_logs
 
+from elspeth.contracts.blobs import BlobContentMissingError, BlobIntegrityError
 from elspeth.contracts.errors import AuditIntegrityError
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
@@ -45,8 +46,8 @@ def test_cleanup_integrity_failure_propagates_instead_of_a_coded_terminal_failur
 ) -> None:
     """An AuditIntegrityError raised by blob compensation keeps its type.
 
-    The primary fork failure is durably settled first, but the compensation
-    integrity fault outranks it: routing the request through
+    The compensation integrity fault must become the durable terminal reason
+    before the operation is settled: routing the request through
     ``raise_guided_operation_failure`` would answer a Tier-1 corruption signal
     with the generic terminal-failure envelope, losing the dedicated
     ``AuditIntegrityError`` handler and its failed-turn metadata. The leaked
@@ -56,6 +57,12 @@ def test_cleanup_integrity_failure_propagates_instead_of_a_coded_terminal_failur
     session_id, from_message_id = _fork_target(client)
     service = client.app.state.session_service
     blob_service = client.app.state.blob_service
+    operation_id = str(uuid4())
+    payload = {
+        "operation_id": operation_id,
+        "from_message_id": str(from_message_id),
+        "new_message_content": "Build the edited request.",
+    }
 
     with (
         capture_logs() as cap_logs,
@@ -69,16 +76,55 @@ def test_cleanup_integrity_failure_propagates_instead_of_a_coded_terminal_failur
     ):
         client.post(
             f"/api/sessions/{session_id}/fork",
-            json={
-                "operation_id": str(uuid4()),
-                "from_message_id": str(from_message_id),
-                "new_message_content": "Build the edited request.",
-            },
+            json=payload,
         )
 
+    replay = client.post(f"/api/sessions/{session_id}/fork", json=payload)
+    assert replay.status_code == 500
+    assert replay.json()["detail"]["failure_code"] == "integrity_error"
     residue = [entry for entry in cap_logs if entry.get("event") == "session.fork_blob_cleanup_failed"]
     assert len(residue) == 1
     assert residue[0]["exc_class"] == "AuditIntegrityError"
+
+
+@pytest.mark.parametrize(
+    "integrity_failure",
+    (
+        BlobIntegrityError(str(uuid4()), expected="a" * 64, actual="b" * 64),
+        BlobContentMissingError(str(uuid4()), storage_path="/managed/blobs/missing"),
+    ),
+    ids=("hash_mismatch", "content_missing"),
+)
+def test_blob_cleanup_integrity_failure_propagates_instead_of_a_coded_terminal_failure(
+    composer_test_client: TestClient,
+    integrity_failure: BlobIntegrityError | BlobContentMissingError,
+) -> None:
+    """Tier-1 blob custody errors must not enter the operational BlobError arm."""
+    client = composer_test_client
+    session_id, from_message_id = _fork_target(client)
+    service = client.app.state.session_service
+    blob_service = client.app.state.blob_service
+    operation_id = str(uuid4())
+    payload = {
+        "operation_id": operation_id,
+        "from_message_id": str(from_message_id),
+        "new_message_content": "Build the edited request.",
+    }
+
+    with (
+        patch.object(service, "settle_guided_fork_operation", side_effect=RuntimeError("settlement exploded")),
+        patch.object(blob_service, "cleanup_blobs_for_fork", side_effect=integrity_failure),
+        pytest.raises(type(integrity_failure)) as exc_info,
+    ):
+        client.post(
+            f"/api/sessions/{session_id}/fork",
+            json=payload,
+        )
+
+    assert exc_info.value is integrity_failure
+    replay = client.post(f"/api/sessions/{session_id}/fork", json=payload)
+    assert replay.status_code == 500
+    assert replay.json()["detail"]["failure_code"] == "integrity_error"
 
 
 def test_ordinary_cleanup_failure_still_surfaces_the_primary_coded_failure(

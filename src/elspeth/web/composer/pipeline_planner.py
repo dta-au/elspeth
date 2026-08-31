@@ -3109,11 +3109,7 @@ def _serialize_provider_discovery_result(
         outputs = provider_current_state["outputs"] if "outputs" in provider_current_state else []
         selected_name = selected["sink_name"] if isinstance(selected, Mapping) and "sink_name" in selected else None
         output = next(
-            (
-                candidate
-                for candidate in outputs
-                if isinstance(candidate, Mapping) and (candidate["name"] if "name" in candidate else None) == selected_name
-            ),
+            (candidate for candidate in outputs if candidate["name"] == selected_name),
             None,
         )
         if output is not None:

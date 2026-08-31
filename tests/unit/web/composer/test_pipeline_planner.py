@@ -2455,6 +2455,32 @@ def test_unmatched_projection_node_read_still_fails_closed() -> None:
     assert payload["data"]["error_code"] == "surface_projection_unavailable"
 
 
+def test_malformed_projection_output_candidate_raises_instead_of_failing_closed() -> None:
+    """Owned output candidates obey the same invariant posture as nodes."""
+    current_state = _empty_state()
+    result = ToolResult(
+        success=True,
+        updated_state=current_state,
+        validation=current_state.validate(),
+        affected_nodes=(),
+        data={"output": {"sink_name": "rows"}},
+    )
+    call = _ParsedToolCall(
+        call_id="call-output",
+        name="get_pipeline_state",
+        raw_arguments='{"component":"rows"}',
+        arguments={"component": "rows"},
+    )
+
+    with pytest.raises(TypeError):
+        _serialize_provider_discovery_result(
+            call=call,
+            result=result,
+            surface=PlannerSurface.GUIDED_STAGED,
+            provider_current_state={"outputs": ["malformed-candidate"]},
+        )
+
+
 @pytest.mark.asyncio
 async def test_schema_fact_survives_rejection_while_issue_specific_discovery_adds_information(
     tmp_path: Path,

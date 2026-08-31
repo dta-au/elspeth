@@ -599,8 +599,16 @@ class BlobServiceProtocol(Protocol):
         source_session_id: UUID,
         target_session_id: UUID,
         operation_id: str,
+        *,
+        live_write_fence: BlobForkWriteFence | None = None,
     ) -> BlobForkCleanupResult:
-        """Clean blobs from the named source's same-principal fork child."""
+        """Clean blobs from the named source's same-principal fork child.
+
+        By default the exact parent operation must already be failed. During
+        same-request compensation, ``live_write_fence`` instead authorizes
+        cleanup while the operation still owns its staged child, allowing the
+        caller to settle the final failure reason exactly once afterward.
+        """
         ...
 
     async def finalize_run_output_blobs(

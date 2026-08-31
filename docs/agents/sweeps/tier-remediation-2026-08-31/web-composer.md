@@ -238,25 +238,13 @@ RECOMMEND) are synthesized explicitly after membership. Pinned by the
 existing TestPromptShieldRules suite (the shieldless-view case exercises the
 absent-key path).
 
-### web/composer/planner_authoring_aids.py:R6:build_schema_contract_evidence:fp=0eefb79191188d69 — restage
+### web/composer/planner_authoring_aids.py:R6:build_schema_contract_evidence:fp=0eefb79191188d69 — fixed (code)
 ### web/composer/planner_authoring_aids.py:R6:build_schema_contract_evidence:fp=82dca06d91637d83 — restage
-Sites :1596 (`except ValueError` → omission reason `schema_unavailable`) and
-:1604 (`except _SchemaContractProjectionUnsupported` → omission reason
-`schema_projection_unsupported`). Both catches convert the failure into an
-explicitly RECORDED omission entry appended to `omission_candidates` and
-published by `_schema_evidence_envelope` as `omitted` +
-`omissions_withheld_count` — the recorded-omission form: failure recorded and
-surfaced in the declared result. `_SchemaContractProjectionUnsupported` is
-deliberately raised by `planner_plugin_contract` (:1109-1125).
-
-Proposed rationale (schema_unavailable): "`catalog.get_schema` raising
-ValueError for a referenced-but-unavailable schema is converted into the
-recorded omission `{'plugin_id': …, 'reason': 'schema_unavailable'}` and
-published through `_schema_evidence_envelope` (`omitted` /
-`omissions_withheld_count`) — a recorded, surfaced outcome in the declared
-evidence result, not a swallow. Pinned by
-tests/unit/web/composer/test_schema_contract_carry_forward.py::test_final_envelope_stays_within_byte_budget_after_withheld_count_growth,
-whose _BoundaryCatalog raises exactly this ValueError."
+The `ValueError` catch was removed. Availability is settled against the same
+snapshot before `catalog.get_schema` runs, so a failure while reading an
+available identity is an internal catalog/profile defect and now propagates.
+Pinned by
+tests/unit/web/composer/test_schema_contract_carry_forward.py::test_internal_schema_read_failure_propagates.
 
 Proposed rationale (projection_unsupported): "`planner_plugin_contract`
 deliberately raises `_SchemaContractProjectionUnsupported` for

@@ -1911,6 +1911,48 @@ class TestLifespanShutdown:
         assert fake_operator_telemetry.shutdown_calls == 1
 
     @pytest.mark.asyncio
+    async def test_fatal_periodic_cleanup_failure_stops_lifespan_and_preserves_shutdown(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+    ) -> None:
+        """A dead required sweeper must stop serving and cannot skip teardown."""
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
+        fake_execution_service = _RecordingExecutionService()
+        fake_operator_telemetry = _RecordingOperatorTelemetry()
+        app.state.operator_telemetry = fake_operator_telemetry
+        cleanup_failed = asyncio.Event()
+
+        async def fatal_cleanup(*_args: object, **_kwargs: object) -> None:
+            cleanup_failed.set()
+            raise OSError("orphan cleanup storage unavailable")
+
+        async def shutdown_workers() -> None:
+            return None
+
+        monkeypatch.setattr(app_module, "_periodic_orphan_cleanup", fatal_cleanup)
+        monkeypatch.setattr("elspeth.web.async_workers.shutdown_async_workers", shutdown_workers)
+
+        async def serve_until_stopped() -> None:
+            async with lifespan(app):
+                await asyncio.Event().wait()
+
+        with patch("elspeth.web.app.ExecutionServiceImpl", return_value=fake_execution_service):
+            lifespan_task = asyncio.create_task(serve_until_stopped())
+            await asyncio.wait_for(cleanup_failed.wait(), timeout=5.0)
+            done, _pending = await asyncio.wait({lifespan_task}, timeout=0.2)
+            if lifespan_task not in done:
+                lifespan_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, OSError):
+                    await lifespan_task
+
+        assert lifespan_task in done, "fatal orphan cleanup left the service lifespan running"
+        with pytest.raises(OSError, match="orphan cleanup storage unavailable"):
+            await lifespan_task
+        assert fake_execution_service.shutdown_calls == 1
+        assert fake_operator_telemetry.shutdown_calls == 1
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("deployment_target", "state_mode", "expected_create_tables"),
         [

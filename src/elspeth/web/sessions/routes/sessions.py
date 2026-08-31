@@ -7,9 +7,11 @@ from typing import Any
 from uuid import uuid4
 
 from elspeth.web.blobs.protocol import (
+    BlobContentMissingError,
     BlobError,
     BlobForkFenceLostError,
     BlobForkWriteFence,
+    BlobIntegrityError,
     BlobQuotaExceededError,
     BlobRecord,
 )
@@ -744,18 +746,10 @@ def register_session_routes(router: APIRouter) -> None:
                     "quota_exceeded"
                     if isinstance(primary_exc, BlobQuotaExceededError)
                     else "integrity_error"
-                    if isinstance(primary_exc, AuditIntegrityError)
+                    if isinstance(primary_exc, (AuditIntegrityError, BlobContentMissingError, BlobIntegrityError))
                     else "operation_failed"
                 )
-                try:
-                    failed = await service.fail_guided_operation(
-                        fence,
-                        failure_code=failure_code,
-                        actor="composer_route",
-                    )
-                except GuidedOperationFenceLostError:
-                    # Only the fail-CAS winner owns cleanup.
-                    continue
+                cleanup_integrity_exc: AuditIntegrityError | BlobContentMissingError | BlobIntegrityError | None = None
 
                 if staged is not None:
                     try:
@@ -763,8 +757,18 @@ def register_session_routes(router: APIRouter) -> None:
                             session_id,
                             staged.session.id,
                             fence.operation_id,
+                            live_write_fence=BlobForkWriteFence(
+                                source_session_id=session_id,
+                                target_session_id=staged.session.id,
+                                operation_id=fence.operation_id,
+                                lease_token=fence.lease_token,
+                                attempt=fence.attempt,
+                            ),
                         )
-                    except AuditIntegrityError as integrity_exc:
+                    except BlobForkFenceLostError:
+                        # A stale worker never cleans a child now owned by takeover.
+                        continue
+                    except (AuditIntegrityError, BlobContentMissingError, BlobIntegrityError) as integrity_exc:
                         # A Tier-1 integrity failure inside compensation
                         # outranks the primary coded failure and must reach
                         # the app-level ``AuditIntegrityError`` handler with
@@ -782,7 +786,8 @@ def register_session_routes(router: APIRouter) -> None:
                             operation_id=fence.operation_id,
                             exc_class=type(integrity_exc).__name__,
                         )
-                        raise
+                        cleanup_integrity_exc = integrity_exc
+                        failure_code = "integrity_error"
                     except (BlobError, SQLAlchemyError, OSError) as cleanup_exc:
                         # The exception note alone is not a record: the tail
                         # below surfaces the PRIMARY failure through
@@ -821,6 +826,19 @@ def register_session_routes(router: APIRouter) -> None:
                     # The failed child is retained as archived audit evidence.
                     # Only its copied blobs are compensatable; deleting the
                     # session would also destroy the frozen plan envelope.
+
+                try:
+                    failed = await service.fail_guided_operation(
+                        fence,
+                        failure_code=failure_code,
+                        actor="composer_route",
+                    )
+                except GuidedOperationFenceLostError:
+                    # Only the fail-CAS winner owns cleanup and settlement.
+                    continue
+
+                if cleanup_integrity_exc is not None:
+                    raise cleanup_integrity_exc from primary_exc
 
                 raise_guided_operation_failure(failed)
         raise AuditIntegrityError("Session fork lost its operation fence on every rejoin attempt without a joinable winner")

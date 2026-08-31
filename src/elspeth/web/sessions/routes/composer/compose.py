@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import replace as _replace_dataclass
 
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE
@@ -403,6 +404,24 @@ async def recompose(
                     status_code=502,
                     detail={"error_type": "composer_error", "detail": str(exc)},
                 ) from exc
+            finally:
+                # Preserve unclassified first-party exceptions without a
+                # broad catch. P4 owns their tool rows; this finalizer drains
+                # only attached advisor LLM rows. A typed handler above has
+                # already raised a fresh HTTPException by this point, whose
+                # absence of llm_calls prevents duplicate persistence.
+                current_exc = sys.exception()
+                llm_calls = (
+                    () if current_exc is None or isinstance(current_exc, asyncio.CancelledError) else _llm_calls_from_exception(current_exc)
+                )
+                if llm_calls:
+                    await _persist_llm_calls(
+                        service,
+                        session.id,
+                        llm_calls,
+                        pre_send_state_id,
+                        plugin_crash_pending=True,
+                    )
 
             # Compute the post-compose guided_session and composer_meta.
             # Mirror of send_message §5a-§5b: if the transition prompt fired

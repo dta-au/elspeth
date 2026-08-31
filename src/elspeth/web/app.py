@@ -760,29 +760,49 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             create_tables=create_landscape_tables,
         )
     )
+    lifespan_owner = asyncio.current_task()
+    if lifespan_owner is None:
+        raise RuntimeError("service lifespan must run inside an asyncio task")
+
+    def _stop_lifespan_on_orphan_failure(completed: asyncio.Task[None]) -> None:
+        if not completed.cancelled() and completed.exception() is not None:
+            lifespan_owner.cancel()
+
+    orphan_task.add_done_callback(_stop_lifespan_on_orphan_failure)
 
     try:
         yield
     finally:
-        # Cancel periodic cleanup before shutting down the executor
+        # Cancel periodic cleanup before shutting down the executor. A fatal
+        # sweeper failure cancels this owning task via the done callback above;
+        # awaiting the completed task then restores that original failure.
+        # Teardown stays in the nested finally so the failure cannot skip the
+        # executor, telemetry, or shared-worker shutdown sequence.
         orphan_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await orphan_task
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                await orphan_task
+        finally:
+            app.state.readiness_probe_runner.close()
 
-        app.state.readiness_probe_runner.close()
+            # Shutdown execution service thread pool without blocking the loop:
+            # worker cleanup still schedules terminal-state writes back onto it.
+            try:
+                await execution_service.shutdown()
+            finally:
+                # Tier-2 operator telemetry stops only after all audited execution
+                # work has drained. Expected collector outages are bounded/redacted
+                # inside the runtime and can never rewrite a committed Landscape
+                # record.
+                try:
+                    await app.state.operator_telemetry.shutdown()
+                finally:
+                    # Tear down the process-wide run_sync_in_worker pool before
+                    # disposing the engine, so no worker thread races a query
+                    # against a disposed pool.
+                    from elspeth.web.async_workers import shutdown_async_workers
 
-        # Shutdown execution service thread pool without blocking the loop:
-        # worker cleanup still schedules terminal-state writes back onto it.
-        await execution_service.shutdown()
-        # Tier-2 operator telemetry stops only after all audited execution work
-        # has drained. Expected collector outages are bounded/redacted inside
-        # the runtime and can never rewrite a committed Landscape record.
-        await app.state.operator_telemetry.shutdown()
-        # Tear down the process-wide run_sync_in_worker pool before disposing
-        # the engine, so no worker thread races a query against a disposed pool.
-        from elspeth.web.async_workers import shutdown_async_workers
-
-        await shutdown_async_workers()
+                    await shutdown_async_workers()
 
 
 class _BodySizeLimitMiddleware(BaseHTTPMiddleware):

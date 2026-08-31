@@ -1111,6 +1111,7 @@ async def test_f5_advisor_unclassified_exception_still_records_llm_call() -> Non
     # stays None and the finally block skips record_llm_call.
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service, "_persist_turn_audit", wraps=service._persist_turn_audit) as mock_persist,
         patch(
             "elspeth.web.composer.service._litellm_acompletion",
             new_callable=AsyncMock,
@@ -1127,6 +1128,15 @@ async def test_f5_advisor_unclassified_exception_still_records_llm_call() -> Non
     )
     assert advisor_llm_calls[0].status.name != "SUCCESS"
     assert advisor_llm_calls[0].error_class == "ValueError"
+    assert mock_persist.await_count == 1, "the advisor dispatch escaped before P4 could publish its outer audit row"
+    persist_kwargs = mock_persist.await_args.kwargs
+    assert persist_kwargs["crash_pending"] is True
+    failed_outcome = persist_kwargs["tool_outcomes"][-1]
+    assert failed_outcome.call.function.name == "request_advisor_hint"
+    assert failed_outcome.error_class == "ValueError"
+    assert failed_outcome.error_message == "ValueError"
+    persisted_failure = json.loads(service._phase3_last_redacted_tool_rows[-1].content)
+    assert persisted_failure["_redaction_status"] == "plugin_crash"
 
 
 @pytest.mark.asyncio
@@ -1542,15 +1552,27 @@ async def test_first_party_failure_in_the_advisor_path_is_not_reported_as_a_prov
 
     catalog = _mock_catalog()
     service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    original = AuditIntegrityError("recorder could not seal the advisor call")
 
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
-        pytest.raises(AuditIntegrityError, match="recorder could not seal"),
+        patch.object(service, "_persist_turn_audit", wraps=service._persist_turn_audit) as mock_persist,
+        pytest.raises(AuditIntegrityError, match="recorder could not seal") as exc_info,
     ):
         mock_llm.side_effect = [
             _make_advisor_tool_call("call_first_party_bug"),
             _make_text_only_response("would incorrectly continue"),
         ]
-        mock_advisor.side_effect = AuditIntegrityError("recorder could not seal the advisor call")
+        mock_advisor.side_effect = original
         await service.compose("help me", [], _empty_state())
+
+    assert exc_info.value is original
+    assert mock_persist.await_count == 1
+    persist_kwargs = mock_persist.await_args.kwargs
+    assert persist_kwargs["crash_pending"] is True
+    failed_outcome = persist_kwargs["tool_outcomes"][-1]
+    assert failed_outcome.call.function.name == "request_advisor_hint"
+    assert failed_outcome.error_class == "AuditIntegrityError"
+    persisted_failure = json.loads(service._phase3_last_redacted_tool_rows[-1].content)
+    assert persisted_failure["_redaction_status"] == "plugin_crash"

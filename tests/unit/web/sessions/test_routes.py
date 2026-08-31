@@ -5952,6 +5952,45 @@ class TestLiteLLMErrorRedaction:
         )
         self._assert_redacted(msg_resp, "llm_unavailable", "APIError")
 
+    def test_send_message_unclassified_compose_failure_persists_attached_llm_call(self, tmp_path) -> None:
+        """A first-party 500 must not discard the advisor LLM row built before it."""
+        llm_call = _llm_call(
+            status=ComposerLLMCallStatus.API_ERROR,
+            provider_request_id=None,
+            error_class="ValueError",
+            error_message="Provider call failed (ValueError)",
+        )
+        original = ValueError("first-party advisor admission failed")
+        cast(Any, original).llm_calls = (llm_call,)
+        mock_composer = SimpleNamespace()
+        mock_composer.surface_pending_interpretation_reviews = AsyncMock(
+            spec=ComposerService.surface_pending_interpretation_reviews,
+            return_value=None,
+        )
+        mock_composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=original)
+
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post("/api/sessions", json={"title": "Test"})
+        session_id = uuid.UUID(resp.json()["id"])
+        msg_resp = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "Hello"},
+        )
+
+        assert msg_resp.status_code == 500
+        loop = asyncio.new_event_loop()
+        try:
+            persisted = loop.run_until_complete(service.get_messages(session_id, limit=None))
+        finally:
+            loop.close()
+        llm_rows = _llm_call_audit_rows(persisted)
+        assert len(llm_rows) == 1
+        assert llm_rows[0][1]["call"]["status"] == ComposerLLMCallStatus.API_ERROR.value
+        assert llm_rows[0][1]["call"]["error_class"] == "ValueError"
+
     def test_send_message_bad_request_provider_detail_is_exposed_when_enabled(self, tmp_path) -> None:
         """_BadRequestLLMError must use its dedicated provider-detail carrier at the route layer."""
         mock_composer = SimpleNamespace()
@@ -6166,6 +6205,51 @@ class TestLiteLLMErrorRedaction:
 
         recompose_resp = client.post(f"/api/sessions/{session_id}/recompose")
         self._assert_redacted(recompose_resp, "llm_unavailable", "APIError")
+
+    def test_recompose_unclassified_compose_failure_persists_attached_llm_call(self, tmp_path) -> None:
+        """The recompose 500 mirror durably publishes attached advisor evidence."""
+        llm_call = _llm_call(
+            status=ComposerLLMCallStatus.API_ERROR,
+            provider_request_id=None,
+            error_class="AuditIntegrityError",
+            error_message="Provider call failed (AuditIntegrityError)",
+        )
+        original = AuditIntegrityError("first-party advisor audit failure")
+        cast(Any, original).llm_calls = (llm_call,)
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=original)
+
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post("/api/sessions", json={"title": "Test"})
+        session_id = uuid.UUID(resp.json()["id"])
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(
+                service.add_message(
+                    session_id,
+                    "user",
+                    "Build a pipeline",
+                    writer_principal="route_user_message",
+                )
+            )
+        finally:
+            loop.close()
+
+        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose")
+
+        assert recompose_resp.status_code == 500
+        loop = asyncio.new_event_loop()
+        try:
+            persisted = loop.run_until_complete(service.get_messages(session_id, limit=None))
+        finally:
+            loop.close()
+        llm_rows = _llm_call_audit_rows(persisted)
+        assert len(llm_rows) == 1
+        assert llm_rows[0][1]["call"]["status"] == ComposerLLMCallStatus.API_ERROR.value
+        assert llm_rows[0][1]["call"]["error_class"] == "AuditIntegrityError"
 
     def test_recompose_bad_request_provider_detail_is_exposed_when_enabled(self, tmp_path) -> None:
         """recompose must mirror send_message for _BadRequestLLMError provider detail."""

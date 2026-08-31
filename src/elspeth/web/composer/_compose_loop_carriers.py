@@ -127,6 +127,34 @@ class _AdvisorReviewState:
 
 
 @dataclass(frozen=True, slots=True)
+class _AdvisorCallSuccess:
+    """Successfully admitted advisor guidance and its accounting metadata."""
+
+    guidance: str
+    metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "metadata")
+
+
+@dataclass(frozen=True, slots=True)
+class _AdvisorProviderFailure:
+    """Recognised Tier-3 provider failure that may become tool feedback."""
+
+    error_class: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AdvisorFirstPartyFailure:
+    """Unclassified controlled-code failure that must propagate after P4."""
+
+    original_exc: Exception
+
+
+_AdvisorCallOutcome = _AdvisorCallSuccess | _AdvisorProviderFailure | _AdvisorFirstPartyFailure
+
+
+@dataclass(frozen=True, slots=True)
 class _ToolOutcome:
     """Result of one tool call within a compose turn.
 
@@ -242,6 +270,11 @@ class _DispatchOutcome:
     # Plugin-crash carrier — P4 must propagate this AFTER persist
     plugin_crash: ComposerPluginCrashError | None
     plugin_crash_cause: BaseException | None
+
+    # First-party advisor failure — unlike plugin_crash this keeps the
+    # original exception type, but follows the same persist-before-propagate
+    # discipline so the request_advisor_hint row is never left OPEN.
+    advisor_failure: Exception | None
 
     # Advisor-tool compose timeout — the tool envelope is already closed in
     # P3, but P4 must persist/redact the current assistant+tool turn before the

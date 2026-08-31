@@ -70,6 +70,10 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedLLMCompletion,
     _AdmittedLLMProviderMetadata,
     _AdmittedToolCall,
+    _AdvisorCallOutcome,
+    _AdvisorCallSuccess,
+    _AdvisorFirstPartyFailure,
+    _AdvisorProviderFailure,
     _AdvisorReviewState,
     _CallModelOutcome,
     _ClassifyOutcome,
@@ -4679,7 +4683,7 @@ class ComposerServiceImpl:
         assistant_message: _AdmittedAssistantMessage,
         raw_assistant_content: str | None,
         assistant_tool_calls: tuple[_AdmittedToolCall, ...],
-        plugin_crash: ComposerPluginCrashError | None,
+        crash_pending: bool,
         session_id: str | None,
         current_state_id: str | None,
         persisted_tool_call_turn: bool,
@@ -4710,7 +4714,7 @@ class ComposerServiceImpl:
             assistant_message=persisted_assistant_message,
             raw_assistant_content=persisted_raw_assistant_content,
             assistant_tool_calls=assistant_tool_calls,
-            plugin_crash=plugin_crash,
+            crash_pending=crash_pending,
             session_id=session_id,
             current_state_id=current_state_id,
             persisted_tool_call_turn=persisted_tool_call_turn,
@@ -6311,7 +6315,11 @@ class ComposerServiceImpl:
                 # the completed audit prefix.
                 early_advisor_message_count = len(llm_messages)
                 early_checkpoint_deadline_expired = False
-                if not _cancellation_requested.is_set() and dispatch_result.advisor_compose_timeout is None:
+                if (
+                    not _cancellation_requested.is_set()
+                    and dispatch_result.advisor_compose_timeout is None
+                    and dispatch_result.advisor_failure is None
+                ):
                     try:
                         await self._maybe_run_early_checkpoint(
                             state=dispatch_result.state,
@@ -6334,7 +6342,7 @@ class ComposerServiceImpl:
                     assistant_message=dispatch_result.assistant_message,
                     raw_assistant_content=dispatch_result.raw_assistant_content,
                     assistant_tool_calls=dispatch_result.assistant_tool_calls,
-                    plugin_crash=dispatch_result.plugin_crash,
+                    crash_pending=(dispatch_result.plugin_crash is not None or dispatch_result.advisor_failure is not None),
                     session_id=session_id,
                     current_state_id=_current_state_id,
                     persisted_tool_call_turn=_persisted_tool_call_turn,
@@ -6457,6 +6465,20 @@ class ComposerServiceImpl:
                 if dispatch.plugin_crash_cause is None:
                     raise dispatch.plugin_crash
                 raise dispatch.plugin_crash from dispatch.plugin_crash_cause
+
+            if dispatch.advisor_failure is not None:
+                # The advisor boundary deliberately preserves unclassified
+                # controlled-code faults instead of laundering them into a
+                # provider outage. P3 has already recorded PLUGIN_CRASH and
+                # P4 has published that tool row. A failed unwind publication
+                # is a new Tier-1 integrity fault and therefore takes primacy;
+                # otherwise re-raise the exact original exception object.
+                if persist.unwind_audit_failed:
+                    raise AuditIntegrityError(
+                        "Advisor failure audit row could not be persisted",
+                        failed_turn=failed_turn,
+                    ) from dispatch.advisor_failure
+                raise dispatch.advisor_failure
 
             if deferred_cancel is not None:
                 # P3's in-flight tool and P4's atomic audit publication are
@@ -7213,9 +7235,39 @@ class ComposerServiceImpl:
             f"branch here."
         )
 
+    async def _call_advisor_for_tool(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        recorder: BufferingRecorder | None,
+        timeout: float | None = None,
+    ) -> _AdvisorCallOutcome:
+        """Classify an advisor call without suppressing controlled-code faults.
+
+        The tool dispatcher needs one explicit result for the recoverable
+        provider family and a different result for faults that must unwind.
+        Returning that discrimination keeps the provider boundary here,
+        beside the code that owns the taxonomy, while allowing P3 to close
+        and P4 to persist the outer tool audit row before an original
+        first-party exception is re-raised.
+        """
+        try:
+            guidance, metadata = await self._call_advisor_with_audit(
+                arguments,
+                recorder=recorder,
+                timeout=timeout,
+            )
+        except TimeoutError:
+            raise
+        except advisor_provider_failure_types() as exc:
+            return _AdvisorProviderFailure(error_class=type(exc).__name__)
+        except Exception as exc:
+            return _AdvisorFirstPartyFailure(original_exc=exc)
+        return _AdvisorCallSuccess(guidance=guidance, metadata=metadata)
+
     async def _call_advisor_with_audit(
         self,
-        arguments: dict[str, Any],
+        arguments: Mapping[str, Any],
         *,
         recorder: BufferingRecorder | None,
         timeout: float | None = None,
@@ -7236,8 +7288,10 @@ class ComposerServiceImpl:
         the ``finally`` block so the audit captures failure modes
         (timeouts, auth errors, malformed responses) just as cleanly as
         the success path. The outer ``ComposerToolInvocation`` record is
-        the caller's responsibility — the compose-loop interception
-        wraps this call with ``finish_success`` either way.
+        the caller's responsibility: success and recognised provider failure
+        close with ``finish_success`` because both are explicit tool feedback;
+        an unclassified first-party failure closes with
+        ``finish_plugin_crash`` and propagates after P4.
 
         Anthropic prompt-cache markers are deliberately NOT applied here.
         Advisor calls now include the same composer skill stack as normal

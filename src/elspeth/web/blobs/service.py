@@ -441,25 +441,29 @@ def _require_live_blob_write_fence(
         _require_live_guided_operation_write_fence(conn, guided_operation_write_fence)
 
 
-def _require_failed_fork_cleanup_authorization(
+def _require_fork_cleanup_authorization(
     conn: Connection,
     *,
     source_session_id: str,
     target_session_id: str,
     operation_id: str,
+    live_write_fence: BlobForkWriteFence | None,
 ) -> None:
-    """Require the failed parent operation and its exact retained plan envelope."""
-    operation = conn.execute(
-        select(guided_operations_table.c.status).where(
-            guided_operations_table.c.session_id == source_session_id,
-            guided_operations_table.c.operation_id == operation_id,
-            guided_operations_table.c.kind == "session_fork",
-            guided_operations_table.c.status == "failed",
-            guided_operations_table.c.result_session_id.is_(None),
-        )
-    ).one_or_none()
-    if operation is None:
-        raise AuditIntegrityError("Fork blob cleanup is not authorized by the exact failed parent operation")
+    """Require one exact live or failed operation plus its retained plan."""
+    if live_write_fence is None:
+        operation = conn.execute(
+            select(guided_operations_table.c.status).where(
+                guided_operations_table.c.session_id == source_session_id,
+                guided_operations_table.c.operation_id == operation_id,
+                guided_operations_table.c.kind == "session_fork",
+                guided_operations_table.c.status == "failed",
+                guided_operations_table.c.result_session_id.is_(None),
+            )
+        ).one_or_none()
+        if operation is None:
+            raise AuditIntegrityError("Fork blob cleanup is not authorized by the exact failed parent operation")
+    else:
+        _require_live_fork_write_fence(conn, live_write_fence)
 
     matching_plans = 0
     rows = conn.execute(
@@ -3171,14 +3175,25 @@ class BlobServiceImpl:
         source_session_id: UUID,
         target_session_id: UUID,
         operation_id: str,
+        *,
+        live_write_fence: BlobForkWriteFence | None = None,
     ) -> BlobForkCleanupResult:
-        """Clean a failed fork child while holding its custody lock throughout."""
+        """Clean an authorized fork child while holding its custody lock."""
         source_session_id_str, target_session_id_str = _validated_fork_session_ids(
             source_session_id,
             target_session_id,
         )
         if type(operation_id) is not str or not 1 <= len(operation_id) <= 128:
             raise ValueError("operation_id must be a non-empty bounded string")
+        if live_write_fence is not None:
+            if type(live_write_fence) is not BlobForkWriteFence:
+                raise TypeError("live_write_fence must be an exact BlobForkWriteFence")
+            if (
+                live_write_fence.source_session_id != source_session_id
+                or live_write_fence.target_session_id != target_session_id
+                or live_write_fence.operation_id != operation_id
+            ):
+                raise AuditIntegrityError("Fork blob cleanup write fence does not match its source, target, and operation")
 
         def _sync() -> BlobForkCleanupResult:
             deleted_ids: list[UUID] = []
@@ -3191,11 +3206,12 @@ class BlobServiceImpl:
                         source_session_id=source_session_id_str,
                         target_session_id=target_session_id_str,
                     )
-                    _require_failed_fork_cleanup_authorization(
+                    _require_fork_cleanup_authorization(
                         conn,
                         source_session_id=source_session_id_str,
                         target_session_id=target_session_id_str,
                         operation_id=operation_id,
+                        live_write_fence=live_write_fence,
                     )
                     snapshot_ids = tuple(
                         sorted(
@@ -3231,11 +3247,12 @@ class BlobServiceImpl:
                                     source_session_id=source_session_id_str,
                                     target_session_id=target_session_id_str,
                                 )
-                                _require_failed_fork_cleanup_authorization(
+                                _require_fork_cleanup_authorization(
                                     conn,
                                     source_session_id=source_session_id_str,
                                     target_session_id=target_session_id_str,
                                     operation_id=operation_id,
+                                    live_write_fence=live_write_fence,
                                 )
                                 row = conn.execute(
                                     select(blobs_table)
@@ -3272,6 +3289,8 @@ class BlobServiceImpl:
                                 session_id_str=target_session_id_str,
                                 stage=stage,
                             )
+                    except (BlobForkFenceLostError, BlobContentMissingError, BlobIntegrityError):
+                        raise
                     except (BlobError, SQLAlchemyError, OSError) as cleanup_exc:
                         errors.append(
                             BlobForkCleanupError(

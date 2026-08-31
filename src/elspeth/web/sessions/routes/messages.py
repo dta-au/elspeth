@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import replace as _replace_dataclass
 
 from elspeth.contracts.errors import GuidedCustodyIntegrityError
@@ -627,6 +628,28 @@ def register_message_routes(router: APIRouter) -> None:
                         status_code=502,
                         detail={"error_type": "composer_error", "detail": str(exc)},
                     ) from exc
+                finally:
+                    # Unknown/first-party composer faults are intentionally
+                    # not caught here: their exact type must keep unwinding.
+                    # P4 already owns the request_advisor_hint tool row; this
+                    # finalizer publishes only attached inner LLM sidecars.
+                    # Typed handlers above translate their fault before this
+                    # runs, so sys.exception() is then the new HTTPException
+                    # and cannot duplicate the rows those handlers persisted.
+                    current_exc = sys.exception()
+                    llm_calls = (
+                        ()
+                        if current_exc is None or isinstance(current_exc, asyncio.CancelledError)
+                        else _llm_calls_from_exception(current_exc)
+                    )
+                    if llm_calls:
+                        await _persist_llm_calls(
+                            service,
+                            session.id,
+                            llm_calls,
+                            compose_base_state_id,
+                            plugin_crash_pending=True,
+                        )
                 _compose_result = result
 
                 # 5. Save state if version changed — post-compose provenance.
