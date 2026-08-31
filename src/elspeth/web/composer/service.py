@@ -2204,6 +2204,7 @@ class ComposerServiceImpl:
         return ComposeLoopTestResult(
             assistant_message=result.message,
             raw_assistant_content=result.raw_assistant_content,
+            persisted_assistant_content=result.persisted_assistant_content,
             tool_outcomes=tuple(self._phase3_last_tool_outcomes),
             persisted_assistant_tool_calls=tuple(self._phase3_last_redacted_assistant_tool_calls),
             persisted_tool_row_content=tuple(row.content for row in self._phase3_last_redacted_tool_rows),
@@ -8469,6 +8470,12 @@ class ComposeLoopTestResult:
     raw_assistant_content: str | None = None
     tool_outcomes: tuple[Any, ...] = ()
     persisted_assistant_row: Any | None = None
+    # What the compose loop already committed for the turn's assistant row,
+    # threaded off ``ComposerResult.persisted_assistant_content``. Exposed so
+    # compose-loop tests can pin the threading the turn-end writers depend on
+    # to avoid re-emitting that row (elspeth-d581b3da7f) without reaching into
+    # the route.
+    persisted_assistant_content: str | None = None
     persisted_assistant_tool_calls: tuple[Any, ...] = ()
     persisted_tool_row_content: tuple[Any, ...] = ()
     # Buffered per-call audit invocations so dispatch-branch tests can

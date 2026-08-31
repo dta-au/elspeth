@@ -13782,3 +13782,89 @@ async def test_state_revert_onto_a_legacy_unbindable_row_gets_revert_specific_wo
         "the files this pipeline uses. Choose a different version from Composition history."
     )
     assert _LEGACY_PRIVATE_PATH not in revert.text
+
+
+def test_send_message_does_not_re_emit_the_already_persisted_turn_prose(tmp_path) -> None:
+    """The turn-end row carries the notice alone, not the planner's prose again.
+
+    elspeth-d581b3da7f. The staged interpretation-review handoff terminates the
+    tool batch at the successful review call, so the model's last prose IS the
+    tool-call turn's prose — which the compose loop has already committed with
+    its ``tool_calls`` envelope. The turn-end writer then persisted
+    ``result.message`` verbatim, and because ``_composer_conversation_messages``
+    filters only ``role="audit"``/``"tool"``, BOTH assistant rows reached the
+    SPA transcript. Live session 891b7b1e shows the pair 99ms apart.
+
+    This drives the real route, so it sees what the diagnosing lane's
+    compose-loop test could not: that second row.
+    """
+    from elspeth.web.composer.no_tool_policy import compose_interpretation_review_handoff_message
+    from elspeth.web.sessions._persist_payload import RedactedToolRow
+    from elspeth.web.sessions.routes._helpers import _composer_conversation_messages
+
+    prose = "Surfacing the review card now."
+    handoff_message = compose_interpretation_review_handoff_message(prose)
+    handoff_suffix = handoff_message[len(prose) :]
+
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session_id = uuid.UUID(client.post("/api/sessions", json={"title": "Review handoff"}).json()["id"])
+
+    async def _compose_with_midloop_persist(*_args, **_kwargs) -> ComposerResult:
+        # What the compose loop's P4 does mid-turn: commit the assistant row
+        # carrying this turn's prose plus the tool_calls envelope.
+        outcome = await service.persist_compose_turn_async(
+            session_id=str(session_id),
+            assistant_content=prose,
+            raw_content=None,
+            redacted_assistant_tool_calls=(
+                {
+                    "id": "call_review",
+                    "type": "function",
+                    "function": {"name": "request_interpretation_review", "arguments": "{}"},
+                },
+            ),
+            redacted_tool_rows=(RedactedToolRow(tool_call_id="call_review", content="{}", composition_state_payload=None),),
+            parent_composition_state_id=None,
+            expected_current_state_id=None,
+            writer_principal="compose_loop",
+            plugin_crash_pending=False,
+        )
+        return ComposerResult(
+            message=handoff_message,
+            state=_EMPTY_STATE,
+            raw_assistant_content=prose,
+            persisted_assistant_message_id=outcome.assistant_id,
+            persisted_assistant_content=prose,
+            persisted_tool_call_turn=True,
+        )
+
+    composer = SimpleNamespace()
+    composer.surface_pending_interpretation_reviews = AsyncMock(
+        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+    )
+    composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=_compose_with_midloop_persist)
+    app.state.composer_service = composer
+
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Build the pipeline."})
+    assert response.status_code == 200
+
+    messages = asyncio.run(service.get_messages(session_id, limit=None))
+    assistant_rows = [message for message in messages if message.role == "assistant"]
+
+    # The prose appears exactly once in the whole transcript — this is the
+    # assertion that fails when the turn-end writer re-emits result.message.
+    carrying_prose = [row for row in assistant_rows if prose in row.content]
+    assert len(carrying_prose) == 1, [row.content for row in assistant_rows]
+    assert carrying_prose[0].tool_calls, "the surviving copy must be the mid-loop row with its tool_calls envelope"
+
+    # And the turn-end row carries the backend notice alone.
+    turn_end = [row for row in assistant_rows if row.id != carrying_prose[0].id]
+    assert len(turn_end) == 1
+    assert turn_end[0].content == handoff_suffix
+    assert turn_end[0].raw_content == ""
+
+    # Both rows reach the SPA transcript (the filter drops only audit/tool
+    # rows), which is why the duplicate was user-visible.
+    conversation = _composer_conversation_messages(messages)
+    assert sum(prose in message.content for message in conversation if message.role == "assistant") == 1

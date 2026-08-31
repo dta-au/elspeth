@@ -3935,3 +3935,92 @@ async def test_review_handoff_prose_is_generated_once_and_already_persisted(
     assert result.raw_assistant_content == _REVIEW_TURN_PROSE
     assert result.assistant_message.startswith(_REVIEW_TURN_PROSE)
     assert result.assistant_message != _REVIEW_TURN_PROSE
+
+
+@pytest.mark.asyncio
+async def test_staged_handoff_threads_the_persisted_row_content_to_the_route(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """The loop must hand the route what it already committed, not just its id.
+
+    elspeth-d581b3da7f. The turn-end writers cannot recognise their own
+    re-emission from ``persisted_assistant_message_id`` alone: that id is
+    carried across loop iterations while ``_persist_turn_audit`` runs only on
+    the tool-dispatch path, so it can point at an earlier row than the one
+    ``message`` was rendered from. The content of the committed row is what
+    makes the comparison sound, so the loop has to thread it.
+
+    Pins the compose-loop half of the fix; the route half is
+    ``test_send_message_does_not_re_emit_the_already_persisted_turn_prose``.
+    """
+    from elspeth.web.sessions.models import chat_messages_table
+
+    composer = _build_composer(tmp_path, sessions_service)
+    session_id = uuid4()
+    with sessions_service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Review handoff threading",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_set_pipeline",
+                tool_name="set_pipeline",
+                arguments=_set_pipeline_with_pending_interpretation_args(),
+            ),
+            _fake_response_with_tool_call(
+                tool_call_id="call_review",
+                tool_name="request_interpretation_review",
+                content=_REVIEW_TURN_PROSE,
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "modern, useful, engaging, and clear for the public.",
+                },
+            ),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=None,
+        message="create a workflow that rates how cool pages are",
+    )
+
+    # Instrument guard: without reaching the staged-handoff branch this would
+    # pass vacuously.
+    assert [inv.tool_name for inv in result.tool_invocations] == [
+        "set_pipeline",
+        "request_interpretation_review",
+    ]
+
+    with sessions_service._engine.begin() as conn:
+        assistant_rows = [
+            row
+            for row in conn.execute(chat_messages_table.select().order_by(chat_messages_table.c.sequence_no)).mappings().all()
+            if row["role"] == "assistant"
+        ]
+
+    # One row per tool-dispatch iteration: the set_pipeline turn (no prose)
+    # then the review turn. The threading must track the LATEST persist, not
+    # the first — the set_pipeline row's empty content would make the route's
+    # prefix test match anything.
+    assert len(assistant_rows) == 2
+    assert assistant_rows[0]["content"] == ""
+
+    # The threaded content is the bytes actually committed — the route
+    # subtracts exactly these to keep only the backend-authored suffix.
+    assert result.persisted_assistant_content == assistant_rows[-1]["content"]
+    assert result.persisted_assistant_content == _REVIEW_TURN_PROSE
+    assert result.assistant_message.startswith(result.persisted_assistant_content)
