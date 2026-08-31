@@ -384,6 +384,7 @@ class TestDraftAndArtifact:
     def test_artifact_hash_binds_current_contract_semantics_and_field_set(self) -> None:
         # Order-insensitive over fields; sample evidence never participates.
         assert source_data_contract_artifact_hash(["b", "a"]) == source_data_contract_artifact_hash(["a", "b"])
+        assert source_data_contract_artifact_hash(["a", "a"]) == source_data_contract_artifact_hash(["a"])
         assert source_data_contract_artifact_hash(["a"]) != source_data_contract_artifact_hash(["a", "b"])
         legacy_v1_hash = stable_hash({"review_kind": SOURCE_DATA_CONTRACT_USER_TERM, "demanded_fields": ["a"]})
         assert source_data_contract_artifact_hash(["a"]) != legacy_v1_hash
@@ -418,6 +419,41 @@ class TestDraftAndArtifact:
             {
                 "contract_version": 2,
                 "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": [],
+                "sample_header": None,
+                "missing_from_sample": [],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["size", "colour"],
+                "sample_header": None,
+                "missing_from_sample": [],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour", "colour"],
+                "sample_header": None,
+                "missing_from_sample": [],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour"],
+                "sample_header": [],
+                "missing_from_sample": [],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour"],
+                "sample_header": None,
+                "missing_from_sample": ["colour"],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
                 "demanded_fields": ["colour"],
                 "sample_header": None,
                 "missing_from_sample": [1],
@@ -445,6 +481,11 @@ class TestDraftAndArtifact:
             "legacy-version",
             "wrong-kind",
             "malformed-sample",
+            "empty-demand",
+            "unsorted-demand",
+            "duplicate-demand",
+            "sample-miss-omitted",
+            "no-sample-has-miss",
             "malformed-missing",
             "missing-not-demanded",
             "extra-key",

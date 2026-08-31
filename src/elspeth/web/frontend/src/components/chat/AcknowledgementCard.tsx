@@ -90,6 +90,24 @@ const DATA_CONTRACT_DRAFT_KEYS = [
   "missing_from_sample",
 ] as const;
 
+function compareUnicodeCodePoints(left: string, right: string): number {
+  const leftPoints = Array.from(left, (char) => char.codePointAt(0) ?? 0);
+  const rightPoints = Array.from(right, (char) => char.codePointAt(0) ?? 0);
+  const sharedLength = Math.min(leftPoints.length, rightPoints.length);
+  for (let index = 0; index < sharedLength; index += 1) {
+    const difference = leftPoints[index] - rightPoints[index];
+    if (difference !== 0) return difference;
+  }
+  return leftPoints.length - rightPoints.length;
+}
+
+function stringArraysEqual(left: string[], right: string[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
+}
+
 export function parseDataContractDraft(draft: string): DataContractDraft | null {
   let payload: unknown;
   try {
@@ -115,6 +133,16 @@ export function parseDataContractDraft(draft: string): DataContractDraft | null 
   ) {
     return null;
   }
+  const demandedFields = demanded as string[];
+  const canonicalDemanded = [...new Set(demandedFields)].sort(
+    compareUnicodeCodePoints,
+  );
+  if (
+    demandedFields.length === 0 ||
+    !stringArraysEqual(demandedFields, canonicalDemanded)
+  ) {
+    return null;
+  }
   const sample = record["sample_header"];
   if (
     sample !== null &&
@@ -126,15 +154,21 @@ export function parseDataContractDraft(draft: string): DataContractDraft | null 
   const missing = record["missing_from_sample"];
   if (
     !Array.isArray(missing) ||
-    !missing.every((field) => typeof field === "string") ||
-    !missing.every((field) => demanded.includes(field))
+    !missing.every((field) => typeof field === "string")
   ) {
     return null;
   }
+  const missingFromSample = missing as string[];
+  const sampleHeader = sample as string[] | null;
+  const expectedMissing =
+    sampleHeader === null
+      ? []
+      : demandedFields.filter((field) => !sampleHeader.includes(field));
+  if (!stringArraysEqual(missingFromSample, expectedMissing)) return null;
   return {
-    demandedFields: demanded as string[],
-    sampleHeader: sample as string[] | null,
-    missingFromSample: missing as string[],
+    demandedFields,
+    sampleHeader,
+    missingFromSample,
   };
 }
 

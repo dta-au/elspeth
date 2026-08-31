@@ -87,7 +87,7 @@ def source_data_contract_artifact_hash(fields: Iterable[str]) -> str:
             "review_kind": SOURCE_DATA_CONTRACT_USER_TERM,
             "contract_version": SOURCE_DATA_CONTRACT_DRAFT_VERSION,
             "enforcement_semantics": SOURCE_DATA_CONTRACT_ENFORCEMENT_SEMANTICS,
-            "demanded_fields": sorted(fields),
+            "demanded_fields": sorted(set(fields)),
         }
     )
 
@@ -366,7 +366,7 @@ def build_source_data_contract_draft(
     renderer carries the prose. Source-validation quarantine is a distinct,
     earlier path whose rows never reach ADR-016's boundary check.
     """
-    demanded = sorted(demanded_fields)
+    demanded = sorted(set(demanded_fields))
     missing_from_sample = sorted(set(demanded) - set(sample_header)) if sample_header is not None else []
     payload = {
         "contract_version": SOURCE_DATA_CONTRACT_DRAFT_VERSION,
@@ -416,13 +416,16 @@ def _validated_source_data_contract_fields(
     demanded = payload["demanded_fields"]
     if not isinstance(demanded, list) or not all(isinstance(field, str) for field in demanded):
         return None
+    if not demanded or demanded != sorted(set(demanded)):
+        return None
     sample_header = payload["sample_header"]
     if sample_header is not None and (not isinstance(sample_header, list) or not all(isinstance(field, str) for field in sample_header)):
         return None
     missing_from_sample = payload["missing_from_sample"]
     if not isinstance(missing_from_sample, list) or not all(isinstance(field, str) for field in missing_from_sample):
         return None
-    if not set(missing_from_sample) <= set(demanded):
+    expected_missing = [] if sample_header is None else sorted(set(demanded) - set(sample_header))
+    if missing_from_sample != expected_missing:
         return None
     return tuple(demanded)
 

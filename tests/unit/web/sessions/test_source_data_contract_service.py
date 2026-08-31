@@ -343,7 +343,16 @@ async def test_settlement_surfacer_mints_the_card_for_a_blocked_uploaded_source(
 
 
 @pytest.mark.asyncio
-async def test_settlement_surfacer_supersedes_a_pending_legacy_v1_card(service, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "only_missing_evidence",
+    (False, True),
+    ids=("normal-settlement", "repair-backstop"),
+)
+async def test_settlement_surfacer_supersedes_a_pending_legacy_v1_card(
+    service,
+    tmp_path: Path,
+    only_missing_evidence: bool,
+) -> None:
     """A pre-upgrade pending card carries the old consequence copy.
 
     Its graph demand is unchanged, but it must not be reused as a v2 review:
@@ -411,7 +420,7 @@ async def test_settlement_surfacer_supersedes_a_pending_legacy_v1_card(service, 
         model_version="1",
         provider="anthropic",
         composer_skill_hash="0" * 64,
-        only_missing_evidence=True,
+        only_missing_evidence=only_missing_evidence,
     )
 
     events = [
