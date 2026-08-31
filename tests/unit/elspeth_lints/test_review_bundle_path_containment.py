@@ -10,7 +10,7 @@ import pytest
 
 from elspeth_lints.core import review_bundle
 from elspeth_lints.core.atomic_io import AtomicWriteSymlinkError
-from elspeth_lints.core.review_bundle import ReviewBundle, write_bundle
+from elspeth_lints.core.review_bundle import SCHEMA_VERSION, ReviewBundle, write_bundle
 from elspeth_lints.mcp import server as judge_server
 
 
@@ -21,13 +21,14 @@ class _BundleIdSubclass(str):
 def _bundle(bundle_id: str) -> ReviewBundle:
     return ReviewBundle(
         bundle_id=bundle_id,
-        schema_version=1,
+        schema_version=SCHEMA_VERSION,
         created_at="2026-08-02T00:00:00+00:00",
         staged_by="containment-test",
         root="src/elspeth",
         allowlist_dir="config/cicd/enforce_tier_model",
-        source_rev=None,
+        source_rev="a" * 40,
         source_dirty=False,
+        source_snapshot_sha256="0" * 64,
         actions=(),
     )
 
