@@ -302,12 +302,12 @@ export function TutorialGuidedShell({
             )}
           </div>
         }
-        artifact={<ArtifactWorkspace />}
-        inspector={
-          <WorkspaceInspector
-            validationContent={<PipelineValidationSummary isTutorial />}
+        artifact={
+          <ArtifactWorkspace
+            checksValidationContent={<PipelineValidationSummary isTutorial />}
           />
         }
+        inspector={<WorkspaceInspector />}
         actionBar={
           <WorkspaceActionBar
             capabilities={{

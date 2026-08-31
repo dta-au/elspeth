@@ -115,20 +115,19 @@ vi.mock("@/components/workspace/ArtifactWorkspace", () => ({
   // "false", so the assertion could not fail unless the shell affirmatively
   // passed true — and deleting the prop pass-through entirely would go
   // unnoticed. "undefined" is a distinguishable, and a failing, value.
-  ArtifactWorkspace: (props: { runAvailable?: boolean }) => (
+  ArtifactWorkspace: (props: {
+    runAvailable?: boolean;
+    checksValidationContent?: ReactNode;
+  }) => (
     <div data-run-available={String(props.runAvailable)}>
       Artifact workspace
+      {props.checksValidationContent}
     </div>
   ),
 }));
 
 vi.mock("@/components/workspace/WorkspaceInspector", () => ({
-  WorkspaceInspector: ({ validationContent }: { validationContent?: ReactNode }) => (
-    <div>
-      Inspector workspace
-      {validationContent}
-    </div>
-  ),
+  WorkspaceInspector: () => <div>Inspector workspace</div>,
 }));
 
 vi.mock("@/components/workspace/WorkspaceActionBar", () => ({
@@ -254,7 +253,7 @@ describe("TutorialGuidedShell", () => {
     expect(stub.dataset.isTutorial).toBe("true");
   });
 
-  it("uses the common workspace with tutorial-safe actions and inspector validation", async () => {
+  it("uses the common workspace with tutorial-safe actions and Checks-tab validation", async () => {
     render(<TutorialGuidedShell sessionId="sess-1" onCompleted={vi.fn()} />);
 
     expect(await screen.findByTestId("composer-workspace-stub")).toBeInTheDocument();

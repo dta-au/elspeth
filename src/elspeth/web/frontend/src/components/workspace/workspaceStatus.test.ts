@@ -4,6 +4,7 @@ import { makeValidationResult } from "@/test/composerFixtures";
 import type { AuditReadinessSnapshot } from "@/types/api";
 import {
   projectAuditWorkspaceStatus,
+  projectChecksWorkspaceStatus,
   projectValidationWorkspaceStatus,
 } from "./workspaceStatus";
 
@@ -42,6 +43,7 @@ describe("workspace status projections", () => {
       text: "Not checked",
       tone: "neutral",
       accessibleLabel: "Validation: Not checked",
+      issueCount: 0,
     });
     expect(
       projectValidationWorkspaceStatus(makeValidationResult()),
@@ -49,6 +51,7 @@ describe("workspace status projections", () => {
       text: "Passed",
       tone: "success",
       accessibleLabel: "Validation: Passed",
+      issueCount: 0,
     });
     expect(
       projectValidationWorkspaceStatus(
@@ -81,6 +84,7 @@ describe("workspace status projections", () => {
       text: "2 warnings",
       tone: "warning",
       accessibleLabel: "Validation: 2 warnings",
+      issueCount: 2,
     });
     expect(
       projectValidationWorkspaceStatus(
@@ -100,6 +104,7 @@ describe("workspace status projections", () => {
       text: "1 error",
       tone: "error",
       accessibleLabel: "Validation: 1 error",
+      issueCount: 1,
     });
   });
 
@@ -128,6 +133,7 @@ describe("workspace status projections", () => {
       text: "2 errors",
       tone: "error",
       accessibleLabel: "Validation: 2 errors",
+      issueCount: 2,
     });
   });
 
@@ -148,6 +154,7 @@ describe("workspace status projections", () => {
       text: "1 warning",
       tone: "warning",
       accessibleLabel: "Validation: 1 warning",
+      issueCount: 1,
     });
   });
 
@@ -160,6 +167,7 @@ describe("workspace status projections", () => {
       text: "Failed",
       tone: "error",
       accessibleLabel: "Validation: Failed",
+      issueCount: 0,
     });
   });
 
@@ -168,6 +176,7 @@ describe("workspace status projections", () => {
       text: "Checking",
       tone: "busy",
       accessibleLabel: "Validation: Checking",
+      issueCount: 0,
     });
     expect(
       projectValidationWorkspaceStatus(
@@ -179,6 +188,7 @@ describe("workspace status projections", () => {
       text: "Check failed",
       tone: "error",
       accessibleLabel: "Validation: Check failed",
+      issueCount: 0,
     });
   });
 
@@ -197,6 +207,7 @@ describe("workspace status projections", () => {
       text: "Ready",
       tone: "success",
       accessibleLabel: "Audit: Ready",
+      issueCount: 0,
     });
     expect(
       projectAuditWorkspaceStatus({
@@ -233,6 +244,7 @@ describe("workspace status projections", () => {
       text: "Error",
       tone: "error",
       accessibleLabel: "Audit: Error",
+      issueCount: 0,
     });
   });
 
@@ -292,6 +304,35 @@ describe("workspace status projections", () => {
       text: "2 issues",
       tone: "error",
       accessibleLabel: "Audit: 2 issues",
+      // 1, not 2: the "validation" row restates the validation channel's own
+      // failure, so it is excluded from the merge contribution while the
+      // standalone text/tone still count it.
+      issueCount: 1,
+    });
+  });
+
+  it("contributes no merge count when the validation mirror row is the only issue", () => {
+    const mirrorOnly = auditSnapshot({
+      rows: auditSnapshot().rows.map((row) =>
+        row.id === "validation"
+          ? { ...row, status: "error" as const, summary: "Blocked" }
+          : row,
+      ),
+      validation_result: makeValidationResult({ is_valid: false, errors: [] }),
+    });
+
+    expect(
+      projectAuditWorkspaceStatus({
+        activeSessionId: SESSION_ID,
+        compositionVersion: 4,
+        snapshotsBySession: { [SESSION_ID]: mirrorOnly },
+        errorBySession: {},
+      }),
+    ).toEqual({
+      text: "1 issue",
+      tone: "error",
+      accessibleLabel: "Audit: 1 issue",
+      issueCount: 0,
     });
   });
 
@@ -315,6 +356,197 @@ describe("workspace status projections", () => {
       text: "1 issue",
       tone: "warning",
       accessibleLabel: "Audit: 1 issue",
+      issueCount: 1,
     });
+  });
+});
+
+describe("merged checks projection", () => {
+  const validationPassed = projectValidationWorkspaceStatus(
+    makeValidationResult(),
+  );
+  const auditReady = projectAuditWorkspaceStatus({
+    activeSessionId: SESSION_ID,
+    compositionVersion: 4,
+    snapshotsBySession: { [SESSION_ID]: auditSnapshot() },
+    errorBySession: {},
+  });
+
+  function validationWithErrors(count: number) {
+    return projectValidationWorkspaceStatus(
+      makeValidationResult({
+        is_valid: false,
+        errors: Array.from({ length: count }, (_, i) => ({
+          component_id: `node-${i}`,
+          component_type: "transform",
+          message: "Invalid",
+          suggestion: null,
+        })),
+      }),
+    );
+  }
+
+  function auditWithIssues(ids: readonly string[]) {
+    return projectAuditWorkspaceStatus({
+      activeSessionId: SESSION_ID,
+      compositionVersion: 4,
+      snapshotsBySession: {
+        [SESSION_ID]: auditSnapshot({
+          rows: auditSnapshot().rows.map((row) =>
+            ids.includes(row.id)
+              ? { ...row, status: "warning" as const, summary: "Review" }
+              : row,
+          ),
+        }),
+      },
+      errorBySession: {},
+    });
+  }
+
+  it("is Ready only when both channels succeed", () => {
+    expect(
+      projectChecksWorkspaceStatus(validationPassed, auditReady),
+    ).toEqual({
+      text: "Ready",
+      tone: "success",
+      accessibleLabel: "Checks: Ready",
+      issueCount: 0,
+    });
+  });
+
+  it("counts a validation failure once even though the audit snapshot mirrors it as a row", () => {
+    // The e2e "validation-audit-issues" shape: the audit snapshot's
+    // "validation" row is mechanically tied to validation_result.is_valid, so
+    // summing both channels naively counts every validation failure twice —
+    // once in full via the validation channel, once more as the mirror row.
+    const failingAudit = projectAuditWorkspaceStatus({
+      activeSessionId: SESSION_ID,
+      compositionVersion: 4,
+      snapshotsBySession: {
+        [SESSION_ID]: auditSnapshot({
+          rows: auditSnapshot().rows.map((row) =>
+            row.id === "validation"
+              ? { ...row, status: "error" as const, summary: "Blocked" }
+              : row.id === "plugin_trust"
+                ? { ...row, status: "warning" as const, summary: "Review" }
+                : row,
+          ),
+          validation_result: makeValidationResult({ is_valid: false, errors: [] }),
+        }),
+      },
+      errorBySession: {},
+    });
+
+    expect(
+      projectChecksWorkspaceStatus(validationWithErrors(2), failingAudit),
+    ).toEqual({
+      text: "3 issues",
+      tone: "error",
+      accessibleLabel: "Checks: 3 issues",
+      issueCount: 3,
+    });
+  });
+
+  it("sums both channels' issues and takes the worse tone (validation errors dominate audit warnings)", () => {
+    expect(
+      projectChecksWorkspaceStatus(
+        validationWithErrors(2),
+        auditWithIssues(["provenance"]),
+      ),
+    ).toEqual({
+      text: "3 issues",
+      tone: "error",
+      accessibleLabel: "Checks: 3 issues",
+      issueCount: 3,
+    });
+  });
+
+  it("sums both channels' issues and takes the worse tone (audit warnings surface past a passing validation)", () => {
+    expect(
+      projectChecksWorkspaceStatus(
+        validationPassed,
+        auditWithIssues(["provenance", "retention"]),
+      ),
+    ).toEqual({
+      text: "2 issues",
+      tone: "warning",
+      accessibleLabel: "Checks: 2 issues",
+      issueCount: 2,
+    });
+  });
+
+  it("uses the singular noun for exactly one merged issue", () => {
+    expect(
+      projectChecksWorkspaceStatus(validationPassed, auditWithIssues(["provenance"])),
+    ).toMatchObject({ text: "1 issue", tone: "warning", issueCount: 1 });
+  });
+
+  it("reports Checking while either channel is still in flight", () => {
+    expect(
+      projectChecksWorkspaceStatus(
+        projectValidationWorkspaceStatus(null, true, null),
+        auditReady,
+      ),
+    ).toMatchObject({
+      text: "Checking",
+      tone: "busy",
+      accessibleLabel: "Checks: Checking",
+    });
+    expect(
+      projectChecksWorkspaceStatus(
+        projectValidationWorkspaceStatus(null),
+        projectAuditWorkspaceStatus({
+          activeSessionId: SESSION_ID,
+          compositionVersion: 5,
+          snapshotsBySession: { [SESSION_ID]: auditSnapshot() },
+          errorBySession: {},
+        }),
+      ),
+    ).toMatchObject({ text: "Checking", tone: "busy" });
+  });
+
+  it("stays Not checked when validation never ran and nothing is in flight", () => {
+    expect(
+      projectChecksWorkspaceStatus(
+        projectValidationWorkspaceStatus(null),
+        auditReady,
+      ),
+    ).toEqual({
+      text: "Not checked",
+      tone: "neutral",
+      accessibleLabel: "Checks: Not checked",
+      issueCount: 0,
+    });
+  });
+
+  it("projects a zero-count failure as Check failed, never as 0 issues", () => {
+    expect(
+      projectChecksWorkspaceStatus(
+        projectValidationWorkspaceStatus(null, false, "boom"),
+        auditReady,
+      ),
+    ).toEqual({
+      text: "Check failed",
+      tone: "error",
+      accessibleLabel: "Checks: Check failed",
+      issueCount: 0,
+    });
+    expect(
+      projectChecksWorkspaceStatus(
+        validationPassed,
+        projectAuditWorkspaceStatus({
+          activeSessionId: SESSION_ID,
+          compositionVersion: 4,
+          snapshotsBySession: { [SESSION_ID]: auditSnapshot() },
+          errorBySession: { [SESSION_ID]: "identity mismatch" },
+        }),
+      ),
+    ).toMatchObject({ text: "Check failed", tone: "error", issueCount: 0 });
+  });
+
+  it("an error tone with a real count keeps the count as the text", () => {
+    expect(
+      projectChecksWorkspaceStatus(validationWithErrors(1), auditReady),
+    ).toMatchObject({ text: "1 issue", tone: "error", issueCount: 1 });
   });
 });

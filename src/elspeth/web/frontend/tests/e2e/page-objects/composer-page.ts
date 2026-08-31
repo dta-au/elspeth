@@ -70,19 +70,15 @@ export class ComposerPage {
   }
 
   inspector(): Locator {
-    return this.page.getByRole("complementary", { name: "Inspector" });
+    return this.page.getByRole("complementary", { name: "History" });
   }
 
   inspectorBody(): Locator {
     return this.page.locator(".workspace-inspector-body");
   }
 
-  inspectorTab(name: "Validation" | "Audit"): Locator {
-    return this.inspector().getByRole("tab", { name, exact: true });
-  }
-
   closeInspector(): Locator {
-    return this.inspector().getByRole("button", { name: "Close inspector" });
+    return this.inspector().getByRole("button", { name: "Close history" });
   }
 
   actionBar(): Locator {
@@ -105,12 +101,11 @@ export class ComposerPage {
     return this.page.getByRole("tab", { name: "Pipeline", exact: true });
   }
 
-  validationStatus(): Locator {
-    return this.page.getByRole("button", { name: /^Validation: / });
-  }
-
-  auditStatus(): Locator {
-    return this.page.getByRole("button", { name: /^Audit: / });
+  /* The Checks artifact tab absorbed the retired Validation/Audit action-bar
+     chips. While enabled its accessible name carries the live merged status
+     ("Checks: 25 issues"), so locate on the stable prefix. */
+  checksTab(): Locator {
+    return this.page.getByRole("tab", { name: /^Checks/ });
   }
 
   catalogButton(): Locator {
