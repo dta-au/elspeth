@@ -582,14 +582,16 @@ function ArtifactPreviewView({
             fontSize: 11,
           }}
         >
-          {/* row_count_preview is a PHYSICAL LINE count: the backend caps
-              with `splitlines()` (web/execution/preview.py:162), so a CSV
-              whose values contain newlines yields far fewer records than
-              lines. Calling them rows asserted a number the table below
-              visibly contradicts. */}
+          {/* row_count_preview is the count of complete logical records the
+              backend included (a CSV header remains one record). Byte-cut
+              fragments are withheld rather than counted. */}
           Preview truncated
           {preview.row_count_preview != null &&
-            ` to ${plural(preview.row_count_preview, "line")}`}
+            ` to ${plural(preview.row_count_preview, "row")}${
+              preview.content_type === "csv" && preview.row_count_preview > 0
+                ? " including header"
+                : ""
+            }`}
           {" — "}
           <Button variant="bare" className="link-button" onClick={onDownload}>
             download for full file
@@ -662,8 +664,9 @@ interface TabularPreviewProps {
  *
  * Still deliberately tolerant of ragged rows: short rows are padded and
  * over-wide rows widen the header, because a preview should render what is
- * there rather than refuse. What it no longer does is MANUFACTURE that
- * raggedness out of correctly-quoted input.
+ * there rather than refuse. Synthetic columns get explicit labels and a
+ * visible caveat. What this no longer does is MANUFACTURE raggedness out of
+ * correctly-quoted input.
  */
 function buildTabularPreviewModel(
   text: string,
@@ -671,7 +674,10 @@ function buildTabularPreviewModel(
   truncated: boolean,
 ): TabularPreviewModel | null {
   if (contentType === "jsonl") {
-    const lines = text.split("\n").filter((line) => line.length > 0);
+    const lines = text
+      .split("\n")
+      .map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line))
+      .filter((line) => line.length > 0);
     if (lines.length === 0) {
       return null;
     }
@@ -682,8 +688,10 @@ function buildTabularPreviewModel(
     };
   }
 
-  // Sniff on the first physical line: a header row is never itself quoted
-  // across a newline, so this is safe to do before parsing.
+  // Legacy best-effort while the preview contract carries no dialect: choose
+  // only between built-in comma CSV and .tsv tab output. Header values may
+  // themselves contain commas/newlines, so ambiguous or custom delimiters need
+  // dialect metadata rather than another sniff heuristic.
   const firstLine = text.split("\n", 1)[0] ?? "";
   const tabCount = (firstLine.match(/\t/g) ?? []).length;
   const commaCount = (firstLine.match(/,/g) ?? []).length;
@@ -704,15 +712,17 @@ function buildTabularPreviewModel(
   // the SAME endedInQuotes flag and has always reported the malformed case
   // as a caveat; this is that rule, applied to the second consumer.
   const rows_ = endedInQuotes ? parsed.slice(0, -1) : parsed;
-  const caveat = endedInQuotes
+  const incompleteRecordCaveat = endedInQuotes
     ? truncated
-      // Real and common: the backend's physical-line cap routinely lands
-      // mid-value on LLM output, whose prose responses span many lines.
+      // Defensive for stale servers or captured responses: the current
+      // backend withholds byte-cut fragments at a complete record boundary.
       ? "The last record was cut off by the preview limit and is not shown — download for the full file."
       : "Content has an unterminated quoted field — the final record could not be read."
     : null;
   if (rows_.length === 0) {
-    return null;
+    return incompleteRecordCaveat === null
+      ? null
+      : { headers: [], rows: [], caveat: incompleteRecordCaveat };
   }
 
   const [headerRow = [], ...bodyRows] = rows_;
@@ -720,10 +730,21 @@ function buildTabularPreviewModel(
     bodyRows.length === 0
       ? headerRow.length
       : Math.max(headerRow.length, ...bodyRows.map((row) => row.length));
-  const headers = Array.from({ length: columnCount }, (_, i) => headerRow[i] ?? "");
+  const hasExtraFields = columnCount > headerRow.length;
+  const headers = Array.from(
+    { length: columnCount },
+    (_, i) => headerRow[i] ?? `Unnamed column ${i + 1}`,
+  );
   const rows = bodyRows.map((row) =>
     Array.from({ length: columnCount }, (_, i) => row[i] ?? ""),
   );
+  const extraFieldsCaveat = hasExtraFields
+    ? "Some rows contain more fields than the header; extra columns are labelled for review."
+    : null;
+  const caveat =
+    incompleteRecordCaveat !== null && extraFieldsCaveat !== null
+      ? `${incompleteRecordCaveat} ${extraFieldsCaveat}`
+      : incompleteRecordCaveat ?? extraFieldsCaveat;
   return { headers, rows, caveat };
 }
 
@@ -734,7 +755,7 @@ function TabularPreview({ text, contentType, truncated }: TabularPreviewProps) {
   }
   return (
     <>
-      <PreviewTable table={table} />
+      {table.headers.length > 0 && <PreviewTable table={table} />}
       {table.caveat !== null && (
         <div
           style={{

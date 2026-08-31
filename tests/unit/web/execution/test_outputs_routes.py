@@ -12,6 +12,7 @@ artefact, gated by a path-allowlist guard that enforces
 
 from __future__ import annotations
 
+import csv
 import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -1111,6 +1112,53 @@ class TestRunOutputPreviewEndpoint:
         assert body["truncated"] is False
         assert body["row_count_preview"] == 3
         assert body["total_size_bytes"] == sink_file.stat().st_size
+
+    @pytest.mark.asyncio
+    async def test_csv_preview_transport_preserves_five_120_line_records(
+        self,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
+        run_id = uuid4()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
+        sink_file = outputs_dir / "llm_results.csv"
+        with sink_file.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=("id", "answer"))
+            writer.writeheader()
+            for record_index in range(5):
+                writer.writerow(
+                    {
+                        "id": record_index,
+                        "answer": "\n".join(f"record {record_index} line {line_index}" for line_index in range(120)),
+                    }
+                )
+
+        svc = _execution_service_for_status(run_id)
+        _install_manifest_loader(
+            monkeypatch,
+            artifacts=[_file_artifact_in_outputs(sink_file)],
+            run_id=run_id,
+        )
+        app = _create_test_app(
+            execution_service=svc,
+            settings=_FakeSettings(data_dir=str(tmp_path)),
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                f"/api/runs/{run_id}/outputs/art-1/preview",
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        parsed_rows = list(csv.reader(body["preview_text"].splitlines(keepends=True)))
+        assert len(parsed_rows) == 6
+        assert body["row_count_preview"] == len(parsed_rows)
+        assert body["truncated"] is False
 
     @pytest.mark.asyncio
     async def test_text_file_under_cap_returns_full_content(self, monkeypatch, tmp_path) -> None:
