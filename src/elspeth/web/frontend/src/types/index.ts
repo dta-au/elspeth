@@ -1065,6 +1065,7 @@ export interface RunOutputArtifactPreview {
   preview_text: string;
   truncated: boolean;
   total_size_bytes: number;
+  /** Complete logical records included; CSV/TSV counts include the header. */
   row_count_preview: number | null;
 }
 

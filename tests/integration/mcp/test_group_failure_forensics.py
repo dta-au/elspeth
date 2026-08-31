@@ -138,7 +138,6 @@ collectors:
     plugin: batch_stats
     input: stitch_in
     on_success: stitch_out
-    on_error: discard
     options:
       value_field: sentence
       schema: {{mode: observed}}
@@ -146,7 +145,6 @@ collectors:
     plugin: batch_stats
     input: section_merge
     on_success: out
-    on_error: discard
     options:
       value_field: page
       schema: {{mode: observed}}

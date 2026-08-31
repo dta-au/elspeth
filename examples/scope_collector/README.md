@@ -97,9 +97,9 @@ that row — not a number you configured and hoped matched.
   `first` are not implemented.
 - Ordinary transforms may sit between opener and closer — they run inside the
   bound region, as `read_value` does here.
-- `on_error` on a collector is optional. Omitted, the route derives from
-  structure and losses settle through the scope's group machinery rather than
-  through a configured error edge.
+- A collector does not accept `on_error`. Collector-plugin failure is a
+  whole-group verdict that settles through the scope's group policy and
+  nesting, not through a per-row error edge.
 
 ## See Also
 

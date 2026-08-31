@@ -1610,9 +1610,8 @@ describe("guided collector proposals (WS6 lift, ruling 7878)", () => {
   }
 
   it("decodes the collector behavior with its opener identity and closed policy", () => {
-    // No collector node_error edge in the fixture: on_error is OPTIONAL on a
-    // collector (group failure is structural), so this decode succeeding is
-    // itself the optional-error pin.
+    // No collector node_error edge in the fixture: collector failure is a
+    // structural whole-group verdict, so the wire must not promise one.
     const decoded = decodeGetGuidedResponse(collectorProposalWireResponse());
 
     expect(decoded.next_turn?.type).toBe("propose_pipeline");
@@ -1627,6 +1626,64 @@ describe("guided collector proposals (WS6 lift, ruling 7878)", () => {
         opener_stable_id: "00000000-0000-4000-8000-000000000602",
         policy: "require_all",
       },
+    });
+  });
+
+  it("rejects a collector node_error flow", () => {
+    expect(() => decodeGetGuidedResponse(collectorProposalWireResponse((payload) => {
+      const graph = payload.graph as Record<string, unknown>;
+      const edges = graph.edges as Array<Record<string, unknown>>;
+      edges.push({
+        stable_id: "00000000-0000-4000-8000-000000000616",
+        from_endpoint: { kind: "node", stable_id: "00000000-0000-4000-8000-000000000603" },
+        to_endpoint: { kind: "discard" },
+        flow: { kind: "node_error" },
+      });
+      (payload.component_counts as Record<string, number>).edges = 7;
+    }))).toThrow(/collector/i);
+  });
+
+  it("preserves every collector scope binding on the current composition state", () => {
+    const response = singleSelectWireResponse();
+    response.composition_state = {
+      id: "state-collector",
+      session_id: "session-collector",
+      version: 1,
+      sources: {},
+      nodes: [
+        {
+          id: "collect_pages",
+          node_type: "collector",
+          plugin: "batch_stats",
+          input: "expanded_pages",
+          on_success: "documents",
+          on_error: null,
+          options: {},
+          scope_name: "document_pages",
+          scope_opener: "expand_pages",
+          scope_policy: "best_effort",
+        },
+      ],
+      edges: [],
+      outputs: [],
+      metadata: { name: null, description: null },
+      is_valid: true,
+      validation_errors: null,
+      validation_warnings: null,
+      validation_suggestions: null,
+      derived_from_state_id: null,
+      created_at: "2026-09-01T00:00:00Z",
+      composer_meta: null,
+      plugin_policy_findings: [],
+    };
+
+    const decoded = decodeGetGuidedResponse(response);
+
+    expect(decoded.composition_state?.nodes[0]).toMatchObject({
+      node_type: "collector",
+      scope_name: "document_pages",
+      scope_opener: "expand_pages",
+      scope_policy: "best_effort",
     });
   });
 

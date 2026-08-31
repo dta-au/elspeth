@@ -414,7 +414,7 @@ describe("ChatPanel", () => {
   // symptom (how tall the box got).
   const terminalCompleteProgress: ComposerProgressSnapshot = {
     session_id: "session-1",
-    request_id: "message-1",
+    request_id: "u1",
     phase: "complete",
     headline: "The composer has updated the pipeline.",
     evidence: ["The assistant response has been saved for this session."],
@@ -472,14 +472,65 @@ describe("ChatPanel", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("does not resurrect terminal composer progress after a later system notice", () => {
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue(idleComposer);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [soloSession],
+      // Validation notices are standalone system turns and can land after the
+      // assistant reply. They must not make the settled progress card return.
+      messages: [
+        chatMsg({ id: "u1", role: "user", content: "Build me a pipeline" }),
+        chatMsg({ id: "a1", role: "assistant", content: "Done — the pipeline is saved." }),
+        chatMsg({ id: "s1", role: "system", content: "Validation passed." }),
+      ],
+      composerProgress: terminalCompleteProgress,
+    });
+
+    render(<ChatPanel />);
+
+    expect(screen.getByText("Done — the pipeline is saved.")).toBeInTheDocument();
+    expect(screen.getByText("Validation passed.")).toBeInTheDocument();
+    expect(screen.queryByText("Last composer update")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("The composer has updated the pipeline."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not show terminal composer progress superseded by a later user turn", () => {
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue(idleComposer);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [soloSession],
+      messages: [
+        chatMsg({ id: "u0", role: "user", content: "Build the old pipeline" }),
+        chatMsg({ id: "u1", role: "user", content: "Build the current pipeline" }),
+      ],
+      composerProgress: { ...terminalCompleteProgress, request_id: "u0" },
+    });
+
+    render(<ChatPanel />);
+
+    expect(screen.getByText("Build the current pipeline")).toBeInTheDocument();
+    expect(screen.queryByText("Last composer update")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("The composer has updated the pipeline."),
+    ).not.toBeInTheDocument();
+  });
+
   it("keeps terminal composer progress while the reply has not landed yet", () => {
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue(idleComposer);
     useSessionStore.setState({
       activeSessionId: "session-1",
       sessions: [soloSession],
-      // Tail is the user's row — the turn settled but no reply text exists,
-      // so the snapshot is still the only account of what happened.
-      messages: [chatMsg({ id: "u1", role: "user", content: "Build me a pipeline" })],
+      // The latest user turn settled without reply text, so the snapshot is
+      // still the only account of what happened. A successful older turn must
+      // not cause this newer terminal outcome to be hidden.
+      messages: [
+        chatMsg({ id: "u0", role: "user", content: "Build an earlier pipeline" }),
+        chatMsg({ id: "a0", role: "assistant", content: "The earlier pipeline is ready." }),
+        chatMsg({ id: "u1", role: "user", content: "Build me a pipeline" }),
+      ],
       composerProgress: terminalCompleteProgress,
     });
 

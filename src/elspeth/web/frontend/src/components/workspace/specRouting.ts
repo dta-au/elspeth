@@ -205,14 +205,15 @@ export function buildConnectionIndex(state: CompositionState): ConnectionIndex {
   const producers = buildConnectionProducers(state);
   const consumers = new Map<string, string[]>();
 
-  // The two registrations the Graph tab does not make, layered on top so its
-  // behaviour cannot change. Verified: `on_validation_failure` appears in
-  // GraphView.tsx only as a config-panel field, never as a producer
-  // registration, and `on_write_failure` not at all. Both are needed here
-  // because the Spec tab prints every routing field as prose, including the
-  // failure lanes; omitting either would be asymmetric for no reason a reader
-  // could infer — a source's validation-failure lane would resolve upstream
-  // while an output's write-failure lane title-cased.
+  // The two engine-level failure routes are layered on top of the shared
+  // NAMED-connection producer index. GraphView projects them independently as
+  // direct error edges to configured outputs; they do not belong in
+  // buildConnectionProducers because the runtime never exposes them as
+  // ordinary connections that processing nodes can consume. Both are needed
+  // here because the Spec tab prints every routing field as prose, including
+  // the failure lanes; omitting either would be asymmetric for no reason a
+  // reader could infer — a source's validation-failure lane would resolve
+  // upstream while an output's write-failure lane title-cased.
   //
   // The DISCARD_CONNECTION guard is deliberate: `discard` is not a connection
   // (_producer_resolver.py), so registering an output that discards write

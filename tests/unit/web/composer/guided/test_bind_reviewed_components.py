@@ -2623,6 +2623,26 @@ def _public_node_correction_target(
     )
 
 
+def test_collector_node_correction_schema_does_not_expose_on_error() -> None:
+    stable_id = "99999999-9999-4999-8999-999999999999"
+    target = _public_node_correction_target(
+        "page_stitcher",
+        stable_id=stable_id,
+        node_type="collector",
+        plugin="batch_stats",
+        behavior={
+            "kind": "collector",
+            "opener_stable_id": "66666666-6666-4666-8666-666666666666",
+            "policy": "require_all",
+        },
+    )
+
+    patch_schema = guided_authorized_pipeline_schema(_guided(), correction_target=target)["properties"]["node_patch"]
+
+    assert "on_error" not in patch_schema["properties"]
+    assert {"input", "on_success", "scope_name", "scope_opener", "scope_policy"} <= set(patch_schema["properties"])
+
+
 def test_node_patch_overlays_gate_condition_without_reauthoring_hidden_routes() -> None:
     predecessor = _correction_predecessor()
     stable_id = "66666666-6666-4666-8666-666666666666"

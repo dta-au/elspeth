@@ -208,7 +208,7 @@ export function branchEntries(
  * queue-as-sole-canonical-producer (GraphView.tsx's `queueIds` set), the
  * row_union authoritative-outbound semantics
  * (`authoritativeRowUnionOutboundSemantics`), and the phase-1 alias dedup
- * (`inferredBranchAliases`).
+ * (`inferredBranchSemantics`).
  *
  * The ids are COMPONENT ids, the one namespace sources and nodes share:
  * a source publishes under `sourceComponentId(name)` ("source" for the default
@@ -290,7 +290,11 @@ export function indexConnectionProducers(
   for (const node of state.nodes) {
     const published = publishedSuccessConnection(node);
     if (published && published !== DISCARD_CONNECTION) push("published", published, node.id);
-    if (node.on_error && node.on_error !== DISCARD_CONNECTION) {
+    // CompositionState has one universal nullable on_error slot, but a
+    // collector rejects non-null values: its failure is a whole-group verdict.
+    // Fail closed for legacy/malformed states so no phantom error edge reaches
+    // either the Spec routing view or the canvas producer index.
+    if (node.node_type !== "collector" && node.on_error && node.on_error !== DISCARD_CONNECTION) {
       push("on_error", node.on_error, node.id);
     }
     if (node.routes) {
