@@ -110,6 +110,70 @@ def test_reject_unimportable_sections_refuses_a_declined_section_by_name() -> No
         _reject_unimportable_sections({"transforms": [], "commencement_gates": [{"plugin": "corpus"}]})
 
 
+def test_reject_unimportable_sections_refuses_unknown_top_level_key_by_name() -> None:
+    """A settings typo must fail before state construction can erase it."""
+    with pytest.raises(RuntimeYamlImportError) as exc_info:
+        _reject_unimportable_sections({"transforms": [], "commencment_gates": []})
+
+    assert str(exc_info.value) == (
+        "pipeline YAML contains unknown top-level keys: ['commencment_gates']. Importing would silently discard them. Check for typos."
+    )
+
+
+def test_reject_unimportable_sections_sorts_multiple_unknown_keys_deterministically() -> None:
+    """Diagnostic order follows key names, never YAML insertion order."""
+    errors = []
+    for doc in (
+        {"sources": {}, "zeta_setting": 1, "alpha_setting": 2},
+        {"sources": {}, "alpha_setting": 2, "zeta_setting": 1},
+    ):
+        with pytest.raises(RuntimeYamlImportError) as exc_info:
+            _reject_unimportable_sections(doc)
+        errors.append(str(exc_info.value))
+
+    assert (
+        errors
+        == [
+            "pipeline YAML contains unknown top-level keys: ['alpha_setting', 'zeta_setting']. "
+            "Importing would silently discard them. Check for typos."
+        ]
+        * 2
+    )
+
+
+def test_reject_unimportable_sections_refuses_non_string_top_level_keys() -> None:
+    """YAML scalar keys cannot bypass the closed top-level vocabulary."""
+    with pytest.raises(RuntimeYamlImportError) as exc_info:
+        _reject_unimportable_sections({"sources": {}, None: 1, 7: 2})
+
+    assert str(exc_info.value) == (
+        "pipeline YAML contains non-string top-level keys: ['7 (int)', 'None (NoneType)']. Top-level keys must be strings."
+    )
+
+
+def test_composition_state_from_runtime_yaml_names_unknown_only_mapping_keys() -> None:
+    """The pipeline-shape guard must not replace the more useful key diagnosis."""
+    with pytest.raises(RuntimeYamlImportError) as exc_info:
+        composition_state_from_runtime_yaml("zeta_setting: 1\nalpha_setting: 2\n")
+
+    assert str(exc_info.value) == (
+        "pipeline YAML contains unknown top-level keys: ['alpha_setting', 'zeta_setting']. "
+        "Importing would silently discard them. Check for typos."
+    )
+
+
+def test_composition_state_from_runtime_yaml_keeps_known_web_metadata() -> None:
+    """The unknown-key guard must retain the importer's explicit web-only key."""
+    state = composition_state_from_runtime_yaml(
+        _minimal_pipeline_doc() + "metadata:\n" + "  name: Imported pipeline\n" + "  description: Retained in composition state\n"
+    )
+
+    assert state.metadata == PipelineMetadata(
+        name="Imported pipeline",
+        description="Retained in composition state",
+    )
+
+
 def test_source_from_runtime_entry_rejects_non_mapping_entry() -> None:
     with pytest.raises(RuntimeYamlImportError, match=r"sources\.s must be a mapping"):
         _source_from_runtime_entry("s", ["not", "a", "mapping"])
@@ -214,9 +278,10 @@ def test_composition_state_from_runtime_yaml_rejects_malformed_yaml_syntax() -> 
 
 def test_composition_state_from_runtime_yaml_rejects_non_pipeline_mapping() -> None:
     """Hardening: a valid YAML mapping that describes no pipeline section at all
-    must not silently import as an empty (destructive-replace) composition."""
+    must not silently import as an empty (destructive-replace) composition.
+    The closed key vocabulary provides the more actionable named diagnosis."""
     not_a_pipeline = "shopping_list:\n  - milk\n  - eggs\nnotes: just some random yaml\n"
-    with pytest.raises(RuntimeYamlImportError, match="must define at least one pipeline section"):
+    with pytest.raises(RuntimeYamlImportError, match=r"unknown top-level keys: \['notes', 'shopping_list'\]"):
         composition_state_from_runtime_yaml(not_a_pipeline)
 
 

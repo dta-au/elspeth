@@ -8146,7 +8146,8 @@ sinks:
     async def test_post_state_yaml_rejects_non_pipeline_mapping(self, tmp_path) -> None:
         """Hardening (T-1): a syntactically valid YAML mapping that names no
         pipeline section must not silently import as an empty composition --
-        that would be a silent destructive replace of the session's prior work."""
+        that would be a silent destructive replace of the session's prior work.
+        The rejection names every unrecognised key so a typo is actionable."""
         app, service = _make_app(tmp_path)
         client = TestClient(app)
 
@@ -8156,8 +8157,41 @@ sinks:
         resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": not_a_pipeline})
 
         assert resp.status_code == 400
-        assert "must define at least one pipeline section" in resp.json()["detail"]
+        assert resp.json()["detail"] == (
+            "pipeline YAML contains unknown top-level keys: ['notes', 'shopping_list']. "
+            "Importing would silently discard them. Check for typos."
+        )
         # The session's current state must remain unset -- nothing was persisted.
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_post_state_yaml_rejects_unknown_key_before_persistence(self, tmp_path) -> None:
+        """A typo beside valid sections is a named 400, never a lossy import."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+
+        session = await service.create_session("alice", "Replay", "local")
+        yaml_text = """
+sources:
+  source:
+    plugin: csv
+    on_success: main
+    options:
+      schema:
+        mode: observed
+sinks:
+  main:
+    plugin: csv
+    on_write_failure: discard
+commencment_gates: []
+"""
+
+        resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == (
+            "pipeline YAML contains unknown top-level keys: ['commencment_gates']. Importing would silently discard them. Check for typos."
+        )
         assert await service.get_current_state(session.id) is None
 
     @pytest.mark.asyncio

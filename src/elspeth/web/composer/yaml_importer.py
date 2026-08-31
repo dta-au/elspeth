@@ -51,6 +51,11 @@ _SCOPE_FIELDS = frozenset({"name", "opener", "closer", "policy"})
 _PIPELINE_SECTION_KEYS = frozenset(
     {"source", "sources", "transforms", "gates", "row_unions", "aggregations", "coalesce", "queues", "sinks", "collectors", "scopes"}
 )
+# ``metadata`` is a Composer-only section: it is represented in
+# ``CompositionState.metadata`` but is not part of the runtime's
+# ``ElspethSettings`` model. Keep the complete set of keys this importer reads
+# separate from the structural subset used by the pipeline-shape guard.
+_COMPOSER_HANDLED_SECTION_KEYS = _PIPELINE_SECTION_KEYS | {"metadata"}
 
 # Sections that are DELIBERATELY dropped, with the ratified decision that says
 # so. This is not the same act as declining to support a section: the composer's
@@ -107,29 +112,46 @@ _DECLINED_SECTION_REASONS: dict[str, str] = {
     source_param="doc",
     suppresses=("R1", "R5"),
     invariant=(
-        "raises RuntimeYamlImportError naming every modelled ElspethSettings section the composer "
-        "cannot import; a section is never dropped silently"
+        "raises RuntimeYamlImportError naming every top-level key the composer neither imports nor "
+        "intentionally drops; a section is never dropped silently"
     ),
     test_ref="tests/unit/web/composer/test_yaml_importer.py::test_reject_unimportable_sections_refuses_a_declined_section_by_name",
     test_fingerprint="83b3cec68a80483e5281976e2b7ff8927fac25e34a07d973899f479f854f4f7b",
 )
-def _reject_unimportable_sections(doc: Mapping[str, object]) -> None:
-    """Refuse a document carrying a modelled section the composer cannot hold.
+def _reject_unimportable_sections(doc: Mapping[Any, object]) -> None:
+    """Refuse every top-level key the composer cannot faithfully classify.
 
     DERIVED from ``ElspethSettings.model_fields``, never restated: the previous
     hand-written subset silently discarded the fifteen sections outside it, and
     adding the missing names by hand would have rebuilt the same defect for the
-    sixteenth. A section this module has no opinion about is a hard error rather
-    than a quiet drop, so a NEW settings section cannot pass through unnoticed —
-    it arrives as a refusal naming itself until someone classifies it.
+    sixteenth. Keys outside the settings model are typos or foreign sections and
+    need the same fail-closed treatment. A section this module has no opinion
+    about is a hard error rather than a quiet drop, so either kind of new key
+    arrives as a refusal naming itself until someone classifies it.
     """
     from elspeth.core.config import ElspethSettings
 
+    keys = tuple(doc)
+    non_string = sorted(f"{key!r} ({type(key).__name__})" for key in keys if not isinstance(key, str))
+    if non_string:
+        raise RuntimeYamlImportError(f"pipeline YAML contains non-string top-level keys: {non_string}. Top-level keys must be strings.")
+
+    string_keys = tuple(key for key in keys if isinstance(key, str))
     modelled = frozenset(ElspethSettings.model_fields)
+    unknown = sorted(
+        key
+        for key in string_keys
+        if key not in modelled and key not in _COMPOSER_HANDLED_SECTION_KEYS and key not in _INTENTIONALLY_DROPPED_SECTIONS
+    )
+    if unknown:
+        raise RuntimeYamlImportError(
+            f"pipeline YAML contains unknown top-level keys: {unknown}. Importing would silently discard them. Check for typos."
+        )
+
     present = [
         key
-        for key in doc
-        if isinstance(key, str) and key in modelled and key not in _PIPELINE_SECTION_KEYS and key not in _INTENTIONALLY_DROPPED_SECTIONS
+        for key in string_keys
+        if key in modelled and key not in _COMPOSER_HANDLED_SECTION_KEYS and key not in _INTENTIONALLY_DROPPED_SECTIONS
     ]
     if not present:
         return
@@ -761,6 +783,7 @@ def composition_state_from_runtime_yaml(pipeline_yaml: str, *, version: int = 1)
         # object construction.
         raise RuntimeYamlImportError(f"YAML parse failed: {exc.__class__.__name__}") from exc
     doc = _require_mapping(parsed, "pipeline YAML")
+    _reject_unimportable_sections(doc)
     if not _PIPELINE_SECTION_KEYS & doc.keys():
         # A pasted document can be syntactically valid YAML *and* a mapping
         # (so it clears _require_mapping above) while describing nothing
@@ -774,8 +797,6 @@ def composition_state_from_runtime_yaml(pipeline_yaml: str, *, version: int = 1)
             "pipeline YAML must define at least one pipeline section "
             "(source, sources, transforms, gates, row_unions, aggregations, coalesce, collectors, scopes, queues, or sinks)"
         )
-
-    _reject_unimportable_sections(doc)
 
     raw_sources = doc.get("sources")
     if raw_sources is None and doc.get("source") is not None:
