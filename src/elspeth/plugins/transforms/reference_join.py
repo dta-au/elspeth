@@ -361,19 +361,27 @@ def _derive_joined_field_types(cfg: ReferenceJoinConfig, index: ReferenceIndex) 
     Under ``on_miss: fail`` the emitted set is CLOSED — a row either takes a
     value already resolved in the index or fails — so the type derives from
     exactly those values (a csv table therefore derives str unless an
-    expression converts: csv.DictReader yields str for every cell).
+    expression converts: csv.DictReader yields str for every cell). Closing it
+    means reading it at ENTRY granularity, not field granularity: ``process``
+    fails the whole row when any one output field is unresolved, so an entry
+    that leaves one field unresolved emits nothing for the others either, and
+    a None it happens to hold is not a value this join can write.
     ``default`` adds the configured default to the set, because a key miss is
-    always possible. ``null`` abstains outright: any row may miss and take a
-    None. Unification is conservative — mixed concrete types declare ``any``
-    (an honest abstention), never a guess; a None in the set makes the field
-    nullable rather than widening its type.
+    always possible, and every entry can emit there — an unresolved field takes
+    the default rather than failing the row. ``null`` abstains outright: any
+    row may miss and take a None. Unification is conservative — mixed concrete
+    types declare ``any`` (an honest abstention), never a guess; a None in the
+    set makes the field nullable rather than widening its type.
     """
+    emitting = list(index.entries.values())
+    if cfg.on_miss == "fail":
+        emitting = [entry_values for entry_values in emitting if all(entry_values[name] is not _UNRESOLVED for name in cfg.output)]
     derived: dict[str, FieldDefinition] = {}
     for name in sorted(cfg.output):
         if cfg.on_miss == "null":
             derived[name] = FieldDefinition(name=name, field_type="any", required=True, nullable=True)
             continue
-        values = [entry_values[name] for entry_values in index.entries.values() if entry_values[name] is not _UNRESOLVED]
+        values = [entry_values[name] for entry_values in emitting if entry_values[name] is not _UNRESOLVED]
         if cfg.on_miss == "default":
             values.append(cfg.default_values[name])
         types: set[Literal["str", "int", "float", "bool", "any"]] = {
@@ -397,6 +405,12 @@ def _validate_declared_output_types(cfg: ReferenceJoinConfig, derived: Mapping[s
     refused here at config load — the alternative was silently overwriting the
     author, which forced a TRUE declaration wrong and steered the correction
     downstream as type erasure (elspeth-cd5cb844bc).
+
+    ``required`` is refused rather than honored for a different reason: every
+    joined field is named in the output ``guaranteed_fields``, and
+    ``SchemaConfig.from_dict`` refuses a guarantee that is optional. Honoring
+    ``required: false`` would mint a config the authoring seam rejects, so the
+    contradiction is reported here instead of being rewritten in silence.
     """
     for declared in cfg.schema_config.fields or ():
         if declared.name not in derived:
@@ -416,7 +430,13 @@ def _validate_declared_output_types(cfg: ReferenceJoinConfig, derived: Mapping[s
             )
             raise ValueError(
                 f"schema declares {declared.name!r} as never null, but {reason}. "
-                "Declare the field nullable ({'name': ..., 'field_type': ..., 'nullable': true}) or remove the null."
+                f"Declare the field nullable — '{declared.name}: {declared.field_type}?' — or remove the null."
+            )
+        if not declared.required:
+            raise ValueError(
+                f"schema declares {declared.name!r} optional, but reference_join creates it and guarantees it on "
+                "every row it emits, and a guarantee cannot be optional. Declare it required, or drop it from "
+                "'fields' and let the join declare it."
             )
 
 
@@ -424,22 +444,15 @@ def _reference_join_added_output_fields(cfg: ReferenceJoinConfig, index: Referen
     """One definition per joined field, always required — the join writes every
     output field on every row it emits.
 
-    The author's own declaration wins when one exists (already validated
-    compatible by ``_validate_declared_output_types``); otherwise the type is
-    derived from the resolved index. ``required`` is forced True either way,
-    because the field is guaranteed below and an optional guarantee is a
-    contradiction.
+    The author's own declaration is taken WHOLE when one exists, never merged
+    with the derivation: ``_validate_declared_output_types`` has already refused
+    every part of it the resolved table refutes, so what is left is true and
+    rewriting any of it here would be the silent overwrite this change removes.
+    A field the author did not declare takes the derived definition.
     """
     derived = _derive_joined_field_types(cfg, index)
     declared_by_name = {field.name: field for field in cfg.schema_config.fields or ()}
-    added: list[FieldDefinition] = []
-    for name in sorted(cfg.output):
-        if name in declared_by_name:
-            declared = declared_by_name[name]
-            added.append(FieldDefinition(name=name, field_type=declared.field_type, required=True, nullable=declared.nullable))
-        else:
-            added.append(derived[name])
-    return tuple(added)
+    return tuple(declared_by_name[name] if name in declared_by_name else derived[name] for name in sorted(cfg.output))
 
 
 def _build_reference_join_output_schema_config(cfg: ReferenceJoinConfig, index: ReferenceIndex) -> SchemaConfig:
@@ -473,7 +486,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:734483e67976103c"
+    source_file_hash: str | None = "sha256:89af64c51dc15b48"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (

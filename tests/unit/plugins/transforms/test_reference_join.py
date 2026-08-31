@@ -610,6 +610,48 @@ class TestJoinedOutputFieldTypes:
         assert field.python_type is str
         assert field.source == "declared"
 
+    def test_an_entry_that_cannot_emit_contributes_no_value(self) -> None:
+        """Under fail, one unresolved field fails the WHOLE row (``process``).
+
+        So "coats" — whose ``b`` does not resolve — emits nothing at all, and
+        its ``a`` of None is not a value this join can ever write. Counting it
+        would declare ``a`` nullable and then refuse a true non-nullable
+        declaration, which is the closed set being read too wide.
+        """
+        table = json.dumps([{"sku": "hats", "a": "x", "b": "y"}, {"sku": "coats", "a": None}])
+        transform = build(reference_content=table, reference_format="json", output={"a": "ref['a']", "b": "ref['b']"})
+        field = _declared_output_field(transform, "a")
+        assert field.field_type == "str"
+        assert field.nullable is False, "the only entry that can emit carries no null"
+
+    def test_under_default_a_partially_sparse_entry_still_counts(self) -> None:
+        """That entry DOES emit here — the unresolved field takes the default."""
+        table = json.dumps([{"sku": "hats", "a": "x", "b": "y"}, {"sku": "coats", "a": None}])
+        transform = build(
+            reference_content=table,
+            reference_format="json",
+            output={"a": "ref['a']", "b": "ref['b']"},
+            on_miss="default",
+            default_values={"a": "n/a", "b": "n/a"},
+        )
+        field = _declared_output_field(transform, "a")
+        assert field.field_type == "str"
+        assert field.nullable is True, "the coats row emits, carrying its authored null"
+
+    def test_a_table_where_no_entry_resolves_every_field_abstains(self) -> None:
+        """Each field resolves somewhere, so the table loads — but no row emits.
+
+        Every key leaves some output field unresolved, so under fail every row
+        fails and the emitted set is genuinely empty. ``any`` is the honest
+        reading of an empty set; it is vacuous rather than wrong.
+        """
+        table = json.dumps([{"sku": "hats", "a": 1}, {"sku": "coats", "b": 2}])
+        transform = build(reference_content=table, reference_format="json", output={"a": "ref['a']", "b": "ref['b']"})
+        for name in ("a", "b"):
+            field = _declared_output_field(transform, name)
+            assert field.field_type == "any"
+            assert field.nullable is False
+
     def test_live_session_shape_a_downstream_str_declaration_is_green(self) -> None:
         """Session 891b7b1e: category→response_sla_hours over csv under fail.
 
@@ -700,3 +742,52 @@ class TestAuthorDeclarationsOnJoinedFields:
                 schema={"mode": "flexible", "fields": ["note: str"]},
             )
         assert "nullable" in str(exc.value)
+
+    def test_a_true_non_nullable_declaration_survives_a_partially_sparse_entry(self) -> None:
+        """The refusal must fire on a false claim only, never on a true one."""
+        table = json.dumps([{"sku": "hats", "a": "x", "b": "y"}, {"sku": "coats", "a": None}])
+        transform = build(
+            reference_content=table,
+            reference_format="json",
+            output={"a": "ref['a']", "b": "ref['b']"},
+            schema={"mode": "flexible", "fields": ["a: str"]},
+        )
+        field = _declared_output_field(transform, "a")
+        assert field.field_type == "str"
+        assert field.nullable is False
+
+    def test_an_optional_declaration_on_a_joined_field_is_refused(self) -> None:
+        """The join writes every output field on every row it emits, and names
+        them all in ``guaranteed_fields``.
+
+        ``SchemaConfig.from_dict`` refuses a guaranteed field that is optional,
+        so honoring ``required: false`` here would build a config the authoring
+        seam rejects. Refusing says so instead of silently rewriting it — the
+        same doctrine the type and nullable checks follow.
+        """
+        with pytest.raises(PluginConfigError) as exc:
+            build(
+                schema={
+                    "mode": "flexible",
+                    "fields": [{"name": "product_description", "type": "str", "required": False, "nullable": False}],
+                }
+            )
+        message = str(exc.value)
+        assert "product_description" in message
+        assert "guarantee" in message
+
+    def test_a_required_declaration_on_a_joined_field_is_accepted(self) -> None:
+        transform = build(
+            schema={
+                "mode": "flexible",
+                "fields": [{"name": "product_description", "type": "str", "required": True, "nullable": False}],
+            }
+        )
+        assert _declared_output_field(transform, "product_description").required is True
+
+    def test_an_optional_declaration_on_a_non_joined_field_is_untouched(self) -> None:
+        """Only the fields this transform creates carry the guarantee."""
+        transform = build(
+            schema={"mode": "flexible", "fields": [{"name": "order_id", "type": "str", "required": False, "nullable": False}]}
+        )
+        assert _declared_output_field(transform, "order_id").required is False
