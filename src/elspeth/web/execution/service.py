@@ -41,6 +41,7 @@ from elspeth.contracts.cli import ProgressEvent
 from elspeth.contracts.enums import NodeStateStatus, RunStatus, is_llm_authored_creation_modality
 from elspeth.contracts.errors import GracefulShutdownError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.plugin_semantics import SemanticOutcome, UnknownSemanticPolicy
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
@@ -144,6 +145,7 @@ from elspeth.web.execution.secret_guard import (
 )
 from elspeth.web.interpretation_state import InterpretationReviewPending, materialize_state_for_execution
 from elspeth.web.landscape_access import open_landscape_db
+from elspeth.web.plugin_policy.coverage import node_has_capability
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, WebPluginPolicy
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import validate_plugin_policy
@@ -1521,7 +1523,9 @@ class ExecutionServiceImpl:
                         ],
                     ),
                 )
-            llm_retry_policy_error = web_llm_retry_budget_policy_error(node.plugin, node.options)
+            llm_retry_policy_error = (
+                web_llm_retry_budget_policy_error(node.options) if node_has_capability(node, PluginCapability.LLM) else None
+            )
             if llm_retry_policy_error is not None:
                 raise PipelineValidationError(
                     errors=(

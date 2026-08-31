@@ -52,7 +52,7 @@ from elspeth.web.plugin_policy.coverage import (
 from elspeth.web.plugin_policy.coverage import (
     build_output_stream_graph as _output_stream_graph,
 )
-from elspeth.web.plugin_policy.coverage import node_has_blocking_control
+from elspeth.web.plugin_policy.coverage import node_has_blocking_control, node_has_capability
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
 INTERPRETATION_REQUIREMENTS_KEY = "interpretation_requirements"
@@ -528,7 +528,7 @@ def prompt_shield_recommendation_warning_pairs(
     graph = _output_stream_graph(state.nodes)
     warnings: list[tuple[str, str]] = []
     for node in state.nodes:
-        if node.plugin != "llm":
+        if not node_has_capability(node, PluginCapability.LLM):
             continue
         if _llm_has_authorized_shield_upstream(node, graph):
             continue  # State A — already shielded, silent
@@ -571,7 +571,7 @@ def _llm_untrusted_content_producers(
     not in the pipeline.
     """
 
-    if node.plugin != "llm":
+    if not node_has_capability(node, PluginCapability.LLM):
         return frozenset()
     return _stream_reaches_untrusted(node.input, graph, frozenset())
 
@@ -626,7 +626,7 @@ def _llm_has_authorized_shield_upstream(
     predecessor path is fail-safe (NOT proven safe), so the advisory still fires.
     """
 
-    if node.plugin != "llm":
+    if not node_has_capability(node, PluginCapability.LLM):
         return False
     return _stream_proves_shield(node.input, graph, frozenset())
 
@@ -678,7 +678,7 @@ def prompt_shield_state_for_node(
     ``False`` (State C, fail-safe).
     """
 
-    if node.plugin != "llm":
+    if not node_has_capability(node, PluginCapability.LLM):
         return "A"
     graph = _output_stream_graph(all_nodes)
     if _llm_has_authorized_shield_upstream(node, graph):
@@ -2309,7 +2309,7 @@ def _reconcile_node_options(
         if (
             kind is InterpretationKind.PIPELINE_DECISION
             and user_term == PROMPT_SHIELD_USER_TERM
-            and proposed.plugin == "llm"
+            and node_has_capability(proposed, PluginCapability.LLM)
             and _llm_has_authorized_shield_upstream(proposed, proposed_graph)
         ):
             continue
