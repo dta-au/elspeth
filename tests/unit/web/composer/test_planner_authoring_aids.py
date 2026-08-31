@@ -695,6 +695,22 @@ class TestForkCoalesceExemplar:
         assert len({llm["options"]["response_field"] for llm in llms}) == 2
         assert all("queries" not in llm["options"] for llm in llms)
 
+    def test_field_mapper_exemplar_teaches_source_to_target_rename_direction(self, tmp_path: Path) -> None:
+        """A real rename keeps mapping direction visible across both contracts."""
+        view, _snapshot = _profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        cleanup = next(node for node in args["nodes"] if node.get("plugin") == "field_mapper")
+        mapping = cleanup["options"]["mapping"]
+        assert mapping["sentiment"] == "ticket_sentiment"
+        assert any(source != target for source, target in mapping.items())
+
+        input_guarantees = set(cleanup["options"]["schema"]["guaranteed_fields"])
+        sink_fields = {field.partition(":")[0].strip() for field in args["outputs"][0]["options"]["schema"]["fields"]}
+        assert input_guarantees == set(mapping)
+        assert sink_fields == set(mapping.values())
+
     def test_forked_exemplar_still_builds_with_controls_inserted(self, tmp_path: Path) -> None:
         """Inserting the control nodes must not break the exemplar's topology.
 

@@ -814,6 +814,57 @@ class TestTransformExecutor:
         assert kwargs["path"] == TerminalPath.UNROUTED
         assert kwargs["context"]["exception_type"] == "DeclaredRequiredInputFieldsViolation"
 
+    def test_field_mapper_missing_mapping_source_never_reaches_non_strict_process(self) -> None:
+        """A derived mapping-source requirement closes the original silent-skip seam."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = FieldMapper(
+            {
+                "schema": {"mode": "observed"},
+                "mapping": {
+                    "colour": "colour",
+                    "complementary_colour": "recommended_pairing",
+                },
+                "strict": False,
+            }
+        )
+        transform.node_id = "tidy_output"
+        transform.on_error = "discard"
+        token = _make_token(
+            data={"colour": "blue"},
+            contract=SchemaContract(
+                mode="FLEXIBLE",
+                fields=(
+                    make_field(
+                        "colour",
+                        python_type=str,
+                        original_name="colour",
+                        required=True,
+                        source="declared",
+                    ),
+                ),
+                locked=True,
+            ),
+            token_id="tok_missing_mapping_source",
+        )
+        ctx = make_context()
+        transform.on_start(ctx)
+
+        with (
+            patch.object(FieldMapper, "process", autospec=True) as process,
+            pytest.raises(DeclaredRequiredInputFieldsViolation, match=r"missing \['complementary_colour'\]"),
+        ):
+            executor.execute_transform(transform, token, ctx)
+
+        process.assert_not_called()
+        factory.data_flow.record_token_outcome.assert_called_once()
+        kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
+        assert kwargs["outcome"] == TerminalOutcome.FAILURE
+        assert kwargs["path"] == TerminalPath.UNROUTED
+        assert kwargs["context"]["exception_type"] == "DeclaredRequiredInputFieldsViolation"
+
     def test_type_coerce_fixed_schema_accepts_pre_coercion_input_and_succeeds(self) -> None:
         """TypeCoerce must validate input before coercion and output after coercion."""
         from elspeth.plugins.transforms.type_coerce import TypeCoerce
