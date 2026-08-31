@@ -46,6 +46,7 @@ import {
 } from "@/utils/compositionState";
 import {
   branchEntries,
+  DISCARD_CONNECTION,
   publishedSuccessConnection,
   FAN_IN_NODE_TYPES,
 } from "@/lib/graphTopology";
@@ -704,7 +705,9 @@ function selectedComponentConfig(
       typeLabel: "sink",
       plugin: output.plugin,
       pluginKind: "sink",
-      connections: {},
+      connections: withoutNullishFields({
+        on_write_failure: output.on_write_failure,
+      }),
       options: output.options,
     };
   }
@@ -1288,6 +1291,45 @@ export function GraphView() {
       return true;
     }
     const nodeIds = new Set(rfNodes.map(n => n.id));
+    const outputIds = new Set(compositionState.outputs.map((output) => output.name));
+    function addDirectOutputErrorEdge(
+      kind: string,
+      sourceId: string,
+      targetId: string | undefined,
+    ): void {
+      if (
+        !targetId
+        || targetId === DISCARD_CONNECTION
+        || !outputIds.has(targetId)
+      ) {
+        return;
+      }
+      const semanticKey = edgeSemanticIdentity(
+        sourceId,
+        targetId,
+        "error",
+        "error",
+      );
+      if (existingConnections.has(semanticKey)) return;
+
+      rfEdges.push({
+        id: inferredSemanticEdgeId(
+          kind,
+          sourceId,
+          targetId,
+          "error",
+          "error",
+        ),
+        source: sourceId,
+        target: targetId,
+        label: "error",
+        data: { flowType: "error" },
+        animated: true,
+        style: { stroke: EDGE_COLORS.error, strokeWidth: 1.5 },
+        labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
+      });
+      existingConnections.add(semanticKey);
+    }
 
     // Always infer missing edges from connection properties.
     // ELSPETH uses a NAMED CONNECTION POINT model:
@@ -1647,6 +1689,12 @@ export function GraphView() {
         });
         existingConnections.add(semanticKey);
       }
+
+      addDirectOutputErrorEdge(
+        "source-validation-failure",
+        sourceId,
+        source.on_validation_failure,
+      );
     }
 
     // Handle direct sink references (on_success/on_error/routes pointing to sink names)
@@ -1786,6 +1834,17 @@ export function GraphView() {
           }
         }
       }
+    }
+
+    // Source validation and sink write failure are engine-level routes to
+    // configured outputs. They are not named-connection producers, so they
+    // stay out of buildProducerRegistry and are projected directly here.
+    for (const output of compositionState.outputs) {
+      addDirectOutputErrorEdge(
+        "output-write-failure",
+        output.name,
+        output.on_write_failure,
+      );
     }
 
     // DELIBERATE EXCLUSION: this outbound rewrite stays row_union-scoped and

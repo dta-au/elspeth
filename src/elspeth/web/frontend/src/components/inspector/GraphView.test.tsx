@@ -1235,6 +1235,213 @@ describe("GraphView", () => {
       ]);
     });
 
+    it("keeps source success and validation-failure semantics when both target the same sink", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          sources: {
+            source: {
+              plugin: "csv",
+              options: {},
+              on_success: "quarantine",
+              on_validation_failure: "quarantine",
+            },
+          },
+          outputs: [{ name: "quarantine", plugin: "json", options: {} }],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+
+      const routes = edgeElements(container, "source", "quarantine");
+      expect(routes).toHaveLength(2);
+      expect(routes.map((edge) => edge.textContent).sort()).toEqual([
+        "error",
+        "success",
+      ]);
+      expectDistinctVisibleLanes(routes);
+      expect(connectionTexts("source to quarantine:")).toEqual([
+        "source to quarantine: error (error)",
+        "source to quarantine: success (success)",
+      ]);
+    });
+
+    it("draws output write-failure routing and exposes it through the keyboard inspector", async () => {
+      const user = userEvent.setup();
+      useSessionStore.setState({
+        selectedNodeId: null,
+        selectNode: (nodeId: string | null) =>
+          useSessionStore.setState({ selectedNodeId: nodeId } as never),
+        compositionState: makeState({
+          sources: {
+            source: { plugin: "csv", options: {}, on_success: "results" },
+          },
+          outputs: [
+            {
+              name: "results",
+              plugin: "csv",
+              options: {},
+              on_write_failure: "failed_writes",
+            },
+            {
+              name: "failed_writes",
+              plugin: "json",
+              options: {},
+              on_write_failure: "discard",
+            },
+          ],
+        }),
+      } as never);
+
+      const { container } = render(<GraphView />);
+
+      const failureRoutes = edgeElements(container, "results", "failed_writes");
+      expect(failureRoutes).toHaveLength(1);
+      expect(failureRoutes[0]).toHaveTextContent("error");
+      expect(connectionTexts("results to failed_writes:")).toEqual([
+        "results to failed_writes: error (error)",
+      ]);
+
+      const components = screen.getByRole("list", {
+        name: /pipeline components in source-to-sink order/i,
+      });
+      const results = within(components).getByRole("button", {
+        name: /sink: results/i,
+      });
+      results.focus();
+      await user.keyboard("{Enter}");
+
+      const panel = screen.getByRole("complementary", {
+        name: /results configuration/i,
+      });
+      expect(panel).toHaveFocus();
+      await user.click(within(panel).getByText("Connections & schema"));
+      expect(within(panel).getByText("on_write_failure")).toBeInTheDocument();
+      expect(within(panel).getByText("failed_writes")).toBeInTheDocument();
+    });
+
+    it("does not duplicate engine failure routes already represented by explicit edge hints", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          sources: {
+            source: {
+              plugin: "csv",
+              options: {},
+              on_success: "results",
+              on_validation_failure: "quarantine",
+            },
+          },
+          edges: [
+            makeEdge({
+              id: "source-failure-hint",
+              from_node: "source",
+              to_node: "quarantine",
+              edge_type: "on_error",
+              label: "error",
+            }),
+            makeEdge({
+              id: "write-failure-hint",
+              from_node: "results",
+              to_node: "failed_writes",
+              edge_type: "on_error",
+              label: "error",
+            }),
+          ],
+          outputs: [
+            {
+              name: "results",
+              plugin: "csv",
+              options: {},
+              on_write_failure: "failed_writes",
+            },
+            {
+              name: "quarantine",
+              plugin: "json",
+              options: {},
+              on_write_failure: "discard",
+            },
+            {
+              name: "failed_writes",
+              plugin: "json",
+              options: {},
+              on_write_failure: "discard",
+            },
+          ],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+
+      expect(edgeElements(container, "source", "quarantine")).toHaveLength(1);
+      expect(edgeElements(container, "results", "failed_writes")).toHaveLength(1);
+      expect(connectionTexts("source to quarantine:")).toEqual([
+        "source to quarantine: error (error)",
+      ]);
+      expect(connectionTexts("results to failed_writes:")).toEqual([
+        "results to failed_writes: error (error)",
+      ]);
+    });
+
+    it("keeps discard failure settings inspectable without inventing a node or edge", async () => {
+      const user = userEvent.setup();
+      useSessionStore.setState({
+        selectedNodeId: null,
+        selectNode: (nodeId: string | null) =>
+          useSessionStore.setState({ selectedNodeId: nodeId } as never),
+        compositionState: makeState({
+          sources: {
+            source: {
+              plugin: "csv",
+              options: {},
+              on_success: "results",
+              on_validation_failure: "discard",
+            },
+          },
+          outputs: [
+            {
+              name: "results",
+              plugin: "csv",
+              options: {},
+              on_write_failure: "discard",
+            },
+          ],
+        }),
+      } as never);
+
+      const { container } = render(<GraphView />);
+
+      expect(screen.queryByTestId("node-discard")).not.toBeInTheDocument();
+      expect(container.querySelectorAll('[data-edge-target="discard"]')).toHaveLength(0);
+      expect(connectionTexts("source to discard:")).toEqual([]);
+      expect(connectionTexts("results to discard:")).toEqual([]);
+
+      const components = screen.getByRole("list", {
+        name: /pipeline components in source-to-sink order/i,
+      });
+      const source = within(components).getByRole("button", {
+        name: /^source:/i,
+      });
+      source.focus();
+      await user.keyboard("{Enter}");
+      let panel = screen.getByRole("complementary", {
+        name: /source configuration/i,
+      });
+      await user.click(within(panel).getByText("Connections & schema"));
+      expect(within(panel).getByText("on_validation_failure")).toBeInTheDocument();
+      expect(within(panel).getByText("discard")).toBeInTheDocument();
+
+      const results = within(components).getByRole("button", {
+        name: /sink: results/i,
+      });
+      results.focus();
+      await user.keyboard("{Enter}");
+      panel = screen.getByRole("complementary", {
+        name: /results configuration/i,
+      });
+      await user.click(within(panel).getByText("Connections & schema"));
+      expect(within(panel).getByText("on_write_failure")).toBeInTheDocument();
+      expect(within(panel).getByText("discard")).toBeInTheDocument();
+    });
+
     it("keeps a fork branch edge and a route edge that re-enters the same branch", () => {
       useSessionStore.setState({
         compositionState: makeState({
