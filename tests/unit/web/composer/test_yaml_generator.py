@@ -19,6 +19,10 @@ from elspeth.web.composer.state import (
     SourceSpec,
 )
 from elspeth.web.composer.yaml_generator import (
+    _MARKER_LABELS,
+    _PUBLIC_SOURCE_LINKAGE_KEYS,
+    _PUBLIC_STORAGE_OPTION_KEYS,
+    PUBLIC_EXPORT_REBIND_GUIDANCE,
     PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX,
     PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX,
     PUBLIC_EXPORT_REDACTION_HEADER,
@@ -28,6 +32,7 @@ from elspeth.web.composer.yaml_generator import (
     generate_public_yaml,
     generate_yaml,
     public_export_redaction,
+    public_export_redaction_header,
 )
 from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY, SOURCE_AUTHORING_KEY
@@ -2041,13 +2046,14 @@ class TestProfileLoweringProvenanceStrip:
 
 
 class TestPublicExportRedactionMarker:
-    """The public export names its own redaction (elspeth-06f92da0d9).
+    """The public export can name its own redaction (elspeth-06f92da0d9).
 
     The custody scrub is deliberate and stays; what these tests pin is that
-    a redacted export is never presented bare: the text opens with a header
-    comment naming what was stripped per component, and
-    ``public_export_redaction`` reports the same facts structurally. Blob
-    UUIDs never appear (scrub ruling 2304d57fb).
+    the download boundary can say what was stripped instead of presenting the
+    not-runnable YAML bare, and that the marker stays OUT of
+    ``generate_public_yaml`` so the MCP / shareable-review / acceptance-import
+    consumers keep bare bytes. Blob UUIDs never appear (scrub ruling
+    2304d57fb).
     """
 
     @staticmethod
@@ -2093,30 +2099,63 @@ class TestPublicExportRedactionMarker:
             version=1,
         )
 
-    def test_redacted_export_opens_with_marker_header(self) -> None:
+    def test_redaction_header_names_each_stripped_component(self) -> None:
+        header = public_export_redaction_header(self._redacted_state())
+
+        assert header.startswith(PUBLIC_EXPORT_REDACTION_HEADER)
+        assert f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}source stripped=blob-linkage,local-path" in header
+        assert f"{PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX}out stripped=local-path" in header
+        assert PUBLIC_EXPORT_REBIND_GUIDANCE in header
+        # The marker names categories, never the stripped values themselves.
+        assert "20b944e3" not in header
+        assert "/data/blobs" not in header
+
+    def test_marker_prose_uses_labels_not_raw_option_keys(self) -> None:
+        """The category labels exist to keep custody-egress greps meaningful.
+
+        Sibling consumers assert no literal blob-linkage key token appears in
+        a serialised public artifact (``tests/unit/composer_mcp/test_server.py``,
+        ``tests/unit/web/shareable_reviews/test_service.py``). The labels keep
+        ``blob_ref`` out of the prose; ``blob_id`` survives only inside the
+        ``source_blob_ids`` request-field name the user must actually type,
+        which is the concrete reason this block cannot live in
+        ``generate_public_yaml`` (see the fence test below).
+        """
+        header = public_export_redaction_header(self._redacted_state())
+
+        assert "blob_ref" not in header
+        assert "source_blob_ids" in header
+        assert "blob_id" in header  # only as a substring of source_blob_ids
+        assert "blob_id=" not in header
+
+    def test_generate_public_yaml_stays_bare_for_sibling_consumers(self) -> None:
+        """Fence: the marker must never migrate back into the shared generator.
+
+        ``generate_public_yaml`` also feeds the MCP ``generate_yaml`` tool, the
+        content-addressed shareable-review snapshot, and the ECS acceptance
+        harness's ``POST /state/yaml`` round trip. Header bytes there break the
+        custody-egress greps and make an exporter emit text the importer
+        re-parses. Only ``GET /{session_id}/state/yaml`` composes the header.
+        """
         rendered = generate_public_yaml(self._redacted_state())
 
-        assert rendered.startswith(PUBLIC_EXPORT_REDACTION_HEADER)
-        assert f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}source stripped=blob_ref,path" in rendered
-        assert f"{PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX}out stripped=path" in rendered
-        assert "source_blob_ids" in rendered  # the re-bind guidance names the import argument
-        # The marker must never leak the stripped values themselves.
-        assert "20b944e3" not in rendered
-        assert "/data/blobs" not in rendered
+        assert PUBLIC_EXPORT_REDACTION_HEADER not in rendered
+        assert not rendered.startswith("#")
+        assert "blob_ref" not in rendered
+        assert "blob_id" not in rendered
+        assert "source_blob_ids" not in rendered
 
     def test_header_is_comment_only_and_body_parses_unchanged(self) -> None:
         state = self._redacted_state()
 
-        rendered = generate_public_yaml(state)
+        document = public_export_redaction_header(state) + generate_public_yaml(state)
 
-        assert yaml.safe_load(rendered) == generate_public_pipeline_dict(state)
-        assert generate_public_yaml(state) == rendered  # deterministic
+        assert yaml.safe_load(document) == generate_public_pipeline_dict(state)
+        # Deterministic for a given state: same bytes on every call.
+        assert public_export_redaction_header(state) + generate_public_yaml(state) == document
 
     def test_clean_export_carries_no_marker(self) -> None:
-        rendered = generate_public_yaml(self._clean_state())
-
-        assert PUBLIC_EXPORT_REDACTION_HEADER not in rendered
-        assert not rendered.startswith("#")
+        assert public_export_redaction_header(self._clean_state()) == ""
 
     def test_public_export_redaction_reports_stripped_keys_per_component(self) -> None:
         assert public_export_redaction(self._redacted_state()) == {
@@ -2124,3 +2163,13 @@ class TestPublicExportRedactionMarker:
             "outputs": {"out": ["path"]},
         }
         assert public_export_redaction(self._clean_state()) == {"sources": {}, "outputs": {}}
+
+    def test_marker_labels_cover_every_stripped_key(self) -> None:
+        """A new storage/linkage key must not KeyError inside a user's export.
+
+        ``_marker_labels`` indexes ``_MARKER_LABELS`` directly (house offensive
+        style). This pins the label vocabulary against the same authorities
+        ``public_export_redaction`` reports from, so widening either set fails
+        here rather than 500-ing the export route.
+        """
+        assert set(_MARKER_LABELS) == _PUBLIC_STORAGE_OPTION_KEYS | _PUBLIC_SOURCE_LINKAGE_KEYS

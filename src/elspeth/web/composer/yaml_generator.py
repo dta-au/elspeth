@@ -721,10 +721,16 @@ def public_export_redaction(state: CompositionState) -> PublicExportRedaction:
 
 
 # The marker prose uses category labels, not raw option-key names: the
-# custody-egress guards (MCP server, shareable reviews) pin the literal
-# key tokens (e.g. "blob_ref") absent from public YAML text, and an
-# explanatory comment must not weaken those greps. The structured route
-# response (`StateYamlRedaction`) carries the exact key names instead.
+# custody-egress guards over sibling consumers assert that the literal key
+# tokens never appear anywhere in a serialised public artifact, and an
+# explanatory comment must not weaken those greps. Exact key names travel on
+# the structured route response (`StateYamlRedaction`) instead, where they are
+# data rather than prose.
+#
+# The keys are the union of the projection's own storage-key authorities and
+# the blob-linkage keys; `test_marker_labels_cover_every_stripped_key` pins
+# that coverage, so a new path option fails CI instead of raising KeyError
+# inside a user's export.
 _MARKER_LABELS = {
     "path": "local-path",
     "file": "local-path",
@@ -739,7 +745,14 @@ def _marker_labels(keys: list[str]) -> str:
 
 
 def public_export_redaction_header(state: CompositionState) -> str:
-    """Header comment block naming the redactions, or ``""`` when none apply."""
+    """Marker block for a public export that leaves ELSPETH as a document.
+
+    Returns ``""`` when the projection stripped nothing. Apply this ONLY at
+    the user-download boundary (``GET /{session_id}/state/yaml``) and never
+    inside :func:`generate_public_yaml` — see that function for why the other
+    consumers keep bare bytes. Deterministic for a given state: the account is
+    derived from the same state the body is.
+    """
     redaction = public_export_redaction(state)
     if not redaction["sources"] and not redaction["outputs"]:
         return ""
@@ -755,13 +768,25 @@ def public_export_redaction_header(state: CompositionState) -> str:
 def generate_public_yaml(state: CompositionState) -> str:
     """Convert a CompositionState to deterministic public export/share/MCP YAML.
 
-    When the public projection stripped custody data (source paths / blob
-    linkage, sink paths), the text carries a leading comment block naming
-    exactly what was removed and how to re-bind it — the redaction is
-    deliberate and stays, but it must never be presented bare
-    (elspeth-06f92da0d9). Determinism is preserved: the header derives from
-    the same state as the body.
+    Returns the projected document and nothing else. The custody-redaction
+    marker block (:func:`public_export_redaction_header`) is deliberately NOT
+    applied here: this function serves four consumers with different
+    contracts, and only one of them hands a user a document to keep
+    (elspeth-06f92da0d9).
+
+    * The MCP ``generate_yaml`` tool and the shareable-review snapshot each
+      carry a structured composition beside the text, and both are covered by
+      custody-egress guards asserting no literal blob-linkage key token
+      appears anywhere in the serialised artifact — prose naming the
+      ``source_blob_ids`` re-bind field trips them.
+    * The share snapshot is content-addressed, so these bytes are an identity.
+    * ``web/_aws_ecs_acceptance/capture.py`` feeds this output straight back
+      into ``POST /state/yaml``, which makes the generator an import producer
+      as well as an export producer; a marker here would be an instruction the
+      importer then re-parses.
+
+    The export route composes header + body. Every other consumer keeps the
+    bare document.
     """
     doc = generate_public_pipeline_dict(state)
-    body = yaml.dump(doc, default_flow_style=False, sort_keys=False)
-    return public_export_redaction_header(state) + body
+    return yaml.dump(doc, default_flow_style=False, sort_keys=False)

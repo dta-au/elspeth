@@ -19,6 +19,7 @@ from elspeth.web.composer.yaml_generator import (
     PUBLIC_EXPORT_REBIND_GUIDANCE,
     PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX,
     public_export_redaction,
+    public_export_redaction_header,
     reattach_guided_blob_refs_for_public_export,
 )
 from elspeth.web.composer.yaml_importer import (
@@ -1062,7 +1063,13 @@ async def get_state_yaml(
         request=request,
         session_id=session.id,
     )
-    yaml_str = generate_public_yaml(export_state)
+    # elspeth-06f92da0d9: this route is the one consumer that hands the user a
+    # document to keep, so it is where the deliberate custody redaction stops
+    # being invisible — header first, then the bare projection. The marker
+    # lives here rather than in ``generate_public_yaml`` because the MCP,
+    # share, and acceptance-import consumers of that function must keep bare
+    # bytes (see its docstring).
+    yaml_str = public_export_redaction_header(export_state) + generate_public_yaml(export_state)
 
     # Phase 6A B3 — sessions-DB audit event for YAML export.
     #
