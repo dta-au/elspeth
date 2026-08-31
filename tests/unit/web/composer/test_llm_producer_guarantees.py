@@ -108,7 +108,14 @@ def _llm_node(node_id: str, source: str, out: str, response_field: str) -> NodeS
     )
 
 
-def _consumer(node_id: str, source: str, required: list[str], mapping: dict[str, str]) -> NodeSpec:
+def _consumer(node_id: str, source: str, required: list[str] | None, mapping: dict[str, str]) -> NodeSpec:
+    options: dict[str, Any] = {
+        "mapping": mapping,
+        "select_only": True,
+        "schema": {"mode": "observed"},
+    }
+    if required is not None:
+        options["required_input_fields"] = required
     return NodeSpec(
         id=node_id,
         node_type="transform",
@@ -116,12 +123,7 @@ def _consumer(node_id: str, source: str, required: list[str], mapping: dict[str,
         input=source,
         on_success="main",
         on_error="discard",
-        options={
-            "mapping": mapping,
-            "select_only": True,
-            "schema": {"mode": "observed"},
-            "required_input_fields": required,
-        },
+        options=options,
         condition=None,
         routes=None,
         fork_to=None,
@@ -162,7 +164,7 @@ def _probe_failed_warnings(summary: ValidationSummary) -> list[str]:
     return [w.message for w in summary.warnings if "Computed contract probe" in w.message]
 
 
-def _linear_summary(required: list[str]) -> ValidationSummary:
+def _linear_summary(required: list[str] | None) -> ValidationSummary:
     state = _base_state()
     state = state.with_node(_llm_node("recommend_pairing", "rows", "pairing_done", "complementary_colour"))
     state = state.with_node(
@@ -176,7 +178,7 @@ def _linear_summary(required: list[str]) -> ValidationSummary:
     return _with_output(state).validate()
 
 
-def _fork_coalesce_summary(required: list[str]) -> ValidationSummary:
+def _fork_coalesce_summary(required: list[str] | None) -> ValidationSummary:
     """The live-session shape: fork -> two llm arms -> union coalesce -> consumer."""
     state = _base_state()
     state = state.with_node(
@@ -228,13 +230,15 @@ def _fork_coalesce_summary(required: list[str]) -> ValidationSummary:
 
 class TestLlmProducerGuarantees:
     def test_linear_llm_consumer_requiring_response_field_is_accepted(self) -> None:
-        summary = _linear_summary(["colour", "complementary_colour"])
+        # No hand-authored required_input_fields: the field_mapper mapping is
+        # the authority that derives this consumer contract.
+        summary = _linear_summary(None)
         assert _contract_violations(summary) == []
         assert summary.is_valid, [e.to_dict() for e in summary.errors]
 
     def test_linear_llm_probe_emits_no_probe_failure_warning(self) -> None:
         """The fail-closed arm must not be reached for a well-authored llm node."""
-        summary = _linear_summary(["colour", "complementary_colour"])
+        summary = _linear_summary(None)
         assert _probe_failed_warnings(summary) == []
 
     def test_linear_llm_consumer_requiring_absent_field_is_still_rejected(self) -> None:
@@ -250,8 +254,8 @@ class TestLlmProducerGuarantees:
         assert "complementary_colour" in joined
 
     def test_fork_coalesce_llm_pipeline_is_accepted(self) -> None:
-        """elspeth-d4ae04b374's live shape validates once llm guarantees are real."""
-        summary = _fork_coalesce_summary(["colour", "complementary_colour", "hex_code"])
+        """The live shape validates using field_mapper's DERIVED requirements."""
+        summary = _fork_coalesce_summary(None)
         assert _contract_violations(summary) == []
         assert summary.is_valid, [e.to_dict() for e in summary.errors]
 

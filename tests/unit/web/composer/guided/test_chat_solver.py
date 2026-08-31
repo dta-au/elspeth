@@ -37,6 +37,7 @@ from elspeth.web.composer.guided.chat_solver import (
     Step1SourceChatResolution,
     _build_step_1_source_dynamic_block,
     _build_step_2_sink_tool_prompt,
+    _llm_safe_schema_option,
     _parse_step_1_source_tool_arguments,
     _parse_step_2_sink_tool_arguments,
     _step_2_sink_digest_block,
@@ -3100,6 +3101,30 @@ def test_build_step_chat_context_block_names_artifacts_llm_safely() -> None:
     assert "/srv/elspeth/blobs" not in block.system_content
     assert _FREEFORM_BLOB_REF not in block.system_content
     assert "results.jsonl" not in block.system_content
+
+
+def test_llm_safe_schema_preserves_explicit_empty_guarantee_vote() -> None:
+    projected = _llm_safe_schema_option(
+        {"mode": "observed", "guaranteed_fields": []},
+        field_aliases={},
+    )
+
+    assert projected == {"mode": "observed", "guaranteed_fields": []}
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"mode": "observed"},
+        {"mode": "observed", "guaranteed_fields": "not-a-sequence"},
+        {"mode": "observed", "guaranteed_fields": [7]},
+        {"mode": "observed", "guaranteed_fields": ["unknown"]},
+    ],
+)
+def test_llm_safe_schema_does_not_mint_an_empty_vote_from_absent_or_unprojectable_guarantees(
+    schema: dict[str, object],
+) -> None:
+    assert _llm_safe_schema_option(schema, field_aliases={}) == {"mode": "observed"}
 
 
 def test_context_block_reports_blob_binding_from_the_guided_path_sentinel() -> None:

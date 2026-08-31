@@ -81,6 +81,33 @@ interface DataContractDraft {
   missingFromSample: string[];
 }
 
+const DATA_CONTRACT_DRAFT_VERSION = 2;
+const DATA_CONTRACT_DRAFT_KEYS = [
+  "contract_version",
+  "kind",
+  "demanded_fields",
+  "sample_header",
+  "missing_from_sample",
+] as const;
+
+function compareUnicodeCodePoints(left: string, right: string): number {
+  const leftPoints = Array.from(left, (char) => char.codePointAt(0) ?? 0);
+  const rightPoints = Array.from(right, (char) => char.codePointAt(0) ?? 0);
+  const sharedLength = Math.min(leftPoints.length, rightPoints.length);
+  for (let index = 0; index < sharedLength; index += 1) {
+    const difference = leftPoints[index] - rightPoints[index];
+    if (difference !== 0) return difference;
+  }
+  return leftPoints.length - rightPoints.length;
+}
+
+function stringArraysEqual(left: string[], right: string[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
+}
+
 export function parseDataContractDraft(draft: string): DataContractDraft | null {
   let payload: unknown;
   try {
@@ -90,6 +117,15 @@ export function parseDataContractDraft(draft: string): DataContractDraft | null 
   }
   if (typeof payload !== "object" || payload === null) return null;
   const record = payload as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (
+    keys.length !== DATA_CONTRACT_DRAFT_KEYS.length ||
+    !DATA_CONTRACT_DRAFT_KEYS.every((key) => keys.includes(key)) ||
+    record["contract_version"] !== DATA_CONTRACT_DRAFT_VERSION ||
+    record["kind"] !== "source_data_contract"
+  ) {
+    return null;
+  }
   const demanded = record["demanded_fields"];
   if (
     !Array.isArray(demanded) ||
@@ -97,20 +133,40 @@ export function parseDataContractDraft(draft: string): DataContractDraft | null 
   ) {
     return null;
   }
+  const demandedFields = demanded as string[];
+  const canonicalDemanded = [...new Set(demandedFields)].sort(
+    compareUnicodeCodePoints,
+  );
+  if (
+    demandedFields.length === 0 ||
+    !stringArraysEqual(demandedFields, canonicalDemanded)
+  ) {
+    return null;
+  }
   const sample = record["sample_header"];
-  const sampleHeader =
-    sample === null || sample === undefined
-      ? null
-      : Array.isArray(sample) && sample.every((cell) => typeof cell === "string")
-        ? (sample as string[])
-        : null;
+  if (
+    sample !== null &&
+    (!Array.isArray(sample) ||
+      !sample.every((cell) => typeof cell === "string"))
+  ) {
+    return null;
+  }
   const missing = record["missing_from_sample"];
-  const missingFromSample =
-    Array.isArray(missing) && missing.every((field) => typeof field === "string")
-      ? (missing as string[])
-      : [];
+  if (
+    !Array.isArray(missing) ||
+    !missing.every((field) => typeof field === "string")
+  ) {
+    return null;
+  }
+  const missingFromSample = missing as string[];
+  const sampleHeader = sample as string[] | null;
+  const expectedMissing =
+    sampleHeader === null
+      ? []
+      : demandedFields.filter((field) => !sampleHeader.includes(field));
+  if (!stringArraysEqual(missingFromSample, expectedMissing)) return null;
   return {
-    demandedFields: demanded as string[],
+    demandedFields,
     sampleHeader,
     missingFromSample,
   };
@@ -381,7 +437,8 @@ export function AcknowledgementCard({
 
   // Data-contract body: the demanded columns with per-field sample warnings,
   // the illustrative sample note, and the honest consequence of acknowledging
-  // (rows missing a promised column QUARANTINE; the run continues). Falls back
+  // (a valid source row that breaks the producer guarantee stops the run).
+  // Source-validation quarantine is a separate, earlier path. Falls back
   // to the raw draft when the payload cannot be parsed — an attestation
   // surface must never silently render a degraded summary as the real one.
   const dataContract =
@@ -429,9 +486,11 @@ export function AcknowledgementCard({
             )}
           </p>
           <p className="ack-card-data-contract-note">
-            A column only needs to be <em>present</em> on each row — it may be
-            empty. Rows missing one of these columns will be set aside
-            (quarantined) and the run continues.
+            Each valid row must carry the column in both its data and emitted
+            schema contract; the value may be empty. If either omits one of
+            these columns, the run stops and records a source data-contract
+            failure. Rows quarantined during source validation are handled
+            separately and never reach this check.
           </p>
         </div>
       ) : (

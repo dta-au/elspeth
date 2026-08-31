@@ -7,13 +7,13 @@ from typing import NotRequired, TypedDict
 from pydantic import BaseModel, ConfigDict, Field
 
 from elspeth.contracts.blobs import BlobRecord
-from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.secrets import collect_credential_field_violations
 from elspeth.web.blobs.protocol import BlobNotFoundError, BlobServiceProtocol
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
+from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.state import CompositionState, SourceSpec
 from elspeth.web.composer.yaml_generator import (
     PUBLIC_EXPORT_REBIND_GUIDANCE,
@@ -27,7 +27,7 @@ from elspeth.web.composer.yaml_importer import (
     RuntimeYamlImportError,
     composition_state_from_runtime_yaml,
 )
-from elspeth.web.interpretation_state import BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX, parse_interpretation_requirements
+from elspeth.web.interpretation_state import parse_interpretation_requirements
 from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS, allowed_source_directories, managed_blob_directory, resolve_data_path
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
@@ -83,6 +83,37 @@ from .._helpers import (
 )
 
 router = APIRouter()
+
+_STATE_REVERT_SURFACE_PROVENANCE = "state_revert"
+_E2E_SEED_SURFACE_PROVENANCE = "e2e_seed"
+
+
+async def _surface_reverted_interpretation_reviews(
+    service: SessionServiceProtocol,
+    *,
+    session_id: UUID,
+    state_record: Any,
+) -> None:
+    """Repair review-card debt for a fresh or replayed revert result."""
+    # Historical minimal service-authored checkpoints can predate populated
+    # metadata and therefore cannot be promoted to CompositionState. They also
+    # predate structured interpretation requirements; preserve their existing
+    # revert compatibility instead of turning this additive repair into a 500.
+    if state_record.metadata_ is None:
+        return
+    from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+
+    await surface_pending_interpretation_reviews_for_state(
+        _state_from_record(state_record),
+        sessions_service=service,
+        session_id=str(session_id),
+        current_state_id=str(state_record.id),
+        model_identifier=_STATE_REVERT_SURFACE_PROVENANCE,
+        model_version=_STATE_REVERT_SURFACE_PROVENANCE,
+        provider=_STATE_REVERT_SURFACE_PROVENANCE,
+        composer_skill_hash=_STATE_REVERT_SURFACE_PROVENANCE,
+        only_missing_evidence=True,
+    )
 
 
 def _composition_plugin_policy_findings(
@@ -608,6 +639,11 @@ async def revert_state(
         if type(result) is not GuidedCompositionStateResult:
             raise AuditIntegrityError("State revert replay has a non-state result locator")
         replay_state = await service.get_state_in_session(result.state_id, session.id)
+        await _surface_reverted_interpretation_reviews(
+            service,
+            session_id=session.id,
+            state_record=replay_state,
+        )
         with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
             return _state_response(replay_state, policy_catalog=catalog)
 
@@ -643,6 +679,12 @@ async def revert_state(
                 actor="composer_route",
             )
             raise_guided_operation_failure(failure)
+
+    await _surface_reverted_interpretation_reviews(
+        service,
+        session_id=session.id,
+        state_record=new_state,
+    )
 
     with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
         return _state_response(new_state, policy_catalog=catalog)
@@ -690,6 +732,34 @@ async def import_state_yaml(
             user_id=str(user.user_id),
         )
         _reject_malformed_interpretation_requirements(imported_state)
+        # Import must be atomic with respect to review recoverability. Reuse
+        # the generic Composer surfacer's own pure site-to-writer mapping so a
+        # pending site that cannot become a consumable event is rejected before
+        # the composition state is saved.
+        from elspeth.web.composer.service import (
+            prepare_pending_interpretation_event_drafts_for_state,
+            unsurfaceable_pending_interpretation_review_sites,
+        )
+
+        try:
+            unsurfaceable_sites = unsurfaceable_pending_interpretation_review_sites(imported_state)
+        except (InvariantError, KeyError, TypeError, ValueError) as exc:
+            # These remain invariant failures for internally persisted state.
+            # At this route the state is untrusted YAML, so reject statically
+            # without echoing its field names or values.
+            raise HTTPException(
+                status_code=400,
+                detail="Imported YAML contains malformed interpretation review metadata.",
+            ) from exc
+        if unsurfaceable_sites:
+            site_labels = ", ".join(f"{site.component_id}:{site.kind.value}" for site in unsurfaceable_sites)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Imported YAML contains pending interpretation review site(s) that cannot be surfaced: "
+                    f"{site_labels}. Remove or repair the hand-written interpretation_requirements entry and re-import."
+                ),
+            )
 
         service: SessionServiceProtocol = request.app.state.session_service
         state_data, _validation = await _state_data_from_composer_state(
@@ -706,19 +776,21 @@ async def import_state_yaml(
             initial_version=imported_state.version,
             telemetry_source="compose",
         )
-        state_record = await service.save_composition_state(
+        interpretation_drafts = prepare_pending_interpretation_event_drafts_for_state(
+            imported_state,
+            model_identifier=_YAML_IMPORT_SURFACE_PROVENANCE,
+            model_version=_YAML_IMPORT_SURFACE_PROVENANCE,
+            provider=_YAML_IMPORT_SURFACE_PROVENANCE,
+            composer_skill_hash=_YAML_IMPORT_SURFACE_PROVENANCE,
+        )
+        response_state = await service.save_composition_state_with_interpretations(
             session.id,
             state_data,
             provenance="session_seed",
-        )
-        await _surface_imported_interpretation_review_events(
-            service,
-            session_id=session.id,
-            state=imported_state,
-            composition_state_id=UUID(str(state_record.id)),
+            interpretations=interpretation_drafts,
         )
         with _named_guided_custody_projection():
-            return _state_response(state_record, policy_catalog=catalog)
+            return _state_response(response_state, policy_catalog=catalog)
 
 
 # Provenance sentinel for interpretation events surfaced by the YAML import
@@ -736,93 +808,30 @@ def _reject_malformed_interpretation_requirements(state: CompositionState) -> No
     Legitimate exports never carry requirement rows (``strip_authoring_options``
     removes them at export) and the importer's auto-stagers only emit
     well-formed rows, so any malformed row here was hand-written into the
-    pasted document. Rejecting outright is the same
+    pasted document. Sources and nodes cross the same untrusted YAML boundary;
+    checking only nodes would turn a malformed source row into a later 500.
+    Rejecting outright is the same
     stricter-than-the-tool-path posture as ``_reject_fabricated_secret_literals``
     for this paste-facing entry point — and it guarantees the post-persist
     surfacing pass below can parse every row without a post-persist failure
-    path. Audit hygiene: name the node, never echo row content.
+    path. Audit hygiene: name the component, never echo row content.
     """
-    for node in state.nodes:
+    components = [
+        *((f"Source '{source_name}'", source.options) for source_name, source in state.sources.items()),
+        *((f"Node '{node.id}'", node.options) for node in state.nodes),
+    ]
+    for component, options in components:
         try:
-            parse_interpretation_requirements(node.options)
+            parse_interpretation_requirements(options)
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Node '{node.id}' carries a malformed interpretation_requirements entry. "
+                    f"{component} carries a malformed interpretation_requirements entry. "
                     "Remove the hand-written interpretation_requirements block and re-import; "
                     "the importer stages review requirements itself."
                 ),
             ) from exc
-
-
-async def _surface_imported_interpretation_review_events(
-    service: SessionServiceProtocol,
-    *,
-    session_id: UUID,
-    state: CompositionState,
-    composition_state_id: UUID,
-) -> None:
-    """Surface a resolvable pending interpretation EVENT for every pending
-    requirement carried by the just-imported state (elspeth-ae5160c3cb).
-
-    Imported YAML never passes through the compose loop, so neither the
-    freeform finalization surfacer nor the guided B1 surfacer runs. Without
-    this pass the staged requirements block the run fail-closed (the
-    interpretation-state enumerators) while no review card exists and the
-    resolve path has nothing to target — an unrecoverable block.
-
-    Every row parses cleanly here by construction:
-    ``_reject_malformed_interpretation_requirements`` already 400-rejected
-    malformed rows pre-persist, so a parse failure at this seam is a
-    first-party bug and crashes honestly rather than being caught.
-
-    Mirrors the guided B1 W1 backstop: ``create_pending_interpretation_event``
-    raises a ValueError subclass on any writer-boundary mismatch (e.g. a
-    hand-written requirement row that fails its per-kind precondition), and
-    this runs after ``save_composition_state`` at a persist seam — so a
-    mismatched site is SKIPPED and stays fail-closed at the run-time gate
-    (advisory polarity) rather than 500ing the import after the state
-    already persisted. The requirements staged by the importer's own
-    auto-stagers always satisfy the boundary; only hand-crafted rows can
-    trip it.
-    """
-    for node in state.nodes:
-        requirements = parse_interpretation_requirements(node.options)
-        if requirements is None:
-            continue
-        for requirement in requirements:
-            if requirement["status"] != "pending":
-                continue
-            draft = requirement["draft"]
-            if type(draft) is not str or not draft:
-                continue
-            # kind/user_term are validated non-empty members by the parse above.
-            kind = InterpretationKind(requirement["kind"])
-            user_term = requirement["user_term"]
-            try:
-                await service.create_pending_interpretation_event(
-                    session_id=session_id,
-                    composition_state_id=composition_state_id,
-                    affected_node_id=node.id,
-                    tool_call_id=f"{BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}{uuid4()}",
-                    user_term=user_term,
-                    kind=kind,
-                    llm_draft=draft,
-                    model_identifier=_YAML_IMPORT_SURFACE_PROVENANCE,
-                    model_version=_YAML_IMPORT_SURFACE_PROVENANCE,
-                    provider=_YAML_IMPORT_SURFACE_PROVENANCE,
-                    composer_skill_hash=_YAML_IMPORT_SURFACE_PROVENANCE,
-                )
-            except ValueError:
-                # W1 backstop, same shape and rationale as the guided B1
-                # surfacer (composer/service.py): the per-kind writer boundary
-                # is NECESSARY but not always SUFFICIENT to replicate here, a
-                # raise at this post-persist seam would 500 an import whose
-                # state already saved, and a skipped advisory surface stays
-                # fail-closed at the run-time gate. Deliberately not slog'd —
-                # a skipped advisory surface is not a telemetry/audit event.
-                continue
 
 
 @router.post(
@@ -869,6 +878,18 @@ async def seed_state_for_e2e(
             secret_service=request.app.state.scoped_secret_resolver,
             user_id=str(user.user_id),
         )
+        _reject_malformed_interpretation_requirements(seeded_state)
+        from elspeth.web.composer.service import (
+            prepare_pending_interpretation_event_drafts_for_state,
+            unsurfaceable_pending_interpretation_review_sites,
+        )
+
+        try:
+            unsurfaceable_sites = unsurfaceable_pending_interpretation_review_sites(seeded_state)
+        except (InvariantError, KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid composition state JSON") from exc
+        if unsurfaceable_sites:
+            raise HTTPException(status_code=400, detail="Composition state contains review debt that cannot be surfaced")
 
         service: SessionServiceProtocol = request.app.state.session_service
         state_data, _validation = await _state_data_from_composer_state(
@@ -885,10 +906,18 @@ async def seed_state_for_e2e(
             initial_version=seeded_state.version,
             telemetry_source="state_seed",
         )
-        state_record = await service.save_composition_state(
+        interpretation_drafts = prepare_pending_interpretation_event_drafts_for_state(
+            seeded_state,
+            model_identifier=_E2E_SEED_SURFACE_PROVENANCE,
+            model_version=_E2E_SEED_SURFACE_PROVENANCE,
+            provider=_E2E_SEED_SURFACE_PROVENANCE,
+            composer_skill_hash=_E2E_SEED_SURFACE_PROVENANCE,
+        )
+        state_record = await service.save_composition_state_with_interpretations(
             session.id,
             state_data,
             provenance="session_seed",
+            interpretations=interpretation_drafts,
         )
         with _named_guided_custody_projection():
             return _state_response(state_record, policy_catalog=catalog)

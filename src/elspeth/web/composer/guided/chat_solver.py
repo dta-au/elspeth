@@ -1556,8 +1556,9 @@ def _untrusted_source_validation_failure_context(on_validation_failure: str) -> 
     suppresses=("R1", "R5"),
     invariant=(
         "returns None for a non-mapping schema; extracts only the string mode and aliases for "
-        "string-list guaranteed_fields plus the declared fields of an explicit (fixed/flexible) "
-        "schema; raw labels and malformed members are dropped, never raised on"
+        "string-list guaranteed_fields, preserving a valid explicit empty list, plus the declared "
+        "fields of an explicit (fixed/flexible) schema; raw labels and malformed members are "
+        "dropped, never raised on"
     ),
 )
 def _llm_safe_schema_option(
@@ -1574,7 +1575,7 @@ def _llm_safe_schema_option(
     guaranteed_fields = schema.get("guaranteed_fields")
     if isinstance(guaranteed_fields, (list, tuple)):
         safe_guaranteed_fields = [field_aliases[field] for field in guaranteed_fields if isinstance(field, str) and field in field_aliases]
-        if safe_guaranteed_fields:
+        if not guaranteed_fields or safe_guaranteed_fields:
             safe["guaranteed_fields"] = safe_guaranteed_fields
     # An explicit schema's declared fields are its field inventory (and are
     # implicitly guaranteed); without them a fixed-schema source reaches the

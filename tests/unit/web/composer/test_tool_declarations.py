@@ -186,6 +186,7 @@ class TestSetSourceFromBlobMigration:
             _DEFAULT_SOURCE_VALIDATION_FAILURE,
             _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
         )
+        from elspeth.web.composer.tools.sources import _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE
 
         expected = {
             "name": "set_source_from_blob",
@@ -226,6 +227,7 @@ class TestSetSourceFromBlobMigration:
                         "description": (
                             "Plugin-specific config (merged with blob path). Required fields vary by plugin: "
                             "text sources need 'column' (output field name) and 'schema' (e.g., {mode: 'observed'})."
+                            + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE
                         ),
                     },
                 },
@@ -657,6 +659,8 @@ class TestStep3MutationTierMigration:
         }
 
     def test_patch_source_options(self) -> None:
+        from elspeth.web.composer.tools.sources import _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE
+
         assert self._get("patch_source_options") == {
             "name": "patch_source_options",
             "description": "Apply a shallow merge-patch to a named source's options. "
@@ -668,7 +672,7 @@ class TestStep3MutationTierMigration:
                     "source_name": {"type": "string", "description": "Source root name to patch. Defaults to 'source'."},
                     "patch": {
                         "type": "object",
-                        "description": "Merge-patch to apply to source options.",
+                        "description": "Merge-patch to apply to source options." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
                     },
                 },
                 "required": ["patch"],
@@ -757,6 +761,17 @@ class TestStep3MutationTierMigration:
         # full replace (elspeth-ee89aca5d0).
         assert "Add or rewire a node in an existing pipeline" in skill
         assert "`upsert_node` / `upsert_edge`" in skill
+
+    def test_core_skill_teaches_the_fail_closed_source_data_contract(self) -> None:
+        """Planner guidance must not contradict ADR-016's runtime contract."""
+        skill = " ".join(
+            (Path(__file__).parents[4] / "src/elspeth/web/composer/skills/pipeline_composer.md").read_text(encoding="utf-8").split()
+        )
+
+        assert "records failed boundary evidence and stops the run" in skill
+        assert "both row data and the emitted row contract" in skill
+        assert "Rows the source quarantines during its own validation never reach this check" in skill
+        assert "rows missing a promised column quarantine; the run continues" not in skill
 
     def test_core_skill_keeps_the_full_rebuild_steer_scoped_to_new_builds(self) -> None:
         """The new edit row must not read as licence for tool-by-tool NEW builds.
@@ -911,6 +926,8 @@ class TestStep3BlobDiscoveryTierMigration:
         assert names == {"list_blobs", "list_composer_blobs", "get_blob_metadata", "get_blob_content", "inspect_source"}
 
     def test_wire_blob_inline_ref(self) -> None:
+        from elspeth.web.composer.tools._common import _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
+
         assert self._get("wire_blob_inline_ref") == {
             "name": "wire_blob_inline_ref",
             "description": (
@@ -925,7 +942,7 @@ class TestStep3BlobDiscoveryTierMigration:
                         "description": (
                             "Canonical path: source.options.<field>, source:<name>.options.<field>, "
                             "node:<node_id>.options.<field> for a transform, aggregation, or collector, "
-                            "or output:<name>.options.<field>."
+                            "or output:<name>.options.<field>." + _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
                         ),
                     },
                     "blob_id": {

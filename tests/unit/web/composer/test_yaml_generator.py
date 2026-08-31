@@ -1895,6 +1895,23 @@ class TestConditionalKeyGuards:
         assert "merge_point" in str(exc_info.value)
         assert "branches" in str(exc_info.value)
 
+    def test_coalesce_options_raise_instead_of_disappearing_during_lowering(self) -> None:
+        """A validation-bypassing caller still cannot silently erase authored options."""
+        base = _make_fork_coalesce_pipeline()
+        state = replace(
+            base,
+            nodes=(
+                base.nodes[0],
+                replace(base.nodes[1], options={"schema": {"mode": "observed"}}),
+            ),
+        )
+
+        with pytest.raises(PipelineLoweringError) as exc_info:
+            generate_yaml(state)
+
+        assert "merge_point" in str(exc_info.value)
+        assert "options" in str(exc_info.value)
+
     @pytest.mark.parametrize("field_name", ["merge", "policy"])
     def test_injected_state_dict_missing_coalesce_default_raises_typed_lowering_error(self, field_name: str) -> None:
         """The injected-state_dict entry point is the only path that can omit these.

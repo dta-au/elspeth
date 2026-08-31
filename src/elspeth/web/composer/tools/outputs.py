@@ -18,6 +18,7 @@ from elspeth.web.composer.state import (
     OutputSpec,
 )
 from elspeth.web.composer.tools._common import (
+    _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _STEP_DESCRIPTION_DESCRIPTION,
     ToolContext,
     ToolResult,
@@ -86,7 +87,7 @@ _SET_OUTPUT_DECLARATION = ToolDeclaration(
                 "type": "object",
                 "description": (
                     f"Plugin-specific config. For {FILE_SINK_PLUGIN_SLASH_TEXT} file sinks in runnable web pipelines, "
-                    "include path, schema, and explicit collision_policy."
+                    "include path, schema, and explicit collision_policy." + _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
             "on_write_failure": {
@@ -321,7 +322,7 @@ _PATCH_OUTPUT_OPTIONS_DECLARATION = ToolDeclaration(
             },
             "patch": {
                 "type": "object",
-                "description": "Merge-patch to apply to output options.",
+                "description": "Merge-patch to apply to output options." + _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
             },
         },
         "required": ["sink_name", "patch"],

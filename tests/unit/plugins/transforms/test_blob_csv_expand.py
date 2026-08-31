@@ -937,6 +937,15 @@ def test_blob_csv_expand_field_arm_declares_the_removal_it_performs() -> None:
     assert field_transform.removed_input_fields == frozenset({"content"})
 
 
+def test_blob_csv_expand_field_arm_abstains_on_unresolved_original_header() -> None:
+    transform = _build_field_transform(schema={"mode": "observed"}, text_field="Content Body")
+
+    assert transform.passes_through_input is False
+    assert transform.forwards_input_fields is False
+    assert transform.removed_input_fields == frozenset()
+    assert transform.preserves_input_values is True
+
+
 def test_blob_csv_expand_blob_arm_keeps_the_full_pass_through_promise() -> None:
     """The blob arm reads a hash, not the document, so nothing is consumed."""
     body = b"id,name\n1,alice\n"

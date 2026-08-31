@@ -78,13 +78,16 @@ from elspeth.web.composer.state import (
     CompositionState,
 )
 from elspeth.web.composer.tools._common import (
+    _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE,
+    _INTERPRETATION_REVIEW_FOLLOWUP,
+    _RUNTIME_OWNED_LLM_OPTION_KEYS,
+    _SERVER_OWNED_SOURCE_OPTION_KEYS,
     ToolContext,
     ToolResult,
     _composition_canonical_interpretation_requirement_error,
     _discovery_result,
     _failure_result,
     _mutation_result,
-    _runtime_owned_llm_option_error,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
@@ -503,16 +506,22 @@ def _apply_inline_blob_marker(state: CompositionState, field_path: str, marker: 
             if source_name == "source":
                 raise ValueError("Cannot wire source ref: no source has been set")
             raise ValueError(f"Source {source_name!r} not found in composition state")
+        if keys[0] in _SERVER_OWNED_SOURCE_OPTION_KEYS:
+            field_name = keys[0]
+            raise ValueError(
+                f"wire_blob_inline_ref cannot write server/resolver-owned source option root '{field_name}'. "
+                "Bind source blobs with set_source_from_blob or set_source_from_blobs; "
+                "ELSPETH stamps source_authoring and canonical blob metadata from session records."
+            )
         # Symmetric with the node arm below: never let a wire write land inside a
         # source's interpretation_requirements. Source review metadata
-        # (INVENTED_SOURCE) may only be staged as a pending composer requirement
-        # and resolved by resolve_interpretation_event — a wired ref here would
-        # corrupt that structure outside the review boundary.
+        # (INVENTED_SOURCE) may only be staged as a pending composer requirement;
+        # a wired ref here would corrupt that structure outside the review boundary.
         if keys[0] == INTERPRETATION_REQUIREMENTS_KEY:
             raise ValueError(
                 "wire_blob_inline_ref cannot write source interpretation_requirements; "
-                "review metadata may only be staged as pending composer input and "
-                "resolved by resolve_interpretation_event."
+                "stage an authorable pending source review with set_source or patch_source_options. "
+                f"{_INTERPRETATION_REVIEW_FOLLOWUP}"
             )
         patched_options = _set_nested_option(dict(deep_thaw(source.options)), keys, marker)
         return state.with_named_source(source_name, replace(source, options=patched_options))
@@ -527,20 +536,20 @@ def _apply_inline_blob_marker(state: CompositionState, field_path: str, marker: 
                     raise ValueError(
                         "Inline blob references can only be wired into source, transform, aggregation, collector, or output plugin options."
                     )
-                if node.plugin == "llm" and keys[0] == INTERPRETATION_REQUIREMENTS_KEY:
+                if keys[0] == INTERPRETATION_REQUIREMENTS_KEY:
                     raise ValueError(
-                        "wire_blob_inline_ref cannot write LLM interpretation_requirements; "
-                        "review metadata may only be staged as pending composer input and "
-                        "resolved by resolve_interpretation_event."
+                        "wire_blob_inline_ref cannot write node interpretation_requirements; "
+                        "stage an authorable pending node review with upsert_node or patch_node_options. "
+                        f"{_INTERPRETATION_REVIEW_FOLLOWUP}"
                     )
-                runtime_owned_error = _runtime_owned_llm_option_error(
-                    node.plugin,
-                    {keys[0]: marker},
-                    tool_name="wire_blob_inline_ref",
-                    component_id=node_id,
-                )
-                if runtime_owned_error is not None:
-                    raise ValueError(runtime_owned_error)
+                if node.plugin == "llm" and keys[0] in _RUNTIME_OWNED_LLM_OPTION_KEYS:
+                    field_name = keys[0]
+                    raise ValueError(
+                        "wire_blob_inline_ref field_path targets runtime-owned top-level LLM option "
+                        f"'{field_name}'. This field_path cannot be wired. For an author-owned LLM option "
+                        "edit use patch_node_options, or upsert_node for a full node edit, without the runtime hash; "
+                        "ELSPETH re-derives it during review reconciliation or execution."
+                    )
                 patched_options = _set_nested_option(dict(deep_thaw(node.options)), keys, marker)
                 new_nodes.append(replace(node, options=patched_options))
                 found = True
@@ -555,8 +564,8 @@ def _apply_inline_blob_marker(state: CompositionState, field_path: str, marker: 
         if keys[0] == INTERPRETATION_REQUIREMENTS_KEY:
             raise ValueError(
                 "wire_blob_inline_ref cannot write output interpretation_requirements; "
-                "review metadata may only be staged as pending composer input and "
-                "resolved by resolve_interpretation_event."
+                "outputs do not own review metadata. Stage an authorable pending review on its source or node. "
+                f"{_INTERPRETATION_REVIEW_FOLLOWUP}"
             )
         new_outputs = []
         found = False
@@ -716,7 +725,7 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
                 "description": (
                     "Canonical path: source.options.<field>, source:<name>.options.<field>, "
                     "node:<node_id>.options.<field> for a transform, aggregation, or collector, "
-                    "or output:<name>.options.<field>."
+                    "or output:<name>.options.<field>." + _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
             "blob_id": {"type": "string", "format": "uuid", "description": "Ready blob ID to wire as inline content."},

@@ -8,10 +8,11 @@ import structlog
 from fastapi import FastAPI
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.progress import ComposerProgressRegistry
-from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
@@ -167,6 +168,83 @@ async def test_e2e_state_seed_route_persists_canonical_state(tmp_path: Path) -> 
     assert record.version == 1
     assert record.metadata_ == {"name": "Seeded E2E", "description": "seeded by test route"}
     assert record.sources["source"]["plugin"] == "csv"
+
+
+@pytest.mark.asyncio
+async def test_e2e_state_seed_route_surfaces_pending_review_cards(tmp_path: Path) -> None:
+    """The Playwright seed endpoint produces executable Composer state, so
+    it must uphold the same persisted-site/card invariant as YAML import."""
+    app, service = _make_app(tmp_path, e2e_state_seed_enabled=True)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Review seed", "local")
+    base = _valid_state(tmp_path, session_id=str(session.id))
+    seeded = CompositionState(
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="score",
+                options=base.sources["source"].options,
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="score",
+                node_type="transform",
+                plugin="llm",
+                input="source",
+                on_success="out",
+                on_error="discard",
+                options={
+                    "model": "anthropic/claude-haiku-4.5",
+                    "prompt_template": "Score {{ row.id }}",
+                    "interpretation_requirements": [
+                        {
+                            "id": "prompt:score",
+                            "kind": "llm_prompt_template",
+                            "user_term": "llm_prompt_template:score",
+                            "status": "pending",
+                            "draft": "Score {{ row.id }}",
+                        },
+                        {
+                            "id": "model:score",
+                            "kind": "llm_model_choice",
+                            "user_term": "llm_model_choice:score",
+                            "status": "pending",
+                            "draft": "anthropic/claude-haiku-4.5",
+                        },
+                    ],
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=base.outputs,
+        metadata=base.metadata,
+        version=1,
+    )
+
+    async def _pass_preflight(*_args, **_kwargs):
+        return ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness())
+
+    with patch("elspeth.web.sessions.routes._helpers._runtime_preflight_for_state", side_effect=_pass_preflight):
+        response = client.post(
+            f"/api/sessions/{session.id}/state/e2e-seed",
+            json={"state": seeded.to_dict()},
+        )
+
+    assert response.status_code == 200, response.text
+    events = await service.list_interpretation_events(session.id, status="pending")
+    assert [event.kind for event in events] == [
+        InterpretationKind.LLM_PROMPT_TEMPLATE,
+        InterpretationKind.LLM_MODEL_CHOICE,
+    ]
+    assert {str(event.composition_state_id) for event in events} == {response.json()["id"]}
 
 
 @pytest.mark.asyncio

@@ -941,7 +941,7 @@ def _fork_coalesce_pipeline() -> dict[str, object]:
                 "branches": {"branch_a": "tone_done", "branch_b": "usage_done"},
                 "policy": "require_all",
                 "merge": "union",
-                "options": {"schema": {"mode": "observed"}},
+                "options": {},
             },
             {
                 "id": "shape_output",
@@ -1928,7 +1928,7 @@ def _coalesce_correction_predecessor() -> CompositionState:
                 input="branches",
                 on_success=None,
                 on_error=None,
-                options={"schema": {"mode": "observed"}},
+                options={},
                 condition=None,
                 routes=None,
                 fork_to=None,

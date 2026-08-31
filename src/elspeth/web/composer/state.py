@@ -22,7 +22,7 @@ from pydantic import ValidationError as PydanticValidationError
 from elspeth.contracts.enums import OutputMode
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.guarantee_propagation import compose_propagation
-from elspeth.contracts.plugin_protocols import TransformProtocol
+from elspeth.contracts.plugin_protocols import SourceProtocol, TransformProtocol
 from elspeth.contracts.plugin_semantics import SemanticEdgeContract
 from elspeth.contracts.schema import (
     SchemaConfig,
@@ -59,7 +59,6 @@ from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.templates import create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.sources.field_normalization import (
     describe_undeclared_row_fields,
-    normalize_field_name,
     undeclared_row_fields,
 )
 from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
@@ -1733,32 +1732,15 @@ _SOURCE_CONFIG_ERROR_PREFIX = "Invalid configuration for source "
 # on how it had learned of the error and could not converge. Neither surface's
 # text was pinned by any test, which is why the drift landed green.
 _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION: Final[str] = (
-    "A field_mapper with select_only: true declares a required output field that its own mapping cannot guarantee. "
-    "The rejection's contract facts name the node and the declared-but-unguaranteed field names, which are mapping "
-    "TARGETS. Because a node's `schema` block is its INPUT contract, a target name is usually absent from "
-    "`schema.fields` altogether, so an instruction to remove it from the declaration has nothing to act on."
+    "A field_mapper with select_only: true produced contradictory internal contract metadata: a required output "
+    "field was absent from the mapping's computed guarantees. Since d4ae04b374 the mapping itself is the required-read "
+    "authority; every configured target must therefore be present on every successful row."
 )
 _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX: Final[str] = (
-    "Change ONLY that node, and remember `schema` is ALSO its runtime input model: under `mode: fixed` a repair "
-    "must leave every field a row actually carries declared, or the row is rejected before the mapping runs. Each "
-    "name in `missing_fields` is a mapping TARGET, so first look up its SOURCE in the `mapping` you authored — "
-    "what repairs one kind of source is inert for another. If the source contains a dot it is a nested read that "
-    "`schema.guaranteed_fields` cannot name: set `strict: true`, which is node-wide and routes any row missing ANY "
-    "mapped source to on_error, and if `schema.mode` is `fixed` set it to `flexible` in the same edit — fixed mode "
-    "rejects the nested read's top-level container field as an undeclared extra, so `strict: true` alone clears "
-    "this error and then fails every row at input validation. Otherwise, IF you are certain the source is spelled "
-    "exactly as the upstream row keys it, declare it in `schema.fields` AND name it in `schema.guaranteed_fields` "
-    "AND remove the target's own entry from `schema.fields` — all three, since leaving the target declared makes "
-    "the node demand the emitted name as an input it never receives. If you are not certain of that spelling, do "
-    "NOT guess: a source the row is not keyed by is accepted by both of those declarations and changes nothing, "
-    "returning this same error. Withdraw the guarantee instead — make the target optional by appending `?` to its "
-    "declared type in `schema.fields` (do not delete the entry: a fixed/flexible schema must keep at least one "
-    "field, so deleting the last one is rejected), drop it from `schema.guaranteed_fields` if named there, and if "
-    "`schema.mode` is `fixed` set it to `flexible` so the key the row actually arrives under passes input "
-    "validation. A consumer that needs the field then rejects at its own edge rather than here. Or repair it end "
-    "to end: rename the field upstream so the row is keyed by a normalization-stable spelling, rewrite the mapping "
-    "key to that SAME spelling, and then declare and guarantee it. Never rewrite the mapping key alone to make it "
-    "look right: that is accepted silently and drops the column."
+    "Do not mutate the pipeline to work around this error. Preserve the authored mapping and report the node and "
+    "missing_fields as an internal field_mapper contract defect: the plugin must derive every mapping target into "
+    "its output guarantees. For a fixed input schema, independently ensure it declares each configured flat source "
+    "or dotted source's top-level root; emitted target names are not substitutes for those input fields."
 )
 _TRANSFORM_OUTPUT_COLLISION_EXPLANATION: Final[str] = (
     "A transform declares an output field that already arrives on its input row. The engine rejects a transform that "
@@ -4205,165 +4187,6 @@ def _check_schema_contracts(
                 raise
             return None
 
-    def _mapping_source_of(options: Mapping[str, Any], target: str) -> str:
-        """Return the mapping key that emits ``target``.
-
-        No shape guard, and no absent-key fallback, because neither state is
-        reachable from the one call site. Rule C reaches this only after
-        ``_probe_transform_output_schema`` returned a config, which means
-        ``FieldMapperConfig`` already parsed these same options — so ``mapping``
-        is a validated ``dict[str, str]``. And ``target`` always has an entry,
-        because under ``select_only`` the projection that produces
-        ``declared_required`` emits mapping TARGETS only, making ``missing`` a
-        subset of ``mapping.values()`` by construction (a declared non-target is
-        dropped by the projection, never carried into ``missing``).
-
-        A ``KeyError``/``AttributeError`` here is therefore a framework bug and
-        must crash loudly rather than degrade into advice that names no source.
-        """
-        mapping: Mapping[str, str] = options["mapping"]
-        return next(source for source, mapped in mapping.items() if mapped == target)
-
-    remedy_class_cache: dict[str, str] = {}
-
-    def _mapping_source_remedy_class(source: str, target: str) -> str:
-        """Memoized ``_classify_mapping_source``.
-
-        Two plugin constructions per classification, and ``validate()`` runs on
-        every composer tool call, so a many-target mapper would otherwise pay
-        for each one. The verdict depends only on the SOURCE — the target is a
-        free variable the probes carry through — so one entry per distinct
-        source serves every target it maps to.
-        """
-        if source in remedy_class_cache:
-            return remedy_class_cache[source]
-        verdict = _classify_mapping_source(source, target)
-        remedy_class_cache[source] = verdict
-        return verdict
-
-    def _classify_mapping_source(source: str, target: str) -> str:
-        """Classify what would actually repair ``source`` -> ``target``.
-
-        Asks the PLUGIN, by constructing two canonical counterfactual configs
-        and reading back whether ``target`` lands in its guarantees. The message
-        therefore cannot disagree with the rule it explains: both read the same
-        ``_output_schema_config``. A hand-written predicate here would drift —
-        the obvious spellings (``str.isidentifier``, "lowercase with no spaces")
-        are both measurably wrong, admitting ``Name``/``userID``/``_id``/``a__b``
-        where the plugin abstains and rejecting ``class_``/``_1``/``if_`` where
-        it does not (elspeth-920bd88299, and elspeth-f262a8c678 for the
-        isidentifier half).
-
-        ``declarable`` — the source is the name the row is keyed by, so
-        declaring and guaranteeing it repairs the node while KEEPING the
-        downstream promise. ``strict_only`` — a nested read, which
-        ``guaranteed_fields`` can never name. ``unguaranteeable`` — the plugin
-        deliberately abstains (it cannot tell whether the row is keyed by the
-        literal or by its normalized form), so NO declaration repairs it.
-        """
-        declared_options = {
-            "mapping": {source: target},
-            "select_only": True,
-            "schema": {"mode": "fixed", "fields": [f"{source}: any"], "guaranteed_fields": [source]},
-        }
-        constructed, config = _probe_transform_output_schema("field_mapper", declared_options)
-        if constructed and config is not None and target in (config.guaranteed_fields or ()):
-            return "declarable"
-        strict_options = {
-            "mapping": {source: target},
-            "select_only": True,
-            "strict": True,
-            "schema": {"mode": "fixed", "fields": [f"{target}: any"]},
-        }
-        constructed, config = _probe_transform_output_schema("field_mapper", strict_options)
-        if constructed and config is not None and target in (config.guaranteed_fields or ()):
-            return "strict_only"
-        return "unguaranteeable"
-
-    def _unguaranteed_target_remedies(options: Mapping[str, Any], missing: frozenset[str]) -> str:
-        """Build Rule C's repair advice, one clause per applicable source class.
-
-        Emits ONLY the remedies measured to work for the sources actually in
-        play — measured through EXECUTION, not just through this validator.
-        The rule previously offered four alternatives joined by "OR", of
-        which two were inert for the shape that fires most and one was
-        unauthorable in every shape — so a planner could apply a remedy, have
-        the mutation ACCEPTED, and get a byte-identical error back with no
-        signal that its repair had done nothing (elspeth-920bd88299). The
-        successor defect was subtler: a remedy that cleared THIS validator but
-        left a node whose fixed-mode INPUT model rejected the very field the
-        mapping reads, so every row died in ``_run_preflight`` before
-        ``process()`` — which is why the fixed-mode clauses below also
-        instruct the ``schema.mode: flexible`` switch.
-        """
-        # Direct indexing on the same grounds as ``_mapping_source_of``: this
-        # function runs only after ``_probe_transform_output_schema`` returned
-        # a config, so ``FieldMapperConfig`` (whose ``schema`` and ``mode``
-        # are required, defaultless fields) already parsed these options.
-        schema_is_fixed = options["schema"]["mode"] == "fixed"
-
-        # Seeded with every class so the reads below are direct indexing: this
-        # dict is built and consumed here, so a ``.get`` default would be
-        # covering for an absence this function itself rules out.
-        by_class: dict[str, list[tuple[str, str]]] = {"declarable": [], "strict_only": [], "unguaranteeable": []}
-        for target in sorted(missing):
-            source = _mapping_source_of(options, target)
-            by_class[_mapping_source_remedy_class(source, target)].append((target, source))
-
-        clauses: list[str] = [
-            "Those names are mapping TARGETS, and `schema` is this node's INPUT contract, so a target is usually "
-            "absent from `schema.fields` altogether — removing it from the declaration then changes nothing and "
-            "this same error repeats."
-        ]
-        for target, source in by_class["declarable"]:
-            clauses.append(
-                f"'{target}' is mapped from '{source}', which the row is keyed by: declare '{source}' in "
-                f"`schema.fields`, name it in `schema.guaranteed_fields`, AND remove '{target}' from "
-                f"`schema.fields` — all three, because leaving '{target}' declared makes this node demand the "
-                f"emitted name as an input field it never receives."
-            )
-        for target, source in by_class["strict_only"]:
-            container = source.split(".", 1)[0]
-            fixed_mode_leg = (
-                f" Set `schema.mode: flexible` in the same edit: `schema` is also this node's runtime input "
-                f"model, and fixed mode rejects the top-level '{container}' field the nested read consumes as an "
-                f"undeclared extra — with `strict: true` alone this error clears and every row then fails input "
-                f"validation before the mapping runs."
-                if schema_is_fixed
-                else ""
-            )
-            clauses.append(
-                f"'{target}' is mapped from the nested read '{source}', which `schema.guaranteed_fields` cannot "
-                f"name: set `strict: true` instead. That is node-wide — it routes any row missing ANY mapped "
-                f"source to on_error rather than emitting the row without it.{fixed_mode_leg}"
-            )
-        for target, source in by_class["unguaranteeable"]:
-            fixed_mode_leg = (
-                ", and set `schema.mode: flexible` so the key the row actually arrives under passes this node's input validation"
-                if schema_is_fixed
-                else ""
-            )
-            try:
-                stable_spelling = f"'{normalize_field_name(source)}'"
-            except ValueError:
-                # ``ExternalHeaderError``/``ValueError`` for a literal with no
-                # normalized form at all (``'!!!'``) — there is no spelling to
-                # name, but the shape of the repair is still statable.
-                stable_spelling = "a normalization-stable spelling"
-            clauses.append(
-                f"'{target}' is mapped from '{source}', which is not the name a row is keyed by, so this node "
-                f"cannot promise '{target}' at all — no `schema` declaration and no `strict: true` clears this. "
-                f"Do NOT rewrite the mapping key to another spelling on its own: that is accepted silently and "
-                f"drops the column. Either withdraw the guarantee — make '{target}' optional by appending `?` to "
-                f"its declared type in `schema.fields` (do not delete the entry: a fixed/flexible schema must "
-                f"keep at least one field, so deleting the last one is rejected), drop '{target}' from "
-                f"`schema.guaranteed_fields` if named there{fixed_mode_leg} — after which a consumer that "
-                f"requires '{target}' rejects at its own edge; or repair it end to end — rename the field "
-                f"upstream so the row is keyed by {stable_spelling}, rewrite the mapping key to that SAME "
-                f"spelling, and then declare and guarantee it like any row-keyed source."
-            )
-        return " ".join(clauses)
-
     class _CollisionProbe(NamedTuple):
         declared_output_fields: frozenset[str]
         can_overwrite_input: bool
@@ -4609,12 +4432,15 @@ def _check_schema_contracts(
             if transform is not None:
                 transform.close()
 
-        if is_pass_through_instance:
+        forwards_input = transform.forwards_input_fields
+        forwards_through_open_contract = forwards_input and (output_schema_config is None or output_schema_config.allows_extra_fields)
+        if is_pass_through_instance or forwards_through_open_contract:
             base = output_schema_config.get_effective_guaranteed_fields() if output_schema_config is not None else frozenset()
             inherited_participates, inherited_fields = _connection_propagation_vote(
                 producer_node.input,
                 visited_fan_in_ids=visited_fan_in_ids,
             )
+            removals = frozenset() if is_pass_through_instance else transform.removed_input_fields
             # ADR-009 §Clause 1: share the aggregation rule with graph.py.
             # Composer's producer-graph is single-upstream at this level
             # (coalesce absorbs fan-in via pre-computed output), so we pass a
@@ -4630,7 +4456,7 @@ def _check_schema_contracts(
             # validate_sink_required_fields rejects accordingly).
             return (
                 own_participates or inherited_participates,
-                compose_propagation(base, [inherited_fields if inherited_participates else None]),
+                compose_propagation(base, [inherited_fields - removals if inherited_participates else None]),
             )
 
         if output_schema_config is None:
@@ -5756,6 +5582,98 @@ def _check_schema_contracts(
             return False
         return schema_config is not None and not schema_config.is_observed
 
+    def _resolved_producer_field_type(
+        producer: ProducerEntry,
+        field_name: str,
+        *,
+        visited: frozenset[str] = frozenset(),
+    ) -> str | None:
+        """Resolve a declared type through truthful value-preserving forwarders."""
+        if producer.producer_id in visited:
+            return None
+        owner = _producer_owner(producer)
+        raw_schema = get_raw_schema_config(producer.options, owner=owner)
+        if is_source_producer_id(producer.producer_id):
+            if raw_schema is None:
+                return None
+            if raw_schema.fields is not None:
+                for field in raw_schema.fields:
+                    if field.name == field_name:
+                        return None if field.field_type == "any" else field.field_type
+                return None
+            if not raw_schema.is_observed or field_name not in (raw_schema.guaranteed_fields or ()):
+                return None
+
+            source_name = "source" if producer.producer_id == "source" else producer.producer_id.removeprefix("source:")
+            source_spec = source_map.get(source_name)
+            if source_spec is None or producer.plugin_name is None:
+                return None
+            source: SourceProtocol | None = None
+            try:
+                from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+                probe_options = prepare_validation_probe_options(source_spec.options, plugin=producer.plugin_name)
+                probe_options["on_validation_failure"] = source_spec.on_validation_failure
+                source = get_shared_plugin_manager().create_source(producer.plugin_name, probe_options)
+                return source.observed_value_type
+            except Exception as exc:
+                if _is_source_config_probe_exception(exc):
+                    return None
+                raise
+            finally:
+                if source is not None:
+                    source.close()
+
+        producer_node = node_by_id[producer.producer_id]
+        if producer_node.node_type not in {"transform", "aggregation"} or producer_node.plugin is None:
+            return None
+
+        transform: TransformProtocol | None = None
+        try:
+            from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+            transform = get_shared_plugin_manager().create_transform(
+                producer_node.plugin,
+                prepare_validation_probe_options(producer_node.options, plugin=producer_node.plugin),
+            )
+            output_config = transform._output_schema_config
+            if output_config is not None and output_config.fields is not None:
+                for field in output_config.fields:
+                    if field.name == field_name:
+                        return None if field.field_type == "any" else field.field_type
+
+            forwards_field_unchanged = (
+                transform.forwards_input_fields
+                and transform.preserves_input_values
+                and field_name not in transform.removed_input_fields
+                and (output_config is None or output_config.allows_extra_fields)
+            )
+            if not ((transform.passes_through_input and transform.preserves_input_values) or forwards_field_unchanged):
+                return None
+        except Exception as exc:
+            if _is_config_probe_exception(exc):
+                return None
+            raise
+        finally:
+            if transform is not None:
+                transform.close()
+
+        upstream = resolver.find_producer_for(producer_node.input)
+        if upstream is None:
+            return None
+        upstream = _walk_producer_entry_to_real_producer(
+            upstream,
+            connection_name=producer_node.input,
+            warnings=[],
+        )
+        if upstream is None:
+            return None
+        return _resolved_producer_field_type(
+            upstream,
+            field_name,
+            visited=visited | {producer.producer_id},
+        )
+
     def _edge_field_type_conflict(producer: ProducerEntry, consumer: NodeSpec | OutputSpec) -> ValidationEntry | None:
         """Mirror the runtime's Phase-2 edge TYPE check on declared field specs.
 
@@ -5802,10 +5720,11 @@ def _check_schema_contracts(
         loop's job and extras belong to the Rule A/B walkers; reporting either
         here would double-attribute one defect.
 
-        Callers gate on ``_producer_is_typed_source``, which is the runtime's
-        own Phase-2 bypass — observed sources and transform/gate/coalesce
-        producers resolve to a dynamic effective producer schema at runtime and
-        are skipped there, so they are skipped here too.
+        A direct typed source settles its own fields. A transform with an open
+        output may additionally carry an ancestor declaration only when its
+        explicit forwarding and value-preservation contracts prove the field
+        survives unchanged. Removed fields, fixed output firewalls, rewriting
+        transforms, and unresolved fan-in all abstain.
         """
         if isinstance(consumer, OutputSpec):
             consumer_id = f"output:{consumer.name}"
@@ -5814,7 +5733,6 @@ def _check_schema_contracts(
             consumer_id = consumer.id
             consumer_component = f"node:{consumer.id}"
         try:
-            producer_schema_config = get_raw_schema_config(producer.options, owner=_producer_owner(producer))
             consumer_options = consumer.options
             consumer_owner = consumer_component
             if isinstance(consumer, NodeSpec) and consumer.node_type == "aggregation":
@@ -5825,24 +5743,22 @@ def _check_schema_contracts(
             # ``contract_config_invalid`` parsers; do not double-report.
             return None
 
-        if producer_schema_config is None or consumer_schema_config is None:
+        if consumer_schema_config is None:
             return None
         if consumer_schema_config.is_observed:
             return None
-        if producer_schema_config.fields is None or consumer_schema_config.fields is None:
+        if consumer_schema_config.fields is None:
             return None
 
-        producer_types = {field.name: field.field_type for field in producer_schema_config.fields}
         # ``any`` is a declared abstention on BOTH sides — the author has said
         # the type is not pinned, so no conflict is mechanically provable.
-        mismatches = [
-            (field.name, field.field_type, producer_types[field.name])
-            for field in consumer_schema_config.fields
-            if field.name in producer_types
-            and field.field_type != "any"
-            and producer_types[field.name] != "any"
-            and producer_types[field.name] != field.field_type
-        ]
+        mismatches: list[tuple[str, str, str]] = []
+        for field_def in consumer_schema_config.fields:
+            if field_def.field_type == "any":
+                continue
+            producer_type = _resolved_producer_field_type(producer, field_def.name)
+            if producer_type is not None and producer_type != field_def.field_type:
+                mismatches.append((field_def.name, field_def.field_type, producer_type))
         if not mismatches:
             return None
         detail = ", ".join(f"{name} (consumer expects {expected}, producer emits {actual})" for name, expected, actual in mismatches)
@@ -5944,11 +5860,11 @@ def _check_schema_contracts(
 
         producer_is_typed_source = _producer_is_typed_source(actual_producer)
         contract_required = consumer_required
+        type_error = _edge_field_type_conflict(actual_producer, node)
+        if type_error is not None:
+            errors.append(type_error)
         if producer_is_typed_source:
             contract_required = consumer_required | consumer_effective_required
-            type_error = _edge_field_type_conflict(actual_producer, node)
-            if type_error is not None:
-                errors.append(type_error)
             if declared_string_input:
                 string_type_error = _string_input_field_type_conflict(actual_producer, node, declared_string_input)
                 if string_type_error is not None:
@@ -6220,14 +6136,12 @@ def _check_schema_contracts(
             assert producer_vote is not None  # No error => guarantees resolved.
             producer_participates, producer_guaranteed = producer_vote
 
-            # Field-TYPE conflict on the producer -> sink edge, gated exactly as
-            # the node-consumer call above: only a typed (fixed/flexible) SOURCE
-            # presents a static schema the runtime's Phase-2 check reads; a
-            # transform/gate/coalesce producer is dynamic and skipped there too.
-            if _producer_is_typed_source(actual_producer):
-                sink_type_error = _edge_field_type_conflict(actual_producer, output)
-                if sink_type_error is not None:
-                    errors.append(sink_type_error)
+            # Field-TYPE conflict on the producer -> sink edge. Direct typed
+            # declarations and safely forwarded ancestor types share the same
+            # resolver as node consumers above.
+            sink_type_error = _edge_field_type_conflict(actual_producer, output)
+            if sink_type_error is not None:
+                errors.append(sink_type_error)
 
             # ADR-007 parity: mirror the runtime abstention clause in
             # validate_sink_required_fields (core/dag/schema_validation.py).
@@ -6305,17 +6219,20 @@ def _check_schema_contracts(
                 if sink_extras_error is not None:
                     errors.append(sink_extras_error)
 
-    # Rule C: per-transform self-consistency between declared output schema
-    # and the *actual* predicted emit set, scoped to plugins whose emit set
-    # can be computed deterministically from config alone. Currently:
-    # ``field_mapper`` with ``select_only=True`` — the actual output is
-    # exactly ``mapping.values()``, so any declared output field absent from
-    # mapping targets cannot be emitted.
+    # Rule C: internal self-consistency tripwire between the declared output
+    # schema and the *actual* predicted emit set. For ``field_mapper`` with
+    # ``select_only=True`` the successful emit set is exactly
+    # ``mapping.values()``. Since d4ae04b374 the mapping is also the
+    # required-read authority: representable sources are checked before
+    # ``process()``, and unrepresentable misses route to error. Consequently
+    # every target MUST be in the plugin-computed guarantee set. A finding here
+    # is framework drift, not an author-repairable schema choice.
     #
     # Why this is plugin-scoped rather than generic: ``_output_schema_config.
-    # guaranteed_fields`` has plugin-specific semantics. For field_mapper it
-    # IS the actual emit set (computed by ``_build_field_mapper_output_schema_config``
-    # from the mapping). For additive plugins like ``line_explode``/``web_scrape``
+    # guaranteed_fields`` has plugin-specific semantics. For a select-only
+    # field_mapper it IS the actual emit set (computed by
+    # ``_build_field_mapper_output_schema_config`` from the mapping). For
+    # additive plugins like ``line_explode``/``web_scrape``
     # it is a *lower bound* on emission (only the fields the transform itself
     # adds — passes-through input fields are not enumerated), so a generic
     # ``get_effective_guaranteed_fields() - guaranteed_fields`` check would
@@ -6335,17 +6252,9 @@ def _check_schema_contracts(
             continue
         if node.id in parse_failed_producers:
             continue
-        # Gate on the PLUGIN'S parse of select_only, not on raw-JSON
-        # truthiness. The two disagree on exactly the pydantic-False strings
-        # ("false"/"False"/"no"/"off"/"0"): ``bool()`` reads every non-empty
-        # string as True, and the drifted gate adjudicated a mapper whose
-        # parsed select_only is False under this rule's select_only-only
-        # jurisdiction, asserting "with select_only: true" about a
-        # configuration the node does not have (elspeth-fc3cd7a86c).
-        # Constructing the CONFIG asks the single owner of that semantics
-        # while still short-circuiting before plugin construction and
-        # touching no private plugin instance attributes. An unparseable
-        # config is the config-parse rules' to report, never Rule C's.
+        # Gate on the PLUGIN'S parse of select_only, not raw-JSON truthiness;
+        # pydantic-False strings and Python bool() disagree. An unparseable
+        # config belongs to the config-parse rules, never this tripwire.
         node_cfg = _probe_field_mapper_config(node.options)
         if node_cfg is None:
             continue
@@ -6370,14 +6279,13 @@ def _check_schema_contracts(
                 f"[{_format_fields(declared_required)}] (required) but with select_only: true the mapping can only "
                 f"guarantee [{_format_fields(predicted_emit)}]. "
                 f"Declared required output fields not guaranteed by this transform: [{_format_fields(missing)}]. "
-                f"{_unguaranteed_target_remedies(node.options, missing)}",
+                + _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX,
                 "high",
                 "transform_declared_output_not_guaranteed",
                 # Self-inconsistency: producer and consumer are the same node.
-                # missing_fields are mapping TARGETS the node declares required
-                # but cannot guarantee — not names the author necessarily wrote
-                # in `schema.fields`, which is why the message resolves each one
-                # back to its mapping source before advising anything.
+                # Missing fields are mapping TARGETS. Since the mapping itself
+                # is now the required-read authority, this is internal plugin
+                # contract drift rather than an author-repairable declaration.
                 contract=SchemaContractDetail(
                     producer=node.id,
                     consumer=node.id,
@@ -7136,6 +7044,20 @@ class CompositionState:
                         )
                     )
             elif node.node_type == "coalesce":
+                # ``CoalesceSettings`` is a built-in structural contract and
+                # has no plugin options field.  The YAML generator therefore
+                # cannot lower NodeSpec.options for this node kind.  Refuse
+                # any non-empty mapping here instead of validating authored
+                # metadata that disappears before runtime (elspeth-15b400881f).
+                if node.options:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Coalesce '{node.id}' does not accept options; author branches, policy, merge, and optional timeout_seconds instead.",
+                            "high",
+                            "coalesce_config_invalid",
+                        )
+                    )
                 if node.branches is None:
                     errors.append(
                         _err(

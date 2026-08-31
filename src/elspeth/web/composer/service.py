@@ -33,7 +33,12 @@ if TYPE_CHECKING:
     from elspeth.web.composer.guided.planning import GuidedCorrectionTarget, GuidedRevisionAuthority
     from elspeth.web.composer.guided.state_machine import TerminalState
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
-    from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, GuidedOperationFence, SessionServiceProtocol
+    from elspeth.web.sessions.protocol import (
+        ComposerSessionPreferencesRecord,
+        GuidedOperationFence,
+        PreparedInterpretationEventDraft,
+        SessionServiceProtocol,
+    )
     from elspeth.web.sessions.telemetry import _SessionsTelemetry
 
 import structlog
@@ -178,6 +183,7 @@ from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.skills import assert_skill_hash_unchanged_on_disk
 from elspeth.web.composer.source_demand import (
     build_source_data_contract_draft,
+    parse_legacy_source_data_contract_fields,
     sample_header_for_source,
 )
 from elspeth.web.composer.state import CompositionState, NodeSpec, ValidationSummary
@@ -228,6 +234,7 @@ from elspeth.web.interpretation_state import (
     pending_execution_interpretation_sites,
     source_name_from_component_id,
     vague_term_wiring_count,
+    validate_pipeline_decision_node_semantics,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
@@ -954,11 +961,11 @@ def _orphaned_interpretation_review_validation(
     wording, which would point the user at a card that does not exist.
 
     The gate fires for EVERY interpretation kind that
-    ``_missing_pending_interpretation_review_sites`` can surface — vague_term,
-    invented_source, and pipeline_decision — not just legacy vague_term tokens.
+    ``_missing_pending_interpretation_review_sites`` can surface, including
+    both source-level kinds, not just legacy vague_term tokens.
     ``component_type`` is therefore derived per-site from the kind
-    (``INVENTED_SOURCE`` is a source-level handoff, every other kind is a
-    transform-level one) so the persisted ``ValidationError`` / readiness
+    (``INVENTED_SOURCE`` and ``SOURCE_DATA_CONTRACT`` are source-level
+    handoffs; node review kinds are transform-level) so the persisted ``ValidationError`` / readiness
     blocker carries the correct component type into the audit trail; and
     ``affected_nodes`` excludes source sites, mirroring the runtime preflight's
     canonical handling (``execution/validation.py`` ``InterpretationReviewPending``
@@ -966,7 +973,7 @@ def _orphaned_interpretation_review_validation(
     """
 
     def _component_type_for_kind(kind: InterpretationKind) -> Literal["source", "transform"]:
-        return "source" if kind is InterpretationKind.INVENTED_SOURCE else "transform"
+        return "source" if kind in {InterpretationKind.INVENTED_SOURCE, InterpretationKind.SOURCE_DATA_CONTRACT} else "transform"
 
     site_detail = ", ".join(f"{kind.value}:{component_id}:{term}" for component_id, term, kind in missing_sites)
     detail = f"The pipeline carries an unresolvable interpretation handoff with no matching pending review and cannot run: {site_detail}."
@@ -1670,13 +1677,15 @@ async def _surfaced_evidence_keys(
 ) -> frozenset[tuple[str, str, InterpretationKind]]:
     """Per-site surfacing evidence on one state, in ANY resolution status.
 
-    The interpretation_events rows bound to a committed state ARE the durable
-    completion record for that state's surfacing debt: resolving or
-    abandoning a review updates its row, it never removes it, and the state
+    Current-version interpretation_events rows bound to a committed state ARE
+    the durable completion record for that state's surfacing debt: resolving
+    or abandoning a review updates its row, it never removes it, and the state
     the rows bind to is immutable. A pending-only check would therefore read
     an already-resolved site as still owed and recreate it against stale
     historical state — which the writer boundary rejects outright once the
-    placeholder has been consumed.
+    placeholder has been consumed. The deliberate exception is a v1
+    source_data_contract card: it proves the old consequence was shown, not
+    the corrected v2 consequence, so migration must surface current evidence.
     """
 
     events = await sessions_service.list_interpretation_events(
@@ -1684,11 +1693,22 @@ async def _surfaced_evidence_keys(
         status="all",
         composition_state_id=UUID(current_state_id),
     )
-    return frozenset(
-        (event.affected_node_id, event.user_term, event.kind)
-        for event in events
-        if event.affected_node_id is not None and event.user_term is not None and event.kind is not None
-    )
+    evidence: set[tuple[str, str, InterpretationKind]] = set()
+    for event in events:
+        if event.affected_node_id is None or event.user_term is None or event.kind is None:
+            continue
+        if (
+            event.kind is InterpretationKind.SOURCE_DATA_CONTRACT
+            and event.llm_draft is not None
+            and parse_legacy_source_data_contract_fields(event.llm_draft) is not None
+        ):
+            # A v1 row is durable evidence that the old card was surfaced, but
+            # it is not evidence that this state's corrected v2 consequence
+            # was shown. Let the repair surfacer supersede a pending v1 card or
+            # mint a current card beside resolved v1 history.
+            continue
+        evidence.add((event.affected_node_id, event.user_term, event.kind))
+    return frozenset(evidence)
 
 
 async def _auto_surface_prompt_template_reviews_for_state(
@@ -1718,36 +1738,23 @@ async def _auto_surface_prompt_template_reviews_for_state(
     for site in interpretation_sites(state):
         if site.kind is not InterpretationKind.LLM_PROMPT_TEMPLATE:
             continue
-        node = next((candidate for candidate in state.nodes if candidate.id == site.component_id), None)
-        if node is None:
+        surfaced = _backend_surface_args_for_site(state, site)
+        if surfaced is None:
             continue
-        options = node.options
-        prompt_template = options["prompt_template"]
-        if type(prompt_template) is not str or not prompt_template:
-            raise InvariantError(
-                "_auto_surface_prompt_template_reviews: prompt-template interpretation site lost its non-empty prompt_template"
-            )
+        affected_node_id, user_term, prompt_template = surfaced
+        if (affected_node_id, user_term, InterpretationKind.LLM_PROMPT_TEMPLATE) in already_surfaced:
+            continue
         # The transactional writer owns kind-specific reviewed-content
         # identity. Calling it for every candidate preserves idempotence across
         # unrelated state versions while allowing same-text skeleton changes to
         # supersede stale cards.
-        # The create_pending gate (sessions/service.py) REQUIRES exactly one
-        # pending PT requirement on the node for this user_term. Surface only
-        # where that precondition holds — otherwise create_pending would raise
-        # and crash the compose loop. A prompt_template node with no pending PT
-        # requirement is the requirement-None enumerator branch
-        # (_missing_prompt_template_review_sites) and is left to the orphan gate.
-        if not ComposerServiceImpl._has_pending_prompt_template_requirement(options, user_term=site.user_term):
-            continue
-        if (site.component_id, site.user_term, InterpretationKind.LLM_PROMPT_TEMPLATE) in already_surfaced:
-            continue
         try:
             await sessions_service.create_pending_interpretation_event(
                 session_id=UUID(session_id),
                 composition_state_id=UUID(current_state_id),
-                affected_node_id=site.component_id,
+                affected_node_id=affected_node_id,
                 tool_call_id=f"{BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}{uuid4()}",  # (D1)
-                user_term=site.user_term,
+                user_term=user_term,
                 kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
                 llm_draft=prompt_template,
                 model_identifier=model_identifier,  # (D2)
@@ -1823,7 +1830,27 @@ def _backend_surface_args_for_site(
     if node is None:
         return None
     options = node.options
+    # Prompt/model/vague cards share the event writer's LLM-transform
+    # discriminator.  Checking only the requirement draft is insufficient:
+    # an aggregation carrying copied LLM options, or a transform with no
+    # prompt, still enumerates a fail-closed site but the writer rejects it.
+    is_llm_transform = node.node_type == "transform" and node.plugin == "llm"
+    if site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+        if not is_llm_transform:
+            return None
+        prompt_template = options["prompt_template"] if "prompt_template" in options else None
+        if type(prompt_template) is not str or not prompt_template:
+            raise InvariantError(
+                "_auto_surface_prompt_template_reviews: prompt-template interpretation site lost its non-empty prompt_template"
+            )
+        # The writer requires exactly one matching pending requirement. A
+        # requirement-free legacy site cannot become a resolvable card.
+        if not ComposerServiceImpl._has_pending_prompt_template_requirement(options, user_term=site.user_term):
+            return None
+        return (node.id, site.user_term, prompt_template)
     if site.kind is InterpretationKind.LLM_MODEL_CHOICE:
+        if not is_llm_transform:
+            return None
         model = options["model"] if "model" in options else None
         if type(model) is not str or not model:
             return None
@@ -1847,16 +1874,92 @@ def _backend_surface_args_for_site(
         draft = ComposerServiceImpl._matching_requirement_draft(options, kind=site.kind, user_term=site.user_term)
         if draft is None:
             return None
+        try:
+            validate_pipeline_decision_node_semantics(
+                node=node,
+                all_nodes=state.nodes,
+                user_term=site.user_term,
+                draft=draft,
+                context="backend interpretation-review surfacer",
+            )
+        except ValueError:
+            return None
         return (node.id, site.user_term, draft)
     if site.kind is InterpretationKind.VAGUE_TERM:
         # Only authored/staged vague-term requirements are surfaced.
         # Bare legacy placeholders carry no requirement and are left
         # fail-closed at the run-time gate; never invent a draft.
+        if not is_llm_transform:
+            return None
+        prompt_template = options["prompt_template"] if "prompt_template" in options else None
+        if type(prompt_template) is not str or not prompt_template:
+            return None
+        if vague_term_wiring_count(options, user_term=site.user_term) != 1:
+            return None
         draft = ComposerServiceImpl._matching_requirement_draft(options, kind=site.kind, user_term=site.user_term)
         if draft is None:
             return None
         return (node.id, site.user_term, draft)
-    return None
+
+
+def unsurfaceable_pending_interpretation_review_sites(
+    state: CompositionState,
+) -> tuple[InterpretationReviewSite, ...]:
+    """Return execution-blocking review sites the backend cannot eventize.
+
+    This is the pure pre-persistence view of the same site-to-writer argument
+    authority used by :func:`surface_pending_interpretation_reviews_for_state`.
+    Paste/import routes use it to reject atomically instead of committing a
+    state whose fail-closed execution debt has no consumable review card.
+    """
+
+    return tuple(site for site in interpretation_sites(state) if _backend_surface_args_for_site(state, site) is None)
+
+
+def prepare_pending_interpretation_event_drafts_for_state(
+    state: CompositionState,
+    *,
+    model_identifier: str,
+    model_version: str,
+    provider: str,
+    composer_skill_hash: str,
+) -> tuple[PreparedInterpretationEventDraft, ...]:
+    """Prepare the generic surfacer's event cohort for atomic settlement.
+
+    Prompt-template cards retain the established first-pass ordering; every
+    kind still delegates to ``_backend_surface_args_for_site``, the one pure
+    site-to-writer projection shared with asynchronous repair surfacing.
+    Callers must reject ``unsurfaceable_pending_interpretation_review_sites``
+    before invoking this function.
+    """
+    from elspeth.web.sessions.protocol import PreparedInterpretationEventDraft
+
+    sites = interpretation_sites(state)
+    ordered_sites = (
+        *(site for site in sites if site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE),
+        *(site for site in sites if site.kind is not InterpretationKind.LLM_PROMPT_TEMPLATE),
+    )
+    drafts: list[PreparedInterpretationEventDraft] = []
+    for site in ordered_sites:
+        surfaced = _backend_surface_args_for_site(state, site)
+        if surfaced is None:
+            raise InvariantError("atomic interpretation cohort contains an unsurfaceable pending site")
+        affected_node_id, user_term, llm_draft = surfaced
+        drafts.append(
+            PreparedInterpretationEventDraft(
+                event_id=uuid4(),
+                affected_node_id=affected_node_id,
+                tool_call_id=f"{BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}{uuid4()}",
+                user_term=user_term,
+                kind=site.kind,
+                llm_draft=llm_draft,
+                model_identifier=model_identifier,
+                model_version=model_version,
+                provider=provider,
+                composer_skill_hash=composer_skill_hash,
+            )
+        )
+    return tuple(drafts)
 
 
 async def surface_pending_interpretation_reviews_for_state(
@@ -2510,7 +2613,8 @@ class ComposerServiceImpl:
             if type(requirement) not in (dict, MappingProxyType):
                 raise InvariantError("_has_pending_prompt_template_requirement: interpretation requirement entries must be dict-shaped")
             requirement_map = cast(Mapping[str, Any], requirement)
-            if requirement_map["kind"] != InterpretationKind.LLM_PROMPT_TEMPLATE.value:
+            requirement_kind = requirement_map["kind"] if "kind" in requirement_map else InterpretationKind.VAGUE_TERM.value
+            if requirement_kind != InterpretationKind.LLM_PROMPT_TEMPLATE.value:
                 continue
             if requirement_map["status"] != "pending":
                 continue
@@ -2543,8 +2647,8 @@ class ComposerServiceImpl:
         time with ``UnresolvedInterpretationPlaceholderError``. This pass runs
         after every site-creating guided commit (source / transform /
         recipe-apply) and surfaces a resolvable pending EVENT for every site
-        whose writer-boundary precondition holds — covering all five
-        ``InterpretationKind`` members, not just ``llm_prompt_template``.
+        whose writer-boundary precondition holds — covering every
+        ``InterpretationKind`` member, not just ``llm_prompt_template``.
 
         Each branch reads the site's ``draft``/``user_term`` from the node or
         source requirement so the strict per-kind writer boundary
@@ -2611,7 +2715,8 @@ class ComposerServiceImpl:
         for requirement in raw:
             if not isinstance(requirement, Mapping):
                 continue
-            if requirement.get("kind") != kind.value:
+            requirement_kind = requirement.get("kind", InterpretationKind.VAGUE_TERM.value)
+            if requirement_kind != kind.value:
                 continue
             if requirement.get("status") != "pending":
                 continue
@@ -2619,7 +2724,7 @@ class ComposerServiceImpl:
             if not isinstance(requirement_term, str) or requirement_term.strip() != user_term.strip():
                 continue
             draft = requirement.get("draft")
-            if isinstance(draft, str):
+            if isinstance(draft, str) and draft:
                 matches.append(draft)
         return matches[0] if len(matches) == 1 else None
 

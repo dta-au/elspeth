@@ -412,7 +412,9 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # When True, every SUCCESS row carries every field on its input row EXCEPT
     # removed_input_fields. Weaker than passes_through_input in two ways it must
     # stay weaker in: it tolerates a named removal set, and it says nothing
-    # about WHICH rows are emitted. Read only by walk_definite_emitted_fields.
+    # about WHICH rows are emitted. With an extras-allowing output contract,
+    # presence and definite-emits walks both propagate predecessor lower bounds
+    # through the named subtraction; a fixed contract is a firewall.
     forwards_input_fields: bool
     removed_input_fields: frozenset[str]
 

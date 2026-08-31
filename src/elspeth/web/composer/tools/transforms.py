@@ -33,6 +33,7 @@ from elspeth.web.composer.state import (
     queue_node_contract_error,
 )
 from elspeth.web.composer.tools._common import (
+    _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _STEP_DESCRIPTION_DESCRIPTION,
     ToolContext,
     ToolResult,
@@ -240,7 +241,7 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "description": (
                 "Plugin-specific config (transform/aggregation only). The schema: block declares what "
                 "ARRIVES at the node, never its transformed result; declare arriving types on the "
-                "SOURCE schema or via an upstream type_coerce (observed CSV fields arrive as str)."
+                "SOURCE schema or via an upstream type_coerce (observed CSV fields arrive as str)." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
             ),
         },
         "condition": {"type": ["string", "null"], "description": "Boolean expression (gate only). Evaluated per row."},
@@ -1632,7 +1633,7 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
                     "For a gate, edit on_error only with upsert_node. "
                     "A patched schema: block declares what ARRIVES at the node, never its transformed "
                     "result; to change what arrives, declare the type on the SOURCE schema "
-                    "(patch_source_options) or insert a type_coerce upstream."
+                    "(patch_source_options) or insert a type_coerce upstream." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
         },
@@ -1806,7 +1807,10 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
                         "description": "Unique ID for the inserted transform.",
                     },
                     "plugin": {"type": "string", "description": "Transform plugin name."},
-                    "options": {"type": "object", "description": "Plugin-specific authored options."},
+                    "options": {
+                        "type": "object",
+                        "description": "Plugin-specific authored options." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+                    },
                     "on_error": {
                         "type": ["string", "null"],
                         "description": "Optional error route; defaults to discard.",

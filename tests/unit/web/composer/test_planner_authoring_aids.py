@@ -664,8 +664,28 @@ def _assert_operator_ruled_topology(args: dict[str, Any]) -> None:
 
 
 class TestForkCoalesceExemplar:
+    def test_llm_exemplar_teaches_source_to_target_mapping_direction(self, tmp_path: Path) -> None:
+        """At least one rename key is an arriving LLM response field.
+
+        Identity-only mappings are direction-blind: they let an author reverse
+        ``source -> target`` without any visible difference.  The worked LLM
+        exemplar must keep a real rename whose key is produced by an LLM arm
+        and whose value is the tidied output name (elspeth-d4ae04b374).
+        """
+        view, _snapshot = _profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        llm_response_fields = {node["options"]["response_field"] for node in args["nodes"] if node.get("plugin") == "llm"}
+        cleanup = next(node for node in args["nodes"] if node.get("plugin") == "field_mapper")
+        renames = {source: target for source, target in cleanup["options"]["mapping"].items() if source != target}
+
+        assert renames
+        assert set(renames) <= llm_response_fields
+        assert set(renames.values()).isdisjoint(llm_response_fields)
+
     def test_fork_coalesce_exemplar_validates_under_the_live_profile_posture(self, tmp_path: Path) -> None:
-        """The exact fork -> two-llm -> coalesce exemplar bytes must build."""
+        """The exemplar builds with derived producer and authored consumer contracts."""
         (tmp_path / "outputs").mkdir(exist_ok=True)
         view, snapshot = _profile_view(tmp_path)
         args = fork_coalesce_exemplar_args(view)
@@ -677,6 +697,25 @@ class TestForkCoalesceExemplar:
 
         rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
         assert candidate.acceptable is True, f"fork/coalesce exemplar rejected: {rejection}"
+        state = candidate.result.updated_state
+        coalesce = next(node for node in state.nodes if node.node_type == "coalesce")
+        cleanup = next(node for node in state.nodes if node.plugin == "field_mapper")
+        output = state.outputs[0]
+
+        # The structural node contributes no authored producer claim. Its
+        # require-all/union guarantees are instead derived from branch plugin
+        # contracts, and validate() proves those guarantees satisfy the
+        # cleanup's declared input contract.
+        assert coalesce.options == {}
+        branch_output_fields = {node.options["response_field"] for node in state.nodes if node.plugin == "llm"}
+        assert branch_output_fields <= set(cleanup.options["schema"]["guaranteed_fields"])
+        assert state.validate().is_valid
+
+        # Exact emitted shape remains planner-authored at the consumer seam.
+        assert cleanup.options["select_only"] is True
+        assert output.options["schema"]["mode"] == "fixed"
+        sink_fields = [field.partition(":")[0] for field in output.options["schema"]["fields"]]
+        assert sink_fields == list(cleanup.options["mapping"].values())
 
     def test_fork_coalesce_exemplar_has_the_operator_ruled_topology(self, tmp_path: Path) -> None:
         """Two separate LLM transform nodes + coalesce merge — never a queries map."""
@@ -2125,6 +2164,32 @@ class TestModelCustody:
         assert "multi_query" in rules
         assert "does NOT create row fields" in rules
 
+    def test_known_business_columns_are_declared_at_the_sink_not_left_to_row_one(self) -> None:
+        """The planner must not promise a stable output shape and author an observed sink.
+
+        ``guaranteed_fields`` is a producer-presence contract, a coalesce has
+        no authored schema option, and a sink consumes rows rather than
+        producing them.  The stable CSV header therefore belongs in the
+        sink's explicit ``fields`` declaration (with an exact projection when
+        the user asked for exactly those columns), never in copied guarantee
+        metadata on every downstream component.
+        """
+        view, _snapshot = _trained_view()
+
+        rules = " ".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        assert "first accepted row" in rules
+        assert "sink schema.fields" in rules
+        assert "plugin-free coalesce" in rules
+        assert "guaranteed_fields on a sink" in rules
+
+    def test_llm_usage_and_model_columns_are_named_as_operational_not_audit_fields(self) -> None:
+        """Runtime row columns must not be conflated with separate audit metadata."""
+        view, _snapshot = _trained_view()
+
+        rules = " ".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        assert "operational row fields" in rules
+        assert "_usage / _model audit fields" not in rules
+
 
 class TestLlmSourceGenerationAid:
     def test_source_only_generation_uses_llm_source_without_transform_advice(self, tmp_path: Path) -> None:
@@ -2306,6 +2371,15 @@ class TestCoalesceVocabulary:
 
         coalesce = next(node for node in args["nodes"] if node["node_type"] == "coalesce")
         assert coalesce["input"] in set(coalesce["branches"].values())
+
+    def test_exemplar_does_not_put_a_noop_schema_on_the_structural_coalesce(self, tmp_path: Path) -> None:
+        """CoalesceSettings has no schema field; export drops NodeSpec options."""
+        view, _snapshot = _profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        coalesce = next(node for node in args["nodes"] if node["node_type"] == "coalesce")
+        assert coalesce["options"] == {}
 
 
 class TestNamedButMissingFile:

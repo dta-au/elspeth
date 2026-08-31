@@ -9,16 +9,20 @@ invented_source (materialize_state_for_execution returns the pending site).
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
-from typing import Any
+from typing import Any, Literal
+
+import pytest
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_USER_TERM,
     build_source_data_contract_draft,
     source_data_contract_artifact_hash,
 )
-from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     SOURCE_AUTHORING_KEY,
@@ -102,6 +106,40 @@ def _resolved_contract_options(acknowledged: list[str], *, extra: dict[str, Any]
     return options
 
 
+def _legacy_v1_contract_options(acknowledged: list[str]) -> dict[str, Any]:
+    """Persisted v1 evidence: valid historically, but not v2 authority."""
+    payload = {
+        "contract_version": 1,
+        "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+        "demanded_fields": sorted(acknowledged),
+        "sample_header": None,
+        "missing_from_sample": [],
+    }
+    draft = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return {
+        "path": "/tmp/upload.csv",
+        "schema": {"mode": "observed", "guaranteed_fields": list(acknowledged)},
+        INTERPRETATION_REQUIREMENTS_KEY: [
+            {
+                "id": "source-data-contract-source",
+                "kind": InterpretationKind.SOURCE_DATA_CONTRACT.value,
+                "user_term": SOURCE_DATA_CONTRACT_USER_TERM,
+                "status": "resolved",
+                "draft": draft,
+                "event_id": "11111111-1111-1111-1111-111111111111",
+                "accepted_value": draft,
+                "accepted_artifact_hash": stable_hash(
+                    {
+                        "review_kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                        "demanded_fields": sorted(acknowledged),
+                    }
+                ),
+                "resolved_prompt_template_hash": None,
+            }
+        ],
+    }
+
+
 class TestSiteStaging:
     def test_uploaded_source_with_demand_stages_a_site(self) -> None:
         sites = _contract_sites(_state({"path": "/tmp/upload.csv"}, required=["colour"]))
@@ -129,6 +167,44 @@ class TestSiteStaging:
     def test_acknowledged_matching_demand_is_clean(self) -> None:
         state = _state(_resolved_contract_options(["colour"]), required=["colour"])
         assert _contract_sites(state) == []
+
+    def test_legacy_v1_acknowledgement_reopens_with_current_demand_and_blocks_execution(self) -> None:
+        state = _state(_legacy_v1_contract_options(["colour"]), required=["colour"])
+
+        assert current_source_data_contract_demand(state, "source") == ("colour",)
+        assert [site.component_id for site in _contract_sites(state)] == ["source"]
+        assert isinstance(materialize_state_for_execution(state), InterpretationReviewPending)
+
+    def test_incoherent_accepted_value_and_hash_blocks_execution(self) -> None:
+        options = _resolved_contract_options(["colour"])
+        options[INTERPRETATION_REQUIREMENTS_KEY][0]["accepted_value"] = build_source_data_contract_draft(["size"], None)
+        state = _state(options, required=["colour"])
+
+        sites = _contract_sites(state)
+
+        assert len(sites) == 1
+        assert sites[0].component_id == "source"
+        assert isinstance(materialize_state_for_execution(state), InterpretationReviewPending)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (
+            ("event_id", None),
+            ("event_id", ""),
+            ("resolved_prompt_template_hash", "forged-second-domain-hash"),
+        ),
+        ids=("missing-event", "empty-event", "opposite-hash"),
+    )
+    def test_incomplete_resolved_evidence_blocks_execution(self, field: str, value: object) -> None:
+        options = _resolved_contract_options(["colour"])
+        options[INTERPRETATION_REQUIREMENTS_KEY][0][field] = value
+        state = _state(options, required=["colour"])
+
+        sites = _contract_sites(state)
+
+        assert len(sites) == 1
+        assert sites[0].component_id == "source"
+        assert isinstance(materialize_state_for_execution(state), InterpretationReviewPending)
 
     def test_demand_growth_reopens_the_card(self) -> None:
         # Acknowledged {colour}; the pipeline now also requires 'size' from
@@ -164,8 +240,12 @@ def _queue_node() -> NodeSpec:
     )
 
 
-def _fan_in_state(sources: dict[str, SourceSpec]) -> CompositionState:
-    node = _llm_node(required=["colour"])
+def _fan_in_state(
+    sources: dict[str, SourceSpec],
+    *,
+    required: list[str] | None = None,
+) -> CompositionState:
+    node = _llm_node(required=required if required is not None else ["colour"])
     return CompositionState(
         source=None,
         sources=sources,
@@ -179,6 +259,63 @@ def _fan_in_state(sources: dict[str, SourceSpec]) -> CompositionState:
 
 def _fan_in_source(options: dict[str, Any]) -> SourceSpec:
     return SourceSpec(plugin="csv", on_success="q", options=options, on_validation_failure="discard")
+
+
+def _fork_fan_in_state(node_type: Literal["coalesce", "row_union"]) -> CompositionState:
+    is_coalesce = node_type == "coalesce"
+    source = SourceSpec(
+        plugin="csv",
+        on_success="input",
+        options=_resolved_contract_options(["colour"]),
+        on_validation_failure="discard",
+    )
+    gate = NodeSpec(
+        id="split",
+        node_type="gate",
+        plugin=None,
+        input="input",
+        on_success=None,
+        on_error="discard",
+        options={},
+        condition="True",
+        routes={"true": "fork", "false": "fork"},
+        fork_to=("a", "b"),
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    fan_in = NodeSpec(
+        id="joined" if is_coalesce else "u",
+        node_type=node_type,
+        plugin=None,
+        input="a",
+        on_success=None if is_coalesce else "joined",
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches={"a": "a", "b": "b"},
+        policy="require_all" if is_coalesce else None,
+        merge="union" if is_coalesce else None,
+    )
+    consumer = replace(_llm_node(required=["colour", "size"]), input="joined", on_success="output")
+    return CompositionState(
+        source=None,
+        sources={"source": source},
+        nodes=(gate, fan_in, consumer),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="output",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
 
 
 class TestFanInSiteLifecycle:
@@ -235,6 +372,44 @@ class TestFanInSiteLifecycle:
         sites = _contract_sites(state)
         assert [site.component_id for site in sites] == ["source:src_b"]
         assert current_source_data_contract_demand(state, "src_b") == ("colour",)
+
+    def test_growth_after_sole_guarantees_reopens_every_source_card(self) -> None:
+        # Both sources previously promised their sole guaranteed field.  A
+        # later consumer grows the contract, so stripping each accepted field
+        # for recomputation must preserve that arm's explicit-empty vote and
+        # surface the full current demand on both resolvable cards.
+        state = _fan_in_state(
+            {
+                "src_a": _fan_in_source(_resolved_contract_options(["colour"], extra={"path": "/tmp/a.csv"})),
+                "src_b": _fan_in_source(_resolved_contract_options(["colour"], extra={"path": "/tmp/b.csv"})),
+            },
+            required=["colour", "size"],
+        )
+
+        assert current_source_data_contract_demand(state, "src_a") == ("colour", "size")
+        assert current_source_data_contract_demand(state, "src_b") == ("colour", "size")
+        assert sorted(site.component_id for site in _contract_sites(state)) == ["source:src_a", "source:src_b"]
+
+    def test_row_union_growth_after_sole_guarantee_reopens_source_card(self) -> None:
+        state = _fork_fan_in_state("row_union")
+        result = state.validate()
+        assert [error for error in result.errors if error.error_code != "schema_contract_violation"] == []
+        assert [(contract.from_id, contract.to_id, contract.missing_fields) for contract in result.edge_contracts] == [
+            ("u", "rate", ("size",)),
+        ]
+        assert current_source_data_contract_demand(state, "source") == ("colour", "size")
+        assert [site.component_id for site in _contract_sites(state)] == ["source"]
+
+    def test_coalesce_growth_after_sole_guarantee_reopens_source_card(self) -> None:
+        state = _fork_fan_in_state("coalesce")
+
+        result = state.validate()
+        assert [error for error in result.errors if error.error_code != "schema_contract_violation"] == []
+        assert [(contract.from_id, contract.to_id, contract.missing_fields) for contract in result.edge_contracts] == [
+            ("joined", "rate", ("size",)),
+        ]
+        assert current_source_data_contract_demand(state, "source") == ("colour", "size")
+        assert [site.component_id for site in _contract_sites(state)] == ["source"]
 
 
 class TestReadinessBlocking:

@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import Any, Final, cast
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.blobs import ALLOWED_MIME_TYPES
@@ -23,7 +23,18 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.canonical import stable_hash
-from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.protocol import (
+    REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
+    REQUEST_INTERPRETATION_REVIEW_KIND_VALUES,
+    REQUEST_INTERPRETATION_REVIEW_KINDS,
+    SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION,
+    SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION,
+    SOURCE_DATA_CONTRACT_DRAFT_MISMATCH_ACTUAL_TYPE,
+    SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
+    SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE,
+    SOURCE_DATA_CONTRACT_TARGET_EXPECTATION,
+    ToolArgumentError,
+)
 from elspeth.web.composer.redaction import (
     SetPipelineArgumentsModel,
     redact_source_storage_path,
@@ -51,6 +62,8 @@ from elspeth.web.composer.tools._common import (
     _ECHOED_REVIEW_METADATA_NOTE,
     _ECHOED_SOURCE_AUTHORING_NOTE,
     _FULL_STATE_COMPONENT_ALIAS_SET,
+    _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+    _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
     _STEP_DESCRIPTION_DESCRIPTION,
     ReviewedSourceAuthority,
@@ -107,6 +120,7 @@ from elspeth.web.composer.tools.declarations import (
 )
 from elspeth.web.composer.tools.sources import (
     _MIME_TO_SOURCE,
+    _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _delimiter_extra_for_csv_blob,
     _drop_echoed_source_authoring,
     _header_only_inline_csv_conflict,
@@ -183,7 +197,8 @@ class _RequestInterpretationReviewArgumentsModel(BaseModel):
 
     * ``affected_node_id`` — short identifier; 256-char cap matches the wire
       cap used by ``upsert_node.id``.
-    * ``kind`` — closed interpretation class for the review row.
+    * ``kind`` — closed request-tool interpretation class; backend-only
+      prompt-template surfacing is excluded by the field validator.
     * ``user_term`` and ``llm_draft`` — capped at 8192 chars to defend against
       pathological inputs that would distend the audit row beyond the
       schema's 8192-byte expectation (see ``interpretation_events_table``
@@ -202,11 +217,22 @@ class _RequestInterpretationReviewArgumentsModel(BaseModel):
     """
 
     affected_node_id: str = Field(min_length=1, max_length=256)
-    kind: InterpretationKind
+    kind: InterpretationKind = Field(json_schema_extra={"enum": list(REQUEST_INTERPRETATION_REVIEW_KIND_VALUES)})
     user_term: str = Field(min_length=1, max_length=8192)
     llm_draft: str | None = Field(default=None, min_length=1, max_length=8192)
 
     model_config = ConfigDict(extra="forbid")
+
+    @field_validator("kind")
+    @classmethod
+    def _kind_must_be_requestable(cls, value: InterpretationKind) -> InterpretationKind:
+        if value not in REQUEST_INTERPRETATION_REVIEW_KINDS:
+            raise ToolArgumentError(
+                argument="kind",
+                expected=REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
+                actual_type=("llm_prompt_template — surfaced automatically by the backend at turn finalization; do not request it"),
+            )
+        return value
 
 
 def _validate_source_artifact_review_content(value: str) -> None:
@@ -1749,7 +1775,8 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     },
                     "options": {
                         "type": "object",
-                        "description": "Plugin-specific source config. Required by most file/data sources.",
+                        "description": "Plugin-specific source config. Required by most file/data sources."
+                        + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
                     },
                     "on_success": {
                         "type": "string",
@@ -1795,7 +1822,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     "type": "object",
                     "properties": {
                         "plugin": {"type": "string"},
-                        "options": {"type": "object"},
+                        "options": {
+                            "type": "object",
+                            "description": "Plugin-specific source config." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+                        },
                         "on_success": {"type": "string"},
                         "on_validation_failure": {
                             "type": ["string", "null"],
@@ -1843,7 +1873,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                                 "node, never as an edge; omit it to preserve fail-fast behavior."
                             ),
                         },
-                        "options": {"type": "object"},
+                        "options": {
+                            "type": "object",
+                            "description": "Plugin-specific node config." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+                        },
                         "condition": {"type": ["string", "null"]},
                         "routes": {
                             "type": ["object", "null"],
@@ -1954,7 +1987,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "plugin": {"type": "string"},
                         "options": {
                             "type": "object",
-                            "description": "Plugin-specific sink config.",
+                            "description": "Plugin-specific sink config." + _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
                         },
                         "on_write_failure": {"type": ["string", "null"]},
                         "description": {
@@ -2253,24 +2286,21 @@ def _assert_affected_component(
         if source_name is None:
             raise ToolArgumentError(
                 argument="affected_node_id",
-                expected="'source' for source_data_contract or 'source:<name>' for a named source",
+                expected=SOURCE_DATA_CONTRACT_TARGET_EXPECTATION,
                 actual_type="node id",
             )
         source = state.sources.get(source_name)
         if source is None:
             raise ToolArgumentError(
                 argument="affected_node_id",
-                expected=f"an existing source component ({affected_node_id!r})",
-                actual_type="missing source",
+                expected=SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
+                actual_type=SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE,
             )
         matched_terms = _matching_interpretation_sites(state, affected_node_id, kind, user_term)
         if not matched_terms:
             raise ToolArgumentError(
                 argument="affected_node_id",
-                expected=(
-                    "a source with an outstanding data-contract demand — the pipeline must require fields "
-                    "from this source that no current acknowledgement covers"
-                ),
+                expected=SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION,
                 actual_type=f"missing pending {kind.value} review site",
             )
         # The draft is SERVER-COMPUTED from the graph's demand backtrace and
@@ -2281,8 +2311,8 @@ def _assert_affected_component(
         if llm_draft is not None and llm_draft != computed_draft:
             raise ToolArgumentError(
                 argument="llm_draft",
-                expected="omitted — the server computes the data-contract card from the graph's demand backtrace",
-                actual_type="caller-supplied draft that does not match the server-computed data contract",
+                expected=SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION,
+                actual_type=SOURCE_DATA_CONTRACT_DRAFT_MISMATCH_ACTUAL_TYPE,
             )
         return computed_draft
 
@@ -2753,18 +2783,6 @@ async def _handle_request_interpretation_review(
             "request_interpretation_review arguments",
         ),
     )
-    # Backend owns prompt-template surfacing (elspeth-e51216d305 Case B). The
-    # ``llm_prompt_template`` review is auto-staged on every LLM node and the
-    # BACKEND surfaces its EVENT against the FINAL frozen skeleton at turn
-    # finalization, so it can never go stale against a later skeleton mutation.
-    # The LLM must NOT surface it mid-build via this tool; reject the kind at
-    # the Tier-3 boundary immediately after the parse, before any service call.
-    if parsed.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-        raise ToolArgumentError(
-            argument="kind",
-            expected="vague_term, invented_source, pipeline_decision, or llm_model_choice",
-            actual_type=("llm_prompt_template — surfaced automatically by the backend at turn finalization; do not request it"),
-        )
     # F-34 credential prefilter: Tier-3 boundary check before any DB write.
     # ``reject_credential_shaped_content`` raises ``ValueError``; we wrap
     # as ToolArgumentError so the compose loop's ARG_ERROR routing catches

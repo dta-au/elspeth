@@ -325,6 +325,8 @@ def _generate_pipeline_dict(
     if coalesces:
         doc["coalesce"] = []
         for c in coalesces:
+            if c["options"]:
+                raise PipelineLoweringError(f"Coalesce '{c['id']}' does not accept options; remove them before runtime lowering.")
             entry = {
                 "name": c["id"],
                 "branches": _require_node_key(c, "branches", "Coalesce"),

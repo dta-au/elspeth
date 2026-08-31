@@ -1517,3 +1517,30 @@ class TestReplyRegisterRule:
     def test_termination_checklist_includes_the_register_line(self) -> None:
         checklist = SYSTEM_PROMPT.split("## Termination States", 1)[1]
         assert "no tool-argument keys, validation fields, or enum values in prose" in checklist
+
+
+class TestMutationEchoOperatingContract:
+    """The high-salience freeform contract prevents post-success reread loops."""
+
+    def test_operating_contract_names_the_echo_and_remaining_validation_authorities(self) -> None:
+        section = SYSTEM_PROMPT.split("## Operating Contract — read first", 1)[1].split("## Skill Router", 1)[0]
+
+        assert "`applied_component`" in section
+        assert "authoritative post-change state" in section
+        assert "`validation` / `validation_delta`" in section
+
+    def test_operating_contract_forbids_confirmation_rereads(self) -> None:
+        section = SYSTEM_PROMPT.split("## Operating Contract — read first", 1)[1].split("## Skill Router", 1)[0]
+
+        assert "Never call `get_pipeline_state` to confirm components named in that echo" in " ".join(section.split())
+
+    def test_review_handoff_recovery_uses_mutation_echo_before_state_read(self) -> None:
+        section = SYSTEM_PROMPT.split("If review handoff fails for a staged requirement", 1)[1].split(
+            "`interpretation_requirements` is always a JSON array", 1
+        )[0]
+        flattened = " ".join(section.split())
+
+        assert "latest successful mutation's `applied_component`" in flattened
+        assert "Only when that mutation omitted the echo or its echo does not cover the affected component" in flattened
+        assert "Read `get_pipeline_state`" not in flattened
+        assert "Read the current pipeline state" not in flattened

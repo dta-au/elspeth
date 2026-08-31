@@ -91,6 +91,7 @@ from elspeth.web.interpretation_state import (
     composer_pipeline_decision_user_term_error,
     parse_interpretation_requirements,
     project_planner_context_interpretation_requirement,
+    resolved_review_evidence_is_coherent,
     serialize_authoring_review_options,
     source_name_from_component_id,
     strip_authoring_options,
@@ -120,6 +121,15 @@ _FULL_STATE_COMPONENT_ALIASES: Final[tuple[str, ...]] = ("", "full", "all", "pip
 _FULL_STATE_COMPONENT_ALIAS_SET: Final[frozenset[str]] = frozenset(_FULL_STATE_COMPONENT_ALIASES)
 _DATA_ERROR_KEY: Final[str] = "error"
 _RUNTIME_OWNED_LLM_OPTION_KEYS: Final[frozenset[str]] = frozenset({"resolved_prompt_template_hash"})
+_SOURCE_BLOB_REF_OPTION_KEY: Final[str] = "blob_ref"
+_SOURCE_BLOBS_OPTION_KEY: Final[str] = "blobs"
+_SERVER_OWNED_SOURCE_OPTION_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        SOURCE_AUTHORING_KEY,
+        _SOURCE_BLOB_REF_OPTION_KEY,
+        _SOURCE_BLOBS_OPTION_KEY,
+    }
+)
 _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "id",
@@ -130,12 +140,50 @@ _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = froze
         "resolved_prompt_template_hash",
     }
 )
-_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(
-    {
-        "kind",
-        "user_term",
-        "draft",
-    }
+_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER: Final[tuple[str, ...]] = (
+    "kind",
+    "user_term",
+    "draft",
+)
+_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER)
+_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT: Final[str] = ", ".join(
+    (
+        *_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER[:-1],
+        f"and {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER[-1]}",
+    )
+)
+_INTERPRETATION_REVIEW_FOLLOWUP: Final[str] = (
+    "Then call request_interpretation_review for an authorable staged site; "
+    "backend-owned review kinds are surfaced automatically. The user resolves "
+    "the card and ELSPETH writes resolved review metadata."
+)
+_INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
+    " Inside interpretation_requirements, only " + _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT + " are authorable. "
+    "Resolver-owned fields are not settable: "
+    + ", ".join(sorted(_RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS))
+    + ". Omit those fields. Persist an authorable pending review with the current mutation tool, then call "
+    "request_interpretation_review for that staged site; backend-owned review kinds are surfaced automatically. "
+    "The user resolves the card and ELSPETH writes resolved review metadata."
+)
+_LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
+    " Runtime-owned LLM option fields are not settable: "
+    + ", ".join(sorted(_RUNTIME_OWNED_LLM_OPTION_KEYS))
+    + ". Omit them; ELSPETH re-derives them during review reconciliation or execution."
+    + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
+)
+_BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
+    f" The {INTERPRETATION_REQUIREMENTS_KEY} option root is not settable on any source, node, or output path. "
+    "On source paths, these server/resolver-owned roots are also not settable: "
+    + ", ".join(sorted(_SERVER_OWNED_SOURCE_OPTION_KEYS))
+    + ". Bind sources with set_source_from_blob or set_source_from_blobs instead. "
+    "When field_path targets an LLM node, its runtime-owned top-level option is also not settable: "
+    + ", ".join(sorted(_RUNTIME_OWNED_LLM_OPTION_KEYS))
+    + ". For author-owned LLM option edits use patch_node_options, or upsert_node for a full node edit; "
+    "blob wiring cannot author those values."
+)
+_OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
+    f" The {INTERPRETATION_REQUIREMENTS_KEY} option root is not settable on outputs. "
+    "Stage an authorable review on its source or node instead."
 )
 _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(
     {
@@ -2304,9 +2352,10 @@ def _resolver_owned_interpretation_requirement_error(
     requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY]
     malformed_error = (
         f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY} must be a list of "
-        "review entry objects, each carrying non-empty string fields kind, user_term, "
-        "and draft. Omit the field entirely when no review is being staged; canonical "
-        "review metadata is written only by resolve_interpretation_event."
+        "review entry objects, each carrying non-empty string fields "
+        f"{_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT}. Omit the field entirely "
+        "when no review is being staged. "
+        f"{_INTERPRETATION_REVIEW_FOLLOWUP}"
     )
     if type(requirements_value) is not list:
         return malformed_error
@@ -2331,8 +2380,9 @@ def _resolver_owned_interpretation_requirement_error(
             return (
                 f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] includes "
                 "resolver-owned status 'resolved'. Composer tool input may stage pending "
-                "review requirements only; resolved review metadata may only be written by "
-                "resolve_interpretation_event."
+                f"review requirements only. Omit resolver-owned fields and retry {tool_name} "
+                f"with exactly {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT}. "
+                f"{_INTERPRETATION_REVIEW_FOLLOWUP}"
             )
         resolver_owned_fields = sorted(field for field in _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS if field in requirement)
         if resolver_owned_fields:
@@ -2340,8 +2390,8 @@ def _resolver_owned_interpretation_requirement_error(
             return (
                 f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] includes "
                 f"resolver-owned field(s): {field_names}. Composer tool input may supply "
-                "only kind, user_term, and draft; resolver-owned review metadata may only "
-                "be written by resolve_interpretation_event."
+                f"only {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT}. Omit resolver-owned "
+                f"fields and retry {tool_name}. {_INTERPRETATION_REVIEW_FOLLOWUP}"
             )
         if set(requirement) != _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS:
             return malformed_error
@@ -2487,22 +2537,7 @@ def _canonical_interpretation_requirement_error(
             return error
         if type(requirement["accepted_value"]) is not str:
             return error
-        kind = InterpretationKind(requirement["kind"])
-        if kind in (
-            InterpretationKind.INVENTED_SOURCE,
-            InterpretationKind.PIPELINE_DECISION,
-        ):
-            if (
-                type(requirement["accepted_artifact_hash"]) is not str
-                or not requirement["accepted_artifact_hash"].strip()
-                or requirement["resolved_prompt_template_hash"] is not None
-            ):
-                return error
-        elif (
-            type(requirement["resolved_prompt_template_hash"]) is not str
-            or not requirement["resolved_prompt_template_hash"].strip()
-            or requirement["accepted_artifact_hash"] is not None
-        ):
+        if not resolved_review_evidence_is_coherent(requirement, InterpretationKind(requirement["kind"])):
             return error
 
     return None
@@ -2709,8 +2744,8 @@ def _runtime_owned_llm_option_error(
         field_names = ", ".join(supplied)
         return (
             f"{tool_name} options include runtime-owned LLM option(s): {field_names}. "
-            "These audit-link fields may only be written by resolve_interpretation_event, "
-            "not by composer tool input."
+            f"Omit {field_names} and retry {tool_name} with only the author-owned option change; "
+            "ELSPETH re-derives these audit-link fields during review reconciliation or execution."
         )
 
     return None
@@ -3395,6 +3430,10 @@ _ROW_UNION_INTRINSIC_ERROR_CODES: Final[frozenset[str]] = frozenset(
 
 _MUTATION_BLOCKING_INVARIANT_CODES: Final[frozenset[str]] = _ROW_UNION_INTRINSIC_ERROR_CODES | {
     "row_union_on_success_must_be_connection",
+    # Coalesce options have no runtime contract and are dropped by YAML
+    # lowering; rejecting the mutation prevents misleading state from ever
+    # persisting through either upsert_node or set_pipeline.
+    "coalesce_config_invalid",
     "node_timeout_unsupported",
     # A plugin on a gate or coalesce must never persist: upsert_node's
     # post-call hint lookup would resolve the authored token against the

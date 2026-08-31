@@ -77,6 +77,8 @@ from elspeth.web.composer.redaction import (
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.source_demand import (
     build_source_data_contract_draft,
+    parse_legacy_source_data_contract_fields,
+    parse_source_data_contract_accepted_fields,
     sample_header_for_source,
     source_data_contract_artifact_hash,
     stamp_source_options_with_guarantees,
@@ -224,6 +226,7 @@ from elspeth.web.sessions.protocol import (
     InterpretationNodeMissingError,
     InterpretationNodePluginMutatedError,
     InterpretationPlaceholderConsumedError,
+    InterpretationSourceDataContractDriftError,
     InterpretationUnsupportedChoiceError,
     PipelineDispatchRecovery,
     PipelineProposalPublicMetadata,
@@ -231,6 +234,7 @@ from elspeth.web.sessions.protocol import (
     PipelineProposalSettlementResult,
     PreparedGuidedAuditRow,
     PreparedGuidedJsonPayload,
+    PreparedInterpretationEventDraft,
     ProposalEventRecord,
     ProposalLifecycleStatus,
     RunAlreadyActiveError,
@@ -2774,13 +2778,14 @@ def _reviewed_content_identity(
         return stable_hash(domain)
 
     if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
-        # The reviewed artifact is the backtraced demand FIELD SET alone —
-        # recomputed server-side from the state record, never read from the
-        # event text. The sample header is illustrative card evidence and is
-        # deliberately outside the identity: a re-read sample must not abandon
-        # or unstick a card whose demanded fields are unchanged. No staged
-        # requirement row participates either — the card derives from graph
-        # demand, so there may legitimately be none at surfacing time.
+        # The reviewed artifact binds the current contract version,
+        # fail-closed consequence, and backtraced demand FIELD SET — the
+        # fields are recomputed server-side from the state record, never read
+        # from the event text. The sample header is illustrative card evidence
+        # and is deliberately outside the identity: a re-read sample must not
+        # abandon or unstick a card whose demanded fields are unchanged. No
+        # staged requirement row participates either — the card derives from
+        # graph demand, so there may legitimately be none at surfacing time.
         _source_name, demand = _source_data_contract_demand_from_state_record(
             state_record,
             affected_node_id=affected_node_id,
@@ -3590,9 +3595,17 @@ def _resolve_source_data_contract(
 
     Resolution stamps the demand into ``schema.guaranteed_fields`` (observed
     mode preserved — participate-but-open), which is what ADR-016's
-    ``SourceGuaranteedFieldsContract`` then enforces per-row at runtime: a
-    broken promise quarantines rows, it never aborts the run.
+    ``SourceGuaranteedFieldsContract`` then enforces per-row at runtime. A
+    valid source row that breaks the producer guarantee records a FAILED token
+    and source-node state before the Tier-1 violation aborts the run. Rows
+    quarantined during source validation never reach that boundary check.
     """
+    reviewed_fields = parse_source_data_contract_accepted_fields(llm_draft)
+    if reviewed_fields is None:
+        raise InterpretationPlaceholderConsumedError(
+            "resolve_interpretation_event: source_data_contract card uses a retired or malformed contract version; "
+            "reload the session and acknowledge the current review"
+        )
     source_name = source_name_from_component_id(affected_node_id)
     if source_name is None:
         raise InterpretationNodeMissingError(
@@ -3616,6 +3629,10 @@ def _resolve_source_data_contract(
         affected_node_id=affected_node_id,
         context="resolve_interpretation_event",
     )
+    if reviewed_fields != demand:
+        raise InterpretationPlaceholderConsumedError(
+            "resolve_interpretation_event: source_data_contract card fields no longer match the current demand"
+        )
     stamped_options = stamp_source_options_with_guarantees(options, demand)
     if stamped_options is None:
         raise InterpretationPlaceholderConsumedError(
@@ -7711,13 +7728,44 @@ class SessionServiceImpl:
                     ).one_or_none()
                     if surfacing_state_row is None:
                         raise AuditIntegrityError("create_pending_interpretation_event: pending review has no same-session surfacing state")
+                    pending_state_record = self._row_to_state_record(surfacing_state_row)
                     pending_review_identity = _reviewed_content_identity(
-                        self._row_to_state_record(surfacing_state_row),
+                        pending_state_record,
                         kind=kind,
                         affected_node_id=affected_node_id,
                         user_term=pending_user_term,
                         context="create_pending_interpretation_event",
                     )
+                    if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+                        pending_draft = pending_row.llm_draft
+                        if type(pending_draft) is not str:
+                            raise AuditIntegrityError(
+                                "create_pending_interpretation_event: pending source_data_contract review has no draft"
+                            )
+                        current_fields = parse_source_data_contract_accepted_fields(pending_draft)
+                        legacy_fields = parse_legacy_source_data_contract_fields(pending_draft)
+                        if current_fields is None and legacy_fields is None:
+                            raise AuditIntegrityError(
+                                "create_pending_interpretation_event: pending source_data_contract review has a malformed draft"
+                            )
+                        _pending_source_name, pending_demand = _source_data_contract_demand_from_state_record(
+                            pending_state_record,
+                            affected_node_id=affected_node_id,
+                            context="create_pending_interpretation_event",
+                        )
+                        pending_fields = current_fields if current_fields is not None else legacy_fields
+                        if pending_fields != pending_demand:
+                            raise AuditIntegrityError(
+                                "create_pending_interpretation_event: pending source_data_contract review draft disagrees "
+                                "with its immutable surfacing-state demand"
+                            )
+                        if legacy_fields is not None:
+                            # V1 showed a materially different consequence.
+                            # Preserve it as abandoned audit history and mint a
+                            # v2 card; field equality cannot reuse old copy as
+                            # current user authority.
+                            rows_to_abandon.append(pending_row.id)
+                            continue
                     if not review_disabled and matching_pending_row is None and pending_review_identity == current_review_identity:
                         matching_pending_row = pending_row
                     else:
@@ -8130,29 +8178,54 @@ class SessionServiceImpl:
                         surfacing_state_record = self._row_to_state_record(surfacing_state_row)
                 if surfacing_state_record is None:
                     raise AuditIntegrityError(f"resolve_interpretation_event: event {eid!r} has no same-session surfacing state")
-                surfacing_review_identity = _reviewed_content_identity(
-                    surfacing_state_record,
-                    kind=kind,
-                    affected_node_id=event_row.affected_node_id,
-                    user_term=event_row.user_term,
-                    context="resolve_interpretation_event",
-                )
-                live_review_identity = _reviewed_content_identity(
-                    state_record,
-                    kind=kind,
-                    affected_node_id=event_row.affected_node_id,
-                    user_term=event_row.user_term,
-                    context="resolve_interpretation_event",
-                )
-                if live_review_identity != surfacing_review_identity:
-                    if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-                        raise InterpretationPlaceholderConsumedError(
-                            "resolve_interpretation_event: llm_prompt_template prompt skeleton no longer matches "
-                            "the structure the review approved"
-                        )
-                    raise InterpretationPlaceholderConsumedError(
-                        "resolve_interpretation_event: reviewed content no longer matches the event's surfacing state"
+                if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+                    source_name, reviewed_fields = _source_data_contract_demand_from_state_record(
+                        surfacing_state_record,
+                        affected_node_id=event_row.affected_node_id,
+                        context="resolve_interpretation_event",
                     )
+                    try:
+                        _live_source_name, current_fields = _source_data_contract_demand_from_state_record(
+                            state_record,
+                            affected_node_id=event_row.affected_node_id,
+                            context="resolve_interpretation_event",
+                        )
+                    except InterpretationResolveError as exc:
+                        raise InterpretationSourceDataContractDriftError(
+                            source_name=source_name,
+                            reviewed_fields=reviewed_fields,
+                            current_fields=None,
+                        ) from exc
+                    if current_fields != reviewed_fields:
+                        raise InterpretationSourceDataContractDriftError(
+                            source_name=source_name,
+                            reviewed_fields=reviewed_fields,
+                            current_fields=current_fields,
+                        )
+                else:
+                    surfacing_review_identity = _reviewed_content_identity(
+                        surfacing_state_record,
+                        kind=kind,
+                        affected_node_id=event_row.affected_node_id,
+                        user_term=event_row.user_term,
+                        context="resolve_interpretation_event",
+                    )
+                    live_review_identity = _reviewed_content_identity(
+                        state_record,
+                        kind=kind,
+                        affected_node_id=event_row.affected_node_id,
+                        user_term=event_row.user_term,
+                        context="resolve_interpretation_event",
+                    )
+                    if live_review_identity != surfacing_review_identity:
+                        if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+                            raise InterpretationPlaceholderConsumedError(
+                                "resolve_interpretation_event: llm_prompt_template prompt skeleton no longer matches "
+                                "the structure the review approved"
+                            )
+                        raise InterpretationPlaceholderConsumedError(
+                            "resolve_interpretation_event: reviewed content no longer matches the event's surfacing state"
+                        )
                 final_sources: Mapping[str, Mapping[str, Any]] | None
                 final_nodes: list[Mapping[str, Any]]
                 resolved_prompt_template_hash: str | None
@@ -9401,6 +9474,72 @@ class SessionServiceImpl:
             derived_from_state_id=None,
             composer_meta=state.composer_meta,
         )
+
+    async def save_composition_state_with_interpretations(
+        self,
+        session_id: UUID,
+        state: CompositionStateData,
+        *,
+        provenance: CompositionStateProvenance,
+        interpretations: tuple[PreparedInterpretationEventDraft, ...],
+    ) -> CompositionStateRecord:
+        """Commit one imported state and its review-event cohort atomically.
+
+        The prepared writer closures reuse the exact standalone event-writer
+        boundary, but execute under the state insert's transaction.  Any
+        writer rejection or storage failure therefore rolls back the state and
+        every earlier event in the cohort.  Opt-out auto-resolution may append
+        derived versions in the same transaction; return that final head.
+        """
+        if type(interpretations) is not tuple or any(type(draft) is not PreparedInterpretationEventDraft for draft in interpretations):
+            raise TypeError("interpretations must be an exact tuple of PreparedInterpretationEventDraft")
+        sid = str(session_id)
+        state_id = uuid.uuid4()
+        now = self._now()
+        writers: list[Callable[[Connection], InterpretationEventRecord]] = []
+        for index, draft in enumerate(interpretations):
+            writer = await self._prepare_or_create_pending_interpretation_event(
+                session_id=session_id,
+                composition_state_id=state_id,
+                affected_node_id=draft.affected_node_id,
+                tool_call_id=draft.tool_call_id,
+                user_term=draft.user_term,
+                kind=draft.kind,
+                llm_draft=draft.llm_draft,
+                model_identifier=draft.model_identifier,
+                model_version=draft.model_version,
+                provider=draft.provider,
+                composer_skill_hash=draft.composer_skill_hash,
+                # list_interpretation_events orders by created_at then id.
+                # Preserve the generic surfacer's deterministic call order
+                # without depending on random event UUID ordering.
+                created_at=now + timedelta(microseconds=index),
+                _event_id=draft.event_id,
+                _prepare_only=True,
+            )
+            writers.append(cast("Callable[[Connection], InterpretationEventRecord]", writer))
+
+        def _sync() -> CompositionStateRecord:
+            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+                self._insert_composition_state(
+                    conn,
+                    session_id=sid,
+                    payload=StatePayload(data=state),
+                    provenance=provenance,
+                    created_at=now,
+                    state_id=str(state_id),
+                )
+                for writer in writers:
+                    writer(conn)
+                result_row = conn.execute(
+                    select(composition_states_table)
+                    .where(composition_states_table.c.session_id == sid)
+                    .order_by(desc(composition_states_table.c.version))
+                    .limit(1)
+                ).one()
+                return self._row_to_state_record(result_row)
+
+        return cast(CompositionStateRecord, await self._run_sync(_sync))
 
     async def commit_transition_response(
         self,

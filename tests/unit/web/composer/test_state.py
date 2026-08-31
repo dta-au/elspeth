@@ -5988,17 +5988,13 @@ class TestSchemaContractValidation:
         assert sink_contract.satisfied is False
         assert "text" in sink_contract.missing_fields
 
-    def test_sink_required_fields_abstaining_producer_defers_to_runtime(self) -> None:
-        """An abstaining producer must not fail the sink required-fields check.
+    def test_sink_required_fields_accepts_mapper_derived_target_guarantee(self) -> None:
+        """Configured mapping sources make every target present on success.
 
-        Mirror of the runtime abstention clause in
-        ``core/dag/schema_validation.py::validate_sink_required_fields``:
-        when the producer's guarantee vote is (no fields, did not participate),
-        the static check defers to per-row runtime validation instead of
-        rejecting. A select_only field_mapper with an observed schema and no
-        local guaranteed_fields abstains exactly this way — the tutorial's
-        accepted transform chain (elspeth-3283f2eaec) was permanently blocked
-        because the composer hard-failed where the runtime would build and run.
+        The executor dispatches any row missing a configured source before
+        ``process``. The mapper therefore participates with its derived target
+        guarantees even when its authored observed schema has no local
+        ``guaranteed_fields``.
         """
         state = self._empty_state()
         state = state.with_source(
@@ -6033,24 +6029,13 @@ class TestSchemaContractValidation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         result = state.validate()
         assert result.is_valid, result.errors
-        # No static claim either way: the edge renders as "not yet checked",
-        # not as a satisfied contract the composer cannot actually vouch for.
-        assert not any(ec.to_id == "output:main" for ec in result.edge_contracts)
+        sink_contract = next(ec for ec in result.edge_contracts if ec.to_id == "output:main")
+        assert sink_contract.producer_guarantees == ("summary", "url")
+        assert sink_contract.satisfied is True
 
-    @pytest.mark.parametrize(
-        ("proven_sources", "expected_targets", "expected_missing"),
-        [
-            (("raw_url", "raw_summary"), ("summary", "url"), ()),
-            (("raw_url",), ("url",), ("summary",)),
-        ],
-    )
-    def test_guided_select_only_mapper_declares_only_proven_guarantees(
-        self,
-        proven_sources: tuple[str, ...],
-        expected_targets: tuple[str, ...],
-        expected_missing: tuple[str, ...],
-    ) -> None:
-        """Guided cleanup earns a positive verdict without guessing missing fields."""
+    @pytest.mark.parametrize("proven_sources", [("raw_url", "raw_summary"), ("raw_url",)])
+    def test_guided_select_only_mapper_declares_all_derived_target_guarantees(self, proven_sources: tuple[str, ...]) -> None:
+        """Upstream schema lower bounds do not narrow successful-row outputs."""
         state = self._empty_state()
         state = state.with_source(
             self._make_source(
@@ -6085,10 +6070,10 @@ class TestSchemaContractValidation:
 
         result = state.validate()
         sink_contract = next(ec for ec in result.edge_contracts if ec.to_id == "output:main")
-        assert result.is_valid is (not expected_missing)
-        assert sink_contract.satisfied is (not expected_missing)
-        assert sink_contract.producer_guarantees == expected_targets
-        assert sink_contract.missing_fields == expected_missing
+        assert result.is_valid
+        assert sink_contract.satisfied is True
+        assert sink_contract.producer_guarantees == ("summary", "url")
+        assert sink_contract.missing_fields == ()
 
     def test_sink_required_fields_inherited_participation_still_fails(self) -> None:
         """A pass-through downstream of a participating producer cannot abstain.
@@ -6193,149 +6178,11 @@ class TestSchemaContractValidation:
         assert result.is_valid, result.errors
         assert not any("contract probe" in w.message.lower() for w in result.warnings), [w.message for w in result.warnings]
 
-    def test_rule_c_self_consistency_fires_through_authoring_metadata(self) -> None:
-        """Rule C must not be silently skipped by composer-only option keys.
-
-        The per-node select_only self-consistency check probes the plugin
-        constructor; with ``interpretation_requirements`` left in options the
-        probe raised (extra keys forbidden) and Rule C silently skipped the
-        exact guided nodes it exists to check. The probe must strip authoring
-        metadata like every other contract probe.
-        """
-        state = self._empty_state()
-        state = state.with_source(
-            self._make_source(
-                options={"schema": {"mode": "observed", "guaranteed_fields": ["url"]}},
-            )
-        )
-        state = state.with_node(
-            self._make_transform(
-                "t1",
-                "t1",
-                "main",
-                plugin="field_mapper",
-                options={
-                    "select_only": True,
-                    # 'bogus' IS a mapping target, so it is genuinely declared on
-                    # output — but its source is not guaranteed on input, so the
-                    # mapper cannot guarantee it -> Rule C violation. Keying the
-                    # vehicle on an unguaranteed RENAME rather than on a field
-                    # merely declared and never selected keeps this test about
-                    # what it says it is about: the probe stripping authoring
-                    # metadata so Rule C runs at all (elspeth-a2bf676e6f).
-                    "mapping": {"url": "url", "maybe_missing": "bogus"},
-                    "schema": {
-                        # flexible, not fixed: 'maybe_missing' is a mapping
-                        # SOURCE and therefore a configured READ
-                        # (elspeth-d4ae04b374), absent from fields on purpose so
-                        # 'bogus' stays unguaranteed. Under extra='forbid' that
-                        # read could never fire and construction rejects it
-                        # (elspeth-d3958d90f5).
-                        "mode": "flexible",
-                        "fields": ["url: str", "bogus: str"],
-                        "guaranteed_fields": ["url"],
-                    },
-                    "interpretation_requirements": [
-                        {
-                            "id": "drop_fields_review",
-                            "kind": "pipeline_decision",
-                            "user_term": "drop_fields",
-                            "status": "resolved",
-                            "draft": "Keep only url.",
-                            "event_id": "00000000-0000-0000-0000-000000000001",
-                            "accepted_value": "Keep only url.",
-                            "accepted_artifact_hash": "0" * 64,
-                        }
-                    ],
-                },
-            )
-        )
-        state = state.with_output(self._make_output())
-        state = state.with_edge(self._make_edge("e1", "source", "t1"))
-        result = state.validate()
-        assert any("Transform output guarantee violation" in e.message and "bogus" in e.message for e in result.errors), [
-            e.message for e in result.errors
-        ]
-
-    # ---- Rule C repair advice: TRUTH pins ---------------------------------
-    #
-    # Every one of these applies the remedy the message itself names, verbatim,
-    # and asserts the outcome. Existence pins ("the message mentions
-    # guaranteed_fields") are what this rule had before elspeth-920bd88299, and
-    # they held green across a rewrite whose four remedies were, measured: two
-    # inert on the shape that fires most, one unauthorable in every shape, and
-    # one that named a field the author's declaration did not contain. A remedy
-    # a planner can apply, have ACCEPTED, and get a byte-identical error back
-    # from is the whole defect — so the assertion has to be that it clears.
-
-    def _rule_c_state(
-        self,
-        mapping: dict[str, str],
-        fields: list[str],
-        *,
-        sink_requires: str | None = None,
-        select_only: Any = True,
-        schema_mode: str = "fixed",
-    ) -> CompositionState:
-        """A minimal source -> field_mapper -> sink composition for Rule C.
-
-        ``schema_mode`` exists because these fixtures state a mapping SOURCE
-        deliberately absent from ``fields`` — that asymmetry is what leaves the
-        target unguaranteed and is the point of Rule C. Since
-        elspeth-d4ae04b374 a mapping source is a configured READ
-        (``FieldMapperConfig.declared_input_fields``), and ``mode: fixed`` is
-        ``extra='forbid'``, so for a source config time CAN name, a row carrying
-        it dies at input validation and the mapping could never fire —
-        construction rejects that as incoherent (elspeth-d3958d90f5). Those
-        cases pass ``schema_mode="flexible"``, which keeps the fixture
-        buildable AND the target unguaranteed.
-
-        The default stays ``fixed`` deliberately. A source config time CANNOT
-        name — a non-fixed-point like ``'Name'``, or a dotted nested read —
-        ABSTAINS from ``declared_input_fields``, so it never reaches that
-        construction check and builds fine under ``fixed``. Those tests assert
-        that Rule C's remedy ADVISES ``schema.mode: flexible``, so their fixture
-        must not already be flexible or they would stop proving it.
-        """
-        state = self._empty_state()
-        state = state.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
-        state = state.with_node(
-            self._make_transform(
-                "t1",
-                "t1",
-                "main",
-                plugin="field_mapper",
-                options={"select_only": select_only, "mapping": mapping, "schema": {"mode": schema_mode, "fields": fields}},
-            )
-        )
-        # The sink is what makes a withdrawn guarantee visible. Against a
-        # schema-less sink every remedy looks equally good, including the ones
-        # that clear the error by promising nothing.
-        sink_options: dict[str, Any] = {}
-        if sink_requires is not None:
-            sink_options = {"schema": {"mode": "fixed", "fields": [f"{sink_requires}: str"], "required_input_fields": [sink_requires]}}
-        state = state.with_output(OutputSpec(name="main", plugin="csv", options=sink_options, on_write_failure="discard"))
-        return state.with_edge(self._make_edge("e1", "source", "t1"))
-
-    @staticmethod
-    def _rule_c_error(result: Any) -> Any:
-        matches = [e for e in result.errors if e.error_code == "transform_declared_output_not_guaranteed"]
-        return matches[0] if matches else None
+    # ---- Mapping guarantee authority after d4ae04b374 ---------------------
 
     @staticmethod
     def _run_field_mapper_as_the_executor_would(options: dict[str, Any], row: Any) -> Any:
-        """Execute a field_mapper config through the executor-shaped chain.
-
-        Mirrors ``TransformExecutor``: preflight ``input_schema.model_validate``
-        (strict), then ``process()``, then the ADR-014 post-emission
-        ``verify_schema_config_mode``. Rule C's remedies are advice about a
-        RUNTIME contract, so a remedy that only clears composer validation is
-        untested — that is exactly the defect class these pins exist for
-        (docs/agents/recent-code-hints.md, "a repair that breaks the run").
-
-        Raises whatever the first failing stage raises; returns the
-        TransformResult on success (post-emission check included).
-        """
+        """Execute the preflight -> process -> output-contract chain."""
         from elspeth.contracts.schema_contract import PipelineRow
         from elspeth.engine.executors.schema_config_mode import verify_schema_config_mode
         from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -6361,85 +6208,18 @@ class TestSchemaContractValidation:
         finally:
             transform.close()
 
-    def test_rule_c_select_only_gate_agrees_with_the_plugins_parse(self) -> None:
-        """The applicability gate must test the PARSED boolean, not raw-JSON truthiness.
+    def test_rule_c_advises_per_source_class_within_one_node(self) -> None:
+        """The historical Rule C classes now share one mapping authority.
 
-        ``FieldMapperConfig`` reads ``"false"``/``"False"``/``"no"``/``"off"``/
-        ``"0"`` as False while ``bool()`` reads every non-empty string as True.
-        With the drifted gate, a mapper whose parsed ``select_only`` is False
-        was adjudicated under Rule C's select_only-only jurisdiction and the
-        message asserted "with select_only: true" about a configuration the
-        node does not have (elspeth-fc3cd7a86c). The shape below makes the
-        drift observable: 'Name' is a non-fixed-point mapping source, so the
-        select_only=False output declaration abstains from naming the
-        passthrough set and the emit comparison comes up non-empty for ANY
-        value that slips the gate.
-
-        Pinned as value-by-value PARITY with the config class itself — the
-        single owner of the semantics — rather than as a five-string
-        blocklist, so the gate cannot drift from the plugin's parse again in
-        either direction. An unparseable value must fall to the config-parse
-        rules, never to Rule C.
+        The input-side enforcement differs by representability, but every
+        successful row contains every configured target. Rule C must therefore
+        stay quiet instead of prescribing per-source repair clauses. The test
+        name is retained so the integrated affected matrix keeps its original
+        regression identifier.
         """
-        from elspeth.plugins.infrastructure.config_base import PluginConfigError
-        from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
-
-        mapping = {"Name": "b"}
-        fields = ["b: str", "c: str"]
-        pydantic_false_but_python_truthy = ["false", "False", "no", "off", "0"]  # the drift class
-        pydantic_true_spellings = ["true", "True", "yes", "on", "1", 1, 1.0]  # must keep firing
-        pydantic_false_numerics = [0, 0.0]
-        rejected_at_parse = ["banana", "", None, [], {}]  # config rules' to report, not Rule C's
-        values: list[Any] = [
-            True,
-            False,
-            *pydantic_false_but_python_truthy,
-            *pydantic_true_spellings,
-            *pydantic_false_numerics,
-            *rejected_at_parse,
-        ]
-        for value in values:
-            try:
-                expected = FieldMapperConfig.from_dict(
-                    {"mapping": mapping, "select_only": value, "schema": {"mode": "fixed", "fields": fields}},
-                    plugin_name="field_mapper",
-                ).select_only
-            except PluginConfigError:
-                expected = False
-            result = self._rule_c_state(mapping, fields, select_only=value).validate()
-            fired = self._rule_c_error(result) is not None
-            assert fired is expected, (value, fired, expected, [e.message for e in result.errors])
-
-    def test_rule_c_names_the_mapping_source_not_only_the_unguaranteed_target(self) -> None:
-        """The remedy must name the SOURCE, because that is what the author declared.
-
-        ``missing`` holds mapping TARGETS while ``schema.fields`` is the node's
-        INPUT contract and commonly holds SOURCES, so advice phrased against the
-        named field alone tells the author to edit a string their config does
-        not contain. That edit is accepted and changes nothing.
-        """
-        result = self._rule_c_state({"first_name": "fname"}, ["fname: str"], schema_mode="flexible").validate()
-        error = self._rule_c_error(result)
-        assert error is not None, [e.error_code for e in result.errors]
-        assert "'first_name'" in error.message, error.message
-        assert "mapping TARGETS" in error.message, error.message
-
-    def test_rule_c_remedy_for_a_declarable_source_clears_and_keeps_the_guarantee(self) -> None:
-        """Following the message must clear the error AND still satisfy the sink.
-
-        The three-part edit is conjunctive on purpose: dropping the target's own
-        entry is not tidying. Leaving it declared makes the node demand the
-        EMITTED name as an input field it never receives, which trades Rule C
-        for a schema_contract_violation on the input edge.
-        """
-        before = self._rule_c_state({"first_name": "fname"}, ["fname: str"], sink_requires="fname", schema_mode="flexible").validate()
-        assert self._rule_c_error(before) is not None
-
-        # Exactly what the message instructs: declare the source, guarantee the
-        # source, remove the target's entry.
-        repaired = self._empty_state()
-        repaired = repaired.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
-        repaired = repaired.with_node(
+        state = self._empty_state()
+        state = state.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
+        state = state.with_node(
             self._make_transform(
                 "t1",
                 "t1",
@@ -6447,153 +6227,41 @@ class TestSchemaContractValidation:
                 plugin="field_mapper",
                 options={
                     "select_only": True,
-                    "mapping": {"first_name": "fname"},
-                    "schema": {"mode": "fixed", "fields": ["first_name: str"], "guaranteed_fields": ["first_name"]},
+                    "strict": False,
+                    "mapping": {"first_name": "fname", "user.name": "uname", "Name": "nm"},
+                    "schema": {"mode": "flexible", "fields": ["fname: str", "uname: str", "nm: str"]},
                 },
             )
         )
-        repaired = repaired.with_output(
+        state = state.with_output(
             OutputSpec(
                 name="main",
                 plugin="csv",
-                options={"schema": {"mode": "fixed", "fields": ["fname: str"], "required_input_fields": ["fname"]}},
+                options={
+                    "schema": {
+                        "mode": "fixed",
+                        "fields": ["fname: str", "uname: str", "nm: str"],
+                        "required_input_fields": ["fname", "uname", "nm"],
+                    }
+                },
                 on_write_failure="discard",
             )
         )
-        repaired = repaired.with_edge(self._make_edge("e1", "source", "t1"))
-        after = repaired.validate()
-        assert after.errors == (), [(e.error_code, e.message) for e in after.errors]
-
-    def test_rule_c_does_not_offer_a_declaration_remedy_for_an_unguaranteeable_source(self) -> None:
-        """A source the row is not keyed by has NO declaration remedy — say so.
-
-        ``Name`` passes both config gates, so the old advice was authorable,
-        accepted, and completely inert: the planner made a successful edit and
-        got the same error back with nothing to distinguish its repair from a
-        no-op. The second half of this test is the discriminator — it proves the
-        message is declining a remedy that genuinely does not work, rather than
-        merely being differently worded.
-        """
-        result = self._rule_c_state({"Name": "nm"}, ["nm: str"]).validate()
-        error = self._rule_c_error(result)
-        assert error is not None, [e.error_code for e in result.errors]
-        assert "cannot promise 'nm' at all" in error.message, error.message
-        assert "Do NOT rewrite the mapping key" in error.message, error.message
-        # The withdraw arm must be executable in the single-field shape: a
-        # deletion instruction empties `schema.fields`, which FieldMapperConfig
-        # rejects (fixed/flexible require at least one field), so the message
-        # must instruct the optional marker instead — and the mode switch, so
-        # the key the row actually arrives under passes input validation.
-        assert "appending `?`" in error.message, error.message
-        assert "must keep at least one field" in error.message, error.message
-        assert "`schema.mode: flexible`" in error.message, error.message
-        # The upstream arm must be completable: naming the stable spelling and
-        # the mapping-key rewrite that goes WITH the upstream rename. Without
-        # both, upstream can guarantee the literal 'Name' forever and this rule
-        # still fires, because a non-fixed-point source always abstains.
-        assert "'name'" in error.message, error.message
-        assert "SAME spelling" in error.message, error.message
-        assert "remove it from `schema.fields`" not in error.message, error.message
-
-        # The remedy the message withholds, applied anyway: still fires, and the
-        # message is byte-identical, which is exactly why it must not be offered.
-        state = self._empty_state()
-        state = state.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
-        state = state.with_node(
-            self._make_transform(
-                "t1",
-                "t1",
-                "main",
-                plugin="field_mapper",
-                options={
-                    "select_only": True,
-                    "mapping": {"Name": "nm"},
-                    "schema": {"mode": "fixed", "fields": ["Name: str", "nm: str"], "guaranteed_fields": ["Name"]},
-                },
-            )
-        )
-        state = state.with_output(self._make_output())
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
-        still = self._rule_c_error(state.validate())
-        assert still is not None, "declaring an unguaranteeable source must not clear Rule C"
 
-    def test_rule_c_unguaranteeable_escape_is_executable_and_deletion_is_not(self) -> None:
-        """The withdraw arm applied verbatim must construct, validate, AND run.
+        result = state.validate()
 
-        Both remedies previously offered for a single-field non-fixed-point
-        mapper were dead ends: deleting the target's entry left
-        ``schema.fields`` empty (PluginConfigError), and guaranteeing the
-        literal upstream never clears because the plugin abstains for every
-        non-fixed-point source, strict or not. The escape that works is the
-        optional marker plus the flexible-mode switch; this applies it exactly
-        as the message words it and proves each stage.
-        """
-        # Composer layer: the escape clears Rule C.
-        escaped_flexible = self._empty_state()
-        escaped_flexible = escaped_flexible.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
-        escaped_flexible = escaped_flexible.with_node(
-            self._make_transform(
-                "t1",
-                "t1",
-                "main",
-                plugin="field_mapper",
-                options={"select_only": True, "mapping": {"Name": "nm"}, "schema": {"mode": "flexible", "fields": ["nm: str?"]}},
-            )
-        )
-        escaped_flexible = escaped_flexible.with_output(self._make_output())
-        escaped_flexible = escaped_flexible.with_edge(self._make_edge("e1", "source", "t1"))
-        assert self._rule_c_error(escaped_flexible.validate()) is None
-
-        # Executor layer: the row a normalizing source actually produces for a
-        # CSV header 'Name' is keyed 'name' with original_name lineage — the
-        # escape admits it and the mapping resolves through that lineage.
-        from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-        from elspeth.testing import make_field
-
-        options = {"select_only": True, "mapping": {"Name": "nm"}, "schema": {"mode": "flexible", "fields": ["nm: str?"]}}
-        row = PipelineRow(
-            {"name": "Ada"},
-            SchemaContract(mode="OBSERVED", fields=(make_field("name", str, original_name="Name"),), locked=True),
-        )
-        result = self._run_field_mapper_as_the_executor_would(options, row)
-        assert result.status == "success", result
-        assert result.row.to_dict() == {"nm": "Ada"}
-
-        # The remedy the message must NOT offer: deleting the only entry is
-        # rejected at construction, so a planner applying it cannot even get
-        # back to validation.
-        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
-
-        with pytest.raises(ValueError, match="at least one field"):
-            get_shared_plugin_manager().create_transform(
-                "field_mapper",
-                {"select_only": True, "mapping": {"Name": "nm"}, "schema": {"mode": "fixed", "fields": []}},
-            )
+        assert not any(error.error_code == "transform_declared_output_not_guaranteed" for error in result.errors)
+        sink_contract = next(contract for contract in result.edge_contracts if contract.to_id == "output:main")
+        assert sink_contract.producer_guarantees == ("fname", "nm", "uname")
+        assert sink_contract.satisfied is True
 
     def test_rule_c_offers_strict_only_for_a_nested_read_and_it_works(self) -> None:
-        """A dotted source is the one class where ``strict: true`` is the remedy.
+        """The historical strict-only premise is retired after d4ae04b374.
 
-        It is offered ONLY here. For a declarable source ``strict`` and the
-        declaration remedy are mutually exclusive mechanisms — declaring the
-        source required kills a row lacking it at input validation, before the
-        strict branch in ``process()`` is ever reached — so naming both in one
-        message invites a planner to apply one and reason about the other.
-
-        For a fixed-mode schema the message must ALSO instruct the mode switch:
-        ``schema`` is simultaneously the node's runtime INPUT model, and fixed
-        mode rejects the nested read's top-level container as an undeclared
-        extra (``extra_forbidden``) in ``_run_preflight`` — so ``strict: true``
-        alone clears composer validation while every row still dies before
-        ``process()``. The execution legs below are the proof for both halves.
+        A dotted mapping with its root declared guarantees the target without
+        ``strict``. The old regression identifier is retained deliberately.
         """
-        result = self._rule_c_state({"user.name": "uname"}, ["uname: str"]).validate()
-        error = self._rule_c_error(result)
-        assert error is not None, [e.error_code for e in result.errors]
-        assert "nested read 'user.name'" in error.message, error.message
-        assert "`strict: true`" in error.message, error.message
-        assert "`schema.mode: flexible`" in error.message, error.message
-        assert "'user'" in error.message, error.message
-
         state = self._empty_state()
         state = state.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
         state = state.with_node(
@@ -6604,100 +6272,71 @@ class TestSchemaContractValidation:
                 plugin="field_mapper",
                 options={
                     "select_only": True,
-                    "strict": True,
+                    "strict": False,
                     "mapping": {"user.name": "uname"},
-                    "schema": {"mode": "flexible", "fields": ["uname: str"]},
+                    "schema": {"mode": "fixed", "fields": ["user: any"]},
                 },
             )
         )
-        state = state.with_output(self._make_output())
+        state = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={
+                    "schema": {
+                        "mode": "fixed",
+                        "fields": ["uname: any"],
+                        "required_input_fields": ["uname"],
+                    }
+                },
+                on_write_failure="discard",
+            )
+        )
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
-        assert self._rule_c_error(state.validate()) is None
+
+        result = state.validate()
+
+        assert not any(error.error_code == "transform_declared_output_not_guaranteed" for error in result.errors)
+        sink_contract = next(contract for contract in result.edge_contracts if contract.to_id == "output:main")
+        assert sink_contract.producer_guarantees == ("uname",)
+        assert sink_contract.satisfied is True
 
     def test_rule_c_nested_read_remedy_is_executable_and_the_old_one_was_not(self) -> None:
-        """The advised config must survive the executor, not just the composer.
+        """The fixed input model names ``user``; the emitted target is not an input.
 
-        The first half runs the full advice — ``strict: true`` AND
-        ``schema.mode: flexible`` — through the executor-shaped chain and
-        requires the mapped value to come out. The second half is the
-        discriminator: the advice as previously worded (``strict: true`` with
-        the fixed-mode declaration untouched) passes composer validation and
-        then fails preflight input validation on the very field the mapping
-        reads, which is why the message now names the mode switch.
+        The old target-only schema is rejected at construction. With the root
+        declared, a present leaf succeeds and a missing child routes in
+        non-strict mode, which is the behavior that makes ``uname`` guaranteed
+        on every successful row. The historical regression identifier is kept
+        for integration-matrix traceability.
         """
-        import pydantic
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
 
-        advised = {
-            "select_only": True,
-            "strict": True,
-            "mapping": {"user.name": "uname"},
-            "schema": {"mode": "flexible", "fields": ["uname: str"]},
-        }
-        result = self._run_field_mapper_as_the_executor_would(advised, {"user": {"name": "Ada"}})
-        assert result.status == "success", result
-        assert result.row.to_dict() == {"uname": "Ada"}
-
-        # A row without the container must route via the strict branch in
-        # process() (recoverable, on_error) — not die in preflight, which
-        # raises PluginContractViolation and aborts the whole run.
-        routed = self._run_field_mapper_as_the_executor_would(advised, {"other": 1})
-        assert routed.status == "error", routed
-        assert routed.reason["reason"] == "missing_field"
-
-        old_advice = {
+        incoherent = {
             "select_only": True,
             "strict": True,
             "mapping": {"user.name": "uname"},
             "schema": {"mode": "fixed", "fields": ["uname: str"]},
         }
-        with pytest.raises(pydantic.ValidationError, match="user"):
-            self._run_field_mapper_as_the_executor_would(old_advice, {"user": {"name": "Ada"}})
+        with pytest.raises(PluginConfigError, match=r"fixed schema forbids.*'user'"):
+            self._run_field_mapper_as_the_executor_would(incoherent, {"user": {"name": "Ada"}})
 
-    def test_rule_c_advises_per_source_class_within_one_node(self) -> None:
-        """One node can hold all three classes at once; each gets its own clause.
+        coherent = {
+            "select_only": True,
+            "strict": False,
+            "mapping": {"user.name": "uname"},
+            "schema": {"mode": "fixed", "fields": ["user: any"]},
+        }
+        present = self._run_field_mapper_as_the_executor_would(coherent, {"user": {"name": "Ada"}})
+        missing_child = self._run_field_mapper_as_the_executor_would(coherent, {"user": {}})
 
-        A single blanket remedy is wrong for two thirds of this node.
-        """
-        result = self._rule_c_state(
-            {"first_name": "fname", "user.name": "uname", "Name": "nm"},
-            ["fname: str", "uname: str", "nm: str"],
-            # 'first_name' is the declarable class, so it is a configured READ
-            # this fixed schema would forbid; the other two abstain. See
-            # _rule_c_state's schema_mode note.
-            schema_mode="flexible",
-        ).validate()
-        error = self._rule_c_error(result)
-        assert error is not None, [e.error_code for e in result.errors]
-        assert "'fname' is mapped from 'first_name', which the row is keyed by" in error.message, error.message
-        assert "'uname' is mapped from the nested read 'user.name'" in error.message, error.message
-        assert "cannot promise 'nm' at all" in error.message, error.message
+        assert present.status == "success"
+        assert present.row.to_dict() == {"uname": "Ada"}
+        assert missing_child.status == "error"
+        assert missing_child.reason["reason"] == "missing_field"
 
-    def test_rule_c_survives_a_mapping_source_that_names_no_field(self) -> None:
-        """A pathological source must yield a FINDING, never a raise.
-
-        The remedy classifier constructs counterfactual configs through
-        ``_probe_transform_output_schema``, which tolerates only
-        ``_is_plugin_config_probe_exception`` and RE-RAISES everything else. A
-        source that is a Python keyword, or that normalizes to nothing
-        (``ExternalHeaderError``), reaches a different raise site than the
-        merely-messy headers the remedies were designed around — and a raise
-        here turns a validation finding into a 500 on the composer surface.
-        """
-        for source in ("class", "!!!", "", "  ", "user..name", "1", "caf\u00e9"):
-            state = self._rule_c_state({source: "tgt"}, ["tgt: str"], schema_mode="flexible")
-            result = state.validate()
-            assert self._rule_c_error(result) is not None, f"no finding for source {source!r}"
-
-    def test_rule_c_message_routes_to_its_own_catalogue_entry(self) -> None:
-        """The rendered message must resolve to ITS rule's advice, not the other's.
-
-        ``_execute_explain_validation_error`` matches raw message text against
-        ``_VALIDATION_ERROR_PATTERNS`` in LIST ORDER, and the composer skill
-        routes a planner to that tool on any unclear rejection. Both rules'
-        headlines begin "Transform ", so the pair is order-sensitive: before the
-        split both messages matched one entry, which is how a Rule D collision
-        on an llm node came to be answered with field_mapper advice.
-        """
+    def test_historical_rule_c_diagnostic_still_routes_separately_from_collision(self) -> None:
+        """Persisted/older diagnostics retain code-keyed explanation parity."""
         from elspeth.web.composer.state import (
             _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX,
             _TRANSFORM_OUTPUT_COLLISION_FIX,
@@ -6710,15 +6349,13 @@ class TestSchemaContractValidation:
                     return fix
             return None
 
-        rule_c = self._rule_c_error(self._rule_c_state({"first_name": "fname"}, ["fname: str"], schema_mode="flexible").validate())
-        assert rule_c is not None
-        assert first_match_fix(rule_c.message) is _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX
-
-        rule_d_message = (
+        guarantee_message = "Transform output guarantee violation: internal field_mapper contract drift."
+        collision_message = (
             "Transform contract violation: node 'rewrite' (llm) declares output fields [headline] but "
             "[headline] already arrive(s) on its input row."
         )
-        assert first_match_fix(rule_d_message) is _TRANSFORM_OUTPUT_COLLISION_FIX
+        assert first_match_fix(guarantee_message) is _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX
+        assert first_match_fix(collision_message) is _TRANSFORM_OUTPUT_COLLISION_FIX
 
     def test_consumer_schema_required_fields_violation_fails(self) -> None:
         state = self._empty_state()
@@ -7416,6 +7053,26 @@ class TestSchemaContractValidation:
         entries = [error for error in result.errors if error.error_code == "coalesce_policy_invalid"]
         assert len(entries) == 1, result.errors
         assert entries[0].component == "node:merge_results"
+
+    def test_coalesce_rejects_options_that_runtime_lowering_would_erase(self) -> None:
+        """A structural coalesce has no plugin options contract to author.
+
+        The composer used to accept ``options.schema`` here, then silently
+        omit the entire options mapping while lowering to ``CoalesceSettings``.
+        Refuse the misleading declaration before it can persist.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+        )
+        coalesce = next(node for node in state.nodes if node.id == "merge_results")
+        state = state.with_node(replace(coalesce, options={"schema": {"mode": "observed"}}))
+
+        result = state.validate()
+
+        [entry] = [error for error in result.errors if error.error_code == "coalesce_config_invalid"]
+        assert entry.component == "node:merge_results"
+        assert "options" in entry.message
 
     def test_coalesce_merge_select_is_rejected_as_unauthorable(self) -> None:
         """``merge: select`` cannot be made runnable from the composer, so Stage 1 must say so.
@@ -8154,7 +7811,10 @@ class TestSchemaContractValidation:
                 None,
                 branches=("branch_a", "branch_b"),
                 merge="select",
-                options={"select_branch": "branch_a"},
+                # NodeSpec cannot author select_branch (that is the defect
+                # this unmirrorable-merge rejection explains), and structural
+                # coalesces accept no options at all.
+                options={},
             )
         )
         state = state.with_node(
@@ -8915,6 +8575,189 @@ class TestSchemaContractValidation:
         rule_d_errors = [e for e in result.errors if e.component == "node:rename" and e.error_code == "transform_contract_violation"]
         assert rule_d_errors, f"Expected a Rule D rejection naming c, got: {[e.message for e in result.errors]}"
         assert "[c] already arrive(s) on its input row" in rule_d_errors[0].message
+
+    def test_rule_d_abstains_when_original_header_collision_depends_on_runtime_lineage(self) -> None:
+        """Static validation must not reject a possible runtime identity.
+
+        Composer knows ``full_name`` arrives but cannot know whether ``Name``
+        resolves to that same field or to a different normalized/source-mapped
+        key. FieldMapper's row-aware guard owns the uncertain collision; Rule D
+        remains reserved for provable collisions.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "observed", "guaranteed_fields": ["name", "full_name"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"Name": "full_name"},
+                    "select_only": False,
+                    "schema": {"mode": "observed"},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        rule_d_errors = [e for e in result.errors if e.component == "node:rename" and e.error_code == "transform_contract_violation"]
+        assert not rule_d_errors, [e.message for e in rule_d_errors]
+
+    def test_open_mapper_propagates_guaranteed_passthrough_to_sink_contract(self) -> None:
+        """The local target lower bound composes with forwarded predecessor fields."""
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "fixed", "fields": ["a: str", "keep: str"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"a": "b"},
+                    "select_only": False,
+                    "schema": {"mode": "observed"},
+                },
+            )
+        )
+        state = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={
+                    "schema": {
+                        "mode": "fixed",
+                        "fields": ["keep: str", "b: str?"],
+                        "required_input_fields": ["keep"],
+                    }
+                },
+                on_write_failure="discard",
+            )
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+        sink_contract = next(contract for contract in result.edge_contracts if contract.to_id == "output:main")
+        assert sink_contract.producer_guarantees == ("b", "keep")
+        assert sink_contract.satisfied is True
+
+    def test_open_mapper_forwarded_type_mismatch_is_rejected(self) -> None:
+        """Composer mirrors runtime type evidence carried by an open forwarder."""
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "fixed", "fields": ["a: str", "keep: str"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "mapped",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"a": "b"},
+                    "select_only": False,
+                    "schema": {"mode": "flexible", "fields": ["a: str"]},
+                },
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "typed",
+                "mapped",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"keep": "keep"},
+                    "select_only": True,
+                    "schema": {"mode": "flexible", "fields": ["keep: int"]},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        mismatch = [entry for entry in result.errors if entry.error_code == "edge_field_type_incompatible"]
+        assert mismatch
+        assert "keep (consumer expects int, producer emits str)" in mismatch[0].message
+
+    @pytest.mark.parametrize(
+        ("source_plugin", "source_options", "expects_mismatch"),
+        [
+            ("csv", {"schema": {"mode": "observed", "guaranteed_fields": ["a", "keep"]}}, True),
+            (
+                "json",
+                {"path": "/data/input.json", "schema": {"mode": "observed", "guaranteed_fields": ["a", "keep"]}},
+                False,
+            ),
+        ],
+    )
+    def test_open_mapper_forwards_only_known_observed_source_structural_type(
+        self,
+        source_plugin: str,
+        source_options: dict[str, Any],
+        expects_mismatch: bool,
+    ) -> None:
+        """Structural CSV typing propagates; an untyped observed source abstains."""
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                plugin=source_plugin,
+                options=source_options,
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "mapped",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"a": "b"},
+                    "select_only": False,
+                    "schema": {"mode": "flexible", "fields": ["a: str"]},
+                },
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "typed",
+                "mapped",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"keep": "keep"},
+                    "select_only": True,
+                    "schema": {"mode": "flexible", "fields": ["keep: int"]},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        mismatch = [entry for entry in result.errors if entry.error_code == "edge_field_type_incompatible"]
+        assert bool(mismatch) is expects_mismatch
+        if mismatch:
+            assert "keep (consumer expects int, producer emits str)" in mismatch[0].message
 
     def test_rule_d_fires_on_a_required_fields_rename_onto_a_guaranteed_field(self) -> None:
         """Third declaration channel (adversarial review of a7c783423): required_fields.

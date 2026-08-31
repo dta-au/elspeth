@@ -21,13 +21,14 @@ from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.plugins.infrastructure.manager import untrusted_content_transform_names
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_USER_TERM,
     backtraced_source_demand,
     parse_source_data_contract_accepted_fields,
     source_data_contract_artifact_hash,
+    source_data_contract_fields_for_demand_recompute,
 )
 
 # ``SOURCE_AUTHORING_KEY`` is re-exported in the explicit ``X as X`` form on
@@ -244,6 +245,47 @@ class InterpretationRequirement(TypedDict):
     accepted_value: str | None
     accepted_artifact_hash: str | None
     resolved_prompt_template_hash: str | None
+
+
+ResolvedReviewEvidenceField = Literal[
+    "accepted_artifact_hash",
+    "resolved_prompt_template_hash",
+]
+
+_ARTIFACT_BOUND_INTERPRETATION_KINDS: Final[frozenset[InterpretationKind]] = frozenset(
+    {
+        InterpretationKind.INVENTED_SOURCE,
+        InterpretationKind.PIPELINE_DECISION,
+        InterpretationKind.SOURCE_DATA_CONTRACT,
+    }
+)
+
+
+def resolved_review_evidence_field(kind: InterpretationKind) -> ResolvedReviewEvidenceField:
+    """Return the one hash field a resolved review kind must carry."""
+    if kind in _ARTIFACT_BOUND_INTERPRETATION_KINDS:
+        return "accepted_artifact_hash"
+    return "resolved_prompt_template_hash"
+
+
+def resolved_review_evidence_is_coherent(
+    requirement: InterpretationRequirement,
+    kind: InterpretationKind,
+) -> bool:
+    """Whether one resolved row carries the complete evidence for ``kind``."""
+    if requirement["status"] != "resolved":
+        return False
+    event_id = requirement["event_id"]
+    if type(event_id) is not str or not event_id.strip():
+        return False
+    if type(requirement["accepted_value"]) is not str:
+        return False
+    evidence_field = resolved_review_evidence_field(kind)
+    other_evidence_field: ResolvedReviewEvidenceField = (
+        "resolved_prompt_template_hash" if evidence_field == "accepted_artifact_hash" else "accepted_artifact_hash"
+    )
+    evidence = requirement[evidence_field]
+    return type(evidence) is str and bool(evidence.strip()) and requirement[other_evidence_field] is None
 
 
 class PromptTextPart(TypedDict):
@@ -1167,6 +1209,55 @@ def _source_data_contract_requirement(options: Mapping[str, Any]) -> Interpretat
     return _requirement_for_kind(_requirements(options), InterpretationKind.SOURCE_DATA_CONTRACT)
 
 
+def resolved_source_data_contract_fields(requirement: InterpretationRequirement) -> tuple[str, ...] | None:
+    """Return the field set bound by coherent resolved contract evidence."""
+    if not resolved_review_evidence_is_coherent(requirement, InterpretationKind.SOURCE_DATA_CONTRACT):
+        return None
+    accepted_value = requirement["accepted_value"]
+    if accepted_value is None:
+        return None
+    fields = parse_source_data_contract_accepted_fields(accepted_value)
+    if not fields:
+        return None
+    if requirement["accepted_artifact_hash"] != source_data_contract_artifact_hash(fields):
+        return None
+    return fields
+
+
+@observation_boundary(
+    tier=3,
+    source="a source options schema mapping persisted in composer state, whose guaranteed_fields value "
+    "may have been authored by the planner or stamped by source_data_contract resolution",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="returns a frozen string set only for an observed schema with an explicit list/tuple of "
+    "string guaranteed_fields; every absent, malformed, or non-observed shape returns None and never raises",
+)
+def _observed_source_guaranteed_fields(options: Mapping[str, Any]) -> frozenset[str] | None:
+    schema_key = "schema" if "schema" in options else ("schema_config" if "schema_config" in options else None)
+    if schema_key is None:
+        return None
+    raw_schema = options[schema_key]
+    if not isinstance(raw_schema, Mapping):
+        return None
+    mode = raw_schema["mode"] if "mode" in raw_schema else None
+    if mode != "observed" or "guaranteed_fields" not in raw_schema:
+        return None
+    raw_fields = raw_schema["guaranteed_fields"]
+    if not isinstance(raw_fields, (list, tuple)) or not all(isinstance(field, str) for field in raw_fields):
+        return None
+    return frozenset(raw_fields)
+
+
+def _source_data_contract_evidence_is_current(
+    source: SourceSpec,
+    requirement: InterpretationRequirement,
+) -> bool:
+    acknowledged_fields = resolved_source_data_contract_fields(requirement)
+    guaranteed_fields = _observed_source_guaranteed_fields(source.options)
+    return acknowledged_fields is not None and guaranteed_fields is not None and frozenset(acknowledged_fields) <= guaranteed_fields
+
+
 def current_source_data_contract_demand(state: CompositionState, source_name: str) -> tuple[str, ...]:
     """Requirement-aware demand backtrace for one source.
 
@@ -1187,14 +1278,20 @@ def current_source_data_contract_demand(state: CompositionState, source_name: st
         return ()
     requirement = _source_data_contract_requirement(source.options)
     disregard: frozenset[str] = frozenset()
-    if requirement is not None and requirement["status"] == "resolved":
-        # _coerce_requirement guarantees a resolved row's accepted_value is a
-        # str (owned TypedDict — nominal handling, no structural re-check).
-        accepted = requirement["accepted_value"]
-        acknowledged = parse_source_data_contract_accepted_fields(accepted) if accepted is not None else None
-        # An unparseable acknowledgement abstains to "strip nothing": the
-        # artifact-hash comparison at the enumerator then re-opens the card,
-        # which is the fail-closed direction.
+    if (
+        requirement is not None
+        and requirement["status"] == "resolved"
+        and resolved_review_evidence_is_coherent(requirement, InterpretationKind.SOURCE_DATA_CONTRACT)
+        and requirement["accepted_value"] is not None
+    ):
+        acknowledged = source_data_contract_fields_for_demand_recompute(
+            requirement["accepted_value"],
+            requirement["accepted_artifact_hash"],
+        )
+        # Invalid evidence strips nothing. Coherent v1 evidence may strip its
+        # old guarantee ONLY here so the current demand resurfaces as a
+        # resolvable v2 card; resolved_source_data_contract_fields remains
+        # current-v2-only and therefore keeps execution fail-closed.
         if acknowledged is not None:
             disregard = frozenset(acknowledged)
     return backtraced_source_demand(state, source_name, disregard_fields=disregard)
@@ -1209,17 +1306,37 @@ def _pending_source_data_contract_sites(state: CompositionState) -> tuple[Interp
     existed at bind time or arose later from a node mutation. Mirrors the
     ``_pending_source_sites`` drift posture for invented_source: a resolved
     requirement is clean ONLY while its accepted artifact (here the
-    acknowledged FIELD SET, bound by ``source_data_contract_artifact_hash``)
+    acknowledged contract version, consequence, and FIELD SET, bound by
+    ``source_data_contract_artifact_hash``)
     still matches the current demand; a demand-set change falls through to a
     pending site, re-opening the card. A demand that shrinks to EMPTY closes
     the site without re-asking: there is nothing left to acknowledge, and
-    the standing stamp remains the user's own recorded promise.
+    the standing stamp remains the user's own recorded promise. Independently,
+    a resolved row whose evidence is incoherent or whose source no longer
+    carries the acknowledged guarantee always emits a blocking integrity site,
+    even when the current graph has no remaining demand. With no live demand,
+    that site is fail-closed state-integrity evidence rather than a new user-
+    resolvable acknowledgement card.
     """
     sites: list[InterpretationReviewSite] = []
     for source_name, source in state.sources.items():
         if SOURCE_AUTHORING_KEY in source.options:
             continue
         requirement = _source_data_contract_requirement(source.options)
+        if (
+            requirement is not None
+            and requirement["status"] == "resolved"
+            and not _source_data_contract_evidence_is_current(source, requirement)
+        ):
+            sites.append(
+                InterpretationReviewSite(
+                    component_id=source_component_id(source_name),
+                    component_type="source",
+                    user_term=requirement["user_term"].strip(),
+                    kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+                )
+            )
+            continue
         demand = current_source_data_contract_demand(state, source_name)
         if not demand:
             continue
@@ -2202,10 +2319,14 @@ def _validated_review_index(options: Mapping[str, Any]) -> dict[tuple[str, Inter
 def _require_resolved_review_coherence(requirement: InterpretationRequirement) -> None:
     if requirement["status"] != "resolved":
         return
-    if type(requirement["event_id"]) is not str or not requirement["event_id"]:
+    event_id = requirement["event_id"]
+    if type(event_id) is not str or not event_id.strip():
         raise ValueError(f"resolved interpretation requirement {requirement['id']!r} has no event_id")
     if type(requirement["accepted_value"]) is not str:
         raise ValueError(f"resolved interpretation requirement {requirement['id']!r} has no accepted_value")
+    kind = InterpretationKind(requirement["kind"])
+    if not resolved_review_evidence_is_coherent(requirement, kind):
+        raise ValueError(f"resolved interpretation requirement {requirement['id']!r} has incoherent evidence")
 
 
 def _node_review_artifact(
@@ -2241,12 +2362,8 @@ def _node_review_artifact(
 
 
 def _resolved_review_hash(requirement: InterpretationRequirement, kind: InterpretationKind) -> str:
-    if kind in (InterpretationKind.PIPELINE_DECISION, InterpretationKind.INVENTED_SOURCE, InterpretationKind.SOURCE_DATA_CONTRACT):
-        field = "accepted_artifact_hash"
-        value = requirement["accepted_artifact_hash"]
-    else:
-        field = "resolved_prompt_template_hash"
-        value = requirement["resolved_prompt_template_hash"]
+    field = resolved_review_evidence_field(kind)
+    value = requirement[field]
     if type(value) is not str or not value:
         raise ValueError(f"resolved interpretation requirement {requirement['id']!r} has no {field}")
     return value
@@ -2376,17 +2493,43 @@ def _reconcile_source_options(
         shell = _pending_authoring_shell(proposed_requirement)
         previous_requirement = previous_index[identity] if identity in previous_index else None
         if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
-            # The acknowledged artifact binds the demand FIELD SET, which is a
-            # fact about the whole graph rather than about this source's own
-            # options, so this per-source reconciliation cannot judge drift.
-            # Carry the coherent resolved row forward verbatim; the pending-site
-            # enumerator (_pending_source_data_contract_sites) recomputes the
-            # live demand on every read and re-opens the card on any mismatch.
+            # The acknowledged artifact binds the contract semantics and
+            # demand FIELD SET, which are facts about the whole graph rather
+            # than about this source's own options, so this per-source
+            # reconciliation cannot judge graph drift. It can and must
+            # validate the accepted-value/hash pair and require the proposed
+            # source to retain the resolver-stamped guarantee before
+            # preserving current authority. The pending-site enumerator
+            # recomputes live graph demand on every read.
             if previous is None or previous_requirement is None or previous_requirement["status"] != "resolved":
                 reconciled.append(shell)
                 continue
             _require_resolved_review_coherence(previous_requirement)
-            _resolved_review_hash(previous_requirement, kind)
+            acknowledged_fields = resolved_source_data_contract_fields(previous_requirement)
+            if acknowledged_fields is None:
+                accepted_value = previous_requirement["accepted_value"]
+                legacy_fields = (
+                    source_data_contract_fields_for_demand_recompute(
+                        accepted_value,
+                        previous_requirement["accepted_artifact_hash"],
+                    )
+                    if accepted_value is not None
+                    else None
+                )
+                if legacy_fields is not None:
+                    # Coherent v1 evidence is valid history but cannot carry
+                    # authority for v2's corrected consequence. Preserve the
+                    # historic row so its fields remain available to the
+                    # migration-only demand recompute; the site enumerator
+                    # still reopens it and the surfacer computes a current v2
+                    # draft from the live graph.
+                    reconciled.append(dict(previous_requirement))
+                    continue
+                raise ValueError(f"resolved interpretation requirement {requirement_id!r} evidence drifted")
+            proposed_guaranteed_fields = _observed_source_guaranteed_fields(proposed.options)
+            if proposed_guaranteed_fields is None or not frozenset(acknowledged_fields) <= proposed_guaranteed_fields:
+                reconciled.append(shell)
+                continue
             reconciled.append(dict(previous_requirement))
             continue
         if kind is not InterpretationKind.INVENTED_SOURCE:

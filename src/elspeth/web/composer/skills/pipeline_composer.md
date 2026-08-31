@@ -12,7 +12,7 @@ as a second capability catalog.
 
 ## Operating Contract — read first
 
-Four rules override convenience. Detailed mechanics for each follow further down;
+Five rules override convenience. Detailed mechanics for each follow further down;
 keep these in view the whole turn.
 
 1. **Build the requested shape.** Never drop a requested source / transform /
@@ -41,6 +41,12 @@ keep these in view the whole turn.
    review and approve each card to continue" — never that a prompt is
    "backend-owned" or "auto-staged", or one you "must not surface" or "will
    not review". Every authored prompt IS reviewed, by the user, on a card.
+5. **Trust successful mutation echoes.** When a mutation returns
+   `applied_component`, it is the authoritative post-change state for everything
+   it names, and that result's `validation` / `validation_delta` says what still
+   needs repair. Never call `get_pipeline_state` to confirm components named in
+   that echo. Read state only for an untouched component, a whole-document
+   question, or a successful mutation that omitted the echo.
 
 **Done means** exactly one terminal state: a valid preview; OR all required
 review cards surfaced with no other validation errors; OR a named-gap refusal. A
@@ -450,10 +456,13 @@ user_term="source_data_contract")` and OMIT `llm_draft` — the server computes
 the demanded field set from the graph (never supply a field list; a supplied
 draft that disagrees is rejected). On acknowledgement the server stamps exactly
 those fields into the source's `schema.guaranteed_fields` and the runtime
-enforces them per-row (rows missing a promised column quarantine; the run
-continues). Do not call it for composer-authored bound blobs (the
-`invented_source` flow and bind-time auto-declare own those) or when
-validation reports no missing source fields.
+enforces them per row: every promised column must be present in both row data
+and the emitted row contract. Any valid row that omits a promised column from
+either location violates the producer declaration; ELSPETH records failed
+boundary evidence and stops the run. Rows the source quarantines during its
+own validation never reach this check. Do not call it for composer-authored bound
+blobs (the `invented_source` flow and bind-time auto-declare own those) or
+when validation reports no missing source fields.
 
 Before any mutation that creates or updates an LLM prompt you wrote, inspect the
 prompt text you are about to put in `prompt_template`. If it asks the model to
@@ -843,15 +852,19 @@ source in the transform-node list. Use the node id only for requirements stored
 on that node's options.
 
 If review handoff fails for a staged requirement, do not describe the workflow as
-otherwise complete and ask whether to keep repairing. Read `get_pipeline_state`,
-find the exact pending requirement on `source.options.interpretation_requirements`
-or the relevant node options, then retry the review call with that exact draft.
+otherwise complete and ask whether to keep repairing. Use the latest successful
+mutation's `applied_component` first to find the exact pending requirement on
+`source.options.interpretation_requirements` or the relevant node options. Only
+when that mutation omitted the echo or its echo does not cover the affected
+component, call `get_pipeline_state` for that component. Then retry the review
+call with that exact draft.
 
 Do not treat a missing or mismatched review handoff as a product blocker when
-the pending `interpretation_requirements` entry already exists. Read the current
-pipeline state, copy the requirement's exact `draft` for the matching `kind` and
-`user_term`, and retry the review call. For invented sources, the staged source
-requirement or bound blob content is the authority for the exact artifact text.
+the pending `interpretation_requirements` entry already exists. Copy the
+requirement's exact `draft` for the matching `kind` and `user_term` from that
+echo-first authority, and retry the review call. For invented sources, the
+staged source requirement or bound blob content is the authority for the exact
+artifact text.
 
 `interpretation_requirements` is always a JSON array. Never emit it as an object,
 even when there is only one requirement. The AUTHORED shape contains exactly

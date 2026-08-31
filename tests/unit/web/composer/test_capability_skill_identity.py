@@ -96,6 +96,17 @@ def test_capability_core_explains_digest_budget_omissions() -> None:
     assert "details_via" in core
 
 
+def test_capability_core_treats_successful_mutation_echo_as_state_authority() -> None:
+    """A mutation echo replaces confirmation reads; it is not optional telemetry."""
+    discovery = load_pipeline_capability_core().split("[capability:discovery-order]", 1)[1].split("## Complete topology", 1)[0]
+    prose = " ".join(discovery.split())
+
+    assert "`applied_component`" in discovery
+    assert "authoritative post-change state" in prose
+    assert "do not call `get_pipeline_state` to confirm" in prose
+    assert "a mutation and the read that confirms it may share one turn" not in prose
+
+
 def test_guided_chat_prompts_are_interaction_only_and_advertise_no_planner_terminal() -> None:
     core = load_pipeline_capability_core()
 

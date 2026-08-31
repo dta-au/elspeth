@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from unittest.mock import MagicMock
 
@@ -12,9 +13,15 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
+from elspeth.web.composer.source_demand import (
+    SOURCE_DATA_CONTRACT_USER_TERM,
+    build_source_data_contract_draft,
+    source_data_contract_artifact_hash,
+)
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import ToolContext
 from elspeth.web.composer.tools.sessions import _execute_get_pipeline_state, _execute_set_pipeline
+from elspeth.web.composer.tools.sources import _execute_patch_source_options
 from elspeth.web.composer.tools.transforms import _execute_patch_node_options, _execute_upsert_node
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
@@ -23,6 +30,10 @@ from elspeth.web.interpretation_state import (
     PROMPT_TEMPLATE_PARTS_KEY,
     SOURCE_AUTHORING_KEY,
     WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+    InterpretationReviewPending,
+    current_source_data_contract_demand,
+    interpretation_sites,
+    materialize_state_for_execution,
     model_choice_artifact_hash,
     pipeline_decision_artifact_hash,
     reconcile_authoritative_reviews,
@@ -121,6 +132,39 @@ def _trained_context() -> ToolContext:
     return ToolContext(
         catalog=PolicyCatalogView.for_trained_operator(catalog, snapshot),
         plugin_snapshot=snapshot,
+    )
+
+
+def _resolved_source_contract_state(*, required_fields: list[str]) -> CompositionState:
+    acknowledged_fields = ["colour"]
+    draft = build_source_data_contract_draft(acknowledged_fields, None)
+    requirement = _requirement(
+        requirement_id="source-data-contract-source",
+        kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+        user_term=SOURCE_DATA_CONTRACT_USER_TERM,
+        status="resolved",
+        draft=draft,
+        accepted_value=draft,
+        accepted_artifact_hash=source_data_contract_artifact_hash(acknowledged_fields),
+    )
+    return _state(
+        nodes=(
+            _node(
+                plugin="passthrough",
+                options={
+                    "required_input_fields": required_fields,
+                    "schema": {"mode": "observed"},
+                },
+            ),
+        ),
+        source_options={
+            "path": "rows.csv",
+            "schema": {
+                "mode": "observed",
+                "guaranteed_fields": acknowledged_fields,
+            },
+            INTERPRETATION_REQUIREMENTS_KEY: [requirement],
+        },
     )
 
 
@@ -505,6 +549,153 @@ def test_exact_payload_round_trips_through_real_set_pipeline_with_authoritative_
     carried = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0]
     assert carried["status"] == "resolved"
     assert carried["event_id"] == "event-1"
+
+
+def test_resolved_source_contract_survives_unrelated_source_patch() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+
+    result = _execute_patch_source_options(
+        {"patch": {"skip_rows": 1}},
+        previous,
+        _trained_context(),
+    )
+
+    assert result.success, result.data
+    source = result.updated_state.sources["source"]
+    assert source.options["skip_rows"] == 1
+    carried = source.options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert carried["status"] == "resolved"
+    assert carried["accepted_artifact_hash"] == source_data_contract_artifact_hash(["colour"])
+
+
+def test_planner_guarantee_addition_preserves_acknowledged_subset_authority() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    exact = _exact_arguments(previous)
+    proposal = deep_thaw(exact.data)
+    proposal["source"]["options"]["schema"]["guaranteed_fields"] = ["colour", "size"]
+    proposal["nodes"][0]["options"]["required_input_fields"] = ["colour", "size"]
+
+    result = _execute_set_pipeline(proposal, previous, _trained_context())
+
+    assert result.success, result.data
+    source = result.updated_state.sources["source"]
+    carried = source.options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert carried["status"] == "resolved"
+    assert carried["accepted_artifact_hash"] == source_data_contract_artifact_hash(["colour"])
+    assert source.options["schema"]["guaranteed_fields"] == ("colour", "size")
+    assert isinstance(materialize_state_for_execution(result.updated_state), CompositionState)
+
+
+def test_deleting_resolved_source_contract_guarantee_reopens_review() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+
+    result = _execute_patch_source_options(
+        {"patch": {"schema": {"mode": "observed"}}},
+        previous,
+        _trained_context(),
+    )
+
+    assert result.success, result.data
+    source = result.updated_state.sources["source"]
+    assert "guaranteed_fields" not in source.options["schema"]
+    requirement = source.options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert requirement["status"] == "pending"
+    assert isinstance(materialize_state_for_execution(result.updated_state), InterpretationReviewPending)
+
+
+def test_exact_payload_round_trips_resolved_source_contract() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    exact = _exact_arguments(previous)
+
+    result = _execute_set_pipeline(deep_thaw(exact.data), previous, _trained_context())
+
+    assert result.success, result.data
+    carried = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert carried["status"] == "resolved"
+    assert carried["event_id"] == "event-1"
+
+
+def test_exact_round_trip_rejects_incoherent_stored_source_contract_evidence() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    source = previous.sources["source"]
+    options = deep_thaw(source.options)
+    options[INTERPRETATION_REQUIREMENTS_KEY][0]["accepted_value"] = build_source_data_contract_draft(["size"], None)
+    forged = previous.with_named_source("source", replace(source, options=options))
+    exact = _exact_arguments(forged)
+
+    result = _execute_set_pipeline(deep_thaw(exact.data), forged, _trained_context())
+
+    assert not result.success
+    assert result.updated_state is forged
+    assert result.data["error_code"] == "review_reconciliation_failed"
+
+
+def test_exact_round_trip_reopens_coherent_legacy_v1_source_contract() -> None:
+    current = _resolved_source_contract_state(required_fields=["colour"])
+    source = current.sources["source"]
+    options = deep_thaw(source.options)
+    legacy_payload = {
+        "contract_version": 1,
+        "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+        "demanded_fields": ["colour"],
+        "sample_header": None,
+        "missing_from_sample": [],
+    }
+    legacy_draft = json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"))
+    requirement = options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    requirement["draft"] = legacy_draft
+    requirement["accepted_value"] = legacy_draft
+    requirement["accepted_artifact_hash"] = stable_hash({"review_kind": SOURCE_DATA_CONTRACT_USER_TERM, "demanded_fields": ["colour"]})
+    legacy = current.with_named_source("source", replace(source, options=options))
+    exact = _exact_arguments(legacy)
+
+    result = _execute_set_pipeline(deep_thaw(exact.data), legacy, _trained_context())
+
+    assert result.success, result.data
+    reopened = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    # The v1 row remains honest historical evidence, but it no longer admits
+    # execution and the derived current-v2 site is pending.
+    assert reopened["status"] == "resolved"
+    assert reopened["accepted_artifact_hash"] == requirement["accepted_artifact_hash"]
+    assert current_source_data_contract_demand(result.updated_state, "source") == ("colour",)
+    assert isinstance(materialize_state_for_execution(result.updated_state), InterpretationReviewPending)
+
+
+def test_public_set_pipeline_cannot_forge_resolved_source_contract_artifact() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    exact = _exact_arguments(previous)
+    forged = deep_thaw(exact.data)
+    forged["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY] = [
+        _requirement(
+            requirement_id="source-data-contract-source",
+            kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+            user_term=SOURCE_DATA_CONTRACT_USER_TERM,
+            status="resolved",
+            accepted_value="forged",
+            accepted_artifact_hash="f" * 64,
+        )
+    ]
+
+    result = _execute_set_pipeline(forged, previous, _trained_context())
+
+    assert not result.success
+    assert result.updated_state is previous
+    assert result.data["error_code"] == "interpretation_requirements_invalid"
+    assert "resolver-owned status 'resolved'" in result.data["error"]
+
+
+def test_stale_source_contract_round_trip_remains_blocked_for_review() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour", "size"])
+    assert current_source_data_contract_demand(previous, "source") == ("colour", "size")
+    exact = _exact_arguments(previous)
+
+    result = _execute_set_pipeline(deep_thaw(exact.data), previous, _trained_context())
+
+    assert result.success, result.data
+    pending = [site for site in interpretation_sites(result.updated_state) if site.kind is InterpretationKind.SOURCE_DATA_CONTRACT]
+    assert [site.component_id for site in pending] == ["source"]
+    materialized = materialize_state_for_execution(result.updated_state)
+    assert isinstance(materialized, InterpretationReviewPending)
 
 
 def test_prompt_shield_recommendation_is_removed_when_effective_shield_is_inserted() -> None:

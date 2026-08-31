@@ -3,7 +3,7 @@
 Pins the writer boundary (server-computed draft, planner field lists
 structurally impossible) and the resolve arm (stamps EXACTLY the backtraced
 demand set into ``schema.guaranteed_fields``, upserts the resolved
-requirement with the field-set artifact hash) — elspeth-da68332faf work
+requirement with the versioned semantic artifact hash) — elspeth-da68332faf work
 item 2.
 
 Fixture pattern mirrors ``test_interpretation_events_service.py``: in-memory
@@ -14,6 +14,7 @@ consumer whose ``required_input_fields`` is the demand.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -37,7 +38,7 @@ from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetad
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import sessions_table
+from elspeth.web.sessions.models import interpretation_events_table, sessions_table
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
@@ -203,6 +204,7 @@ async def test_round_trip_stamps_exactly_the_demand_set(service, tmp_path: Path)
     from elspeth.web.composer.source_demand import parse_source_data_contract_accepted_fields
 
     assert parse_source_data_contract_accepted_fields(row["accepted_value"]) == ("colour",)
+    assert json.loads(row["accepted_value"])["contract_version"] == 2
 
 
 @pytest.mark.asyncio
@@ -338,6 +340,100 @@ async def test_settlement_surfacer_mints_the_card_for_a_blocked_uploaded_source(
     assert event.affected_node_id == "source"
     assert (event.tool_call_id or "").startswith(BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX)
     assert event.llm_draft == _server_draft(("colour", "extra"), ["colour"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "only_missing_evidence",
+    (False, True),
+    ids=("normal-settlement", "repair-backstop"),
+)
+async def test_settlement_surfacer_supersedes_a_pending_legacy_v1_card(
+    service,
+    tmp_path: Path,
+    only_missing_evidence: bool,
+) -> None:
+    """A pre-upgrade pending card carries the old consequence copy.
+
+    Its graph demand is unchanged, but it must not be reused as a v2 review:
+    the old row is terminally abandoned and a current-v2 card is surfaced.
+    """
+    from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+
+    csv_path = tmp_path / "upload.csv"
+    csv_path.write_text("colour,extra\nred,1\n", encoding="utf-8")
+    sid = uuid4()
+    state = await _seed_state(service, session_id=sid, csv_path=str(csv_path), required=["colour"])
+    legacy_draft = json.dumps(
+        {
+            "contract_version": 1,
+            "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+            "demanded_fields": ["colour"],
+            "sample_header": ["colour", "extra"],
+            "missing_from_sample": [],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    legacy_event_id = uuid4()
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(interpretation_events_table).values(
+                id=str(legacy_event_id),
+                session_id=str(sid),
+                composition_state_id=str(state.id),
+                affected_node_id="source",
+                tool_call_id="legacy-v1-card",
+                user_term=SOURCE_DATA_CONTRACT_USER_TERM,
+                kind=InterpretationKind.SOURCE_DATA_CONTRACT.value,
+                llm_draft=legacy_draft,
+                accepted_value=None,
+                choice=InterpretationChoice.PENDING.value,
+                created_at=datetime.now(UTC),
+                resolved_at=None,
+                actor="composer-llm",
+                model_identifier="anthropic/test-model",
+                model_version="1",
+                provider="anthropic",
+                composer_skill_hash="0" * 64,
+                arguments_hash=None,
+                hash_domain_version=None,
+                interpretation_source="user_approved",
+            )
+        )
+
+    with pytest.raises(InterpretationResolveError):
+        await service.resolve_interpretation_event(
+            session_id=sid,
+            event_id=legacy_event_id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="alice",
+        )
+
+    await surface_pending_interpretation_reviews_for_state(
+        state_from_record(state),
+        sessions_service=service,
+        session_id=str(sid),
+        current_state_id=str(state.id),
+        model_identifier="anthropic/test-model",
+        model_version="1",
+        provider="anthropic",
+        composer_skill_hash="0" * 64,
+        only_missing_evidence=only_missing_evidence,
+    )
+
+    events = [
+        event
+        for event in await service.list_interpretation_events(sid, status="all")
+        if event.kind is InterpretationKind.SOURCE_DATA_CONTRACT
+    ]
+    assert sorted(event.choice for event in events) == [
+        InterpretationChoice.ABANDONED,
+        InterpretationChoice.PENDING,
+    ]
+    pending = next(event for event in events if event.choice is InterpretationChoice.PENDING)
+    assert json.loads(pending.llm_draft or "")["contract_version"] == 2
 
 
 @pytest.mark.asyncio

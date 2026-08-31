@@ -29,11 +29,14 @@ from pydantic import Field, field_validator, model_validator
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
+from elspeth.contracts.errors import PluginContractViolation
+from elspeth.contracts.field_collision import detect_field_collisions
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig, PluginConfigError
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.sources.field_normalization import is_normalized_field_name
 
 if TYPE_CHECKING:
     from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -268,7 +271,7 @@ class JSONExplode(BaseTransform):
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8983dddbea054fe3"
+    source_file_hash: str | None = "sha256:36c7c718e2cee382"
     config_model = JSONExplodeConfig
     usage_when_to_use: str = (
         "Use when one JSON array field in each row must become multiple rows, with the surrounding "
@@ -289,6 +292,7 @@ class JSONExplode(BaseTransform):
 """
     capability_tags: tuple[str, ...] = ("json", "array", "fan-out", "deaggregation")
     creates_tokens = True  # CRITICAL: enables new token creation for deaggregation
+    preserves_input_values = True
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
@@ -323,9 +327,11 @@ class JSONExplode(BaseTransform):
         # Sibling fields are duplicated onto every emitted element row (the
         # plugin's own assistance text says so); only the consumed array field
         # is dropped. Same extras-firewall gap line_explode carried
-        # (elspeth-15c72686f2).
-        self.forwards_input_fields = True
-        self.removed_input_fields = frozenset({cfg.array_field})
+        # (elspeth-15c72686f2). An original-header spelling cannot name the
+        # normalized key removed at runtime, so the static declaration
+        # abstains while process() resolves that key from row lineage.
+        self.forwards_input_fields = is_normalized_field_name(cfg.array_field)
+        self.removed_input_fields = frozenset({cfg.array_field}) if self.forwards_input_fields else frozenset()
 
         # Declare output fields for centralized collision detection in TransformExecutor.
         fields = [cfg.output_field]
@@ -344,6 +350,10 @@ class JSONExplode(BaseTransform):
 
     def input_semantic_requirements(self) -> InputSemanticRequirements:
         return _build_json_explode_input_requirements(array_field=self._array_field)
+
+    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Inject one valid item so the value-preservation harness reaches emission."""
+        return [self._augment_invariant_probe_row(probe, field_name=self._array_field, value=["probe-item"])]
 
     @classmethod
     def get_agent_assistance(
@@ -496,6 +506,12 @@ class JSONExplode(BaseTransform):
         else:
             # row[self._array_field] above already validated resolvability.
             normalized_array_field = row.contract.resolve_name(self._array_field)
+        collisions = detect_field_collisions(set(row_data) - {normalized_array_field}, self.declared_output_fields)
+        if collisions:
+            raise PluginContractViolation(
+                f"Transform '{self.name}' would overwrite existing input fields {collisions}. "
+                "This is a pipeline configuration error — the transform's output fields collide with fields already present in the row."
+            )
         base = {k: v for k, v in row_data.items() if k != normalized_array_field}
 
         # Empty array: nothing to deaggregate — quarantine with clear audit trail

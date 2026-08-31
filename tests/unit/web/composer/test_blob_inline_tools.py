@@ -24,6 +24,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.composer.tools import ToolResult, get_tool_definitions
 from elspeth.web.composer.tools import execute_tool as _execute_tool
+from elspeth.web.composer.tools._common import _SERVER_OWNED_SOURCE_OPTION_KEYS
 from elspeth.web.composer.yaml_generator import generate_pipeline_dict
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -597,6 +598,10 @@ class TestWireBlobInlineRef:
         assert result.updated_state is state
         assert "resolved_prompt_template_hash" in result.data["error"]
         assert "runtime-owned" in result.data["error"]
+        assert "field_path" in result.data["error"]
+        assert "patch_node_options" in result.data["error"]
+        assert "upsert_node" in result.data["error"]
+        assert "retry wire_blob_inline_ref" not in result.data["error"]
 
     def test_rejects_llm_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -617,7 +622,8 @@ class TestWireBlobInlineRef:
         assert result.success is False
         assert result.updated_state is state
         assert "interpretation_requirements" in result.data["error"]
-        assert "resolve_interpretation_event" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
 
     def test_rejects_non_llm_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -644,7 +650,8 @@ class TestWireBlobInlineRef:
         assert result.success is False
         assert result.updated_state is state
         assert "interpretation_requirements" in result.data["error"]
-        assert "resolve_interpretation_event" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
 
     def test_rejects_source_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -665,7 +672,34 @@ class TestWireBlobInlineRef:
         assert result.success is False
         assert result.updated_state is state
         assert "interpretation_requirements" in result.data["error"]
-        assert "resolve_interpretation_event" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
+
+    @pytest.mark.parametrize("field_name", sorted(_SERVER_OWNED_SOURCE_OPTION_KEYS))
+    def test_rejects_source_server_owned_root_field_path(
+        self,
+        blob_env: dict[str, Any],
+        field_name: str,
+    ) -> None:
+        blob = _create_blob(blob_env, content="forged source metadata")
+        state = _inline_ref_state()
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": f"source.options.{field_name}",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert field_name in result.data["error"]
+        assert "set_source_from_blob" in result.data["error"]
 
     def test_rejects_output_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -686,7 +720,8 @@ class TestWireBlobInlineRef:
         assert result.success is False
         assert result.updated_state is state
         assert "interpretation_requirements" in result.data["error"]
-        assert "resolve_interpretation_event" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
 
     def test_unrelated_wire_rejects_preexisting_output_interpretation_requirements(
         self,

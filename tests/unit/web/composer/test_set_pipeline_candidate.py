@@ -1603,7 +1603,7 @@ def _fork_coalesce_args(tmp_path: Path) -> dict[str, Any]:
             "merge": "nested",
             "on_success": "main",
             "on_error": "discard",
-            "options": {"schema": {"mode": "observed"}},
+            "options": {},
         },
     ]
     args["edges"] = []
@@ -1788,7 +1788,9 @@ def _multi_output_args(tmp_path: Path) -> dict[str, Any]:
 _EXPECTED_STATE_HASHES = {
     "linear": "21dbf5afc36a0cc402394e1c59bfbb58304ea5564930998ab8b1b8851b78d1e9",
     "named_multi_source_queue": "965e2b3991d2347b633baf4e54e71e37995c10bc386356b547b7a207f8b65f9c",
-    "fork_coalesce": "2b055404018c9bfdf8a688af962e05e7a93c4ba9f4891cba718dfd0cc78e0a5b",  # gate renamed fork -> fork_gate (reserved name)
+    # Structural coalesces carry no plugin options; the gate is named
+    # fork_gate because the bare token "fork" is reserved.
+    "fork_coalesce": "21fef020c5ef5d8c9d9b5319446795a57c257ef366d6ddb1c63cfee24d5a4315",
     "gate": "c0380bca12a88112057ce36547ab39547eb691c03a8751e27f2371593b5abb9e",
     "aggregation": "427cde0492596be8a65cf854e3183de0c868f31fb7a24884d4bd86963fbb22cd",
     "structured_llm": "80d31be6e69ef6937144e9ba5305aa90eaa1f1f8046040c3bb5e17567322f964",
@@ -2049,8 +2051,10 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             stale_review,
             _trained_context(data_dir=tmp_path),
             "Node 'classify': set_pipeline options.interpretation_requirements[0] includes resolver-owned status "
-            "'resolved'. Composer tool input may stage pending review requirements only; resolved review metadata may "
-            "only be written by resolve_interpretation_event.",
+            "'resolved'. Composer tool input may stage pending review requirements only. Omit resolver-owned fields "
+            "and retry set_pipeline with exactly kind, user_term, and draft. Then call request_interpretation_review "
+            "for an authorable staged site; backend-owned review kinds are surfaced automatically. The user resolves "
+            "the card and ELSPETH writes resolved review metadata.",
             "interpretation_requirements_invalid",
         ),
     ]

@@ -81,13 +81,13 @@ from elspeth.web.interpretation_state import (
 )
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import sessions_table
-from elspeth.web.sessions.protocol import CompositionStateData
-from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import (
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
     InterpretationDraftMismatchError,
     InterpretationPlaceholderConsumedError,
-    SessionServiceImpl,
 )
+from elspeth.web.sessions.schema import initialize_session_schema
+from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 # --------------------------------------------------------------------------- #
@@ -1306,7 +1306,6 @@ def test_01_tool_registered_in_get_tool_definitions() -> None:
     assert params["properties"]["kind"]["enum"] == [
         "vague_term",
         "invented_source",
-        "llm_prompt_template",
         "pipeline_decision",
         "llm_model_choice",
         "source_data_contract",
@@ -1579,7 +1578,7 @@ def test_05d_structured_pending_requirement_for_different_term_still_fails() -> 
 
 def test_05e_legacy_structured_pending_requirement_without_kind_defaults_to_vague_term() -> None:
     node = _structured_llm_node()
-    requirement = dict(node.options[INTERPRETATION_REQUIREMENTS_KEY][0])  # type: ignore[index]
+    requirement = dict(node.options[INTERPRETATION_REQUIREMENTS_KEY][0])
     del requirement["kind"]
     options = dict(node.options)
     options[INTERPRETATION_REQUIREMENTS_KEY] = [requirement]
@@ -3096,8 +3095,8 @@ def test_13_dual_registry_invariant() -> None:
     for tool_name, handler in _SESSION_AWARE_TOOL_HANDLERS.items():
         assert asyncio.iscoroutinefunction(handler), f"_SESSION_AWARE_TOOL_HANDLERS[{tool_name!r}] is not a coroutine function"
     for registry_name, registry in sync_registries.items():
-        for tool_name, handler in registry.items():
-            assert not asyncio.iscoroutinefunction(handler), (
+        for tool_name, sync_handler in registry.items():
+            assert not asyncio.iscoroutinefunction(sync_handler), (
                 f"{registry_name}[{tool_name!r}] is async; belongs in _SESSION_AWARE_TOOL_HANDLERS"
             )
 

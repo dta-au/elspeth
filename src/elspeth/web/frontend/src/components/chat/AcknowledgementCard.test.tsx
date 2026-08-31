@@ -11,7 +11,10 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import type { ComponentProps } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { AcknowledgementCard } from "./AcknowledgementCard";
+import {
+  AcknowledgementCard,
+  parseDataContractDraft,
+} from "./AcknowledgementCard";
 import {
   ACKNOWLEDGEMENT_AMEND_LABEL,
   ACKNOWLEDGEMENT_APPROVE_LABEL,
@@ -230,10 +233,10 @@ describe("AcknowledgementCard — source data contract", () => {
     });
   }
 
-  it("renders the demanded fields, the commitment framing, and the quarantine consequence", () => {
+  it("renders the demanded fields, the commitment framing, and the fail-closed consequence", () => {
     renderCard(
       makeDataContractEvent({
-        contract_version: 1,
+        contract_version: 2,
         kind: "source_data_contract",
         demanded_fields: ["colour", "size"],
         sample_header: ["colour", "extra"],
@@ -248,9 +251,14 @@ describe("AcknowledgementCard — source data contract", () => {
     expect(
       screen.getByText(/whatever you feed this pipeline/i),
     ).toBeTruthy();
-    // Honest consequence: quarantine, the run continues.
-    expect(screen.getByText(/set aside\s*\(quarantined\)/i)).toBeTruthy();
-    expect(screen.getByText(/the run continues/i)).toBeTruthy();
+    // A broken acknowledged producer guarantee is a Tier-1 declaration
+    // violation, distinct from Tier-3 source validation quarantine.
+    expect(
+      screen.getByText(/both its data and emitted schema contract/i),
+    ).toBeTruthy();
+    expect(screen.getByText(/the run stops/i)).toBeTruthy();
+    expect(screen.getByText(/source data-contract failure/i)).toBeTruthy();
+    expect(screen.queryByText(/the run continues/i)).toBeNull();
     expect(
       screen.getByRole("button", {
         name: /acknowledge the source data contract/i,
@@ -261,7 +269,7 @@ describe("AcknowledgementCard — source data contract", () => {
   it("warns per demanded field the sample does not show", () => {
     renderCard(
       makeDataContractEvent({
-        contract_version: 1,
+        contract_version: 2,
         kind: "source_data_contract",
         demanded_fields: ["colour", "size"],
         sample_header: ["colour", "extra"],
@@ -286,7 +294,7 @@ describe("AcknowledgementCard — source data contract", () => {
   it("notes when no sample was available", () => {
     renderCard(
       makeDataContractEvent({
-        contract_version: 1,
+        contract_version: 2,
         kind: "source_data_contract",
         demanded_fields: ["colour"],
         sample_header: null,
@@ -310,6 +318,23 @@ describe("AcknowledgementCard — source data contract", () => {
     expect(
       screen.getByText(/could not be parsed/i),
     ).toBeTruthy();
+  });
+
+  it.each([
+    ["legacy version", { contract_version: 1, kind: "source_data_contract", demanded_fields: ["colour"], sample_header: null, missing_from_sample: [] }],
+    ["wrong kind", { contract_version: 2, kind: "invented_source", demanded_fields: ["colour"], sample_header: null, missing_from_sample: [] }],
+    ["missing field", { contract_version: 2, kind: "source_data_contract", demanded_fields: ["colour"], sample_header: null }],
+    ["malformed sample", { contract_version: 2, kind: "source_data_contract", demanded_fields: ["colour"], sample_header: 42, missing_from_sample: [] }],
+    ["empty demand", { contract_version: 2, kind: "source_data_contract", demanded_fields: [], sample_header: null, missing_from_sample: [] }],
+    ["unsorted demand", { contract_version: 2, kind: "source_data_contract", demanded_fields: ["size", "colour"], sample_header: null, missing_from_sample: [] }],
+    ["duplicate demand", { contract_version: 2, kind: "source_data_contract", demanded_fields: ["colour", "colour"], sample_header: null, missing_from_sample: [] }],
+    ["sample miss omitted", { contract_version: 2, kind: "source_data_contract", demanded_fields: ["colour"], sample_header: [], missing_from_sample: [] }],
+    ["no sample has miss", { contract_version: 2, kind: "source_data_contract", demanded_fields: ["colour"], sample_header: null, missing_from_sample: ["colour"] }],
+    ["malformed misses", { contract_version: 2, kind: "source_data_contract", demanded_fields: ["colour"], sample_header: null, missing_from_sample: [1] }],
+    ["miss is not demanded", { contract_version: 2, kind: "source_data_contract", demanded_fields: ["colour"], sample_header: null, missing_from_sample: ["size"] }],
+    ["extra field", { contract_version: 2, kind: "source_data_contract", demanded_fields: ["colour"], sample_header: null, missing_from_sample: [], extra: true }],
+  ])("rejects %s instead of rendering a degraded acknowledgement", (_label, payload) => {
+    expect(parseDataContractDraft(JSON.stringify(payload))).toBeNull();
   });
 });
 

@@ -3950,6 +3950,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         guidedTerminal: guided?.terminal ?? null,
         guidedProposalReview: proposalReviewForTurn(guided?.next_turn ?? null),
       });
+      // Revert is a state-producing route: restoring an older pending
+      // interpretation requirement can mint fresh backend review events.
+      // Pull them into the independent event store so execution does not stay
+      // blocked behind an invisible card until a full session reload.
+      void refreshInterpretationEventsForSession(activeSessionId);
       clearGuidedRetry(retry);
     } catch (err) {
       if (!isAmbiguousGuidedRetryFailure(err)) {
