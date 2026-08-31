@@ -360,7 +360,7 @@ class _JoinedFieldDerivation:
     """Public field definition plus the runtime evidence that produced it."""
 
     definition: FieldDefinition
-    known_non_null_runtime_types: frozenset[type] | None
+    known_non_null_runtime_types: frozenset[type]
 
 
 def _derive_joined_field_types(cfg: ReferenceJoinConfig, index: ReferenceIndex) -> dict[str, _JoinedFieldDerivation]:
@@ -412,11 +412,11 @@ def _validate_declared_output_types(cfg: ReferenceJoinConfig, derived: Mapping[s
 
     A compatible declaration is honored, never clobbered. Authored ``any`` is
     an explicit abstention. Derived public ``any`` retains private evidence so
-    genuinely unknown or vacuous evidence cannot refute the author, while
-    known heterogeneous or unrepresentable runtime types can. What IS
-    refutable is refused here at config load — the alternative was silently
-    overwriting the author, which forced a TRUE declaration wrong and steered
-    the correction downstream as type erasure (elspeth-cd5cb844bc).
+    a vacuous emitted set cannot refute the author, while known heterogeneous
+    or unrepresentable runtime types can. What IS refutable is refused here at
+    config load — the alternative was silently overwriting the author, which
+    forced a TRUE declaration wrong and steered the correction downstream as
+    type erasure (elspeth-cd5cb844bc).
 
     ``required`` is refused rather than honored for a different reason: every
     joined field is named in the output ``guaranteed_fields``, and honoring
@@ -512,7 +512,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ef183666f4c61db6"
+    source_file_hash: str | None = "sha256:93170775ae243b90"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (

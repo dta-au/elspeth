@@ -529,8 +529,8 @@ class TestJoinedOutputFieldTypes:
     The whole table is resolved at config load, so under ``on_miss: fail`` the
     set of values a field can carry is CLOSED — the declared type derives from
     it instead of erasing to ``any``. ``default`` unifies that set with the
-    configured default; ``null`` keeps the honest abstention, because any row
-    may miss and take a ``None``.
+    configured default; ``null`` retains the known hit type and makes the field
+    nullable, because any row may miss and take a ``None``.
     """
 
     def test_a_csv_table_under_fail_derives_str(self) -> None:
