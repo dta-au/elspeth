@@ -518,8 +518,18 @@ composition_states_table = Table(
     # Operational/audit metadata produced by the composer pipeline that
     # describes *how this state was reached* (distinct from ``metadata_``,
     # which carries the user-facing PipelineMetadata name/description).
-    # Currently only ``repair_turns_used`` is surfaced; absence (NULL) is
-    # honest for revert/fork paths where no compose produced this version.
+    # Surfaced keys: ``repair_turns_used``, and ``validation_lane``
+    # (elspeth-67c6fa691d) — which predicate produced this row's
+    # ``is_valid``: "authoring_only" (mid-turn compose writer: Stage-1
+    # ``validate()`` narrowed by pending interpretation-review sites; no
+    # plugin config instantiation, no runtime preflight) or "strict"
+    # (turn-end writer: authoring + runtime preflight via
+    # ``_composer_persisted_validation``). Two writers share the
+    # ``is_valid`` column, so rows with byte-identical content can differ
+    # in validity across lanes; the marker makes that transition legible
+    # to an auditor. Absence (NULL composer_meta or missing key) is honest
+    # for writer paths that predate the marker or copy an existing row
+    # (revert, fork, guided checkpoint copies).
     Column("composer_meta", JSON, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column(

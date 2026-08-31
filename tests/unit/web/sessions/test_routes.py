@@ -1159,6 +1159,9 @@ def test_send_message_auto_commit_settles_exact_pipeline_intent(tmp_path, monkey
     assert current_state is not None
     assert current_state.composer_meta is not None
     assert current_state.composer_meta["repair_turns_used"] == 2
+    # Turn-end rows always record which predicate produced is_valid
+    # (elspeth-67c6fa691d): this writer is the strict authoring+runtime lane.
+    assert current_state.composer_meta["validation_lane"] == "strict"
     from sqlalchemy import func, select
 
     from elspeth.web.sessions.models import composition_states_table

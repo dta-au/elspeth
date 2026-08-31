@@ -2339,6 +2339,13 @@ async def _state_data_from_composer_state(
     )
     state_d = state.to_dict()
     surface_meta = dict(deep_thaw(composer_meta)) if composer_meta is not None else {}
+    # Which predicate produced this row's ``is_valid``: this writer always
+    # derives it through the strict authoring+runtime pipeline above
+    # (``_composer_persisted_validation``), so the lane marker is
+    # unconditionally "strict" — overwriting any "authoring_only" marker
+    # carried forward from a mid-turn compose row (elspeth-67c6fa691d;
+    # column doc at web/sessions/models.py ``composer_meta``).
+    surface_meta["validation_lane"] = "strict"
     if state.guided_session is not None and "guided_session" not in surface_meta:
         surface_meta["guided_session"] = state.guided_session.to_dict()
     persisted_composer_meta = merge_implicit_decisions_meta(surface_meta, state)

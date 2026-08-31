@@ -196,7 +196,7 @@ async def persist_turn_audit(
                 ),
             ),
             composition_state_payload=(
-                phase3_self._state_payload_for_compose_turn_for_test(tool_outcome.response)
+                phase3_self._state_payload_for_compose_turn(tool_outcome.response)
                 if tool_outcome.post_version > tool_outcome.pre_version
                 else None
             ),
