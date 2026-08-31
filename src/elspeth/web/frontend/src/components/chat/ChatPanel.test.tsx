@@ -394,7 +394,16 @@ describe("ChatPanel", () => {
     useSessionStore.setState({
       activeSessionId: "session-1",
       sessions: [session],
-      messages: [],
+      messages: [
+        {
+          id: "message-1",
+          session_id: "session-1",
+          role: "user",
+          content: "Build me a pipeline",
+          tool_calls: null,
+          created_at: "2026-04-26T10:00:01Z",
+        },
+      ],
       composerProgress: progress,
     });
 
@@ -517,6 +526,75 @@ describe("ChatPanel", () => {
       screen.queryByText("The composer has updated the pipeline."),
     ).not.toBeInTheDocument();
   });
+
+  it("does not show unrelated guided progress after exiting to freeform", () => {
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue(idleComposer);
+    const terminal: TerminalState = {
+      kind: "exited_to_freeform",
+      reason: "user_pressed_exit",
+      pipeline_yaml: null,
+    };
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [soloSession],
+      messages: [],
+      guidedSession: {
+        step: "step_1_source",
+        history: [],
+        terminal,
+        chat_history: [],
+        chat_turn_seq: 0,
+        profile: null,
+      },
+      guidedNextTurn: null,
+      guidedTerminal: terminal,
+      composerProgress: {
+        ...terminalCompleteProgress,
+        request_id: "guided-operation-id",
+      },
+    });
+
+    render(<ChatPanel />);
+
+    expect(screen.getByTestId("chat-input")).toBeInTheDocument();
+    expect(screen.queryByText("Last composer update")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("The composer has updated the pipeline."),
+    ).not.toBeInTheDocument();
+  });
+
+  it.each(["pending", "failed"] as const)(
+    "keeps terminal progress for an absent canonical id while the optimistic user row is %s",
+    (localStatus) => {
+      (useComposer as ReturnType<typeof vi.fn>).mockReturnValue(idleComposer);
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        sessions: [soloSession],
+        messages: [
+          chatMsg({
+            id: "local-u1",
+            role: "user",
+            content: "Build me a pipeline",
+            local_status: localStatus,
+          }),
+        ],
+        composerProgress: {
+          ...terminalCompleteProgress,
+          request_id: "canonical-u1",
+          phase: "cancelled",
+          headline: "Composition stopped before saving.",
+          reason: "client_cancelled",
+        },
+      });
+
+      render(<ChatPanel />);
+
+      expect(screen.getByText("Last composer update")).toBeInTheDocument();
+      expect(
+        screen.getByText("Composition stopped before saving."),
+      ).toBeInTheDocument();
+    },
+  );
 
   it("keeps terminal composer progress while the reply has not landed yet", () => {
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue(idleComposer);
