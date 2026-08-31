@@ -44,7 +44,7 @@ def test_composer_service_impl_not_patched_at_module_tail(module_path: Path) -> 
     forbidden_assignments = {
         ("ComposerServiceImpl", "_run_one_turn_for_test"),
         ("ComposerServiceImpl", "_serialize_response_via_walker"),
-        ("ComposerServiceImpl", "_state_payload_for_compose_turn_for_test"),
+        ("ComposerServiceImpl", "_state_payload_for_compose_turn"),
         ("ComposerServiceImpl", "__init__"),
     }
     hits: list[str] = []

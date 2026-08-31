@@ -668,7 +668,125 @@ def generate_yaml(state: CompositionState) -> str:
     return yaml.dump(doc, default_flow_style=False, sort_keys=False)
 
 
+class PublicExportRedaction(TypedDict):
+    """What the public projection stripped, per component (top-level options).
+
+    Keys are component names; values are the sorted top-level option keys the
+    projection removed (storage path carriers and blob linkage). Components
+    that lost nothing are absent, so an empty mapping pair means the export
+    is complete as-is.
+    """
+
+    sources: dict[str, list[str]]
+    outputs: dict[str, list[str]]
+
+
+# Exported marker bytes: the YAML import guard
+# (`web/sessions/routes/composer/state.py`) recognises these exact prefixes,
+# so exporter and importer share one authority. Do not re-derive them.
+PUBLIC_EXPORT_REDACTION_HEADER = "# ELSPETH public export — custody-redacted; NOT runnable as exported."
+PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX = "# redacted-source: "
+PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX = "# redacted-output: "
+PUBLIC_EXPORT_REBIND_GUIDANCE = (
+    "Re-bind each redacted source on import by uploading its data to the target session and passing "
+    'source_blob_ids={"<source name>": "<session blob id>"}; sink paths are re-authored on import.'
+)
+
+_PUBLIC_SOURCE_LINKAGE_KEYS = frozenset({"blob_ref", "blob_id"})
+
+
+def public_export_redaction(state: CompositionState) -> PublicExportRedaction:
+    """Account for what :func:`generate_public_yaml` strips from ``state``.
+
+    Derived from the same key-set authorities the projection itself uses
+    (``_PUBLIC_STORAGE_OPTION_KEYS`` and the blob-linkage keys), over the same
+    blob-ref-reattached export state, so the account cannot drift from the
+    scrub (elspeth-06f92da0d9). Top-level option keys only: that is where the
+    schema-defined source/sink storage carriers live; recursive scrubs of
+    nested custody subtrees stay undocumented here because they carry no
+    re-bindable user data.
+    """
+    export_state = reattach_guided_blob_refs_for_public_export(state)
+    sources: dict[str, list[str]] = {}
+    for source_name, source in export_state.sources.items():
+        stripped = sorted(key for key in source.options if key in _PUBLIC_STORAGE_OPTION_KEYS or key in _PUBLIC_SOURCE_LINKAGE_KEYS)
+        if stripped:
+            sources[source_name] = stripped
+    outputs: dict[str, list[str]] = {}
+    for output in export_state.outputs:
+        stripped = sorted(key for key in output.options if key in _PUBLIC_STORAGE_OPTION_KEYS or key == "blob_id")
+        if stripped:
+            outputs[output.name] = stripped
+    return {"sources": sources, "outputs": outputs}
+
+
+# The marker prose uses category labels, not raw option-key names: the
+# custody-egress guards over sibling consumers assert that the literal key
+# tokens never appear anywhere in a serialised public artifact, and an
+# explanatory comment must not weaken those greps. Exact key names travel on
+# the structured route response (`StateYamlRedaction`) instead, where they are
+# data rather than prose.
+#
+# The keys are the union of the projection's own storage-key authorities and
+# the blob-linkage keys; `test_marker_labels_cover_every_stripped_key` pins
+# that coverage, so a new path option fails CI instead of raising KeyError
+# inside a user's export.
+_MARKER_LABELS = {
+    "path": "local-path",
+    "file": "local-path",
+    "persist_directory": "persist-directory",
+    "blob_ref": "blob-linkage",
+    "blob_id": "blob-linkage",
+}
+
+
+def _marker_labels(keys: list[str]) -> str:
+    return ",".join(sorted({_MARKER_LABELS[key] for key in keys}))
+
+
+def public_export_redaction_header(state: CompositionState) -> str:
+    """Marker block for a public export that leaves ELSPETH as a document.
+
+    Returns ``""`` when the projection stripped nothing. Apply this ONLY at
+    the user-download boundary (``GET /{session_id}/state/yaml``) and never
+    inside :func:`generate_public_yaml` — see that function for why the other
+    consumers keep bare bytes. Deterministic for a given state: the account is
+    derived from the same state the body is.
+    """
+    redaction = public_export_redaction(state)
+    if not redaction["sources"] and not redaction["outputs"]:
+        return ""
+    lines = [PUBLIC_EXPORT_REDACTION_HEADER]
+    for source_name, keys in redaction["sources"].items():
+        lines.append(f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}{source_name} stripped={_marker_labels(keys)}")
+    for output_name, keys in redaction["outputs"].items():
+        lines.append(f"{PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX}{output_name} stripped={_marker_labels(keys)}")
+    lines.append(f"# {PUBLIC_EXPORT_REBIND_GUIDANCE}")
+    return "\n".join(lines) + "\n"
+
+
 def generate_public_yaml(state: CompositionState) -> str:
-    """Convert a CompositionState to deterministic public export/share/MCP YAML."""
+    """Convert a CompositionState to deterministic public export/share/MCP YAML.
+
+    Returns the projected document and nothing else. The custody-redaction
+    marker block (:func:`public_export_redaction_header`) is deliberately NOT
+    applied here: this function serves four consumers with different
+    contracts, and only one of them hands a user a document to keep
+    (elspeth-06f92da0d9).
+
+    * The MCP ``generate_yaml`` tool and the shareable-review snapshot each
+      carry a structured composition beside the text, and both are covered by
+      custody-egress guards asserting no literal blob-linkage key token
+      appears anywhere in the serialised artifact — prose naming the
+      ``source_blob_ids`` re-bind field trips them.
+    * The share snapshot is content-addressed, so these bytes are an identity.
+    * ``web/_aws_ecs_acceptance/capture.py`` feeds this output straight back
+      into ``POST /state/yaml``, which makes the generator an import producer
+      as well as an export producer; a marker here would be an instruction the
+      importer then re-parses.
+
+    The export route composes header + body. Every other consumer keeps the
+    bare document.
+    """
     doc = generate_public_pipeline_dict(state)
     return yaml.dump(doc, default_flow_style=False, sort_keys=False)

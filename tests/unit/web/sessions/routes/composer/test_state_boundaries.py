@@ -246,3 +246,70 @@ async def test_surface_imported_reviews_skips_writer_rejected_rows() -> None:
     assert [call["user_term"] for call in surfaced] == ["llm_prompt_template:score"]
     assert surfaced[0]["llm_draft"] == "Score this: {{ row.value }}"
     assert surfaced[0]["model_identifier"] == "yaml_import"
+
+
+def _marked_export_yaml(marker_line: str) -> str:
+    return f"{marker_line}\nsources:\n  source:\n    plugin: csv\n    options: {{}}\n"
+
+
+def test_redaction_marker_source_names_parses_only_exporter_marker_lines() -> None:
+    from elspeth.web.composer.yaml_generator import PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX
+    from elspeth.web.sessions.routes.composer.state import _redaction_marker_source_names
+
+    text = (
+        f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}source stripped=blob_ref,path\n"
+        f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}other_source stripped=path\n"
+        "# redacted-source: two tokens stripped=path\n"  # multi-token name: ignored
+        "# some unrelated comment\n"
+        "sources: {}\n"
+    )
+    assert _redaction_marker_source_names(text) == frozenset({"source", "other_source"})
+    assert _redaction_marker_source_names("sources: {}\n") == frozenset()
+
+
+def test_reject_redacted_sources_without_rebind_400s_path_absent_shape() -> None:
+    """The path-ABSENT redacted-export shape gets re-bind guidance, not a raw
+    Pydantic 'path Field required' from the strict lane (elspeth-06f92da0d9)."""
+    from fastapi import HTTPException
+
+    from elspeth.web.composer.yaml_generator import PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX
+    from elspeth.web.sessions.routes.composer.state import _reject_redacted_sources_without_rebind
+
+    state = _single_source_state({"schema": {"mode": "observed"}})
+    yaml_text = _marked_export_yaml(f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}source stripped=blob_ref,path")
+
+    with pytest.raises(HTTPException) as exc_info:
+        _reject_redacted_sources_without_rebind(state, yaml_text=yaml_text)
+
+    assert exc_info.value.status_code == 400
+    assert "custody-redacted" in exc_info.value.detail
+    assert "source_blob_ids" in exc_info.value.detail
+
+
+def test_reject_redacted_sources_passes_rebound_and_repathed_sources() -> None:
+    from elspeth.web.composer.yaml_generator import PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX
+    from elspeth.web.sessions.routes.composer.state import _reject_redacted_sources_without_rebind
+
+    yaml_text = _marked_export_yaml(f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}source stripped=blob_ref,path")
+
+    # blob_ref restored by _state_with_imported_source_blobs: bound, passes.
+    _reject_redacted_sources_without_rebind(
+        _single_source_state({"blob_ref": "20b944e3-fd46-434f-b9a2-4fb508db30f0", "path": "/data/x.csv"}),
+        yaml_text=yaml_text,
+    )
+    # Hand-re-added path option: passes here; path guards police the value.
+    _reject_redacted_sources_without_rebind(
+        _single_source_state({"path": "inputs/x.csv"}),
+        yaml_text=yaml_text,
+    )
+
+
+def test_reject_redacted_sources_is_inert_without_a_marker() -> None:
+    from elspeth.web.sessions.routes.composer.state import _reject_redacted_sources_without_rebind
+
+    # Hand-written path-absent YAML with no exporter marker: pre-existing
+    # behaviour stands (strict preflight refuses; persists is_valid=False).
+    _reject_redacted_sources_without_rebind(
+        _single_source_state({"schema": {"mode": "observed"}}),
+        yaml_text="sources:\n  source:\n    plugin: csv\n    options: {}\n",
+    )

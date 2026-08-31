@@ -3812,3 +3812,121 @@ async def test_stranded_prompt_template_requirements_surface_via_backstop(
     )
     materialized = materialize_state_for_execution(head)
     assert not isinstance(materialized, InterpretationReviewPending), materialized
+
+
+# ---------------------------------------------------------------------------
+# elspeth-d581b3da7f — which mechanism duplicates the planner's turn text?
+# ---------------------------------------------------------------------------
+
+
+_REVIEW_TURN_PROSE = "Surfacing the review card now."
+# Distinctive text on a scripted response the loop should NEVER reach. If a
+# second generation produced the duplicate, the loop would have consumed this.
+_UNREACHED_THIRD_TURN_PROSE = "A THIRD PROVIDER TURN WAS REQUESTED."
+
+
+@pytest.mark.asyncio
+async def test_review_handoff_prose_is_generated_once_and_already_persisted(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """Decide between the two proposed mechanisms for the msg4/msg5 duplication.
+
+    Session 891b7b1e persisted the planner's prose twice 99ms apart, the second
+    copy carrying a ``trusted_system_notice``. Two mechanisms were proposed and
+    this test discriminates them:
+
+    * **Double generation** — the backend makes a SECOND provider call that
+      re-renders the same prose. The scripted LLM holds a third response with
+      distinctive text; a second generation consumes it. Refuted when the
+      provider-call count stays at 2 and that text appears nowhere.
+    * **Server re-emission** — ONE provider call renders the prose, the compose
+      loop persists it mid-loop alongside its ``tool_calls``, and the turn-end
+      writer then persists the SAME prose again with the handoff suffix
+      appended. Confirmed by the assertions below.
+
+    The staged-handoff branch terminates the batch at the successful review
+    call, so the model's LAST prose IS the tool-call turn's prose — which the
+    compose loop has already committed. ``result.assistant_message`` re-carries
+    it because ``_append_interpretation_review_handoff_message`` augments the
+    model's rendered text rather than emitting the notice alone.
+    """
+    from elspeth.web.sessions.models import chat_messages_table
+
+    composer = _build_composer(tmp_path, sessions_service)
+    session_id = uuid4()
+    with sessions_service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Review handoff duplication mechanism",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_set_pipeline",
+                tool_name="set_pipeline",
+                arguments=_set_pipeline_with_pending_interpretation_args(),
+            ),
+            _fake_response_with_tool_call(
+                tool_call_id="call_review",
+                tool_name="request_interpretation_review",
+                content=_REVIEW_TURN_PROSE,
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "modern, useful, engaging, and clear for the public.",
+                },
+            ),
+            _fake_text_response(_UNREACHED_THIRD_TURN_PROSE),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=None,
+        message="create a workflow that rates how cool pages are",
+    )
+
+    # Instrument guard: without reaching the staged-handoff branch the rest
+    # would pass vacuously.
+    assert [inv.tool_name for inv in result.tool_invocations] == [
+        "set_pipeline",
+        "request_interpretation_review",
+    ]
+
+    # --- Double generation is REFUTED -------------------------------------
+    # One provider call per loop iteration and no more. The third scripted
+    # response was never requested, so nothing re-rendered the review prose.
+    assert len(llm.messages) == 2
+    assert _UNREACHED_THIRD_TURN_PROSE not in result.assistant_message
+
+    # --- Server re-emission is CONFIRMED ----------------------------------
+    with sessions_service._engine.begin() as conn:
+        assistant_rows = [
+            row
+            for row in conn.execute(chat_messages_table.select().order_by(chat_messages_table.c.sequence_no)).mappings().all()
+            if row["role"] == "assistant"
+        ]
+
+    # The compose loop already committed the model's prose for this turn, with
+    # the tool_calls envelope that produced the review card.
+    carrying_prose = [row for row in assistant_rows if row["content"] == _REVIEW_TURN_PROSE]
+    assert len(carrying_prose) == 1, [row["content"] for row in assistant_rows]
+    assert carrying_prose[0]["tool_calls"], "the mid-loop row must carry its tool_calls envelope"
+    assert carrying_prose[0]["writer_principal"] == "compose_loop"
+
+    # And the turn-end writer is handed that same prose back with the notice
+    # appended — persisting ``assistant_message`` verbatim is what produced the
+    # second copy in session 891b7b1e.
+    assert result.raw_assistant_content == _REVIEW_TURN_PROSE
+    assert result.assistant_message.startswith(_REVIEW_TURN_PROSE)
+    assert result.assistant_message != _REVIEW_TURN_PROSE

@@ -992,6 +992,33 @@ def materialize_state_for_authoring(state: CompositionState) -> CompositionState
     return replace(state, nodes=tuple(materialized_nodes))
 
 
+def _profile_resolved_model_node_ids(state: CompositionState) -> frozenset[str]:
+    """LLM nodes whose concrete model came from an operator-owned profile alias."""
+    return frozenset(node.id for node in state.nodes if node.plugin == "llm" and _node_str_option(node, "profile") is not None)
+
+
+def pending_execution_interpretation_sites(
+    state: CompositionState,
+    *,
+    operator_resolved_model_node_ids: frozenset[str] = frozenset(),
+) -> tuple[InterpretationReviewSite, ...]:
+    """Pending interpretation-review sites as the execution gate counts them.
+
+    Single authority for "which unresolved reviews block execution": derives
+    the operator-profile model exemption from the state itself (unioned with
+    any caller-supplied ids) and delegates to :func:`interpretation_sites`.
+    :func:`materialize_state_for_execution` and the composer's mid-turn
+    composition-state persistence (``_state_payload_for_compose_turn``) share
+    this predicate so a state the mid-turn writer persists as valid can never
+    carry a review the execution gate would block on — the two answers agree
+    by construction (elspeth-67c6fa691d).
+    """
+    return interpretation_sites(
+        state,
+        operator_resolved_model_node_ids=operator_resolved_model_node_ids | _profile_resolved_model_node_ids(state),
+    )
+
+
 def materialize_state_for_execution(
     state: CompositionState,
     *,
@@ -1011,12 +1038,9 @@ def materialize_state_for_execution(
     construction. Mirrors ``execution.validation``'s ``profile``-is-str test.
     """
 
-    profile_resolved_model_node_ids = frozenset(
-        node.id for node in state.nodes if node.plugin == "llm" and _node_str_option(node, "profile") is not None
-    )
-    operator_resolved_model_node_ids = operator_resolved_model_node_ids | profile_resolved_model_node_ids
+    operator_resolved_model_node_ids = operator_resolved_model_node_ids | _profile_resolved_model_node_ids(state)
 
-    pending_sites = interpretation_sites(
+    pending_sites = pending_execution_interpretation_sites(
         state,
         operator_resolved_model_node_ids=operator_resolved_model_node_ids,
     )
