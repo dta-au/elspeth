@@ -407,10 +407,19 @@ def _validate_declared_output_types(cfg: ReferenceJoinConfig, derived: Mapping[s
     downstream as type erasure (elspeth-cd5cb844bc).
 
     ``required`` is refused rather than honored for a different reason: every
-    joined field is named in the output ``guaranteed_fields``, and
-    ``SchemaConfig.from_dict`` refuses a guarantee that is optional. Honoring
-    ``required: false`` would mint a config the authoring seam rejects, so the
-    contradiction is reported here instead of being rewritten in silence.
+    joined field is named in the output ``guaranteed_fields``, and honoring
+    ``required: false`` would build an output SchemaConfig that fails its OWN
+    ``to_dict``/``from_dict`` round-trip — ``from_dict`` refuses a guarantee
+    that is optional, and the output config is constructed directly, so nothing
+    else catches it (pinned by
+    ``test_an_optional_joined_field_would_not_survive_its_own_round_trip``).
+    The contradiction is reported here instead of being rewritten in silence.
+
+    Deriving ``required=False`` for a joined field remains open to the plugin
+    (elspeth-cd5cb844bc names it as an option under ``on_miss: null``), but it
+    would have to drop the field from ``guaranteed_fields`` in the same change.
+    This check constrains what an AUTHOR may assert against a guarantee the
+    plugin currently makes; it does not decide what that guarantee should be.
     """
     for declared in cfg.schema_config.fields or ():
         if declared.name not in derived:
@@ -486,7 +495,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:89af64c51dc15b48"
+    source_file_hash: str | None = "sha256:94e210ea3f3c3fec"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (

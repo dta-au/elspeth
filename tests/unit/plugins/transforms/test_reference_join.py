@@ -756,14 +756,36 @@ class TestAuthorDeclarationsOnJoinedFields:
         assert field.field_type == "str"
         assert field.nullable is False
 
+    def test_an_optional_joined_field_would_not_survive_its_own_round_trip(self) -> None:
+        """Why the refusal below is a contradiction and not a house rule.
+
+        The join names every output field in ``guaranteed_fields``. Honoring
+        ``required: false`` would therefore build an output config that
+        ``from_dict`` rejects — and because the output config is CONSTRUCTED
+        DIRECTLY, that rejection would not surface until something replayed it.
+        Asserted here against the real types rather than left as a claim in a
+        docstring, so the refusal's justification fails if it ever stops being
+        true.
+        """
+        from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
+
+        optional_joined = (FieldDefinition(name="d", field_type="str", required=False, nullable=False),)
+        guaranteed = ("d",)
+        built = SchemaConfig(
+            mode="flexible",
+            fields=declare_missing_guaranteed_fields(optional_joined, guaranteed),
+            guaranteed_fields=guaranteed,
+        )
+        with pytest.raises(ValueError, match="contains optional fields not guaranteed"):
+            SchemaConfig.from_dict(built.to_dict())
+
     def test_an_optional_declaration_on_a_joined_field_is_refused(self) -> None:
         """The join writes every output field on every row it emits, and names
-        them all in ``guaranteed_fields``.
+        them all in ``guaranteed_fields``, so ``required: false`` is refutable.
 
-        ``SchemaConfig.from_dict`` refuses a guaranteed field that is optional,
-        so honoring ``required: false`` here would build a config the authoring
-        seam rejects. Refusing says so instead of silently rewriting it — the
-        same doctrine the type and nullable checks follow.
+        Refusing says so instead of silently rewriting it — the same doctrine
+        the type and nullable checks follow. The contradiction it avoids is
+        pinned by the round-trip test above.
         """
         with pytest.raises(PluginConfigError) as exc:
             build(
