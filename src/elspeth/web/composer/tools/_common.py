@@ -36,6 +36,7 @@ from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.sink import FILE_SINK_PLUGINS, FILE_SINK_REPAIR_EXTENSIONS
 from elspeth.contracts.trust_boundary import observation_boundary
@@ -103,6 +104,7 @@ from elspeth.web.paths import (
     resolve_data_path,
     resolve_sink_data_path,
 )
+from elspeth.web.plugin_policy.coverage import transform_plugin_has_capability
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error, web_rag_provider_config_policy_error
 from elspeth.web.secrets.ref_policy import (
@@ -1970,7 +1972,9 @@ def _validate_transform_provider_config_policy(options: Mapping[str, Any], *, pl
     provider_policy_error = web_rag_provider_config_policy_error(options)
     if provider_policy_error is not None:
         return provider_policy_error
-    return web_llm_retry_budget_policy_error(plugin, options)
+    if transform_plugin_has_capability(plugin, PluginCapability.LLM):
+        return web_llm_retry_budget_policy_error(options)
+    return None
 
 
 def _prevalidate_plugin_options(
