@@ -1880,6 +1880,8 @@ def _backend_surface_args_for_site(
         prompt_template = options["prompt_template"] if "prompt_template" in options else None
         if type(prompt_template) is not str or not prompt_template:
             return None
+        if vague_term_wiring_count(options, user_term=site.user_term) != 1:
+            return None
         draft = ComposerServiceImpl._matching_requirement_draft(options, kind=site.kind, user_term=site.user_term)
         if draft is None:
             return None
@@ -2699,7 +2701,8 @@ class ComposerServiceImpl:
         for requirement in raw:
             if not isinstance(requirement, Mapping):
                 continue
-            if requirement.get("kind") != kind.value:
+            requirement_kind = requirement.get("kind", InterpretationKind.VAGUE_TERM.value)
+            if requirement_kind != kind.value:
                 continue
             if requirement.get("status") != "pending":
                 continue
@@ -2707,7 +2710,7 @@ class ComposerServiceImpl:
             if not isinstance(requirement_term, str) or requirement_term.strip() != user_term.strip():
                 continue
             draft = requirement.get("draft")
-            if isinstance(draft, str):
+            if isinstance(draft, str) and draft:
                 matches.append(draft)
         return matches[0] if len(matches) == 1 else None
 

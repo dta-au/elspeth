@@ -8040,7 +8040,12 @@ transforms:
         assert await service.list_interpretation_events(session.id, status="all") == []
 
     @pytest.mark.asyncio
-    async def test_post_state_yaml_rejects_unsurfaceable_pending_site_atomically(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("draft_yaml", ["null", "''"])
+    async def test_post_state_yaml_rejects_unsurfaceable_pending_site_atomically(
+        self,
+        tmp_path: Path,
+        draft_yaml: str,
+    ) -> None:
         """Every persisted pending review site must have a consumable event.
 
         A hand-written vague-term row without a draft is schema-valid enough
@@ -8050,7 +8055,7 @@ transforms:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Unsupported review import", "local")
-        yaml_text = """
+        yaml_text = f"""
 transforms:
 - name: score
   plugin: llm
@@ -8063,7 +8068,7 @@ transforms:
       kind: vague_term
       user_term: recent
       status: pending
-      draft: null
+      draft: {draft_yaml}
 """
 
         response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
@@ -8102,6 +8107,72 @@ transforms:
         assert "cannot be surfaced" in response.json()["detail"]
         assert await service.get_current_state(session.id) is None
         assert await service.list_interpretation_events(session.id, status="all") == []
+
+    @pytest.mark.asyncio
+    async def test_post_state_yaml_rejects_structured_vague_term_without_prompt_part(self, tmp_path: Path) -> None:
+        """A structured vague-term card must bind exactly one prompt part,
+        matching the writer's reviewed-content identity boundary."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app, raise_server_exceptions=False)
+        session = await service.create_session("alice", "Vague-term wiring mismatch", "local")
+        yaml_text = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    prompt_template: 'Score records from the last 30 days'
+    interpretation_requirements:
+    - id: vague:score
+      kind: vague_term
+      user_term: recent
+      status: pending
+      draft: last 30 days
+"""
+
+        response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert response.status_code == 400, response.text
+        assert "cannot be surfaced" in response.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+        assert await service.list_interpretation_events(session.id, status="all") == []
+
+    @pytest.mark.asyncio
+    async def test_post_state_yaml_accepts_wired_kindless_legacy_vague_term(self, tmp_path: Path) -> None:
+        """The canonical parser defaults an absent kind to vague_term; the
+        surfacer must not falsely reject that writer-valid legacy shape."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Legacy vague term", "local")
+        yaml_text = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score records from the last 30 days'
+    prompt_template_parts:
+    - kind: text
+      text: 'Score records from '
+    - kind: interpretation_ref
+      requirement_id: vague:score
+    interpretation_requirements:
+    - id: vague:score
+      user_term: recent
+      status: pending
+      draft: last 30 days
+"""
+
+        response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert response.status_code == 200, response.text
+        events = await service.list_interpretation_events(session.id, status="pending")
+        assert InterpretationKind.VAGUE_TERM in {event.kind for event in events}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
