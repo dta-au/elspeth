@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
+  deriveInlineSourceRowCount,
   projectInlineSourceSummary,
   useInlineSourceStore,
 } from "./inlineSourceStore";
@@ -48,6 +49,39 @@ function toProvenance(wire: BlobCreationModalityWire): InlineSourceProvenance {
   const _exhaustive: never = wire;
   throw new Error(`Unhandled modality ${String(_exhaustive)}`);
 }
+
+describe("deriveInlineSourceRowCount", () => {
+  it("counts quoted multiline CSV values as one logical record", () => {
+    expect(
+      deriveInlineSourceRowCount(
+        "text/csv",
+        'id,note\n1,"line one\nline two"\n2,plain\n',
+      ),
+    ).toBe(2);
+  });
+
+  it("keeps quoted commas and escaped quotes within their records", () => {
+    expect(
+      deriveInlineSourceRowCount(
+        "text/csv; charset=utf-8",
+        'id,note\n1,"comma, inside"\n2,"escaped ""quote"""\n',
+      ),
+    ).toBe(2);
+  });
+
+  it("returns unknown for an unterminated quoted field", () => {
+    expect(
+      deriveInlineSourceRowCount(
+        "text/csv",
+        'id,note\n1,"unfinished\nstill unfinished',
+      ),
+    ).toBeNull();
+  });
+
+  it("counts a final quoted empty record without a terminal newline", () => {
+    expect(deriveInlineSourceRowCount("text/csv", 'value\n""')).toBe(1);
+  });
+});
 
 describe("inlineSourceStore", () => {
   beforeEach(() => resetStore(useInlineSourceStore));

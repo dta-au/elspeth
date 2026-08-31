@@ -1017,15 +1017,20 @@ class RunOutputArtifactPreview(_StrictResponse):
 
     Returned by ``GET /api/runs/{rid}/outputs/{aid}/preview``. Intended
     as a head-of-file render so an operator can decide whether to pull
-    the full file via the ``/content`` endpoint. Bounded to the lesser
-    of 256 KiB or 100 rows; ``truncated`` indicates the cap was hit.
+    the full file via the ``/content`` endpoint. Bounded to 256 KiB;
+    tabular previews are additionally capped at 100 complete logical
+    records. ``truncated`` indicates either cap was hit.
 
     ``content_type`` is the renderer hint:
     * ``csv`` / ``jsonl`` — UI may render as a parsed table.
     * ``json`` — UI may pretty-print.
     * ``text`` — UI renders as monospace pre-formatted block.
-    * ``binary`` — bytes are not text (or extension is unknown);
+    * ``binary`` — bytes are not valid previewable text;
       ``preview_text`` is empty and the UI suggests downloading.
+
+    ``row_count_preview`` counts complete logical tabular records included in
+    ``preview_text``. A CSV/TSV header counts as one record. It is ``None``
+    when no trustworthy logical count is available (including malformed CSV).
     """
 
     artifact_id: str
