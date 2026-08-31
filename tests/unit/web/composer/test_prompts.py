@@ -1533,3 +1533,14 @@ class TestMutationEchoOperatingContract:
         section = SYSTEM_PROMPT.split("## Operating Contract — read first", 1)[1].split("## Skill Router", 1)[0]
 
         assert "Never call `get_pipeline_state` to confirm components named in that echo" in " ".join(section.split())
+
+    def test_review_handoff_recovery_uses_mutation_echo_before_state_read(self) -> None:
+        section = SYSTEM_PROMPT.split("If review handoff fails for a staged requirement", 1)[1].split(
+            "`interpretation_requirements` is always a JSON array", 1
+        )[0]
+        flattened = " ".join(section.split())
+
+        assert "latest successful mutation's `applied_component`" in flattened
+        assert "Only when that mutation omitted the echo or its echo does not cover the affected component" in flattened
+        assert "Read `get_pipeline_state`" not in flattened
+        assert "Read the current pipeline state" not in flattened

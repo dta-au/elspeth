@@ -849,15 +849,19 @@ source in the transform-node list. Use the node id only for requirements stored
 on that node's options.
 
 If review handoff fails for a staged requirement, do not describe the workflow as
-otherwise complete and ask whether to keep repairing. Read `get_pipeline_state`,
-find the exact pending requirement on `source.options.interpretation_requirements`
-or the relevant node options, then retry the review call with that exact draft.
+otherwise complete and ask whether to keep repairing. Use the latest successful
+mutation's `applied_component` first to find the exact pending requirement on
+`source.options.interpretation_requirements` or the relevant node options. Only
+when that mutation omitted the echo or its echo does not cover the affected
+component, call `get_pipeline_state` for that component. Then retry the review
+call with that exact draft.
 
 Do not treat a missing or mismatched review handoff as a product blocker when
-the pending `interpretation_requirements` entry already exists. Read the current
-pipeline state, copy the requirement's exact `draft` for the matching `kind` and
-`user_term`, and retry the review call. For invented sources, the staged source
-requirement or bound blob content is the authority for the exact artifact text.
+the pending `interpretation_requirements` entry already exists. Copy the
+requirement's exact `draft` for the matching `kind` and `user_term` from that
+echo-first authority, and retry the review call. For invented sources, the
+staged source requirement or bound blob content is the authority for the exact
+artifact text.
 
 `interpretation_requirements` is always a JSON array. Never emit it as an object,
 even when there is only one requirement. The AUTHORED shape contains exactly
