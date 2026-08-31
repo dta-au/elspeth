@@ -15,7 +15,6 @@ the explain-tool pointer when some entry resolved to nothing.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -74,11 +73,16 @@ def execute_tool(
     )
 
 
-def _sourceless_set_pipeline(catalog: CatalogService) -> dict[str, Any]:
-    """The live 891b7b1e turn-2 shape: an explicit ``source: null`` rebuild."""
+def _unknown_source_plugin_set_pipeline(catalog: CatalogService) -> dict[str, Any]:
+    """Submit a schema-valid rebuild whose source plugin is unavailable."""
     result = execute_tool(
         "set_pipeline",
-        {"source": None, "nodes": [], "edges": [], "outputs": []},
+        {
+            "source": {"plugin": "definitely_not_a_plugin", "on_success": "rows"},
+            "nodes": [],
+            "edges": [],
+            "outputs": [],
+        },
         _empty_state(),
         catalog,
     )
@@ -88,13 +92,13 @@ def _sourceless_set_pipeline(catalog: CatalogService) -> dict[str, Any]:
 
 
 class TestFreeformRejectionCarriesCataloguedRepairText:
-    def test_sourceless_set_pipeline_carries_the_catalogued_fix(self) -> None:
+    def test_unknown_source_plugin_set_pipeline_carries_the_catalogued_fix(self) -> None:
         """The production symptom: the rejection now ships its own repair text."""
-        payload = _sourceless_set_pipeline(_mock_catalog())
+        payload = _unknown_source_plugin_set_pipeline(_mock_catalog())
 
-        assert [entry.get("error_code") for entry in payload["validation"]["errors"]] == ["no_source_configured"]
-        guidance = payload["validation_guidance"]["codes"]["no_source_configured"]
-        explanation, suggested_fix = explain_validation_code("no_source_configured")
+        assert [entry.get("error_code") for entry in payload["validation"]["errors"]] == ["plugin_not_installed"]
+        guidance = payload["validation_guidance"]["codes"]["plugin_not_installed"]
+        explanation, suggested_fix = explain_validation_code("plugin_not_installed")
         assert guidance == {"explanation": explanation, "suggested_fix": suggested_fix}
 
     def test_a_fully_enriched_rejection_does_not_advertise_the_explain_tool(self) -> None:
@@ -103,7 +107,7 @@ class TestFreeformRejectionCarriesCataloguedRepairText:
         Advertising it there costs a provider turn to re-read guidance already
         in the context (elspeth-41b406c9fc).
         """
-        payload = _sourceless_set_pipeline(_mock_catalog())
+        payload = _unknown_source_plugin_set_pipeline(_mock_catalog())
 
         assert "explain_tool" not in payload["validation_guidance"]
 
@@ -190,8 +194,12 @@ class TestValidationGuidanceCustody:
         the ``_SafeResponseEnvelope`` declaration this fails, and the
         redaction snapshot's ``sensitive_path_count`` drops with it.
         """
-        payload = _sourceless_set_pipeline(_mock_catalog())
-        assert "no source" in json.dumps(payload["validation_guidance"]).lower()
+        payload = _unknown_source_plugin_set_pipeline(_mock_catalog())
+        explanation, suggested_fix = explain_validation_code("plugin_not_installed")
+        assert payload["validation_guidance"]["codes"]["plugin_not_installed"] == {
+            "explanation": explanation,
+            "suggested_fix": suggested_fix,
+        }
 
         persisted = redact_tool_call_response("set_pipeline", payload, telemetry=MagicMock())
 
