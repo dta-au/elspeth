@@ -7,9 +7,10 @@ processing.
 
 THREE-TIER TRUST MODEL COMPLIANCE:
 
-Per the plugin protocol, transforms trust that pipeline field types are correct:
-- Sources and earlier transforms validate required fields and their declared types
-- A non-string source field is an upstream validation bug and should crash
+Per the plugin protocol, transforms distinguish contract violations from bad row data:
+- A missing source field is an upstream contract violation and raises ``KeyError``
+- A non-string source value is returned as a non-retryable row error so the
+  executor can apply the configured ``on_error`` route without coercing data
 - Empty strings are valid string values but cannot be deaggregated into rows, so
   they are returned as non-retryable data errors
 """
@@ -221,8 +222,9 @@ def _build_line_explode_output_semantics(
     one and leaving ``TextSink``'s requirement satisfied by nothing in the
     registry.
 
-    ``value_type=STR``: ``process`` rejects a non-``str`` source with TypeError,
-    and a slice of a ``str`` is a ``str``.
+    ``value_type=STR``: ``process`` returns an error for a non-``str`` source,
+    while every successful output is a slice of a ``str`` and therefore a
+    ``str``.
 
     ``content_kind=UNKNOWN`` is an honest ABSTENTION, not an omission.
     Splitting changes where the line boundaries are, never what the text MEANS,
@@ -296,7 +298,7 @@ class LineExplode(BaseTransform):
     name = "line_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1affe90c77cd763a"
+    source_file_hash: str | None = "sha256:a24ef64211aa0d1f"
     config_model = LineExplodeConfig
     usage_when_to_use: str = (
         "Use to split one newline-framed text field into rows while preserving the rest of the input "

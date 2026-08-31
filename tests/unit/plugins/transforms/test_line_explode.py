@@ -403,7 +403,7 @@ class TestLineExplodeOutputSemantics:
 
     def test_line_explode_into_json_explode_is_now_a_hard_conflict(self):
         """The second NEW block, also correct: a text line is not a list, and
-        json_explode raises TypeError on a str rather than parsing it."""
+        json_explode returns a non-retryable error on a str rather than parsing it."""
         from elspeth.contracts.plugin_semantics import SemanticOutcome
         from elspeth.plugins.transforms.json_explode import _build_json_explode_input_requirements
 
