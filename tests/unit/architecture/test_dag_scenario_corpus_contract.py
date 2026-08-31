@@ -5845,10 +5845,8 @@ def test_manifest_gap_ownership_and_not_applicable_reasons_follow_the_approved_r
                 expected_owner = "elspeth-7cdc4da434"
             elif scenario.id == "retry-quarantine-discard-routed-errors" and dimension == "contracts":
                 expected_owner = "elspeth-67b44040ee"
-            elif scenario.id == "retry-quarantine-discard-routed-errors" and dimension == "runtime":
+            elif scenario.id == "retry-quarantine-discard-routed-errors" and dimension in {"runtime", "audit"}:
                 expected_owner = "elspeth-6f6bbbec00"
-            elif scenario.id == "retry-quarantine-discard-routed-errors" and dimension == "audit":
-                expected_owner = "elspeth-2e66723070"
             elif scenario.id == "checkpoint-deterministic-resume" and dimension == "contracts":
                 expected_owner = "elspeth-f321e3ff21"
             elif scenario.id == "checkpoint-deterministic-resume" and dimension == "recovery":

@@ -4302,9 +4302,9 @@ scenarios:
           - harness-retry-quarantine-discard-routed-errors-transform-discard
           - harness-retry-quarantine-discard-routed-errors-transform-error-route
           - b3-stateful-runtime-exact-contracts
-        reason: Exact leader-path runtime cases pass, but authoritative scheduler disposition and follower drain execution remain open under elspeth-2e66723070 and elspeth-6f6bbbec00.
+        reason: Exact leader-path runtime cases and authoritative scheduler-disposition proofs pass, but follower drain execution remains open under elspeth-6f6bbbec00.
         owner_issue: elspeth-6f6bbbec00
-        exit_gate: Both authoritative scheduler-disposition and follower-drain issues integrate, then these exact corpus cases pass unchanged.
+        exit_gate: The follower-drain issue integrates, then these exact corpus cases pass unchanged.
       audit:
         status: partial
         evidence:
@@ -4315,9 +4315,9 @@ scenarios:
           - harness-retry-quarantine-discard-routed-errors-transform-discard
           - harness-retry-quarantine-discard-routed-errors-transform-error-route
           - b3-stateful-runtime-exact-contracts
-        reason: Exact durable leader-path evidence passes, but authoritative scheduler disposition and follower drain audit proof remain open under elspeth-2e66723070 and elspeth-6f6bbbec00.
-        owner_issue: elspeth-2e66723070
-        exit_gate: Both authoritative scheduler-disposition and follower-drain issues integrate, then durable and portable exact corpus evidence passes unchanged.
+        reason: Exact durable leader-path evidence and authoritative scheduler-disposition proofs pass, but follower drain audit proof remains open under elspeth-6f6bbbec00.
+        owner_issue: elspeth-6f6bbbec00
+        exit_gate: The follower-drain issue integrates, then durable and portable exact corpus evidence passes unchanged.
       recovery:
         status: pass
         evidence: [harness-retry-quarantine-discard-routed-errors-retry-success-reopen-resume]
