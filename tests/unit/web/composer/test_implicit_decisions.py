@@ -229,11 +229,14 @@ def test_llm_source_non_model_options_and_routing_keep_source_contract() -> None
     }
     assert by_path["source.response_field"]["category"] == "source"
     assert by_path["source.schema.mode"]["category"] == "source"
+    # "discard" is the tool layer's default-fill, so the disclosure must say
+    # "default", not claim the planner picked it (elspeth-0aace271b4 I1,
+    # elspeth-f324fd1a6e).
     assert by_path["source.on_validation_failure"] == {
         "path": "source.on_validation_failure",
         "value": "discard",
         "category": "error_routing",
-        "provenance": "picked",
+        "provenance": "default",
         "candidate_alternatives": ["discard", "named_sink"],
     }
 

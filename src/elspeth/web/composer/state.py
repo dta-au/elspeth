@@ -8355,12 +8355,25 @@ class CompositionState:
         suggestions: list[ValidationEntry] = []
         _sug = ValidationEntry
 
-        # S1: No error routing
+        # S1: No retaining error routing. "discard" does not count as error
+        # routing here (elspeth-0aace271b4 I5): the composer tool layer
+        # default-fills on_error="discard", so counting it made this advisory
+        # permanently unreachable, and discard silently drops failed rows in a
+        # system whose purpose is lineage. The wording is a pipeline-level
+        # nudge, deliberately neutral about which node should change
+        # (control-covered llm nodes may legitimately have to keep "discard" —
+        # elspeth-184d9c9686).
         has_gate = any(n.node_type == "gate" for n in self.nodes)
-        has_error_routing = any(e.edge_type == "on_error" for e in self.edges) or any(n.on_error is not None for n in self.nodes)
-        if not has_gate and not has_error_routing and self.nodes:
+        has_retaining_error_routing = any(e.edge_type == "on_error" for e in self.edges) or any(
+            n.on_error is not None and n.on_error != "discard" for n in self.nodes
+        )
+        if not has_gate and not has_retaining_error_routing and self.nodes:
             suggestions.append(
-                _sug("pipeline", "Consider adding error routing — rows that fail transforms currently have no explicit destination.", "low")
+                _sug(
+                    "pipeline",
+                    "Consider adding error routing to a retention output — failed rows are currently discarded rather than kept for review.",
+                    "low",
+                )
             )
 
         # S2: Single output to external sink — suggest a local fallback
