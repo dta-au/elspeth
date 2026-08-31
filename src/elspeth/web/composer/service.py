@@ -228,6 +228,7 @@ from elspeth.web.interpretation_state import (
     pending_execution_interpretation_sites,
     source_name_from_component_id,
     vague_term_wiring_count,
+    validate_pipeline_decision_node_semantics,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
@@ -1718,36 +1719,23 @@ async def _auto_surface_prompt_template_reviews_for_state(
     for site in interpretation_sites(state):
         if site.kind is not InterpretationKind.LLM_PROMPT_TEMPLATE:
             continue
-        node = next((candidate for candidate in state.nodes if candidate.id == site.component_id), None)
-        if node is None:
+        surfaced = _backend_surface_args_for_site(state, site)
+        if surfaced is None:
             continue
-        options = node.options
-        prompt_template = options["prompt_template"]
-        if type(prompt_template) is not str or not prompt_template:
-            raise InvariantError(
-                "_auto_surface_prompt_template_reviews: prompt-template interpretation site lost its non-empty prompt_template"
-            )
+        affected_node_id, user_term, prompt_template = surfaced
+        if (affected_node_id, user_term, InterpretationKind.LLM_PROMPT_TEMPLATE) in already_surfaced:
+            continue
         # The transactional writer owns kind-specific reviewed-content
         # identity. Calling it for every candidate preserves idempotence across
         # unrelated state versions while allowing same-text skeleton changes to
         # supersede stale cards.
-        # The create_pending gate (sessions/service.py) REQUIRES exactly one
-        # pending PT requirement on the node for this user_term. Surface only
-        # where that precondition holds — otherwise create_pending would raise
-        # and crash the compose loop. A prompt_template node with no pending PT
-        # requirement is the requirement-None enumerator branch
-        # (_missing_prompt_template_review_sites) and is left to the orphan gate.
-        if not ComposerServiceImpl._has_pending_prompt_template_requirement(options, user_term=site.user_term):
-            continue
-        if (site.component_id, site.user_term, InterpretationKind.LLM_PROMPT_TEMPLATE) in already_surfaced:
-            continue
         try:
             await sessions_service.create_pending_interpretation_event(
                 session_id=UUID(session_id),
                 composition_state_id=UUID(current_state_id),
-                affected_node_id=site.component_id,
+                affected_node_id=affected_node_id,
                 tool_call_id=f"{BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}{uuid4()}",  # (D1)
-                user_term=site.user_term,
+                user_term=user_term,
                 kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
                 llm_draft=prompt_template,
                 model_identifier=model_identifier,  # (D2)
@@ -1823,6 +1811,17 @@ def _backend_surface_args_for_site(
     if node is None:
         return None
     options = node.options
+    if site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+        prompt_template = options["prompt_template"] if "prompt_template" in options else None
+        if type(prompt_template) is not str or not prompt_template:
+            raise InvariantError(
+                "_auto_surface_prompt_template_reviews: prompt-template interpretation site lost its non-empty prompt_template"
+            )
+        # The writer requires exactly one matching pending requirement. A
+        # requirement-free legacy site cannot become a resolvable card.
+        if not ComposerServiceImpl._has_pending_prompt_template_requirement(options, user_term=site.user_term):
+            return None
+        return (node.id, site.user_term, prompt_template)
     if site.kind is InterpretationKind.LLM_MODEL_CHOICE:
         model = options["model"] if "model" in options else None
         if type(model) is not str or not model:
@@ -1847,6 +1846,16 @@ def _backend_surface_args_for_site(
         draft = ComposerServiceImpl._matching_requirement_draft(options, kind=site.kind, user_term=site.user_term)
         if draft is None:
             return None
+        try:
+            validate_pipeline_decision_node_semantics(
+                node=node,
+                all_nodes=state.nodes,
+                user_term=site.user_term,
+                draft=draft,
+                context="backend interpretation-review surfacer",
+            )
+        except ValueError:
+            return None
         return (node.id, site.user_term, draft)
     if site.kind is InterpretationKind.VAGUE_TERM:
         # Only authored/staged vague-term requirements are surfaced.
@@ -1856,7 +1865,20 @@ def _backend_surface_args_for_site(
         if draft is None:
             return None
         return (node.id, site.user_term, draft)
-    return None
+
+
+def unsurfaceable_pending_interpretation_review_sites(
+    state: CompositionState,
+) -> tuple[InterpretationReviewSite, ...]:
+    """Return execution-blocking review sites the backend cannot eventize.
+
+    This is the pure pre-persistence view of the same site-to-writer argument
+    authority used by :func:`surface_pending_interpretation_reviews_for_state`.
+    Paste/import routes use it to reject atomically instead of committing a
+    state whose fail-closed execution debt has no consumable review card.
+    """
+
+    return tuple(site for site in interpretation_sites(state) if _backend_surface_args_for_site(state, site) is None)
 
 
 async def surface_pending_interpretation_reviews_for_state(

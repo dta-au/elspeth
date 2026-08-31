@@ -7661,6 +7661,180 @@ sinks:
         assert mc.user_term == "llm_model_choice:score"
 
     @pytest.mark.asyncio
+    async def test_post_state_yaml_surfaces_source_data_contract_review(self, tmp_path: Path) -> None:
+        """A YAML-bound uploaded source uses the same source-site surfacer as
+        Composer settlement, so its derived contract debt is visible and
+        resolvable instead of blocking execution behind an empty card list."""
+        from elspeth.web.composer.source_demand import build_source_data_contract_draft
+        from elspeth.web.interpretation_state import InterpretationReviewPending, materialize_state_for_execution
+        from elspeth.web.sessions.routes._helpers import _state_from_record
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Source contract import", "local")
+        blob_id = uuid.uuid4()
+        blob_path = tmp_path / "blobs" / str(session.id) / f"{blob_id}_input.csv"
+        blob_path.parent.mkdir(parents=True)
+        blob_path.write_text("colour,extra\nred,1\n", encoding="utf-8")
+        app.state.blob_service = MagicMock(spec=BlobServiceProtocol)
+        app.state.blob_service.get_blob.return_value = SimpleNamespace(
+            id=blob_id,
+            session_id=session.id,
+            storage_path=str(blob_path),
+        )
+        yaml_text = """
+sources:
+  source:
+    plugin: csv
+    on_success: source
+    options:
+      path: /old/blob.csv
+      schema:
+        mode: observed
+transforms:
+- name: consumer
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    required_input_fields: [colour]
+sinks:
+  main:
+    plugin: csv
+    options:
+      path: outputs/out.csv
+    on_write_failure: discard
+"""
+
+        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+            return ValidationResult(is_valid=True, checks=[], errors=[])
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
+            response = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={"yaml": yaml_text, "source_blob_ids": {"source": str(blob_id)}},
+            )
+
+        assert response.status_code == 200, response.text
+        record = await service.get_current_state(session.id)
+        assert record is not None
+        blocked = materialize_state_for_execution(_state_from_record(record))
+        assert isinstance(blocked, InterpretationReviewPending)
+        assert [(site.component_id, site.kind) for site in blocked.sites] == [("source", InterpretationKind.SOURCE_DATA_CONTRACT)]
+
+        events = await service.list_interpretation_events(session.id, status="pending")
+        assert [(event.affected_node_id, event.kind) for event in events] == [("source", InterpretationKind.SOURCE_DATA_CONTRACT)]
+        event = events[0]
+        assert event.llm_draft == build_source_data_contract_draft(["colour"], ("colour", "extra"))
+        assert event.model_identifier == "yaml_import"
+
+        resolved = client.post(
+            f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
+            json={"choice": "accepted_as_drafted"},
+        )
+        assert resolved.status_code == 200, resolved.text
+        current = await service.get_current_state(session.id)
+        assert current is not None
+        assert not isinstance(materialize_state_for_execution(_state_from_record(current)), InterpretationReviewPending)
+
+    @pytest.mark.asyncio
+    async def test_post_state_yaml_mixed_review_order_matches_generic_surfacer(self, tmp_path: Path) -> None:
+        """Source and node review cards retain the generic surfacer's stable
+        ordering rather than a YAML-route-specific node-only projection."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Mixed review import", "local")
+        blob_id = uuid.uuid4()
+        blob_path = tmp_path / "blobs" / str(session.id) / f"{blob_id}_input.csv"
+        blob_path.parent.mkdir(parents=True)
+        blob_path.write_text("colour,extra\nred,1\n", encoding="utf-8")
+        app.state.blob_service = MagicMock(spec=BlobServiceProtocol)
+        app.state.blob_service.get_blob.return_value = SimpleNamespace(
+            id=blob_id,
+            session_id=session.id,
+            storage_path=str(blob_path),
+        )
+        yaml_text = """
+sources:
+  source:
+    plugin: csv
+    on_success: source
+    options:
+      path: /old/blob.csv
+      schema:
+        mode: observed
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score this: {{ row.colour }}'
+    required_input_fields: [colour]
+sinks:
+  main:
+    plugin: csv
+    options:
+      path: outputs/out.csv
+    on_write_failure: discard
+"""
+
+        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+            return ValidationResult(is_valid=True, checks=[], errors=[])
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
+            response = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={"yaml": yaml_text, "source_blob_ids": {"source": str(blob_id)}},
+            )
+
+        assert response.status_code == 200, response.text
+        events = await service.list_interpretation_events(session.id, status="pending")
+        assert [(event.affected_node_id, event.kind) for event in events] == [
+            ("score", InterpretationKind.LLM_PROMPT_TEMPLATE),
+            ("source", InterpretationKind.SOURCE_DATA_CONTRACT),
+            ("score", InterpretationKind.LLM_MODEL_CHOICE),
+        ]
+        assert all(event.model_identifier == "yaml_import" for event in events)
+
+    @pytest.mark.asyncio
+    async def test_post_state_yaml_rejects_unsurfaceable_pending_site_atomically(self, tmp_path: Path) -> None:
+        """Every persisted pending review site must have a consumable event.
+
+        A hand-written vague-term row without a draft is schema-valid enough
+        to block execution but cannot pass the event writer boundary. Reject
+        the whole import before writing either state or event rows.
+        """
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Unsupported review import", "local")
+        yaml_text = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    interpretation_requirements:
+    - id: vague:score
+      kind: vague_term
+      user_term: recent
+      status: pending
+      draft: null
+"""
+
+        response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert response.status_code == 400, response.text
+        assert "cannot be surfaced" in response.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+        assert await service.list_interpretation_events(session.id, status="all") == []
+
+    @pytest.mark.asyncio
     async def test_post_state_yaml_rejects_malformed_interpretation_requirements(self, tmp_path) -> None:
         """Hand-written interpretation_requirements rows the schema would
         refuse are rejected 400 before persistence (elspeth-ae5160c3cb)."""
