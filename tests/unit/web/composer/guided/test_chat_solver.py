@@ -1149,6 +1149,179 @@ async def test_step_1_shape_rejected_resolve_source_is_repaired_within_one_tool_
 
 
 @pytest.mark.asyncio
+async def test_step_1_source_repair_preserves_grouped_retains_when_only_source_is_resent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Correcting only the rejected source must keep its valid retain siblings."""
+    calls_seen = 0
+
+    async def repairing_only_source(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            source_arguments = {name: value for name, value in _PAIR_SOURCE_ARGUMENTS.items() if name != "plugin"}
+            calls = [
+                SimpleNamespace(
+                    id="c_source_rejected",
+                    function=SimpleNamespace(name="resolve_source", arguments=json.dumps(source_arguments)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_1",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_2",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+                ),
+            ]
+        else:
+            calls = [
+                SimpleNamespace(
+                    id="c_source_corrected",
+                    function=SimpleNamespace(name="resolve_source", arguments=json.dumps(_PAIR_SOURCE_ARGUMENTS)),
+                )
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_only_source)
+    outcome = await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="Use these rows, then retain two topology requirements.",
+        plugin_hint=None,
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
+    assert outcome.resolution.plugin == "json"
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert calls_seen == 2
+
+
+@pytest.mark.asyncio
+async def test_step_2_sink_repair_preserves_grouped_retains_when_only_sink_is_resent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The step-2 repair boundary keeps the same valid-sibling custody."""
+    calls_seen = 0
+
+    async def repairing_only_sink(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            sink_arguments = dict(_PAIR_SINK_ARGUMENTS)
+            sink_arguments["output"] = {name: value for name, value in _PAIR_SINK_ARGUMENTS["output"].items() if name != "plugin"}
+            calls = [
+                SimpleNamespace(
+                    id="c_sink_rejected",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(sink_arguments)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_1",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_2",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+                ),
+            ]
+        else:
+            calls = [
+                SimpleNamespace(
+                    id="c_sink_corrected",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_SINK_ARGUMENTS)),
+                )
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_only_sink)
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save the rows, then retain two topology requirements.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+    assert outcome.sink.outputs[0].plugin == "json"
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert calls_seen == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+async def test_resolution_repair_prose_reply_returns_pending_retains_with_withheld_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    """A repair-round prose decline cannot silently discard valid siblings."""
+    calls_seen = 0
+
+    async def declining_repair(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 2:
+            return _ok_response("I need more information before I can correct that selection.")
+        if stage == "source":
+            resolution_arguments = {name: value for name, value in _PAIR_SOURCE_ARGUMENTS.items() if name != "plugin"}
+            resolution_call = SimpleNamespace(
+                id="c_source_rejected",
+                function=SimpleNamespace(name="resolve_source", arguments=json.dumps(resolution_arguments)),
+            )
+        else:
+            resolution_arguments = dict(_PAIR_SINK_ARGUMENTS)
+            resolution_arguments["output"] = {name: value for name, value in _PAIR_SINK_ARGUMENTS["output"].items() if name != "plugin"}
+            resolution_call = SimpleNamespace(
+                id="c_sink_rejected",
+                function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(resolution_arguments)),
+            )
+        calls = [
+            resolution_call,
+            SimpleNamespace(
+                id="c_retain_1",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+            SimpleNamespace(
+                id="c_retain_2",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", declining_repair)
+    if stage == "source":
+        outcome = await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Use the rows, then retain two topology requirements.",
+            plugin_hint=None,
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+    else:
+        outcome = await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Save the rows, then retain two topology requirements.",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert outcome.resolution_error_class == "PairedResolutionNotResent"
+    assert calls_seen == 2
+
+
+@pytest.mark.asyncio
 async def test_step_1_shape_repair_is_bounded_by_max_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
     """Both attempts malformed: exactly two calls, then today's rejection propagates."""
     calls: list[dict[str, Any]] = []
@@ -1634,6 +1807,67 @@ async def test_step_1_group_with_one_malformed_retain_is_repaired_answering_ever
     assert {message["tool_call_id"] for message in tool_results} == {"c_source", "c_retain_1", "c_retain_2"}
     rejected = [message for message in tool_results if message["tool_call_id"] == "c_retain_2"]
     assert "rejected" in rejected[0]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("malformed_first", [False, True])
+@pytest.mark.parametrize("resend_full_group", [False, True])
+async def test_deferred_repair_preserves_valid_siblings_exactly_once_in_call_order(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    malformed_first: bool,
+    resend_full_group: bool,
+) -> None:
+    """Targeted and complete repairs preserve the original group exactly once."""
+    calls_seen = 0
+
+    async def repairing_only_rejected(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            valid_call = SimpleNamespace(
+                id="c_retain_valid",
+                function=SimpleNamespace(
+                    name="retain_deferred_intent",
+                    arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS if malformed_first else _VALID_DEFERRED_ARGUMENTS),
+                ),
+            )
+            rejected_call = SimpleNamespace(
+                id="c_retain_rejected",
+                function=SimpleNamespace(
+                    name="retain_deferred_intent",
+                    arguments=json.dumps({"target_stage": "topology"}),
+                ),
+            )
+            calls = [rejected_call, valid_call] if malformed_first else [valid_call, rejected_call]
+        else:
+            corrected_call = SimpleNamespace(
+                id="c_retain_corrected",
+                function=SimpleNamespace(
+                    name="retain_deferred_intent",
+                    arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS if malformed_first else _SECOND_DEFERRED_ARGUMENTS),
+                ),
+            )
+            resent_valid_call = SimpleNamespace(
+                id="c_retain_valid_resent",
+                function=SimpleNamespace(
+                    name="retain_deferred_intent",
+                    arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS if malformed_first else _VALID_DEFERRED_ARGUMENTS),
+                ),
+            )
+            if resend_full_group:
+                calls = [corrected_call, resent_valid_call] if malformed_first else [resent_valid_call, corrected_call]
+            else:
+                calls = [corrected_call]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_only_rejected)
+    outcome = await _run_stage_solver(stage)
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert calls_seen == 2
 
 
 @pytest.mark.asyncio

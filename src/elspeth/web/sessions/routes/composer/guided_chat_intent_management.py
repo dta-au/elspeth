@@ -757,12 +757,12 @@ def apply_deferred_request(
     chat: StepChatResult,
 ) -> DeferredRequestApplication:
     if deferred_actions:
-        if len(authority.new_intent_ids) < len(deferred_actions):
-            raise AuditIntegrityError("deferred request authority minted fewer intent ids than actions")
+        if len(authority.new_intent_ids) != len(deferred_actions):
+            raise AuditIntegrityError("deferred request authority must mint exactly as many intent ids as actions")
         guided = authority.guided
         disposition_chats: list[StepChatResult] = []
         retained_intent_ids: list[UUID] = []
-        for action, intent_id in zip(deferred_actions, authority.new_intent_ids, strict=False):
+        for action, intent_id in zip(deferred_actions, authority.new_intent_ids, strict=True):
             guided, action_chat, appended_id = _apply_one_deferred_action(
                 action,
                 guided=guided,
