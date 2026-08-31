@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 from botocore.exceptions import ClientError
+from structlog.testing import capture_logs
 from tests.unit.plugins.transforms.aws.test_guardrails_client import (
     CONTENT_FILTERS,
     FakeExecution,
@@ -38,6 +39,16 @@ class _SequencedSDK:
         self.close_count += 1
         if self._close_error is not None:
             raise self._close_error
+
+
+def _provider_close_error(marker: str = "PRIVATE_CLOSE_ERROR_MARKER") -> ClientError:
+    return ClientError(
+        {
+            "Error": {"Code": "InternalServerException", "Message": marker},
+            "ResponseMetadata": {"RetryAttempts": 0},
+        },
+        "Close",
+    )
 
 
 def _profile(plugin: str = "aws_bedrock_prompt_shield") -> BedrockGuardrailProfileSettings:
@@ -213,29 +224,59 @@ def test_live_check_does_not_close_borrowed_sdk_client() -> None:
     assert sdk.close_count == 0
 
 
-def test_owned_sdk_close_failure_does_not_replace_success_receipt(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_owned_sdk_provider_close_failure_does_not_replace_success_receipt(monkeypatch: pytest.MonkeyPatch) -> None:
     sdk = _SequencedSDK(
         response(),
         response(detected="PROMPT_ATTACK"),
-        close_error=RuntimeError("PRIVATE_CLOSE_ERROR_MARKER"),
+        close_error=_provider_close_error(),
+    )
+    monkeypatch.setattr(
+        "elspeth.plugins.transforms.aws.guardrails_client.build_bedrock_runtime_client",
+        lambda _region: sdk,
+    )
+    with capture_logs() as logs:
+        receipt = run_guardrail_live_check(
+            profile=_profile(),
+            safe_text="safe",
+            blocked_text="blocked",
+            execution=FakeExecution(),
+            state_id="state-1",
+            run_id="run-1",
+            telemetry_emit=lambda _event: None,
+        )
+
+    assert receipt.safe_case_passed is True
+    assert receipt.attack_case_blocked is True
+    assert sdk.close_count == 1
+    (close_log,) = [entry for entry in logs if entry["event"] == "guardrail_sdk_client_close_failed"]
+    assert close_log["error_type"] == "ClientError"
+    assert "PRIVATE_CLOSE_ERROR_MARKER" not in repr(close_log)
+
+
+def test_owned_sdk_close_bug_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the declared botocore surface is a provider close failure; an
+    ordinary exception from close() is a first-party bug and crashes."""
+    sdk = _SequencedSDK(
+        response(),
+        response(detected="PROMPT_ATTACK"),
+        close_error=RuntimeError("close bug"),
     )
     monkeypatch.setattr(
         "elspeth.plugins.transforms.aws.guardrails_client.build_bedrock_runtime_client",
         lambda _region: sdk,
     )
 
-    receipt = run_guardrail_live_check(
-        profile=_profile(),
-        safe_text="safe",
-        blocked_text="blocked",
-        execution=FakeExecution(),
-        state_id="state-1",
-        run_id="run-1",
-        telemetry_emit=lambda _event: None,
-    )
+    with pytest.raises(RuntimeError, match="close bug"):
+        run_guardrail_live_check(
+            profile=_profile(),
+            safe_text="safe",
+            blocked_text="blocked",
+            execution=FakeExecution(),
+            state_id="state-1",
+            run_id="run-1",
+            telemetry_emit=lambda _event: None,
+        )
 
-    assert receipt.safe_case_passed is True
-    assert receipt.attack_case_blocked is True
     assert sdk.close_count == 1
 
 
@@ -249,7 +290,7 @@ def test_owned_sdk_close_failure_does_not_replace_sanitized_provider_error(monke
         },
         "ApplyGuardrail",
     )
-    sdk = _SequencedSDK(failure, close_error=RuntimeError(close_marker))
+    sdk = _SequencedSDK(failure, close_error=_provider_close_error(close_marker))
     monkeypatch.setattr(
         "elspeth.plugins.transforms.aws.guardrails_client.build_bedrock_runtime_client",
         lambda _region: sdk,

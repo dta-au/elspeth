@@ -516,7 +516,7 @@ class SinkEffectCoordinator:
         heartbeat = _SinkEffectLeaseHeartbeat(effects=self._effects, claim=lease, ttl=self._lease_ttl)
         heartbeat.start()
         try:
-            return self._execute_effect_under_lease(
+            result = self._execute_effect_under_lease(
                 effect=effect,
                 request=request,
                 sink=sink,
@@ -527,6 +527,12 @@ class SinkEffectCoordinator:
             )
         finally:
             heartbeat.stop()
+        # A heartbeat failure captured after the last in-flight
+        # refresh_and_check would otherwise ride out inside the stopped
+        # thread: authority was in doubt during the window, so the outcome
+        # must not be reported as a clean success.
+        heartbeat.check_and_raise()
+        return result
 
     def _execute_effect_under_lease(
         self,

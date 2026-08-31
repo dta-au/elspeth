@@ -8,7 +8,6 @@ from dataclasses import dataclass
 
 import structlog
 
-import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.audit_protocols import CallRecorder
 from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
@@ -20,6 +19,7 @@ from elspeth.plugins.transforms.aws.guardrails_client import (
     GuardrailResponseError,
     GuardrailServiceError,
     GuardrailSource,
+    _bedrock_provider_exception_types,
 )
 
 logger = structlog.get_logger(__name__)
@@ -114,16 +114,15 @@ def run_guardrail_live_check(
         if owns_sdk_client and client is not None:
             try:
                 client.sdk_client.close()
-            except contract_errors.TIER_1_ERRORS:
-                raise
-            except (TypeError, AttributeError, KeyError, NameError):
-                raise  # Programming errors must crash, even during teardown
-            except Exception as close_error:
-                # Provider-defined close failure on a client we own: recorded
-                # here rather than silently discarded, and never allowed to
-                # replace the live-check verdict already decided above.
+            except _bedrock_provider_exception_types() as close_error:
+                # Declared botocore close failure on a client we own, after
+                # the live-check verdict is already decided: acknowledged with
+                # a bounded warning (type only — provider errors may wrap
+                # payloads) and never allowed to replace that verdict. This
+                # site has no row or operation parent for a telemetry event.
+                # Anything outside the declared botocore surface is a bug and
+                # propagates.
                 logger.warning(
                     "guardrail_sdk_client_close_failed",
-                    error=str(close_error),
                     error_type=type(close_error).__name__,
                 )

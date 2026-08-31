@@ -1000,3 +1000,49 @@ def test_concurrent_expired_takeover_loser_waits_for_single_reclaim_publication(
         for worker in workers:
             worker.join(timeout=5)
         db.close()
+
+
+def test_heartbeat_failure_after_last_inflight_check_fails_the_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A heartbeat failure captured after the final refresh_and_check must
+    surface from execute(), never ride out inside the stopped thread as a
+    clean success: authority was in doubt during the finalize window."""
+    from elspeth.engine.executors import sink_effects as sink_effects_module
+    from tests.fixtures.landscape import make_factory, make_landscape_db
+
+    db = make_landscape_db()
+    factory = make_factory(db)
+    run_id, sink_id, members = _pipeline_members(factory, 1)
+    request = _execution_request(run_id, sink_id, members)
+    target = DuplicateObservableTarget()
+    sink = DuplicateObservableSink(target)
+
+    heartbeats: list[sink_effects_module._SinkEffectLeaseHeartbeat] = []
+    original_init = sink_effects_module._SinkEffectLeaseHeartbeat.__init__
+
+    def recording_init(self: sink_effects_module._SinkEffectLeaseHeartbeat, **kwargs: object) -> None:
+        original_init(self, **kwargs)  # type: ignore[arg-type]
+        heartbeats.append(self)
+
+    monkeypatch.setattr(sink_effects_module._SinkEffectLeaseHeartbeat, "__init__", recording_init)
+
+    def store_late_heartbeat_failure(seam: SinkEffectExecutionSeam) -> None:
+        # AFTER_FINALIZE_BEFORE_RESPONSE is past the last foreground
+        # refresh_and_check: simulate the background thread capturing a
+        # failure in exactly that window.
+        if seam is SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE and heartbeats:
+            execution_heartbeat = heartbeats[-1]
+            execution_heartbeat._error = LandscapeRecordError("execution lease heartbeat lost authority")
+            execution_heartbeat._failed_event.set()
+
+    try:
+        with pytest.raises(LandscapeRecordError, match="execution lease heartbeat lost authority"):
+            SinkEffectCoordinator(
+                factory=factory,
+                worker_id="late-heartbeat-holder",
+                lease_ttl=timedelta(seconds=30),
+                fault_hook=store_late_heartbeat_failure,
+            ).execute(request, sink)
+    finally:
+        db.close()

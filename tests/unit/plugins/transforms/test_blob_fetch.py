@@ -245,6 +245,75 @@ def test_blob_fetch_rejects_unapproved_content_type(monkeypatch: pytest.MonkeyPa
     assert result.status == "error"
     assert result.reason is not None
     assert result.reason["reason"] == "unsupported_content_type"
+    assert result.reason["content_type"] == "application/pdf"
+    assert payload_store.stored_payloads == []
+
+
+def test_blob_fetch_rejection_metadata_keeps_the_raw_header_not_the_normalized_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The allow-list decision uses the normalized media type, but the routed
+    error metadata reports the header exactly as the server sent it — the two
+    halves of the parsed _ContentType must not collapse into one value."""
+    import elspeth.plugins.transforms.blob_fetch as blob_fetch_module
+    from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+    monkeypatch.setattr(
+        blob_fetch_module,
+        "validate_url_for_ssrf",
+        lambda url, allowed_ranges=(): _safe_request_for(url),
+    )
+
+    response = httpx.Response(
+        200,
+        content=b"%PDF-1.7",
+        headers={"content-type": "Application/PDF; charset=binary"},
+        request=httpx.Request("GET", "https://203.0.113.10:443/file.pdf"),
+    )
+    transform = BlobFetch(_config())
+    payload_store = _PayloadStoreFake()
+    transform._payload_store = payload_store
+    transform._fetch_url = lambda _safe, _ctx: (response, "https://example.test/file.pdf", _call())  # type: ignore[method-assign]
+
+    result = transform.process(make_pipeline_row({"url": "https://example.test/file.pdf"}), make_context())
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "unsupported_content_type"
+    assert result.reason["content_type"] == "Application/PDF; charset=binary"
+    assert payload_store.stored_payloads == []
+
+
+def test_blob_fetch_records_absent_content_type_header_as_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An absent Tier-3 content-type header is recorded as None in the routed
+    error metadata — never fabricated as an externally-supplied empty string."""
+    import elspeth.plugins.transforms.blob_fetch as blob_fetch_module
+    from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+    monkeypatch.setattr(
+        blob_fetch_module,
+        "validate_url_for_ssrf",
+        lambda url, allowed_ranges=(): _safe_request_for(url),
+    )
+
+    response = httpx.Response(
+        200,
+        content=b"payload",
+        request=httpx.Request("GET", "https://203.0.113.10:443/file"),
+    )
+    assert "content-type" not in response.headers
+    transform = BlobFetch(_config())
+    payload_store = _PayloadStoreFake()
+    transform._payload_store = payload_store
+    transform._fetch_url = lambda _safe, _ctx: (response, "https://example.test/file", _call())  # type: ignore[method-assign]
+
+    result = transform.process(make_pipeline_row({"url": "https://example.test/file"}), make_context())
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "unsupported_content_type"
+    assert result.reason["content_type"] is None
+    assert "None" in result.reason["error"]
     assert payload_store.stored_payloads == []
 
 

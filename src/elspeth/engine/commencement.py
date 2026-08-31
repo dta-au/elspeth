@@ -117,10 +117,8 @@ def evaluate_commencement_gates(
             # bug, never a user's failing gate. Wrapping it below would
             # relabel it "your gate failed"; let it crash through instead.
             raise
-        except BaseException as exc:
+        except Exception as exc:
             reraise_if_engine_crash_through(exc)
-            if not isinstance(exc, Exception):
-                raise
             raise CommencementGateFailedError(
                 gate_name=gate.name,
                 condition=audited_condition,

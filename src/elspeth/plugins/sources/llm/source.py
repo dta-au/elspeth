@@ -80,12 +80,10 @@ class _LLMSourceLoadSession(Iterator[SourceRow]):
             raise StopIteration
         if self._shutdown_event is not None and self._shutdown_event.is_set():
             self._closed = True
+            # The generator is first-party code: a failure escaping its
+            # teardown is a bug and propagates over the shutdown outcome.
             try:
                 self._rows.close()
-            except contract_errors.TIER_1_ERRORS:
-                raise
-            except Exception as exc:
-                self._source._report_cleanup_failure(resource="load_iterator", error=exc, suppressed=True)
             finally:
                 self._source._release_load_resources(suppress_errors=True)
             raise StopIteration
@@ -123,7 +121,7 @@ class LLMSource(BaseSource):
     name = "llm"
     determinism = Determinism.NON_DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:262d121a2fbbfcaf"
+    source_file_hash: str | None = "sha256:fb170fbf7b3b4a7b"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     capability_tags: tuple[str, ...] = ("llm", "generation", "single-row")
