@@ -1548,9 +1548,11 @@ def _proof_repair_is_applicable(state: CompositionState) -> bool:
 def _empty_state_uploaded_blob_repair_message(ready_blobs: tuple[Mapping[str, Any], ...], *, next_turn: int) -> str:
     """Build a bounded repair prompt for empty-state stalls with ready uploads.
 
-    The message contains the same metadata exposed by ``list_blobs``: blob id,
-    filename, MIME type, byte size, creator, and status. It never includes raw
-    blob bytes, storage paths, or full content hashes.
+    The message contains a subset of the metadata exposed by ``list_blobs``:
+    blob id, filename, MIME type, byte size, creator, and status. It omits
+    ``creation_modality`` because the caller has already filtered to
+    ``created_by == "user"`` uploads, for which the modality is uniform. It
+    never includes raw blob bytes, storage paths, or full content hashes.
     """
     rendered_blobs = []
     for blob in ready_blobs[:5]:
@@ -2204,6 +2206,7 @@ class ComposerServiceImpl:
         return ComposeLoopTestResult(
             assistant_message=result.message,
             raw_assistant_content=result.raw_assistant_content,
+            persisted_assistant_content=result.persisted_assistant_content,
             tool_outcomes=tuple(self._phase3_last_tool_outcomes),
             persisted_assistant_tool_calls=tuple(self._phase3_last_redacted_assistant_tool_calls),
             persisted_tool_row_content=tuple(row.content for row in self._phase3_last_redacted_tool_rows),
@@ -2970,6 +2973,12 @@ class ComposerServiceImpl:
         blocking_diagnostics: tuple[Mapping[str, Any], ...],
         repair_turns_used: int,
         persisted_assistant_message_id: str | None,
+        # REQUIRED (no default): the content of the row named by
+        # ``persisted_assistant_message_id``. Threading the id without it is the
+        # shape that silently regresses to re-emitting already-persisted prose
+        # (elspeth-d581b3da7f), so a missed site must fail loudly here rather
+        # than default to None.
+        persisted_assistant_content: str | None,
         persisted_tool_call_turn: bool,
     ) -> ComposerResult:
         """Return a backend-owned blocker instead of finalizing after the cap."""
@@ -2993,6 +3002,7 @@ class ComposerServiceImpl:
             ),
             repair_turns_used=repair_turns_used,
             persisted_assistant_message_id=persisted_assistant_message_id,
+            persisted_assistant_content=persisted_assistant_content,
             persisted_tool_call_turn=persisted_tool_call_turn,
         )
 
@@ -4643,6 +4653,12 @@ class ComposerServiceImpl:
         current_state_id: str | None,
         persisted_tool_call_turn: bool,
         persisted_assistant_message_id: str | None,
+        # REQUIRED (no default): the content of the row named by
+        # ``persisted_assistant_message_id``. Threading the id without it is the
+        # shape that silently regresses to re-emitting already-persisted prose
+        # (elspeth-d581b3da7f), so a missed site must fail loudly here rather
+        # than default to None.
+        persisted_assistant_content: str | None,
         advisor_repair_context_introduced: bool = False,
     ) -> _PersistOutcome:
         """Phase P4 of the compose loop — delegates to :func:`turn_audit.persist_turn_audit`."""
@@ -4668,6 +4684,7 @@ class ComposerServiceImpl:
             current_state_id=current_state_id,
             persisted_tool_call_turn=persisted_tool_call_turn,
             persisted_assistant_message_id=persisted_assistant_message_id,
+            persisted_assistant_content=persisted_assistant_content,
         )
 
     async def _dispatch_tool_batch(
@@ -4804,6 +4821,7 @@ class ComposerServiceImpl:
         all_cache_hits = dispatch.all_cache_hits
         persisted_tool_call_turn = persist.persisted_tool_call_turn
         persisted_assistant_message_id = persist.persisted_assistant_message_id
+        persisted_assistant_content = persist.persisted_assistant_content
         failed_turn = persist.failed_turn
 
         # §7.7 anti-anchor hint: if the last 3 failed tool calls share the
@@ -4974,6 +4992,7 @@ class ComposerServiceImpl:
                     handoff_result,
                     repair_turns_used=repair_turns_used,
                     persisted_assistant_message_id=persisted_assistant_message_id,
+                    persisted_assistant_content=persisted_assistant_content,
                     persisted_tool_call_turn=persisted_tool_call_turn,
                 )
                 return _ClassifyOutcome(
@@ -5039,6 +5058,7 @@ class ComposerServiceImpl:
                             advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
                             repair_turns_used=repair_turns_used,
                             persisted_assistant_message_id=persisted_assistant_message_id,
+                            persisted_assistant_content=persisted_assistant_content,
                             persisted_tool_call_turn=persisted_tool_call_turn,
                             allow_repair_continue=False,
                             user_message=message,
@@ -5111,6 +5131,7 @@ class ComposerServiceImpl:
                         result,
                         repair_turns_used=repair_turns_used,
                         persisted_assistant_message_id=persisted_assistant_message_id,
+                        persisted_assistant_content=persisted_assistant_content,
                         persisted_tool_call_turn=persisted_tool_call_turn,
                     )
                     return _ClassifyOutcome(
@@ -5166,6 +5187,12 @@ class ComposerServiceImpl:
         progress: ComposerProgressSink | None,
         repair_turns_used: int,
         persisted_assistant_message_id: str | None,
+        # REQUIRED (no default): the content of the row named by
+        # ``persisted_assistant_message_id``. Threading the id without it is the
+        # shape that silently regresses to re-emitting already-persisted prose
+        # (elspeth-d581b3da7f), so a missed site must fail loudly here rather
+        # than default to None.
+        persisted_assistant_content: str | None,
         persisted_tool_call_turn: bool,
         advisor_checkpoint_passes_used: int,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
@@ -5277,6 +5304,7 @@ class ComposerServiceImpl:
                         blocking_diagnostics=proof_repair.blocking_diagnostics,
                         repair_turns_used=repair_turns_used,
                         persisted_assistant_message_id=persisted_assistant_message_id,
+                        persisted_assistant_content=persisted_assistant_content,
                         persisted_tool_call_turn=persisted_tool_call_turn,
                     ),
                 )
@@ -5321,6 +5349,7 @@ class ComposerServiceImpl:
                 advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
                 repair_turns_used=repair_turns_used,
                 persisted_assistant_message_id=persisted_assistant_message_id,
+                persisted_assistant_content=persisted_assistant_content,
                 persisted_tool_call_turn=persisted_tool_call_turn,
                 allow_repair_continue=True,
                 user_message=message,
@@ -5426,6 +5455,7 @@ class ComposerServiceImpl:
             result,
             repair_turns_used=repair_turns_used,
             persisted_assistant_message_id=persisted_assistant_message_id,
+            persisted_assistant_content=persisted_assistant_content,
             persisted_tool_call_turn=persisted_tool_call_turn,
         )
         return _TerminateOutcome(action="return", result=threaded)
@@ -5686,6 +5716,12 @@ class ComposerServiceImpl:
         advisor_checkpoint_passes_used: int,
         repair_turns_used: int,
         persisted_assistant_message_id: str | None,
+        # REQUIRED (no default): the content of the row named by
+        # ``persisted_assistant_message_id``. Threading the id without it is the
+        # shape that silently regresses to re-emitting already-persisted prose
+        # (elspeth-d581b3da7f), so a missed site must fail loudly here rather
+        # than default to None.
+        persisted_assistant_content: str | None,
         persisted_tool_call_turn: bool,
         allow_repair_continue: bool,
         runtime_preflight: ValidationResult | None,
@@ -5814,6 +5850,7 @@ class ComposerServiceImpl:
                         orphan_result,
                         repair_turns_used=repair_turns_used,
                         persisted_assistant_message_id=persisted_assistant_message_id,
+                        persisted_assistant_content=persisted_assistant_content,
                         persisted_tool_call_turn=persisted_tool_call_turn,
                     ),
                     advisor_passes_delta=passes_delta,
@@ -5893,6 +5930,7 @@ class ComposerServiceImpl:
                     recorder=recorder,
                     repair_turns_used=repair_turns_used,
                     persisted_assistant_message_id=persisted_assistant_message_id,
+                    persisted_assistant_content=persisted_assistant_content,
                     persisted_tool_call_turn=persisted_tool_call_turn,
                     runtime_preflight=runtime_preflight,
                     outstanding_findings=outstanding_findings,
@@ -6086,6 +6124,7 @@ class ComposerServiceImpl:
         advisor_checkpoint_passes_used = 0
         advisor_review_state = _AdvisorReviewState()
         persisted_assistant_message_id: str | None = None
+        persisted_assistant_content: str | None = None
         persisted_tool_call_turn = False
         failed_turn: FailedTurnMetadata | None = None
         current_state_id: str | None = initial_current_state_id
@@ -6144,6 +6183,7 @@ class ComposerServiceImpl:
                     progress=progress,
                     repair_turns_used=repair_turns_used,
                     persisted_assistant_message_id=persisted_assistant_message_id,
+                    persisted_assistant_content=persisted_assistant_content,
                     persisted_tool_call_turn=persisted_tool_call_turn,
                     advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
                     plugin_snapshot=plugin_snapshot,
@@ -6201,6 +6241,7 @@ class ComposerServiceImpl:
                 _cancellation_requested: asyncio.Event = cancellation_requested,
                 _persisted_tool_call_turn: bool = persisted_tool_call_turn,
                 _persisted_assistant_message_id: str | None = persisted_assistant_message_id,
+                _persisted_assistant_content: str | None = persisted_assistant_content,
                 _advisor_repair_context_introduced: bool = advisor_repair_context_introduced,
             ) -> tuple[_DispatchOutcome, _PersistOutcome, int, bool, bool]:
                 dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
@@ -6267,6 +6308,7 @@ class ComposerServiceImpl:
                     current_state_id=_current_state_id,
                     persisted_tool_call_turn=_persisted_tool_call_turn,
                     persisted_assistant_message_id=_persisted_assistant_message_id,
+                    persisted_assistant_content=_persisted_assistant_content,
                     advisor_repair_context_introduced=_advisor_repair_context_introduced,
                 )
                 return (
@@ -6306,6 +6348,7 @@ class ComposerServiceImpl:
             )
             current_state_id = persist.current_state_id
             persisted_assistant_message_id = persist.persisted_assistant_message_id
+            persisted_assistant_content = persist.persisted_assistant_content
             persisted_tool_call_turn = persist.persisted_tool_call_turn
             failed_turn = persist.failed_turn
             # Finalize-context elision drain (Task 6 Step 3). Gated on
@@ -7445,6 +7488,12 @@ class ComposerServiceImpl:
         recorder: BufferingRecorder,
         repair_turns_used: int,
         persisted_assistant_message_id: str | None,
+        # REQUIRED (no default): the content of the row named by
+        # ``persisted_assistant_message_id``. Threading the id without it is the
+        # shape that silently regresses to re-emitting already-persisted prose
+        # (elspeth-d581b3da7f), so a missed site must fail loudly here rather
+        # than default to None.
+        persisted_assistant_content: str | None,
         persisted_tool_call_turn: bool,
         runtime_preflight: ValidationResult | None,
         outstanding_findings: ValidationResult | None,
@@ -7543,6 +7592,7 @@ class ComposerServiceImpl:
             ),
             repair_turns_used=repair_turns_used,
             persisted_assistant_message_id=persisted_assistant_message_id,
+            persisted_assistant_content=persisted_assistant_content,
             persisted_tool_call_turn=persisted_tool_call_turn,
         )
 
@@ -8439,6 +8489,12 @@ class ComposeLoopTestResult:
     raw_assistant_content: str | None = None
     tool_outcomes: tuple[Any, ...] = ()
     persisted_assistant_row: Any | None = None
+    # What the compose loop already committed for the turn's assistant row,
+    # threaded off ``ComposerResult.persisted_assistant_content``. Exposed so
+    # compose-loop tests can pin the threading the turn-end writers depend on
+    # to avoid re-emitting that row (elspeth-d581b3da7f) without reaching into
+    # the route.
+    persisted_assistant_content: str | None = None
     persisted_assistant_tool_calls: tuple[Any, ...] = ()
     persisted_tool_row_content: tuple[Any, ...] = ()
     # Buffered per-call audit invocations so dispatch-branch tests can

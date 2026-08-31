@@ -851,6 +851,17 @@ class ToolResult:
             field *only when non-empty*. Eliminates the second
             round-trip the LLM would otherwise burn calling
             ``get_plugin_schema`` separately after each rejection.
+        validation_guidance: Inline repair guidance for a failed mutation —
+            the closed catalogue's ``(explanation, suggested_fix)`` for every
+            resolvable ``error_code`` in ``validation.errors``, plus the
+            ``explain_validation_error`` pointer when some entry resolved to
+            nothing. Built by ``generation.build_validation_guidance`` and
+            populated only on failed mutations by ``execute_tool``. Every
+            value is STATIC catalogue text; nothing per-request rides here.
+            ``to_dict`` emits this field *only when non-empty*. Saves the
+            turn the LLM would otherwise burn calling
+            ``explain_validation_error`` after a rejection — the same trade
+            ``plugin_schemas`` makes for option-shape failures.
         applied_component: Post-finalizer projection of the components a
             successful mutation applied — the exact ``set_pipeline``
             arguments ``get_pipeline_state(component="set_pipeline_arguments")``
@@ -871,6 +882,7 @@ class ToolResult:
     runtime_preflight: ValidationResult | None = None
     post_call_hints: tuple[str, ...] = ()
     plugin_schemas: Mapping[str, Mapping[str, Any]] | None = None
+    validation_guidance: Mapping[str, Any] | None = None
     applied_component: Mapping[str, Any] | None = None
     _validation_snapshot_hash: str | None = field(default=None, compare=False, repr=False)
     # True when this failure envelope deliberately withheld the pre-mutation
@@ -886,6 +898,8 @@ class ToolResult:
             freeze_fields(self, "data")
         if self.plugin_schemas is not None:
             freeze_fields(self, "plugin_schemas")
+        if self.validation_guidance is not None:
+            freeze_fields(self, "validation_guidance")
         if self.applied_component is not None:
             freeze_fields(self, "applied_component")
 
@@ -936,6 +950,9 @@ class ToolResult:
 
         if self.plugin_schemas:
             result["plugin_schemas"] = deep_thaw(self.plugin_schemas)
+
+        if self.validation_guidance:
+            result["validation_guidance"] = deep_thaw(self.validation_guidance)
 
         if self.applied_component:
             result["applied_component"] = deep_thaw(self.applied_component)
@@ -1429,7 +1446,29 @@ def _apply_merge_patch(
 
 
 def _serialize_source(source: SourceSpec) -> dict[str, Any]:
-    """Serialize a SourceSpec to a plain dict for LLM consumption."""
+    """Serialize a SourceSpec to a plain dict for LLM consumption.
+
+    A DIAGNOSTIC view: ``options`` is emitted verbatim, server-owned keys
+    (``source_authoring``, ``blob_ref``) included. Both inspection arms of
+    ``get_pipeline_state`` land here — the whole-document
+    ``_serialize_full_pipeline_state`` and the ``component="source"`` slice
+    — and neither is a ``set_pipeline`` payload. The round-trippable
+    projection is a separate component the tool schema names,
+    ``get_pipeline_state(component="set_pipeline_arguments")``
+    (``_serialize_set_pipeline_arguments``), which rebinds a blob-backed
+    source through ``blob_id``.
+
+    Keeping ``source_authoring`` here is the scoping elspeth-c67fbbbd83
+    chose, not an oversight it missed. The leak that cost a planner turn
+    was the per-turn state context block, projected by
+    ``prompts.project_server_owned_option_metadata``; stripping this view
+    would not have prevented it. Nor would a strip buy round-trippability:
+    a blob-bound source replayed verbatim rejects on ``blob_ref`` first,
+    because that guard cannot enforce ``path`` against the blob's canonical
+    storage_path. Echoing the block costs nothing in any case —
+    ``_drop_echoed_source_authoring`` accepts an exact echo of the stored
+    value, and only a non-matching one rejects.
+    """
     return {
         "plugin": source.plugin,
         "on_success": source.on_success,

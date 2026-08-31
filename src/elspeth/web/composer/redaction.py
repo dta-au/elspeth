@@ -23,8 +23,9 @@ from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
 
-from elspeth.contracts.blobs import AllowedMimeType
+from elspeth.contracts.blobs import BLOB_CREATORS, AllowedMimeType
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError, GuidedCustodyIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
@@ -149,6 +150,11 @@ _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD: Mapping[str, frozenset[str]] = MappingProxy
         ),
         "kind": frozenset(kind.value for kind in InterpretationKind),
         "pipeline_content_hash_schema": frozenset({"composer.pipeline-dispatch-result.v1"}),
+        # Blob origin on get_blob_content. Derived from the same closed
+        # vocabularies the DB CHECKs mirror, so the allowlist cannot drift
+        # from the columns it admits.
+        "created_by": BLOB_CREATORS,
+        "creation_modality": frozenset(modality.value for modality in CreationModality),
     }
 )
 _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS = frozenset(
@@ -2904,7 +2910,9 @@ _CLEAR_SOURCE_REASON = HandlesNoSensitiveDataReason(
 
 
 _LIST_BLOBS_REASON = HandlesNoSensitiveDataReason(
-    sensitive_data_locations=("session blob inventory — id/filename/mime_type/size_bytes per blob, no raw content",),
+    sensitive_data_locations=(
+        "session blob inventory — id/filename/mime_type/size_bytes/created_by/creation_modality per blob, no raw content",
+    ),
     why_arguments_safe=(
         "list_blobs accepts no arguments — the JSON schema declares an empty properties "
         "object with additionalProperties=false, and redaction strips any unknown keys "
@@ -2913,7 +2921,9 @@ _LIST_BLOBS_REASON = HandlesNoSensitiveDataReason(
     why_responses_safe=(
         "Response is the blob-inventory list — operator-uploaded filenames, mime_types, "
         "and structural metadata per blob — but never the raw blob content; payload bytes "
-        "are exposed only via get_blob_content whose policy applies a length-only summary."
+        "are exposed only via get_blob_content whose policy applies a length-only summary. "
+        "created_by and creation_modality are closed server-recorded vocabularies naming "
+        "who authored each blob's bytes; they carry no model, prompt, or operator identity."
     ),
 )
 
@@ -3294,6 +3304,14 @@ class GetBlobContentDataModel(BaseModel):
     content: Annotated[str, Sensitive(summarizer=_summarize_blob_content)]
     truncated: bool
     size_bytes: int
+    # Blob origin (elspeth-47eba5cced). Not Sensitive: both are closed
+    # server-recorded vocabularies, and _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD
+    # admits only their declared members, so the persisted audit row keeps
+    # the provenance queryable while any off-vocabulary value is summarized
+    # away. They carry no model, prompt, or operator identity — the five
+    # creating_* columns stay off this wire entirely.
+    created_by: str
+    creation_modality: str
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3341,6 +3359,7 @@ class _ToolResultResponseModel(BaseModel):
     validation_delta: _SafeResponseEnvelope = None
     post_call_hints: _SafeResponseEnvelope = None
     plugin_schemas: _SafeResponseEnvelope = None
+    validation_guidance: _SafeResponseEnvelope = None
     applied_component: _SafeResponseEnvelope = None
     pipeline_content_hash_schema: Literal["composer.pipeline-dispatch-result.v1"] | None = None
     pipeline_content_hash: Annotated[str | None, Sensitive(summarizer=_summarize_external_response_value)] = None
@@ -3550,6 +3569,7 @@ _TOOL_RESULT_OPTIONAL_RESPONSE_KEYS: tuple[str, ...] = (
     "validation_delta",
     "post_call_hints",
     "plugin_schemas",
+    "validation_guidance",
     "applied_component",
 )
 
