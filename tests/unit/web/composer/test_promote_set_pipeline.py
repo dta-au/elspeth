@@ -910,6 +910,7 @@ class TestPromoteSetPipelineArgErrorRouting:
                         "model": "anthropic/claude-haiku-4.5",
                         "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                         "prompt_template": "Read {{ row.content }}.",
+                        "required_input_fields": ["content"],
                         "schema": {"mode": "observed"},
                         INTERPRETATION_REQUIREMENTS_KEY: [cleanup_requirement],
                     },
@@ -1073,6 +1074,7 @@ class TestPromoteSetPipelineArgErrorRouting:
                         "model": "anthropic/claude-haiku-4.5",
                         "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                         "prompt_template": "Summarise {{ row.text }}.",
+                        "required_input_fields": ["text"],
                         "schema": {"mode": "observed"},
                     },
                 }

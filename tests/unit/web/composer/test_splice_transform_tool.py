@@ -56,7 +56,7 @@ def _state() -> CompositionState:
         source=SourceSpec(
             plugin="csv",
             on_success="rows",
-            options={"path": "rows.csv", "schema": {"mode": "observed"}},
+            options={"path": "rows.csv", "schema": {"mode": "flexible", "fields": ["text: str"]}},
             on_validation_failure="discard",
         ),
         nodes=(
@@ -138,9 +138,10 @@ def test_splice_transform_public_dispatch_rejects_llm_runtime_hash_atomically() 
     arguments = _arguments(
         options={
             "provider": "openrouter",
-            "model": "openai/gpt-4o-mini",
+            "model": "openai/gpt-4o",
             "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
             "prompt_template": "Summarise {{ row.text }}.",
+            "required_input_fields": ["text"],
             "resolved_prompt_template_hash": None,
             "schema": {"mode": "observed"},
         }
@@ -168,9 +169,10 @@ def test_splice_transform_public_dispatch_rejects_resolver_owned_review_atomical
     arguments = _arguments(
         options={
             "provider": "openrouter",
-            "model": "openai/gpt-4o-mini",
+            "model": "openai/gpt-4o",
             "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
             "prompt_template": "Summarise {{ row.text }}.",
+            "required_input_fields": ["text"],
             INTERPRETATION_REQUIREMENTS_KEY: [
                 {
                     "kind": "llm_prompt_template",
@@ -263,9 +265,10 @@ def test_splice_transform_identical_review_staged_replay_is_same_object() -> Non
             "plugin": "llm",
             "options": {
                 "provider": "openrouter",
-                "model": "openai/gpt-4o-mini",
+                "model": "openai/gpt-4o",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                 "prompt_template": "Summarise {{ row.text }}.",
+                "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
             },
             "on_error": "discard",
@@ -294,9 +297,10 @@ def test_splice_transform_replay_preserves_all_trusted_requirement_ids() -> None
             "plugin": "llm",
             "options": {
                 "provider": "openrouter",
-                "model": "openai/gpt-4o-mini",
+                "model": "openai/gpt-4o",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                 "prompt_template": "Summarise using {{interpretation:summary_style}}: {{ row.text }}.",
+                "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
                 INTERPRETATION_REQUIREMENTS_KEY: [
                     {
@@ -357,9 +361,10 @@ def test_splice_transform_identical_replay_rejects_noncanonical_retained_require
             "plugin": "llm",
             "options": {
                 "provider": "openrouter",
-                "model": "openai/gpt-4o-mini",
+                "model": "openai/gpt-4o",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                 "prompt_template": "Summarise {{ row.text }}.",
+                "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
             },
             "on_error": "discard",

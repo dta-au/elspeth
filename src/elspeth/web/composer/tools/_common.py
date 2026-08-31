@@ -2125,37 +2125,50 @@ def _prevalidate_plugin_options(
             msg = exc.cause if exc.cause is not None else str(exc)
             return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
 
-        cause = exc.__cause__
-        has_model_level_error = not isinstance(cause, PydanticValidationError) or any(not error["loc"] for error in cause.errors())
-        if secret_ref_keys and has_model_level_error:
-            # Presence-dependent model validators cannot distinguish a withheld
-            # marker from an absent credential. Retry structure-only validation
-            # with the same non-secret placeholder used by export preflight.
-            # Return immediately on success to preserve the established deferred
-            # secret path, which intentionally does not inspect secret values or
-            # advance into value-source checks that the primary pass did not reach.
+        if secret_ref_keys:
+            # A missing deferred credential can prevent Pydantic from running
+            # EVERY model validator, so the primary error shape cannot tell us
+            # whether unrelated model-level errors exist. Retry with the same
+            # non-secret placeholder used by export preflight regardless of the
+            # primary error locations. A successful retry yields a real config
+            # that must continue into value-source validation below.
             try:
-                config_cls.from_dict(placeholder_options, plugin_name=plugin_name)
+                config = config_cls.from_dict(placeholder_options, plugin_name=plugin_name)
             except PluginConfigError as placeholder_exc:
+                # Inline blob content is another deferred value, but it has no
+                # type-safe generic placeholder. Preserve its established
+                # field-level filtering while retaining every unrelated error
+                # discovered after the secret placeholder unblocked validation.
+                if blob_inline_ref_keys:
+                    placeholder_cause = placeholder_exc.__cause__
+                    if isinstance(placeholder_cause, PydanticValidationError):
+                        remaining = [
+                            error for error in placeholder_cause.errors() if not (error["loc"] and error["loc"][0] in blob_inline_ref_keys)
+                        ]
+                        if not remaining:
+                            return None
+                        lines = "; ".join(f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}" for error in remaining)
+                        return f"Invalid options for {plugin_type} '{plugin_name}': {lines}"
                 msg = placeholder_exc.cause if placeholder_exc.cause is not None else str(placeholder_exc)
                 return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
-            return None
 
-        # Secret refs were withheld. Filter out field-level errors on those
-        # fields while retaining every unrelated validation failure.
-        if not isinstance(cause, PydanticValidationError):
-            # ValueError path (model validators) — can't filter per-field.
-            msg = exc.cause if exc.cause is not None else str(exc)
-            return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
+        if not secret_ref_keys:
+            # Only inline blob refs were withheld. Filter out field-level
+            # errors on those deferred fields while retaining every unrelated
+            # validation failure.
+            cause = exc.__cause__
+            if not isinstance(cause, PydanticValidationError):
+                # ValueError path (model validators) — can't filter per-field.
+                msg = exc.cause if exc.cause is not None else str(exc)
+                return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
 
-        deferred_keys = secret_ref_keys | blob_inline_ref_keys
-        remaining = [e for e in cause.errors() if not (e["loc"] and e["loc"][0] in deferred_keys)]
-        if not remaining:
-            return None
+            remaining = [e for e in cause.errors() if not (e["loc"] and e["loc"][0] in blob_inline_ref_keys)]
+            if not remaining:
+                return None
 
-        # Re-format only the non-secret errors.
-        lines = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in remaining)
-        return f"Invalid options for {plugin_type} '{plugin_name}': {lines}"
+            # Re-format only the non-deferred errors.
+            lines = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in remaining)
+            return f"Invalid options for {plugin_type} '{plugin_name}': {lines}"
 
     # Construction passed type/required validation. Now enforce the config's
     # VALUE_SOURCES declarations (e.g. OpenRouter ``model`` catalog membership)

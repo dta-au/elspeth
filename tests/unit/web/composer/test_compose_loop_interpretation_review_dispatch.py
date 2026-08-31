@@ -530,7 +530,7 @@ def _set_pipeline_with_pending_interpretation_args(term: str = "cool") -> dict[s
                 "on_error": "discard",
                 "options": {
                     "provider": "openrouter",
-                    "model": "openai/gpt-4o-mini",
+                    "model": "openai/gpt-4o",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                     "prompt_template": f"Rate how {{{{interpretation:{term}}}}} this row is.",
                     "schema": {"mode": "observed"},
@@ -653,9 +653,10 @@ def _set_pipeline_clean_llm_node_args() -> dict[str, Any]:
                 "on_error": "discard",
                 "options": {
                     "provider": "openrouter",
-                    "model": "openai/gpt-4o-mini",
+                    "model": "openai/gpt-4o",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                     "prompt_template": "Summarise {{ row.text }} in one sentence.",
+                    "required_input_fields": ["text"],
                     "schema": {"mode": "observed"},
                 },
             }
