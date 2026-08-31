@@ -168,7 +168,13 @@ class FieldMapperConfig(TransformDataConfig):
         description="Mapping from existing input field names to output field names.",
     )
     select_only: bool = Field(default=False, description="When true, emit only fields named in the mapping.")
-    strict: bool = Field(default=False, description="When true, fail if any mapped source field is missing from an input row.")
+    strict: bool = Field(
+        default=False,
+        description=(
+            "When true, fail if any mapped source field is missing from an input row. "
+            "Dotted and unresolved original-header sources also route on a miss when false."
+        ),
+    )
 
     @property
     def declared_input_fields(self) -> frozenset[str]:
@@ -304,7 +310,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c2580df91866b56c"
+    source_file_hash: str | None = "sha256:4f4ac18326922086"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -349,10 +355,9 @@ class FieldMapper(BaseTransform):
 
         self.declared_output_fields = self._derive_declared_output_fields(cfg)
 
-        # Wider than declared_output_fields: every rename target is CREATED here
-        # whenever its source arrives, even when it is not GUARANTEED (non-strict
-        # mode, or a source that only resolves at runtime). Requiring any of them
-        # on input is the elspeth-d6eeb3a71d trap, so all of them demote.
+        # Rename targets are created here, never required on input. Requiring
+        # one is the elspeth-d6eeb3a71d trap, so every non-identity target
+        # demotes from the node's derived input requirements.
         self._self_created_input_fields = frozenset(target for source, target in cfg.mapping.items() if source != target)
 
         # Field-forwarding declaration for the extras direction
@@ -420,114 +425,10 @@ class FieldMapper(BaseTransform):
         """
         return "." not in source and not _names_a_row_key(source)
 
-    @classmethod
-    def _mapping_target_is_guaranteed(
-        cls,
-        cfg: FieldMapperConfig,
-        source: str,
-        input_fields_present: set[str],
-    ) -> bool:
-        """Whether target exists on every successful row for this mapping."""
-        if cls._is_unresolved_original_source(source):
-            return False
-        if cfg.strict:
-            return True
-        return cls._is_static_normalized_source(source) and source in input_fields_present
-
     @property
     def self_created_input_fields(self) -> frozenset[str]:
-        """Override: every rename target may be created, not just the guaranteed ones."""
+        """Override: non-identity rename targets are created by this node."""
         return self._self_created_input_fields
-
-    @classmethod
-    def _emit_set_is_closed(cls, cfg: FieldMapperConfig) -> bool:
-        """True when this node's emitted field set is fully determined by config.
-
-        Under ``select_only`` the output dict starts EMPTY and is written only by
-        mapping entries: no upstream row to delete from, and no unnameable
-        removal. The emit set is ``mapping.values()``, computable at construction.
-
-        Under ``select_only: false`` the emitted set is
-        ``(upstream - removed) | targets``, computable only by the ADR-007 walk.
-        That branch declares its emit set through a DIFFERENT CHANNEL —
-        ``forwards_input_fields`` / ``removed_input_fields`` — and ``process``
-        resolves removal names at RUNTIME via ``contract.resolve_name``, so no
-        construction-time claim about the emitted set is sound there.
-
-        Named rather than written as a bare ``if cfg.select_only`` on purpose
-        (elspeth-c84fa33f75). The failure mode that naming prevents: a sibling
-        reductive plugin with no ``select_only`` option gets the condition copied
-        as ``if cfg.strict`` — the only half that appears to transfer — which
-        reintroduces the defect somewhere Rule C's gate does not protect it.
-        """
-        return cfg.select_only
-
-    @classmethod
-    def _admitted_input_fields(cls, cfg: FieldMapperConfig) -> set[str]:
-        """Input fields this node may treat as present when computing its emit set.
-
-        Two questions live here, and answering only the first was the defect.
-
-        WHICH PREDICATE. ``guaranteed_fields`` is not the whole answer.
-        ``SchemaConfig`` documents the type system as a second, implicit source
-        of guarantees: a ``mode: fixed`` config with required declared ``fields``
-        guarantees them even when ``guaranteed_fields`` is ``None`` — which is an
-        ABSTAIN, not an explicit zero. ``get_effective_guaranteed_fields`` is the
-        predicate that says so, and the sibling builders that already ask it
-        (``BaseTransform._build_output_schema_config``, ``value_transform``,
-        ``json_explode``, the llm builder) are the reference implementations.
-        Reading ``guaranteed_fields or ()`` collapsed abstain into explicit-zero,
-        so the raw half of this node's output config abstained while
-        ``_project_field_declarations_onto_output`` still declared the target
-        required — and the composer's Rule C compares exactly those two halves,
-        rejecting a pipeline the engine builds and RUNS. Composer stricter than
-        engine: a FALSE REJECT.
-
-        WHEN IT MAY BE ASKED. Only where the emit set is CLOSED. Applying the
-        wider predicate unconditionally is the form a review panel rejected with
-        four reproduced defects (elspeth-c84fa33f75): on the non-``select_only``
-        branch it is a CATEGORY ERROR — an emit-set claim placed in the
-        node-local guarantee channel for the one branch whose emit set is only
-        computable at walk time — and it produces both a false build-time
-        rejection and a runtime ``DeclaredOutputFieldsViolation``. Those are one
-        defect on two axes, and this gate cures both because the gate IS the
-        closure predicate. On the open branch the answer is HEAD's, bit for bit.
-
-        The old name (``base_guaranteed``) is what invited the raw-tuple read:
-        it named a config KEY rather than the question being asked.
-
-        One helper for both callers deliberately. ``_mapping_target_is_guaranteed``
-        is shared, so two call sites computing "what the input admits"
-        differently would feed one predicate two answers about one config.
-        """
-        if cls._emit_set_is_closed(cfg):
-            return cls._promised_on_every_input_row(cfg)
-        return set(cfg.schema_config.guaranteed_fields or ())
-
-    @classmethod
-    def _promised_on_every_input_row(cls, cfg: FieldMapperConfig) -> set[str]:
-        """Every field the config promises is present on each row reaching ``process``.
-
-        THREE spellings make that promise, and all three must produce one
-        verdict (elspeth-0d1da6dc44; the third found by adversarial review of
-        a7c783423): explicit ``guaranteed_fields``, fixed/flexible-mode
-        required declared ``fields`` (both via
-        ``get_effective_guaranteed_fields``), and ``required_fields`` (via
-        ``get_effective_required_fields``). ``required_fields`` qualifies
-        because ``get_raw_node_required_fields`` feeds the build-time edge
-        contract, which fail-closes against EVERY upstream that does not
-        guarantee the field — measured: an abstaining bare-observed upstream is
-        rejected outright, no abstention skip — so no runnable graph delivers a
-        row lacking one. If that Phase-1 strictness is ever relaxed to skip
-        abstaining upstreams, this limb becomes unsound and must be revisited.
-
-        Shared by the declaration derivation AND the closed-branch emit
-        predicate so the two cannot drift: the emit builder relies on
-        ``declared_output_fields ⊆ guaranteed_targets`` to omit the union
-        (see ``_build_field_mapper_output_schema_config``), which holds only
-        while both sites read the same promise set.
-        """
-        return set(cfg.schema_config.get_effective_guaranteed_fields()) | set(cfg.schema_config.get_effective_required_fields())
 
     @classmethod
     def _derive_declared_output_fields(cls, cfg: FieldMapperConfig) -> frozenset[str]:
@@ -542,30 +443,18 @@ class FieldMapper(BaseTransform):
         (elspeth-6ea3619737; the narrowing-vs-arming history is
         elspeth-892161b2d5).
 
-        The input promise is ``_promised_on_every_input_row`` — every
-        declaration channel that puts the source on each arriving row, NOT the
-        raw ``guaranteed_fields`` tuple. The raw read collapsed the
-        fixed-schema ABSTAIN into explicit-zero, so on the ``select_only:
-        false`` branch a fixed-schema declaration disarmed every collision gate
-        while the identical promise spelled ``guaranteed_fields: [...]`` armed
-        them — the same real overwrite, opposite verdicts by declaration
-        channel (elspeth-0d1da6dc44); ``required_fields`` was the third such
-        channel.
+        The mapping itself is now the promise. Normalization-stable sources and
+        dotted roots are asserted through ``declared_input_fields`` and checked
+        before ``process()``; unresolved original-header aliases and dotted
+        leaves route a missing value to error even under ``strict: false``.
+        Consequently every successful row contains every mapped target. This
+        is independent of how (or whether) the input schema repeats the source.
 
-        NOT ``_admitted_input_fields``: that helper answers the EMIT-set
-        question for ``_build_field_mapper_output_schema_config`` and stays
-        gated on ``_emit_set_is_closed`` (elspeth-c84fa33f75 — an emit-set
-        claim on the open branch is a category error). This method asks only
-        whether each TARGET is written on every valid row, which is sound on
-        both branches: a valid row necessarily carries every promised source,
-        so its target is written whichever branch emits it.
+        Identity mappings are excluded because ``declared_output_fields`` is
+        also the collision surface: rewriting a field to itself creates no new
+        field. The output schema below still guarantees identity targets.
         """
-        promised_on_input = cls._promised_on_every_input_row(cfg)
-        return frozenset(
-            target
-            for source, target in cfg.mapping.items()
-            if source != target and cls._mapping_target_is_guaranteed(cfg, source, promised_on_input)
-        )
+        return frozenset(target for source, target in cfg.mapping.items() if source != target)
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the real rename/drop path for the backward invariant."""
@@ -656,18 +545,22 @@ class FieldMapper(BaseTransform):
         The base _build_output_schema_config() incorrectly copies input fields into
         output guarantees. This method builds the correct output field set.
 
-        When select_only=True: output guarantees are ONLY the mapping targets.
-        When select_only=False: output guarantees are input fields MINUS removed
-            sources PLUS new targets.
+        When select_only=True, the guarantee set is exactly the mapping targets.
+        When select_only=False, it is the node-local passthrough lower bound
+        minus nameable removed sources, plus every mapping target. Inherited
+        fields are carried separately by the forwarding/removal declarations.
         """
-        # Wider than ``_derive_declared_output_fields``'s
-        # ``explicitly_promised_on_input``, and deliberately so: this describes
-        # what the node EMITS, where the type system's implicit guarantees
-        # count. That site feeds the collision TRIGGER, where they must not.
-        admitted_on_input = self._admitted_input_fields(cfg)
-        guaranteed_targets = {
-            target for source, target in cfg.mapping.items() if self._mapping_target_is_guaranteed(cfg, source, admitted_on_input)
-        }
+        # On the open branch this is only the node-local passthrough lower
+        # bound. Effective fixed-schema declarations must not be mistaken for
+        # a complete open emit set; inherited fields travel through the graph
+        # walk's forwarding channel instead.
+        admitted_on_input = set(cfg.schema_config.guaranteed_fields or ())
+        # The mapping is the required-read authority. Every successful row has
+        # every target: representable sources are checked before ``process()``,
+        # while unresolved aliases and dotted leaves route on a miss. No
+        # separate ``strict`` or schema guarantee is needed to restate that
+        # promise (elspeth-d4ae04b374).
+        guaranteed_targets = set(cfg.mapping.values())
 
         if cfg.select_only:
             # Only mapped targets appear in output
@@ -690,13 +583,9 @@ class FieldMapper(BaseTransform):
                 passthrough_fields = admitted_on_input - removed_sources
             output_fields = passthrough_fields | guaranteed_targets
 
-        # Deliberately NOT unioned with ``declared_output_fields``: that set is
-        # derived from ``get_effective_guaranteed_fields`` on BOTH branches
-        # (elspeth-0d1da6dc44), while this emit description must keep abstaining
-        # on the open branch (elspeth-c84fa33f75 — an emit-set claim there is a
-        # category error). On the closed branch ``admitted_on_input`` is the
-        # same effective predicate, so ``guaranteed_targets`` already covers
-        # every declared target and the union would be a no-op.
+        # ``guaranteed_targets`` is a lower bound on both branches, not a claim
+        # that the open branch's complete emit set is known. Passthrough fields
+        # still travel through ``forwards_input_fields`` / ``removed_input_fields``.
 
         # Preserve None-vs-empty-tuple semantics: None = abstain, () = explicitly empty.
         # If upstream declared guarantees or we computed non-empty output, declare explicitly.
@@ -757,8 +646,9 @@ class FieldMapper(BaseTransform):
                 # upstream type-contract violation. Route the offending row to on_error
                 # — recorded and attributable — rather than raising and crashing the
                 # whole run on a single malformed nested value. A genuinely absent
-                # intermediate still returns MISSING (handled below), preserving the
-                # strict/non-strict distinction for true absence.
+                # intermediate still returns MISSING. The handling below routes
+                # it even in non-strict mode so a configured target cannot
+                # disappear from a successful row.
                 try:
                     value = get_nested_field(row_data, source)
                 except TypeError as exc:
