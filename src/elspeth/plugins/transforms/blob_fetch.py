@@ -16,6 +16,7 @@ from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.plugin_capabilities import ContentTrust
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -285,9 +286,11 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c0e091ff3b27bb3d"
+    source_file_hash: str | None = "sha256:a7ec5ed8ed9cd12d"
     config_model = BlobFetchConfig
     passes_through_input = True
+    fetches_http = True
+    content_trust = ContentTrust.UNTRUSTED
     capability_tags: tuple[str, ...] = ("http", "network", "blob")
 
     usage_when_to_use = (

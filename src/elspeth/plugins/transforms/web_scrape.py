@@ -29,6 +29,7 @@ from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.plugin_capabilities import ContentTrust
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
@@ -487,9 +488,11 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:74f02de5fbdecdf5"
+    source_file_hash: str | None = "sha256:3491adc519b4c410"
     config_model = WebScrapeConfig
     passes_through_input = True
+    fetches_http = True
+    content_trust = ContentTrust.UNTRUSTED
     capability_tags: tuple[str, ...] = ("http", "network", "scraping")
 
     usage_when_to_use = (

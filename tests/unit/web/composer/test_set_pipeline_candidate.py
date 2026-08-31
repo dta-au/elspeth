@@ -1804,11 +1804,10 @@ _EXPECTED_WARNINGS = {
     # W3 now derives the answer from published_success_connection rather than
     # testing `on_success is not None` by hand, so the accusation is gone.
     #
-    # ``_structured_llm_args`` builds ONE llm node and no fetch step of any
-    # kind, so the remote-content draft's claims ("between the external-content
-    # fetch step and this LLM", "routes internet-controlled text") are false for
-    # this graph. The advisory is chosen by provenance (interpretation_state.py
-    # ``_llm_untrusted_remote_content_producers``), so the local-content sibling
+    # ``_structured_llm_args`` builds ONE llm node and no declared untrusted-
+    # content producer, so a producer-specific draft would be false for this
+    # graph. The advisory is chosen by provenance (interpretation_state.py
+    # ``_llm_untrusted_content_producers``), so the local-content sibling
     # is the correct one here. Referenced, never re-typed: this table inlining
     # the prose is what let it drift silently past the constant it mirrors.
     "structured_llm": (

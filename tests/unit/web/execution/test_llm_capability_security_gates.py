@@ -235,7 +235,8 @@ def test_prompt_shield_advisory_traces_remote_content_for_alternate_llm_name(
 
     assert len(warnings) == 1
     assert warnings[0][0] == f"node:{node.id}"
-    assert "web_scrape upstream" in warnings[0][1]
+    assert "produced by web_scrape" in warnings[0][1]
+    assert "without an authorized prompt-injection shield between them" in warnings[0][1]
 
 
 def test_prompt_shield_advisory_credits_shield_for_alternate_llm_name(

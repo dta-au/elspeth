@@ -949,11 +949,11 @@ def _inspect_text(
 
     if len(lines) == 1 and url_candidates and url_candidates[0] == lines[0].strip():
         warnings.append(
-            "text content is a single URL — pipeline must wire web_scrape to fetch the URL "
+            "text content is a single URL — pipeline must wire a compatible HTTP fetch transform "
             "(text source emits the URL string itself, not the URL's content)"
         )
     elif url_candidates:
-        warnings.append("text content contains URL(s); consider web_scrape downstream if URL fetch is intended")
+        warnings.append("text content contains URL(s); consider a compatible HTTP fetch transform if URL fetch is intended")
 
     return SourceInspectionFacts(
         source_kind="text",

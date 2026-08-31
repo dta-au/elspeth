@@ -48,6 +48,7 @@ from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import (
     CapabilityDeclaration,
+    ContentTrust,
     ControlRole,
     PluginCapability,
     WebConfigAuthority,
@@ -327,6 +328,14 @@ class BaseTransform(ABC):
     capability_tags: tuple[str, ...] = ()
     web_config_authority: WebConfigAuthority = WebConfigAuthority.USER_CONFIGURABLE
     policy_capabilities: frozenset[CapabilityDeclaration] = frozenset()
+    fetches_http: bool = False
+    """Whether the transform performs a direct HTTP(S) fetch governed by its
+    top-level ``options.http`` policy. Web admission derives its complete
+    fetcher vocabulary from this closed declaration; catalogue tags and
+    determinism are deliberately not policy authorities."""
+
+    content_trust: ContentTrust = ContentTrust.TRUSTED_INTERNAL
+    """Trust classification of content the transform itself produces."""
 
     @classmethod
     def check_web_local_requirements(cls) -> bool:

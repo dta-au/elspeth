@@ -34,7 +34,7 @@ from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.errors import FrameworkBugError, RuntimePreflightFailedError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance, PluginAssistanceExample
-from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
+from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ContentTrust, PluginCapability, WebConfigAuthority
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -1183,10 +1183,11 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:69c5a7efb70e7d81"
+    source_file_hash: str | None = "sha256:8440a78b6e6e334d"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
+    content_trust = ContentTrust.UNTRUSTED
     # elspeth-e6e552ce34: the LLM ADDS response fields and never rewrites an
     # input field's value in place. A response field colliding with a
     # guaranteed input is rejected at build by

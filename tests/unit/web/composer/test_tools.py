@@ -297,6 +297,7 @@ def _mock_catalog() -> MagicMock:
         PluginSummary(name="field_mapper", description="Field mapper", plugin_type="transform", config_fields=[]),
         PluginSummary(name="llm", description="LLM transform", plugin_type="transform", config_fields=[]),
         PluginSummary(name="web_scrape", description="Web scrape", plugin_type="transform", config_fields=[]),
+        PluginSummary(name="blob_fetch", description="Blob fetch", plugin_type="transform", config_fields=[]),
         PluginSummary(name="batch_replicate", description="Batch replicate", plugin_type="transform", config_fields=[]),
         PluginSummary(name="batch_stats", description="Batch stats", plugin_type="transform", config_fields=[]),
         PluginSummary(
@@ -16059,8 +16060,8 @@ class TestPreviewProofStep:
         assert result.success, result.data
         return result.updated_state
 
-    def _state_with_text_url_source(self, *, with_web_scrape: bool):
-        """Build a state with a text URL blob source, optionally with web_scrape."""
+    def _state_with_text_url_source(self, *, fetch_plugin: str | None):
+        """Build a state with a text URL blob source and optional HTTP fetcher."""
         state = _empty_state()
         catalog = _mock_catalog()
 
@@ -16068,7 +16069,7 @@ class TestPreviewProofStep:
             "set_source_from_blob",
             {
                 "blob_id": self.url_blob_id,
-                "on_success": "url_rows" if with_web_scrape else "content",
+                "on_success": "url_rows" if fetch_plugin is not None else "content",
                 "on_validation_failure": "discard",
                 "options": {
                     "column": "url",
@@ -16083,29 +16084,42 @@ class TestPreviewProofStep:
         assert result.success, result.data
         state = result.updated_state
 
-        if with_web_scrape:
+        if fetch_plugin is not None:
+            options = (
+                {
+                    "url_field": "url",
+                    "schema": {"mode": "fixed", "fields": ["url: str"]},
+                    "content_field": "content",
+                    "fingerprint_field": "content_fingerprint",
+                    "format": "text",
+                    "text_separator": "\n",
+                    "http": {
+                        "abuse_contact": "test@example.com",
+                        "scraping_reason": "test",
+                        "allowed_hosts": "public_only",
+                    },
+                }
+                if fetch_plugin == "web_scrape"
+                else {
+                    "url_field": "url",
+                    "schema": {"mode": "fixed", "fields": ["url: str"]},
+                    "http": {
+                        "abuse_contact": "test@example.com",
+                        "fetch_reason": "test",
+                        "allowed_hosts": "public_only",
+                    },
+                }
+            )
             result = execute_tool(
                 "upsert_node",
                 {
                     "id": "fetch",
                     "node_type": "transform",
-                    "plugin": "web_scrape",
+                    "plugin": fetch_plugin,
                     "input": "url_rows",
                     "on_success": "content",
                     "on_error": "discard",
-                    "options": {
-                        "url_field": "url",
-                        "schema": {"mode": "fixed", "fields": ["url: str"]},
-                        "content_field": "content",
-                        "fingerprint_field": "content_fingerprint",
-                        "format": "text",
-                        "text_separator": "\n",
-                        "http": {
-                            "abuse_contact": "test@example.com",
-                            "scraping_reason": "test",
-                            "allowed_hosts": "public_only",
-                        },
-                    },
+                    "options": options,
                 },
                 state,
                 catalog,
@@ -16187,6 +16201,54 @@ class TestPreviewProofStep:
 
         diagnostics = result.data["proof_diagnostics"]
         matching = [d for d in diagnostics if d["code"] == "text_source_url_without_web_scrape"]
+        assert matching
+        assert matching[0]["evidence_locator"]["source_name"] == "url_source"
+
+    def test_unrelated_branch_fetcher_does_not_suppress_text_url_blocker(self) -> None:
+        """Fetcher membership is necessary but must be downstream of this source."""
+        state = self._state_with_csv_source(schema_mode="observed").with_named_source(
+            "url_source",
+            SourceSpec(
+                plugin="text",
+                on_success="url_content",
+                options={
+                    "blob_ref": self.url_blob_id,
+                    "column": "url",
+                    "schema": {"mode": "fixed", "fields": ["url: str"]},
+                },
+                on_validation_failure="discard",
+            ),
+        )
+        state = state.with_node(
+            NodeSpec(
+                id="unrelated_fetch",
+                node_type="transform",
+                plugin="web_scrape",
+                input="rows",
+                on_success="unrelated_content",
+                on_error="discard",
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        matching = [
+            diagnostic for diagnostic in result.data["proof_diagnostics"] if diagnostic["code"] == "text_source_url_without_web_scrape"
+        ]
         assert matching
         assert matching[0]["evidence_locator"]["source_name"] == "url_source"
 
@@ -16428,7 +16490,7 @@ class TestPreviewProofStep:
     # -- text_source_url_without_web_scrape ---------------------------------
 
     def test_text_url_without_web_scrape_blocks(self) -> None:
-        state = self._state_with_text_url_source(with_web_scrape=False)
+        state = self._state_with_text_url_source(fetch_plugin=None)
         result = execute_tool(
             "preview_pipeline",
             {},
@@ -16445,7 +16507,20 @@ class TestPreviewProofStep:
         assert result.data["is_valid"] is False
 
     def test_text_url_with_web_scrape_does_not_block(self) -> None:
-        state = self._state_with_text_url_source(with_web_scrape=True)
+        state = self._state_with_text_url_source(fetch_plugin="web_scrape")
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+        codes = [d["code"] for d in result.data["proof_diagnostics"]]
+        assert "text_source_url_without_web_scrape" not in codes
+
+    def test_text_url_with_blob_fetch_does_not_block(self) -> None:
+        state = self._state_with_text_url_source(fetch_plugin="blob_fetch")
         result = execute_tool(
             "preview_pipeline",
             {},
@@ -16461,7 +16536,7 @@ class TestPreviewProofStep:
 
     def test_inspection_warnings_surfaced_as_info(self) -> None:
         """The text source's web_scrape warning is mirrored in proof_diagnostics as info."""
-        state = self._state_with_text_url_source(with_web_scrape=True)
+        state = self._state_with_text_url_source(fetch_plugin="web_scrape")
         result = execute_tool(
             "preview_pipeline",
             {},

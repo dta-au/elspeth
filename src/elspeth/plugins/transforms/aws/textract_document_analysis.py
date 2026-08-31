@@ -35,7 +35,7 @@ from elspeth.contracts.errors import (
 )
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.plugin_capabilities import WebConfigAuthority
+from elspeth.contracts.plugin_capabilities import ContentTrust, WebConfigAuthority
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.canonical import canonical_json
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -308,9 +308,10 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1682f6466bb2d482"
+    source_file_hash: str | None = "sha256:903f8009398889a4"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
+    content_trust = ContentTrust.UNTRUSTED
     creates_tokens = False
     audit_characteristics = frozenset({AuditCharacteristic.CREDENTIALS})
     capability_tags = ("aws", "textract", "document", "ocr", "enrichment")

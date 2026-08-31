@@ -8,7 +8,7 @@ Covers:
   * JSON inspection — array, single object, wrapped data_key, JSONL
     auto-detection from .json content shape.
   * JSONL inspection — multi-line objects, partial parse failures.
-  * Text inspection — single URL → web_scrape hint, multi-line text,
+  * Text inspection — single URL → HTTP-fetch hint, multi-line text,
     URL detection.
   * Bounded reads (8 KiB / 100 rows).
   * Redacted identity surfacing without leaking raw content / full hash.
@@ -551,10 +551,11 @@ class TestJsonInspection:
 
 
 class TestTextInspection:
-    def test_single_url_emits_web_scrape_hint(self) -> None:
+    def test_single_url_emits_capability_neutral_http_fetch_hint(self) -> None:
         f = inspect_blob_content(content=b"https://example.com\n", filename="input.txt", mime_type="text/plain")
         assert f.url_candidates == ("https://example.com",)
-        assert any("web_scrape" in w for w in f.warnings)
+        assert any("compatible HTTP fetch transform" in w for w in f.warnings)
+        assert all("web_scrape" not in w for w in f.warnings)
 
     def test_multi_line_text_with_urls(self) -> None:
         f = inspect_blob_content(

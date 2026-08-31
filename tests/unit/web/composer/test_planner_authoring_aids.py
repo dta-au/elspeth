@@ -1931,9 +1931,8 @@ class TestPromptShieldRules:
         assert "web_scrape" in rendered
         assert "llm" in rendered
         # Shielded deployment: the attachment point is the wiring, not a card.
-        # Producer-neutral wording — "the fetch step" misdescribed a document
-        # extraction producer once aws_textract_document_analysis joined the
-        # untrusted set.
+        # Producer-neutral wording applies equally to fetched, generated,
+        # retrieved, and document-extracted untrusted content.
         assert "between that producer node and" in rendered
 
         from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
@@ -1951,19 +1950,29 @@ class TestPromptShieldRules:
         whether a producer is taught. Document extraction is in that set:
         Textract returns whatever text the uploaded document carried.
         """
+        from elspeth.plugins.infrastructure.manager import untrusted_content_transform_names
         from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
-        from elspeth.web.interpretation_state import _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS
 
-        assert "aws_textract_document_analysis" in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS
+        untrusted_producer_names = untrusted_content_transform_names()
+        assert "aws_textract_document_analysis" in untrusted_producer_names
 
         rendered = "\n".join(
             _prompt_shield_rules(
                 shield_plugin="aws_bedrock_prompt_shield",
-                untrusted_producers=tuple(sorted(_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS)),
+                untrusted_producers=tuple(sorted(untrusted_producer_names)),
             )
         )
-        for producer in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS:
+        for producer in untrusted_producer_names:
             assert producer in rendered
+
+    def test_non_fetch_producer_rules_make_no_fetch_or_remote_provenance_claim(self) -> None:
+        """RAG content is untrusted without being an HTTP-fetch transform."""
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+
+        rendered = "\n".join(_prompt_shield_rules(shield_plugin=None, untrusted_producers=("rag_retrieval",)))
+
+        assert "untrusted or externally controlled upstream content" in rendered
+        assert all(term not in rendered.casefold() for term in ("fetch", "internet", "remote"))
 
     def test_textract_is_shielded_but_never_taught_web_scrape_cleanup(self) -> None:
         """Document text is untrusted input, not raw HTML with a fingerprint field."""
