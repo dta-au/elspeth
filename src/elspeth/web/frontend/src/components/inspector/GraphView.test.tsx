@@ -928,6 +928,28 @@ describe("GraphView", () => {
       ]);
       // No queue self-loop (the queue's implicit output uses its own id).
       expect(ids.some((id) => id.includes("inbound-inbound"))).toBe(false);
+
+      // The hidden list is the graph's text alternative, not secondary
+      // decoration. Pin the queue's implicit self-published output there too:
+      // one queue -> consumer edge, never one bypass per upstream producer.
+      const connections = within(screen.getByRole("list", {
+        name: "Pipeline branch connections",
+      }));
+      expect(
+        connections.getAllByText(
+          "inbound to normalize: success (success)",
+        ),
+      ).toHaveLength(1);
+      expect(
+        connections.queryByText(
+          "source:orders to normalize: success (success)",
+        ),
+      ).not.toBeInTheDocument();
+      expect(
+        connections.queryByText(
+          "source:refunds to normalize: success (success)",
+        ),
+      ).not.toBeInTheDocument();
     });
 
     it("produces the same edge set when source insertion order is reversed", () => {
@@ -2154,6 +2176,27 @@ describe("GraphView", () => {
       expect(inboundEdgeIds("select_fields")).toEqual([
         "edge-inferred-conn-merge_branches-select_fields",
       ]);
+
+      // This list is the diagram's accessible topology authority. Assert all
+      // three fan-in-adjacent connections exactly once: the self-published
+      // coalesce output plus the two alias-labelled inbound arms. A generic
+      // `input` fallback would either omit the outbound or duplicate the first
+      // inbound arm as an unlabelled success edge.
+      const connections = within(screen.getByRole("list", {
+        name: "Pipeline branch connections",
+      }));
+      for (const label of [
+        "recommend_pairing to merge_branches: branch_a (success)",
+        "get_hex to merge_branches: branch_b (success)",
+        "merge_branches to select_fields: success (success)",
+      ]) {
+        expect(connections.getAllByText(label)).toHaveLength(1);
+      }
+      expect(
+        connections.queryByText(
+          "recommend_pairing to merge_branches: success (success)",
+        ),
+      ).not.toBeInTheDocument();
     });
 
     it("draws the outbound edge of an aggregation that omits on_success", () => {
@@ -2196,6 +2239,14 @@ describe("GraphView", () => {
       expect(inboundEdgeIds("select_fields")).toEqual([
         "edge-inferred-conn-roll_up-select_fields",
       ]);
+      const connections = within(screen.getByRole("list", {
+        name: "Pipeline branch connections",
+      }));
+      expect(
+        connections.getAllByText(
+          "roll_up to select_fields: success (success)",
+        ),
+      ).toHaveLength(1);
     });
 
     it("does not invent an implicit outbound connection for a TERMINAL coalesce", () => {

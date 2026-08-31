@@ -90,7 +90,11 @@ are the routing contract: a producer's `on_success`, `routes`, or `fork_to`
 value must match a downstream node's `input` or an output's `sink_name`.
 Error policies are narrower: transform/aggregation/gate `on_error` may be
 `discard` or an output `sink_name`, never a downstream processing input. Node
-ids identify components; they are not implicit connections.
+ids ordinarily identify components rather than connections. The only implicit
+self-publishing node kinds are `aggregation`, `queue`, and `coalesce`: when
+`on_success` is omitted, each publishes under its own node id, and a downstream
+consumer sets `input` to that id. Every other node id identifies only a
+component; `row_union` requires an explicit `on_success` connection.
 
 - [capability-node:transform] A `transform` applies a policy-visible plugin.
   It can preserve, add, rename, parse, expand, or otherwise shape row fields as
