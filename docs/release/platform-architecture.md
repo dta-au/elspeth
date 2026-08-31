@@ -177,5 +177,5 @@ risk appetite or authority-to-operate boundary.
 - [`composer-guide.md`](composer-guide.md) explains the web authoring surface.
 - [`guarantees.md`](guarantees.md) lists the audit and lineage promises the
   system treats as defects if broken.
-- [`assessment-mapping.md`](assessment-mapping.md) maps current evidence to
-  public-sector evaluation touchpoints.
+- The [documentation index](../README.md) routes to the current contracts,
+  operational runbooks, and evaluation material.

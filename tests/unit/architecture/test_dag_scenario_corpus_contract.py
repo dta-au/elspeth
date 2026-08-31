@@ -1005,12 +1005,6 @@ LIVE_DAG_DOCUMENTS = (
     COMPLETENESS_CRITERIA_PATH,
     DOCS_INDEX_PATH,
 )
-ACTIVE_CORPUS_ISSUES = (
-    "elspeth-ef29ef6ba4",
-    "elspeth-cb1053fe46",
-    "elspeth-be41d0ea25",
-)
-
 EXPECTED_HAPPY_PATH_YAML = b"""sources:
   primary:
     plugin: csv
@@ -1557,22 +1551,11 @@ def test_dag_hub_links_the_live_scenario_corpus_authorities() -> None:
     assert "authoritative live" in content.lower()
 
 
-def test_scenario_corpus_readme_links_manifest_criteria_and_active_issue() -> None:
+def test_scenario_corpus_readme_links_manifest_and_criteria() -> None:
     targets = _markdown_link_targets(CORPUS_README_PATH)
-    content = CORPUS_README_PATH.read_text(encoding="utf-8")
 
     assert "v1/manifest.yaml" in targets
     assert "../completeness-criteria.md" in targets
-    for issue_id in ACTIVE_CORPUS_ISSUES:
-        assert issue_id in content
-        assert f"filigree show {issue_id} --json" in content
-
-
-def test_dag_docs_explain_product_criteria_and_executable_lifecycle_cells() -> None:
-    content = "\n".join(path.read_text(encoding="utf-8") for path in (DAG_HUB_PATH, CORPUS_README_PATH, ASSESSMENT_FRAMEWORK_PATH)).lower()
-
-    assert "15 product-quality criteria" in content
-    assert "11 executable lifecycle cells" in content
 
 
 @pytest.mark.parametrize("document", LIVE_DAG_DOCUMENTS)

@@ -142,5 +142,3 @@ hand the result to the right next step.
   that apply once a pipeline runs.
 - Read [`platform-architecture.md`](platform-architecture.md) for the broader
   system shape.
-- Read [`assessment-mapping.md`](assessment-mapping.md) for the public-sector
-  evaluation map and caveats.

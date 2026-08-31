@@ -78,8 +78,6 @@ Out of scope:
 
 ## Public Release Note
 
-The project is MIT licensed and currently pre-production outside the scoped
-interim ATO statement described in `docs/release/executive-summary.md`. The
-current assurance posture is documented candidly in
-`docs/release/executive-summary.md`, `docs/release/assessment-mapping.md`, and
-`docs/release/guarantees.md`.
+The project is MIT licensed and pre-release. The current product status is in
+the [project overview](README.md), and the maintained assurance commitments are
+in [Audit and Lineage Guarantees](docs/release/guarantees.md).

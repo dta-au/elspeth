@@ -496,10 +496,10 @@ class ComposerPluginCrashError(ComposerServiceError):
     ``ComposerConvergenceError``. If the ordering is inverted the generic
     handler would launder the crash into a 502, reintroducing the
     silent-laundering behaviour the narrowed catch was designed to
-    eliminate. The invariant is mechanically enforced by
-    ``scripts/cicd/enforce_composer_catch_order.py`` (rule CCO1), which
-    scans ``web/`` for any ``try`` block where a superclass handler
-    precedes one of its ``ComposerServiceError`` subclasses.
+    eliminate. The ``composer.catch_order`` lint rule mechanically enforces
+    the invariant by scanning ``web/`` for any ``try`` block where a
+    superclass handler precedes one of its ``ComposerServiceError``
+    subclasses.
     """
 
     _FROZEN_ATTRS: ClassVar[frozenset[str]] = frozenset(
