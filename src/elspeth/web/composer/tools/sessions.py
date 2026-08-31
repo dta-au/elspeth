@@ -62,10 +62,8 @@ from elspeth.web.composer.tools._common import (
     _ECHOED_REVIEW_METADATA_NOTE,
     _ECHOED_SOURCE_AUTHORING_NOTE,
     _FULL_STATE_COMPONENT_ALIAS_SET,
-    _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
-    _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+    _SET_PIPELINE_DOCUMENT_SCHEMA_DESCRIPTION,
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
-    _STEP_DESCRIPTION_DESCRIPTION,
     ReviewedSourceAuthority,
     ToolContext,
     ToolResult,
@@ -120,7 +118,6 @@ from elspeth.web.composer.tools.declarations import (
 )
 from elspeth.web.composer.tools.sources import (
     _MIME_TO_SOURCE,
-    _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _delimiter_extra_for_csv_blob,
     _drop_echoed_source_authoring,
     _header_only_inline_csv_conflict,
@@ -1757,15 +1754,13 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
     ),
     json_schema={
         "type": "object",
+        "description": _SET_PIPELINE_DOCUMENT_SCHEMA_DESCRIPTION,
         "properties": {
             "source": {
                 "type": "object",
                 "description": (
-                    "Source configuration. Use blob_id to bind an already uploaded session blob, or "
-                    "inline_blob to materialize user-provided literal data atomically with the pipeline. "
-                    "null carries NO meaning — it is not 'keep the existing source'. Every call must "
-                    "supply source or sources as a real object: on a full rebuild, re-supply the "
-                    "complete existing source block, including blob_id only when that block carries one."
+                    "Single source. On rebuild supply exactly source or sources; null never means keep. "
+                    "blob_id binds a ready blob; inline_blob creates one."
                 ),
                 "properties": {
                     "plugin": {"type": "string"},
@@ -1775,15 +1770,12 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     },
                     "options": {
                         "type": "object",
-                        "description": "Plugin-specific source config. Required by most file/data sources."
-                        + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+                        "description": "Plugin-specific source config; required by most file/data sources.",
                     },
                     "on_success": {
                         "type": "string",
                         "description": (
-                            "Connection-name string the source PUBLISHES. Some downstream "
-                            "consumer (node 'input' or output 'sink_name') MUST equal this. "
-                            "Connections match by string, not by node id."
+                            "Published connection consumed by a node input or output sink_name; never inferred from a node id."
                         ),
                     },
                     "on_validation_failure": {
@@ -1792,7 +1784,6 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     },
                     "description": {
                         "type": ["string", "null"],
-                        "description": _STEP_DESCRIPTION_DESCRIPTION,
                     },
                     "inline_blob": {
                         "type": ["object", "null"],
@@ -1814,9 +1805,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
             "sources": {
                 "type": "object",
                 "description": (
-                    "Named source roots keyed by stable source name; use instead of source for multi-source "
-                    "pipelines. Values share source's shape minus blob_id/inline_blob. null carries NO "
-                    "meaning; every call must supply source or sources as a real object."
+                    "Named sources; values omit blob_id/inline_blob. On rebuild supply exactly source or sources; null never means keep."
                 ),
                 "additionalProperties": {
                     "type": "object",
@@ -1824,7 +1813,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "plugin": {"type": "string"},
                         "options": {
                             "type": "object",
-                            "description": "Plugin-specific source config." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+                            "description": "Plugin-specific source config.",
                         },
                         "on_success": {"type": "string"},
                         "on_validation_failure": {
@@ -1833,7 +1822,6 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         },
                         "description": {
                             "type": ["string", "null"],
-                            "description": _STEP_DESCRIPTION_DESCRIPTION,
                         },
                     },
                     "required": ["plugin", "on_success"],
@@ -1857,25 +1845,18 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "on_success": {
                             "type": ["string", "null"],
                             "description": (
-                                "Connection-name string this node PUBLISHES; some downstream "
-                                "input/sink_name MUST equal it. Omit for gates (they route via "
-                                "condition+routes). A coalesce publishes under its own node id, and "
-                                "its on_success, when set, may ONLY name a sink. A row_union's "
-                                "on_success must name a downstream processing connection, never a sink."
+                                "Published connection; omit for gates. Coalesce may name only a sink; "
+                                "row_union must name a downstream processing connection."
                             ),
                         },
                         "on_error": {
                             "type": ["string", "null"],
                             "minLength": 1,
-                            "description": (
-                                "Node-level error policy (transform/aggregation/gate): 'discard' or a declared sink "
-                                "name. For a gate it covers row expression-evaluation errors and is authored on the "
-                                "node, never as an edge; omit it to preserve fail-fast behavior."
-                            ),
+                            "description": ("Node-level transform/aggregation/gate error policy: discard or a sink; omit for fail-fast."),
                         },
                         "options": {
                             "type": "object",
-                            "description": "Plugin-specific node config." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+                            "description": "Plugin-specific node config.",
                         },
                         "condition": {"type": ["string", "null"]},
                         "routes": {
@@ -1891,9 +1872,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             "items": {"type": "string"},
                             "additionalProperties": {"type": "string"},
                             "description": (
-                                "Branch inputs for coalesce or row_union. For row_union, every "
-                                "branches value is a real consumed input connection; input must "
-                                "repeat the first value only as an adapter placeholder."
+                                "Coalesce/row_union consumed inputs; row_union input repeats its first branch for adapter compatibility."
                             ),
                         },
                         "policy": {"type": ["string", "null"]},
@@ -1916,7 +1895,6 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         },
                         "description": {
                             "type": ["string", "null"],
-                            "description": _STEP_DESCRIPTION_DESCRIPTION,
                         },
                         "scope_name": {
                             "type": ["string", "null"],
@@ -1937,15 +1915,8 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     "required": ["id", "node_type", "input"],
                 },
                 "description": (
-                    "Node specs. A queue node is a structural fan-in point: node_type='queue', id == input == the "
-                    "shared connection name, plugin and every routing field omitted, options at most an optional "
-                    "description; multiple producers may publish that name precisely because the queue is declared. "
-                    "A row_union is plugin-free require_all fork reconvergence: at least two ordered branches, "
-                    "input set to the first branch connection, on_success published to downstream processing "
-                    "(not a sink), no options/routing/policy/merge fields, optional timeout_seconds. "
-                    "A collector closes a declared EXPAND scope: node_type='collector', a batch-aware plugin, "
-                    "and the scope binding authored on the node — scope_name, scope_opener (the multi-row "
-                    "transform that opens the group), and scope_policy ('require_all' or 'best_effort', no default)."
+                    "Processing and structural nodes; queue, row_union, and collector rules are in the supplied "
+                    "canonical pipeline capabilities."
                 ),
             },
             "edges": {
@@ -1964,12 +1935,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     },
                     "required": ["id", "from_node", "to_node", "edge_type"],
                 },
-                "description": (
-                    "Edge specs. edge_type='on_error' is supported for transform/aggregation sink wiring only; "
-                    "a gate's evaluation-error policy is the node's on_error field. "
-                    "Advisory display records: node connection fields are the authoritative runtime "
-                    "wiring, and [] is complete for a fully-wired topology."
-                ),
+                "description": ("Advisory display edges; node routing fields are authoritative. Gate errors use node on_error."),
             },
             "outputs": {
                 "type": "array",
@@ -1978,21 +1944,16 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     "properties": {
                         "sink_name": {
                             "type": "string",
-                            "description": (
-                                "Sink name: BOTH the sink's identifier AND the connection-name the sink "
-                                "consumes — it MUST equal some upstream's on_success value; it need not "
-                                "match any node id."
-                            ),
+                            "description": ("Output id and consumed connection; match an upstream publication, not a node id."),
                         },
                         "plugin": {"type": "string"},
                         "options": {
                             "type": "object",
-                            "description": "Plugin-specific sink config." + _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+                            "description": "Plugin-specific sink config.",
                         },
                         "on_write_failure": {"type": ["string", "null"]},
                         "description": {
                             "type": ["string", "null"],
-                            "description": _STEP_DESCRIPTION_DESCRIPTION,
                         },
                     },
                     "required": ["sink_name", "plugin"],

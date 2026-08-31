@@ -1614,6 +1614,23 @@ _STEP_DESCRIPTION_DESCRIPTION: Final[str] = (
     "change what the step does. Informational only — never affects validation or execution."
 )
 
+_SET_PIPELINE_DOCUMENT_SCHEMA_DESCRIPTION: Final[str] = (
+    "Complete canonical pipeline document. "
+    + _STEP_DESCRIPTION_DESCRIPTION
+    + " Option ownership: source options cannot author "
+    + ", ".join(sorted(_SERVER_OWNED_SOURCE_OPTION_KEYS))
+    + "; bind blobs via set_source_from_blob, set_source_from_blobs, source.blob_id, or source.inline_blob. "
+    "LLM-node options cannot author "
+    + ", ".join(sorted(_RUNTIME_OWNED_LLM_OPTION_KEYS))
+    + "; ELSPETH re-derives them. Output options cannot contain interpretation_requirements; "
+    "stage their reviews on a source or node. Inside interpretation_requirements, only "
+    + _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT
+    + " are authorable. Omit resolver-owned fields: "
+    + ", ".join(sorted(_RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS))
+    + ". Stage a pending review in this document, then call request_interpretation_review; "
+    "backend and user resolution write the remaining metadata."
+)
+
 
 def canonicalize_source_validation_failure(value: str | None) -> str:
     """Fold unspecified spellings of ``on_validation_failure`` into 'discard'.
