@@ -264,6 +264,27 @@ class InterpretationRequirement(TypedDict):
     resolved_prompt_template_hash: str | None
 
 
+ResolvedReviewEvidenceField = Literal[
+    "accepted_artifact_hash",
+    "resolved_prompt_template_hash",
+]
+
+_ARTIFACT_BOUND_INTERPRETATION_KINDS: Final[frozenset[InterpretationKind]] = frozenset(
+    {
+        InterpretationKind.INVENTED_SOURCE,
+        InterpretationKind.PIPELINE_DECISION,
+        InterpretationKind.SOURCE_DATA_CONTRACT,
+    }
+)
+
+
+def resolved_review_evidence_field(kind: InterpretationKind) -> ResolvedReviewEvidenceField:
+    """Return the one hash field a resolved review kind must carry."""
+    if kind in _ARTIFACT_BOUND_INTERPRETATION_KINDS:
+        return "accepted_artifact_hash"
+    return "resolved_prompt_template_hash"
+
+
 class PromptTextPart(TypedDict):
     kind: Literal["text"]
     text: str
@@ -2260,12 +2281,8 @@ def _node_review_artifact(
 
 
 def _resolved_review_hash(requirement: InterpretationRequirement, kind: InterpretationKind) -> str:
-    if kind in (InterpretationKind.PIPELINE_DECISION, InterpretationKind.INVENTED_SOURCE, InterpretationKind.SOURCE_DATA_CONTRACT):
-        field = "accepted_artifact_hash"
-        value = requirement["accepted_artifact_hash"]
-    else:
-        field = "resolved_prompt_template_hash"
-        value = requirement["resolved_prompt_template_hash"]
+    field = resolved_review_evidence_field(kind)
+    value = requirement[field]
     if type(value) is not str or not value:
         raise ValueError(f"resolved interpretation requirement {requirement['id']!r} has no {field}")
     return value

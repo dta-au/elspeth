@@ -287,6 +287,12 @@ def test_canonical_invariant_accepts_exact_coherent_pending_rows() -> None:
             "resolved_prompt_template_hash",
             "accepted_artifact_hash",
         ),
+        (
+            "source_data_contract",
+            "source_data_contract",
+            "accepted_artifact_hash",
+            "resolved_prompt_template_hash",
+        ),
     ),
 )
 def test_canonical_invariant_requires_kind_appropriate_resolved_evidence(
