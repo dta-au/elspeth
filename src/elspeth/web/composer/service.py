@@ -551,6 +551,37 @@ class _MalformedLLMResponseError(ComposerServiceError):
         self.provider_metadata = provider_metadata
 
 
+def advisor_provider_failure_types() -> tuple[type[Exception], ...]:
+    """The Tier-3 failure surface an advisor call can raise.
+
+    Single authority for the callers that degrade an advisor outage into
+    structured tool feedback instead of failing the composer turn. It names
+    the provider SDK, transport and malformed-response families only.
+
+    Deliberately absent: ``TimeoutError`` and ``asyncio.CancelledError``,
+    which callers route through their own deadline and lifecycle arms, and
+    every first-party error. An ``AuditIntegrityError`` out of the recorder,
+    a plugin crash, or an ordinary defect in controlled code is not a
+    provider fault and must keep unwinding rather than be reported to the
+    composer LLM as an advisor outage.
+    """
+
+    import httpx
+    from litellm.exceptions import APIError as LiteLLMAPIError
+    from litellm.exceptions import AuthenticationError as LiteLLMAuthError
+    from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
+    from openai import OpenAIError as OpenAIProviderError
+
+    return (
+        LiteLLMAPIError,
+        LiteLLMAuthError,
+        LiteLLMBadRequestError,
+        OpenAIProviderError,
+        httpx.HTTPError,
+        _MalformedLLMResponseError,
+    )
+
+
 @trust_boundary(
     tier=3,
     source="raw LiteLLM/provider-SDK completion response object (untrusted model/provider output)",

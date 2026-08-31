@@ -26,7 +26,7 @@ from opentelemetry.sdk.resources import Resource
 from pydantic import SecretBytes, ValidationError
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import CompileError, OperationalError
+from sqlalchemy.exc import CompileError, OperationalError, ProgrammingError
 from starlette.requests import Request
 from starlette.responses import Response as StarletteResponse
 from starlette.routing import Mount, Route, WebSocketRoute
@@ -1464,6 +1464,29 @@ class TestLifespanShutdown:
                 pass
 
     @pytest.mark.asyncio
+    async def test_lifespan_aborts_when_startup_orphan_sweep_fails(self, monkeypatch, tmp_path) -> None:
+        """A server that cannot settle orphaned runs must not serve.
+
+        The startup sweep has no catch: sessions would stay blocked by the
+        active-run partial unique index and Landscape rows would stay pending
+        reconciliation with no record that the sweep never ran, so any SQL/IO
+        fault fails startup — same posture as the inline-custody
+        reconciliation above.
+        """
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
+
+        async def _fail_sweep(**_kwargs: object) -> list[RunRecord]:
+            raise OperationalError("UPDATE runs", {}, Exception("db unavailable"))
+
+        monkeypatch.setattr(app.state.session_service, "cancel_all_orphaned_run_records", _fail_sweep)
+        with (
+            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+            pytest.raises(OperationalError),
+        ):
+            async with lifespan(app):
+                pass
+
+    @pytest.mark.asyncio
     async def test_lifespan_aborts_on_composer_config_rejection(self, monkeypatch, tmp_path) -> None:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
         app.state._session_engine_finalizer()
@@ -2229,12 +2252,12 @@ class TestPeriodicOrphanCleanup:
         """Periodic cleanup logs recoverable audit/DB failures and keeps running.
 
         The catch in _periodic_orphan_cleanup is narrowed to
-        (SQLAlchemyError, OSError). OperationalError models the realistic
-        production failure — transient connection drop, lock timeout, or
-        SQLite-busy — that the loop must survive. A prior iteration used
-        RuntimeError here, which is now the wrong signal: RuntimeError is a
-        programmer-bug class and must propagate past the catch (see the
-        companion programmer-bug test below).
+        OperationalError — transient connection drop, lock timeout, or
+        SQLite-busy — the one failure class the loop must survive (and only
+        up to the consecutive-failure bound; see the escalation test below).
+        A prior iteration used RuntimeError here, which is now the wrong
+        signal: RuntimeError is a programmer-bug class and must propagate
+        past the catch (see the companion programmer-bug test below).
 
         The leak assertions on the structured log entry verify that the
         exc_info drop holds: the DB URL fragment and SQL statement from
@@ -2367,7 +2390,7 @@ class TestPeriodicOrphanCleanup:
 
         This is the guardrail for the narrowed catch at
         _periodic_orphan_cleanup: replacing ``except Exception`` with
-        ``except (SQLAlchemyError, OSError)`` means a drifted attribute on
+        ``except OperationalError`` means a drifted attribute on
         ExecutionServiceImpl, a signature change on SessionServiceImpl, or
         an assertion violation now terminates the task immediately. A future
         regression that re-widens the catch would turn production into an
@@ -2442,6 +2465,105 @@ class TestPeriodicOrphanCleanup:
                 "reason": "Orphaned by periodic cleanup — no active executor thread",
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_persistent_operational_error_escalates_after_bound(self) -> None:
+        """Contention absorption is bounded: after the consecutive-failure
+        bound the sweeper stops presuming transience and re-raises, so the
+        stored failure surfaces through the task-death route instead of being
+        logged every interval forever."""
+
+        async def always_fail(**_: object) -> int:
+            raise OperationalError("SELECT * FROM runs", {}, Exception("db unavailable"))
+
+        session_service = _RecordingSessionService(cancel_side_effect=always_fail)
+        execution_service = _RecordingExecutionService()
+
+        with capture_logs() as cap_logs:
+            telemetry = build_sessions_telemetry()
+            task = asyncio.create_task(
+                _periodic_orphan_cleanup(session_service, execution_service, telemetry, interval_seconds=0, max_age_seconds=3600)
+            )
+            with pytest.raises(OperationalError):
+                await asyncio.wait_for(task, timeout=5.0)
+
+        bound = app_module._ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES
+        assert len(session_service.cancel_all_orphaned_runs_calls) == bound
+
+        failure_events = [entry for entry in cap_logs if entry.get("event") == "periodic_orphan_cleanup_failed"]
+        escalation_events = [entry for entry in cap_logs if entry.get("event") == "periodic_orphan_cleanup_escalating"]
+        assert len(failure_events) == bound - 1
+        assert len(escalation_events) == 1
+        event = escalation_events[0]
+        assert event["exc_class"] == "OperationalError"
+        assert event["consecutive_failures"] == bound
+        # The redaction pattern holds on the escalation event too.
+        assert "db unavailable" not in str(event)
+        assert "SELECT * FROM runs" not in str(event)
+
+    @pytest.mark.asyncio
+    async def test_recovery_resets_the_escalation_counter(self) -> None:
+        """A successful sweep resets the consecutive-failure counter: only an
+        unbroken failure run escalates. Without the reset, the post-recovery
+        failure below would be failure number ``bound`` and kill the task, and
+        the second recovery would never be observed."""
+        bound = app_module._ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES
+        second_recovery = asyncio.Event()
+        call_count = {"n": 0}
+
+        async def fail_recover_fail_recover(**_: object) -> int:
+            call_count["n"] += 1
+            if call_count["n"] <= bound - 1 or call_count["n"] == bound + 1:
+                raise OperationalError("stmt", {}, Exception("db unavailable"))
+            if call_count["n"] >= bound + 2:
+                second_recovery.set()
+            return 0
+
+        session_service = _RecordingSessionService(cancel_side_effect=fail_recover_fail_recover)
+        execution_service = _RecordingExecutionService()
+
+        telemetry = build_sessions_telemetry()
+        task = asyncio.create_task(
+            _periodic_orphan_cleanup(session_service, execution_service, telemetry, interval_seconds=0, max_age_seconds=3600)
+        )
+        try:
+            await asyncio.wait_for(second_recovery.wait(), timeout=5.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "standing_exc",
+        [
+            pytest.param(ProgrammingError("SELECT bad", {}, Exception("no such column")), id="programming_error"),
+            pytest.param(OSError("sessions.db unreachable"), id="os_error"),
+        ],
+    )
+    async def test_standing_faults_terminate_task_immediately(self, standing_exc: Exception) -> None:
+        """Only OperationalError models transient contention. A non-operational
+        SQLAlchemyError or a raw OSError is standing operator/programmer state:
+        it must escape the catch on the first occurrence — no retry, no
+        redacted-retry log event."""
+
+        async def raise_standing(**_: object) -> int:
+            raise standing_exc
+
+        session_service = _RecordingSessionService(cancel_side_effect=raise_standing)
+        execution_service = _RecordingExecutionService()
+
+        with capture_logs() as cap_logs:
+            telemetry = build_sessions_telemetry()
+            task = asyncio.create_task(
+                _periodic_orphan_cleanup(session_service, execution_service, telemetry, interval_seconds=0, max_age_seconds=3600)
+            )
+            with pytest.raises(type(standing_exc)):
+                await asyncio.wait_for(task, timeout=5.0)
+
+        assert len(session_service.cancel_all_orphaned_runs_calls) == 1
+        failure_events = [entry for entry in cap_logs if entry.get("event") == "periodic_orphan_cleanup_failed"]
+        assert failure_events == [], cap_logs
 
 
 class TestOrphanLandscapeReconciliation:
@@ -3350,7 +3472,15 @@ class TestDeploymentStateModeStartup:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         settings = _external_settings(tmp_path, "azure-container-apps", composer_boot_probe_enabled=False)
-        engine = create_engine("sqlite:///:memory:")
+        from elspeth.web.sessions.engine import create_session_engine as real_create_session_engine
+        from elspeth.web.sessions.schema import initialize_session_schema as real_initialize_session_schema
+
+        # External mode assumes an externally managed schema that exists
+        # before boot, and the startup orphan sweep fails startup when it
+        # cannot read the runs table — so the fake engine must carry the
+        # real schema, not an empty in-memory database.
+        engine = real_create_session_engine(f"sqlite:///{tmp_path / 'external-sessions.db'}")
+        real_initialize_session_schema(engine)
         original_dispose = engine.dispose
         dispose_calls = 0
 

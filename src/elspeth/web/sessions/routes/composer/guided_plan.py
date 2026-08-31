@@ -665,6 +665,17 @@ async def post_guided_plan(
                     secondary=lookup_exc,
                     site="fence_lost_winner_lookup",
                 )
+                # Parity with the ordinary-failure arm's identical rejoin
+                # below: a failure in the system-owned winner lookup must
+                # propagate. Noting it and reporting the cancellation instead
+                # filed a Tier-1 corruption signal — a failed replay
+                # verification, or an outcome the closed union does not admit
+                # — as a log line under a routine terminal event, and did the
+                # same for any first-party defect in the rejoin. This route
+                # lost the fence, so it has no durable write of its own in
+                # doubt; what is in doubt is the record it just failed to
+                # read.
+                raise
             else:
                 if joined is None or isinstance(joined, (GuidedOperationLease, GuidedOperationExpired)):
                     _note_guided_full_secondary_failure(

@@ -727,16 +727,17 @@ def test_omission_reporting_is_entry_and_byte_bounded_with_closed_withheld_count
 
 
 def test_final_envelope_stays_within_byte_budget_after_withheld_count_growth() -> None:
-    broken = tuple((cast(PluginKind, "source"), f"broken_{index:03d}") for index in range(100))
+    # Omission pressure comes from referenced-but-never-loaded identities
+    # (the not_loaded_this_session arm): schema reads for available loaded
+    # identities are contract-bound and cannot legitimately fail.
+    missing = tuple((cast(PluginKind, "source"), f"missing_{index:03d}") for index in range(100))
 
     class _BoundaryCatalog(_MultiSchemaCatalog):
         def __init__(self) -> None:
-            super().__init__((("source", "boundary"), *broken))
+            super().__init__((("source", "boundary"),))
             self.enum_length = 1
 
         def get_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
-            if name.startswith("broken_"):
-                raise ValueError("schema_unavailable")
             schema = super().get_schema(plugin_type, name)
             raw = schema.model_dump()
             enum = ["x" * self.enum_length]
@@ -746,7 +747,7 @@ def test_final_envelope_stays_within_byte_budget_after_withheld_count_growth() -
 
     catalog = _BoundaryCatalog()
     view, _snapshot = _multi_policy_view(catalog)
-    loaded = frozenset({("source", "boundary"), *broken})
+    loaded = frozenset({("source", "boundary")})
 
     low, high = 1, 100_000
     boundary_evidence: dict[str, object] | None = None
@@ -756,7 +757,7 @@ def test_final_envelope_stays_within_byte_budget_after_withheld_count_growth() -
         evidence, _evidenced = build_schema_contract_evidence(
             view,
             schemas_loaded=loaded,
-            referenced={("source", "boundary")},
+            referenced={("source", "boundary"), *missing},
         )
         if evidence["schemas"]:
             boundary_evidence = cast(dict[str, object], evidence)
@@ -767,6 +768,26 @@ def test_final_envelope_stays_within_byte_budget_after_withheld_count_growth() -
     assert boundary_evidence is not None
     assert cast(int, boundary_evidence["omissions_withheld_count"]) > 9
     assert cast(int, boundary_evidence["canonical_bytes_used"]) <= cast(int, boundary_evidence["max_canonical_bytes"])
+
+
+def test_internal_schema_read_failure_propagates() -> None:
+    """Availability is settled before the schema read, so a ValueError from
+    reading an available identity is an internal defect: it must propagate,
+    never be recorded as an omission that conceals the failure."""
+
+    class _DefectiveCatalog(_MultiSchemaCatalog):
+        def get_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
+            raise ValueError("projection bookkeeping defect")
+
+    catalog = _DefectiveCatalog((("source", "plugin_000"),))
+    view, _snapshot = _multi_policy_view(catalog)
+
+    with pytest.raises(ValueError, match="projection bookkeeping defect"):
+        build_schema_contract_evidence(
+            view,
+            schemas_loaded=frozenset({("source", "plugin_000")}),
+            referenced=set(),
+        )
 
 
 def test_unreferenced_identity_removed_by_policy_rotation_is_not_redisclosed() -> None:

@@ -3004,10 +3004,10 @@ def _project_planner_plugin_contract(data: object) -> tuple[PlannerPluginContrac
     suppresses=("R5",),
     invariant=(
         "dispatches on result.data's shape (an authoritative-state component echo) and falls closed "
-        "to the leak-safe surface_projection_unavailable payload for anything unrecognized; never "
-        "raises. Two of this function's isinstance sites root at provider_current_state (a separate, "
-        "policy-owned server-computed projection, not this boundary) and are outside this decorator's "
-        "scope by design"
+        "to the leak-safe surface_projection_unavailable payload for anything unrecognized; raises "
+        "only on an internal invariant failure in the policy-owned provider_current_state projection. "
+        "The output-lookup isinstance site roots at provider_current_state (a separate, policy-owned "
+        "server-computed projection, not this boundary) and is outside this decorator's scope by design"
     ),
 )
 def _serialize_provider_discovery_result(
@@ -3094,12 +3094,11 @@ def _serialize_provider_discovery_result(
         selected = authoritative_data["node"]
         nodes = provider_current_state["nodes"] if "nodes" in provider_current_state else []
         selected_id = selected["id"] if isinstance(selected, Mapping) and "id" in selected else None
+        # Node candidates are ELSPETH's own server-computed projection: a
+        # candidate without a subscriptable "id" is an internal invariant
+        # failure that must raise, not fall closed as a surface error.
         node = next(
-            (
-                candidate
-                for candidate in nodes
-                if isinstance(candidate, Mapping) and (candidate["id"] if "id" in candidate else None) == selected_id
-            ),
+            (candidate for candidate in nodes if candidate["id"] == selected_id),
             None,
         )
         if node is not None:
