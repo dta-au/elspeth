@@ -2624,6 +2624,7 @@ async def maybe_resolve_step_1_source_chat(
     shape_repair_used = False
     deferred_repair_used = False
     pending_deferred_repair_slots: tuple[DeferredIntentAction | None, ...] | None = None
+    pending_deferred_repair_error: DeferredIntentActionShapeError | None = None
     pending_grouped_source_call: _RepairThreadToolCall | None = None
     pending_deferred_actions: tuple[DeferredIntentAction, ...] = ()
     max_attempts = 2
@@ -2713,6 +2714,13 @@ async def maybe_resolve_step_1_source_chat(
                 retain_calls = [
                     call for call in terminal_calls if call.function is not None and call.function.name == "retain_deferred_intent"
                 ]
+                if pending_deferred_repair_error is not None and not retain_calls:
+                    # The repair transaction is unresolved until a retain
+                    # cohort arrives. A different terminal must not replace it
+                    # and silently discard the original malformed instruction;
+                    # the caller converts this owned shape error into durable
+                    # clarification retention for the whole originating Send.
+                    raise pending_deferred_repair_error
                 source_calls = [call for call in terminal_calls if call.function is not None and call.function.name == "resolve_source"]
                 withheld_source_calls = [
                     call for call in tool_calls if call.function is not None and call.function.name == "resolve_source"
@@ -2777,6 +2785,7 @@ async def maybe_resolve_step_1_source_chat(
                         if deferred_repair_used or attempt_index + 1 >= max_attempts or admitted_repair is None:
                             raise retain_failures[0][1]
                         deferred_repair_used = True
+                        pending_deferred_repair_error = retain_failures[0][1]
                         pending_deferred_repair_slots = _deferred_intent_repair_slots(
                             calls=tuple(retain_calls),
                             rejected_calls=tuple(call for call, _ in retain_failures),
@@ -2956,6 +2965,8 @@ async def maybe_resolve_step_1_source_chat(
             # and must not be trusted; it falls through to the advisory fallback
             # (now grounded by _ADVISORY_NO_TOOLS_ADDENDUM) exactly as before.
             if not tool_calls:
+                if pending_deferred_repair_error is not None:
+                    raise pending_deferred_repair_error
                 if pending_deferred_actions:
                     # The model declined to resend the rejected source after a
                     # grouped repair. Its already-validated retain siblings
@@ -3003,6 +3014,8 @@ async def maybe_resolve_step_1_source_chat(
             # Non-empty tool_calls with no resolve_source (hallucinated tool name
             # or function=None): return the empty outcome so the route falls back
             # to the tool-less advisory call, matching the step-2 contract.
+            if pending_deferred_repair_error is not None:
+                raise pending_deferred_repair_error
             status = ComposerLLMCallStatus.SUCCESS
             return GuidedChatEmptyOutcome()
         except TimeoutError:
@@ -3623,6 +3636,7 @@ async def maybe_resolve_step_2_sink_chat(
     # whole Send.
     deferred_repair_used = False
     pending_deferred_repair_slots: tuple[DeferredIntentAction | None, ...] | None = None
+    pending_deferred_repair_error: DeferredIntentActionShapeError | None = None
     pending_grouped_sink_call: _RepairThreadToolCall | None = None
     # A group's VALID parsed retains must survive their sink half never
     # becoming acceptable: if the loop would otherwise end without a terminal
@@ -3664,6 +3678,11 @@ async def maybe_resolve_step_2_sink_chat(
                 retain_calls = [
                     call for call in terminal_calls if call.function is not None and call.function.name == "retain_deferred_intent"
                 ]
+                if pending_deferred_repair_error is not None and not retain_calls:
+                    # Keep the repair cohort transactional: resolution,
+                    # management, and other terminals cannot replace an
+                    # unresolved retain group from the originating Send.
+                    raise pending_deferred_repair_error
                 sink_calls = [call for call in terminal_calls if call.function is not None and call.function.name == "resolve_sink"]
                 withheld_sink_calls = [call for call in tool_calls if call.function is not None and call.function.name == "resolve_sink"]
                 # A resolve_sink + 1..K retain_deferred_intent GROUP is the one
@@ -3724,6 +3743,7 @@ async def maybe_resolve_step_2_sink_chat(
                         if deferred_repair_used or _iteration + 1 >= iterations or admitted_repair is None:
                             raise retain_failures[0][1]
                         deferred_repair_used = True
+                        pending_deferred_repair_error = retain_failures[0][1]
                         pending_deferred_repair_slots = _deferred_intent_repair_slots(
                             calls=tuple(retain_calls),
                             rejected_calls=tuple(call for call, _ in retain_failures),
@@ -3878,6 +3898,8 @@ async def maybe_resolve_step_2_sink_chat(
             # carries a hallucinated tool call is a more suspicious shape and
             # must not have its prose trusted either (falls through instead).
             if not tool_calls:
+                if pending_deferred_repair_error is not None:
+                    raise pending_deferred_repair_error
                 if pending_deferred_actions:
                     # The model declined to resend the group after its sink half
                     # was rejected; the valid retains still apply rather than
@@ -3901,6 +3923,8 @@ async def maybe_resolve_step_2_sink_chat(
             # dispatching anything.
             discovery_calls = [tc for tc in tool_calls if tc.function is not None and tc.function.name in allowed_discovery]
             if not discovery_calls or len(discovery_calls) != len(tool_calls):
+                if pending_deferred_repair_error is not None:
+                    raise pending_deferred_repair_error
                 if pending_deferred_actions:
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredIntentWithheldResolutionOutcome(
@@ -4003,6 +4027,8 @@ async def maybe_resolve_step_2_sink_chat(
     # Discovery iteration cap reached without a resolve_sink. A group's valid
     # retain calls still apply alone (R2-F15: the instructions are never
     # silently discarded); otherwise degrade to the advisory fallback.
+    if pending_deferred_repair_error is not None:
+        raise pending_deferred_repair_error
     if pending_deferred_actions:
         return GuidedChatDeferredIntentWithheldResolutionOutcome(
             actions=pending_deferred_actions,

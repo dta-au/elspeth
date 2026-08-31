@@ -1965,6 +1965,101 @@ async def test_targeted_retain_repair_preserves_valid_grouped_resolution(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("retry_content", [None, "I cannot express that constraint."])
+async def test_deferred_repair_decline_uses_clarification_retention(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    retry_content: str | None,
+) -> None:
+    """A no-tool repair reply must retain the original malformed instruction."""
+    calls_seen = 0
+
+    async def declining_repair(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        calls = (
+            [
+                SimpleNamespace(
+                    id="c_retain_valid",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_rejected",
+                    function=SimpleNamespace(
+                        name="retain_deferred_intent",
+                        arguments=json.dumps({"target_stage": "topology"}),
+                    ),
+                ),
+            ]
+            if calls_seen == 1
+            else []
+        )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=retry_content, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", declining_repair)
+
+    with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+        await _run_stage_solver(stage)
+    assert calls_seen == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("retry_kind", ["resolution", "management", "hallucinated"])
+async def test_deferred_repair_non_retain_retry_uses_clarification_retention(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    retry_kind: str,
+) -> None:
+    """A different terminal or unknown tool cannot replace the retain cohort."""
+    calls_seen = 0
+
+    async def replacing_retain_group_with_resolution(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = [
+                SimpleNamespace(
+                    id="c_retain_valid",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_rejected",
+                    function=SimpleNamespace(
+                        name="retain_deferred_intent",
+                        arguments=json.dumps({"target_stage": "topology"}),
+                    ),
+                ),
+            ]
+        else:
+            function_name = {
+                "resolution": "resolve_source" if stage == "source" else "resolve_sink",
+                "management": "manage_deferred_intent",
+                "hallucinated": "peek_secrets",
+            }[retry_kind]
+            arguments = (
+                json.dumps(_PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS) if retry_kind == "resolution" else "{}"
+            )
+            calls = [
+                SimpleNamespace(
+                    id="c_replacement",
+                    function=SimpleNamespace(
+                        name=function_name,
+                        arguments=arguments,
+                    ),
+                )
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", replacing_retain_group_with_resolution)
+
+    with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+        await _run_stage_solver(stage)
+    assert calls_seen == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
 async def test_form_directed_revision_keeps_retain_from_pair_with_withheld_resolution(
     monkeypatch: pytest.MonkeyPatch,
     stage: str,
