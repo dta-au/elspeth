@@ -16,11 +16,13 @@ from pathlib import Path
 from typing import Any, Literal, TypedDict
 
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.composer._producer_resolver import published_success_connection
 from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec, _coalesce_branch_connections
 from elspeth.web.paths import resolve_data_path
+from elspeth.web.plugin_policy.coverage import node_has_capability
 
 FANOUT_GUARD_ERROR_TYPE = "execution_fanout_ack_required"
 FANOUT_GUARD_AUDIT_COMMENT = "elspeth_execution_fanout_guard"
@@ -204,7 +206,7 @@ def evaluate_execution_fanout_guard(
     all_deterministic = True
 
     for node in state.nodes:
-        if node.node_type != "transform" or node.plugin != "llm":
+        if node.node_type != "transform" or not node_has_capability(node, PluginCapability.LLM):
             continue
 
         trace = _trace_upstream_fanout(

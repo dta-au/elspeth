@@ -499,16 +499,13 @@ def test_s3_source_policy_accepts_profile_lowered_source_evidence() -> None:
 #     plugin name), so ``node_type`` was its ONLY limiter. Measured before
 #     the fix, with a transform control: transform FIRES, aggregation and
 #     collector SILENT.
-#   - ``_llm_policy_components`` feeds the base-URL and tracing egress gates,
-#     which key on the literal plugin name ``"llm"``. Its collector half is
-#     unreachable (``llm`` is not batch-aware), but its AGGREGATION half is
-#     LIVE: ``llm`` on an aggregation validates with zero composer errors,
-#     because the batch-aware constraint lives in ``_collector_intrinsic_errors``
-#     and the aggregation arm never checks it.
-#
-# The name-scoping hole those LLM gates share — a capability-declaring plugin
-# under any other name escapes them on a plain transform node — is NOT closed
-# here and is tracked as elspeth-c7626ae109.
+#   - ``_llm_policy_components`` feeds the base-URL and tracing egress gates.
+#     Its collector half is unreachable for today's builtin ``llm`` (which is
+#     not batch-aware), but the helper must keep node-kind and capability
+#     classification orthogonal: a future batch-aware LLM plugin cannot be
+#     dropped merely because it is hosted by a collector. Capability-derived
+#     subject tests for alternate plugin names live in
+#     ``test_llm_capability_security_gates.py`` (elspeth-c7626ae109).
 # ---------------------------------------------------------------------------
 
 _MANAGED_IDENTITY_OPTIONS: dict[str, object] = {
@@ -561,14 +558,11 @@ def test_managed_identity_gate_skips_plugin_less_structural_nodes() -> None:
 
 
 @pytest.mark.parametrize("node_type", ["transform", "aggregation", "collector"])
-def test_llm_policy_components_include_every_plugin_bearing_node_kind(node_type: str) -> None:
-    """The helper feeding the base-URL and tracing egress gates must present
-    the node at all; before the widening it silently dropped non-transforms.
-    """
+def test_llm_policy_components_include_every_llm_capable_node_kind(node_type: str) -> None:
+    """The helper must not narrow a capability subject by node kind."""
     from elspeth.web.execution._validation_materialization import _llm_policy_components
 
-    plugin = "llm" if node_type != "collector" else "batch_stats"
-    state = _state(nodes=(_kind_node(node_type, plugin=plugin, options={}),))
+    state = _state(nodes=(_kind_node(node_type, plugin="llm", options={}),))
 
     components = _llm_policy_components(state)
 
