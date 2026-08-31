@@ -514,3 +514,189 @@ class TestJoinKeySpelling:
         assert result.status == "success"
         assert result.row is not None
         assert result.row.to_dict()["d"] == "A fine hat"
+
+
+def _declared_output_field(transform: ReferenceJoin, name: str) -> Any:
+    config = transform._output_schema_config
+    assert config is not None and config.fields is not None
+    return {field.name: field for field in config.fields}[name]
+
+
+class TestJoinedOutputFieldTypes:
+    """The resolved index knows every value the join can emit (elspeth-cd5cb844bc).
+
+    The whole table is resolved at config load, so under ``on_miss: fail`` the
+    set of values a field can carry is CLOSED — the declared type derives from
+    it instead of erasing to ``any``. ``default`` unifies that set with the
+    configured default; ``null`` keeps the honest abstention, because any row
+    may miss and take a ``None``.
+    """
+
+    def test_a_csv_table_under_fail_derives_str(self) -> None:
+        """csv.DictReader yields str for every cell, so a csv join is str."""
+        transform = build(on_miss="fail")
+        field = _declared_output_field(transform, "product_description")
+        assert field.field_type == "str"
+        assert field.required is True
+        assert field.nullable is False, "no value in the closed emitted set is None"
+
+    def test_a_json_table_under_fail_derives_the_value_type(self) -> None:
+        """Sparse entries fail the row under fail, so they do not widen the type."""
+        transform = build(
+            reference_content=PRODUCTS_JSON,
+            reference_format="json",
+            output={"tax_rate": "ref['tax']['rate']"},
+            on_miss="fail",
+        )
+        field = _declared_output_field(transform, "tax_rate")
+        assert field.field_type == "float"
+
+    def test_a_bool_value_derives_bool_not_int(self) -> None:
+        table = json.dumps([{"sku": "hats", "in_stock": True}, {"sku": "coats", "in_stock": False}])
+        transform = build(reference_content=table, reference_format="json", output={"stocked": "ref['in_stock']"})
+        assert _declared_output_field(transform, "stocked").field_type == "bool"
+
+    def test_mixed_types_across_entries_abstain_to_any(self) -> None:
+        table = json.dumps([{"sku": "hats", "code": 1}, {"sku": "coats", "code": "X"}])
+        transform = build(reference_content=table, reference_format="json", output={"code": "ref['code']"})
+        assert _declared_output_field(transform, "code").field_type == "any"
+
+    def test_a_structured_value_abstains_to_any(self) -> None:
+        transform = build(
+            reference_content=PRODUCTS_JSON,
+            reference_format="json",
+            output={"tax": "ref['tax']"},
+            on_miss="null",
+        )
+        assert _declared_output_field(transform, "tax").field_type == "any"
+
+    def test_a_table_authored_null_under_fail_makes_the_field_nullable(self) -> None:
+        table = json.dumps([{"sku": "hats", "note": "fine"}, {"sku": "coats", "note": None}])
+        transform = build(reference_content=table, reference_format="json", output={"note": "ref['note']"})
+        field = _declared_output_field(transform, "note")
+        assert field.field_type == "str", "the type comes from the non-null values"
+        assert field.nullable is True, "the table holds a null this join will emit"
+
+    def test_on_miss_null_keeps_the_honest_any(self) -> None:
+        """Any row may miss and take a None; the abstention is deliberate."""
+        transform = build(on_miss="null")
+        field = _declared_output_field(transform, "product_description")
+        assert field.field_type == "any"
+        assert field.nullable is True
+
+    def test_on_miss_default_unifies_with_a_matching_default(self) -> None:
+        transform = build(on_miss="default", default_values={"product_description": "n/a"})
+        field = _declared_output_field(transform, "product_description")
+        assert field.field_type == "str"
+        assert field.nullable is False
+
+    def test_on_miss_default_with_a_foreign_typed_default_abstains(self) -> None:
+        """A key miss is always possible, so the default's type joins the set."""
+        transform = build(on_miss="default", default_values={"product_description": 0})
+        assert _declared_output_field(transform, "product_description").field_type == "any"
+
+    def test_on_miss_default_with_a_null_default_is_nullable(self) -> None:
+        transform = build(on_miss="default", default_values={"product_description": None})
+        field = _declared_output_field(transform, "product_description")
+        assert field.field_type == "str"
+        assert field.nullable is True
+
+    def test_emitted_row_contract_carries_the_derived_type(self) -> None:
+        """ADR-014: the contract on the emitted row states str, not object."""
+        transform = build()
+        result = transform.process(make_pipeline_row({"product": "hats"}), make_source_context())
+        assert result.row is not None and result.row.contract is not None
+        field = {f.normalized_name: f for f in result.row.contract.fields}["product_description"]
+        assert field.python_type is str
+        assert field.source == "declared"
+
+    def test_live_session_shape_a_downstream_str_declaration_is_green(self) -> None:
+        """Session 891b7b1e: category→response_sla_hours over csv under fail.
+
+        The producer must declare str, and the DAG authority that a downstream
+        ``response_sla_hours: str`` consumer triggers must find no mismatch.
+        The str assertion carries the weight — ``any`` also returns None from
+        the authority, but as an abstention, which is the foreclosure this
+        ticket removes.
+        """
+        from elspeth.contracts.data import resolved_guarantee_type_mismatch
+
+        transform = build(
+            reference_content="category,response_sla_hours\nbilling,24\nsupport,8\n",
+            key_field="category",
+            reference_key_name="category",
+            output={"response_sla_hours": "ref['response_sla_hours']"},
+            on_miss="fail",
+        )
+        field = _declared_output_field(transform, "response_sla_hours")
+        assert field.field_type == "str"
+        assert resolved_guarantee_type_mismatch(field.field_type, str, consumer_strict=True) is None
+
+
+class TestAuthorDeclarationsOnJoinedFields:
+    """An author's own declaration is honored when true and refused when false.
+
+    Before elspeth-cd5cb844bc the schema builder overwrote every declared
+    joined field with ``any`` — the planner's TRUE ``response_sla_hours: str``
+    was forced wrong, and validation then steered the declaration downstream
+    as type erasure.
+    """
+
+    def test_a_compatible_declaration_survives(self) -> None:
+        transform = build(schema={"mode": "flexible", "fields": ["product_description: str"]})
+        field = _declared_output_field(transform, "product_description")
+        assert field.field_type == "str", "the author's declaration must not be clobbered to any"
+
+    def test_a_declared_wider_nullable_is_honored(self) -> None:
+        transform = build(
+            schema={
+                "mode": "flexible",
+                "fields": [{"name": "product_description", "field_type": "str", "nullable": True}],
+            }
+        )
+        field = _declared_output_field(transform, "product_description")
+        assert field.field_type == "str"
+        assert field.nullable is True, "an author may declare wider than the derivation proves"
+
+    def test_an_authored_any_is_an_abstention_and_survives(self) -> None:
+        transform = build(schema={"mode": "flexible", "fields": ["product_description: any"]})
+        assert _declared_output_field(transform, "product_description").field_type == "any"
+
+    def test_a_declaration_against_a_derived_any_survives(self) -> None:
+        """Mixed entries abstain; an abstention cannot refute the author."""
+        table = json.dumps([{"sku": "hats", "code": 1}, {"sku": "coats", "code": "X"}])
+        transform = build(
+            reference_content=table,
+            reference_format="json",
+            output={"code": "ref['code']"},
+            schema={"mode": "flexible", "fields": ["code: str"]},
+        )
+        assert _declared_output_field(transform, "code").field_type == "str"
+
+    def test_a_non_join_field_keeps_its_declaration_either_way(self) -> None:
+        transform = build(schema={"mode": "flexible", "fields": ["order_id: int"]})
+        assert _declared_output_field(transform, "order_id").field_type == "int"
+
+    def test_an_incompatible_declaration_is_refused_at_load(self) -> None:
+        with pytest.raises(PluginConfigError) as exc:
+            build(schema={"mode": "flexible", "fields": ["product_description: int"]})
+        message = str(exc.value)
+        assert "product_description" in message
+        assert "int" in message and "str" in message
+
+    def test_a_never_null_declaration_under_on_miss_null_is_refused(self) -> None:
+        """on_miss: null writes None on any miss; a non-nullable claim is false."""
+        with pytest.raises(PluginConfigError) as exc:
+            build(on_miss="null", schema={"mode": "flexible", "fields": ["product_description: str"]})
+        assert "nullable" in str(exc.value)
+
+    def test_a_never_null_declaration_against_a_table_authored_null_is_refused(self) -> None:
+        table = json.dumps([{"sku": "hats", "note": "fine"}, {"sku": "coats", "note": None}])
+        with pytest.raises(PluginConfigError) as exc:
+            build(
+                reference_content=table,
+                reference_format="json",
+                output={"note": "ref['note']"},
+                schema={"mode": "flexible", "fields": ["note: str"]},
+            )
+        assert "nullable" in str(exc.value)
