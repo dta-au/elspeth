@@ -6,7 +6,7 @@ resolve ``dict[str, typing.Any]`` (raised as ``InvalidArgument`` at example
 generation), and several MANIFEST argument models use ``Annotated[dict[str,
 Any], Sensitive(summarizer=...)]`` for option/slot/patch fields.
 
-Two distinct Hypothesis-resolution issues are addressed here:
+Three distinct Hypothesis-resolution issues are addressed here:
 
 1.  **``dict[str, Any]`` resolution.**  Hypothesis cannot generate values for
     ``typing.Any`` because there is no runtime instance of ``Any``.  We register
@@ -24,7 +24,14 @@ Two distinct Hypothesis-resolution issues are addressed here:
     ``Field(default_factory=dict)`` so the sentinel arm never appears in the
     generation strategy.
 
-**Why the 4 overrides are not auto-generated.**  Each ``st.builds(...)``
+3.  **Cross-field source selection.** ``SetPipelineArgumentsModel`` requires
+    exactly one of ``source`` or ``sources`` to be supplied and non-null.
+    Hypothesis cannot infer that ``model_validator`` contract from the field
+    annotations, so its default strategy generates invalid neither/both
+    combinations. An explicit top-level strategy chooses one branch and omits
+    the other field entirely.
+
+**Why the overrides are not auto-generated.**  Each ``st.builds(...)``
 override below carries **load-bearing per-field customizations** beyond the
 ``options`` sentinel issue.  For example, ``_set_pipeline_source_strategy``
 narrows ``inline_blob`` to ``st.one_of(st.none(), st.from_type(_InlineBlobModel))``
@@ -91,6 +98,7 @@ from elspeth.web.composer import tools as tools_module
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     MANIFEST,
+    SetPipelineArgumentsModel,
     SetSourceFromBlobArgumentsModel,
     SetSourceFromBlobsArgumentsModel,
     ToolRedaction,
@@ -220,6 +228,32 @@ def _set_pipeline_named_source_strategy() -> st.SearchStrategy[_SetPipelineNamed
     )
 
 
+@st.composite
+def _set_pipeline_arguments_strategy(draw: st.DrawFn) -> SetPipelineArgumentsModel:
+    """Generate only the model's exactly-one-source-selection contract."""
+    common = {
+        "nodes": draw(st.lists(st.from_type(_PipelineNodeModel), max_size=3)),
+        "edges": draw(st.lists(st.from_type(_PipelineEdgeModel), max_size=3)),
+        "outputs": draw(st.lists(st.from_type(_PipelineOutputModel), max_size=3)),
+        "metadata": draw(st.one_of(st.none(), st.from_type(_PipelineMetadataModel))),
+    }
+    if draw(st.booleans()):
+        return SetPipelineArgumentsModel(
+            source=draw(st.from_type(_SetPipelineSourceModel)),
+            **common,
+        )
+    return SetPipelineArgumentsModel(
+        sources=draw(
+            st.dictionaries(
+                st.text(),
+                st.from_type(_SetPipelineNamedSourceModel),
+                max_size=3,
+            )
+        ),
+        **common,
+    )
+
+
 def _pipeline_node_strategy() -> st.SearchStrategy[_PipelineNodeModel]:
     return st.builds(
         _PipelineNodeModel,
@@ -313,15 +347,18 @@ st.register_type_strategy(_PipelineNodeModel, _pipeline_node_strategy())
 st.register_type_strategy(_PipelineOutputModel, _pipeline_output_strategy())
 st.register_type_strategy(_SpliceTransformNodeModel, _splice_transform_node_strategy())
 st.register_type_strategy(_RepairToolCallShadowModel, _repair_tool_call_strategy())
+st.register_type_strategy(SetPipelineArgumentsModel, _set_pipeline_arguments_strategy())
 
 
-# Mirror of the four explicit ``st.register_type_strategy`` calls above.  This
+# Mirror of the default-factory ``st.register_type_strategy`` calls above. This
 # tuple is the single source of truth that the drift guard consults — if you
 # add a new ``st.register_type_strategy(Model, ...)`` for a model with
 # ``Field(default_factory=dict)``, you MUST add ``Model`` to this tuple in the
 # same edit.  Conversely, adding a new MANIFEST model with
 # ``Field(default_factory=dict)`` and forgetting an override here will cause
-# the drift guard to raise at conftest import time.
+# the drift guard to raise at conftest import time. The cross-field
+# ``SetPipelineArgumentsModel`` override has no default-factory dict field and
+# is intentionally outside this narrower inventory.
 _OVERRIDE_REGISTERED_MODELS: tuple[type[BaseModel], ...] = (
     SetSourceFromBlobArgumentsModel,
     SetSourceFromBlobsArgumentsModel,
@@ -525,7 +562,9 @@ def _fake_llm_response(
                 id=str(call["id"]),
                 function=_FakeFunction(
                     name=str(call["name"]),
-                    arguments=json.dumps(call.get("arguments", {})),
+                    arguments=json.dumps(
+                        {"pipeline": call.get("arguments", {})} if call["name"] == "set_pipeline" else call.get("arguments", {})
+                    ),
                 ),
             )
             for call in tool_calls

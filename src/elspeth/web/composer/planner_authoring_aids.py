@@ -4,8 +4,9 @@ The static skill pack deliberately carries no deployment plugin inventory (the
 ``no_deployment_plugin_facts`` gate enforces this), so worked ``set_pipeline``
 exemplars — which must name real plugins — are rendered here at prompt-build
 from the policy-visible catalog and ride in the planner's reviewed-context
-user message. The exact objects rendered into the prompt are validated
-through ``build_set_pipeline_candidate`` in
+user message. The exact flat canonical documents nested in the provider
+envelopes rendered into the prompt are validated through
+``build_set_pipeline_candidate`` in
 ``tests/unit/web/composer/test_planner_authoring_aids.py``; an exemplar the
 current validator rejects fails CI rather than teaching planners a dead shape.
 
@@ -223,7 +224,7 @@ class _ExemplarMetadata(TypedDict):
 
 
 class _SetPipelineExemplar(TypedDict):
-    """Closed top-level shape for worked set_pipeline arguments."""
+    """Closed flat canonical document nested in worked provider arguments."""
 
     source: _ExemplarSource
     nodes: list[_ExemplarNode]
@@ -232,20 +233,26 @@ class _SetPipelineExemplar(TypedDict):
     metadata: _ExemplarMetadata
 
 
+class _SetPipelineProviderArguments(TypedDict):
+    """Provider envelope around one flat canonical set-pipeline document."""
+
+    pipeline: _SetPipelineExemplar
+
+
 class _SourceCustodyAid(TypedDict):
     rules: list[str]
-    set_pipeline_exemplar_inline_blob: _SetPipelineExemplar
+    set_pipeline_exemplar_inline_blob: _SetPipelineProviderArguments
     existing_blob_source_binding: _ExemplarSource
 
 
 class _ForkCoalesceAid(TypedDict):
     rules: list[str]
-    set_pipeline_exemplar: _SetPipelineExemplar
+    set_pipeline_exemplar: _SetPipelineProviderArguments
 
 
 class _ForkRowUnionAid(TypedDict):
     rules: list[str]
-    set_pipeline_exemplar: _SetPipelineExemplar
+    set_pipeline_exemplar: _SetPipelineProviderArguments
 
 
 class _RulesAid(TypedDict):
@@ -335,8 +342,12 @@ _SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
     "If no tool returned the identifier, bind the data with source.inline_blob "
     "(filename, mime_type, content) or create_blob first. Never fabricate a "
     "blob_id, secret reference, model identifier, or any other identifier.",
-    "inline_blob.content must be the user's data verbatim, exactly as it "
-    "appears in their message; custody records it against that message.",
+    "inline_blob.content must be verbatim source data. Usually that is the "
+    "user's data exactly as it appears in their message; custody records it "
+    "against that message. The ONLY exception is content you generated "
+    "because the user explicitly requested planner-authored sample data; "
+    "bind it through inline_blob and follow the invented_source provenance "
+    "rule below.",
     "Custody owns the storage binding: author schema.mode and on_validation_failure on a blob-bound source, never path or blob_ref.",
     "A file the user NAMES but never uploaded, whose content is not in the "
     "conversation, has NO legal binding: source paths must resolve to real "
@@ -354,9 +365,27 @@ _SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
     # Session 891b7b1e turn 2: the planner sent source: null intending
     # 'keep the existing source' and burned a repair turn on the rejection.
     "set_pipeline is a FULL replacement: source: null never means 'keep "
-    "the current source'. A rebuild must re-supply the source explicitly — "
-    "copy the existing blob_id (from get_pipeline_state or list_blobs) "
-    "into source.blob_id, or resend inline_blob.",
+    "the current source'. Re-supply the source explicitly. Plugin-backed "
+    "sources must be preserved in that shape; "
+    "do not assume the current source is blob-bound. Retain source.blob_id "
+    "only for an existing singular blob-bound source whose block carries "
+    "one; use source.inline_blob only when intentionally supplying new "
+    "literal data.",
+    "ORDINARY/FREEFORM MUTATION SURFACE: when inspection and mutation tools "
+    "are advertised, re-supply the complete existing `source` configuration "
+    "or named `sources` map from "
+    "get_pipeline_state(component='set_pipeline_arguments'). If that reports "
+    "round_trip_unavailable, never fabricate or rebind source custody: use an "
+    "advertised narrow patch tool when the requested task permits, otherwise "
+    "surface the named gap.",
+    "PROPOSAL PLANNER SURFACE: read the current-state context and use only "
+    "tools advertised in this request. Re-supply an existing source only "
+    "when that context carries its exact authorable source binding. If the "
+    "authoritative binding is absent, redacted, diagnostic-only, or named/"
+    "multiple blob custody cannot round-trip, surface an exact-source/"
+    "round-trip gap and stop instead of guessing; never invoke an "
+    "unadvertised inspection or mutation tool, and never fabricate or rebind "
+    "source custody.",
     # Session 891b7b1e turn 1: the planner fabricated rows at the user's
     # request, then narrated its own content as 'the system auto-generated
     # placeholder content' — a provenance inversion in an audit-grade tool.
@@ -823,10 +852,12 @@ _REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
     "Do not author rows for llm_prompt_template or llm_model_choice — "
     "required LLM reviews auto-stage on every llm node. The planner-owned "
     "kinds are vague_term (wired via prompt_template_parts), registered "
-    "pipeline_decision, and invented_source. Auto-staged LLM reviews "
-    "surface at TURN END against the final frozen pipeline skeleton — an "
+    "pipeline_decision, and invented_source.",
+    "Only the llm_prompt_template review auto-surfaces through ordinary "
+    "no-tool finalization at TURN END against the final frozen pipeline "
+    "skeleton — an "
     "intermediate valid=True preview mid-turn is not a completion signal; "
-    "finish mutating and the backend surfaces the reviews itself.",
+    "finish mutating and let the backend surface that prompt-template review.",
     "NEVER author a pipeline_decision row with user_term "
     "required_control_auto_wired — that disclosure is staged exclusively by "
     "the server's required-control auto-wire pass, and a hand-authored row "
@@ -2713,7 +2744,10 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
     aids: _PlannerAuthoringAids = {
         "purpose": (
             "Server-rendered worked exemplars and catalog digest from the live "
-            "policy-visible catalog. These shapes validate against the current deployment."
+            "policy-visible catalog. These shapes validate against the current deployment. "
+            "Each set_pipeline_exemplar* value is a provider tool-argument envelope: "
+            "its pipeline field contains the flat canonical set-pipeline document "
+            "used directly by internal and MCP consumers."
         ),
     }
     custody = source_custody_exemplar_args(catalog, visible=visible)
@@ -2721,20 +2755,20 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
     if custody is not None and custody_blob_variant is not None:
         aids["source_custody"] = {
             "rules": list(_SOURCE_CUSTODY_RULES),
-            "set_pipeline_exemplar_inline_blob": custody,
+            "set_pipeline_exemplar_inline_blob": {"pipeline": custody},
             "existing_blob_source_binding": custody_blob_variant["source"],
         }
     fork_coalesce = fork_coalesce_exemplar_args(catalog, visible=visible, summaries=summaries)
     if fork_coalesce is not None:
         aids["fork_coalesce"] = {
             "rules": list(_FORK_COALESCE_RULES),
-            "set_pipeline_exemplar": fork_coalesce,
+            "set_pipeline_exemplar": {"pipeline": fork_coalesce},
         }
     fork_row_union = fork_row_union_exemplar_args(catalog, visible=visible)
     if fork_row_union is not None:
         aids["fork_row_union"] = {
             "rules": list(_FORK_ROW_UNION_RULES),
-            "set_pipeline_exemplar": fork_row_union,
+            "set_pipeline_exemplar": {"pipeline": fork_row_union},
         }
     # Resolved before the llm aids because the on_error rule they carry is
     # control-mode conditional. ``_selected_control_profile`` returns None for

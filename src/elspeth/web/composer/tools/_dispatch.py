@@ -60,6 +60,7 @@ from elspeth.web.composer.tools._registry import (
     should_augment_with_plugin_schemas,
 )
 from elspeth.web.composer.tools.discovery import _SESSION_AWARE_TOOL_NAMES
+from elspeth.web.composer.tools.generation import build_validation_guidance
 from elspeth.web.composer.tools.sessions import (
     _SESSION_AWARE_TOOL_HANDLERS,
     ADVISOR_TRIGGER_VALUES,
@@ -542,6 +543,37 @@ def _augment_with_plugin_schemas(
     return replace(result, plugin_schemas=schemas)
 
 
+def _augment_with_validation_guidance(result: ToolResult, tool_name: str) -> ToolResult:
+    """Attach inline catalogue repair guidance to a failed mutation.
+
+    The freeform twin of the planner surface's rejection enrichment
+    (``pipeline_planner._allowlisted_candidate_feedback``, which resolves the
+    same catalogue through ``explain_validation_code``). Without it the
+    freeform tool loop shipped a bare closed code and the model had to spend
+    a turn on ``explain_validation_error`` to learn the fix — the exact
+    round-trip ``plugin_schemas`` already eliminates for option-shape
+    failures (elspeth-5ff149dc4e; live session 891b7b1e burned a turn on
+    ``no_source_configured`` this way).
+
+    Scoped to mutation tools deliberately. Only ``_ToolResultResponseModel``
+    and the ``_tool_result_response_keys`` declarative entries admit the key;
+    a discovery tool such as ``get_blob_content`` answers to its own
+    ``extra="forbid"`` response model, and an unscoped augmentation would
+    fail its response path closed.
+
+    No-op on success, when the handler already set the field, and whenever
+    the envelope carries no error entries.
+    """
+    if tool_name not in _ALL_MUTATION_TOOL_NAMES:
+        return result
+    if result.success or result.validation_guidance is not None:
+        return result
+    guidance = build_validation_guidance(entry.error_code for entry in result.validation.errors)
+    if guidance is None:
+        return result
+    return replace(result, validation_guidance=guidance)
+
+
 def finalize_tool_result(
     result: ToolResult,
     *,
@@ -554,7 +586,12 @@ def finalize_tool_result(
     if tool_name in _ALL_MUTATION_TOOL_NAMES:
         result = _inject_prior_validation(result, prior_validation)
     result = _augment_with_plugin_schemas(result, tool_name, catalog, context)
-    return normalize_tool_result_validation(result, catalog)
+    result = normalize_tool_result_validation(result, catalog)
+    # Strictly after normalization: it can CONCATENATE the revalidated state's
+    # entries onto the rejections (_common.normalize_tool_result_validation),
+    # and guidance derived from the pre-normalization set would silently omit
+    # every code those entries introduce.
+    return _augment_with_validation_guidance(result, tool_name)
 
 
 def _enforce_composition_interpretation_gate(

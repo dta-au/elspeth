@@ -150,8 +150,11 @@ class ReferenceJoinConfig(TransformDataConfig):
                 raise ValueError(f"on_miss is 'default' but default_values has no entry for {missing_defaults}")
 
         # Parse here so a malformed table fails at config load rather than on the
-        # first row, and so duplicate keys are refused before anything runs.
-        build_reference_index(self)
+        # first row, and so duplicate keys are refused before anything runs. The
+        # declared-type check must live here, not in __init__, so pre-validation
+        # and the engine agree on rejection (test_validation_path_agreement).
+        index = build_reference_index(self)
+        _validate_declared_output_types(self, _derive_joined_field_types(self, index))
         return self
 
     @property
@@ -346,21 +349,128 @@ def _coerce_key(value: object) -> str:
     raise ReferenceTableError(f"reference key must be a string or number, got {type(value).__name__}")
 
 
-def _reference_join_added_output_fields(cfg: ReferenceJoinConfig) -> tuple[FieldDefinition, ...]:
-    # Declared ``any`` following value_transform, which guarantees.py:610-616
-    # names as the precedent for a transform that writes fields whose type it
-    # cannot know statically. Nullable because a table may hold a JSON null and
-    # because on_miss: null writes one.
-    return tuple(FieldDefinition(name=name, field_type="any", required=True, nullable=True) for name in sorted(cfg.output))
+#: Exact-type map from a resolved reference value to a declarable field type.
+#: An exact test keeps bool apart from int; anything unmapped (a dict or list a
+#: JSON table may hold) declares ``any``.
+_VALUE_FIELD_TYPES: dict[type, Literal["str", "int", "float", "bool"]] = {str: "str", bool: "bool", int: "int", float: "float"}
 
 
-def _build_reference_join_output_schema_config(cfg: ReferenceJoinConfig) -> SchemaConfig:
+def _derive_joined_field_types(cfg: ReferenceJoinConfig, index: ReferenceIndex) -> dict[str, FieldDefinition]:
+    """Derive each joined field's declarable type from the resolved index.
+
+    Under ``on_miss: fail`` the emitted set is CLOSED — a row either takes a
+    value already resolved in the index or fails — so the type derives from
+    exactly those values (a csv table therefore derives str unless an
+    expression converts: csv.DictReader yields str for every cell). Closing it
+    means reading it at ENTRY granularity, not field granularity: ``process``
+    fails the whole row when any one output field is unresolved, so an entry
+    that leaves one field unresolved emits nothing for the others either, and
+    a None it happens to hold is not a value this join can write.
+    ``default`` adds the configured default to the set, because a key miss is
+    always possible, and every entry can emit there — an unresolved field takes
+    the default rather than failing the row. ``null`` abstains outright: any
+    row may miss and take a None. Unification is conservative — mixed concrete
+    types declare ``any`` (an honest abstention), never a guess; a None in the
+    set makes the field nullable rather than widening its type.
+    """
+    emitting = list(index.entries.values())
+    if cfg.on_miss == "fail":
+        emitting = [entry_values for entry_values in emitting if all(entry_values[name] is not _UNRESOLVED for name in cfg.output)]
+    derived: dict[str, FieldDefinition] = {}
+    for name in sorted(cfg.output):
+        if cfg.on_miss == "null":
+            derived[name] = FieldDefinition(name=name, field_type="any", required=True, nullable=True)
+            continue
+        values = [entry_values[name] for entry_values in emitting if entry_values[name] is not _UNRESOLVED]
+        if cfg.on_miss == "default":
+            values.append(cfg.default_values[name])
+        types: set[Literal["str", "int", "float", "bool", "any"]] = {
+            _VALUE_FIELD_TYPES[type(value)] if type(value) in _VALUE_FIELD_TYPES else "any" for value in values if value is not None
+        }
+        field_type: Literal["str", "int", "float", "bool", "any"] = next(iter(types)) if len(types) == 1 else "any"
+        derived[name] = FieldDefinition(
+            name=name,
+            field_type=field_type,
+            required=True,
+            nullable=any(value is None for value in values),
+        )
+    return derived
+
+
+def _validate_declared_output_types(cfg: ReferenceJoinConfig, derived: Mapping[str, FieldDefinition]) -> None:
+    """Refuse an authored joined-field declaration the resolved table proves wrong.
+
+    A compatible declaration is honored, never clobbered; either side saying
+    ``any`` is an abstention and cannot refute the other. What IS refutable is
+    refused here at config load — the alternative was silently overwriting the
+    author, which forced a TRUE declaration wrong and steered the correction
+    downstream as type erasure (elspeth-cd5cb844bc).
+
+    ``required`` is refused rather than honored for a different reason: every
+    joined field is named in the output ``guaranteed_fields``, and honoring
+    ``required: false`` would build an output SchemaConfig that fails its OWN
+    ``to_dict``/``from_dict`` round-trip — ``from_dict`` refuses a guarantee
+    that is optional, and the output config is constructed directly, so nothing
+    else catches it (pinned by
+    ``test_an_optional_joined_field_would_not_survive_its_own_round_trip``).
+    The contradiction is reported here instead of being rewritten in silence.
+
+    Deriving ``required=False`` for a joined field remains open to the plugin
+    (elspeth-cd5cb844bc names it as an option under ``on_miss: null``), but it
+    would have to drop the field from ``guaranteed_fields`` in the same change.
+    This check constrains what an AUTHOR may assert against a guarantee the
+    plugin currently makes; it does not decide what that guarantee should be.
+    """
+    for declared in cfg.schema_config.fields or ():
+        if declared.name not in derived:
+            continue
+        derived_field = derived[declared.name]
+        if "any" not in (declared.field_type, derived_field.field_type) and declared.field_type != derived_field.field_type:
+            raise ValueError(
+                f"schema declares {declared.name!r} as {declared.field_type}, but the resolved reference table "
+                f"can only emit {derived_field.field_type} for it. Fix the declaration or the table; a declared "
+                "type is honored, never silently overwritten."
+            )
+        if derived_field.nullable and not declared.nullable:
+            reason = (
+                "on_miss is 'null', so any row that misses takes a None"
+                if cfg.on_miss == "null"
+                else "the resolved reference table or default_values holds a None this join will emit"
+            )
+            raise ValueError(
+                f"schema declares {declared.name!r} as never null, but {reason}. "
+                f"Declare the field nullable — '{declared.name}: {declared.field_type}?' — or remove the null."
+            )
+        if not declared.required:
+            raise ValueError(
+                f"schema declares {declared.name!r} optional, but reference_join creates it and guarantees it on "
+                "every row it emits, and a guarantee cannot be optional. Declare it required, or drop it from "
+                "'fields' and let the join declare it."
+            )
+
+
+def _reference_join_added_output_fields(cfg: ReferenceJoinConfig, index: ReferenceIndex) -> tuple[FieldDefinition, ...]:
+    """One definition per joined field, always required — the join writes every
+    output field on every row it emits.
+
+    The author's own declaration is taken WHOLE when one exists, never merged
+    with the derivation: ``_validate_declared_output_types`` has already refused
+    every part of it the resolved table refutes, so what is left is true and
+    rewriting any of it here would be the silent overwrite this change removes.
+    A field the author did not declare takes the derived definition.
+    """
+    derived = _derive_joined_field_types(cfg, index)
+    declared_by_name = {field.name: field for field in cfg.schema_config.fields or ()}
+    return tuple(declared_by_name[name] if name in declared_by_name else derived[name] for name in sorted(cfg.output))
+
+
+def _build_reference_join_output_schema_config(cfg: ReferenceJoinConfig, index: ReferenceIndex) -> SchemaConfig:
     schema_config = cfg.schema_config
     field_by_name: dict[str, FieldDefinition] = {}
     if schema_config.fields is not None:
         field_by_name.update((field.name, field) for field in schema_config.fields)
 
-    added_fields = _reference_join_added_output_fields(cfg)
+    added_fields = _reference_join_added_output_fields(cfg, index)
     field_by_name.update((field.name, field) for field in added_fields)
 
     base_guaranteed = set(schema_config.guaranteed_fields or ())
@@ -385,7 +495,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:50c55b1dcfea0f2d"
+    source_file_hash: str | None = "sha256:94e210ea3f3c3fec"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -443,7 +553,7 @@ class ReferenceJoin(BaseTransform):
         self.declared_output_fields = frozenset(cfg.output)
 
         self.input_schema = create_schema_from_config(cfg.schema_config, "ReferenceJoinInput", allow_coercion=False)
-        self._output_schema_config = _build_reference_join_output_schema_config(cfg)
+        self._output_schema_config = _build_reference_join_output_schema_config(cfg, self._index)
         self.output_schema = create_schema_from_config(self._output_schema_config, "ReferenceJoinOutput", allow_coercion=False)
 
     @classmethod

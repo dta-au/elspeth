@@ -440,7 +440,7 @@ async def test_set_pipeline_output_without_options_preserves_collision_control_e
             server.request_handlers,
             "set_pipeline",
             {
-                "source": None,
+                "source": {"plugin": "null", "on_success": "rows"},
                 "nodes": [],
                 "edges": [],
                 "outputs": [

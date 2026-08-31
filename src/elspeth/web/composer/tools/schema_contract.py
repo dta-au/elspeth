@@ -297,13 +297,49 @@ def assert_set_pipeline_schema_compatible(*, advertised_schema: Mapping[str, Any
     advertised_definitions: Mapping[str, Any] = {}
     if "$defs" in advertised:
         advertised_definitions = _schema_mapping(advertised["$defs"], path="$defs")
+    runtime_directional = _without_verified_set_pipeline_source_union(runtime_schema, path="runtime $")
+    advertised_directional = _without_verified_set_pipeline_source_union(advertised, path="advertised $")
     _assert_directional_compatibility(
-        runtime_schema,
-        advertised,
+        runtime_directional,
+        advertised_directional,
         runtime_definitions,
         advertised_definitions,
         path="$",
     )
+
+
+def _without_verified_set_pipeline_source_union(
+    schema: Mapping[str, Any],
+    *,
+    path: str,
+) -> Mapping[str, Any]:
+    """Verify and remove the root source union before directional walking.
+
+    ``_schema_branches`` treats a root ``oneOf`` as the complete branch and
+    therefore cannot also compare its sibling ``properties`` constraints.
+    The set_pipeline union is deliberately tiny and closed: verify its exact
+    two required-property branches, then run the existing directional walk on
+    every sibling field. Synthetic schemas without the set_pipeline source
+    properties remain available to the walker's focused tests unchanged.
+    """
+    if "properties" not in schema:
+        return schema
+    properties = _schema_mapping(schema["properties"], path=f"{path}.properties")
+    if "source" not in properties or "sources" not in properties:
+        return schema
+    if "oneOf" not in schema:
+        raise RuntimeError(f"{path}: set_pipeline schema must require exactly one of source or sources")
+    raw_branches = _schema_sequence(schema["oneOf"], path=f"{path}.oneOf")
+    required_sets: list[frozenset[str]] = []
+    for index, raw_branch in enumerate(raw_branches):
+        branch = _schema_mapping(raw_branch, path=f"{path}.oneOf[{index}]")
+        if set(branch) != {"required"}:
+            raise RuntimeError(f"{path}.oneOf[{index}]: source-selection branch must contain only required")
+        required_sets.append(_required_fields(branch, path=f"{path}.oneOf[{index}]"))
+    expected = {frozenset({"source"}), frozenset({"sources"})}
+    if len(required_sets) != 2 or set(required_sets) != expected:
+        raise RuntimeError(f"{path}: set_pipeline source-selection oneOf must require source xor sources")
+    return {key: value for key, value in schema.items() if key != "oneOf"}
 
 
 # core/config.py enforces these at settings_load, well after a composer

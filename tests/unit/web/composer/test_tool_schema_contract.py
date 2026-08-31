@@ -33,6 +33,32 @@ def _registered_set_pipeline_schema() -> dict[str, Any]:
     return next(definition["parameters"] for definition in get_tool_definitions() if definition["name"] == "set_pipeline")
 
 
+def _web_set_pipeline_definition() -> dict[str, Any]:
+    from elspeth.web.composer.service import ComposerServiceImpl
+    from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
+
+    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    return next(tool["function"] for tool in service._get_litellm_tools() if tool["function"]["name"] == "set_pipeline")
+
+
+def _provider_transported_set_pipeline_schema(provider: str) -> dict[str, Any]:
+    """Return the schema LiteLLM actually transports to a supported provider."""
+    from litellm.litellm_core_utils.prompt_templates.factory import _bedrock_tools_pt
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+    definition = _web_set_pipeline_definition()
+    wrapped_definition: Any = {"type": "function", "function": definition}
+    if provider == "anthropic":
+        anthropic_tool: Any
+        anthropic_tool, _ = AnthropicConfig()._map_tool_helper(wrapped_definition)
+        return anthropic_tool["input_schema"]
+    bedrock_tools: Any = _bedrock_tools_pt(
+        [wrapped_definition],
+        model="anthropic.claude-3-5-sonnet-20241022-v2:0",
+    )
+    return bedrock_tools[0]["toolSpec"]["inputSchema"]["json"]
+
+
 _BASE_PIPELINE: dict[str, Any] = {
     "source": {"plugin": "csv", "on_success": "rows"},
     "nodes": [],
@@ -42,11 +68,190 @@ _BASE_PIPELINE: dict[str, Any] = {
 
 
 @pytest.mark.parametrize(
+    ("case", "source_selection"),
+    [
+        pytest.param("missing_both", {}, id="missing-both"),
+        pytest.param("source_null", {"source": None}, id="source-null"),
+        pytest.param("sources_null", {"sources": None}, id="sources-null"),
+        pytest.param(
+            "both_non_null",
+            {
+                "source": {"plugin": "csv", "on_success": "rows"},
+                "sources": {"orders": {"plugin": "csv", "on_success": "rows"}},
+            },
+            id="both-non-null",
+        ),
+        pytest.param(
+            "source_null_with_named_sources",
+            {
+                "source": None,
+                "sources": {"orders": {"plugin": "csv", "on_success": "rows"}},
+            },
+            id="source-null-with-named-sources",
+        ),
+        pytest.param(
+            "sources_null_with_singular_source",
+            {
+                "source": {"plugin": "csv", "on_success": "rows"},
+                "sources": None,
+            },
+            id="sources-null-with-singular-source",
+        ),
+    ],
+)
+def test_set_pipeline_source_selection_is_rejected_by_provider_and_runtime_contracts(
+    case: str,
+    source_selection: dict[str, Any],
+) -> None:
+    del case  # readable parametrization id only
+    payload = {
+        **source_selection,
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
+
+    for schema in (_registered_set_pipeline_schema(), canonical_set_pipeline_schema()):
+        assert list(Draft202012Validator(schema).iter_errors(payload))
+    with pytest.raises(ValueError):
+        SetPipelineArgumentsModel.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "source_selection",
+    [
+        pytest.param({"source": {"plugin": "csv", "on_success": "rows"}}, id="singular-source"),
+        pytest.param(
+            {"sources": {"orders": {"plugin": "csv", "on_success": "rows"}}},
+            id="named-sources",
+        ),
+    ],
+)
+def test_set_pipeline_source_selection_accepts_each_real_provider_shape(
+    source_selection: dict[str, Any],
+) -> None:
+    payload = {
+        **source_selection,
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
+
+    for schema in (_registered_set_pipeline_schema(), canonical_set_pipeline_schema()):
+        assert list(Draft202012Validator(schema).iter_errors(payload)) == []
+    SetPipelineArgumentsModel.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("case", "source_selection", "expected_valid"),
+    [
+        pytest.param("missing_pipeline", {}, False, id="missing-outer-pipeline"),
+        pytest.param("pipeline_null", {"pipeline": None}, False, id="pipeline-null"),
+        pytest.param(
+            "missing_both",
+            {"pipeline": {"nodes": [], "edges": [], "outputs": []}},
+            False,
+            id="inner-missing-both",
+        ),
+        pytest.param(
+            "source_null",
+            {"pipeline": {"source": None, "nodes": [], "edges": [], "outputs": []}},
+            False,
+            id="inner-source-null",
+        ),
+        pytest.param(
+            "sources_null",
+            {"pipeline": {"sources": None, "nodes": [], "edges": [], "outputs": []}},
+            False,
+            id="inner-sources-null",
+        ),
+        pytest.param(
+            "both_non_null",
+            {
+                "pipeline": {
+                    "source": {"plugin": "csv", "on_success": "rows"},
+                    "sources": {"orders": {"plugin": "csv", "on_success": "rows"}},
+                    "nodes": [],
+                    "edges": [],
+                    "outputs": [],
+                }
+            },
+            False,
+            id="inner-both-non-null",
+        ),
+        pytest.param(
+            "source_null_with_named_sources",
+            {
+                "pipeline": {
+                    "source": None,
+                    "sources": {"orders": {"plugin": "csv", "on_success": "rows"}},
+                    "nodes": [],
+                    "edges": [],
+                    "outputs": [],
+                }
+            },
+            False,
+            id="inner-source-null-with-named-sources",
+        ),
+        pytest.param(
+            "sources_null_with_singular_source",
+            {
+                "pipeline": {
+                    "source": {"plugin": "csv", "on_success": "rows"},
+                    "sources": None,
+                    "nodes": [],
+                    "edges": [],
+                    "outputs": [],
+                }
+            },
+            False,
+            id="inner-sources-null-with-singular-source",
+        ),
+        pytest.param(
+            "singular_source",
+            {
+                "pipeline": {
+                    "source": {"plugin": "csv", "on_success": "rows"},
+                    "nodes": [],
+                    "edges": [],
+                    "outputs": [],
+                }
+            },
+            True,
+            id="singular-source",
+        ),
+        pytest.param(
+            "named_sources",
+            {
+                "pipeline": {
+                    "sources": {"orders": {"plugin": "csv", "on_success": "rows"}},
+                    "nodes": [],
+                    "edges": [],
+                    "outputs": [],
+                }
+            },
+            True,
+            id="named-sources",
+        ),
+    ],
+)
+@pytest.mark.parametrize("provider", ["anthropic", "bedrock"])
+def test_set_pipeline_source_selection_survives_supported_provider_adapter(
+    provider: str,
+    case: str,
+    source_selection: dict[str, Any],
+    expected_valid: bool,
+) -> None:
+    """The provider must receive the same exactly-one-source admission rule."""
+    del case  # readable parametrization id only
+    validator = Draft202012Validator(_provider_transported_set_pipeline_schema(provider))
+    assert validator.is_valid(source_selection) is expected_valid
+
+
+@pytest.mark.parametrize(
     ("path", "value"),
     [
         (("metadata",), None),
-        (("source",), None),
-        (("sources",), None),
         (("source", "blob_id"), None),
         (("source", "on_validation_failure"), None),
         (("source", "inline_blob"), None),
@@ -290,6 +495,9 @@ def test_directional_guard_distinguishes_absent_optional_keyword_from_present_nu
 def test_directional_guard_does_not_skip_a_malformed_advertised_union_branch() -> None:
     module = _schema_contract_module()
     valid = deepcopy(_registered_set_pipeline_schema())
+    # This is a focused generic-union walker test. The registered schema's
+    # own source-selection oneOf is verified separately before that walk.
+    del valid["oneOf"]
     malformed = deepcopy(valid)
     malformed["properties"] = None
 

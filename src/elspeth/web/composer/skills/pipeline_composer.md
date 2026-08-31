@@ -93,6 +93,11 @@ For ordinary build/edit turns, the action path is:
 | Create a new pipeline or perform an intentional full rebuild | `set_pipeline` |
 | Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform` |
 | Make an option-only edit to an existing node | `patch_node_options` |
+| Add or rewire a node in an existing pipeline, when neither narrower row above fits | `upsert_node` / `upsert_edge` |
+
+Every row below the first requires a pipeline that already exists. A new build
+never walks this table row by row — it is one `set_pipeline` call, as the next
+section requires.
 
 ### Complex New Pipeline Batching
 
@@ -102,13 +107,16 @@ or more workflow patterns, finish live inventory and schema loading first, then
 submit one `set_pipeline` carrying the source, nodes, edges, outputs, metadata,
 and required interpretation requirements together.
 
-Do not build complex new pipelines tool-by-tool with `set_source`,
-`upsert_node`, `upsert_edge`, `set_output`, or `patch_*` calls. Use those
-smaller mutation tools only for narrow edits to an existing draft, or after a
-tool diagnostic identifies a focused repair to an already-submitted full
-topology. A malformed or rejected full build is repaired by resubmitting the
-same complete requested topology with corrected arguments, not by switching into
-a one-component-at-a-time construction loop.
+The rest of this section governs NEW builds only. Do not build a complex new
+pipeline tool-by-tool with `set_source`, `upsert_node`, `upsert_edge`,
+`set_output`, or `patch_*` calls. Within a new build, reach for those smaller
+mutation tools only after a tool diagnostic identifies a focused repair to an
+already-submitted full topology. A malformed or rejected full build is repaired
+by resubmitting the same complete requested topology with corrected arguments,
+not by switching into a one-component-at-a-time construction loop.
+
+Editing a pipeline that already exists is not a new build: route those turns
+through the edit table above.
 
 Canonical multi-step bundles to build in one `set_pipeline` after schemas are
 known:

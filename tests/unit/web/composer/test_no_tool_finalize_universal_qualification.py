@@ -188,7 +188,8 @@ def _fake_response_with_tool_call(*, tool_call_id: str, tool_name: str, argument
 
     class _Message:
         def __init__(self) -> None:
-            self.tool_calls = [_ToolCall(tool_call_id, _Func(tool_name, json.dumps(arguments)))]
+            provider_arguments = {"pipeline": arguments} if tool_name == "set_pipeline" else arguments
+            self.tool_calls = [_ToolCall(tool_call_id, _Func(tool_name, json.dumps(provider_arguments)))]
             self.content = None
 
     class _Choice:

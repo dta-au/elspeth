@@ -137,9 +137,12 @@ _TEST_SESSION_ID = "11111111-1111-4111-8111-111111111111"
 # fail-closed cap is composer_planner_max_request_bytes, 2 MiB). It only ever
 # moves by an operator ruling: growth must be priced as deliberately-landed
 # palette additions, never absorbed by deforming a plugin contract or trimming
-# load-bearing teaching text to fit. Last re-set 2026-08-27 (John): 96 -> 100
-# KiB, paid for by reference_join + the two blob expanders (+911 B net).
-_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = 100 * 1024
+# load-bearing teaching text to fit. Re-set 2026-08-27 (John): 96 -> 100 KiB,
+# paid for by reference_join + the two blob expanders (+911 B net). Re-set
+# 2026-08-31 (John): 100 -> 102 KiB, paid for by the provider set-pipeline
+# envelope plus state-aware, surface-scoped source-rebuild guidance (current
+# fixed scaffold: 103,596 B).
+_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = 102 * 1024
 
 
 @dataclass
@@ -3619,13 +3622,18 @@ async def test_missing_source_candidate_fails_closed_before_full_candidate_is_ac
     feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
     assert feedback["success"] is False
     assert feedback["validation"]["is_valid"] is False
-    # The pre-application rejection carries the closed code itself; the
-    # unchanged empty state's errors are gated out of planner feedback
-    # (tutorial op 1152d7e3: they were red herrings on every OTHER semantic
-    # rejection, steering repairs toward re-authoring source/sinks).
-    assert [error["component"] for error in feedback["validation"]["errors"]] == ["rejected_mutation"]
-    assert feedback["validation"]["errors"][0]["error_code"] == "no_source_configured"
-    assert all(error["error_class"] == "ValidationError" for error in feedback["validation"]["errors"])
+    # Terminal-schema admission rejects the malformed provider response before
+    # candidate construction, so the handler-level no_source_configured
+    # defense is unreachable on this public path.
+    assert feedback["validation"]["errors"] == [
+        {
+            "component": "pipeline",
+            "severity": "high",
+            "error_code": "canonical_schema",
+            "error_class": "SchemaValidationError",
+            "schema_violations": [{"path": "pipeline", "rule": "oneOf"}],
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -4753,34 +4761,30 @@ _CANONICAL_SCHEMA_FEEDBACK = {
 }
 
 
-def _missing_source_feedback() -> dict[str, Any]:
-    explanation, suggested_fix = explain_validation_code("no_source_configured") or ("", "")
-    return {
-        "success": False,
-        "validation": {
-            "is_valid": False,
-            "errors": [
-                {
-                    "component": "rejected_mutation",
-                    "severity": "high",
-                    "error_code": "no_source_configured",
-                    "error_class": "ValidationError",
-                    "explanation": explanation,
-                    "suggested_fix": suggested_fix,
-                }
-            ],
-        },
-        # See _binding_rejection_expected_feedback: an enriched entry makes
-        # the explain_validation_error advertisement information-free.
-    }
+_MISSING_SOURCE_SCHEMA_FEEDBACK = {
+    "success": False,
+    "validation": {
+        "is_valid": False,
+        "errors": [
+            {
+                "component": "pipeline",
+                "severity": "high",
+                "error_code": "canonical_schema",
+                "error_class": "SchemaValidationError",
+                "schema_violations": [{"path": "pipeline", "rule": "oneOf"}],
+            }
+        ],
+    },
+}
 
 
 def _sourceless_pipeline(data_dir: Path) -> dict[str, Any]:
-    """A terminal candidate naming no source at all.
+    """Script a provider response that violates the terminal source union.
 
-    Legal against the terminal schema: ``SetPipelineArgumentsModel`` leaves
-    both ``source`` and ``sources`` optional, so a re-plan "delta" candidate
-    that drops the source block validates and reaches the finalizer.
+    Providers receive the schema and should not emit this shape, but the
+    planner still validates their output rather than trusting enforcement.
+    Omitting both ``source`` and ``sources`` violates the root ``oneOf`` and
+    must be rejected before candidate materialization or finalization.
     """
     pipeline = _pipeline(data_dir)
     del pipeline["source"]
@@ -4799,11 +4803,10 @@ async def test_freeform_sources_omitted_candidate_gets_bounded_no_source_repair(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    """Characterize the repair the freeform surface already produces.
+    """A noncompliant provider response gets one bounded schema repair.
 
-    Pins the exact feedback the guided surface must match — the parity the
-    planner-side guard preserves rather than replacing with a bare schema
-    complaint.
+    The source omission is rejected by the advertised/canonical ``oneOf``
+    before the set_pipeline handler can emit ``no_source_configured``.
     """
     completion = _ScriptedCompletion(
         _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
@@ -4813,7 +4816,7 @@ async def test_freeform_sources_omitted_candidate_gets_bounded_no_source_repair(
     proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
 
     assert proposal.proposal.repair_count == 1
-    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _missing_source_feedback()
+    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _MISSING_SOURCE_SCHEMA_FEEDBACK
 
 
 @pytest.mark.asyncio
@@ -4821,11 +4824,11 @@ async def test_guided_sources_omitted_candidate_gets_bounded_repair_not_integrit
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    """A sources-free candidate is an authoring slip, not an integrity breach.
+    """Guided planning rejects the source omission before its finalizer.
 
-    The guided binder answers that shape with ``AuditIntegrityError``; before
-    the planner-side guard that error escaped the loop as a terminal 500
-    (elspeth-bcc6bdac99) instead of one budgeted repair turn.
+    The canonical schema guard spends one repair turn, so the binder-style
+    finalizer never receives the malformed shape and cannot raise its
+    ``AuditIntegrityError`` backstop.
     """
     completion = _ScriptedCompletion(
         _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
@@ -4841,7 +4844,7 @@ async def test_guided_sources_omitted_candidate_gets_bounded_repair_not_integrit
     )
 
     assert proposal.proposal.repair_count == 1
-    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _missing_source_feedback()
+    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _MISSING_SOURCE_SCHEMA_FEEDBACK
 
 
 @pytest.mark.asyncio
@@ -4852,17 +4855,18 @@ async def test_guided_sources_omitted_candidate_gets_bounded_repair_not_integrit
         (PlannerSurface.GUIDED_STAGED, _binder_style_finalizer),
     ],
 )
-async def test_repeated_sources_omitted_candidate_draws_the_repeat_notice(
+async def test_repeated_sources_omitted_candidates_each_get_schema_feedback(
     tmp_path: Path,
     tool_context: ToolContext,
     surface: PlannerSurface,
     finalizer: Any,
 ) -> None:
-    """A re-emitted sourceless candidate is told it changed nothing.
+    """Each provider-invalid source omission gets canonical schema feedback.
 
-    Rejecting the shape in the planner loop must not drop it out of rejection
-    fingerprinting: an identical rejection repeating across attempts is a
-    feedback-quality defect the loop has to name, not silently burn budget on.
+    Repetition detection is candidate-rejection behavior after canonical
+    admission. These responses never become candidates, so each attempt gets
+    the same schema violation and spends one bounded repair turn without a
+    misleading candidate-level repeat notice.
     """
     completion = _ScriptedCompletion(
         _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
@@ -4882,8 +4886,9 @@ async def test_repeated_sources_omitted_candidate_draws_the_repeat_notice(
     assert proposal.proposal.repair_count == 2
     first = json.loads(completion.requests[1]["messages"][-1]["content"])
     second = json.loads(completion.requests[2]["messages"][-1]["content"])
-    assert first == _missing_source_feedback()
-    assert second == {**_missing_source_feedback(), "repeat_notice": _REPEAT_NOTICE}
+    assert first == _MISSING_SOURCE_SCHEMA_FEEDBACK
+    assert second == _MISSING_SOURCE_SCHEMA_FEEDBACK
+    assert "repeat_notice" not in second
 
 
 @pytest.mark.asyncio
@@ -6820,7 +6825,7 @@ async def test_escape_hatch_retains_terminal_candidate_across_pre_custody_reject
         model_arguments["pipeline"]["source"]["plugin"] = 123
     elif rejection_kind == "missing_source":
         model_arguments["pipeline"] = _sourceless_pipeline(tmp_path)
-        expected_code = "no_source_configured"
+        expected_code = "canonical_schema"
     else:
         intent_id = "00000000-0000-4000-8000-000000000315"
         model_arguments["claimed_deferred_intent_ids"] = [intent_id]

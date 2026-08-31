@@ -326,8 +326,9 @@ def _replace_llm_tool_call_arguments(
     The compose loop appends the provider-authored assistant message before
     dispatch.  A subsequent provider turn must not receive raw inline bytes
     from that history after ELSPETH has intercepted them for proposal custody.
+    ``arguments`` are always the flat internal semantic shape; set_pipeline is
+    re-enveloped only while serializing the provider transcript.
     """
-    encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
     for message in reversed(llm_messages):
         if "role" not in message or message["role"] != "assistant":
             continue
@@ -342,6 +343,11 @@ def _replace_llm_tool_call_arguments(
             function = call["function"] if "function" in call else None
             if type(function) is not dict:
                 raise AuditIntegrityError("Assistant tool call has malformed function envelope")
+            if "name" not in function or type(function["name"]) is not str:
+                raise AuditIntegrityError("Assistant tool call has malformed function envelope")
+            function_name = function["name"]
+            provider_arguments: Mapping[str, Any] = {"pipeline": arguments} if function_name == "set_pipeline" else arguments
+            encoded = json.dumps(provider_arguments, sort_keys=True, separators=(",", ":"))
             function["arguments"] = encoded
             return
     raise AuditIntegrityError("Assistant tool call was not present in the active LLM transcript")
@@ -828,7 +834,55 @@ async def run_tool_batch(
             all_cache_hits = False
             continue
 
-        arguments = cast(dict[str, Any], decoded_arguments)
+        if tool_name == "set_pipeline":
+            pipeline_arguments = decoded_arguments["pipeline"] if "pipeline" in decoded_arguments else None
+            if set(decoded_arguments) != {"pipeline"} or type(pipeline_arguments) is not dict:
+                turn_has_mutation = True
+                audit_arguments = {
+                    "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+                    "error_class": "TypeError",
+                }
+                decoded_args_by_call_id[tool_call.id] = dict(audit_arguments)
+                _replace_llm_tool_call_arguments(
+                    llm_messages,
+                    tool_call_id=tool_call.id,
+                    arguments=audit_arguments,
+                )
+                audit = begin_dispatch(
+                    tool_call.id,
+                    tool_name,
+                    audit_arguments,
+                    version_before=state.version,
+                    actor=actor,
+                )
+                error_payload = {"error": "Tool 'set_pipeline' arguments must contain exactly one 'pipeline' object field."}
+                recorder.record(
+                    finish_arg_error(
+                        audit,
+                        error_class="TypeError",
+                        error_message="invalid provider argument envelope",
+                        error_payload=error_payload,
+                    )
+                )
+                _append_tool_outcome(
+                    response=None,
+                    error_class="TypeError",
+                    error_message="invalid provider argument envelope",
+                    post_version=state.version,
+                )
+                anti_anchor.record_failure(tool_name, audit.arguments_hash)
+                llm_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(error_payload),
+                    }
+                )
+                all_cache_hits = False
+                continue
+            arguments = cast(dict[str, Any], pipeline_arguments)
+        else:
+            arguments = cast(dict[str, Any], decoded_arguments)
         if unknown_audit_arguments is not None:
             audit_arguments = unknown_audit_arguments
         elif tool_name == "set_pipeline":

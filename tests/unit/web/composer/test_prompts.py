@@ -592,7 +592,12 @@ class TestBuildSystemPrompt:
         assert "three or more components" in flattened
         assert "two or more workflow patterns" in flattened
         assert "submit one `set_pipeline`" in flattened
-        assert "Do not build complex new pipelines tool-by-tool" in flattened
+        assert "Do not build a complex new pipeline tool-by-tool" in flattened
+        # The prohibition is scoped to new builds so the edit table's
+        # add/rewire row cannot read as licence for a construction loop
+        # (elspeth-ee89aca5d0); the steer itself must survive that scoping.
+        assert "governs NEW builds only" in flattened
+        assert "Editing a pipeline that already exists is not a new build" in flattened
         assert "`classify -> enrich -> route`" in flattened
         assert "`classify -> aggregate -> cross-tab`" in flattened
         assert "`split/expand -> gate-route per branch`" in flattened

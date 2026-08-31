@@ -89,6 +89,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -128,6 +129,119 @@ def _raw_tool_call_llm(*, name: str, raw_arguments: str) -> _FakeComposeLLM:
         ]
     )
     return _FakeComposeLLM((first, _fake_llm_response(content="Done.")))
+
+
+def test_server_rewrite_keeps_set_pipeline_wrapped_in_provider_transcript() -> None:
+    from elspeth.web.composer.tool_batch import _replace_llm_tool_call_arguments
+
+    semantic_arguments = {
+        "source": {"plugin": "csv", "on_success": "rows"},
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_pipeline",
+                    "type": "function",
+                    "function": {"name": "set_pipeline", "arguments": json.dumps({"pipeline": {}})},
+                }
+            ],
+        }
+    ]
+
+    _replace_llm_tool_call_arguments(
+        messages,
+        tool_call_id="call_pipeline",
+        arguments=semantic_arguments,
+    )
+
+    encoded = messages[0]["tool_calls"][0]["function"]["arguments"]
+    assert json.loads(encoded) == {"pipeline": semantic_arguments}
+
+
+def test_server_rewrite_rejects_owned_function_envelope_without_name() -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.composer.tool_batch import _replace_llm_tool_call_arguments
+
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_pipeline",
+                    "type": "function",
+                    "function": {"arguments": json.dumps({"pipeline": {}})},
+                }
+            ],
+        }
+    ]
+
+    with pytest.raises(AuditIntegrityError, match="malformed function envelope"):
+        _replace_llm_tool_call_arguments(
+            messages,
+            tool_call_id="call_pipeline",
+            arguments={"source": {}, "nodes": [], "edges": [], "outputs": []},
+        )
+
+
+@pytest.mark.parametrize(
+    "provider_arguments",
+    [
+        pytest.param({}, id="missing-outer-pipeline"),
+        pytest.param({"pipeline": None}, id="pipeline-null"),
+        pytest.param(
+            {
+                "source": {"plugin": "csv", "on_success": "rows"},
+                "nodes": [],
+                "edges": [],
+                "outputs": [],
+            },
+            id="flat-semantic-arguments",
+        ),
+        pytest.param(
+            {
+                "pipeline": {
+                    "source": {"plugin": "csv", "on_success": "rows"},
+                    "nodes": [],
+                    "edges": [],
+                    "outputs": [],
+                },
+                "unexpected": True,
+            },
+            id="extra-outer-key",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_set_pipeline_invalid_provider_envelope_is_closed_arg_error_before_dispatch(
+    fake_composer_service: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_arguments: dict[str, Any],
+) -> None:
+    def _explode(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("invalid provider envelope reached set_pipeline candidate or handler")
+
+    monkeypatch.setattr("elspeth.web.composer.tool_batch.build_set_pipeline_candidate", _explode)
+    monkeypatch.setattr("elspeth.web.composer.tool_batch.execute_tool", _explode)
+    llm = _raw_tool_call_llm(name="set_pipeline", raw_arguments=json.dumps(provider_arguments))
+
+    result = await fake_composer_service._run_one_turn_for_test(llm=llm, session_id=result_session_id)
+
+    assert len(result.tool_invocations) == 1
+    invocation = result.tool_invocations[0]
+    assert invocation.status is ComposerToolStatus.ARG_ERROR
+    assert result.tool_outcomes[0].error_class == "TypeError"
+    assert json.loads(invocation.arguments_canonical) == {
+        "_redaction_status": "invalid_tool_arguments",
+        "error_class": "TypeError",
+    }
 
 
 @pytest.mark.asyncio

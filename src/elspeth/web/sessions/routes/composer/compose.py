@@ -27,7 +27,6 @@ from .._helpers import (
     PipelinePlannerError,
     Request,
     SessionServiceProtocol,
-    TransitionAssistantDraft,
     UserIdentity,
     _BadRequestLLMError,
     _cancel_on_client_disconnect,
@@ -61,6 +60,7 @@ from .._helpers import (
     _verify_session_ownership,
     asyncio,
     client_cancelled_progress_event,
+    composer_turn_end_assistant_row,
     contextlib,
     convergence_progress_event,
     get_current_user,
@@ -450,12 +450,7 @@ async def recompose(
                     intent=result.pipeline_commit_intent,
                     composer_meta=_post_compose_meta,
                     telemetry_source="recompose",
-                    transition_assistant=TransitionAssistantDraft(
-                        content=result.message,
-                        raw_content=result.raw_assistant_content,
-                    )
-                    if _guided_terminal_for_compose is not None
-                    else None,
+                    transition_assistant=composer_turn_end_assistant_row(result) if _guided_terminal_for_compose is not None else None,
                 )
                 if type(settlement_outcome) is PipelineRouteSettlement:
                     route_settlement = settlement_outcome
@@ -469,6 +464,13 @@ async def recompose(
                         message=PIPELINE_STAGED_REVIEW_MESSAGE,
                         pipeline_commit_intent=None,
                     )
+            # Computed HERE, below the auto-commit-revoked branch above: that
+            # branch rebinds ``result`` with the staged-review message, so a
+            # pair hoisted to the top of the handler would be stale. Every
+            # writer below shares this one — the turn-end row must not re-carry
+            # prose the compose loop already committed mid-turn
+            # (elspeth-d581b3da7f).
+            _turn_end = composer_turn_end_assistant_row(result)
             if route_settlement is not None:
                 state_response = _state_response(
                     route_settlement.settlement.state,
@@ -547,8 +549,8 @@ async def recompose(
                         session_id=session.id,
                         expected_current_state_id=pre_send_state_id,
                         state=state_data,
-                        assistant_content=result.message,
-                        raw_content=result.raw_assistant_content,
+                        assistant_content=_turn_end.content,
+                        raw_content=_turn_end.raw_content,
                     )
                     new_state_record = transition_settlement.state
                     assistant_msg = transition_settlement.message
@@ -586,8 +588,8 @@ async def recompose(
                     session_id=session.id,
                     expected_current_state_id=pre_send_state_id,
                     state=_transition_state_data,
-                    assistant_content=result.message,
-                    raw_content=result.raw_assistant_content,
+                    assistant_content=_turn_end.content,
+                    raw_content=_turn_end.raw_content,
                 )
                 _transition_record = transition_settlement.state
                 assistant_msg = transition_settlement.message
@@ -599,9 +601,9 @@ async def recompose(
                 assistant_msg = await service.add_message(
                     session.id,
                     "assistant",
-                    result.message,
+                    _turn_end.content,
                     composition_state_id=post_compose_state_id,
-                    raw_content=result.raw_assistant_content,
+                    raw_content=_turn_end.raw_content,
                     writer_principal="compose_loop",
                 )
             # Per-tool-call audit trail (recompose path; symmetric with

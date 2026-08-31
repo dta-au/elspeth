@@ -48,6 +48,7 @@ async def persist_turn_audit(
     current_state_id: str | None,
     persisted_tool_call_turn: bool,
     persisted_assistant_message_id: str | None,
+    persisted_assistant_content: str | None,
 ) -> _PersistOutcome:
     """Phase P4 of the compose loop — redact then persist the turn audit.
 
@@ -247,6 +248,15 @@ async def persist_turn_audit(
                 failed_turn=failed_turn,
             )
         persisted_assistant_message_id = audit_outcome.assistant_id
+        # Derived here rather than by the caller because this is the only
+        # frame that knows what reached the row: the persist call above sends
+        # ``assistant_message.content or ""``, and ``assistant_message`` is
+        # already the substituted message on the advisor-repair branch. A
+        # caller reconstructing it from the turn prose would record the wrong
+        # bytes for that branch (elspeth-d581b3da7f). Rolled back (no
+        # assistant id) means no row holds anything — the pair goes to None
+        # together.
+        persisted_assistant_content = None if audit_outcome.assistant_id is None else (assistant_message.content or "")
         # The unwind-failure outcome means the transaction rolled back: no
         # assistant or tool row survived, so the driver must retain the
         # in-flight invocation evidence on the propagated plugin crash.
@@ -254,6 +264,7 @@ async def persist_turn_audit(
     return _PersistOutcome(
         current_state_id=current_state_id,
         persisted_assistant_message_id=persisted_assistant_message_id,
+        persisted_assistant_content=persisted_assistant_content,
         persisted_tool_call_turn=persisted_tool_call_turn,
         unwind_audit_failed=unwind_audit_failed,
         failed_turn=failed_turn,

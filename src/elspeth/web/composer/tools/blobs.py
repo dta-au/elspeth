@@ -152,6 +152,51 @@ class BlobCreatePayload(TypedDict):
     originated_in: Literal["this_tool_call"]
 
 
+class BlobContentPayload(TypedDict):
+    """Closed dict shape for the get_blob_content tool's success result data.
+
+    ``created_by`` and ``creation_modality`` are the read-back half of the
+    self-authorship marker on :class:`BlobCreatePayload` (elspeth-47eba5cced).
+    ``originated_in`` can only speak for the tool call that created the blob;
+    a later ``get_blob_content`` is a different call, and custody rewrites
+    have by then excised the planner's own inline bytes from the live
+    transcript.  Without these two fields the read-back result carried no
+    origin facts at all, so a planner reading back content it fabricated
+    earlier saw a discovery-shaped result and could narrate its own invention
+    as something the system produced.
+
+    Both are stored columns, not derived classifications: each is a closed
+    vocabulary (``BLOB_CREATORS`` / :class:`CreationModality`) mirrored by a
+    DB CHECK and re-checked on every read by ``_guard_blob_row_literals``.
+    They are typed ``str`` here to match :class:`BlobToolRecord`, whose
+    values that guard has already narrowed.
+
+    Read them as a PAIR.  ``creation_modality`` alone is not an authorship
+    statement: four unrelated paths write ``verbatim`` — the composer, for
+    content copied out of the user's own message; ``create_blob`` behind the
+    upload route; ``create_pending_blob`` for pipeline output; and
+    ``copy_blobs_for_fork``.  ``created_by`` is what separates them.
+
+    Both fields report what the row RECORDS, which is not always what
+    happened: fork copy preserves ``created_by`` but resets the modality to
+    ``verbatim`` and nulls the five ``creating_*`` columns, so an
+    LLM-generated blob carried across a session fork records as verbatim.
+    That is a defect in the fork writer, not something this read path can
+    detect — and it is the reason no derived "the assistant authored this"
+    flag is offered here: such a flag would confidently deny authorship of
+    content the assistant really did invent.
+    """
+
+    blob_id: str
+    filename: str
+    mime_type: str
+    content: str
+    truncated: bool
+    size_bytes: int
+    created_by: str
+    creation_modality: str
+
+
 def _blob_row_to_tool_dict(row: Any) -> BlobToolRecord:
     """Serialize a validated blobs row to the tool-layer dict shape."""
     _guard_blob_row_literals(row)
@@ -272,6 +317,12 @@ def _sync_list_blobs(engine: Engine, session_id: str) -> list[dict[str, Any]]:
                 "mime_type": blob["mime_type"],
                 "size_bytes": blob["size_bytes"],
                 "created_by": blob["created_by"],
+                # Paired with created_by so the inventory answers "who
+                # authored these bytes" at the same depth as the read-back
+                # path (get_blob_content). created_by alone cannot: the
+                # composer writes created_by="assistant" both for content it
+                # generated and for content copied verbatim from the user.
+                "creation_modality": blob["creation_modality"],
                 "status": blob["status"],
             }
             for blob in (_blob_row_to_tool_dict(row) for row in rows)
@@ -2171,24 +2222,31 @@ def _execute_get_blob_content(
     if truncated:
         content = content[:max_chars]
 
-    return _discovery_result(
-        state,
-        {
-            "blob_id": blob_id,
-            "filename": blob["filename"],
-            "mime_type": blob["mime_type"],
-            "content": content,
-            "truncated": truncated,
-            "size_bytes": blob["size_bytes"],
-        },
-    )
+    payload: BlobContentPayload = {
+        "blob_id": blob_id,
+        "filename": blob["filename"],
+        "mime_type": blob["mime_type"],
+        "content": content,
+        "truncated": truncated,
+        "size_bytes": blob["size_bytes"],
+        # Origin facts, read straight off the row. See BlobContentPayload:
+        # they are the only within-result signal that distinguishes reading
+        # back self-authored content from discovering an operator's file.
+        "created_by": blob["created_by"],
+        "creation_modality": blob["creation_modality"],
+    }
+    return _discovery_result(state, payload)
 
 
 _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(
     name="get_blob_content",
     handler=_execute_get_blob_content,
     kind=ToolKind.BLOB_DISCOVERY,
-    description="Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters.",
+    description=(
+        "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters. "
+        "The result also carries the blob's recorded origin — created_by (user, assistant, or pipeline) and "
+        "creation_modality — so content the assistant generated earlier is not mistaken for a discovered file."
+    ),
     json_schema={
         "type": "object",
         "properties": {

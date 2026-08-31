@@ -4,10 +4,10 @@ The aids exist because the 2026-07-22 pack stress test showed cold planners
 fabricating ``blob_id`` values and missing the source options contract: the
 pack had rules but no worked exemplars, and the ``no_deployment_plugin_facts``
 gate (correctly) forbids plugin literals in the static prompts. These tests
-enforce the self-verifying-teaching contract: the exact exemplar objects the
-planner prompt carries are run through ``build_set_pipeline_candidate``
-against the real catalog, so a drifting exemplar fails CI instead of teaching
-planners an invalid shape.
+enforce the self-verifying-teaching contract: the exact flat canonical
+documents nested in the prompt's provider envelopes are run through
+``build_set_pipeline_candidate`` against the real catalog, so a drifting
+exemplar fails CI instead of teaching planners an invalid shape.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from typing import Any, get_args
 from uuid import uuid4
 
 import pytest
+from jsonschema import Draft202012Validator
 from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
@@ -879,7 +880,7 @@ class TestForkRowUnionExemplar:
         view, _snapshot = _trained_view()
         payload = build_planner_authoring_aids(view)
 
-        assert payload["fork_row_union"]["set_pipeline_exemplar"] == planner_authoring_aids.fork_row_union_exemplar_args(view)
+        assert payload["fork_row_union"]["set_pipeline_exemplar"] == {"pipeline": planner_authoring_aids.fork_row_union_exemplar_args(view)}
         rendered = " ".join(payload["fork_row_union"]["rules"])
         assert "require_all" in rendered
         assert "N-to-N" in rendered
@@ -985,7 +986,7 @@ class TestForkRowUnionExemplar:
         payload = build_planner_authoring_aids(view)
 
         section = payload["fork_coalesce"]
-        assert section["set_pipeline_exemplar"] == fork_coalesce_exemplar_args(view)
+        assert section["set_pipeline_exemplar"] == {"pipeline": fork_coalesce_exemplar_args(view)}
 
 
 class TestSelectedControlProfile:
@@ -1117,7 +1118,7 @@ class TestExemplarDomainDisjointness:
         payload = build_planner_authoring_aids(view)
 
         section = payload["fork_coalesce"]
-        assert section["set_pipeline_exemplar"] == fork_coalesce_exemplar_args(view)
+        assert section["set_pipeline_exemplar"] == {"pipeline": fork_coalesce_exemplar_args(view)}
         rules = " ".join(section["rules"])
         assert "SHAPE SELECTION" in rules  # run-3 E1: selection rule, not preference
         assert "queries map (multi_query)" in rules  # run-3 E1: both shapes taught, selection by input variance
@@ -1795,13 +1796,40 @@ class TestExpressionGrammarAid:
 
 
 class TestAuthoringAidsPayload:
+    def test_set_pipeline_exemplars_match_the_web_provider_argument_envelope(self) -> None:
+        """Prompt examples wrap flat canonical documents exactly as the web tool does."""
+        from elspeth.web.composer.service import ComposerServiceImpl
+
+        view, _snapshot = _trained_view()
+        payload = build_planner_authoring_aids(view)
+        semantic_exemplars = (
+            source_custody_exemplar_args(view),
+            fork_coalesce_exemplar_args(view),
+            planner_authoring_aids.fork_row_union_exemplar_args(view),
+        )
+        prompt_exemplars = (
+            payload["source_custody"]["set_pipeline_exemplar_inline_blob"],
+            payload["fork_coalesce"]["set_pipeline_exemplar"],
+            payload["fork_row_union"]["set_pipeline_exemplar"],
+        )
+        service = object.__new__(ComposerServiceImpl)
+        provider_tool = next(tool for tool in service._get_litellm_tools() if tool["function"]["name"] == "set_pipeline")
+        provider_schema = provider_tool["function"]["parameters"]
+        validator = Draft202012Validator(provider_schema)
+
+        assert all(exemplar is not None and "pipeline" not in exemplar for exemplar in semantic_exemplars)
+        assert len(prompt_exemplars) == len(semantic_exemplars) == 3
+        for prompt_args, semantic in zip(prompt_exemplars, semantic_exemplars, strict=True):
+            assert prompt_args == {"pipeline": semantic}
+            validator.validate(prompt_args)
+
     def test_payload_carries_the_custody_exemplar_and_the_closed_provenance_rule(self) -> None:
         view, _snapshot = _trained_view()
 
         payload = build_planner_authoring_aids(view)
 
         custody = payload["source_custody"]
-        assert custody["set_pipeline_exemplar_inline_blob"] == source_custody_exemplar_args(view)
+        assert custody["set_pipeline_exemplar_inline_blob"] == {"pipeline": source_custody_exemplar_args(view)}
         blob_variant = source_custody_exemplar_args(view, blob_id=PLACEHOLDER_BLOB_ID)
         assert blob_variant is not None
         assert custody["existing_blob_source_binding"] == blob_variant["source"]
@@ -2470,9 +2498,65 @@ class TestSession891b7b1eLiveReviewEdits:
     def test_custody_rules_state_full_replacement_source_resupply(self) -> None:
         """elspeth-6cadbff05f: source: null never means 'keep the source'."""
         view, _snapshot = _trained_view()
-        rendered = "\n".join(build_planner_authoring_aids(view)["source_custody"]["rules"])
-        assert "FULL replacement" in rendered
-        assert "source: null never means" in rendered
+        rules = build_planner_authoring_aids(view)["source_custody"]["rules"]
+
+        replacement_rule = next(rule for rule in rules if rule.startswith("set_pipeline is a FULL replacement"))
+        mutation_rule = next(rule for rule in rules if rule.startswith("ORDINARY/FREEFORM MUTATION SURFACE"))
+        proposal_rule = next(rule for rule in rules if rule.startswith("PROPOSAL PLANNER SURFACE"))
+
+        assert "source: null never means" in replacement_rule
+        assert "Plugin-backed sources must be preserved" in replacement_rule
+        assert "do not assume the current source is blob-bound" in replacement_rule
+        assert "source.blob_id only for an existing singular blob-bound source whose block carries one" in replacement_rule
+        assert "source.inline_blob only when intentionally supplying new literal data" in replacement_rule
+
+        assert "complete existing `source` configuration" in mutation_rule
+        assert "named `sources` map" in mutation_rule
+        assert "get_pipeline_state(component='set_pipeline_arguments')" in mutation_rule
+        assert "round_trip_unavailable" in mutation_rule
+        assert "never fabricate or rebind source custody" in mutation_rule
+        assert "advertised narrow patch tool" in mutation_rule
+        assert "surface the named gap" in mutation_rule
+
+        assert "current-state context" in proposal_rule
+        assert "only tools advertised in this request" in proposal_rule
+        assert "never invoke an unadvertised inspection or mutation tool" in proposal_rule
+        assert "exact authorable source binding" in proposal_rule
+        assert "exact-source/round-trip gap" in proposal_rule
+        assert "stop instead of guessing" in proposal_rule
+
+    def test_proposal_planner_custody_rule_names_no_unadvertised_tool(self) -> None:
+        """Shared aids must not teach proposal planners calls absent from their palette."""
+        from elspeth.web.composer.pipeline_planner import PlannerDiscoveryPolicy, planner_tool_definitions
+        from elspeth.web.composer.pipeline_proposal import PlannerSurface
+        from elspeth.web.composer.tools import get_tool_definitions
+
+        view, _snapshot = _trained_view()
+        rules = build_planner_authoring_aids(view)["source_custody"]["rules"]
+        proposal_rule = next(rule for rule in rules if rule.startswith("PROPOSAL PLANNER SURFACE"))
+        registered_names = {definition["name"] for definition in get_tool_definitions()}
+        named_tools = {name for name in registered_names if name in proposal_rule}
+
+        for surface in PlannerSurface:
+            policy = PlannerDiscoveryPolicy.initial(surface)
+            advertised_names = {definition["function"]["name"] for definition in planner_tool_definitions(policy)}
+            assert named_tools <= advertised_names
+
+        assert "get_pipeline_state" not in proposal_rule
+        assert "patch_source_options" not in proposal_rule
+
+    def test_custody_verbatim_rule_names_the_user_requested_sample_exception(self) -> None:
+        """Planner-authored samples must be an explicit, provenance-preserving exception."""
+        view, _snapshot = _trained_view()
+        rules = build_planner_authoring_aids(view)["source_custody"]["rules"]
+
+        verbatim_rule = next(rule for rule in rules if rule.startswith("inline_blob.content must be"))
+        assert "verbatim source data" in verbatim_rule
+        assert "ONLY exception" in verbatim_rule
+        assert "user explicitly requested" in verbatim_rule
+        assert "planner-authored sample data" in verbatim_rule
+        assert "bind it through inline_blob" in verbatim_rule
+        assert "invented_source" in verbatim_rule
 
     def test_custody_rules_demand_first_person_invented_source_narration(self) -> None:
         """elspeth-47eba5cced: fabricated-at-user-request content is self-authored."""
@@ -2482,12 +2566,18 @@ class TestSession891b7b1eLiveReviewEdits:
         assert "invented_source" in rendered
         assert "get_blob_content" in rendered
 
-    def test_review_registry_rule_states_turn_end_review_timing(self) -> None:
-        """elspeth-2251bcc0c3: mid-turn valid=True is not a completion signal."""
+    def test_review_registry_turn_end_promise_is_prompt_template_only(self) -> None:
+        """Ordinary no-tool finalization surfaces prompt review, not model choice."""
         view, _snapshot = _trained_view()
-        rendered = "\n".join(build_planner_authoring_aids(view)["review_registry"]["rules"])
-        assert "TURN END" in rendered
-        assert "not a completion signal" in rendered
+        rules = build_planner_authoring_aids(view)["review_registry"]["rules"]
+
+        timing_rules = [rule for rule in rules if "TURN END" in rule or "finalization" in rule]
+        assert len(timing_rules) == 1
+        assert all("llm_model_choice" not in rule for rule in timing_rules)
+        timing_rule = timing_rules[0]
+        assert "ordinary no-tool finalization" in timing_rule
+        assert "llm_prompt_template" in timing_rule
+        assert "not a completion signal" in timing_rule
 
 
 class TestLlmOnErrorRuleGating:

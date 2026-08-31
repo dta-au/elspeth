@@ -241,6 +241,37 @@ class TestToolListOrderIsCacheKeyContract:
         # by the filter).
         assert set(tool_names).issubset(set(defn_names))
 
+    def test_only_web_set_pipeline_is_enveloped_without_changing_cache_marker_placement(self) -> None:
+        from elspeth.web.composer.service import ComposerServiceImpl
+        from elspeth.web.composer.tools import get_tool_definitions
+        from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
+
+        definitions = get_tool_definitions()
+        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        tools = service._get_litellm_tools()
+
+        assert [tool["function"]["name"] for tool in tools] == [definition["name"] for definition in definitions]
+        for definition, tool in zip(definitions, tools, strict=True):
+            parameters = tool["function"]["parameters"]
+            if definition["name"] == "set_pipeline":
+                assert parameters == {
+                    "type": "object",
+                    "properties": {"pipeline": definition["parameters"]},
+                    "required": ["pipeline"],
+                    "additionalProperties": False,
+                }
+            else:
+                assert parameters == definition["parameters"]
+
+        _, marked_tools = apply_anthropic_cache_markers([], tools)
+        assert marked_tools is not None
+        marked_names = [tool["function"]["name"] for tool in marked_tools]
+        assert marked_names == [definition["name"] for definition in definitions]
+        assert ["cache_control" in tool for tool in marked_tools] == [False] * (len(marked_tools) - 1) + [True]
+        assert marked_tools[-1]["cache_control"] == {"type": "ephemeral"}
+        set_pipeline_index = marked_names.index("set_pipeline")
+        assert marked_tools[set_pipeline_index]["function"] == tools[set_pipeline_index]["function"]
+
     def test_trailing_tool_name_is_locked(self) -> None:
         """Lock the trailing tool's NAME so a reorder of ``get_tool_definitions()``
         breaks this test rather than silently invalidating Anthropic's prompt cache.
