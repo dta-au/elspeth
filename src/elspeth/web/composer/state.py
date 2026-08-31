@@ -22,7 +22,7 @@ from pydantic import ValidationError as PydanticValidationError
 from elspeth.contracts.enums import OutputMode
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.guarantee_propagation import compose_propagation
-from elspeth.contracts.plugin_protocols import TransformProtocol
+from elspeth.contracts.plugin_protocols import SourceProtocol, TransformProtocol
 from elspeth.contracts.plugin_semantics import SemanticEdgeContract
 from elspeth.contracts.schema import (
     SchemaConfig,
@@ -5594,12 +5594,35 @@ def _check_schema_contracts(
         owner = _producer_owner(producer)
         raw_schema = get_raw_schema_config(producer.options, owner=owner)
         if is_source_producer_id(producer.producer_id):
-            if raw_schema is None or raw_schema.fields is None:
+            if raw_schema is None:
                 return None
-            for field in raw_schema.fields:
-                if field.name == field_name:
-                    return None if field.field_type == "any" else field.field_type
-            return None
+            if raw_schema.fields is not None:
+                for field in raw_schema.fields:
+                    if field.name == field_name:
+                        return None if field.field_type == "any" else field.field_type
+                return None
+            if not raw_schema.is_observed or field_name not in (raw_schema.guaranteed_fields or ()):
+                return None
+
+            source_name = "source" if producer.producer_id == "source" else producer.producer_id.removeprefix("source:")
+            source_spec = source_map.get(source_name)
+            if source_spec is None or producer.plugin_name is None:
+                return None
+            source: SourceProtocol | None = None
+            try:
+                from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+                probe_options = prepare_validation_probe_options(source_spec.options, plugin=producer.plugin_name)
+                probe_options["on_validation_failure"] = source_spec.on_validation_failure
+                source = get_shared_plugin_manager().create_source(producer.plugin_name, probe_options)
+                return source.observed_value_type
+            except Exception as exc:
+                if _is_source_config_probe_exception(exc):
+                    return None
+                raise
+            finally:
+                if source is not None:
+                    source.close()
 
         producer_node = node_by_id[producer.producer_id]
         if producer_node.node_type not in {"transform", "aggregation"} or producer_node.plugin is None:

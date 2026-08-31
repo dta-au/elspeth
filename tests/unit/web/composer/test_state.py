@@ -8698,6 +8698,67 @@ class TestSchemaContractValidation:
         assert mismatch
         assert "keep (consumer expects int, producer emits str)" in mismatch[0].message
 
+    @pytest.mark.parametrize(
+        ("source_plugin", "source_options", "expects_mismatch"),
+        [
+            ("csv", {"schema": {"mode": "observed", "guaranteed_fields": ["a", "keep"]}}, True),
+            (
+                "json",
+                {"path": "/data/input.json", "schema": {"mode": "observed", "guaranteed_fields": ["a", "keep"]}},
+                False,
+            ),
+        ],
+    )
+    def test_open_mapper_forwards_only_known_observed_source_structural_type(
+        self,
+        source_plugin: str,
+        source_options: dict[str, Any],
+        expects_mismatch: bool,
+    ) -> None:
+        """Structural CSV typing propagates; an untyped observed source abstains."""
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                plugin=source_plugin,
+                options=source_options,
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "mapped",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"a": "b"},
+                    "select_only": False,
+                    "schema": {"mode": "flexible", "fields": ["a: str"]},
+                },
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "typed",
+                "mapped",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"keep": "keep"},
+                    "select_only": True,
+                    "schema": {"mode": "flexible", "fields": ["keep: int"]},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        mismatch = [entry for entry in result.errors if entry.error_code == "edge_field_type_incompatible"]
+        assert bool(mismatch) is expects_mismatch
+        if mismatch:
+            assert "keep (consumer expects int, producer emits str)" in mismatch[0].message
+
     def test_rule_d_fires_on_a_required_fields_rename_onto_a_guaranteed_field(self) -> None:
         """Third declaration channel (adversarial review of a7c783423): required_fields.
 
