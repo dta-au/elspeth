@@ -10,6 +10,7 @@ from elspeth.core.config import ElspethSettings
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec, queue_node_contract_error
 from elspeth.web.composer.yaml_generator import generate_public_yaml, generate_yaml
 from elspeth.web.composer.yaml_importer import (
+    _PIPELINE_SECTION_KEYS,
     MAX_RUNTIME_YAML_IMPORT_CHARS,
     RuntimeYamlImportError,
     _collector_nodes_from_runtime_lists,
@@ -65,6 +66,12 @@ def test_string_mapping_rejects_non_string_value() -> None:
         _string_mapping({"a": 7}, "routes")
 
 
+def test_string_mapping_rejects_post_normalization_key_collision() -> None:
+    """YAML ``true`` and quoted ``'true'`` cannot overwrite one another."""
+    with pytest.raises(RuntimeYamlImportError, match="duplicate normalized key 'true'"):
+        _string_mapping({True: "first", "true": "second"}, "routes")
+
+
 def test_string_tuple_rejects_non_string_item() -> None:
     with pytest.raises(RuntimeYamlImportError, match=r"branches\[0\] must be a non-empty string"):
         _string_tuple([7], "branches")
@@ -104,10 +111,21 @@ def test_row_union_branches_rejects_non_string_branch_entry() -> None:
 
 
 def test_reject_unimportable_sections_refuses_a_declined_section_by_name() -> None:
-    """Trust-boundary test_ref: a modelled section the composer cannot hold is
-    refused NAMING itself, rather than silently dropped (elspeth-9482eda744)."""
-    with pytest.raises(RuntimeYamlImportError, match="commencement_gates"):
-        _reject_unimportable_sections({"transforms": [], "commencement_gates": [{"plugin": "corpus"}]})
+    """Trust-boundary test_ref: every rejected key category is named together."""
+    with pytest.raises(RuntimeYamlImportError) as exc_info:
+        _reject_unimportable_sections(
+            {
+                "transforms": [],
+                "commencement_gates": [{"plugin": "corpus"}],
+                "commencment_gates": [],
+                None: "not a string key",
+            }
+        )
+
+    detail = str(exc_info.value)
+    assert "None (NoneType)" in detail
+    assert "commencment_gates" in detail
+    assert "commencement_gates" in detail
 
 
 def test_reject_unimportable_sections_refuses_unknown_top_level_key_by_name() -> None:
@@ -116,7 +134,8 @@ def test_reject_unimportable_sections_refuses_unknown_top_level_key_by_name() ->
         _reject_unimportable_sections({"transforms": [], "commencment_gates": []})
 
     assert str(exc_info.value) == (
-        "pipeline YAML contains unknown top-level keys: ['commencment_gates']. Importing would silently discard them. Check for typos."
+        "pipeline YAML contains top-level content the composer cannot import: "
+        "unknown keys ['commencment_gates']. Importing would silently discard or override it."
     )
 
 
@@ -134,8 +153,8 @@ def test_reject_unimportable_sections_sorts_multiple_unknown_keys_deterministica
     assert (
         errors
         == [
-            "pipeline YAML contains unknown top-level keys: ['alpha_setting', 'zeta_setting']. "
-            "Importing would silently discard them. Check for typos."
+            "pipeline YAML contains top-level content the composer cannot import: "
+            "unknown keys ['alpha_setting', 'zeta_setting']. Importing would silently discard or override it."
         ]
         * 2
     )
@@ -147,7 +166,8 @@ def test_reject_unimportable_sections_refuses_non_string_top_level_keys() -> Non
         _reject_unimportable_sections({"sources": {}, None: 1, 7: 2})
 
     assert str(exc_info.value) == (
-        "pipeline YAML contains non-string top-level keys: ['7 (int)', 'None (NoneType)']. Top-level keys must be strings."
+        "pipeline YAML contains top-level content the composer cannot import: "
+        "non-string keys ['7 (int)', 'None (NoneType)']. Importing would silently discard or override it."
     )
 
 
@@ -157,26 +177,148 @@ def test_composition_state_from_runtime_yaml_names_unknown_only_mapping_keys() -
         composition_state_from_runtime_yaml("zeta_setting: 1\nalpha_setting: 2\n")
 
     assert str(exc_info.value) == (
-        "pipeline YAML contains unknown top-level keys: ['alpha_setting', 'zeta_setting']. "
-        "Importing would silently discard them. Check for typos."
+        "pipeline YAML contains top-level content the composer cannot import: "
+        "unknown keys ['alpha_setting', 'zeta_setting']. Importing would silently discard or override it."
     )
 
 
-def test_composition_state_from_runtime_yaml_keeps_known_web_metadata() -> None:
-    """The unknown-key guard must retain the importer's explicit web-only key."""
-    state = composition_state_from_runtime_yaml(
-        _minimal_pipeline_doc() + "metadata:\n" + "  name: Imported pipeline\n" + "  description: Retained in composition state\n"
+def test_reject_unimportable_sections_accepts_known_pipeline_sections() -> None:
+    """The closed vocabulary must not reject any section the importer reads."""
+    _reject_unimportable_sections(dict.fromkeys(_PIPELINE_SECTION_KEYS))
+
+
+@pytest.mark.parametrize(
+    "metadata_yaml",
+    [
+        "metadata: authored-name\n",
+        "metadata:\n  name: Imported pipeline\n  description: Lost on export\n",
+        "metadata:\n  name: Imported pipeline\n  owner: also-lost\n",
+    ],
+)
+def test_composition_state_from_runtime_yaml_rejects_metadata_that_export_cannot_preserve(metadata_yaml: str) -> None:
+    """Valid, malformed, and extended metadata all lack runtime authority."""
+    with pytest.raises(RuntimeYamlImportError, match="metadata"):
+        composition_state_from_runtime_yaml(_minimal_pipeline_doc() + metadata_yaml)
+
+
+def test_composition_state_from_runtime_yaml_rejects_deleted_singular_source_surface() -> None:
+    """ADR-025 deleted ``source:`` rather than retaining a compatibility shim."""
+    with pytest.raises(RuntimeYamlImportError, match=r"source.*ADR-025"):
+        composition_state_from_runtime_yaml(
+            "source:\n  plugin: csv\n  on_success: out\n  options: {}\nsinks:\n  out:\n    plugin: json\n    on_write_failure: discard\n"
+        )
+
+
+def test_composition_state_from_runtime_yaml_rejects_source_alias_coexistence() -> None:
+    """Singular and plural source forms cannot compete by parser precedence."""
+    doc = _minimal_pipeline_doc().replace(
+        "sources:\n",
+        "source:\n  plugin: csv\n  on_success: out\n  options: {}\nsources:\n",
+        1,
     )
 
-    assert state.metadata == PipelineMetadata(
-        name="Imported pipeline",
-        description="Retained in composition state",
-    )
+    with pytest.raises(RuntimeYamlImportError, match=r"conflicting keys \['source', 'sources'\]"):
+        composition_state_from_runtime_yaml(doc)
+
+
+@pytest.mark.parametrize(
+    "duplicate_kind",
+    ["top-level", "nested"],
+)
+def test_composition_state_from_runtime_yaml_rejects_duplicate_mapping_keys(duplicate_kind: str) -> None:
+    """Duplicate keys at any mapping depth are loss, never last-value-wins."""
+    doc = _minimal_pipeline_doc()
+    if duplicate_kind == "top-level":
+        doc += "sources: {}\n"
+    else:
+        doc = doc.replace("      schema:\n", "      schema:\n        mode: fixed\n      schema:\n", 1)
+
+    with pytest.raises(RuntimeYamlImportError, match="duplicate YAML mapping key"):
+        composition_state_from_runtime_yaml(doc)
+
+
+@pytest.mark.parametrize(
+    ("section_yaml", "expected_path"),
+    [
+        ("", "sources.primary.on_succes"),
+        (
+            "transforms:\n"
+            "- name: transform_one\n"
+            "  plugin: passthrough\n"
+            "  input: primary\n"
+            "  on_success: out\n"
+            "  on_error: discard\n"
+            "  on_succes: lost\n",
+            "transforms[0].on_succes",
+        ),
+        (
+            "transforms:\n"
+            "- name: transform_one\n"
+            "  plugin: passthrough\n"
+            "  input: primary\n"
+            "  on_success: out\n"
+            "  on_error: discard\n"
+            "  trigger: {count: 2}\n",
+            "transforms[0].trigger",
+        ),
+        (
+            "gates:\n- name: gate_one\n  input: primary\n  condition: 'True'\n  routes: {true: out}\n  routs: {true: lost}\n",
+            "gates[0].routs",
+        ),
+        (
+            "aggregations:\n"
+            "- name: aggregation_one\n"
+            "  plugin: batch_stats\n"
+            "  input: primary\n"
+            "  on_success: out\n"
+            "  on_error: discard\n"
+            "  output_mod: row\n",
+            "aggregations[0].output_mod",
+        ),
+        (
+            "coalesce:\n- name: joined\n  branches: [left, right]\n  policy: require_all\n  merge: nested\n  optionz: {}\n",
+            "coalesce[0].optionz",
+        ),
+        ("", "sinks.out.on_write_failur"),
+    ],
+)
+def test_composition_state_from_runtime_yaml_rejects_unknown_structural_fields(
+    section_yaml: str,
+    expected_path: str,
+) -> None:
+    """Runtime model extra=forbid must survive the Composer import boundary."""
+    doc = _minimal_pipeline_doc()
+    if expected_path == "sources.primary.on_succes":
+        doc = doc.replace("    on_success: out\n", "    on_success: out\n    on_succes: lost\n", 1)
+    elif expected_path == "sinks.out.on_write_failur":
+        doc = doc.replace("    on_write_failure: discard\n", "    on_write_failure: discard\n    on_write_failur: lost\n", 1)
+    else:
+        doc += section_yaml
+
+    with pytest.raises(RuntimeYamlImportError) as exc_info:
+        composition_state_from_runtime_yaml(doc)
+    entry_path, field = expected_path.rsplit(".", 1)
+    assert entry_path in str(exc_info.value)
+    assert field in str(exc_info.value)
 
 
 def test_source_from_runtime_entry_rejects_non_mapping_entry() -> None:
     with pytest.raises(RuntimeYamlImportError, match=r"sources\.s must be a mapping"):
         _source_from_runtime_entry("s", ["not", "a", "mapping"])
+
+
+def test_source_from_runtime_entry_rejects_conflicting_validation_failure_spellings() -> None:
+    """Compatibility aliases may agree, but one cannot silently override another."""
+    with pytest.raises(RuntimeYamlImportError, match="conflicting on_validation_failure"):
+        _source_from_runtime_entry(
+            "s",
+            {
+                "plugin": "csv",
+                "on_success": "out",
+                "on_validation_failure": "discard",
+                "options": {"on_validation_failure": "quarantine"},
+            },
+        )
 
 
 @pytest.mark.parametrize("authored", ["", None, 17])
@@ -281,7 +423,7 @@ def test_composition_state_from_runtime_yaml_rejects_non_pipeline_mapping() -> N
     must not silently import as an empty (destructive-replace) composition.
     The closed key vocabulary provides the more actionable named diagnosis."""
     not_a_pipeline = "shopping_list:\n  - milk\n  - eggs\nnotes: just some random yaml\n"
-    with pytest.raises(RuntimeYamlImportError, match=r"unknown top-level keys: \['notes', 'shopping_list'\]"):
+    with pytest.raises(RuntimeYamlImportError, match=r"unknown keys \['notes', 'shopping_list'\]"):
         composition_state_from_runtime_yaml(not_a_pipeline)
 
 
@@ -1116,7 +1258,9 @@ _ELSPETH_SETTINGS_SECTIONS = frozenset(ElspethSettings.model_fields)
 _SECTION_PROBE_YAML: dict[str, str] = {
     "aggregations": "aggregations:\n- name: agg\n  plugin: batch_stats\n  input: out\n  on_success: out\n  on_error: discard\n  options:\n    schema:\n      mode: observed\n",
     "checkpoint": "checkpoint:\n  enabled: true\n",
-    "coalesce": "coalesce:\n- name: co\n  branches: {}\n  on_success: out\n",
+    "coalesce": (
+        "coalesce:\n- name: co\n  branches: {left: left, right: right}\n  policy: require_all\n  merge: union\n  on_success: out\n"
+    ),
     "collection_probes": "collection_probes:\n- collection: c\n  plugin: chroma\n  options: {}\n",
     "collectors": "collectors:\n- name: col\n  plugin: passthrough\n  input: out\n  on_success: out\n  on_error: discard\n  options: {}\n",
     "commencement_gates": 'commencement_gates:\n- name: ready\n  condition: "1 > 0"\n',
@@ -1133,9 +1277,22 @@ _SECTION_PROBE_YAML: dict[str, str] = {
     "rate_limit": "rate_limit:\n  requests_per_minute: 60\n",
     "replay_from": "replay_from: run-123\n",
     "retry": "retry:\n  max_attempts: 2\n",
-    "row_unions": "row_unions:\n- name: ru\n  branches: []\n  on_success: out\n",
+    "row_unions": "row_unions:\n- name: ru\n  branches: [left, right]\n  on_success: out\n",
     "run_mode": "run_mode: normal\n",
-    "scopes": "scopes:\n- name: sc\n  opener: out\n  closer: out\n",
+    "scopes": (
+        "collectors:\n"
+        "- name: col\n"
+        "  plugin: batch_stats\n"
+        "  input: out\n"
+        "  on_success: out\n"
+        "  on_error: discard\n"
+        "  options: {}\n"
+        "scopes:\n"
+        "- name: sc\n"
+        "  opener: out\n"
+        "  closer: col\n"
+        "  policy: all\n"
+    ),
     "sinks": "",  # already present in the base document
     "sources": "",  # already present in the base document
     "telemetry": "telemetry:\n  enabled: false\n",
@@ -1154,6 +1311,8 @@ def _section_survived(state: CompositionState, section: str) -> bool:
         return bool(state.sources)
     if section == "sinks":
         return bool(state.outputs)
+    if section == "scopes":
+        return any(node.scope_name is not None for node in state.nodes)
     return bool(state.nodes) and any(_node_matches_section(node, section) for node in state.nodes)
 
 
@@ -1225,21 +1384,19 @@ def test_every_modelled_section_is_imported_or_refused_by_name(section: str) -> 
         )
         return
 
-    try:
+    if section in _PIPELINE_SECTION_KEYS:
         state = composition_state_from_runtime_yaml(doc)
-    except RuntimeYamlImportError as exc:
-        assert section in str(exc), (
-            f"Section {section!r} is refused, which is legitimate — but the refusal must NAME it "
-            f"so the author knows what was rejected. Got: {exc}"
+        # Imported rather than refused: the section's content must be
+        # REPRESENTED, not swallowed. A bare "no exception" is exactly the
+        # silent-drop defect.
+        assert _section_survived(state, section), (
+            f"Section {section!r} imported without error but left no trace in the composition state. "
+            f"That is the silent drop this test exists to forbid: refuse it by name, or carry it."
         )
         return
 
-    # Imported rather than refused: the section's content must be REPRESENTED,
-    # not swallowed. A bare "no exception" is exactly the silent-drop defect.
-    assert _section_survived(state, section), (
-        f"Section {section!r} imported without error but left no trace in the composition state. "
-        f"That is the silent drop this test exists to forbid: refuse it by name, or carry it."
-    )
+    with pytest.raises(RuntimeYamlImportError, match=section):
+        composition_state_from_runtime_yaml(doc)
 
 
 def test_a_newly_modelled_section_is_refused_rather_than_dropped(monkeypatch: pytest.MonkeyPatch) -> None:

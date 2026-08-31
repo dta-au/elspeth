@@ -8158,8 +8158,8 @@ sinks:
 
         assert resp.status_code == 400
         assert resp.json()["detail"] == (
-            "pipeline YAML contains unknown top-level keys: ['notes', 'shopping_list']. "
-            "Importing would silently discard them. Check for typos."
+            "pipeline YAML contains top-level content the composer cannot import: "
+            "unknown keys ['notes', 'shopping_list']. Importing would silently discard or override it."
         )
         # The session's current state must remain unset -- nothing was persisted.
         assert await service.get_current_state(session.id) is None
@@ -8190,7 +8190,8 @@ commencment_gates: []
 
         assert resp.status_code == 400
         assert resp.json()["detail"] == (
-            "pipeline YAML contains unknown top-level keys: ['commencment_gates']. Importing would silently discard them. Check for typos."
+            "pipeline YAML contains top-level content the composer cannot import: "
+            "unknown keys ['commencment_gates']. Importing would silently discard or override it."
         )
         assert await service.get_current_state(session.id) is None
 
