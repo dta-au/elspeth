@@ -48,14 +48,17 @@ from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle
 from elspeth_lints.core.source_snapshot import observe_source_snapshot
 from elspeth_lints.core.tier_model_scan import (
     TargetCensus,
-    TargetCoverage,
     census_tree_targets,
-    plan_judge_cleanup_groups,
+    diagnosis_deferred_prefixes,
     plan_non_judge_rotations,
+    routable_new_judgment_findings,
     scan_single_file_findings,
-    scan_tree_findings,
 )
-from elspeth_lints.rules.trust_tier.tier_model.rotate import RotationPlan, _finding_covered_by_per_file_rule
+from elspeth_lints.rules.trust_tier.tier_model.rotate import (
+    RotationPlan,
+    _finding_covered_by_per_file_rule,
+    identity_prefix,
+)
 from elspeth_lints.rules.trust_tier.tier_model.rule import _load_tier_model_allowlist
 
 # A ``stale_delete`` target is safe to remove only while the tree still reports
@@ -72,7 +75,6 @@ class BundleVerificationReport:
     diagnosis: JudgeSignatureDiagnosisReport
     rotation_plan: RotationPlan | None
     target_census: TargetCensus
-    operator_derived_actions: tuple[BundleAction, ...]
 
     @property
     def ok(self) -> bool:
@@ -132,62 +134,30 @@ def verify_bundle_against_tree(
         mismatches.append("bundle source snapshot SHA-256 does not match the current scanner Python/YAML inputs")
 
     diagnosis = diagnose_judge_signatures(root=root, allowlist_dir=allowlist_dir)
-    diagnosis_items_by_key: dict[str, list[Any]] = {}
-    for item in diagnosis.items:
-        diagnosis_items_by_key.setdefault(item.key, []).append(item)
-    duplicate_diagnosis_keys = {key for key, items in diagnosis_items_by_key.items() if len(items) > 1}
-    for key in sorted(duplicate_diagnosis_keys):
-        owners = sorted(item.source_file for item in diagnosis_items_by_key[key])
-        mismatches.append(f"target diagnosis contains duplicate diagnosis key {key!r} in {owners!r}")
-    index: dict[str, Any] = {key: items[0] for key, items in diagnosis_items_by_key.items() if key not in duplicate_diagnosis_keys}
-    bundle_action_keys: set[str] = set()
-    for action in bundle.actions:
-        if action.key in bundle_action_keys:
-            mismatches.append(f"review bundle contains duplicate action key {action.key!r}")
-        bundle_action_keys.add(action.key)
+    index: dict[str, Any] = {item.key: item for item in diagnosis.items}
     allowlist = _load_tier_model_allowlist(allowlist_dir)
-    raw_findings = tuple(scan_tree_findings(root=root))
-    full_rotation_plan = plan_non_judge_rotations(
-        findings=raw_findings,
-        allowlist=allowlist,
-        diagnosis_items=diagnosis.items,
-    )
-    cleanup_groups = plan_judge_cleanup_groups(
-        findings=raw_findings,
-        allowlist=allowlist,
-        orphan_keys=frozenset(item.key for item in diagnosis.items if item.status in _STALE_DELETE_ORPHAN_STATUSES),
-    )
-    resign_assigned_keys = {rotation.new_key for rotation in full_rotation_plan.rotations}
-    resign_assigned_keys.update(finding_key for group in cleanup_groups for finding_key in group.finding_keys)
-    target_coverage = TargetCoverage(
-        exact_keys=frozenset(entry.key for entry in allowlist.entries),
-        diagnosis_assigned_keys=frozenset(
-            item.repair_key for item in diagnosis.items if item.status in _SIGNABLE_DIAGNOSIS_STATUSES and item.repair_key is not None
-        ),
-        resign_assigned_keys=frozenset(resign_assigned_keys),
-    )
+    covered_keys = frozenset(entry.key for entry in allowlist.entries)
     target_scan = census_tree_targets(
         root=root,
-        findings=raw_findings,
-        coverage=target_coverage,
+        covered_keys=covered_keys,
         per_file_rules=allowlist.per_file_rules,
     )
+    deferred_prefixes = diagnosis_deferred_prefixes(diagnosis.items)
 
     # Survey every non-judge-gated rotation even when the staged bundle omits
     # the lane. Remove findings already assigned to judge-gated diagnosis so a
     # mixed signed/pre-judge identity group is classified on its true residual
     # population rather than producing filtered-plan pollution.
+    full_rotation_plan = plan_non_judge_rotations(
+        findings=target_scan.findings,
+        allowlist=allowlist,
+        diagnosis_items=diagnosis.items,
+    )
     for group in full_rotation_plan.ambiguous:
         mismatches.append(
             "target census found ambiguous non-judge target group "
             f"{group.prefix!r} ({group.finding_count} finding(s), {group.entry_count} entry/entries)"
         )
-    rotations_by_old_key: dict[str, list[Any]] = {}
-    for rotation in full_rotation_plan.rotations:
-        rotations_by_old_key.setdefault(rotation.old_key, []).append(rotation)
-    for old_key, rotations in sorted(rotations_by_old_key.items()):
-        if len(rotations) > 1:
-            mismatches.append(f"target census rotation old_key {old_key!r} has {len(rotations)} owners; rotation ownership must be unique")
     rotation_keys = {action.key for action in bundle.actions if action.kind == "rotation"}
     for rotation in full_rotation_plan.rotations:
         if rotation.old_key not in rotation_keys:
@@ -204,7 +174,12 @@ def verify_bundle_against_tree(
         file_findings = new_judgment_findings_by_file.setdefault(finding.file_path, {})
         assert file_findings is not None
         file_findings[canonical_key] = finding
-    for finding in target_scan.uncovered_findings:
+    expected_new_judgments = routable_new_judgment_findings(
+        uncovered_findings=target_scan.uncovered_findings,
+        diagnosis_items=diagnosis.items,
+        rotation_plan=full_rotation_plan,
+    )
+    for finding in expected_new_judgments:
         canonical_key = _finding_canonical_key(finding)
         if canonical_key not in justify_keys:
             mismatches.append(f"target census missing justify action for uncovered finding {canonical_key!r}")
@@ -212,33 +187,9 @@ def verify_bundle_against_tree(
     action_keys_by_kind = {
         kind: {action.key for action in bundle.actions if action.kind == kind} for kind in ("drift_repair", "stale_delete")
     }
-    operator_derived_actions: list[BundleAction] = []
     for item in diagnosis.items:
-        if item.key in duplicate_diagnosis_keys:
-            continue
         if item.status in _SIGNABLE_DIAGNOSIS_STATUSES and item.key not in action_keys_by_kind["drift_repair"]:
-            if item.status == "INVALID_SIGNATURE" and diagnosis.verification_mode == "authoritative":
-                # A key-free stage can validate the signed row's shape and
-                # binding, but it cannot authenticate the HMAC without
-                # violating key custody. The operator-key gate is the first
-                # place this status is knowable, so make the repair explicit
-                # there and require the CLI to show/fire it as part of the
-                # reviewed transaction rather than deadlocking on an
-                # impossible key-free re-stage.
-                if item.key in bundle_action_keys:
-                    mismatches.append(f"operator-derived invalid-signature repair for {item.key!r} conflicts with a staged action")
-                else:
-                    operator_derived_actions.append(
-                        BundleAction(
-                            lane="resign",
-                            kind="drift_repair",
-                            key=item.key,
-                            source_file=item.source_file,
-                            diagnosis_status=item.status,
-                        )
-                    )
-            else:
-                mismatches.append(f"target census missing drift_repair action for {item.key!r} ({item.status})")
+            mismatches.append(f"target census missing drift_repair action for {item.key!r} ({item.status})")
         elif item.status in _STALE_DELETE_ORPHAN_STATUSES and item.key not in action_keys_by_kind["stale_delete"]:
             mismatches.append(f"target census missing stale_delete action for orphan {item.key!r} ({item.status})")
 
@@ -251,7 +202,8 @@ def verify_bundle_against_tree(
                     action,
                     root=root,
                     live_findings_by_file=new_judgment_findings_by_file,
-                    covered_keys=target_coverage.exact_keys | target_coverage.diagnosis_assigned_keys,
+                    covered_keys=covered_keys,
+                    deferred_prefixes=deferred_prefixes,
                     per_file_rules=allowlist.per_file_rules,
                 )
             )
@@ -275,7 +227,6 @@ def verify_bundle_against_tree(
         diagnosis=diagnosis,
         rotation_plan=rotation_plan,
         target_census=target_scan.census,
-        operator_derived_actions=tuple(sorted(operator_derived_actions, key=lambda action: (action.kind, action.key))),
     )
 
 
@@ -296,6 +247,7 @@ def _verify_new_judgment(
     root: Path,
     live_findings_by_file: dict[str, dict[str, Any] | None],
     covered_keys: frozenset[str],
+    deferred_prefixes: frozenset[str],
     per_file_rules: list[PerFileRule],
 ) -> list[str]:
     if not action.file_path:  # pragma: no cover - enforced by BundleAction.__post_init__
@@ -319,6 +271,8 @@ def _verify_new_judgment(
         ]
     if action.key in covered_keys or _finding_covered_by_per_file_rule(finding, per_file_rules):
         return [f"new_judgment {action.key!r}: finding is already covered by the current allowlist; re-run stage_scan"]
+    if identity_prefix(action.key) in deferred_prefixes:
+        return [f"new_judgment {action.key!r}: identity is reserved for an outstanding diagnosis action; re-run stage_scan"]
     return []
 
 
@@ -339,17 +293,9 @@ def _verify_stale_delete(action: BundleAction, index: dict[str, Any]) -> list[st
 def _verify_rotation(action: BundleAction, rotation_plan: RotationPlan | None) -> list[str]:
     if rotation_plan is None:  # pragma: no cover - a rotation action guarantees a computed plan
         return [f"rotation {action.key!r}: no filtered rotation plan was computed"]
-    rotations = [candidate for candidate in rotation_plan.rotations if candidate.old_key == action.key]
-    if not rotations:
+    old_keys = {rotation.old_key for rotation in rotation_plan.rotations}
+    if action.key not in old_keys:
         return [f"rotation {action.key!r}: no longer an applicable rotation old_key in a fresh non-judge-gated scan"]
-    if len(rotations) != 1:
-        return [f"rotation {action.key!r}: fresh rotation old_key has {len(rotations)} owners; expected exactly one"]
-    rotation = rotations[0]
-    if action.source_file != rotation.entry_source_file:
-        return [
-            f"rotation {action.key!r}: staged source_file {action.source_file!r} does not match "
-            f"the fresh rotation owning YAML {rotation.entry_source_file!r}"
-        ]
     return []
 
 
