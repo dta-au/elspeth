@@ -265,7 +265,7 @@ const wireTurn: Record<string, unknown> = {
         // Advisory copy — contains "prompt-injection shield" but not the
         // azure_prompt_shield node literal (see note above).
         message:
-          "LLM node 'rate' consumes externally-fetched content from a web_scrape upstream without an authorized prompt-injection shield between them. Continuing without it is allowed.",
+          "LLM node 'rate' consumes untrusted or externally controlled upstream content produced by web_scrape without an authorized prompt-injection shield between them. Continuing without it is allowed.",
       },
     ],
     blockers: [],

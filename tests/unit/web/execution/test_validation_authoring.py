@@ -8,7 +8,10 @@ from typing import Any, cast
 
 import pytest
 
+from elspeth.contracts import Determinism
 from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem, SecretScope
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.plugins.transforms.blob_fetch import BlobFetch
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution._validation_authoring import (
@@ -355,6 +358,31 @@ def test_web_network_phase_returns_typed_failure() -> None:
     assert result.errors[0].error_code == "web_scrape_private_network_not_allowed"
 
 
+def test_web_network_phase_derives_future_fetchers_from_plugin_capability(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FutureHTTPFetcher(BlobFetch):
+        name = "future_http_fetcher"
+        determinism = Determinism.EXTERNAL_CALL
+        fetches_http = True
+
+    manager = get_shared_plugin_manager()
+    registered = tuple(manager.get_transforms())
+    monkeypatch.setattr(manager, "get_transforms", lambda: (*registered, FutureHTTPFetcher))
+    state = _state(
+        nodes=(
+            _node(
+                plugin=FutureHTTPFetcher.name,
+                options={"http": {"allowed_hosts": "allow_private"}},
+            ),
+        )
+    )
+
+    result = validate_web_network_policy(_policy(state), plugin_snapshot=_web_snapshot())
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "web_scrape_network_policy"
+    assert result.errors[0].error_code == "web_fetch_private_network_not_allowed"
+
+
 def test_web_resource_phase_returns_typed_failure() -> None:
     state = _state(
         nodes=(
@@ -374,6 +402,28 @@ def test_web_resource_phase_returns_typed_failure() -> None:
         "web_fetch_resource_limit_exceeded",
         "web_fetch_resource_limit_exceeded",
     ]
+
+
+def test_web_resource_phase_caps_web_scrape() -> None:
+    state = _state(
+        nodes=(
+            _node(
+                plugin="web_scrape",
+                options={"http": {"timeout": 31, "max_body_bytes": 10 * 1024 * 1024 + 1}},
+            ),
+        )
+    )
+
+    result = validate_web_resource_policy(_policy(state), plugin_snapshot=_web_snapshot())
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "web_fetch_resource_policy"
+    assert result.failed_check.affected_nodes == ("node", "node")
+    assert [error.error_code for error in result.errors] == [
+        "web_fetch_resource_limit_exceeded",
+        "web_fetch_resource_limit_exceeded",
+    ]
+    assert all("web_scrape.http" in error.message for error in result.errors)
 
 
 def test_resource_limit_outcome_rejects_ambiguous_state() -> None:

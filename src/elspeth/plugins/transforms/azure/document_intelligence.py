@@ -40,6 +40,7 @@ from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.enums import AuditCharacteristic
 from elspeth.contracts.errors import FrameworkBugError, PluginRetryableError, is_capacity_error
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.plugin_capabilities import ContentTrust
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
@@ -293,9 +294,10 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:a683f03e54b950c3"
+    source_file_hash: str | None = "sha256:24c7e149d5bd98a5"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
+    content_trust = ContentTrust.UNTRUSTED
     creates_tokens = False
     discovery_secret_requirements: Mapping[str, tuple[str, ...]] = {
         "api_key": ("AZURE_DOCUMENT_INTELLIGENCE_KEY",),

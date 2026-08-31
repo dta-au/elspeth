@@ -26,6 +26,7 @@ from elspeth.core.expression_parser import ExpressionEvaluationError, Expression
 from elspeth.plugins.infrastructure.manager import (
     PluginNotFoundError,
     get_shared_plugin_manager,
+    http_fetch_transform_names,
 )
 from elspeth.plugins.transforms.llm.model_catalog import (
     MODEL_CATALOG_OPENROUTER,
@@ -56,6 +57,7 @@ from elspeth.web.composer.state import (
     ValidationEntryDict,
     _coalesce_branch_connections,
     _is_config_probe_exception,
+    _runtime_nodes_downstream_of_connection,
     _source_options_have_schema,
     _validate_gate_expression,
 )
@@ -2971,8 +2973,9 @@ def _compute_proof_diagnostics_for_source(
         normalization or field_mapping resolution failed before schema
         comparison could proceed.
       * ``text_source_url_without_web_scrape`` — text source whose blob
-        content is a single URL but no web_scrape node downstream. The
-        URL string itself reaches sinks instead of the URL's content.
+        content is a single URL but no compatible HTTP-fetch transform is
+        downstream. The URL string itself reaches sinks instead of the URL's
+        content. The stable historical code is retained for API compatibility.
       * ``gate_expression_type_mismatch_against_source_schema`` — observed
         CSV source values are still strings, and a gate reached through a
         provably field-preserving path fails against sampled rows before runtime.
@@ -3267,22 +3270,24 @@ def _compute_proof_diagnostics_for_source(
             )
         )
 
-    # 3. Text source containing a single URL but no web_scrape downstream.
+    # 3. Text source containing a single URL but no compatible HTTP fetcher
+    #    reachable from this source. An unrelated fetch branch does not count.
     if facts.source_kind == "text" and facts.url_candidates:
-        node_plugins = {(n.plugin or "").lower() for n in state.nodes}
-        if "web_scrape" not in node_plugins:
+        fetch_transform_names = http_fetch_transform_names()
+        downstream_nodes = _runtime_nodes_downstream_of_connection(source.on_success, state.nodes)
+        if not any(node.plugin in fetch_transform_names for node in downstream_nodes):
             diagnostics.append(
                 _blocking_diagnostic(
                     code="text_source_url_without_web_scrape",
                     message=(
                         f"Source blob contains URL(s) {list(facts.url_candidates)} but no "
-                        "web_scrape transform is wired downstream. The URL string itself will "
-                        "flow to sinks, not the URL's content."
+                        "compatible HTTP fetch transform is wired downstream from this source. "
+                        "The URL string itself will flow to sinks, not the URL's content."
                     ),
                     suggested_repair=(
-                        "upsert_node({node_type: 'transform', plugin: 'web_scrape', "
-                        "input: <source on_success>, options: {url_field: '<column>'}}) and route "
-                        "the source on_success to it."
+                        "Discover an available compatible HTTP fetch transform, wire its input to "
+                        "this source's on_success connection, configure its URL field, and route "
+                        "the source through it."
                     ),
                     evidence_locator={
                         "source": "blob",

@@ -313,10 +313,10 @@ JSON-escaped, so grep the bare hex token), then any
 - `tests/unit/plugins/transforms/test_external_catalogue_metadata.py` — an
   external-call or non-deterministic transform must appear in
   `EXPECTED_EXTERNAL_TAGS`, `_REQUIRED_GUIDANCE`, and, when it surfaces
-  externally controlled text, `_REMOTE_CONTENT_PRODUCERS`; it must also join
-  `_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS` in
-  `src/elspeth/web/interpretation_state.py`, a fail-open set where an
-  unlisted producer reads as trusted.
+  externally controlled text, declare
+  `content_trust = ContentTrust.UNTRUSTED`; the catalogue guidance test and
+  Composer prompt-shield admission both derive their producer vocabulary from
+  that closed declaration.
 - `tests/unit/plugins/test_validation_path_agreement.py` — any config with a
   `@model_validator` needs a rejection case in `_TRANSFORM_REJECTION_CASES`.
 - `tests/invariants/test_input_schema_config_is_captured.py`
