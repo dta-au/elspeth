@@ -210,6 +210,16 @@ class ComposerResult:
     # SessionServiceProtocol.persist_compose_turn_async. Routes must not drain
     # tool_invocations again for that turn.
     persisted_assistant_message_id: str | None = None
+    # The content that row actually holds. The turn-end writers in
+    # ``routes/messages.py`` and ``routes/composer/compose.py`` use it to
+    # recognise when ``message`` merely re-carries prose the compose loop has
+    # already committed, and then persist only the backend-authored suffix
+    # (``_helpers.composer_turn_end_assistant_row``, elspeth-d581b3da7f).
+    # Defaulted because 55 test constructions and every non-loop producer
+    # legitimately leave the whole pair unset; the biconditional in
+    # ``__post_init__`` is what makes a HALF-threaded pair — the shape that
+    # regresses to duplication — unrepresentable.
+    persisted_assistant_content: str | None = None
     persisted_tool_call_turn: bool = False
     # Number of forced repair turns the proof step injected into this compose
     # invocation. Capped at 2 by the loop. 0 means first-pass success; 1 or 2
@@ -294,6 +304,27 @@ class ComposerResult:
                 "ComposerResult.repair_turns_used must be 0, 1, or 2 "
                 "(capped by _MAX_REPAIR_TURNS in web/composer/service.py); "
                 f"got {self.repair_turns_used}."
+            )
+        # Persisted-row pairing. The compose loop threads the id and the
+        # content of the already-committed assistant row through ~13 sites
+        # via ``dataclasses.replace``; a site that carries the id and drops
+        # the content leaves the turn-end writer unable to recognise its own
+        # re-emission, and it silently reverts to persisting the planner's
+        # prose a second time (elspeth-d581b3da7f, live session 891b7b1e).
+        # Because both fields are defaulted, that miss would otherwise be
+        # invisible — this check is what converts it into a crash at the
+        # construction boundary.
+        if (self.persisted_assistant_message_id is None) != (self.persisted_assistant_content is None):
+            raise ValueError(
+                "ComposerResult field-pairing invariant violated: "
+                "persisted_assistant_message_id and persisted_assistant_content "
+                "must be set or unset together. The id names the assistant row "
+                "the compose loop already committed and the content is what "
+                "that row holds; carrying one without the other regresses the "
+                "turn-end writer to re-emitting prose that is already in the "
+                "transcript. "
+                f"id={'set' if self.persisted_assistant_message_id is not None else 'None'}, "
+                f"content={'set' if self.persisted_assistant_content is not None else 'None'}."
             )
 
 
