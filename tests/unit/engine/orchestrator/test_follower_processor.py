@@ -1717,15 +1717,15 @@ class TestBestEffortDepartContainment:
         assert len(repo.depart_calls) == 1
         assert any("transient DB failure" in record.getMessage() for record in caplog.records)
 
-    def test_integrity_error_is_contained_and_recorded(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_integrity_error_propagates(self) -> None:
+        """depart_worker's CAS and audit-event insert share one transaction:
+        a constraint failure there is corruption evidence, not an established
+        transient race, so it must never be relabelled best-effort."""
         repo = _RaisingDepartRepo(SQLAIntegrityError("stmt", None, Exception("dup")))
         follower, _, _, _, _ = _make_follower(coord_repo=repo)
 
-        with caplog.at_level(logging.WARNING, logger="elspeth.engine.orchestrator.follower"):
+        with pytest.raises(SQLAIntegrityError):
             follower._best_effort_depart()
-
-        assert len(repo.depart_calls) == 1
-        assert any("transient DB failure" in record.getMessage() for record in caplog.records)
 
     def test_unexpected_exception_propagates(self) -> None:
         repo = _RaisingDepartRepo(RuntimeError("depart bug"))
