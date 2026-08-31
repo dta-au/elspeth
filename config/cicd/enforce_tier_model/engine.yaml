@@ -391,25 +391,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[23]/body[1]'
   judge_metadata_signature: 'hmac-sha256:v2:d7dbcae67efdd199c03864f86efedb62ba2a7abc9fbb0e0bee8dbc79145aad6e'
-- key: engine/executors/state_guard.py:R6:stamped_node_state_id:fp=2339d2e8e97d0d1c
+- key: engine/executors/state_guard.py:R6:stamped_node_state_id:fp=d3b7cc335e05c8be
   owner: john
   reason: |-
     This is a prescribed best-effort exception-stamp read, not a swallowed Tier-1 audit-data failure. In `engine/executors/state_guard.py:64-70`, `stamped_node_state_id()` reads metadata from the exception object's own `__dict__` with `stamped = vars(exc).get(_EXCEPTION_NODE_STATE_ID_ATTR)`, catches only `TypeError` from `vars(exc)` when an exception type has no writable/readable instance dictionary, and returns `None` for "unstamped." The adjacent stamping contract at `engine/executors/state_guard.py:56-58` makes the failure mode explicit: an exception type that rejects stamping is "left unstamped" so the consumer's `state_id` invariant fails loudly rather than mis-attributing an audit record. This suppression is valid only while the site remains this exact narrow `vars(exc)`/`except TypeError: return None` stamp-inspection pattern and does not broaden into hiding Landscape/audit corruption or terminal-state write failures.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:17:38.673633+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
+  judge_recorded_at: '2026-08-31T16:22:05.466384+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.94
   judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM. The `except TypeError: return None` is not swallowing a Tier-1 audit failure — it handles the narrow case where `vars(exc)` raises because the exception type has no writable `__dict__` (e.g. `__slots__`). The stamping contract explicitly documents that unstampable exceptions are left unstamped, and the consumer's state_id-required invariant then fails loudly downstream; returning None here is the meaning-preserving 'absent stamp' signal, symmetric with the `contextlib.suppress` on the write side. The exception caught is narrow (TypeError only), the alternative signal (None) is honest about absence rather than fabricating an id, and the visible comments corroborate the rationale.
+    RULE MISFIRES — the narrow `TypeError` handler converts the absence of an exception instance dictionary into the function’s documented `None` sentinel for “unstamped”; it does not conceal a Tier-1 audit failure, fabricate a state ID, or continue with misattributed evidence. The downstream control is `record_transform_error_with_routing`, verified at engine/executors/transform.py:74-118, which rejects a missing `state_id` before recording a DIVERT event. R6’s premise of swallowing an error without an explicit result is therefore false at this site.
   judge_signature_version: 2
-  scope_fingerprint: 958a96b6897f946f964dde4d8865d0a7ab980fc15d3c1e80533523093edcf8af
-  judge_transport: openrouter
-  ast_path: 'body[21]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:45403672cf1e0b275907b2fce2f8fc34aa8d7cd038f1ce93ffb76992c65f28e7'
+  scope_fingerprint: 4bd768d3fe9b882571743518f89f520d494801d221ef90e943ada4b6d1a525e9
+  judge_transport: codex_cli
+  ast_path: 'body[24]/body[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:908b61efa5b1e813686b4e7a261f04b9e624d68f5d2ae6521abdab21fd66a83a'
 - key: engine/executors/state_guard.py:R5:NodeStateGuard:_extract_audit_evidence_context:fp=651c302502eb070c
   owner: john
   reason: |-
@@ -1472,17 +1472,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T02:30:59.059188+00:00'
+  judge_recorded_at: '2026-08-31T16:16:48.461058+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.96
   judge_rationale: |-
-    PRESCRIBED FORM: the nominal `bool` check is an offensive admission gate over an expression result whose runtime type is not guaranteed by the visible contract. The code rejects non-booleans with the specifically typed `CommencementGateFailedError`, records the audit snapshot, and deliberately avoids leaking the returned value, so it prevents truthiness from silently authorizing a run rather than masking a contract violation. The reported subject is not a direct shape access rooted at a clearly identified external parameter, so the structural decorator nudge is not established here.
+    PRESCRIBED FORM — `ExpressionParser.evaluate` explicitly returns `Any` (`src/elspeth/core/expression_parser.py:1043`), so its result has no runtime-enforced boolean contract. The visible code performs an offensive `isinstance` check and immediately raises `CommencementGateFailedError` before any truthiness decision, without coercing, defaulting, or exposing the returned value. This is the commencement admission control itself, not a defensive re-check of a guaranteed Tier-2 shape; the decorator is inapplicable because the checked subject is the evaluator's polymorphic return rather than a direct shape guard rooted at one external parameter.
   judge_signature_version: 2
-  scope_fingerprint: d5609e6d850b05dcbab504d33e5c813bf58519e0a877ecd59ca8f06f3c501779
+  scope_fingerprint: 4d8aa2c165868e9e75a747953e2b60a3b405dfb07e371ec9d8fcec05d13c8762
   judge_transport: codex_cli
   ast_path: 'body[14]/body[4]/body[1]/body[2]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:a77f4af309bc235f5e7d6d84e9d94164248a5e09fff10e234bc864102d983724'
+  judge_metadata_signature: 'hmac-sha256:v2:b7182e810955d7a4eed6ffe1099cc6ce0806f741b979fa5fd6ec0c82cb060ff1'
 - key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:_latest_exact_member_result:fp=755208f37daeea8f
   owner: john
   reason: |-
@@ -1597,3 +1597,22 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[32]/body[14]/body[12]/body[7]/body[3]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:377d011a3980a6852be3b61ab7ffe8d5f3c99c0db388f6b9bac6d1df18365c88'
+- key: engine/executors/transform.py:R5:TransformExecutor:execute_transform:fp=9497b85b06e43bf9
+  owner: john
+  reason: |-
+    PRESCRIBED NOMINAL DISPATCH: `BatchTransformRuntime` is an ELSPETH-owned concrete opt-in base class, deliberately not a runtime-checkable Protocol, and this check selects the row-pipelined batch path only for inheriting, enabled transforms. Non-members and disabled members take the ordinary synchronous path; partial subclasses fail loudly through the base members' `NotImplementedError` defaults, so no contract violation is hidden. `tests/unit/engine/test_executors.py::TestTransformExecutorBatchPath::test_batch_transform_mixin_is_nominal_runtime_subclass` pins rejection of a structural impostor, and `tests/unit/engine/test_executors.py::TestTransformExecutorBatchPath::test_batch_path_invoked_for_mixin_transform` plus `::test_non_batch_transform_uses_process` pin both dispatch arms.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T18:28:56.633930+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — the visible code uses `isinstance(transform, BatchTransformRuntime)` as nominal opt-in dispatch between two supported execution paths, not as a defensive re-check that hides a fixed-contract violation. The excerpt explicitly identifies `BatchTransformRuntime` as an ELSPETH-owned nominal runtime base and rejects structural shape as the admission criterion; disabled or non-member transforms proceed through the ordinary synchronous path rather than being coerced or silently repaired. The site is not a Tier-3 parameter-rooted trust boundary, so the `@trust_boundary` decorator contract does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 893355e147694ebf84d2efdae3ecbbf5ab4f8b1862caaef7175dfeebfed78bee
+  judge_transport: codex_cli
+  ast_path: 'body[26]/body[10]/body[6]/value/test/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:42d2ffbeff5ef44276c6b4c812eeb734730246d50e8ea6193e5f78c3f785c00d'

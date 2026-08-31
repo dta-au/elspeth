@@ -4132,25 +4132,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[12]/body[14]/test'
   judge_metadata_signature: 'hmac-sha256:v2:d37be820bcde51e5d8e34e2209a501681c8f580cd1bbea4148de2dc4956aa0aa'
-- key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=33c94c68a7ab867a
+- key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=f0b32cc34f684d18
   owner: john
   reason: |-
     R5 `isinstance(value, np.datetime64)` normalizes numpy datetimes to `datetime`. Unlike pandas Timestamp on the line above, np.datetime64 is not a datetime subclass at all, so no inheritance-based route reaches it. The arm also carries the missing-value case: `np.isnat(value)` maps NaT to NoneType, keeping missing datetimes consistent with the pd.NA / pd.NaT handling earlier in the function. Invalidated if np.datetime64 values were converted to Timestamps before contract inference.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:04:23.393405+00:00'
+  judge_recorded_at: '2026-08-31T15:47:35.325480+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.94
+  judge_confidence: 0.96
   judge_rationale: |-
-    PRESCRIBED FORM — the flagged `isinstance` is explicit runtime type discrimination in a normalization routine, not a defensive re-check that conceals a fixed-contract violation. The rationale is site-specific and the visible branches show meaning-preserving contract-type normalization: `np.datetime64` maps to `datetime`, while `np.isnat(value)` records missingness as `NoneType` rather than fabricating a datetime value. Because the excerpt does not show the function definition or its decorators, the policy forbids assuming that a new `@trust_boundary` decorator is needed.
+    PRESCRIBED FORM: the `isinstance(value, np.datetime64)` branch is explicit contract-type normalization, not a defensive re-check that hides a malformed fixed-contract value. The rationale specifically establishes why inheritance cannot classify this NumPy type, while the visible code maps ordinary values to `datetime` and the missing-value sentinel `NaT` to `NoneType`, consistent with the surrounding normalization policy and without fabricating a value. Because the excerpt omits the function definition and any decorators, the structural decorator alternative cannot be safely recommended.
   judge_signature_version: 2
   scope_fingerprint: fc04b9e54f54cea9f30e60fd1a118623703af398e941025c4140c11e25e812cc
   judge_transport: codex_cli
-  ast_path: 'body[11]/body[13]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:2b478dbb00353fe0f514dcb65219c1a5ff8722d8d55e8c93fa4c8c8d975bcf0c'
+  ast_path: 'body[12]/body[13]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:883b9d90d2f40ca5eff94d9cdbf4a530ebca4e24e1d2d654fd7456408d8b4500'
 - key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=3d0d39dab0a8365f
   owner: john
   reason: |-
@@ -4227,3 +4227,22 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[12]/body[12]/test'
   judge_metadata_signature: 'hmac-sha256:v2:1d88c2b50aa07d7ef38f6495ac478f9386a6f3c4e3a39e14189839830c136aa2'
+- key: contracts/results.py:R5:_require_artifact_metadata:fp=5cd957a737428a01
+  owner: john
+  reason: |-
+    The `isinstance(item, Mapping)` check is a traversal discriminator that broadens rejection, not acceptance: every mapping, including a mutable plain dict, is immediately passed to `_require_artifact_metadata`, whose first check requires `MappingProxyType` and raises otherwise; the false arm permits only non-mapping leaf values. `tests/unit/contracts/test_results.py::TestArtifactDescriptorDeepFreeze::test_validator_rejects_nested_plain_dict` pins mutable-mapping rejection, and `tests/unit/contracts/test_results.py::TestArtifactDescriptorDeepFreeze::test_validator_rejects_non_str_nested_key` pins recursive validation.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T18:20:47.857412+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    PRESCRIBED FORM — the R5 check is an offensive traversal discriminator, not defensive acceptance or recovery. At src/elspeth/contracts/results.py:158-171, every nested Mapping is recursively passed to `_require_artifact_metadata`, whose first substantive check requires `MappingProxyType` and raises `TypeError` for mutable mappings; the non-mapping branch merely leaves leaf values alone. The named tests could not be read within the permitted tool roots, but the visible control itself establishes the claimed crash-on-invalid-shape behavior, so the test claim is not needed for this verdict. This is not an argued Tier-3 parameter boundary requiring the structural decorator.
+  judge_signature_version: 2
+  scope_fingerprint: 19484de8770974a7e3aacc57635ec9a0aca129a555b27f7cede66c6d1fbbdd72
+  judge_transport: codex_cli
+  ast_path: 'body[27]/body[2]/body[1]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:449e443a4dad99fcb1aa578389180f67a85ff161fff6ce68db6c0734799be2f8'
