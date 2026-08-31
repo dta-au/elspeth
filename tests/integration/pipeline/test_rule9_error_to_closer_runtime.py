@@ -383,7 +383,6 @@ collectors:
     plugin: batch_stats
     input: checked_pages
     on_success: output
-    on_error: discard
     options:
       value_field: item
       schema: {{mode: observed}}

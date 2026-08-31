@@ -588,7 +588,7 @@ class TestStageOneRuntimeFatalPromotions:
             ("aggregation", "fork", "output"): False,
             ("collector", "on_success", "node"): True,
             ("collector", "on_success", "output"): True,
-            ("collector", "on_error", "output"): True,
+            ("collector", "on_error", "output"): False,
             ("collector", "on_error", "node"): False,
             ("collector", "route_true", "output"): False,
             ("collector", "fork", "output"): False,

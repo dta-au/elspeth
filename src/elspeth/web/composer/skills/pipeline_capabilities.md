@@ -156,11 +156,12 @@ ids identify components; they are not implicit connections.
   (quarantining the source row) when the scope is outermost — there is no
   `on_group_failure` field. One scope per collector and per
   opener; `on_success` names the flush destination (a sink or a consumed
-  connection); `on_error` is optional (`discard` or a sink name — omitted, the
-  route derives from the scope's group machinery). Omit gate, coalesce, and
-  aggregation fields. At runtime every member of the opener's expansion holds
-  at the collector until the group's roster settles (arrived or lost), then the
-  plugin runs once over the members in expansion order and its output flows to
+  connection). A collector does not accept `on_error`: plugin failure is a
+  whole-group verdict settled through the same structural scope machinery,
+  never a per-row error edge. Omit gate, coalesce, aggregation, and error-route
+  fields. At runtime every member of the opener's expansion holds at the
+  collector until the group's roster settles (arrived or lost), then the plugin
+  runs once over the members in expansion order and its output flows to
   `on_success`.
 - [capability-node:row_union] A `row_union` is a plugin-free, correlated
   barrier that waits for every declared fork branch, then releases the

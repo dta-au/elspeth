@@ -158,7 +158,10 @@ export function buildProducerRegistry(
         label: "success",
       });
     }
-    if (node.on_error) {
+    // Collector failure is a structural whole-group verdict. The universal
+    // CompositionState shape can carry malformed legacy on_error data, but
+    // drawing it would promise a runtime route that does not exist.
+    if (node.node_type !== "collector" && node.on_error) {
       registerProducer(node.on_error, {
         nodeId: node.id,
         edgeType: "error",

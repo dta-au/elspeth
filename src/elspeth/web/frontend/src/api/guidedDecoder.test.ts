@@ -1610,9 +1610,8 @@ describe("guided collector proposals (WS6 lift, ruling 7878)", () => {
   }
 
   it("decodes the collector behavior with its opener identity and closed policy", () => {
-    // No collector node_error edge in the fixture: on_error is OPTIONAL on a
-    // collector (group failure is structural), so this decode succeeding is
-    // itself the optional-error pin.
+    // No collector node_error edge in the fixture: collector failure is a
+    // structural whole-group verdict, so the wire must not promise one.
     const decoded = decodeGetGuidedResponse(collectorProposalWireResponse());
 
     expect(decoded.next_turn?.type).toBe("propose_pipeline");
@@ -1628,6 +1627,20 @@ describe("guided collector proposals (WS6 lift, ruling 7878)", () => {
         policy: "require_all",
       },
     });
+  });
+
+  it("rejects a collector node_error flow", () => {
+    expect(() => decodeGetGuidedResponse(collectorProposalWireResponse((payload) => {
+      const graph = payload.graph as Record<string, unknown>;
+      const edges = graph.edges as Array<Record<string, unknown>>;
+      edges.push({
+        stable_id: "00000000-0000-4000-8000-000000000616",
+        from_endpoint: { kind: "node", stable_id: "00000000-0000-4000-8000-000000000603" },
+        to_endpoint: { kind: "discard" },
+        flow: { kind: "node_error" },
+      });
+      (payload.component_counts as Record<string, number>).edges = 7;
+    }))).toThrow(/collector/i);
   });
 
   it("rejects a collector whose opener does not name a payload node", () => {

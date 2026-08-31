@@ -229,7 +229,7 @@ row unions, queues, or collectors.
 | `input` | string | **Yes** | Input connection name (must match an upstream `on_success`) |
 | `plugin` | string | No | Plugin name. Required for transforms, aggregations, and collectors. Null for gates, coalesces, row unions, and queues. |
 | `on_success` | string | No | Output connection name. Required for transforms, row unions, and collectors. Null for gates and queues. |
-| `on_error` | string | No | Row-error output — a sink name or `"discard"`; for gates this handles expression-evaluation failures, and omission preserves fail-fast execution |
+| `on_error` | string | No | Row-error output — a sink name or `"discard"`; for gates this handles expression-evaluation failures, and omission preserves fail-fast execution. Collectors reject this field because their failures are whole-group verdicts. |
 | `options` | object | No | Plugin-specific configuration |
 | `condition` | string | No | Gate expression (gates only) |
 | `routes` | object | No | Gate route mapping to a sink name, downstream connection name, `"fork"`, or virtual `"discard"` target, e.g. `{"true": "sink_name", "false": "discard"}` (gates only) |
@@ -254,7 +254,7 @@ row unions, queues, or collectors.
 | `coalesce` | `branches`, `policy` | Waits according to `policy`, then merges correlated branch payloads according to `merge` |
 | `row_union` | `branches`, `on_success` | A plugin-free, fixed `require_all` N-to-N barrier that releases every original row unchanged in declared branch order |
 | `queue` | `id == input` | Declares a shared pass-through connection for multiple producers; omit plugin and routing fields, and use only an optional `options.description` |
-| `collector` | `plugin`, `on_success`, `scope_name`, `scope_opener`, `scope_policy` | Closes a declared EXPAND scope with a batch-aware plugin. `scope_opener` names the multi-row transform that opens the group and `scope_policy` decides whether a lost member fails it. A collector flushes on end of group only and does not accept `trigger`. |
+| `collector` | `plugin`, `on_success`, `scope_name`, `scope_opener`, `scope_policy` | Closes a declared EXPAND scope with a batch-aware plugin. `scope_opener` names the multi-row transform that opens the group and `scope_policy` decides whether a lost member fails it. A collector flushes on end of group only and accepts neither `trigger` nor `on_error`; plugin failure is a structural whole-group verdict. |
 
 For `row_union`, branch order is significant. Mapping keys must match the
 upstream gate's `fork_to` names and mapping values name the connection published

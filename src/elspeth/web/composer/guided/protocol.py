@@ -791,10 +791,9 @@ _LEGAL_NODE_FLOWS: Mapping[str, frozenset[str]] = {
     "queue": frozenset({"queue_continue"}),
     "coalesce": frozenset({"coalesce_success"}),
     "row_union": frozenset({"row_union_success"}),
-    # A collector flushes to on_success (node_success) with an OPTIONAL
-    # on_error divert; group-failure handling is structural (ADR-042 §6), so
-    # an omitted on_error means the scope machinery owns the failure route.
-    "collector": frozenset({"node_success", "node_error"}),
+    # A collector flushes to on_success only. Failures are whole-group
+    # verdicts settled structurally through scope policy and nesting.
+    "collector": frozenset({"node_success"}),
 }
 _FLOW_KINDS = frozenset(
     {
@@ -2337,10 +2336,14 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             node_type = node_by_id[from_stable_id]["node_type"]
             if node_type not in _LEGAL_NODE_FLOWS:
                 # Typed verdict instead of a bare KeyError: a node kind with
-                # no legal flows on this surface (a collector, until the
-                # elspeth-88bb77953c ruling extends the projection) must fail
-                # validation, not crash it.
+                # no legal flows on this surface must fail validation, not
+                # crash it.
                 return f"{path}.flow references node kind {node_type!r}, which has no legal flows on this surface"
+            if node_type == "collector" and flow_kind == "node_error":
+                return (
+                    f"{path}.flow declares unsupported collector on_error; collector failures are "
+                    "whole-group verdicts settled through scope policy and nesting"
+                )
             if flow_kind not in _LEGAL_NODE_FLOWS[node_type]:
                 return f"{path}.flow is not legal for its node_type"
         legal_to_kinds = {
@@ -2455,15 +2458,8 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             if flow_kinds.count("node_success") != 1 or flow_kinds.count("node_error") != 1 or len(flow_kinds) != 2:
                 return "payload transform and aggregation nodes require exact success and error flows"
         elif node["node_type"] == "collector":
-            # on_error is OPTIONAL on a collector (omitted, the scope's group
-            # machinery owns the failure route — ADR-042 §6), so the error
-            # flow count is at most one, never exactly one.
-            if (
-                flow_kinds.count("node_success") != 1
-                or flow_kinds.count("node_error") > 1
-                or len(flow_kinds) != flow_kinds.count("node_success") + flow_kinds.count("node_error")
-            ):
-                return "payload collector node requires one success flow and at most one error flow"
+            if flow_kinds != ("node_success",):
+                return "payload collector node requires exactly one success flow and no error flow"
             opener = node_by_id.get(cast(str, node["behavior"]["opener_stable_id"]))
             if opener is None:
                 return "payload collector scope opener must reference a node in the payload"

@@ -1485,7 +1485,7 @@ def _guided_node_patch_schema(
         ),
         "coalesce": ("input", "on_success", "policy", "merge", "timeout_seconds"),
         "row_union": ("input", "on_success", "timeout_seconds"),
-        "collector": ("input", "on_success", "on_error", "scope_name", "scope_opener", "scope_policy"),
+        "collector": ("input", "on_success", "scope_name", "scope_opener", "scope_policy"),
     }
     fields = (
         public_fields_by_kind[public.behavior_kind]
@@ -3780,6 +3780,8 @@ def _build_projection(
             add_targets(origin, node.on_success, {"kind": "coalesce_success", "branch": None})
         elif node.node_type == "row_union":
             add_targets(origin, node.on_success, {"kind": "row_union_success", "branch": None})
+        elif node.node_type == "collector":
+            add_targets(origin, node.on_success, {"kind": "node_success", "branch": None})
         else:
             add_targets(origin, node.on_success, {"kind": "node_success", "branch": None})
             add_targets(origin, node.on_error, {"kind": "node_error"})
