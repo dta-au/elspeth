@@ -81,6 +81,9 @@ export const IMPORT_YAML_SECTION_KEYS = [
 export const IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE =
   `Pipeline YAML must define at least one pipeline section: ${IMPORT_YAML_SECTION_KEYS.slice(0, -1).join(", ")}, or ${IMPORT_YAML_SECTION_KEYS[IMPORT_YAML_SECTION_KEYS.length - 1]}.`;
 
+export const IMPORT_YAML_SINGULAR_SOURCE_REMOVED_MESSAGE =
+  'Section "source" was removed by ADR-025. Use the "sources" mapping instead.';
+
 interface ImportErrorInfo {
   title: string;
   detail: string;
@@ -313,10 +316,8 @@ function findImportYamlSourceBindingCandidatesFromParsed(
   const parsedRoot = parsedDraft.root;
   if (!isRecord(parsedRoot)) return [];
 
-  let rawSources = parsedRoot.sources;
-  if (rawSources === undefined && parsedRoot.source !== undefined) {
-    rawSources = { source: parsedRoot.source };
-  }
+  if (Object.prototype.hasOwnProperty.call(parsedRoot, "source")) return [];
+  const rawSources = parsedRoot.sources;
   if (!isRecord(rawSources)) return [];
 
   const candidates: ImportYamlSourceBindingCandidate[] = [];
@@ -393,6 +394,18 @@ function analyseImportYamlDraftFromParsed(
       stepCount: 0,
       outputCount: 0,
       validationMessage: "Pipeline YAML must be a mapping.",
+    };
+  }
+
+  if (Object.prototype.hasOwnProperty.call(parsedRoot, "source")) {
+    return {
+      hasText: true,
+      canImport: false,
+      sectionsParsed: false,
+      sourceCount: 0,
+      stepCount: 0,
+      outputCount: 0,
+      validationMessage: IMPORT_YAML_SINGULAR_SOURCE_REMOVED_MESSAGE,
     };
   }
 

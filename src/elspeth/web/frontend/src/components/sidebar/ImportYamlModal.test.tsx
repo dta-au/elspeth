@@ -14,6 +14,7 @@ import {
   IMPORT_YAML_422_MESSAGE,
   IMPORT_YAML_SECTION_KEYS,
   IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE,
+  IMPORT_YAML_SINGULAR_SOURCE_REMOVED_MESSAGE,
 } from "./ImportYamlModal";
 import { OPEN_IMPORT_YAML_MODAL_EVENT } from "@/lib/composer-events";
 import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
@@ -660,6 +661,14 @@ describe("ImportYamlModal", () => {
         path: "examples/statistical_batch_plugins/experiment_scores.csv",
       },
     ]);
+  });
+
+  it("does not offer blob bindings for the deleted singular source surface", () => {
+    expect(
+      findImportYamlSourceBindingCandidates(
+        "source:\n  plugin: csv\n  options:\n    path: rejected.csv\nsinks:\n  out: {}\n",
+      ),
+    ).toEqual([]);
   });
 
   it("defers draft YAML analysis through one shared parse", () => {
@@ -1422,7 +1431,23 @@ describe("analyseImportYamlDraft queue recognition", () => {
       sourceCount: 0,
       stepCount: 0,
       outputCount: 0,
-      validationMessage: IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE,
+      validationMessage: IMPORT_YAML_SINGULAR_SOURCE_REMOVED_MESSAGE,
+    });
+  });
+
+  it.each([
+    "source:\n  plugin: csv\nsinks:\n  out: {}\n",
+    "source:\n  plugin: csv\nsources:\n  primary: {}\n",
+  ])("rejects singular source even when another accepted section is present", (yaml) => {
+    const analysis = analyseImportYamlDraft(yaml);
+
+    expect(analysis).toMatchObject({
+      sectionsParsed: false,
+      canImport: false,
+      sourceCount: 0,
+      stepCount: 0,
+      outputCount: 0,
+      validationMessage: IMPORT_YAML_SINGULAR_SOURCE_REMOVED_MESSAGE,
     });
   });
 
