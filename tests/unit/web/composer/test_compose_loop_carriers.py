@@ -11,8 +11,13 @@ from unittest.mock import patch
 
 import pytest
 
-from elspeth.contracts.errors import FailedTurnMetadata
-from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome, _ToolOutcome, _ToolOutcomeResponse
+from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
+from elspeth.web.composer._compose_loop_carriers import (
+    _CallModelOutcome,
+    _PersistOutcome,
+    _ToolOutcome,
+    _ToolOutcomeResponse,
+)
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.service import ComposerServiceImpl, _MalformedLLMResponseError
 from elspeth.web.composer.state import CompositionState
@@ -133,6 +138,33 @@ def test_tool_outcome_freezes_mapping_response() -> None:
         outcome.response["ok"] = False  # type: ignore[index]
     response_dict["ok"] = False
     assert outcome.response["ok"] is True
+
+
+def test_persist_outcome_requires_current_dispatch_disposition() -> None:
+    """P4 callers cannot omit the ownership fact and fall back to row presence."""
+    with pytest.raises(TypeError, match="persisted_assistant_matches_current_dispatch"):
+        _PersistOutcome(  # type: ignore[call-arg]
+            current_state_id=None,
+            persisted_assistant_message_id=None,
+            persisted_assistant_content=None,
+            persisted_tool_call_turn=False,
+            unwind_audit_failed=False,
+            failed_turn=None,
+        )
+
+
+def test_persist_outcome_rejects_current_dispatch_identity_without_committed_row() -> None:
+    """A true disposition requires a complete current-turn persisted row."""
+    with pytest.raises(AuditIntegrityError, match="current-dispatch invariant violated"):
+        _PersistOutcome(
+            current_state_id=None,
+            persisted_assistant_message_id=None,
+            persisted_assistant_content=None,
+            persisted_tool_call_turn=False,
+            persisted_assistant_matches_current_dispatch=True,
+            unwind_audit_failed=False,
+            failed_turn=None,
+        )
 
 
 @pytest.mark.asyncio

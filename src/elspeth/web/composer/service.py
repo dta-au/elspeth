@@ -4686,6 +4686,7 @@ class ComposerServiceImpl:
             persisted_tool_call_turn=persisted_tool_call_turn,
             persisted_assistant_message_id=persisted_assistant_message_id,
             persisted_assistant_content=persisted_assistant_content,
+            assistant_row_uses_current_dispatch=not advisor_repair_context_introduced,
         )
 
     async def _dispatch_tool_batch(
@@ -4995,7 +4996,9 @@ class ComposerServiceImpl:
                     persisted_assistant_message_id=persisted_assistant_message_id,
                     persisted_assistant_content=persisted_assistant_content,
                     persisted_tool_call_turn=persisted_tool_call_turn,
-                    persisted_assistant_matches_terminal_model_turn=(persist.persisted_assistant_message_id is not None),
+                    # P4 owns whether the row was written from this dispatch;
+                    # row presence alone also includes advisor substitutions.
+                    persisted_assistant_matches_terminal_model_turn=persist.persisted_assistant_matches_current_dispatch,
                 )
                 return _ClassifyOutcome(
                     action="return",

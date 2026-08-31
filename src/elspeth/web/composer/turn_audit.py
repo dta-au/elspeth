@@ -49,6 +49,7 @@ async def persist_turn_audit(
     persisted_tool_call_turn: bool,
     persisted_assistant_message_id: str | None,
     persisted_assistant_content: str | None,
+    assistant_row_uses_current_dispatch: bool,
 ) -> _PersistOutcome:
     """Phase P4 of the compose loop — redact then persist the turn audit.
 
@@ -72,6 +73,11 @@ async def persist_turn_audit(
     *not* in this helper: the driver decides whether to raise based
     on ``dispatch.plugin_crash is not None`` so the carrier never
     carries a "post-crash" disposition.
+
+    ``assistant_row_uses_current_dispatch`` is the caller-owned P4
+    disposition for whether ``assistant_message`` still contains the current
+    dispatch's model prose. It is required because the caller performs the
+    advisor-repair substitution; row presence cannot recover that fact.
     """
     from pydantic import ValidationError as PydanticValidationError
 
@@ -266,6 +272,7 @@ async def persist_turn_audit(
         persisted_assistant_message_id=persisted_assistant_message_id,
         persisted_assistant_content=persisted_assistant_content,
         persisted_tool_call_turn=persisted_tool_call_turn,
+        persisted_assistant_matches_current_dispatch=(persisted_assistant_message_id is not None and assistant_row_uses_current_dispatch),
         unwind_audit_failed=unwind_audit_failed,
         failed_turn=failed_turn,
     )

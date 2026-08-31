@@ -52,7 +52,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.web.composer.guided.errors import InvariantError
-from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
+from elspeth.web.composer.no_tool_policy import ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE, is_pending_interpretation_handoff
 from elspeth.web.composer.prompts import render_system_prompt
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.service import (
@@ -4079,6 +4079,63 @@ async def test_staged_handoff_threads_the_persisted_row_content_to_the_route(
 
 
 @pytest.mark.asyncio
+async def test_advisor_repair_staged_handoff_does_not_claim_substituted_row_matches_terminal_turn(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """A P4 advisor-repair substitution is not the terminal model prose."""
+    composer = _build_composer(tmp_path, sessions_service)
+    composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
+        AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: review the interpretation before completion")
+    )
+    session_id = uuid4()
+    with sessions_service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Advisor repair staged handoff",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_set_pipeline",
+                tool_name="set_pipeline",
+                arguments=_set_pipeline_with_pending_interpretation_args(),
+            ),
+            _fake_response_with_tool_call(
+                tool_call_id="call_review",
+                tool_name="request_interpretation_review",
+                content=_REVIEW_TURN_PROSE,
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "modern, useful, engaging, and clear for the public.",
+                },
+            ),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=None,
+        message="create a workflow that rates how cool pages are",
+    )
+
+    assert len(llm.messages) == 2
+    assert result.persisted_assistant_content == ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE
+    assert result.persisted_assistant_content != _REVIEW_TURN_PROSE
+    assert result.persisted_assistant_matches_terminal_model_turn is False
+
+
+@pytest.mark.asyncio
 async def test_staged_handoff_without_current_persist_keeps_same_turn_identity_false(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
@@ -4113,6 +4170,7 @@ async def test_staged_handoff_without_current_persist_keeps_same_turn_identity_f
             persisted_assistant_message_id=None,
             persisted_assistant_content=None,
             persisted_tool_call_turn=False,
+            persisted_assistant_matches_current_dispatch=False,
             unwind_audit_failed=False,
             failed_turn=None,
         )
