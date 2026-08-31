@@ -12,8 +12,8 @@
 
 ## Execution rules
 
-- Work only in `/home/john/elspeth/.claude/worktrees/four-review-regressions` on branch `fix/four-review-regressions`.
-- Prefix every Python/test command with `PYTHONPATH=/home/john/elspeth/.claude/worktrees/four-review-regressions/src:/home/john/elspeth/.claude/worktrees/four-review-regressions/elspeth-lints/src` and use `/home/john/elspeth/.venv/bin/python`.
+- Work only in the dedicated `four-review-regressions` worktree on branch `fix/four-review-regressions`.
+- Run commands from that worktree. Prefix Python/test commands with `PYTHONPATH="$PWD/src:$PWD/elspeth-lints/src"` and use the worktree's `.venv/bin/python` symlink.
 - Run focused tests serially with `-n 0`; the coordinator alone runs the final full suite.
 - Apply test-first RED/GREEN discipline. Do not change production code before observing each new regression test fail for the intended reason.
 - Use `apply_patch` for source edits. Preserve unrelated work. Commit only the named paths for each task.
@@ -29,8 +29,8 @@
 Run:
 
 ```bash
-env PYTHONPATH=/home/john/elspeth/.claude/worktrees/four-review-regressions/src:/home/john/elspeth/.claude/worktrees/four-review-regressions/elspeth-lints/src \
-  /home/john/elspeth/.venv/bin/python -m pytest -n 0 -q \
+env PYTHONPATH="$PWD/src:$PWD/elspeth-lints/src" \
+  .venv/bin/python -m pytest -n 0 -q \
   tests/unit/web/composer/test_failure_validation_guidance.py
 ```
 
@@ -132,22 +132,22 @@ Run Ruff format/check on the five touched Python files. Recompute `ReferenceJoin
 Run serially:
 
 ```bash
-env PYTHONPATH=/home/john/elspeth/.claude/worktrees/four-review-regressions/src:/home/john/elspeth/.claude/worktrees/four-review-regressions/elspeth-lints/src \
-  /home/john/elspeth/.venv/bin/python -m pytest -n 0 -q \
+env PYTHONPATH="$PWD/src:$PWD/elspeth-lints/src" \
+  .venv/bin/python -m pytest -n 0 -q \
   tests/unit/plugins/test_schema_factory.py \
   tests/unit/plugins/transforms/test_reference_join.py \
   tests/unit/plugins/test_validation_path_agreement.py
 ```
 
 ```bash
-env PYTHONPATH=/home/john/elspeth/.claude/worktrees/four-review-regressions/src:/home/john/elspeth/.claude/worktrees/four-review-regressions/elspeth-lints/src \
-  /home/john/elspeth/.venv/bin/python -m pytest -n 0 -q \
+env PYTHONPATH="$PWD/src:$PWD/elspeth-lints/src" \
+  .venv/bin/python -m pytest -n 0 -q \
   tests/integration/core/dag tests/unit/architecture
 ```
 
 ```bash
-env PYTHONPATH=/home/john/elspeth/.claude/worktrees/four-review-regressions/src:/home/john/elspeth/.claude/worktrees/four-review-regressions/elspeth-lints/src \
-  /home/john/elspeth/.venv/bin/python -m elspeth_lints.core.cli check \
+env PYTHONPATH="$PWD/src:$PWD/elspeth-lints/src" \
+  .venv/bin/python -m elspeth_lints.core.cli check \
   --rules plugin_contract.plugin_hashes --root src/elspeth
 ```
 
@@ -218,28 +218,28 @@ Update the same-turn route stub in `test_routes.py` to set the flag true.
 Run serially:
 
 ```bash
-env PYTHONPATH=/home/john/elspeth/.claude/worktrees/four-review-regressions/src:/home/john/elspeth/.claude/worktrees/four-review-regressions/elspeth-lints/src \
-  /home/john/elspeth/.venv/bin/python -m pytest -n 0 -q \
+env PYTHONPATH="$PWD/src:$PWD/elspeth-lints/src" \
+  .venv/bin/python -m pytest -n 0 -q \
   tests/unit/web/sessions/routes/test_turn_end_assistant_row.py
 ```
 
 ```bash
-env PYTHONPATH=/home/john/elspeth/.claude/worktrees/four-review-regressions/src:/home/john/elspeth/.claude/worktrees/four-review-regressions/elspeth-lints/src \
-  /home/john/elspeth/.venv/bin/python -m pytest -n 0 -q \
+env PYTHONPATH="$PWD/src:$PWD/elspeth-lints/src" \
+  .venv/bin/python -m pytest -n 0 -q \
   tests/unit/web/composer/test_compose_loop_interpretation_review_dispatch.py \
   -k "staged_handoff_threads_the_persisted_row_content_to_the_route or repeated_synthesized"
 ```
 
 ```bash
-env PYTHONPATH=/home/john/elspeth/.claude/worktrees/four-review-regressions/src:/home/john/elspeth/.claude/worktrees/four-review-regressions/elspeth-lints/src \
-  /home/john/elspeth/.venv/bin/python -m pytest -n 0 -q \
+env PYTHONPATH="$PWD/src:$PWD/elspeth-lints/src" \
+  .venv/bin/python -m pytest -n 0 -q \
   tests/unit/web/sessions/test_routes.py \
   -k "send_message_does_not_re_emit_the_already_persisted_turn_prose or recompose_auto_commit_revoked_persists_the_post_rebind_message"
 ```
 
 ```bash
-env PYTHONPATH=/home/john/elspeth/.claude/worktrees/four-review-regressions/src:/home/john/elspeth/.claude/worktrees/four-review-regressions/elspeth-lints/src \
-  /home/john/elspeth/.venv/bin/python -m pytest -n 0 -q \
+env PYTHONPATH="$PWD/src:$PWD/elspeth-lints/src" \
+  .venv/bin/python -m pytest -n 0 -q \
   tests/unit/web/test_sessions_composer_attribute_contracts.py \
   tests/unit/elspeth_lints/test_masquerade_gate.py
 ```
@@ -279,8 +279,8 @@ Run the all-rules lint gate with `ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=s
 Once other full-suite processes have cleared, run:
 
 ```bash
-env PYTHONPATH=/home/john/elspeth/.claude/worktrees/four-review-regressions/src:/home/john/elspeth/.claude/worktrees/four-review-regressions/elspeth-lints/src \
-  /home/john/elspeth/.venv/bin/python -m pytest -n 0 tests/
+env PYTHONPATH="$PWD/src:$PWD/elspeth-lints/src" \
+  .venv/bin/python -m pytest -n 0 tests/
 ```
 
 Expected: exit 0 with the terminal pytest summary captured.
