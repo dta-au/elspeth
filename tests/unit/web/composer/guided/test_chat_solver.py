@@ -1872,6 +1872,99 @@ async def test_deferred_repair_preserves_valid_siblings_exactly_once_in_call_ord
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("resend_full_group", [False, True])
+async def test_targeted_retain_repair_preserves_valid_grouped_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    resend_full_group: bool,
+) -> None:
+    """A retain retry preserves the resolution half without duplicating a replay."""
+    calls_seen = 0
+
+    async def repairing_only_rejected_retain(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            resolution_call = SimpleNamespace(
+                id="c_resolution",
+                function=SimpleNamespace(
+                    name="resolve_source" if stage == "source" else "resolve_sink",
+                    arguments=json.dumps(_PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS),
+                ),
+            )
+            calls = [
+                resolution_call,
+                SimpleNamespace(
+                    id="c_retain_valid",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_rejected",
+                    function=SimpleNamespace(
+                        name="retain_deferred_intent",
+                        arguments=json.dumps({"target_stage": "topology"}),
+                    ),
+                ),
+            ]
+        else:
+            corrected_call = SimpleNamespace(
+                id="c_retain_corrected",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+            )
+            if resend_full_group:
+                calls = [
+                    SimpleNamespace(
+                        id="c_resolution_resent",
+                        function=SimpleNamespace(
+                            name="resolve_source" if stage == "source" else "resolve_sink",
+                            arguments=json.dumps(_PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS),
+                        ),
+                    ),
+                    SimpleNamespace(
+                        id="c_retain_valid_resent",
+                        function=SimpleNamespace(
+                            name="retain_deferred_intent",
+                            arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS),
+                        ),
+                    ),
+                    corrected_call,
+                ]
+            else:
+                calls = [corrected_call]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_only_rejected_retain)
+    if stage == "source":
+        outcome = await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Use these rows, then retain two topology requirements.",
+            plugin_hint="json",
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+        assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
+        assert outcome.resolution.plugin == "json"
+    else:
+        outcome = await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Save these rows, then retain two topology requirements.",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+        assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+        assert outcome.sink.outputs[0].plugin == "json"
+
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert calls_seen == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
 async def test_form_directed_revision_keeps_retain_from_pair_with_withheld_resolution(
     monkeypatch: pytest.MonkeyPatch,
     stage: str,

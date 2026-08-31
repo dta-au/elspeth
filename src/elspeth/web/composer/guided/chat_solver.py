@@ -1071,7 +1071,8 @@ def _deferred_intent_repair_thread(
     tool-call turn is re-materialised, then EVERY call id is answered (the
     OpenAI/LiteLLM protocol 400s on an unanswered id). Each rejected retain
     call gets its own value-free shape rejection, in call order; every other
-    call is told it was withheld so the model resends the complete reply.
+    call is told it is held pending so the model can resend either the complete
+    reply or only the rejected retain call.
     Shape-error text is value-free by construction (key names, types,
     vocabulary — never user prose).
     """
@@ -1104,8 +1105,9 @@ def _deferred_intent_repair_thread(
             )
         else:
             content = (
-                "Not applied: a grouped retain_deferred_intent call was rejected. "
-                "After correcting it, resend ALL calls together in one reply."
+                "Not applied yet: this grouped call is held pending because a "
+                "retain_deferred_intent call was rejected. After correcting it, either "
+                "resend ALL calls together or resend only the rejected retain_deferred_intent call."
             )
         thread.append({"role": "tool", "tool_call_id": tool_call.id, "content": content})
     return thread
@@ -1143,6 +1145,18 @@ def _merge_targeted_deferred_intent_repair(
         return repaired_actions
     repaired = iter(repaired_actions)
     return tuple(next(repaired) if action is None else action for action in first_pass_slots)
+
+
+def _held_grouped_resolution_call(
+    admitted: _DeferredIntentRepairThread,
+    *,
+    function_name: str,
+) -> _RepairThreadToolCall | None:
+    """Return the owned current-stage call held across a retain-only repair."""
+    matches = tuple(call for call in admitted.calls if not call.is_rejected and call.function.name == function_name)
+    if len(matches) > 1:
+        raise InvariantError("deferred repair group must contain at most one current-stage resolution")
+    return matches[0] if matches else None
 
 
 def _terminal_shape_error_type(terminal_calls: Any) -> type[GuidedSolverResponseShapeError]:
@@ -2610,6 +2624,7 @@ async def maybe_resolve_step_1_source_chat(
     shape_repair_used = False
     deferred_repair_used = False
     pending_deferred_repair_slots: tuple[DeferredIntentAction | None, ...] | None = None
+    pending_grouped_source_call: _RepairThreadToolCall | None = None
     pending_deferred_actions: tuple[DeferredIntentAction, ...] = ()
     max_attempts = 2
     for attempt_index in range(max_attempts):
@@ -2767,6 +2782,10 @@ async def maybe_resolve_step_1_source_chat(
                             rejected_calls=tuple(call for call, _ in retain_failures),
                             parsed_actions=tuple(parsed_actions),
                         )
+                        pending_grouped_source_call = _held_grouped_resolution_call(
+                            admitted_repair,
+                            function_name="resolve_source",
+                        )
                         deferred_repair_thread = _deferred_intent_repair_thread(
                             admitted_repair,
                             errors=tuple(exc for _, exc in retain_failures),
@@ -2779,6 +2798,12 @@ async def maybe_resolve_step_1_source_chat(
                         first_pass_slots=pending_deferred_repair_slots,
                         repaired_actions=tuple(parsed_actions),
                     )
+                if deferred_actions and not source_calls and pending_grouped_source_call is not None:
+                    # A targeted retry may resend only the rejected retain.
+                    # Restore the provider-independent current-stage sibling
+                    # admitted from the original group; a full replay remains
+                    # authoritative because its fresh source call wins above.
+                    source_calls = [pending_grouped_source_call]
                 if deferred_actions and is_withheld_retained_group:
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredIntentWithheldResolutionOutcome(
@@ -3598,6 +3623,7 @@ async def maybe_resolve_step_2_sink_chat(
     # whole Send.
     deferred_repair_used = False
     pending_deferred_repair_slots: tuple[DeferredIntentAction | None, ...] | None = None
+    pending_grouped_sink_call: _RepairThreadToolCall | None = None
     # A group's VALID parsed retains must survive their sink half never
     # becoming acceptable: if the loop would otherwise end without a terminal
     # outcome (config-invalid sink at the iteration cap, a prose decline, or a
@@ -3703,6 +3729,10 @@ async def maybe_resolve_step_2_sink_chat(
                             rejected_calls=tuple(call for call, _ in retain_failures),
                             parsed_actions=tuple(parsed_actions),
                         )
+                        pending_grouped_sink_call = _held_grouped_resolution_call(
+                            admitted_repair,
+                            function_name="resolve_sink",
+                        )
                         messages.extend(
                             _deferred_intent_repair_thread(
                                 admitted_repair,
@@ -3717,6 +3747,11 @@ async def maybe_resolve_step_2_sink_chat(
                         first_pass_slots=pending_deferred_repair_slots,
                         repaired_actions=tuple(parsed_actions),
                     )
+                if deferred_actions and not sink_calls and pending_grouped_sink_call is not None:
+                    # Targeted retain repair preserves the owned sink sibling;
+                    # if the model replays the whole group, the fresh sink call
+                    # remains authoritative and is not duplicated.
+                    sink_calls = [pending_grouped_sink_call]
                 if deferred_actions and is_withheld_retained_group:
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredIntentWithheldResolutionOutcome(
