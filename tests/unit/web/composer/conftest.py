@@ -525,7 +525,9 @@ def _fake_llm_response(
                 id=str(call["id"]),
                 function=_FakeFunction(
                     name=str(call["name"]),
-                    arguments=json.dumps(call.get("arguments", {})),
+                    arguments=json.dumps(
+                        {"pipeline": call.get("arguments", {})} if call["name"] == "set_pipeline" else call.get("arguments", {})
+                    ),
                 ),
             )
             for call in tool_calls

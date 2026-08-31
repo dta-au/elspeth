@@ -6611,19 +6611,36 @@ class ComposerServiceImpl:
         in the LLM-visible list. The CLI MCP server (composer_mcp/) is not
         affected; advisor is web-composer only by design (the tool is not
         registered in the CLI dispatch tables).
+
+        The web-visible ``set_pipeline`` arguments alone carry a required
+        ``pipeline`` envelope. LiteLLM's Anthropic and Bedrock adapters retain
+        unions nested below a property but discard root-level ``oneOf``. The
+        registry and every internal/MCP consumer remain on the flat semantic
+        argument contract; :mod:`elspeth.web.composer.tool_batch` unwraps the
+        provider envelope before custody, audit, redaction, or dispatch.
         """
         definitions = get_tool_definitions()
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": defn["name"],
-                    "description": defn["description"],
-                    "parameters": defn["parameters"],
-                },
-            }
-            for defn in definitions
-        ]
+        tools: list[dict[str, Any]] = []
+        for defn in definitions:
+            parameters = defn["parameters"]
+            if defn["name"] == "set_pipeline":
+                parameters = {
+                    "type": "object",
+                    "properties": {"pipeline": parameters},
+                    "required": ["pipeline"],
+                    "additionalProperties": False,
+                }
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": defn["name"],
+                        "description": defn["description"],
+                        "parameters": parameters,
+                    },
+                }
+            )
+        return tools
 
     async def _call_llm(
         self,

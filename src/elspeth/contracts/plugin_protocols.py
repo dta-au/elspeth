@@ -202,7 +202,7 @@ class SourceProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
     # base type by construction of the parsed format (csv: "str"). Sources
     # whose observed values carry format-native types (json, database) stay
     # None. Consumed by resolve_guaranteed_field_type's structural source arm.
-    observed_value_type: str | None
+    observed_value_type: ClassVar[str | None]
 
     # Plugin-computed output contract, recorded by
     # BaseSource._initialize_declared_guaranteed_fields(). The DAG builder

@@ -166,7 +166,10 @@ def _fake_response_with_tool_calls(
                         tool_calls=[
                             _ToolCall(
                                 str(call["id"]),
-                                _Func(str(call["name"]), json.dumps(call["arguments"])),
+                                _Func(
+                                    str(call["name"]),
+                                    json.dumps({"pipeline": call["arguments"]} if call["name"] == "set_pipeline" else call["arguments"]),
+                                ),
                             )
                             for call in tool_calls
                         ],

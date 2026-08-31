@@ -227,7 +227,7 @@ def _make_llm_response(
                 id=tc["id"],
                 function=FakeFunction(
                     name=tc["name"],
-                    arguments=json.dumps(tc["arguments"]),
+                    arguments=json.dumps({"pipeline": tc["arguments"]} if tc["name"] == "set_pipeline" else tc["arguments"]),
                 ),
             )
             for tc in tool_calls

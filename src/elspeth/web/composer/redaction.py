@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType, UnionType
 from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
 
 from elspeth.contracts.blobs import AllowedMimeType
 from elspeth.contracts.composer_interpretation import InterpretationKind
@@ -2064,15 +2064,50 @@ class _PipelineMetadataModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _set_pipeline_source_selection_json_schema(schema: dict[str, JsonValue]) -> None:
+    """Expose the model validator's exactly-one non-null source contract.
+
+    Pydantic cannot infer cross-field JSON Schema from ``model_validator``.
+    Its ordinary schema also advertises ``null`` for these default-``None``
+    fields even though the validator rejects that value. Rewrite only those
+    two generated leaves and add the matching union so model-schema consumers
+    see the same admission contract the runtime enforces.
+    """
+    properties = schema["properties"]
+    if type(properties) is not dict:
+        raise RuntimeError("SetPipelineArgumentsModel.properties must emit a JSON Schema object")
+    for field_name in ("source", "sources"):
+        field_schema = properties[field_name]
+        if type(field_schema) is not dict:
+            raise RuntimeError(f"SetPipelineArgumentsModel.{field_name} must emit a JSON Schema object")
+        branches = field_schema["anyOf"]
+        if type(branches) is not list:
+            raise RuntimeError(f"SetPipelineArgumentsModel.{field_name}.anyOf must emit a JSON Schema array")
+        object_branches: list[dict[str, JsonValue]] = []
+        for branch in branches:
+            if branch == {"type": "null"}:
+                continue
+            if type(branch) is not dict:
+                raise RuntimeError(f"SetPipelineArgumentsModel.{field_name}.anyOf must contain JSON Schema objects")
+            object_branches.append(branch)
+        if len(object_branches) != 1:
+            raise RuntimeError(f"SetPipelineArgumentsModel.{field_name} must emit one non-null JSON Schema branch")
+        properties[field_name] = object_branches[0]
+    schema["oneOf"] = [
+        {"required": ["source"]},
+        {"required": ["sources"]},
+    ]
+
+
 class SetPipelineArgumentsModel(BaseModel):
     """Redaction-bearing argument model for the ``set_pipeline`` tool.
 
-    Mirrors the JSON schema declared at ``tools.py:940-1132`` for the
-    ``set_pipeline`` definition and its required-paths (``source``,
-    ``nodes``, ``edges``, ``outputs`` at the top level; nested required
-    fields per :class:`_SetPipelineSourceModel`, :class:`_PipelineNodeModel`,
-    :class:`_PipelineEdgeModel`, :class:`_PipelineOutputModel`).
-    ``metadata`` is optional at the top level.
+    Mirrors the JSON schema declared for ``set_pipeline`` and its
+    required-paths. Exactly one of ``source`` or ``sources`` must be supplied
+    as a non-null object; ``nodes``, ``edges``, and ``outputs`` are always
+    required. Nested required fields follow :class:`_SetPipelineSourceModel`,
+    :class:`_PipelineNodeModel`, :class:`_PipelineEdgeModel`, and
+    :class:`_PipelineOutputModel`. ``metadata`` is optional.
 
     LLM-supplied vs dispatcher-wired arguments
     ------------------------------------------
@@ -2111,7 +2146,18 @@ class SetPipelineArgumentsModel(BaseModel):
     outputs: list[_PipelineOutputModel]
     metadata: Annotated[_PipelineMetadataModel, Sensitive(summarizer=_summarize_set_metadata_patch)] | None = None
 
-    model_config = ConfigDict(extra="forbid")
+    @model_validator(mode="after")
+    def _exactly_one_source_configuration(self) -> SetPipelineArgumentsModel:
+        field_xor = ("source" in self.model_fields_set) != ("sources" in self.model_fields_set)
+        value_xor = (self.source is None) != (self.sources is None)
+        if not field_xor or not value_xor:
+            raise ValueError("set_pipeline requires exactly one non-null source or sources object")
+        return self
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra=_set_pipeline_source_selection_json_schema,
+    )
 
 
 # ---------------------------------------------------------------------------

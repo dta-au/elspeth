@@ -706,13 +706,17 @@ class TestStep3MutationTierMigration:
     def test_set_pipeline_required_top_level(self) -> None:
         """set_pipeline.required is exactly ['nodes', 'edges', 'outputs'].
 
-        Multi-source: a caller may supply either the singular ``source`` or the
-        ``sources`` map (both are optional properties), so neither is required.
+        A caller supplies either singular ``source`` or the ``sources`` map,
+        so neither is unconditionally required; ``oneOf`` enforces the union.
         """
         defn = self._get("set_pipeline")
         params = defn["parameters"]
         assert isinstance(params, dict)
         assert params["required"] == ["nodes", "edges", "outputs"]
+        assert params["oneOf"] == [
+            {"required": ["source"]},
+            {"required": ["sources"]},
+        ]
 
     def test_narrow_edit_tool_descriptions_are_explicit(self) -> None:
         set_pipeline = self._get("set_pipeline")

@@ -108,6 +108,71 @@ def test_execute_tool_rejects_extra_arguments_without_audit_hash_before_handler(
     assert "sk-test-secret" not in result.data["error"]
 
 
+@pytest.mark.parametrize(
+    "source_selection",
+    [
+        pytest.param({}, id="missing-both"),
+        pytest.param({"source": None}, id="source-null"),
+        pytest.param({"sources": None}, id="sources-null"),
+        pytest.param(
+            {
+                "source": {"plugin": "csv", "on_success": "rows"},
+                "sources": {"orders": {"plugin": "csv", "on_success": "rows"}},
+            },
+            id="both-non-null",
+        ),
+        pytest.param(
+            {
+                "source": None,
+                "sources": {"orders": {"plugin": "csv", "on_success": "rows"}},
+            },
+            id="source-null-with-named-sources",
+        ),
+        pytest.param(
+            {
+                "source": {"plugin": "csv", "on_success": "rows"},
+                "sources": None,
+            },
+            id="sources-null-with-singular-source",
+        ),
+    ],
+)
+def test_execute_tool_rejects_invalid_set_pipeline_source_selection_before_handler(
+    monkeypatch: pytest.MonkeyPatch,
+    source_selection: dict[str, Any],
+) -> None:
+    def _explode(
+        arguments: dict[str, Any],
+        state: CompositionState,
+        context: ToolContext,
+    ) -> ToolResult:
+        del arguments, state, context
+        raise AssertionError("schema-invalid source selection reached set_pipeline handler")
+
+    monkeypatch.setattr(
+        dispatch_module,
+        "_MUTATION_TOOLS",
+        {**dispatch_module._MUTATION_TOOLS, "set_pipeline": _explode},
+    )
+    arguments = {
+        **source_selection,
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
+
+    result = execute_tool(
+        "set_pipeline",
+        arguments,
+        _empty_state(),
+        _catalog(),
+        validate_arguments=True,
+    )
+
+    assert result.success is False
+    assert "Invalid arguments for tool 'set_pipeline'" in result.data["error"]
+
+
 def test_execute_tool_rejects_wrong_argument_types_before_handler() -> None:
     result = execute_tool(
         "get_pipeline_state",

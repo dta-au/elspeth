@@ -174,6 +174,97 @@ def test_rejected_candidate_reports_only_the_real_error_not_stale_state(tmp_path
     assert [entry.error_code for entry in result.validation.errors] == ["plugin_options_invalid"]
 
 
+@pytest.mark.parametrize(
+    ("sources", "expected_container", "expects_blob_advice"),
+    [
+        pytest.param(
+            {
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={"path": "inputs/orders.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            },
+            "`source` configuration",
+            False,
+            id="singular-plugin-backed",
+        ),
+        pytest.param(
+            {
+                "orders": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={"path": "inputs/orders.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            },
+            "named `sources` map",
+            False,
+            id="named-plugin-backed",
+        ),
+        pytest.param(
+            {
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={
+                        "path": "blobs/session/orders.csv",
+                        "blob_ref": "11111111-1111-4111-8111-111111111111",
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                )
+            },
+            "`source` configuration",
+            True,
+            id="singular-blob-bound",
+        ),
+    ],
+)
+def test_no_source_internal_defense_uses_prior_source_shape_for_repair_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+    sources: dict[str, SourceSpec],
+    expected_container: str,
+    expects_blob_advice: bool,
+) -> None:
+    """The handler's defensive branch stays accurate behind schema admission."""
+    validated_without_source = sessions_tools.SetPipelineArgumentsModel.model_construct(
+        source=None,
+        sources=None,
+        nodes=[],
+        edges=[],
+        outputs=[],
+        metadata=None,
+    )
+    monkeypatch.setattr(
+        sessions_tools.SetPipelineArgumentsModel,
+        "model_validate",
+        classmethod(lambda cls, value: validated_without_source),
+    )
+    state = CompositionState(
+        sources=sources,
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+    candidate = build_set_pipeline_candidate(
+        {"nodes": [], "edges": [], "outputs": []},
+        state,
+        _trained_context(),
+    )
+
+    error = candidate.result.data["error"]
+    assert "complete existing" in error
+    assert expected_container in error
+    assert ("blob_id" in error) is expects_blob_advice
+    assert ("inline_blob" in error) is expects_blob_advice
+
+
 def _trained_context(*, data_dir: Path | None = None, **kwargs: Any) -> ToolContext:
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
@@ -1283,6 +1374,7 @@ def test_public_set_pipeline_validates_current_and_candidate_exactly_once(
     args["nodes"] = []
     args["edges"] = []
     if rejected:
+        del args["source"]
         args["sources"] = {}
     state = _empty_state()
     context, catalog = _final_validation_rejecting_context(data_dir=tmp_path)
@@ -1319,6 +1411,7 @@ def test_normalizer_skips_revalidation_for_a_withheld_rejection_across_snapshots
     from the untouched ``updated_state`` under the new snapshot.
     """
     args = _linear_args(tmp_path)
+    del args["source"]
     args["sources"] = {}
     state = _empty_state()
     context, _catalog = _final_validation_rejecting_context(data_dir=tmp_path)

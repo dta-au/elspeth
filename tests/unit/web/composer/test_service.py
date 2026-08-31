@@ -1097,6 +1097,8 @@ class TestComposerSingleToolCall:
         assert proposals[0].composer_provider == "test"
         assert proposals[0].composer_skill_hash == composer_service_with_real_sessions._composer_skill_hash
         assert proposals[0].tool_arguments_hash == stable_hash(proposals[0].arguments_json)
+        assert "pipeline" not in proposals[0].arguments_json
+        assert {"source", "nodes", "edges", "outputs", "metadata"}.issubset(proposals[0].arguments_json)
         assert result.tool_outcomes[0].post_version == state.version
 
     @pytest.mark.asyncio

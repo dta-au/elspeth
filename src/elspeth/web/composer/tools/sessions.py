@@ -505,6 +505,39 @@ class SetPipelineCandidate:
         return self.result.success and self.result.validation is not None and self.result.validation.is_valid
 
 
+def _no_source_configured_repair(state: CompositionState) -> str:
+    """Describe the complete source shape an internal caller must restore.
+
+    Public provider calls cannot reach this defense because the declaration
+    schema rejects missing/null/ambiguous source selection. Keep the branch
+    accurate for trusted internal callers without assuming every existing
+    source came from a blob.
+    """
+    prefix = (
+        "set_pipeline requires exactly one non-null source or sources object. "
+        "This tool is a full replacement; omission or null never keeps existing source configuration."
+    )
+    if not state.sources:
+        return f"{prefix} Supply a complete `source` object or named `sources` map."
+
+    singular_default = set(state.sources) == {"source"}
+    container = "`source` configuration" if singular_default else "named `sources` map"
+    guidance = f"{prefix} Re-supply the complete existing {container} from get_pipeline_state(component='set_pipeline_arguments')."
+    if not singular_default:
+        return guidance
+
+    serialized, error = _serialize_set_pipeline_arguments(state)
+    if error is not None or serialized is None or "source" not in serialized:
+        return guidance
+    serialized_source = serialized["source"]
+    if type(serialized_source) is not dict or "blob_id" not in serialized_source:
+        return guidance
+    return (
+        f"{guidance} The existing singular source is blob-bound: retain its source.blob_id; "
+        "use source.inline_blob only when intentionally supplying new literal data."
+    )
+
+
 @trust_boundary(
     tier=3,
     source="LLM composer tool-call arguments",
@@ -735,10 +768,7 @@ def build_set_pipeline_candidate(
         # from set_pipeline failure envelopes — elspeth-e89e6bf47a).
         return _failure_result(
             state,
-            "set_pipeline requires source or sources. This tool is a full replacement — "
-            "source: null does not mean 'keep the existing source'. Re-supply it: copy the "
-            "current blob_id (from get_pipeline_state or list_blobs) into source.blob_id, "
-            "or resend inline_blob.",
+            _no_source_configured_repair(state),
             error_code="no_source_configured",
         )
 
@@ -1692,13 +1722,13 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
         "type": "object",
         "properties": {
             "source": {
-                "type": ["object", "null"],
+                "type": "object",
                 "description": (
                     "Source configuration. Use blob_id to bind an already uploaded session blob, or "
                     "inline_blob to materialize user-provided literal data atomically with the pipeline. "
                     "null carries NO meaning — it is not 'keep the existing source'. Every call must "
                     "supply source or sources as a real object: on a full rebuild, re-supply the "
-                    "existing source by copying its blob_id."
+                    "complete existing source block, including blob_id only when that block carries one."
                 ),
                 "properties": {
                     "plugin": {"type": "string"},
@@ -1744,7 +1774,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                 "required": ["plugin", "on_success"],
             },
             "sources": {
-                "type": ["object", "null"],
+                "type": "object",
                 "description": (
                     "Named source roots keyed by stable source name; use instead of source for multi-source "
                     "pipelines. Values share source's shape minus blob_id/inline_blob. null carries NO "
@@ -1951,6 +1981,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                 },
             },
         },
+        "oneOf": [
+            {"required": ["source"]},
+            {"required": ["sources"]},
+        ],
         "required": ["nodes", "edges", "outputs"],
         "additionalProperties": False,
     },
