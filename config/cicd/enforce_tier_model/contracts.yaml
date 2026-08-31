@@ -634,19 +634,19 @@ allow_hits:
     Prescribed Tier-1 audit-data corruption guard, not a suppressible defensive-programming defect. `BarrierScalars.from_dict` is explicitly reconstructing persisted checkpoint state: `src/elspeth/contracts/barrier_scalars.py:295` says `Reconstruct from checkpoint column value (Tier 1 — crash on corruption).` The flagged `isinstance` at `src/elspeth/contracts/barrier_scalars.py:330` validates the JSON serialization boundary for `coalesce` keys (`"[str, str] array"`) and immediately crashes with `AuditIntegrityError` at lines 331-334 if persisted audit/checkpoint data has drifted or been corrupted. This is not masking bad data or continuing; it reifies the Tier-1 invariant that `to_dict` emits coalesce keys as two strings and rejects any checkpoint row that no longer matches that shape.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:07:41.217530+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.88
+  judge_recorded_at: '2026-08-30T22:43:06.004188+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM. This is a Tier-1 audit/checkpoint reconstruction boundary: BarrierScalars.from_dict deserializes persisted checkpoint state we authored, and per policy the seal-check on re-read of our own data is a natural crash on any anomaly. The isinstance check at line 346 immediately raises AuditIntegrityError with a maximally informative message when the persisted coalesce key shape has drifted — this is offensive programming (detect invalid state, raise meaningful typed exception that bubbles to abort the run), not defensive suppression. The rule fires on shape, but the surrounding pattern uniformly converts shape violations into typed crashes rather than swallowing them, matching the prescribed form for Tier-1 corruption detection.
+    PRESCRIBED FORM — `BarrierScalars.from_dict` reconstructs Tier-1 persisted checkpoint state, and the visible code directly accesses `data["coalesce"]` before validating the deserialized representation. The flagged `isinstance` participates in an explicit invariant check that immediately raises `AuditIntegrityError` when a coalesce key is not a two-element string pair; it neither coerces, defaults, suppresses, nor continues with corrupted data. This is the policy-prescribed offensive crash-on-corruption handling for Tier-1 serialization, whose authorship and trust tier remain unchanged after deserialization.
   judge_signature_version: 2
-  scope_fingerprint: 2b95c74d554a0b2a3b26293907a100ad7c28206bab972bc7da1aebcb1c521abe
-  judge_transport: openrouter
+  scope_fingerprint: 70fd64f4751c904d170d309c29577d7723281c43c94bf7ac96f8b3bce2612d16
+  judge_transport: codex_cli
   ast_path: 'body[12]/body[6]/body[9]/body[2]/test/values[2]/operand/args[0]/elt'
-  judge_metadata_signature: 'hmac-sha256:v2:8895329ce572f1e1c9ed0f7db2c7425840fee194a61db3cf65ddb92f3366eb72'
+  judge_metadata_signature: 'hmac-sha256:v2:7dad5d1536a1b1c94af43b954281f90513f6f31f5b5cf8ef16678fe21b7aa294'
 - key: contracts/barrier_scalars.py:R5:BarrierScalars:from_dict:fp=35a4a7ed6ee85d39
   owner: john
   reason: |-
@@ -843,44 +843,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[19]/body[23]/body[2]/orelse[0]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:981e7d7a3a21796dd4ff96dccfe8efcda636918e0741001e8abb5fa2d1ac0b76'
-- key: contracts/identifiers.py:R5:validate_field_names:fp=3f2a952d6f9d6688
-  owner: john
-  reason: |-
-    `contracts/identifiers.py:46` is the entry guard for `validate_field_names`, a contract-boundary validator for caller-supplied field-name collections. The code rejects the known scalar-container trap and non-sequences before the function treats `names` as iterable: `if isinstance(names, (str, bytes)) or not isinstance(names, Sequence):`. That is a legitimate Tier-3/prescribed boundary shape: validate the external/container shape at the boundary, then validate each field name before returning the normalized contract value. If this site drifted to read persisted audit data or to defensively mask an internal invariant, this suppression would no longer apply.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:20:59.464826+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
-  judge_rationale: |-
-    PRESCRIBED FORM. The isinstance check is at a contract-boundary validator that accepts caller-supplied `names: Sequence[object]` — an unenforced structural annotation whose runtime shape is not guaranteed. The guard offensively rejects the scalar-container trap (str/bytes are Sequences but semantically wrong) and non-sequences by raising ValueError with a maximally-informative message, then proceeds to per-element validation. This is the prescribed offensive isinstance→raise pattern at a validation boundary, not a defensive shape-mask over first-party trusted data. R1/R5 decorator does not apply here — this is not a function-scoped Tier-3 external-data boundary with a named source_param; it is a reusable contract validator whose entire purpose is shape enforcement.
-  judge_signature_version: 2
-  scope_fingerprint: edfea60c9a896ee5aeae1de7df1ee9e6e0d44883961c2213f6ac16f0a2cb3b2b
-  judge_transport: openrouter
-  ast_path: 'body[5]/body[1]/test/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:c4909131daff74fbdf8ab22f761233c6534ead8e9b54782a80777697c97019d5'
-- key: contracts/identifiers.py:R5:validate_field_names:fp=180737c040065cd8
-  owner: john
-  reason: |-
-    contracts/identifiers.py:46 is inside `validate_field_names()`, a shared contract validator whose purpose is to reject malformed caller-provided field-name collections before the engine treats them as normalized identifiers. The `isinstance` check is the boundary guard itself: `if isinstance(names, (str, bytes)) or not isinstance(names, Sequence):` immediately raises `ValueError` with the received type instead of continuing. This is a prescribed validation pattern for raw field-name input, not a Tier-1 audit read hiding corruption; after the collection shape is accepted, each element is validated through `validate_field_name(...)` at contracts/identifiers.py:51 and duplicate names are rejected at contracts/identifiers.py:53-58. Drift that changed this site to tolerate non-sequences, silently coerce a scalar string into characters, or skip per-name validation would invalidate this suppression.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:21:05.613059+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
-  judge_rationale: |-
-    PRESCRIBED FORM. This is a shared contract validator whose declared job is to reject malformed caller-provided field-name collections at the boundary — the parameter is typed `Sequence[object]` and the isinstance check immediately raises ValueError with the received type name. The str/bytes exclusion is meaning-preserving (prevents silently iterating a scalar string into characters), and downstream each element goes through validate_field_name and duplicate detection. This matches the offensive `isinstance`→`raise` enforcement pattern the policy prescribes for boundary validators, not a defensive shape-recheck of first-party trusted data.
-  judge_signature_version: 2
-  scope_fingerprint: edfea60c9a896ee5aeae1de7df1ee9e6e0d44883961c2213f6ac16f0a2cb3b2b
-  judge_transport: openrouter
-  ast_path: 'body[5]/body[1]/test/values[1]/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:1ce7242eb23ed6a014ef4fb138a40cc50a97ec2c7ad32397d0477638c68dadd3'
 - key: contracts/contract_propagation.py:R1:narrow_contract_to_output:fp=0277527a2fa13ad3
   owner: john
   reason: |-
@@ -1493,11 +1455,11 @@ allow_hits:
   owner: john
   reason: |-
     R5 fires on `isinstance(service, RuntimeServiceRateLimit)` in `RuntimeRateLimitConfig.__post_init__`.
-    
+
     TIER-1 FROZEN-DATACLASS POST-INIT GUARD on an ELSPETH-owned concrete class. The code comment states the exact hazard: "Settings->Runtime is mechanical: a services value that isn't a RuntimeServiceRateLimit (e.g. a raw dict) would satisfy the Mapping protocol but fail later in get_service_config." That is the structural-typing trap ADR-032 names -- a raw dict passes any duck-typed check and then blows up at `.requests_per_minute` deep inside rate limiting, at request time rather than at startup.
-    
+
     IT GUARDS THE VALUES, NOT THE MAPPING. `self.services` is typed `Mapping[str, RuntimeServiceRateLimit]`, but that annotation is erased; the loop is the only thing that checks the VALUES, and it runs immediately before `object.__setattr__(self, 'services', MappingProxyType(dict(self.services)))` freezes them. Anything admitted here is frozen in for the run. `raise TypeError` naming `services[{service_name!r}]` is the Tier-1 crash the data manifesto requires, which also puts it out of scope for `@trust_boundary` (tier!=3 is a decoration-time TypeError).
-    
+
     WHAT WOULD INVALIDATE THIS. If `RuntimeRateLimitConfig` were constructed only through a checked factory that cannot receive raw dicts, or if `services` became a validated model field, this loop would be genuinely redundant and should be deleted.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -1518,11 +1480,11 @@ allow_hits:
   owner: john
   reason: |-
     R5 fires on `isinstance(exporter, ExporterConfig)` in `RuntimeTelemetryConfig.__post_init__`.
-    
+
     SAME CLASS OF GUARD AS THE rate-limit `services` loop, over a DIFFERENT container and a different downstream crash. Here the code comment names it: "A non-ExporterConfig entry (e.g. a raw dict) satisfies the tuple type but fails later in the telemetry factory (exporter_config.name -> AttributeError)." `exporter_configs` is a tuple, so the container type is satisfied by ANY element; only this loop checks what is inside it, and it reports the offending INDEX (`exporter_configs[{i}]`) because a tuple element has no name to report.
-    
+
     WHY CRASHING EARLY MATTERS PARTICULARLY HERE: telemetry is initialised on the run's startup path but exporters are exercised during execution, so a malformed entry that is not rejected in `__post_init__` surfaces as an `AttributeError` mid-run, after work has already been done and partially audited. Tier-1 crash-on-anomaly over an owned type; `@trust_boundary` rejects tier=1 at import, so a decorator is not available even in principle.
-    
+
     WHAT WOULD INVALIDATE THIS. If `exporter_configs` were built exclusively by a validated factory from `ExporterConfig` instances with no untyped construction path, this guard becomes dead and should be removed instead of re-signed.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -1543,11 +1505,11 @@ allow_hits:
   owner: john
   reason: |-
     R5 fires on `isinstance(default_state_dir, (str, Path))` in `_rate_limit_state_dir`.
-    
+
     THE SUBJECT IS NOT THE PARAMETER -- IT IS OUR OWN CONSTANTS TABLE. This guard runs only in the `state_dir is None` branch, and its subject is `INTERNAL_DEFAULTS['rate_limit']['state_dir']`, read from `contracts.config.defaults`. That is ELSPETH-owned hardcoded configuration, which is exactly why this site is J and not covered by a Tier-3 boundary: it is not rooted at any parameter and no external data reaches it.
-    
+
     WHY THE GUARD IS STILL RIGHT. `INTERNAL_DEFAULTS` is typed loosely enough (nested `dict[str, Any]`) that mypy cannot prove the entry is a `str | Path`, and the value flows into `Path(state_dir).resolve()`, which bounds where rate-limit SQLite state may be written. A wrong-typed default would either crash far away in `Path()` or, worse, resolve to an unintended root. Raising `TypeError` here converts a silent constants-table edit into an immediate, named startup failure.
-    
+
     WHAT WOULD INVALIDATE THIS. If `INTERNAL_DEFAULTS` became a typed structure (TypedDict or a frozen dataclass) that statically guarantees this entry is `str | Path`, the check would be genuinely dead and should be deleted rather than re-signed.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -1568,11 +1530,11 @@ allow_hits:
   owner: john
   reason: |-
     R5 fires on `isinstance(state_dir, str)` (negated) in `_rate_limit_state_dir` -- the exhaustiveness arm that closes the union the previous guard opened.
-    
+
     By this line `state_dir` has been proven not to be `None` (first branch assigned a default) and not to be a `Path` (previous branch returned), so the declared `str | Path | None` union leaves only `str`. This raise is what makes that reasoning enforced rather than assumed: a caller passing, say, an `os.PathLike` that is neither gets a named `TypeError` at startup instead of an obscure failure inside `Path()`. Deleting it would turn an exhaustive narrowing into a fall-through -- the pattern the plan calls out as F-worthy in dispatchers, here correctly avoided.
-    
+
     Tier-1/2 crash-on-anomaly over ELSPETH-owned internal config (see the sibling rationale for the same function's Path arm for why this parameter is not Tier-3), so a tier-3 decorator does not apply.
-    
+
     WHAT WOULD INVALIDATE THIS. Widening the parameter to `os.PathLike[str]`, or making the callers pass an already-resolved `Path` unconditionally, would make this arm dead code to be deleted rather than re-signed.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -1593,11 +1555,11 @@ allow_hits:
   owner: john
   reason: |-
     R5 fires on the POSITIVE `isinstance(state_dir, Path)` in `_rate_limit_state_dir` -- a dispatch arm, not a rejection.
-    
+
     It selects the already-a-Path fast path (`return state_dir.resolve()`) so a `Path` is not round-tripped through `Path(str(...))`. `Path` is a stdlib concrete class ELSPETH nominally types against; the parameter is annotated `str | Path | None`, so this is ordinary union narrowing over a two-member union we declared, and mypy needs it to know which branch it is in.
-    
+
     NOT A TIER-3 PARSE. `state_dir` reaches here from `RuntimeRateLimitConfig.from_settings(settings, state_dir=...)`, whose only callers are ELSPETH's CLI state root and `WebSettings.data_dir` -- already-validated internal values, not user YAML. That is why this function is J while the retry-policy validators in the same module are honest @trust_boundary sites: the tier follows the data, not the file.
-    
+
     WHAT WOULD INVALIDATE THIS. If `state_dir` were ever wired to accept a raw settings value that has not been through a Pydantic settings model, this function would become a Tier-3 boundary and should be decorated rather than justified.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -1861,7 +1823,7 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[9]/body[3]/body[3]/body[0]/test/operand'
   judge_metadata_signature: 'hmac-sha256:v2:875f3b02cebecb9253802f4ebf3b62f0c478f548afc034c5fbc715007082b1bf'
-- key: contracts/emitted_option.py:R5:emitted_option_fields:fp=16e0bcf134552bcb
+- key: contracts/emitted_option.py:R5:emitted_option_fields:fp=deb22607e1e00ea4
   owner: john
   reason: |-
     isinstance(entry, EmittedToOutput) is a nominal check against a concrete frozen slots dataclass ELSPETH defines in this same module (ADR-032 decision 1), applied to the elements of pydantic's model_fields[name].metadata list. That list is genuinely heterogeneous and open: it holds whatever Annotated metadata each plugin config model carried — pydantic's own Field/constraint objects, annotated-types markers, third-party metadata — so the marker can only be found by identifying it among strangers, not by narrowing a declared type. This is NOT re-checking a value whose type is already guaranteed; there is no type to narrow. Deliberately isinstance rather than the `type(entry) is X` idiom used for the closed owned union in core/landscape/execution/sink_effect_attempt_results.py: there an unmatched value falls through to `raise TypeError`, so exact-type matching fails CLOSED, whereas here an unmatched entry is silently skipped, so exact-type matching would fail OPEN — a subclassed marker would go undeclared and its ${VAR} would reach artifact bytes, which is precisely the failure mode this module was built to close (elspeth-8f0a6b3391: truncate.suffix and csv.headers reaching output). The check protects the settings-loader guard's derivation: elspeth.core.config._reject_sensitive_plugin_env_placeholders_before_expansion reads this mapping to decide which options to refuse a raw env placeholder in, before _expand_env_vars substitutes a host secret that the plugin-side validator can no longer recognise.
@@ -1869,55 +1831,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:42:00.258334+00:00'
+  judge_recorded_at: '2026-08-30T22:45:04.935321+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — the nominal `isinstance(entry, EmittedToOutput)` check identifies an ELSPETH-defined concrete marker within Pydantic metadata that is explicitly heterogeneous and open, rather than defensively revalidating a Tier-1/Tier-2 fixed contract or structurally authenticating an object. The visible loop consistently skips unrelated metadata entries and extracts only the marker’s declared reason, so it does not coerce, fabricate, swallow a contract violation, or disguise a wrong first-party return type. The decorator alternative does not apply because `model` is a system-owned plugin configuration model class, not an external-data parameter requiring Tier-3 promotion.
+    RULE MISFIRES — `src/elspeth/contracts/emitted_option.py:126-131` uses nominal discrimination against the concrete ELSPETH-owned `EmittedToOutput` dataclass while traversing Pydantic's intentionally heterogeneous metadata collection; it neither re-checks a guaranteed element type nor hides a contract violation. The named control is verified: `_declared_emitted_options` consumes this mapping at `src/elspeth/core/config.py:2756-2794`, and `_reject_sensitive_plugin_env_placeholders_before_expansion` uses those declarations at lines 2813-2879 before both loader paths invoke environment expansion at lines 3443-3451 and 3494-3503. This function is not a Tier-3 boundary over an external parameter, so the structural decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 8e17c014547efc69015b8a0cc3ab488f7d11ff8c091a58e9dc2516400a1f500d
   judge_transport: codex_cli
-  ast_path: 'body[8]/body[3]/body[0]/body[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:81f5a384c1047ceb869fbd0dbc5a35f02ec2baf234f89a5e8a086e95c085bc33'
-- key: contracts/emitted_option.py:R5:env_placeholders_in:fp=19a0e2c73f6bc67b
-  owner: john
-  reason: |-
-    isinstance(value, list | tuple) is the sequence arm of the same recursive dispatch over an authored plugin-option value typed `object`. Plural emitted options exist (a sink `headers` list, report_assemble's rendered sequences) and pydantic hands back either a list or a tuple depending on the field's annotation, so both concrete builtin container classes are named — there is no single owned type to nominally check against. Deliberately isinstance rather than `type(value) is list`, for the same fail-direction reason as the arms above: the function's terminal branch is `return False`, so a sequence subclass that this arm failed to recognise would be reported free of placeholders and its ${VAR} would be expanded to a host secret and written into output. The check discriminates authored config shapes; it hides no missing attribute and no contract violation.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:42:03.941343+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
-  judge_rationale: |-
-    RULE MISFIRES — `env_placeholders_in` intentionally dispatches over several valid, authored option shapes accepted through its `object` parameter; the list-or-tuple check is not revalidating a fixed Tier-2 shape or concealing a contract failure. The visible recursive branches and terminal `return False` corroborate the rationale that nominal recognition of both concrete sequence families is necessary to inspect nested strings, while subclass acceptance avoids falsely declaring an unrecognized sequence free of placeholders. This is not a function-scoped Tier-3 boundary case, so the decorator contract does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: d7ca72917ee3a78449a597358087110134b95af2e7dba1a4fae830c11077121d
-  judge_transport: codex_cli
-  ast_path: 'body[9]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:2c8d40dedc80b279cafa8f01bdee6f4ed093a17478d8390322fdddb85165b021'
-- key: contracts/emitted_option.py:R5:env_placeholders_in:fp=332fd7807874ad20
-  owner: john
-  reason: |-
-    isinstance(value, str) is the scalar arm of a recursive union dispatch over an authored plugin-option VALUE typed `object`, because an emitted option has no single owned type: the sink `headers` option alone is str | dict[str, str] | None, and truncate.suffix is str. The function is a predicate, not a parse — it returns bool and constructs no owned type — so @trust_boundary would be a false declaration, and it has two call paths of different tiers: the pre-expansion loader guard sees raw YAML-loaded values, while SinkPathConfig's field validator in plugins/infrastructure/config_base.py sees values pydantic has already validated. Deliberately isinstance rather than `type(value) is str`: the recursion's terminal branch is `return False`, so the else-branch is load-bearing and exact-type matching fails OPEN — a str subclass carrying ${VAR} would be reported clean and the placeholder would be expanded into a host secret written to output bytes. Nominal check against the concrete builtin str; it masks no contract violation, because a value of any other type is simply not the scalar shape and is handled by the arms below.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:42:39.690070+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.94
-  judge_rationale: |-
-    RULE MISFIRES — the `object` parameter has no single fixed shape, and the visible code uses nominal checks against concrete built-ins to dispatch a documented recursive union rather than defensively revalidate or coerce a guaranteed type. The string arm preserves detection for `str` subclasses, while other declared container shapes are handled separately and unsupported scalar shapes produce the predicate’s documented negative result without fabrication or silent contract recovery. The rationale also establishes mixed Tier-3 and already-validated call paths, so declaring this shared predicate itself as a uniform Tier-3 boundary would misstate its role.
-  judge_signature_version: 2
-  scope_fingerprint: d7ca72917ee3a78449a597358087110134b95af2e7dba1a4fae830c11077121d
-  judge_transport: codex_cli
-  ast_path: 'body[9]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:7d360fff6c7438e747a8eb0605edcf7e2a6956e6e625e2fb7bf523c75df26e2d'
+  ast_path: 'body[9]/body[3]/body[0]/body[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:7802ece4c6151c6c027087ef44ec8b2a3f96ad1f061ae253f34856abfa1bd169'
 - key: contracts/events.py:R5:_event_field_to_serializable:fp=0a6e91eb313ec513
   owner: john
   reason: |-
@@ -2279,7 +2203,7 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[9]/body[2]/test/values[0]'
   judge_metadata_signature: 'hmac-sha256:v2:3277e2350de71e7dd7e59f24fd28d135f57b09f7cda5eefc28744e3ae101e404'
-- key: contracts/hashing.py:R5:_normalize_frozen_and_reject_non_finite:fp=1bd17f1f7636dde6
+- key: contracts/hashing.py:R5:_normalize_frozen_and_reject_non_finite:fp=6f4e7a4c1b826d39
   owner: john
   reason: |-
     R5 `isinstance(obj, float)` — first arm of the recursive normalizer that runs immediately before `rfc8785.dumps()`. This is the ONLY point at which a bare Python float is inspected for finiteness on the contracts-layer hashing path, and it is Tier-1 integrity, not input validation: rfc8785 will happily emit a bare `NaN` token, producing an audit digest no verifier can re-derive and no JSON parser will read back. `isinstance` rather than `type(obj) is float` is deliberate so float subclasses reach the same rejection. Placement is also load-bearing — bool is an int, not a float, so booleans correctly skip this arm rather than being probed with math.isnan. Crash path: ValueError propagating out of `canonical_json` / `stable_hash` to whichever audit write called it, which is the intended fail-closed behaviour. Invalidated if rfc8785 grows its own non-finite rejection, or if floats are normalized upstream before reaching this module.
@@ -2287,18 +2211,18 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:45:28.879113+00:00'
+  judge_recorded_at: '2026-08-30T22:45:32.630562+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM — the heterogeneous recursive normalizer uses `isinstance(obj, float)` to select actual float values for explicit finiteness checks, and invalid values raise rather than being coerced, defaulted, or silently suppressed. The visible code supports the site-specific rationale: this arm immediately rejects NaN and Infinity with `ValueError`, while finite floats pass unchanged to canonical serialization, so the check is offensive Tier-1 integrity enforcement rather than defensive revalidation of an expected fixed type. The function accepts a general object rather than a dedicated external-data parameter, so the structural `@trust_boundary` alternative does not apply.
+    PRESCRIBED FORM — the `isinstance(obj, float)` branch is an offensive value-level integrity check in the recursive canonicalization path, not a defensive attempt to hide a fixed-contract type violation. The visible code preserves valid floats unchanged and raises `ValueError` for NaN or Infinity; it neither coerces, fabricates, nor silently recovers, and this is consistent with the rationale’s fail-closed Tier-1 hashing requirement. The function is not shown handling Tier-3 external data, so the `@trust_boundary` decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 1a4c9750c27f3bf94352758ebe8e0fc29c43eee9db7426e08714c7947af43210
   judge_transport: codex_cli
-  ast_path: 'body[11]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:09b21c421589ac7c0863be3ec89233cce6e3236e4710edb6305d9bfeb536daa9'
-- key: contracts/hashing.py:R5:_normalize_frozen_and_reject_non_finite:fp=1d9ef596e869cca3
+  ast_path: 'body[12]/body[1]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:90aa63a3d4467b838b2e74f397408404df91c5d010b4a9c28794e91a9c9f399e'
+- key: contracts/hashing.py:R5:_normalize_frozen_and_reject_non_finite:fp=f774d302e572ddf4
   owner: john
   reason: |-
     R5 `isinstance(obj, Mapping)` against the collections ABC rather than `dict`, and the choice of ABC is the whole reason this arm is correct. `deep_freeze` produces `MappingProxyType`, which is a Mapping but NOT a dict; narrowing this test to `dict` would let every frozen contract mapping skip normalization and reach rfc8785, which rejects MappingProxyType outright. The dict comprehension in the body is what converts the proxy back to a real dict. This is nominal typing against a stdlib ABC we do not own but whose membership is explicit (MappingProxyType is a registered Mapping), not structural duck-typing. Invalidated if `deep_freeze` stops emitting MappingProxyType, or if rfc8785 learns to serialize Mapping subclasses directly.
@@ -2306,18 +2230,18 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:45:26.880108+00:00'
+  judge_recorded_at: '2026-08-30T22:45:47.593340+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
+  judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance(obj, Mapping)` branch is explicit container-kind dispatch within a documented normalization contract, not a defensive re-check that hides malformed fixed-contract data. The visible code confirms that `canonical_json` accepts frozen container equivalents and that this branch meaning-preservingly converts mappings, including `MappingProxyType`, into a concrete `dict` before `rfc8785.dumps`; unsupported and non-finite values are allowed to raise rather than silently defaulted. The finding is not an external-parameter Tier-3 boundary case, so the `@trust_boundary` decorator contract does not apply.
+    RULE MISFIRES — this check discriminates an explicitly supported container representation rather than defensively revalidating a fixed contract or hiding a contract violation. The visible docstring, comments, and comprehension establish that `Mapping`, including `MappingProxyType`, is deliberately accepted and meaning-preservingly normalized to a real `dict` for `rfc8785.dumps`; malformed unsupported values are not silently replaced or fabricated. This is not a function-scoped Tier-3-boundary suppression case, so the `@trust_boundary` decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 1a4c9750c27f3bf94352758ebe8e0fc29c43eee9db7426e08714c7947af43210
   judge_transport: codex_cli
-  ast_path: 'body[11]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:fbf38d94ac5b06d76b0d3878e58180fe929f852f4edd0556dae0b34ec3937778'
-- key: contracts/hashing.py:R5:_normalize_frozen_and_reject_non_finite:fp=c5e39e8d9c92f9d5
+  ast_path: 'body[12]/body[3]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:5b06e462a158728547c32b799124907b9ccb74fd34759b156a60912ed960df60'
+- key: contracts/hashing.py:R5:_normalize_frozen_and_reject_non_finite:fp=345d39d6daff59d1
   owner: john
   reason: |-
     R5 `isinstance(obj, (list, tuple))` — a union arm, and the two types are grouped rather than split because their normalization is genuinely identical: both become a JSON array. `tuple` is in the union for the same reason MappingProxyType is covered above — it is what `deep_freeze` produces for sequences, and rfc8785 accepts only `list`. Contrast the checkpoint serializer, where tuple gets its OWN envelope because that path needs round-trip fidelity; here the output is a hash input, so tuple-ness is not semantic and collapsing it is correct. Invalidated the moment a caller needs `(1, 2)` and `[1, 2]` to hash differently.
@@ -2325,18 +2249,18 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:45:33.154729+00:00'
+  judge_recorded_at: '2026-08-30T22:46:02.509771+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is type-directed normalization across two explicitly supported container variants, not a defensive re-check that hides a fixed-contract violation. The function documentation expressly accepts frozen equivalents and states that tuples are converted to lists before `rfc8785.dumps`, while the flagged branch applies the same recursive JSON-array normalization to both declared sequence forms. The rationale is site-specific and explains why tuple identity is non-semantic for this canonical hash representation, consistently with the visible code.
+    RULE MISFIRES — this `isinstance` is explicit discrimination within the function’s declared normalization contract, not a defensive re-check that conceals a contract violation. The visible code and rationale consistently establish that `list` and the `tuple` produced by frozen-sequence handling intentionally share one hash representation, while invalid or unsupported values are rejected here or by `rfc8785.dumps` rather than silently defaulted. This is not a Tier-3 boundary function case warranting `@trust_boundary`; the supported representation union itself is being normalized for canonical hashing.
   judge_signature_version: 2
   scope_fingerprint: 1a4c9750c27f3bf94352758ebe8e0fc29c43eee9db7426e08714c7947af43210
   judge_transport: codex_cli
-  ast_path: 'body[11]/body[4]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:3577e0a963ef7839ca8246278afdb277014cc8b3027653996250152856e4cc21'
-- key: contracts/hashing.py:R5:_normalize_frozen_and_reject_non_finite:fp=effd9d277ca5b52f
+  ast_path: 'body[12]/body[4]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:23234d613a6c5af0e53dbcd961dff59c5cf7a527eeaeef65ea669455adb6e9ed'
+- key: contracts/hashing.py:R5:_normalize_frozen_and_reject_non_finite:fp=91b631d24da93473
   owner: john
   reason: |-
     R5 `isinstance(obj, frozenset)` — a rejection arm, not a conversion arm, and that is the point. A frozenset has no canonical ordering, so serializing one would make the digest depend on set iteration order: the exact non-determinism `stable_hash` exists to eliminate. The arm raises TypeError rather than silently sorting because sorting is not total over mixed element types, so a "helpful" sort would itself be order-dependent for heterogeneous sets. Note the asymmetry with `_stable_repr` below, which DOES sort frozensets — that is the already-failed fallback path where determinism-within-a-version is the most that is on offer. Invalidated if a canonical frozenset encoding is defined (the tagged `entries` envelope that `core/canonical.py` uses for non-string-keyed mappings would be the natural model).
@@ -2344,75 +2268,18 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:45:29.010987+00:00'
+  judge_recorded_at: '2026-08-30T22:46:16.400738+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM — the visible `isinstance(obj, frozenset)` branch is an offensive invalid-state check that immediately raises an informative `TypeError`; it neither coerces the value nor masks a contract violation. The rationale specifically explains that `frozenset` lacks the canonical ordering required by this hashing path, and lines 51–54 are consistent with rejecting it rather than fabricating an ordering. This is not a function-scoped Tier-3 boundary suppression case, so the decorator contract does not apply.
+    PRESCRIBED FORM — the flagged `isinstance(obj, frozenset)` is an offensive rejection check that immediately raises a meaningful `TypeError`; it neither coerces the value nor hides a contract violation. The visible docstring and `canonical_json` contract explicitly identify frozensets as unsupported because they lack canonical JSON ordering, while the rationale specifically explains why sorting would not establish a sound canonical encoding. The decorator alternative does not apply because the excerpt does not establish `obj` as external-origin data entering a Tier-3 boundary rather than a general canonicalization input.
   judge_signature_version: 2
   scope_fingerprint: 1a4c9750c27f3bf94352758ebe8e0fc29c43eee9db7426e08714c7947af43210
   judge_transport: codex_cli
-  ast_path: 'body[11]/body[2]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:a6dc9247c532c5573a1d215ef5ed181876095023d1383162ff4c7990fb57a2a9'
-- key: contracts/hashing.py:R5:_stable_repr:fp=207626b23f788c06
-  owner: john
-  reason: |-
-    R5 `isinstance(obj, dict)` opening `_stable_repr`, the `repr_hash` fallback used only after `canonical_json` has already failed — i.e. on data that is known malformed and being quarantined. The arm sorts by `repr(key)` rather than by key, and that is why the check is here: on this path keys may be of mixed, mutually non-comparable types, so a plain `sorted(obj.items())` would raise TypeError and turn a quarantine into a crash. `isinstance` rather than an exact type check so dict subclasses (Counter, defaultdict, OrderedDict) also get deterministic ordering instead of falling through to their own repr. Invalidated if `repr_hash` ever acquires a cross-version stability requirement — repr-based hashing cannot meet it, and the fix would be a real encoding, not a change to this test.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:48:42.809275+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — `_stable_repr` is deliberately discriminating the runtime shape of already-malformed Tier-3 data to produce a deterministic quarantine hash, not defensively rechecking a fixed contract or hiding a plugin violation. The control path is verified: `PluginContext.record_validation_error` catches canonical hashing failures and calls `repr_hash` at `src/elspeth/contracts/plugin_context.py:494`, while `_validation_error_match_key` uses the same fallback at `src/elspeth/contracts/plugin_context.py:226`; `repr_hash` then invokes `_stable_repr` at `src/elspeth/contracts/hashing.py:143`. The dict check preserves the observed object and only selects a deterministic representation, with no coercion, fabrication, or silent promotion to Tier 2. `_stable_repr` is a recursive hashing helper rather than the external-data boundary function itself, so the decorator contract does not apply at this site.
-  judge_signature_version: 2
-  scope_fingerprint: fd109e7d91e7cce276b8de8e30615ff2c3c70d0c538d9ab4fe7bfbfe5e01b0bf
-  judge_transport: codex_cli
-  ast_path: 'body[14]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:e53a0481994c0090c494fccc6427af72d68cb319715c0abe89bcb9eb3453b1c8'
-- key: contracts/hashing.py:R5:_stable_repr:fp=8e3796a639d275f9
-  owner: john
-  reason: |-
-    R5 `isinstance(obj, (list, tuple))` in `_stable_repr`. Grouped because both need the same element-wise recursive join; unlike the `canonical_json` path at line 59, this arm does NOT collapse tuple into list — it defers the distinction to line 118, because repr fidelity is the product here rather than a canonical hash input. Ordering matters against the set arm above: list and tuple are not sets, so the arms are disjoint and their relative order is free, but this arm must stay below the dict arm so that no Mapping reaches it. Invalidated if a new ordered container type must hash like a list.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:45:50.046786+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — `_stable_repr` has an intentionally polymorphic `Any` input, and the flagged `isinstance(obj, (list, tuple))` performs semantic container dispatch rather than defensively rechecking or concealing a fixed-contract violation. The visible code preserves list-versus-tuple representation at lines 116–120 and recursively handles their elements, fully supporting the site-specific rationale. This helper does not validate or promote `obj` into Tier 2, so the structural trust-boundary decorator contract does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: fd109e7d91e7cce276b8de8e30615ff2c3c70d0c538d9ab4fe7bfbfe5e01b0bf
-  judge_transport: codex_cli
-  ast_path: 'body[14]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:2c2b112e4087a3903d6c5d095f4f41a4955a552911b7f40f86fd3f3a514f33ad'
-- key: contracts/hashing.py:R5:_stable_repr:fp=d7a9188e0827d26f
-  owner: john
-  reason: |-
-    R5 `isinstance(obj, tuple)` nested inside the `(list, tuple)` arm — the split the previous arm deferred. Without it `(1, 2)` and `[1, 2]` render identically and collide in `repr_hash`, and the `len(obj) == 1` sub-branch exists to reproduce Python's own trailing-comma repr so `(1,)` does not render as the parenthesised expression `(1)`. This is the one place in this module where tuple-ness is semantic rather than incidental. Invalidated if tuples are normalized to lists before reaching `repr_hash`, as they are on the `canonical_json` path.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:45:48.898411+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — the flagged `isinstance(obj, tuple)` does not conceal a contract violation or defensively revalidate a guaranteed shape; it performs semantic type discrimination after the enclosing `(list, tuple)` dispatch. The visible branches deliberately preserve distinct tuple and list representations, including the singleton tuple’s trailing comma, so removing that distinction would change `repr_hash` identity semantics. This is not a Tier-3 promotion guard rooted in malformed-input handling, so the `@trust_boundary` metadata contract is inapplicable.
-  judge_signature_version: 2
-  scope_fingerprint: fd109e7d91e7cce276b8de8e30615ff2c3c70d0c538d9ab4fe7bfbfe5e01b0bf
-  judge_transport: codex_cli
-  ast_path: 'body[14]/body[3]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:6ee2d63b4bebddae095d6abd0b796e3e15a98f2c1669a529d1493a2d3eb644fd'
-- key: contracts/hashing.py:R5:is_lower_sha256_hex:fp=9a8ab01c723f0cd2
+  ast_path: 'body[12]/body[2]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:b673079b55a15c5436c17b07cca52c88ac0a965850f4f2d52d94e27435e4a074'
+- key: contracts/hashing.py:R5:is_lower_sha256_hex:fp=20864168cb85f697
   owner: john
   reason: |-
     R5 `isinstance(value, str)` as the first conjunct of `is_lower_sha256_hex`, a function whose declared return type is `TypeGuard[str]`. The isinstance is not a defensive afterthought here: it IS the evidence the TypeGuard exports to callers, and the parameter is typed `object` precisely so callers may hand it an unverified digest field read back out of the audit store. It is also load-bearing at runtime — `re.fullmatch` raises TypeError on a non-str/bytes argument, so without the guard a None or int digest crashes instead of answering False. A duck-typed probe would be wrong in the other direction: `bytes` satisfies `re.fullmatch` against this ASCII pattern, and a bytes digest must NOT be accepted as a lowercase hex string. Invalidated if `value` is narrowed to `str` in the signature (the check then becomes dead and should be deleted, not sealed) or if the return type stops being a TypeGuard.
@@ -2420,17 +2287,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:48:58.257568+00:00'
+  judge_recorded_at: '2026-08-30T22:46:33.205618+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — `is_lower_sha256_hex` accepts `object` and returns `TypeGuard[str]`, so the visible `isinstance(value, str)` is the runtime evidence required to establish the predicate’s promised narrowing, not a defensive re-check of a guaranteed `str` contract. The check also excludes `bytes` and prevents `re.fullmatch` from receiving unsupported values, allowing the predicate to report nonconformance without coercion, fabrication, or silent exception handling. This is not a function-scoped Tier-3 boundary rooted in an external parameter, so the decorator alternative does not apply.
+    RULE MISFIRES — `is_lower_sha256_hex` explicitly accepts `object` and returns `TypeGuard[str]`, so the flagged `isinstance(value, str)` is the runtime evidence that permits the advertised narrowing rather than a defensive re-check of an already-guaranteed `str`. The visible short-circuit also ensures only strings reach the string-pattern match and rejects `bytes` rather than accepting an unintended representation. This is not an R5 boundary-function case rooted in an external parameter, so the `@trust_boundary` decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 3b7f9bcaecb1d0222b0cb2da4321c826bf0a0c780f9f8b3dc84581fdb2a17c57
   judge_transport: codex_cli
-  ast_path: 'body[10]/body[1]/value/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:62910ee90a0043dc3d8e2dce44cbf7c21fb4a3d80aa92175025f71412e09a675'
+  ast_path: 'body[11]/body[1]/value/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:e486eb6d471464fe1b2271a1265fae409a83461986fd08925467229206fa9161'
 - key: contracts/header_modes.py:R5:parse_header_mode:fp=dc93452b5432e8a4
   owner: john
   reason: |-
@@ -2454,11 +2321,11 @@ allow_hits:
   owner: john
   reason: |-
     THIS SITE (entry arm, `node_id`). `node_id` carries the id of the node the plugin call is attributed to. This is the ASSIGNING arm: it runs before `yield ctx`, and it decides whether the caller's `node_id` overwrites `ctx.node_id` for the duration of the scope. Skipping the guard here would write the `_CONTEXT_SCOPE_UNSET` object itself onto `ctx.node_id`; inverting it would leave the caller's value unapplied, so every audit row written during the scope would be attributed to the previous node, or to the sentinel object itself. The docstring names exactly this hazard: "state/token/contract attribution cannot leak into the next plugin call on the same context."
-    
+
     R5 fires on `isinstance(<param>, _ContextScopeUnset)` in `plugin_context_scope`. `_ContextScopeUnset` is defined 4 lines above the function in this same module and has exactly one instance, `_CONTEXT_SCOPE_UNSET`, used as the parameter default -- an ELSPETH-owned concrete class, so ADR-032 puts this on the 'nominally type what we own' side, not the 'parse what we don't' side. No external data reaches this check: every argument is executor-supplied metadata. The sentinel exists because `None` is a MEANINGFUL value for each of these fields, so 'caller passed None' and 'caller passed nothing' cannot be distinguished by a `None` default.
-    
+
     WHY isinstance AND NOT `is not _CONTEXT_SCOPE_UNSET`. The identity form does not narrow the union for mypy: probed under `mypy --strict` on this repo's config, `if node_id is not _UNSET: ctx.node_id = node_id` fails with "Incompatible types in assignment (expression has type 'str | _Unset | None', variable has type 'str | None')", while the `isinstance` form type-checks clean. Rewriting these 14 guards to identity comparisons would therefore require 14 casts or `type: ignore`s and would REMOVE the static proof that a sentinel can never be written onto the context. The `isinstance` is load-bearing for type safety, not a shape guard over untrusted input.
-    
+
     WHAT WOULD INVALIDATE THIS. If `_ContextScopeUnset` ever gained a second instance, or if `node_id` stopped accepting `None` as a meaningful value (making a plain `None` default sufficient), or if the parameter's type annotation dropped the `_ContextScopeUnset` arm, this guard would no longer be the narrowing that keeps the sentinel off the context and should be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2486,11 +2353,11 @@ allow_hits:
   owner: john
   reason: |-
     THIS SITE (finally arm, `token`). `token` carries the TokenInfo identifying the row currently being processed. This is the RESTORING arm inside `finally:`, and it is guarded on the same parameter as the entry arm on purpose: it must restore `previous_token` if and only if the entry arm overwrote it. Dropping the guard here would restore `previous_token` even when the caller never scoped `token`, clobbering a value the plugin legitimately set on the shared context during the scope; and because this runs in `finally`, it also fires on the exception path, so row lineage for the whole scope would point at the previous row's token, silently mis-parenting every token this plugin call emits -- on the error path as well as the happy one, which is where mis-attributed audit rows are hardest to notice.
-    
+
     R5 fires on `isinstance(<param>, _ContextScopeUnset)` in `plugin_context_scope`. `_ContextScopeUnset` is defined 4 lines above the function in this same module and has exactly one instance, `_CONTEXT_SCOPE_UNSET`, used as the parameter default -- an ELSPETH-owned concrete class, so ADR-032 puts this on the 'nominally type what we own' side, not the 'parse what we don't' side. No external data reaches this check: every argument is executor-supplied metadata. The sentinel exists because `None` is a MEANINGFUL value for each of these fields, so 'caller passed None' and 'caller passed nothing' cannot be distinguished by a `None` default.
-    
+
     WHY isinstance AND NOT `is not _CONTEXT_SCOPE_UNSET`. The identity form does not narrow the union for mypy: probed under `mypy --strict` on this repo's config, `if node_id is not _UNSET: ctx.node_id = node_id` fails with "Incompatible types in assignment (expression has type 'str | _Unset | None', variable has type 'str | None')", while the `isinstance` form type-checks clean. Rewriting these 14 guards to identity comparisons would therefore require 14 casts or `type: ignore`s and would REMOVE the static proof that a sentinel can never be written onto the context. The `isinstance` is load-bearing for type safety, not a shape guard over untrusted input.
-    
+
     WHAT WOULD INVALIDATE THIS. If `_ContextScopeUnset` ever gained a second instance, or if `token` stopped accepting `None` as a meaningful value (making a plain `None` default sufficient), or if the parameter's type annotation dropped the `_ContextScopeUnset` arm, this guard would no longer be the narrowing that keeps the sentinel off the context and should be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2518,11 +2385,11 @@ allow_hits:
   owner: john
   reason: |-
     THIS SITE (finally arm, `operation_id`). `operation_id` carries the id of the operation the plugin call belongs to. This is the RESTORING arm inside `finally:`, and it is guarded on the same parameter as the entry arm on purpose: it must restore `previous_operation_id` if and only if the entry arm overwrote it. Dropping the guard here would restore `previous_operation_id` even when the caller never scoped `operation_id`, clobbering a value the plugin legitimately set on the shared context during the scope; and because this runs in `finally`, it also fires on the exception path, so operation-level call records would be filed under the previous operation, breaking the operation -> call linkage the Landscape audit trail is queried through -- on the error path as well as the happy one, which is where mis-attributed audit rows are hardest to notice.
-    
+
     R5 fires on `isinstance(<param>, _ContextScopeUnset)` in `plugin_context_scope`. `_ContextScopeUnset` is defined 4 lines above the function in this same module and has exactly one instance, `_CONTEXT_SCOPE_UNSET`, used as the parameter default -- an ELSPETH-owned concrete class, so ADR-032 puts this on the 'nominally type what we own' side, not the 'parse what we don't' side. No external data reaches this check: every argument is executor-supplied metadata. The sentinel exists because `None` is a MEANINGFUL value for each of these fields, so 'caller passed None' and 'caller passed nothing' cannot be distinguished by a `None` default.
-    
+
     WHY isinstance AND NOT `is not _CONTEXT_SCOPE_UNSET`. The identity form does not narrow the union for mypy: probed under `mypy --strict` on this repo's config, `if node_id is not _UNSET: ctx.node_id = node_id` fails with "Incompatible types in assignment (expression has type 'str | _Unset | None', variable has type 'str | None')", while the `isinstance` form type-checks clean. Rewriting these 14 guards to identity comparisons would therefore require 14 casts or `type: ignore`s and would REMOVE the static proof that a sentinel can never be written onto the context. The `isinstance` is load-bearing for type safety, not a shape guard over untrusted input.
-    
+
     WHAT WOULD INVALIDATE THIS. If `_ContextScopeUnset` ever gained a second instance, or if `operation_id` stopped accepting `None` as a meaningful value (making a plain `None` default sufficient), or if the parameter's type annotation dropped the `_ContextScopeUnset` arm, this guard would no longer be the narrowing that keeps the sentinel off the context and should be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2547,11 +2414,11 @@ allow_hits:
   owner: john
   reason: |-
     THIS SITE (entry arm, `contract`). `contract` carries the SchemaContract the plugin's rows are validated against. This is the ASSIGNING arm: it runs before `yield ctx`, and it decides whether the caller's `contract` overwrites `ctx.contract` for the duration of the scope. Skipping the guard here would write the `_CONTEXT_SCOPE_UNSET` object itself onto `ctx.contract`; inverting it would leave the caller's value unapplied, so rows would be validated against the previous node's contract -- a validation result that looks green while proving nothing about the actual declared schema. The docstring names exactly this hazard: "state/token/contract attribution cannot leak into the next plugin call on the same context."
-    
+
     R5 fires on `isinstance(<param>, _ContextScopeUnset)` in `plugin_context_scope`. `_ContextScopeUnset` is defined 4 lines above the function in this same module and has exactly one instance, `_CONTEXT_SCOPE_UNSET`, used as the parameter default -- an ELSPETH-owned concrete class, so ADR-032 puts this on the 'nominally type what we own' side, not the 'parse what we don't' side. No external data reaches this check: every argument is executor-supplied metadata. The sentinel exists because `None` is a MEANINGFUL value for each of these fields, so 'caller passed None' and 'caller passed nothing' cannot be distinguished by a `None` default.
-    
+
     WHY isinstance AND NOT `is not _CONTEXT_SCOPE_UNSET`. The identity form does not narrow the union for mypy: probed under `mypy --strict` on this repo's config, `if node_id is not _UNSET: ctx.node_id = node_id` fails with "Incompatible types in assignment (expression has type 'str | _Unset | None', variable has type 'str | None')", while the `isinstance` form type-checks clean. Rewriting these 14 guards to identity comparisons would therefore require 14 casts or `type: ignore`s and would REMOVE the static proof that a sentinel can never be written onto the context. The `isinstance` is load-bearing for type safety, not a shape guard over untrusted input.
-    
+
     WHAT WOULD INVALIDATE THIS. If `_ContextScopeUnset` ever gained a second instance, or if `contract` stopped accepting `None` as a meaningful value (making a plain `None` default sufficient), or if the parameter's type annotation dropped the `_ContextScopeUnset` arm, this guard would no longer be the narrowing that keeps the sentinel off the context and should be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2579,11 +2446,11 @@ allow_hits:
   owner: john
   reason: |-
     THIS SITE (finally arm, `node_id`). `node_id` carries the id of the node the plugin call is attributed to. This is the RESTORING arm inside `finally:`, and it is guarded on the same parameter as the entry arm on purpose: it must restore `previous_node_id` if and only if the entry arm overwrote it. Dropping the guard here would restore `previous_node_id` even when the caller never scoped `node_id`, clobbering a value the plugin legitimately set on the shared context during the scope; and because this runs in `finally`, it also fires on the exception path, so every audit row written during the scope would be attributed to the previous node, or to the sentinel object itself -- on the error path as well as the happy one, which is where mis-attributed audit rows are hardest to notice.
-    
+
     R5 fires on `isinstance(<param>, _ContextScopeUnset)` in `plugin_context_scope`. `_ContextScopeUnset` is defined 4 lines above the function in this same module and has exactly one instance, `_CONTEXT_SCOPE_UNSET`, used as the parameter default -- an ELSPETH-owned concrete class, so ADR-032 puts this on the 'nominally type what we own' side, not the 'parse what we don't' side. No external data reaches this check: every argument is executor-supplied metadata. The sentinel exists because `None` is a MEANINGFUL value for each of these fields, so 'caller passed None' and 'caller passed nothing' cannot be distinguished by a `None` default.
-    
+
     WHY isinstance AND NOT `is not _CONTEXT_SCOPE_UNSET`. The identity form does not narrow the union for mypy: probed under `mypy --strict` on this repo's config, `if node_id is not _UNSET: ctx.node_id = node_id` fails with "Incompatible types in assignment (expression has type 'str | _Unset | None', variable has type 'str | None')", while the `isinstance` form type-checks clean. Rewriting these 14 guards to identity comparisons would therefore require 14 casts or `type: ignore`s and would REMOVE the static proof that a sentinel can never be written onto the context. The `isinstance` is load-bearing for type safety, not a shape guard over untrusted input.
-    
+
     WHAT WOULD INVALIDATE THIS. If `_ContextScopeUnset` ever gained a second instance, or if `node_id` stopped accepting `None` as a meaningful value (making a plain `None` default sufficient), or if the parameter's type annotation dropped the `_ContextScopeUnset` arm, this guard would no longer be the narrowing that keeps the sentinel off the context and should be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2611,11 +2478,11 @@ allow_hits:
   owner: john
   reason: |-
     THIS SITE (finally arm, `aggregation_batch`). `aggregation_batch` carries the AggregationBatchContext for the aggregation currently draining. This is the RESTORING arm inside `finally:`, and it is guarded on the same parameter as the entry arm on purpose: it must restore `previous_aggregation_batch` if and only if the entry arm overwrote it. Dropping the guard here would restore `previous_aggregation_batch` even when the caller never scoped `aggregation_batch`, clobbering a value the plugin legitimately set on the shared context during the scope; and because this runs in `finally`, it also fires on the exception path, so the aggregation's barrier/collection bookkeeping would be attributed to the previous aggregation batch, corrupting the barrier accounting that decides when a batch is complete -- on the error path as well as the happy one, which is where mis-attributed audit rows are hardest to notice.
-    
+
     R5 fires on `isinstance(<param>, _ContextScopeUnset)` in `plugin_context_scope`. `_ContextScopeUnset` is defined 4 lines above the function in this same module and has exactly one instance, `_CONTEXT_SCOPE_UNSET`, used as the parameter default -- an ELSPETH-owned concrete class, so ADR-032 puts this on the 'nominally type what we own' side, not the 'parse what we don't' side. No external data reaches this check: every argument is executor-supplied metadata. The sentinel exists because `None` is a MEANINGFUL value for each of these fields, so 'caller passed None' and 'caller passed nothing' cannot be distinguished by a `None` default.
-    
+
     WHY isinstance AND NOT `is not _CONTEXT_SCOPE_UNSET`. The identity form does not narrow the union for mypy: probed under `mypy --strict` on this repo's config, `if node_id is not _UNSET: ctx.node_id = node_id` fails with "Incompatible types in assignment (expression has type 'str | _Unset | None', variable has type 'str | None')", while the `isinstance` form type-checks clean. Rewriting these 14 guards to identity comparisons would therefore require 14 casts or `type: ignore`s and would REMOVE the static proof that a sentinel can never be written onto the context. The `isinstance` is load-bearing for type safety, not a shape guard over untrusted input.
-    
+
     WHAT WOULD INVALIDATE THIS. If `_ContextScopeUnset` ever gained a second instance, or if `aggregation_batch` stopped accepting `None` as a meaningful value (making a plain `None` default sufficient), or if the parameter's type annotation dropped the `_ContextScopeUnset` arm, this guard would no longer be the narrowing that keeps the sentinel off the context and should be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2640,11 +2507,11 @@ allow_hits:
   owner: john
   reason: |-
     THIS SITE (entry arm, `token`). `token` carries the TokenInfo identifying the row currently being processed. This is the ASSIGNING arm: it runs before `yield ctx`, and it decides whether the caller's `token` overwrites `ctx.token` for the duration of the scope. Skipping the guard here would write the `_CONTEXT_SCOPE_UNSET` object itself onto `ctx.token`; inverting it would leave the caller's value unapplied, so row lineage for the whole scope would point at the previous row's token, silently mis-parenting every token this plugin call emits. The docstring names exactly this hazard: "state/token/contract attribution cannot leak into the next plugin call on the same context."
-    
+
     R5 fires on `isinstance(<param>, _ContextScopeUnset)` in `plugin_context_scope`. `_ContextScopeUnset` is defined 4 lines above the function in this same module and has exactly one instance, `_CONTEXT_SCOPE_UNSET`, used as the parameter default -- an ELSPETH-owned concrete class, so ADR-032 puts this on the 'nominally type what we own' side, not the 'parse what we don't' side. No external data reaches this check: every argument is executor-supplied metadata. The sentinel exists because `None` is a MEANINGFUL value for each of these fields, so 'caller passed None' and 'caller passed nothing' cannot be distinguished by a `None` default.
-    
+
     WHY isinstance AND NOT `is not _CONTEXT_SCOPE_UNSET`. The identity form does not narrow the union for mypy: probed under `mypy --strict` on this repo's config, `if node_id is not _UNSET: ctx.node_id = node_id` fails with "Incompatible types in assignment (expression has type 'str | _Unset | None', variable has type 'str | None')", while the `isinstance` form type-checks clean. Rewriting these 14 guards to identity comparisons would therefore require 14 casts or `type: ignore`s and would REMOVE the static proof that a sentinel can never be written onto the context. The `isinstance` is load-bearing for type safety, not a shape guard over untrusted input.
-    
+
     WHAT WOULD INVALIDATE THIS. If `_ContextScopeUnset` ever gained a second instance, or if `token` stopped accepting `None` as a meaningful value (making a plain `None` default sufficient), or if the parameter's type annotation dropped the `_ContextScopeUnset` arm, this guard would no longer be the narrowing that keeps the sentinel off the context and should be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2672,11 +2539,11 @@ allow_hits:
   owner: john
   reason: |-
     THIS SITE (entry arm, `operation_id`). `operation_id` carries the id of the operation the plugin call belongs to. This is the ASSIGNING arm: it runs before `yield ctx`, and it decides whether the caller's `operation_id` overwrites `ctx.operation_id` for the duration of the scope. Skipping the guard here would write the `_CONTEXT_SCOPE_UNSET` object itself onto `ctx.operation_id`; inverting it would leave the caller's value unapplied, so operation-level call records would be filed under the previous operation, breaking the operation -> call linkage the Landscape audit trail is queried through. The docstring names exactly this hazard: "state/token/contract attribution cannot leak into the next plugin call on the same context."
-    
+
     R5 fires on `isinstance(<param>, _ContextScopeUnset)` in `plugin_context_scope`. `_ContextScopeUnset` is defined 4 lines above the function in this same module and has exactly one instance, `_CONTEXT_SCOPE_UNSET`, used as the parameter default -- an ELSPETH-owned concrete class, so ADR-032 puts this on the 'nominally type what we own' side, not the 'parse what we don't' side. No external data reaches this check: every argument is executor-supplied metadata. The sentinel exists because `None` is a MEANINGFUL value for each of these fields, so 'caller passed None' and 'caller passed nothing' cannot be distinguished by a `None` default.
-    
+
     WHY isinstance AND NOT `is not _CONTEXT_SCOPE_UNSET`. The identity form does not narrow the union for mypy: probed under `mypy --strict` on this repo's config, `if node_id is not _UNSET: ctx.node_id = node_id` fails with "Incompatible types in assignment (expression has type 'str | _Unset | None', variable has type 'str | None')", while the `isinstance` form type-checks clean. Rewriting these 14 guards to identity comparisons would therefore require 14 casts or `type: ignore`s and would REMOVE the static proof that a sentinel can never be written onto the context. The `isinstance` is load-bearing for type safety, not a shape guard over untrusted input.
-    
+
     WHAT WOULD INVALIDATE THIS. If `_ContextScopeUnset` ever gained a second instance, or if `operation_id` stopped accepting `None` as a meaningful value (making a plain `None` default sufficient), or if the parameter's type annotation dropped the `_ContextScopeUnset` arm, this guard would no longer be the narrowing that keeps the sentinel off the context and should be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2704,11 +2571,11 @@ allow_hits:
   owner: john
   reason: |-
     THIS SITE (entry arm, `state_id`). `state_id` carries the id of the node-state record this operation reads and writes. This is the ASSIGNING arm: it runs before `yield ctx`, and it decides whether the caller's `state_id` overwrites `ctx.state_id` for the duration of the scope. Skipping the guard here would write the `_CONTEXT_SCOPE_UNSET` object itself onto `ctx.state_id`; inverting it would leave the caller's value unapplied, so state reads and writes would land on the previous node's state row, mixing two nodes' persisted state. The docstring names exactly this hazard: "state/token/contract attribution cannot leak into the next plugin call on the same context."
-    
+
     R5 fires on `isinstance(<param>, _ContextScopeUnset)` in `plugin_context_scope`. `_ContextScopeUnset` is defined 4 lines above the function in this same module and has exactly one instance, `_CONTEXT_SCOPE_UNSET`, used as the parameter default -- an ELSPETH-owned concrete class, so ADR-032 puts this on the 'nominally type what we own' side, not the 'parse what we don't' side. No external data reaches this check: every argument is executor-supplied metadata. The sentinel exists because `None` is a MEANINGFUL value for each of these fields, so 'caller passed None' and 'caller passed nothing' cannot be distinguished by a `None` default.
-    
+
     WHY isinstance AND NOT `is not _CONTEXT_SCOPE_UNSET`. The identity form does not narrow the union for mypy: probed under `mypy --strict` on this repo's config, `if node_id is not _UNSET: ctx.node_id = node_id` fails with "Incompatible types in assignment (expression has type 'str | _Unset | None', variable has type 'str | None')", while the `isinstance` form type-checks clean. Rewriting these 14 guards to identity comparisons would therefore require 14 casts or `type: ignore`s and would REMOVE the static proof that a sentinel can never be written onto the context. The `isinstance` is load-bearing for type safety, not a shape guard over untrusted input.
-    
+
     WHAT WOULD INVALIDATE THIS. If `_ContextScopeUnset` ever gained a second instance, or if `state_id` stopped accepting `None` as a meaningful value (making a plain `None` default sufficient), or if the parameter's type annotation dropped the `_ContextScopeUnset` arm, this guard would no longer be the narrowing that keeps the sentinel off the context and should be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2736,11 +2603,11 @@ allow_hits:
   owner: john
   reason: |-
     THIS SITE (finally arm, `batch_token_ids`). `batch_token_ids` carries the tuple of token ids that make up the current batch. This is the RESTORING arm inside `finally:`, and it is guarded on the same parameter as the entry arm on purpose: it must restore `previous_batch_token_ids` if and only if the entry arm overwrote it. Dropping the guard here would restore `previous_batch_token_ids` even when the caller never scoped `batch_token_ids`, clobbering a value the plugin legitimately set on the shared context during the scope; and because this runs in `finally`, it also fires on the exception path, so batch membership recorded for this operation would be the previous batch's, so group-loss and batch-completeness accounting would be computed against the wrong set -- on the error path as well as the happy one, which is where mis-attributed audit rows are hardest to notice.
-    
+
     R5 fires on `isinstance(<param>, _ContextScopeUnset)` in `plugin_context_scope`. `_ContextScopeUnset` is defined 4 lines above the function in this same module and has exactly one instance, `_CONTEXT_SCOPE_UNSET`, used as the parameter default -- an ELSPETH-owned concrete class, so ADR-032 puts this on the 'nominally type what we own' side, not the 'parse what we don't' side. No external data reaches this check: every argument is executor-supplied metadata. The sentinel exists because `None` is a MEANINGFUL value for each of these fields, so 'caller passed None' and 'caller passed nothing' cannot be distinguished by a `None` default.
-    
+
     WHY isinstance AND NOT `is not _CONTEXT_SCOPE_UNSET`. The identity form does not narrow the union for mypy: probed under `mypy --strict` on this repo's config, `if node_id is not _UNSET: ctx.node_id = node_id` fails with "Incompatible types in assignment (expression has type 'str | _Unset | None', variable has type 'str | None')", while the `isinstance` form type-checks clean. Rewriting these 14 guards to identity comparisons would therefore require 14 casts or `type: ignore`s and would REMOVE the static proof that a sentinel can never be written onto the context. The `isinstance` is load-bearing for type safety, not a shape guard over untrusted input.
-    
+
     WHAT WOULD INVALIDATE THIS. If `_ContextScopeUnset` ever gained a second instance, or if `batch_token_ids` stopped accepting `None` as a meaningful value (making a plain `None` default sufficient), or if the parameter's type annotation dropped the `_ContextScopeUnset` arm, this guard would no longer be the narrowing that keeps the sentinel off the context and should be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2768,11 +2635,11 @@ allow_hits:
   owner: john
   reason: |-
     THIS SITE (finally arm, `state_id`). `state_id` carries the id of the node-state record this operation reads and writes. This is the RESTORING arm inside `finally:`, and it is guarded on the same parameter as the entry arm on purpose: it must restore `previous_state_id` if and only if the entry arm overwrote it. Dropping the guard here would restore `previous_state_id` even when the caller never scoped `state_id`, clobbering a value the plugin legitimately set on the shared context during the scope; and because this runs in `finally`, it also fires on the exception path, so state reads and writes would land on the previous node's state row, mixing two nodes' persisted state -- on the error path as well as the happy one, which is where mis-attributed audit rows are hardest to notice.
-    
+
     R5 fires on `isinstance(<param>, _ContextScopeUnset)` in `plugin_context_scope`. `_ContextScopeUnset` is defined 4 lines above the function in this same module and has exactly one instance, `_CONTEXT_SCOPE_UNSET`, used as the parameter default -- an ELSPETH-owned concrete class, so ADR-032 puts this on the 'nominally type what we own' side, not the 'parse what we don't' side. No external data reaches this check: every argument is executor-supplied metadata. The sentinel exists because `None` is a MEANINGFUL value for each of these fields, so 'caller passed None' and 'caller passed nothing' cannot be distinguished by a `None` default.
-    
+
     WHY isinstance AND NOT `is not _CONTEXT_SCOPE_UNSET`. The identity form does not narrow the union for mypy: probed under `mypy --strict` on this repo's config, `if node_id is not _UNSET: ctx.node_id = node_id` fails with "Incompatible types in assignment (expression has type 'str | _Unset | None', variable has type 'str | None')", while the `isinstance` form type-checks clean. Rewriting these 14 guards to identity comparisons would therefore require 14 casts or `type: ignore`s and would REMOVE the static proof that a sentinel can never be written onto the context. The `isinstance` is load-bearing for type safety, not a shape guard over untrusted input.
-    
+
     WHAT WOULD INVALIDATE THIS. If `_ContextScopeUnset` ever gained a second instance, or if `state_id` stopped accepting `None` as a meaningful value (making a plain `None` default sufficient), or if the parameter's type annotation dropped the `_ContextScopeUnset` arm, this guard would no longer be the narrowing that keeps the sentinel off the context and should be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2797,11 +2664,11 @@ allow_hits:
   owner: john
   reason: |-
     THIS SITE (finally arm, `contract`). `contract` carries the SchemaContract the plugin's rows are validated against. This is the RESTORING arm inside `finally:`, and it is guarded on the same parameter as the entry arm on purpose: it must restore `previous_contract` if and only if the entry arm overwrote it. Dropping the guard here would restore `previous_contract` even when the caller never scoped `contract`, clobbering a value the plugin legitimately set on the shared context during the scope; and because this runs in `finally`, it also fires on the exception path, so rows would be validated against the previous node's contract -- a validation result that looks green while proving nothing about the actual declared schema -- on the error path as well as the happy one, which is where mis-attributed audit rows are hardest to notice.
-    
+
     R5 fires on `isinstance(<param>, _ContextScopeUnset)` in `plugin_context_scope`. `_ContextScopeUnset` is defined 4 lines above the function in this same module and has exactly one instance, `_CONTEXT_SCOPE_UNSET`, used as the parameter default -- an ELSPETH-owned concrete class, so ADR-032 puts this on the 'nominally type what we own' side, not the 'parse what we don't' side. No external data reaches this check: every argument is executor-supplied metadata. The sentinel exists because `None` is a MEANINGFUL value for each of these fields, so 'caller passed None' and 'caller passed nothing' cannot be distinguished by a `None` default.
-    
+
     WHY isinstance AND NOT `is not _CONTEXT_SCOPE_UNSET`. The identity form does not narrow the union for mypy: probed under `mypy --strict` on this repo's config, `if node_id is not _UNSET: ctx.node_id = node_id` fails with "Incompatible types in assignment (expression has type 'str | _Unset | None', variable has type 'str | None')", while the `isinstance` form type-checks clean. Rewriting these 14 guards to identity comparisons would therefore require 14 casts or `type: ignore`s and would REMOVE the static proof that a sentinel can never be written onto the context. The `isinstance` is load-bearing for type safety, not a shape guard over untrusted input.
-    
+
     WHAT WOULD INVALIDATE THIS. If `_ContextScopeUnset` ever gained a second instance, or if `contract` stopped accepting `None` as a meaningful value (making a plain `None` default sufficient), or if the parameter's type annotation dropped the `_ContextScopeUnset` arm, this guard would no longer be the narrowing that keeps the sentinel off the context and should be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2826,11 +2693,11 @@ allow_hits:
   owner: john
   reason: |-
     THIS SITE (entry arm, `aggregation_batch`). `aggregation_batch` carries the AggregationBatchContext for the aggregation currently draining. This is the ASSIGNING arm: it runs before `yield ctx`, and it decides whether the caller's `aggregation_batch` overwrites `ctx.aggregation_batch` for the duration of the scope. Skipping the guard here would write the `_CONTEXT_SCOPE_UNSET` object itself onto `ctx.aggregation_batch`; inverting it would leave the caller's value unapplied, so the aggregation's barrier/collection bookkeeping would be attributed to the previous aggregation batch, corrupting the barrier accounting that decides when a batch is complete. The docstring names exactly this hazard: "state/token/contract attribution cannot leak into the next plugin call on the same context."
-    
+
     R5 fires on `isinstance(<param>, _ContextScopeUnset)` in `plugin_context_scope`. `_ContextScopeUnset` is defined 4 lines above the function in this same module and has exactly one instance, `_CONTEXT_SCOPE_UNSET`, used as the parameter default -- an ELSPETH-owned concrete class, so ADR-032 puts this on the 'nominally type what we own' side, not the 'parse what we don't' side. No external data reaches this check: every argument is executor-supplied metadata. The sentinel exists because `None` is a MEANINGFUL value for each of these fields, so 'caller passed None' and 'caller passed nothing' cannot be distinguished by a `None` default.
-    
+
     WHY isinstance AND NOT `is not _CONTEXT_SCOPE_UNSET`. The identity form does not narrow the union for mypy: probed under `mypy --strict` on this repo's config, `if node_id is not _UNSET: ctx.node_id = node_id` fails with "Incompatible types in assignment (expression has type 'str | _Unset | None', variable has type 'str | None')", while the `isinstance` form type-checks clean. Rewriting these 14 guards to identity comparisons would therefore require 14 casts or `type: ignore`s and would REMOVE the static proof that a sentinel can never be written onto the context. The `isinstance` is load-bearing for type safety, not a shape guard over untrusted input.
-    
+
     WHAT WOULD INVALIDATE THIS. If `_ContextScopeUnset` ever gained a second instance, or if `aggregation_batch` stopped accepting `None` as a meaningful value (making a plain `None` default sufficient), or if the parameter's type annotation dropped the `_ContextScopeUnset` arm, this guard would no longer be the narrowing that keeps the sentinel off the context and should be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2858,11 +2725,11 @@ allow_hits:
   owner: john
   reason: |-
     THIS SITE (entry arm, `batch_token_ids`). `batch_token_ids` carries the tuple of token ids that make up the current batch. This is the ASSIGNING arm: it runs before `yield ctx`, and it decides whether the caller's `batch_token_ids` overwrites `ctx.batch_token_ids` for the duration of the scope. Skipping the guard here would write the `_CONTEXT_SCOPE_UNSET` object itself onto `ctx.batch_token_ids`; inverting it would leave the caller's value unapplied, so batch membership recorded for this operation would be the previous batch's, so group-loss and batch-completeness accounting would be computed against the wrong set. The docstring names exactly this hazard: "state/token/contract attribution cannot leak into the next plugin call on the same context."
-    
+
     R5 fires on `isinstance(<param>, _ContextScopeUnset)` in `plugin_context_scope`. `_ContextScopeUnset` is defined 4 lines above the function in this same module and has exactly one instance, `_CONTEXT_SCOPE_UNSET`, used as the parameter default -- an ELSPETH-owned concrete class, so ADR-032 puts this on the 'nominally type what we own' side, not the 'parse what we don't' side. No external data reaches this check: every argument is executor-supplied metadata. The sentinel exists because `None` is a MEANINGFUL value for each of these fields, so 'caller passed None' and 'caller passed nothing' cannot be distinguished by a `None` default.
-    
+
     WHY isinstance AND NOT `is not _CONTEXT_SCOPE_UNSET`. The identity form does not narrow the union for mypy: probed under `mypy --strict` on this repo's config, `if node_id is not _UNSET: ctx.node_id = node_id` fails with "Incompatible types in assignment (expression has type 'str | _Unset | None', variable has type 'str | None')", while the `isinstance` form type-checks clean. Rewriting these 14 guards to identity comparisons would therefore require 14 casts or `type: ignore`s and would REMOVE the static proof that a sentinel can never be written onto the context. The `isinstance` is load-bearing for type safety, not a shape guard over untrusted input.
-    
+
     WHAT WOULD INVALIDATE THIS. If `_ContextScopeUnset` ever gained a second instance, or if `batch_token_ids` stopped accepting `None` as a meaningful value (making a plain `None` default sufficient), or if the parameter's type annotation dropped the `_ContextScopeUnset` arm, this guard would no longer be the narrowing that keeps the sentinel off the context and should be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2890,11 +2757,11 @@ allow_hits:
   owner: john
   reason: |-
     R5 fires on `isinstance(url, SanitizedDatabaseUrl)` in `ArtifactDescriptor.for_database`.
-    
+
     THIS IS A CREDENTIAL-EGRESS GUARD, AND NOMINAL TYPING IS THE CONTROL. `SanitizedDatabaseUrl` is an ELSPETH-owned class whose only honest constructor is `from_raw_url()`, which strips credentials. The descriptor built here writes `db://{table}@{url.sanitized_url}` straight into the audit trail. The inline comment states the requirement: "Type safety: enforce SanitizedDatabaseUrl, not duck-typed objects." A structural/duck-typed check would accept any object exposing `.sanitized_url` and `.fingerprint` -- including a raw-URL wrapper that never ran sanitisation -- and a database password would be persisted in the audit trail. This is precisely the case ADR-032 forbids solving with a `runtime_checkable` Protocol, because an impostor passes structural typing.
-    
+
     It raises `TypeError` naming the remediation; it does not coerce. Tier-1 crash semantics, so not a @trust_boundary candidate.
-    
+
     WHAT WOULD INVALIDATE THIS. If `SanitizedDatabaseUrl` gained a constructor that can produce an instance without sanitising, the type would stop being proof of sanitisation and this guard would become misleading rather than protective -- re-judge at that point, and move the check to the property that actually attests sanitisation.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2915,11 +2782,11 @@ allow_hits:
   owner: john
   reason: |-
     R5 fires on `isinstance(url, SanitizedWebhookUrl)` in `ArtifactDescriptor.for_webhook`.
-    
+
     Same credential-egress control as `for_database`, over a DIFFERENT and narrower guarantee, which is why it is a separate owned type rather than a shared one. `SanitizedWebhookUrl.from_raw_url()` removes userinfo, sensitive query/fragment parameters, and KNOWN Slack incoming-webhook path tokens; the method's own docstring is explicit that "Other path-borne secrets are not generically redacted." So the type is a claim about a specific, enumerated set of token forms having been removed, and only `from_raw_url` can honestly make it. A duck-typed object exposing `.sanitized_url` would put an unredacted webhook token into `webhook://{url.sanitized_url}` in the audit trail.
-    
+
     Raises `TypeError` with the remediation; no coercion. Tier-1 crash semantics.
-    
+
     WHAT WOULD INVALIDATE THIS. If webhook path-secret redaction became generic (so the narrow known-forms caveat disappeared), or if `SanitizedWebhookUrl` and `SanitizedDatabaseUrl` were merged into one type, the distinct guarantee this guard pins would change and it must be re-judged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2940,11 +2807,11 @@ allow_hits:
   owner: john
   reason: |-
     R5 fires on `isinstance(action, str)` in `TransformResult.__post_init__`, where `action = success_reason.get("action")`.
-    
+
     TIER-1 FROZEN-DATACLASS POST-INIT GUARD ON PLUGIN-BUG DATA. `success_reason` is a `TransformSuccessReason` TypedDict that ELSPETH's own transform contract requires plugins to supply via `TransformResult.success(row, success_reason={'action': ...})`. TypedDict is erased at runtime, so nothing enforces the `action: str` field except this check. The error message says exactly what class of fault this is: "Missing success_reason['action'] is a plugin bug." A plugin bug must crash (data manifesto), which is why this is a `raise ValueError` and why a tier-3 boundary decorator is structurally inapplicable -- `@trust_boundary` rejects tier=1/2 at import.
-    
+
     WHY IT MATTERS THAT IT IS A `str`: `action` is written into the audit trail as the recorded reason a row succeeded. A non-str action would either serialise into a shape the audit schema does not expect or render as a Python repr in the operator-facing explanation.
-    
+
     WHAT WOULD INVALIDATE THIS. If `TransformSuccessReason` became a validated runtime model (pydantic or an owned frozen dataclass) that guarantees `action: str` at construction, this guard would be genuinely redundant and should be deleted rather than re-signed.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -2965,36 +2832,36 @@ allow_hits:
   owner: john
   reason: |-
     R5 fires on `isinstance(value, MappingProxyType)` in `_require_artifact_metadata`.
-    
+
     `MappingProxyType` is a stdlib type used here as ELSPETH's own frozen-mapping marker, and the check is deliberately narrower than `Mapping`: a plain `dict` MUST fail it. That is the whole point -- artifact metadata is stored in the audit trail, and a mutable mapping could be changed after the descriptor was constructed, so the recorded evidence would no longer match what was attested. Accepting `Mapping` here would accept `dict` and silently reopen that hole.
-    
+
     TIER-1 INTEGRITY, CRASH ON ANOMALY. The guard raises `TypeError(f"{field_name} must be a frozen mapping, got ...")`. It is a construction-time invariant on ELSPETH-owned ArtifactDescriptor state, not a parse of external input, so a tier-3 boundary decorator would be a category error.
-    
+
     WHAT WOULD INVALIDATE THIS. If artifact metadata stopped being required to be deeply frozen, or if the freeze marker changed from `MappingProxyType` to an owned wrapper class, this site would need to move with it.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:49:57.891077+00:00'
+  judge_recorded_at: '2026-08-30T22:46:44.633227+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM — the concrete `MappingProxyType` check offensively enforces the Tier-1 immutability invariant and immediately raises an informative `TypeError`; it neither coerces, fabricates, nor suppresses a contract violation. The visible code confirms that ordinary mutable mappings are rejected and nested frozen mappings are recursively checked, consistent with the site protecting ELSPETH-owned audit evidence rather than parsing Tier-3 input. The trust-boundary decorator does not apply because this is not an external-data boundary.
+    PRESCRIBED FORM — the `isinstance(value, MappingProxyType)` check offensively enforces a Tier-1 construction invariant and immediately raises an informative `TypeError`; it does not suppress, coerce, or fabricate a value. The visible recursion and comment independently establish that accepting a plain or nested mutable `dict` would violate the required deep-freeze property of audit evidence. This is not a Tier-3 boundary over an external parameter, so the `@trust_boundary` decorator contract does not apply.
   judge_signature_version: 2
-  scope_fingerprint: 73a7aa961831dd1a6fd594a56e45275f2f2995b4426aa5a29e39b33878b597b8
+  scope_fingerprint: 19484de8770974a7e3aacc57635ec9a0aca129a555b27f7cede66c6d1fbbdd72
   judge_transport: codex_cli
   ast_path: 'body[27]/body[1]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:22fff9c6136072e4b0bbb5c9590776d3638094a7f502e50db28f7e638d496d2f'
+  judge_metadata_signature: 'hmac-sha256:v2:02dded9bcd49f632a0e3b1db525cf5a20ba133c2aae6f9ce7c66140d2c46c6f8'
 - key: contracts/results.py:R5:_require_pipeline_row:fp=5254915e1d123297
   owner: john
   reason: |-
     R5 fires on `isinstance(value, PipelineRow)` in `_require_pipeline_row`.
-    
+
     `PipelineRow` is an ELSPETH-owned concrete class from `contracts.schema_contract`, so per ADR-032 this is the 'nominally type what ELSPETH owns' side of the rule, not a parse of foreign data.
-    
+
     THIS IS A TIER-1/2 OUTPUT GUARD, NOT A TIER-3 INPUT PARSE. The function's own docstring is "Reject non-PipelineRow output before it can masquerade as valid data." `value` is what a transform RETURNED, on its way into a TransformResult. Its failure mode is a `PluginContractViolation` raise carrying the remediation ("Build transform output with PipelineRow(data, contract) before returning it") -- it crashes on anomaly, which is exactly what Tier 1/2 requires and what disqualifies it from a @trust_boundary (the decorator rejects tier!=3 at import). A duck-typed row that merely looks like a PipelineRow would carry no verified SchemaContract, so contract validation downstream would pass over data nothing had actually checked.
-    
+
     WHAT WOULD INVALIDATE THIS. If `PipelineRow` became a Protocol or an ABC with `__subclasshook__` (making `isinstance` structural rather than nominal), or if plugin output were re-specified as Tier-3 data to be coerced rather than rejected, this guard would need re-judging.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
@@ -4075,63 +3942,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[52]/body[2]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:0b0edd7c30b3070c44bc41c108c4d7f082289cdc2dfddeaef48b03e619fb39a6'
-- key: contracts/secret_scrub.py:R5:_scrub_value:fp=1643d6f2f4ef18b6
-  owner: john
-  reason: |-
-    R5 `isinstance(value, (list, tuple))` in _scrub_value — the ordered-sequence arm. It recurses with parent_key=None, and that is the point of having a separate arm: a positional element inherits no key name from its container, so it must be judged on its own value by the str arm and can never be redacted by name. The concrete (list, tuple) pair is deliberate rather than the Sequence abc — Sequence would swallow str and bytes and destroy the whole-string replacement above. Both are rebuilt as a list because audit payloads are JSON-serialised on persist, where list and tuple are indistinguishable, so preserving the input's exact sequence type would be false precision. Invalidated if: audit payloads stop being JSON-serialised (tuple/list would then be a distinction worth preserving), or if a sequence element gains an inherited name that ought to drive key-based redaction.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:54:43.214695+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
-  judge_rationale: |-
-    RULE MISFIRES — `_scrub_value` accepts deliberately heterogeneous `Any` values, and the flagged check discriminates the ordered-sequence arm of a recursive scrubber rather than defensively revalidating a fixed Tier-1 or Tier-2 contract. The visible code recursively scrubs every list or tuple element and neither suppresses malformed data nor fabricates a missing value; its earlier `str` arm is also consistent with the rationale for avoiding the broader `Sequence` abstraction. Rebuilding both supported sequence forms as lists is consistent with the plainly stated JSON-persistence contract, under which their original distinction is not retained. This is not established as a function-scoped Tier-3 parameter boundary requiring the decorator.
-  judge_signature_version: 2
-  scope_fingerprint: 9069c7ecc80691b5e1ebb70762c9906c0318901c3e710352269977d6b9b1fd87
-  judge_transport: codex_cli
-  ast_path: 'body[15]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:b5b0e765ff86087596ce029bbee7eb7d43d59dc87b4eb3b2c36ee51f16cb17cf'
-- key: contracts/secret_scrub.py:R5:_scrub_value:fp=c07abd60eaa880e8
-  owner: john
-  reason: |-
-    R5 `isinstance(value, str)` in _scrub_value — the leaf arm that inspects VALUES rather than key names. Its position between the Mapping arm and the sequence arm is load-bearing in both directions: str is itself a Sequence, so if the (list, tuple) arm were reached first every string would be walked character by character, and each character rescanned against _PATTERNS — meaning no whole-string replacement would ever fire. Why the check is right: a str is the only leaf that can carry a secret in its own body (a bearer token, a URL with credentials in the netloc), and on a hit the WHOLE string is replaced, deliberately — the inline comment states that partial redaction leaks structure. Non-str scalars (int, float, bool, None, datetime) fall through to the final `return value` unchanged, which is the intended identity for values that cannot hold a secret, not a missed dispatch arm. Invalidated if: a non-str scalar type becomes capable of carrying a credential (e.g. a secret wrapper object enters audit payloads), which would need its own arm rather than the identity default.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:55:06.964483+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance(value, str)` is explicit value-kind dispatch within a recursive visitor over `Any`, not a defensive re-check of a fixed-contract value or an attempt to hide malformed data. The visible ordering is semantically necessary because strings must receive whole-value secret scanning before sequence handling, while non-string scalars intentionally retain identity. No error is swallowed, no value is coerced or fabricated, and `_scrub_value` is an internal traversal helper rather than a Tier-3 promotion boundary suitable for `@trust_boundary`.
-  judge_signature_version: 2
-  scope_fingerprint: 9069c7ecc80691b5e1ebb70762c9906c0318901c3e710352269977d6b9b1fd87
-  judge_transport: codex_cli
-  ast_path: 'body[15]/body[2]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:6fec20505970ca145d13936d9fbcd26b11f412fe72d8ac8aca6ea4aa23947dae'
-- key: contracts/secret_scrub.py:R5:_scrub_value:fp=f564506219bd9c9f
-  owner: john
-  reason: |-
-    R5 `isinstance(value, Set)` in _scrub_value — the unordered-collection arm, and the only one whose body exists for determinism rather than redaction. A set has no iteration order that survives a process restart (str hashing is salted), so scrubbed members are emitted `sorted(..., key=repr)`: without that, two audit writes of the same payload would serialise to different byte sequences and any hash or diff over the persisted payload would report a spurious change. `key=repr` is used because the members are arbitrary post-scrub values with no common ordering. Set is the collections.abc form so frozenset and set both land here, and it must follow the (list, tuple) arm since neither is a Set. Invalidated if: audit payloads stop admitting sets, or if deterministic ordering moves into the canonical serializer, at which point this arm should collapse into the sequence arm.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:59:18.563186+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — `_scrub_value` intentionally dispatches over a heterogeneous `Any` value, so the `Set` check is not a defensive revalidation of a fixed Tier-1 or Tier-2 contract and does not conceal a contract violation. The visible branch converts an intrinsically unordered collection into a deterministically ordered list after recursively scrubbing its members, while the rationale specifically explains the audit-serialization invariant and why `key=repr` is required for otherwise incomparable values. This is functional shape discrimination for canonicalization, not silent recovery, coercive fabrication, or default substitution. The decorator contract does not apply because the evidence does not establish `value` as a Tier-3 external parameter being promoted at this function.
-  judge_signature_version: 2
-  scope_fingerprint: 9069c7ecc80691b5e1ebb70762c9906c0318901c3e710352269977d6b9b1fd87
-  judge_transport: codex_cli
-  ast_path: 'body[15]/body[4]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:44e79008e4bbc936da39f295b25ce254004d1437bf91efa6facfd27f71e7bba6'
 - key: contracts/sink_effects.py:R5:_contains_restricted_reader:fp=4a17ac79e76e3f74
   owner: john
   reason: |-
@@ -4284,83 +4094,7 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[55]/body[0]/test/values[0]/operand'
   judge_metadata_signature: 'hmac-sha256:v2:c485e3c2a1808d77a35af1dd2a6b35c6e2523f9adbff095401533531d9269ad1'
-- key: contracts/type_normalization.py:R5:classify_runtime_type:fp=265da3f04c16ed8e
-  owner: john
-  reason: |-
-    R5 `isinstance(value, np.floating)` maps the numpy float hierarchy to `float` for validation comparison. It sits after the non-finite arm at line 186, which in this never-raising function also returns `float` -- so unlike the inference path the ordering is not integrity-critical here, but the arm is still required for np.float32/np.float16, which are not Python float subclasses and would otherwise produce a spurious TypeMismatchViolation. Invalidated if numpy scalars were normalized before reaching `SchemaContract.validate()`.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:03:07.950518+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.95
-  judge_rationale: |-
-    RULE MISFIRES — `classify_runtime_type` is itself a runtime-type normalization and validation mechanism, and this arm declares NumPy floating scalars equivalent to the contract’s primitive `float` without fabricating or altering the value. The visible fallback returns unknown types unchanged so the caller can produce a `TypeMismatchViolation`, showing that the check does not silently hide arbitrary contract violations. The excerpt omits the function declaration and decorators, so the structural decorator path cannot safely be recommended.
-  judge_signature_version: 2
-  scope_fingerprint: e6c5efa2fb260fd0b763e26f95c596cdb31a5eb78737b72e32838f09812f4188
-  judge_transport: codex_cli
-  ast_path: 'body[13]/body[8]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:a86d772f6fcd54d14cbf72922d69405b26f588d143ab795d42de59c4ee1c594a'
-- key: contracts/type_normalization.py:R5:classify_runtime_type:fp=7f772187ca7ade28
-  owner: john
-  reason: |-
-    R5 `isinstance(value, pd.Timestamp)` maps pandas Timestamps to `datetime` for validation comparison. It is needed because the function's fast path is exact-type membership (`type(value) in ALLOWED_CONTRACT_TYPES`), which a datetime SUBCLASS fails; without this arm every timestamp column validated against a `datetime` contract field would be falsely quarantined. Invalidated if the fast path became inheritance-based.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:04:05.896865+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
-  judge_rationale: |-
-    PRESCRIBED FORM: the `pd.Timestamp` check is an explicit, meaning-preserving normalization of a recognized pandas datetime representation to the declared `datetime` contract type, not a defensive re-check that suppresses a contract violation. The visible exact-type fast path would not recognize this subclass representation, while unknown types remain unaltered and are documented as producing `TypeMismatchViolation`, so the branch neither fabricates a value nor silently admits arbitrary malformed data. The function definition and decorators are outside the excerpt, so the structural decorator test cannot be applied reliably here.
-  judge_signature_version: 2
-  scope_fingerprint: e6c5efa2fb260fd0b763e26f95c596cdb31a5eb78737b72e32838f09812f4188
-  judge_transport: codex_cli
-  ast_path: 'body[13]/body[10]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:32fc4f1a39c88335f6e8f67dabd71c09a3797b44f378af84e3a824553a304de1'
-- key: contracts/type_normalization.py:R5:classify_runtime_type:fp=a83e31b91aebeaff
-  owner: john
-  reason: |-
-    R5 `isinstance(value, np.datetime64)` maps numpy datetimes to `datetime` for validation comparison, and routes NaT to NoneType via `np.isnat` so a missing datetime is classified consistently with the pd.NA / pd.NaT handling above. np.datetime64 is not a datetime subclass, so no inheritance route reaches it. Invalidated if np.datetime64 were converted to Timestamp upstream of validation.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:04:01.840795+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
-  judge_rationale: |-
-    RULE MISFIRES — `classify_runtime_type` is performing declared runtime-type normalization for validation comparison, not defensively masking a violation of a fixed contract. The visible code preserves the semantic distinction between a concrete `np.datetime64` value and the `NaT` missing-value sentinel, mapping them respectively to `datetime` and `NoneType`, while unknown types remain unchanged so the caller can produce a `TypeMismatchViolation`. Because the function declaration and decorators are not visible, the structural decorator alternative cannot be established from this excerpt.
-  judge_signature_version: 2
-  scope_fingerprint: e6c5efa2fb260fd0b763e26f95c596cdb31a5eb78737b72e32838f09812f4188
-  judge_transport: codex_cli
-  ast_path: 'body[13]/body[11]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:a2e13a71c2a36a93dbde5ceeb40ce1f3e6dbcb5ba90cbea0632f4d0ee5c3aad7'
-- key: contracts/type_normalization.py:R5:classify_runtime_type:fp=aaec4501412b1939
-  owner: john
-  reason: |-
-    R5 `isinstance(value, np.bool_)` maps numpy booleans to `bool` for validation comparison. As on the inference path, this arm cannot be replaced by any check on Python `bool` because numpy made `np.bool_` a non-subclass; without it every boolean cell arriving from pandas would be reported as a type mismatch against a `bool` contract field. Invalidated only if numpy changed that inheritance relationship.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:04:01.683851+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    PRESCRIBED FORM — the visible code explicitly normalizes externally sourced NumPy/Pandas scalar types into their meaning-equivalent Python contract types, and `np.bool_` to `bool` is a meaning-preserving boundary normalization rather than masking a first-party contract violation. Unknown types are not fabricated or silently accepted: they remain `fast_type`, allowing the caller's comparison to produce a `TypeMismatchViolation`. The site-specific rationale directly addresses R5 and is consistent with the surrounding normalization arms.
-  judge_signature_version: 2
-  scope_fingerprint: e6c5efa2fb260fd0b763e26f95c596cdb31a5eb78737b72e32838f09812f4188
-  judge_transport: codex_cli
-  ast_path: 'body[13]/body[9]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:89f8252517d935701828d0047f083e870b96f4e61076e1bc7156cf59286b1a5d'
-- key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=1af39ff971cbe5da
+- key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=c1c4c9d106e92750
   owner: john
   reason: |-
     R5 `isinstance(value, np.floating)` normalizes the numpy float family (float16/32/64/longdouble) to Python `float`. It sits immediately AFTER the non-finite rejection on line 101 by design, so that a NaN carried in a numpy float is rejected as an audit-integrity violation rather than quietly normalized to `float` and recorded. As with the integer arm, the numpy float types form a hierarchy that exact-type membership cannot enumerate. Invalidated if the non-finite guard above it were moved or removed, which would let NaN through this arm.
@@ -4368,18 +4102,18 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:04:08.877400+00:00'
+  judge_recorded_at: '2026-08-30T22:47:00.133119+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
+  judge_confidence: 0.94
   judge_rationale: |-
-    PRESCRIBED FORM: the visible code uses `isinstance(value, np.floating)` to recognize NumPy's floating-point type hierarchy and meaningfully normalize its contract type to Python `float`, rather than to conceal a fixed-contract violation. The immediately preceding guard rejects NaN and infinity across both Python and NumPy floats before this normalization arm, so invalid non-finite values cannot be silently admitted into the audit contract. Because the excerpt does not show the function definition or its decorators, the decorator alternative cannot be safely recommended.
+    PRESCRIBED FORM: the flagged check performs explicit, meaning-preserving normalization of the NumPy floating-type family to the Python `float` contract type; it neither supplies a default nor conceals an invalid type. The visible ordering independently supports the site-specific rationale: line 103 rejects NaN and infinity across both Python and NumPy floats before the line 109 family classification, so non-finite audit values cannot pass through this arm. This is intentional type-family discrimination within a normalization function, not a defensive re-check of an already-guaranteed concrete type, and the finding is not established as a function-scoped Tier-3 parameter case requiring the decorator.
   judge_signature_version: 2
   scope_fingerprint: fc04b9e54f54cea9f30e60fd1a118623703af398e941025c4140c11e25e812cc
   judge_transport: codex_cli
-  ast_path: 'body[11]/body[10]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:520d7635d1b2eecef2616a61acc50b096dc575b38a7776887c521fec5548283f'
-- key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=2ea2c1eed147c8df
+  ast_path: 'body[12]/body[10]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:b796c466249bfcee19870d3e8143528ac55582ffcc2c7696fa40592ed6d6da73'
+- key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=eb3f0203760c6e19
   owner: john
   reason: |-
     R5 `isinstance(value, np.str_)` normalizes numpy strings to `str`. The comment immediately below it records the deliberate asymmetry that makes this arm's scope meaningful: `np.bytes_` is intentionally NOT normalized to str or bytes but is left to fall through to the unsupported signal, so that binary data is never silently misclassified as text in a schema contract. Widening this arm to cover np.bytes_ would be exactly the misclassification the comment forbids, and is what would invalidate the suppression.
@@ -4387,17 +4121,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:04:03.968738+00:00'
+  judge_recorded_at: '2026-08-30T22:47:20.951088+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.94
+  judge_confidence: 0.88
   judge_rationale: |-
-    PRESCRIBED FORM — the flagged `isinstance` performs an explicit, meaning-preserving normalization from NumPy's text scalar type to the first-party contract type `str`; it does not conceal a malformed fixed-contract value or fabricate missing data. The visible fallthrough and comment at lines 119–128 independently establish that `np.bytes_` is deliberately rejected as unsupported rather than silently misclassified as text, matching the site-specific rationale. Because the excerpt does not show the function definition or its decorators, the decorator contract cannot safely be recommended.
+    PRESCRIBED FORM — the flagged `isinstance` performs explicit, meaning-preserving normalization from NumPy's textual scalar type `np.str_` to the equivalent contract primitive `str`; it does not conceal a fixed-contract violation or fabricate a value. The visible fallthrough for `np.bytes_` independently supports the site-specific rationale by preserving binary/text semantics and returning the explicit unsupported signal instead of silently coercing binary data. Because the excerpt does not show the start or decorators of `normalize_type_for_contract`, the decorator path cannot be assessed reliably and no decorator recommendation is made.
   judge_signature_version: 2
   scope_fingerprint: fc04b9e54f54cea9f30e60fd1a118623703af398e941025c4140c11e25e812cc
   judge_transport: codex_cli
-  ast_path: 'body[11]/body[14]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:08496dcf3a265ca970cb6ad616969c2828588acfe882223bbb1b508b8bdd5fcd'
+  ast_path: 'body[12]/body[14]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:d37be820bcde51e5d8e34e2209a501681c8f580cd1bbea4148de2dc4956aa0aa'
 - key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=33c94c68a7ab867a
   owner: john
   reason: |-
@@ -4417,7 +4151,7 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[11]/body[13]/test'
   judge_metadata_signature: 'hmac-sha256:v2:2b478dbb00353fe0f514dcb65219c1a5ff8722d8d55e8c93fa4c8c8d975bcf0c'
-- key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=50a060c7b56f86d5
+- key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=3d0d39dab0a8365f
   owner: john
   reason: |-
     R5 `isinstance(value, np.integer)` normalizes the entire numpy signed/unsigned integer family to Python `int`. `np.integer` is the ABC root over int8/int16/int32/int64 and their unsigned variants, each of which is a distinct concrete type -- so isinstance against the hierarchy root is the only expression of 'any numpy integer'. The module's own fast path is `type(value) in ALLOWED_CONTRACT_TYPES` (exact-type membership), which by construction cannot match these. Without this arm a numpy-typed column would fall to the final membership check and return UNSUPPORTED_CONTRACT_TYPE, making an ordinary pandas integer column uncheckpointable. Invalidated if numpy scalars were normalized upstream before reaching contract inference.
@@ -4425,18 +4159,18 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:04:34.459682+00:00'
+  judge_recorded_at: '2026-08-30T22:47:52.735650+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM — the rationale specifically establishes that `np.integer` denotes the supported NumPy integer family, while exact-type membership cannot represent that family-wide classification. The visible code performs explicit, meaning-preserving contract normalization to Python `int`; it neither fabricates a value nor suppresses a malformed shape with a default, and unmatched types still produce `UNSUPPORTED_CONTRACT_TYPE`. The excerpt does not show the function declaration or its decorators, so the structural decorator conditions cannot be established.
+    RULE MISFIRES — `normalize_type_for_contract` is explicitly discriminating among runtime scalar families, not defensively re-checking a fixed first-party type contract or hiding a contract violation. The `np.integer` hierarchy check at line 107 meaning-preservingly maps NumPy signed and unsigned integer scalar types to the Python `int` contract type, while unsupported types remain visible through `UNSUPPORTED_CONTRACT_TYPE` and non-finite floats raise. The rationale is site-specific and consistent with the exact-type fast path at lines 85–87, which cannot represent the intended “any NumPy integer” family match.
   judge_signature_version: 2
   scope_fingerprint: fc04b9e54f54cea9f30e60fd1a118623703af398e941025c4140c11e25e812cc
   judge_transport: codex_cli
-  ast_path: 'body[11]/body[9]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:570c4ad8ee1f7ccc966ea1f00b9fb86a0d6df9d4427ac82d028f843bbca403bc'
-- key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=9f2eaa6366064a79
+  ast_path: 'body[12]/body[9]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:d2ade4a6d4575395ed12dddd2b6a807998a8fb311fee8950535be7aa9b88f043'
+- key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=a5126a3e2cafdf04
   owner: john
   reason: |-
     R5 `isinstance(value, np.bool_)` normalizes numpy booleans to Python `bool`. This arm is load-bearing in a way the others are not: numpy deliberately made `np.bool_` NOT a subclass of Python `bool`, so neither the exact-type fast path nor any inheritance-based check on `bool` can catch it. Without this arm a boolean column read through pandas would be classified as unsupported. Invalidated only if numpy changed that inheritance relationship.
@@ -4444,18 +4178,18 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:04:21.524340+00:00'
+  judge_recorded_at: '2026-08-30T22:48:08.083094+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.96
   judge_rationale: |-
-    PRESCRIBED FORM — the visible code uses `isinstance(value, np.bool_)` to recognize a distinct NumPy scalar type and explicitly normalize it to the meaning-preserving Python contract type `bool`; it does not conceal a malformed fixed-contract value or fabricate data. The rationale is site-specific and the surrounding branches independently confirm that this function is a type-normalization boundary for NumPy/Pandas values, with invalid or unsupported values handled separately. Because the excerpt omits the function signature and decorators, the structural-decorator conditions cannot be established and no decorator nudge is appropriate.
+    PRESCRIBED FORM — the visible branch performs explicit, meaning-preserving normalization of a NumPy boolean scalar to the Python `bool` contract type; it neither hides a malformed fixed-contract value nor fabricates data. The rationale specifically explains why the exact-type fast path cannot recognize `np.bool_`, and the surrounding normalization function consistently treats NumPy/pandas scalar representations as boundary inputs while rejecting integrity-threatening non-finite values. Although R5 and the parameter-rooted expression could otherwise fit the decorator test, the excerpt does not show the function definition or its decorators, so policy requires no decorator suggestion.
   judge_signature_version: 2
   scope_fingerprint: fc04b9e54f54cea9f30e60fd1a118623703af398e941025c4140c11e25e812cc
   judge_transport: codex_cli
-  ast_path: 'body[11]/body[11]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:d19a745e62ec9668eb3492ea48dcb700b6e0facd9f35585a24ad41524e11f088'
-- key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=cdad46840dbe5cf2
+  ast_path: 'body[12]/body[11]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:0a8fbecd4bf67231a893da224dad3a5156112d9cc30432f443e0976e18705d8b'
+- key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=ac8fc37579361834
   owner: john
   reason: |-
     R5 `isinstance(value, (float, np.floating))` is the type half of the NaN/Infinity rejection in `normalize_type_for_contract`, flagged Tier-1 audit integrity by the comment above it. The union is required because the numpy float hierarchy is not covered by Python `float` alone (np.float32 and np.float16 are not float subclasses), and `np.floating` is the ABC root over the whole float16/32/64/longdouble family -- something no `type() in {...}` membership test can enumerate. The comment records the ordering requirement too: this must run BEFORE numpy normalization so that `np.float64(nan)` is caught rather than normalized to `float`. The site raises ValueError, so a non-finite value can never be inferred into a schema contract. Invalidated if the audit trail ever admitted NaN/Infinity, or if this stopped being the contract-INFERENCE entry point (its never-raising sibling `classify_runtime_type` deliberately does the opposite).
@@ -4463,18 +4197,18 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:04:33.109149+00:00'
+  judge_recorded_at: '2026-08-30T22:48:23.527722+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM — the `isinstance` check is not hiding a contract violation; it safely identifies Python and NumPy floating values so the code can offensively reject NaN and Infinity with a meaningful `ValueError`. The visible ordering confirms that this rejection occurs before NumPy floats are normalized, preventing non-finite values from being admitted into an inferred audit contract. The site neither suppresses an error nor fabricates or coerces a malformed value, and the rationale specifically explains why the broader NumPy floating hierarchy must be covered.
+    PRESCRIBED FORM: the visible code uses `isinstance` to identify floating-point values solely so it can reject NaN and Infinity with a meaningful `ValueError`; it does not hide a wrong type, coerce malformed data, or provide a fallback. The ordering comment and subsequent NumPy normalization independently support the site-specific rationale that this check must precede normalization to keep non-finite values out of inferred audit contracts. The decorator alternative is not established because the excerpt omits the function declaration and any decorators, so the required structural-boundary conditions cannot be confirmed.
   judge_signature_version: 2
   scope_fingerprint: fc04b9e54f54cea9f30e60fd1a118623703af398e941025c4140c11e25e812cc
   judge_transport: codex_cli
-  ast_path: 'body[11]/body[8]/test/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:a18e0f3159221c1bc1f66b0949251535583699cb5f404616e302878d26dc0535'
-- key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=f8f218a0f889730a
+  ast_path: 'body[12]/body[8]/test/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:c52832821602bb86784f11ef72f2ef71b9504d53275f41eb08b1611954de1e38'
+- key: contracts/type_normalization.py:R5:normalize_type_for_contract:fp=6a31df1638bf196c
   owner: john
   reason: |-
     R5 `isinstance(value, pd.Timestamp)` normalizes a pandas Timestamp to `datetime`. The arm is needed precisely because pandas Timestamp IS a datetime subclass: the module's fast path uses `type(value) in ALLOWED_CONTRACT_TYPES`, an EXACT-type membership test that a subclass fails, so a Timestamp reaches this point unnormalized and must be mapped to the canonical `datetime` contract type here. Invalidated if the fast path switched to an inheritance-based test, which would absorb this case (and change behaviour for other datetime subclasses).
@@ -4482,14 +4216,14 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-28'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:04:42.277803+00:00'
+  judge_recorded_at: '2026-08-30T22:48:42.146287+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM — the visible function intentionally normalizes third-party numpy/pandas scalar types into canonical contract types, and the flagged `isinstance` performs the declared meaning-preserving `pd.Timestamp`-to-`datetime` classification rather than hiding a fixed-contract violation. The rationale specifically explains why the exact-type fast path at lines 83-85 cannot admit this subclass, while lines 111-112 visibly implement that distinct normalization arm without a silent default or fabricated value. The function declaration and decorators are outside the excerpt, so the policy requires no decorator suggestion.
+    RULE MISFIRES — this `isinstance` is explicit scalar-type discrimination within `normalize_type_for_contract`, not a defensive re-check that conceals a fixed-contract violation. The visible exact-type fast path at lines 85-87 excludes `pd.Timestamp` despite its `datetime` inheritance, while lines 113-114 deliberately map that pandas type to the canonical `datetime` contract type; this is meaning-preserving normalization and the rationale precisely explains why the branch remains reachable. The excerpt begins mid-function and does not show its decorators, so policy forbids assuming a missing `@trust_boundary` and issuing a decorator nudge.
   judge_signature_version: 2
   scope_fingerprint: fc04b9e54f54cea9f30e60fd1a118623703af398e941025c4140c11e25e812cc
   judge_transport: codex_cli
-  ast_path: 'body[11]/body[12]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:b01451c4d76376ee4031b41a6fbb5a06d6595be4a7a9a3c6247ce6fc416a2711'
+  ast_path: 'body[12]/body[12]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:1d88c2b50aa07d7ef38f6495ac478f9386a6f3c4e3a39e14189839830c136aa2'

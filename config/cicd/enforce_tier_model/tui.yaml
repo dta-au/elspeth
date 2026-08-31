@@ -360,4 +360,42 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[10]/body[1]/test/operand'
   judge_metadata_signature: 'hmac-sha256:v2:2577f838d2aab1432de2070aac69eca4077a72c2fe3f2f07b00c6270d0e13877'
+- key: tui/screens/explain_screen.py:R1:ExplainScreen:_artifact_for_lineage:fp=555bc982e45b1a5d
+  owner: john
+  reason: |-
+    This owned state-id index legitimately omits node states that produced no artifact. The explicit empty tuple means continue searching earlier states; only a non-empty sequence returns evidence, and exhausting the search returns the declared `None` verdict. No required artifact field is defaulted.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T02:43:38.075409+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    RULE MISFIRES — `artifacts_by_state_id` is explicitly a sparse owned index, so absence of a state ID means that state produced no artifact rather than that a required field is missing. The empty tuple is used only as the declared no-results sequence while searching earlier states; it neither fabricates artifact evidence nor suppresses malformed Tier-1 data. This is not an external-parameter trust-boundary case, so the decorator contract does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 2028563f6b3a32aa609e6018149ee5f44eec6befdef1f4ef767c77688682a98f
+  judge_transport: codex_cli
+  ast_path: 'body[23]/body[9]/body[3]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:5adbc94a39f3449f35e3ea8c9eeea0a5bf21282400824e5adf686d313cf99ebe'
+- key: tui/widgets/node_detail.py:R5:NodeDetailPanel:render_content:fp=c39d6a802a47f16f
+  owner: john
+  reason: |-
+    The artifact value is Tier-1 persisted audit data. A non-dict raises `TypeError` with state identity, then `_validate_artifact` enforces required fields before rendering. This is a fail-closed corruption guard; no malformed artifact is coerced, skipped, or partially displayed.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T02:44:15.493553+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    PRESCRIBED FORM — the visible `isinstance` check is offensive enforcement: a non-dict Tier-1 artifact immediately raises an informative `TypeError` containing the audit state identity, with no coercion, default, suppression, or partial rendering. The named control was verified at tui/widgets/node_detail.py:91: `_validate_artifact` directly accesses every required artifact field, so missing fields raise rather than being fabricated or hidden. The decorator alternative does not apply because `render_content` takes no external-data parameter and the checked value comes from the panel's fixed `NodeStateInfo` contract.
+  judge_signature_version: 2
+  scope_fingerprint: 67746a8949f6d621597db386766b4854723b9466327b1f46ab001f65150b09f4
+  judge_transport: codex_cli
+  ast_path: 'body[12]/body[2]/body[35]/body[2]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:34bfe5ffcd559c1887c0f3530f44cf72dc1b9e1215860dc13959fecbcd34ea82'
 per_file_rules: []
