@@ -117,6 +117,7 @@ from elspeth.web.secrets.routes import create_secrets_router
 from elspeth.web.secrets.server_store import ServerSecretStore
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
 from elspeth.web.secrets.user_store import UserSecretStore
+from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import (
@@ -1411,6 +1412,7 @@ def _create_app(
             settings,
             yaml_generator_module,
             secret_service=app.state.scoped_secret_resolver,
+            secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),
             user_id=user_id,
             session_id=session_id,
             plugin_snapshot=plugin_snapshot,
