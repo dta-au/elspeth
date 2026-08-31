@@ -567,6 +567,24 @@ def test_resolved_source_contract_survives_unrelated_source_patch() -> None:
     assert carried["accepted_artifact_hash"] == source_data_contract_artifact_hash(["colour"])
 
 
+def test_planner_guarantee_addition_preserves_acknowledged_subset_authority() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    exact = _exact_arguments(previous)
+    proposal = deep_thaw(exact.data)
+    proposal["source"]["options"]["schema"]["guaranteed_fields"] = ["colour", "size"]
+    proposal["nodes"][0]["options"]["required_input_fields"] = ["colour", "size"]
+
+    result = _execute_set_pipeline(proposal, previous, _trained_context())
+
+    assert result.success, result.data
+    source = result.updated_state.sources["source"]
+    carried = source.options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert carried["status"] == "resolved"
+    assert carried["accepted_artifact_hash"] == source_data_contract_artifact_hash(["colour"])
+    assert source.options["schema"]["guaranteed_fields"] == ("colour", "size")
+    assert isinstance(materialize_state_for_execution(result.updated_state), CompositionState)
+
+
 def test_deleting_resolved_source_contract_guarantee_reopens_review() -> None:
     previous = _resolved_source_contract_state(required_fields=["colour"])
 

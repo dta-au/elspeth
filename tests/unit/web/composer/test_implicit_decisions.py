@@ -24,6 +24,7 @@ import pytest
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.web.composer.implicit_decisions import build_implicit_decisions_report
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
+from elspeth.web.composer.source_demand import build_source_data_contract_draft, source_data_contract_artifact_hash
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
 
 _BLOB_REF = "9f2b3c1d-4e5a-4b6c-8d7e-0f1a2b3c4d5e"
@@ -320,21 +321,23 @@ def test_acknowledged_data_contract_guarantee_attributes_to_user_answer() -> Non
     (elspeth-da68332faf work item 2) is evidenced by the USER'S ANSWER —
     detected by the resolved requirement the resolve arm upserts beside the
     stamp — and must never read as the planner's own claim."""
+    acknowledged = ["colour"]
+    accepted = build_source_data_contract_draft(acknowledged, None)
     by_path = _entries_by_path(
         _state_with_source_options(
             {
                 "path": "/data/input.csv",
-                "schema": {"mode": "observed", "guaranteed_fields": ["colour"]},
+                "schema": {"mode": "observed", "guaranteed_fields": acknowledged},
                 "interpretation_requirements": [
                     {
                         "id": "source-data-contract-source",
                         "kind": "source_data_contract",
                         "user_term": "source_data_contract",
                         "status": "resolved",
-                        "draft": '{"demanded_fields":["colour"]}',
+                        "draft": accepted,
                         "event_id": "11111111-1111-1111-1111-111111111111",
-                        "accepted_value": '{"demanded_fields":["colour"]}',
-                        "accepted_artifact_hash": "b" * 64,
+                        "accepted_value": accepted,
+                        "accepted_artifact_hash": source_data_contract_artifact_hash(acknowledged),
                         "resolved_prompt_template_hash": None,
                     }
                 ],
@@ -345,6 +348,37 @@ def test_acknowledged_data_contract_guarantee_attributes_to_user_answer() -> Non
     entry = by_path["source.schema.guaranteed_fields"]
     assert entry["provenance"] == "user_acknowledged"
     assert "acknowledgement" in str(entry["note"])
+
+
+def test_mixed_data_contract_guarantees_attribute_only_acknowledged_subset_to_user() -> None:
+    acknowledged = ["colour"]
+    accepted = build_source_data_contract_draft(acknowledged, None)
+    by_path = _entries_by_path(
+        _state_with_source_options(
+            {
+                "path": "/data/input.csv",
+                "schema": {"mode": "observed", "guaranteed_fields": ["colour", "size"]},
+                "interpretation_requirements": [
+                    {
+                        "id": "source-data-contract-source",
+                        "kind": "source_data_contract",
+                        "user_term": "source_data_contract",
+                        "status": "resolved",
+                        "draft": accepted,
+                        "event_id": "11111111-1111-1111-1111-111111111111",
+                        "accepted_value": accepted,
+                        "accepted_artifact_hash": source_data_contract_artifact_hash(acknowledged),
+                        "resolved_prompt_template_hash": None,
+                    }
+                ],
+            }
+        )
+    )
+
+    entry = by_path["source.schema.guaranteed_fields"]
+    assert entry["provenance"] == "composer_selected"
+    assert "colour" in str(entry["note"])
+    assert "size" in str(entry["note"])
 
 
 def test_pending_data_contract_does_not_reattribute_guarantees() -> None:

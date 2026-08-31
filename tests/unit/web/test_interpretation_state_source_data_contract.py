@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any, Literal
 
+import pytest
+
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_USER_TERM,
@@ -130,14 +132,36 @@ class TestSiteStaging:
         state = _state(_resolved_contract_options(["colour"]), required=["colour"])
         assert _contract_sites(state) == []
 
-    def test_incoherent_accepted_value_and_hash_reopens_the_card(self) -> None:
+    def test_incoherent_accepted_value_and_hash_blocks_execution(self) -> None:
         options = _resolved_contract_options(["colour"])
         options[INTERPRETATION_REQUIREMENTS_KEY][0]["accepted_value"] = build_source_data_contract_draft(["size"], None)
+        state = _state(options, required=["colour"])
 
-        sites = _contract_sites(_state(options, required=["colour"]))
+        sites = _contract_sites(state)
 
         assert len(sites) == 1
         assert sites[0].component_id == "source"
+        assert isinstance(materialize_state_for_execution(state), InterpretationReviewPending)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (
+            ("event_id", None),
+            ("event_id", ""),
+            ("resolved_prompt_template_hash", "forged-second-domain-hash"),
+        ),
+        ids=("missing-event", "empty-event", "opposite-hash"),
+    )
+    def test_incomplete_resolved_evidence_blocks_execution(self, field: str, value: object) -> None:
+        options = _resolved_contract_options(["colour"])
+        options[INTERPRETATION_REQUIREMENTS_KEY][0][field] = value
+        state = _state(options, required=["colour"])
+
+        sites = _contract_sites(state)
+
+        assert len(sites) == 1
+        assert sites[0].component_id == "source"
+        assert isinstance(materialize_state_for_execution(state), InterpretationReviewPending)
 
     def test_demand_growth_reopens_the_card(self) -> None:
         # Acknowledged {colour}; the pipeline now also requires 'size' from

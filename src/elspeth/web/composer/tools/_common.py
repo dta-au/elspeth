@@ -90,7 +90,7 @@ from elspeth.web.interpretation_state import (
     composer_pipeline_decision_user_term_error,
     parse_interpretation_requirements,
     project_planner_context_interpretation_requirement,
-    resolved_review_evidence_field,
+    resolved_review_evidence_is_coherent,
     serialize_authoring_review_options,
     source_name_from_component_id,
     strip_authoring_options,
@@ -2484,14 +2484,7 @@ def _canonical_interpretation_requirement_error(
             return error
         if type(requirement["accepted_value"]) is not str:
             return error
-        evidence_field = resolved_review_evidence_field(InterpretationKind(requirement["kind"]))
-        if evidence_field == "accepted_artifact_hash":
-            evidence_value = requirement["accepted_artifact_hash"]
-            other_evidence_value = requirement["resolved_prompt_template_hash"]
-        else:
-            evidence_value = requirement["resolved_prompt_template_hash"]
-            other_evidence_value = requirement["accepted_artifact_hash"]
-        if type(evidence_value) is not str or not evidence_value.strip() or other_evidence_value is not None:
+        if not resolved_review_evidence_is_coherent(requirement, InterpretationKind(requirement["kind"])):
             return error
 
     return None
