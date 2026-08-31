@@ -1446,7 +1446,29 @@ def _apply_merge_patch(
 
 
 def _serialize_source(source: SourceSpec) -> dict[str, Any]:
-    """Serialize a SourceSpec to a plain dict for LLM consumption."""
+    """Serialize a SourceSpec to a plain dict for LLM consumption.
+
+    A DIAGNOSTIC view: ``options`` is emitted verbatim, server-owned keys
+    (``source_authoring``, ``blob_ref``) included. Both inspection arms of
+    ``get_pipeline_state`` land here — the whole-document
+    ``_serialize_full_pipeline_state`` and the ``component="source"`` slice
+    — and neither is a ``set_pipeline`` payload. The round-trippable
+    projection is a separate component the tool schema names,
+    ``get_pipeline_state(component="set_pipeline_arguments")``
+    (``_serialize_set_pipeline_arguments``), which rebinds a blob-backed
+    source through ``blob_id``.
+
+    Keeping ``source_authoring`` here is the scoping elspeth-c67fbbbd83
+    chose, not an oversight it missed. The leak that cost a planner turn
+    was the per-turn state context block, projected by
+    ``prompts.project_server_owned_option_metadata``; stripping this view
+    would not have prevented it. Nor would a strip buy round-trippability:
+    a blob-bound source replayed verbatim rejects on ``blob_ref`` first,
+    because that guard cannot enforce ``path`` against the blob's canonical
+    storage_path. Echoing the block costs nothing in any case —
+    ``_drop_echoed_source_authoring`` accepts an exact echo of the stored
+    value, and only a non-matching one rejects.
+    """
     return {
         "plugin": source.plugin,
         "on_success": source.on_success,
