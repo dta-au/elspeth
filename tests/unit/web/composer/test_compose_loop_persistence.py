@@ -311,7 +311,12 @@ async def test_current_planner_persistence_rejects_malformed_bound_content_hash(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
 ) -> None:
-    arguments = {"source": None, "nodes": [], "edges": [], "outputs": []}
+    arguments = {
+        "source": {"plugin": "null", "on_success": "rows"},
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
     arguments_canonical = canonical_json(arguments)
     authority_arguments_canonical = composer_authority_canonical_json(arguments)
     result_canonical = canonical_json(

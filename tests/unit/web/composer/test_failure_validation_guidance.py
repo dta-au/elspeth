@@ -6,6 +6,9 @@ rejection feedback resolves each ``error_code`` through
 while the freeform tool loop shipped a bare code and left the model to spend a
 turn on ``explain_validation_error`` to learn the fix. Live session 891b7b1e
 burned exactly that turn on ``no_source_configured`` (elspeth-5ff149dc4e).
+The current set-pipeline argument contract rejects a null source at the schema
+boundary, so the functional rejection below uses a schema-valid source whose
+options fail plugin validation.
 
 ``ToolResult.validation_guidance`` closes that gap the same way
 ``plugin_schemas`` closed the option-shape one: a failed MUTATION carries the
@@ -16,11 +19,11 @@ the explain-tool pointer when some entry resolved to nothing.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.redaction import redact_tool_call_response
+from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import (
     CompositionState,
     PipelineMetadata,
@@ -73,12 +76,17 @@ def execute_tool(
     )
 
 
-def _unknown_source_plugin_set_pipeline(catalog: CatalogService) -> dict[str, Any]:
-    """Submit a schema-valid rebuild whose source plugin is unavailable."""
+def _invalid_source_options_set_pipeline(catalog: CatalogService) -> dict[str, Any]:
+    """Reach semantic rejection through a schema-valid set-pipeline call."""
     result = execute_tool(
         "set_pipeline",
         {
-            "source": {"plugin": "definitely_not_a_plugin", "on_success": "rows"},
+            "source": {
+                "plugin": "csv",
+                "on_success": "rows",
+                "options": {"path": 123},
+                "on_validation_failure": "discard",
+            },
             "nodes": [],
             "edges": [],
             "outputs": [],
@@ -92,13 +100,13 @@ def _unknown_source_plugin_set_pipeline(catalog: CatalogService) -> dict[str, An
 
 
 class TestFreeformRejectionCarriesCataloguedRepairText:
-    def test_unknown_source_plugin_set_pipeline_carries_the_catalogued_fix(self) -> None:
+    def test_invalid_source_options_carry_the_catalogued_fix(self) -> None:
         """The production symptom: the rejection now ships its own repair text."""
-        payload = _unknown_source_plugin_set_pipeline(_mock_catalog())
+        payload = _invalid_source_options_set_pipeline(_mock_catalog())
 
-        assert [entry.get("error_code") for entry in payload["validation"]["errors"]] == ["plugin_not_installed"]
-        guidance = payload["validation_guidance"]["codes"]["plugin_not_installed"]
-        explanation, suggested_fix = explain_validation_code("plugin_not_installed")
+        assert [entry.get("error_code") for entry in payload["validation"]["errors"]] == ["plugin_options_invalid"]
+        guidance = payload["validation_guidance"]["codes"]["plugin_options_invalid"]
+        explanation, suggested_fix = explain_validation_code("plugin_options_invalid")
         assert guidance == {"explanation": explanation, "suggested_fix": suggested_fix}
 
     def test_a_fully_enriched_rejection_does_not_advertise_the_explain_tool(self) -> None:
@@ -107,7 +115,7 @@ class TestFreeformRejectionCarriesCataloguedRepairText:
         Advertising it there costs a provider turn to re-read guidance already
         in the context (elspeth-41b406c9fc).
         """
-        payload = _unknown_source_plugin_set_pipeline(_mock_catalog())
+        payload = _invalid_source_options_set_pipeline(_mock_catalog())
 
         assert "explain_tool" not in payload["validation_guidance"]
 
@@ -194,14 +202,14 @@ class TestValidationGuidanceCustody:
         the ``_SafeResponseEnvelope`` declaration this fails, and the
         redaction snapshot's ``sensitive_path_count`` drops with it.
         """
-        payload = _unknown_source_plugin_set_pipeline(_mock_catalog())
-        explanation, suggested_fix = explain_validation_code("plugin_not_installed")
-        assert payload["validation_guidance"]["codes"]["plugin_not_installed"] == {
+        payload = _invalid_source_options_set_pipeline(_mock_catalog())
+        explanation, suggested_fix = explain_validation_code("plugin_options_invalid")
+        assert payload["validation_guidance"]["codes"]["plugin_options_invalid"] == {
             "explanation": explanation,
             "suggested_fix": suggested_fix,
         }
 
-        persisted = redact_tool_call_response("set_pipeline", payload, telemetry=MagicMock())
+        persisted = redact_tool_call_response("set_pipeline", payload, telemetry=NoopRedactionTelemetry())
 
         assert persisted["validation_guidance"] == "<redacted-response-mapping>"
         assert persisted["validation"]["errors"][0]["message"] == "<redacted-response-text>"

@@ -120,7 +120,16 @@ class _FakeLLMResponse:
 def _llm_response(content: str | None = None, tool_calls: list[dict[str, Any]] | None = None) -> _FakeLLMResponse:
     fakes: list[_FakeTC] | None = None
     if tool_calls:
-        fakes = [_FakeTC(id=tc["id"], function=_FakeFn(name=tc["name"], arguments=json.dumps(tc["arguments"]))) for tc in tool_calls]
+        fakes = [
+            _FakeTC(
+                id=tc["id"],
+                function=_FakeFn(
+                    name=tc["name"],
+                    arguments=json.dumps({"pipeline": tc["arguments"]} if tc["name"] == "set_pipeline" else tc["arguments"]),
+                ),
+            )
+            for tc in tool_calls
+        ]
     return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMsg(content=content, tool_calls=fakes))])
 
 

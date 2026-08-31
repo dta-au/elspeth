@@ -518,7 +518,7 @@ async def test_schema_valid_semantic_arg_error_persists_only_closed_argument_pro
 async def test_legacy_set_pipeline_rejects_malformed_bound_content_hash() -> None:
     hash_canary = "RAW_HASH_/private/operator/path_sk-secret"
     arguments = {
-        "source": None,
+        "source": {"plugin": "null", "on_success": "rows"},
         "nodes": [],
         "edges": [],
         "outputs": [],
