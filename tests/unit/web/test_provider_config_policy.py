@@ -29,7 +29,7 @@ class TestWebLlmBaseUrlPolicy:
     def test_malformed_url_is_rejected_without_reflecting_it(self) -> None:
         malformed_canary = "https://[BASE_URL_CANARY"
 
-        error = web_llm_base_url_policy_error("llm", {"base_url": malformed_canary})
+        error = web_llm_base_url_policy_error({"base_url": malformed_canary})
 
         assert error == LLM_BASE_URL_POLICY_ERROR
         assert "BASE_URL_CANARY" not in error
@@ -106,20 +106,18 @@ class TestWebAwsS3EndpointUrlPolicy:
 
 class TestWebLlmTracingPolicy:
     @pytest.mark.parametrize(
-        ("plugin", "options"),
+        "options",
         [
-            ("csv", {"tracing": {"host": "https://attacker.invalid"}}),
-            (None, {"tracing": {"host": "https://attacker.invalid"}}),
-            ("llm", {}),
-            ("llm", {"tracing": None}),
+            {},
+            {"tracing": None},
         ],
     )
-    def test_allows_non_llm_or_absent_tracing(self, plugin: str | None, options: dict[str, Any]) -> None:
-        assert web_llm_tracing_policy_error(plugin, options) is None
+    def test_allows_absent_tracing(self, options: dict[str, Any]) -> None:
+        assert web_llm_tracing_policy_error(options) is None
 
     @pytest.mark.parametrize("tracing", [{}, False, "langfuse", {"host": "https://credential-canary.attacker.invalid"}])
     def test_rejects_every_non_null_tracing_value_without_echoing_it(self, tracing: object) -> None:
-        error = web_llm_tracing_policy_error("llm", {"tracing": tracing})
+        error = web_llm_tracing_policy_error({"tracing": tracing})
 
         assert error == LLM_TRACING_POLICY_ERROR
         assert "credential-canary" not in error

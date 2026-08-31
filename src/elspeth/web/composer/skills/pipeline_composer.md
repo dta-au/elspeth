@@ -488,8 +488,8 @@ LLM node preflight has four independent review checks:
   `llm_model_choice` requirement when `options.model` is set, and YOU must
   surface it. Omitting the model binding entirely is not compliance: an `llm`
   node needs either `options.profile` or a discovery-served `options.model`.
-- Does public, internet-originated, externally controlled, or otherwise
-  untrusted remote text flow into this LLM without an authorized prompt-injection
+- Does untrusted or externally controlled upstream content flow into this LLM
+  without an authorized prompt-injection
   shield? Stage `pipeline_decision` with
   `user_term="prompt_injection_shield_recommendation"` on the LLM node,
   recommending a policy-visible authorized prompt-injection control discovered

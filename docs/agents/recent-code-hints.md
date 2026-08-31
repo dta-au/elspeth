@@ -8,6 +8,20 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-09-01 — secret wiring is deny-by-default at three seams, and collectors use the transform policy vocabulary** (elspeth-f3c1aafd25; 9da1b39b8, c163b6366)
+  `WebSettings.secret_wiring_allowlist` authorizes only an exact
+  `(secret, component_type, plugin, option_key)` match; an empty policy denies every wiring. The policy vocabulary is
+  `source|transform|sink`: aggregation and collector nodes both match `transform`, consistently with secret-reference
+  placement and authored-state admission. Enforce this contract (1) in `wire_secret_ref`, before writing a marker; (2)
+  in `validate_secret_evidence`, over `policy.authored_state`, so authenticated executable web paths—with their required
+  secret-service and user context—admit markers from imports and every other entry path; and (3) in `/execute`, where
+  `secret_guard` returns a 428 challenge bound to the exact authored composition state before the fanout guard or run
+  creation. The validator explicitly reports a skipped check when that context is unavailable; do not describe that mode
+  as admission. Only the authenticated execute request may return the challenge token: an LLM or composer-tool argument
+  is never approval. Keep the admission and execute walks on authored state because server-side operator-profile lowering
+  may inject credentials after admission by design.
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
 - **2026-08-30 — `.agents/skills/` is the ONE canonical skills tree; every `.claude/skills/<name>` is a committed relative symlink (`git ls-files -s` mode 120000) into it, and the design pack lives at top-level `design/`** (elspeth-1e9d011295)
   Add or edit a skill under `.agents/skills/` only; a real directory under `.claude/skills/` is a regression. Pin paths in
   tests, scripts and `per-file-ignores` at `.agents/skills/...` and `design/...`. Git never sees a path *through* a
@@ -1958,13 +1972,13 @@ the same commit; the rules live there, the history lives here.
   Adding any builtin plugin fires a fixed set of whole-tree exact pins. For a new TRANSFORM the full list (all hit while landing `aws_textract_inline_analysis`, d181ee569):
   1. `tests/unit/plugins/test_discovery.py` `EXPECTED_TRANSFORM_COUNT`.
   2. `tests/unit/plugins/test_catalog_reference_content.py` — total reference count, per-kind `Counter`, `EXPECTED_BUILTIN_IDENTITIES`, and (for a non-profiled plugin) the `DIRECT_CONFIG_REFERENCES` count.
-  3. `tests/unit/plugins/transforms/test_external_catalogue_metadata.py` — an EXTERNAL_CALL/NON_DETERMINISTIC transform must appear in `EXPECTED_EXTERNAL_TAGS` (exact tuple), `_REQUIRED_GUIDANCE` (casefolded substrings of the usage strings), and, when it surfaces externally-controlled text, `_REMOTE_CONTENT_PRODUCERS` ("untrusted before llm" must appear in its guidance).
+  3. `tests/unit/plugins/transforms/test_external_catalogue_metadata.py` — an EXTERNAL_CALL/NON_DETERMINISTIC transform must appear in `EXPECTED_EXTERNAL_TAGS` (exact tuple) and `_REQUIRED_GUIDANCE` (casefolded substrings of the usage strings). When it surfaces externally-controlled text, declare `content_trust = ContentTrust.UNTRUSTED`; the guidance test derives its producer set from that declaration ("untrusted before llm" must appear in its guidance).
   4. `tests/unit/plugins/test_validation_path_agreement.py` — any config with a `@model_validator` needs a rejection case in `_TRANSFORM_REJECTION_CASES`.
   5. `tests/unit/web/catalog/test_service.py` serialized-summary total and the knob-schema golden `tests/golden/web/catalog/knob_schema/<kind>__<name>.json` (generate via `CatalogServiceImpl._schema_cache`).
   6. `config/cicd/contracts-whitelist.yaml` for `__init__:config` / `probe_config:return` `dict[str, Any]` params (pre-commit Check Contracts).
   7. `capability_tags` gate: a tuple of 2-6 lowercase kebab tags; a 7th tag fails.
   8. `PluginAssistance` text is scanned for credential-shaped patterns — "…token: SDK…" trips `token\s*:`, so phrase around it.
-  9. An untrusted-content producer also joins `_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS` (`src/elspeth/web/interpretation_state.py`); that set is FAIL-OPEN, so an unlisted producer silently reads as trusted.
+  9. An untrusted-content producer declares `content_trust = ContentTrust.UNTRUSTED`; Composer prompt-shield admission derives the closed producer vocabulary from registered transform declarations.
   10. Pin `source_file_hash` LAST (ruff/format edits restale it) via `scripts/cicd/plugin_hash.py`.
   Sites missed on a first pass landing `pdf_rasterize` (2026-08-25), to be added to the checklist: `tests/unit/web/catalog/test_service.py:60`, where the serialized-summary total is a bare `sum(...) == N` int literal next to the per-kind counts; `tests/unit/architecture/test_state_engine_catalog_contract.py:35` `V2_CATALOG_SHA256`, a whole-catalog proof hash to rotate LAST, only after every other v2/v3 catalog pin for the new plugin has landed (`:174-175` is what it pins against), since rotating early means rotating twice; `tests/invariants/test_input_schema_config_is_captured.py:80-87` `_EXPECTED_MUTATION_REJECTIONS` and `tests/invariants/test_transform_input_contract_is_satisfiable.py:85-92` `_EXPECTED_ARMING_REJECTIONS`, two separate allowlists both subset-asserted against the live registry, where an unlisted rejection HARD-FAILS, so a new plugin whose config rejects the synthetic mutation/arming probe must be added to BOTH; `config/cicd/contracts-whitelist.yaml` entries in both the `probe_config:return` block (`:173-177`) AND the constructor block (`:216-222`), the constructor entry's trailing segment matching the ACTUAL `__init__` parameter name (e.g. `options`, not the generic `config`); and the Python-to-TS acronym mirror, which has NO parity test — `web/composer/guided/_display.py` `_ACRONYMS` and `web/frontend/src/components/catalog/pluginDisplayName.ts` `ACRONYMS` must each be hand-edited, since a missing entry (e.g. `"pdf"`) humanises the name wrong ("Pdf Rasterize") with no test catching it.
   Sources have the same shape (see 0ec120e2d for the blob_rows list: source count/names, registry, catalog, golden, contracts whitelist). Sites missed again landing `blob_json_expand` + `blob_text_expand` (2026-08-26, b288157c3), in neither list above: `scripts/state_engine_plugin_matrix.py` `EXPECTED_COUNTS` and `EXPECTED_VARIANT_COUNT`, plus `tests/golden/state_engine/plugin_lifecycle_matrix.json` and the PB-09 cases in `docs/architecture/state_engine/proof-catalog/v3/catalog.json`; `src/elspeth/web/audit_readiness/boundary_expectations.py` `EXPECTED_TRANSFORM_DETERMINISMS`, where touching the file fires a pre-commit cohort gate demanding the trailer `telemetry-backfill: audit-readiness` in the commit message; and `tests/unit/plugins/test_state_engine_plugin_matrix.py` default-variant subjects.

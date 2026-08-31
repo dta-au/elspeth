@@ -1842,9 +1842,11 @@ def _composition_references_blob(
     # ``generate_pipeline_dict(state_from_record(record))``). Asking it what it
     # emits gives the options-bearing sections: ``sources``, ``transforms``,
     # ``aggregations``, ``collectors``, ``sinks``. ``gates`` and ``coalesce``
-    # are emitted but PROVABLY INERT — the composer refuses options on them, so
-    # neither key has ever matched; kept rather than removed, because dropping a
-    # key this guard accepts is a behaviour change bought for tidiness.
+    # are emitted without options. The blob authoring tool also rejects every
+    # plugin-free structural node before mutation, because no inline marker
+    # could survive into runtime YAML. Both legacy keys below are kept as
+    # tolerant defence-in-depth for a non-canonical persisted dict rather than
+    # removed for tidiness.
     # ``collectors`` was the live gap: a blob referenced only from a collector's
     # options read as unreferenced and deletion was permitted under an active
     # run (elspeth-ca79b2c63a).

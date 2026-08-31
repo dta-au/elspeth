@@ -19,7 +19,7 @@ from elspeth.core.secrets import (
     collect_credential_field_violations,
     collect_disallowed_secret_ref_markers,
 )
-from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager, untrusted_content_transform_names
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 from elspeth.plugins.transforms.azure.content_safety import AzureContentSafetyConfig
 from elspeth.plugins.transforms.rag.config import PROVIDERS
@@ -61,16 +61,6 @@ EXTERNAL_BY_NAME = {reference.plugin_cls.name: reference for reference in EXTERN
 _REFERENCE_FIELDS = ("usage_when_to_use", "usage_when_not_to_use", "example_use", "capability_tags")
 _PLACEHOLDER_MARKERS = ("todo", "tbd", "replace-me", "placeholder", "see the technical description")
 _PROFILED_NAMES = {"llm", "aws_bedrock_prompt_shield", "aws_bedrock_content_safety"}
-_REMOTE_CONTENT_PRODUCERS = {
-    "web_scrape",
-    "blob_fetch",
-    "llm",
-    "rag_retrieval",
-    "aws_textract_document_analysis",
-    "aws_textract_inline_analysis",
-    "azure_document_intelligence",
-}
-
 _REQUIRED_GUIDANCE = {
     "web_scrape": (
         ("public http(s)", "audited", "markdown", "plain text", "untrusted before llm"),
@@ -401,7 +391,7 @@ def test_rag_azure_example_keeps_auth_and_index_settings_inside_provider_config(
     assert not {"endpoint", "index", "api_key", "search_mode"} & (options.keys() - {"provider_config"})
 
 
-@pytest.mark.parametrize("name", sorted(_REMOTE_CONTENT_PRODUCERS))
+@pytest.mark.parametrize("name", sorted(untrusted_content_transform_names()))
 def test_remote_content_producers_warn_that_content_is_untrusted_before_llm_use(name: str) -> None:
     plugin_cls = EXTERNAL_BY_NAME[name].plugin_cls
     guidance = f"{plugin_cls.usage_when_to_use} {plugin_cls.usage_when_not_to_use}".casefold()

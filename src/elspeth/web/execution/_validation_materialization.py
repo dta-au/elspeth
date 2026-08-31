@@ -18,6 +18,7 @@ from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.blobs_inline import BlobInlineValidationViolation
 from elspeth.contracts.errors import PipelineLoweringError
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.core.blobs_inline import (
     BLOB_INLINE_AGGREGATE_BYTE_CAP,
     BLOB_INLINE_PER_REF_BYTE_CAP,
@@ -46,6 +47,7 @@ from elspeth.web.execution.schemas import (
     ValidationCheck,
     ValidationError,
 )
+from elspeth.web.plugin_policy.coverage import node_has_capability, source_has_capability
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 from elspeth.web.provider_config_policy import (
     web_aws_s3_endpoint_url_policy_error,
@@ -64,7 +66,6 @@ class _LLMPolicyComponent:
     component_id: str
     component_type: Literal["source", "transform"]
     label: str
-    plugin: str | None
     options: Mapping[str, Any]
 
     def __post_init__(self) -> None:
@@ -97,19 +98,15 @@ def _llm_policy_components(state: CompositionState) -> tuple[_LLMPolicyComponent
             component_id=_source_policy_component_id(source_name),
             component_type="source",
             label="Source",
-            plugin=source.plugin,
             options=source.options,
         )
         for source_name, source in source_items
+        if source_has_capability(source, PluginCapability.LLM)
     ]
-    # Every PLUGIN-BEARING node, not ``node_type == "transform"`` alone
-    # (elspeth-df8082552d). Keying on ``node.plugin is None`` derives the
-    # subject set from the authority that actually matters here — does this
-    # node host a plugin whose options these gates can act on — instead of
-    # restating the node-kind vocabulary, which is stated by hand in at least
-    # four other places in the tree already (see elspeth-b3117ec3ac).
-    # Plugin-less structural nodes carry inert options and are skipped
-    # exactly as they were before.
+    # Every LLM-capable plugin-bearing node, not ``node_type == "transform"``
+    # alone (elspeth-df8082552d). Capability resolution supplies both the
+    # plugin-bearing check and the LLM subject vocabulary (elspeth-c7626ae109),
+    # so neither node kinds nor the builtin plugin name are restated here.
     #
     # This is LIVE, not a latent tidy-up: ``llm`` on an AGGREGATION node
     # validates with zero composer errors (the batch-aware constraint is
@@ -130,11 +127,10 @@ def _llm_policy_components(state: CompositionState) -> tuple[_LLMPolicyComponent
             component_id=node.id,
             component_type="transform",
             label=node.node_type.capitalize(),
-            plugin=node.plugin,
             options=node.options,
         )
         for node in state.nodes
-        if node.plugin is not None
+        if node_has_capability(node, PluginCapability.LLM)
     )
     return tuple(components)
 
@@ -347,15 +343,16 @@ def validate_managed_identity_policy(materialized: MaterializedYaml) -> PhaseRep
 def validate_llm_retry_budget_policy(materialized: MaterializedYaml) -> PhaseReport[MaterializedYaml] | PhaseFailure:
     """Reject unsafe sequential multi-query LLM retry budgets.
 
-    Subject set is every PLUGIN-BEARING node (elspeth-df8082552d). Note this
-    gate carries its OWN node walk — it is not fed by
+    Subject set is every LLM-capable plugin-bearing node, regardless of node
+    kind (elspeth-df8082552d, elspeth-c7626ae109). Note this gate carries its
+    OWN node walk — it is not fed by
     ``_llm_policy_components`` despite gating the same plugin, so widening
     that helper alone would have left this site behind.
     """
     for node in materialized.authored.policy.state.nodes:
-        if node.plugin is None:
+        if not node_has_capability(node, PluginCapability.LLM):
             continue
-        policy_error = web_llm_retry_budget_policy_error(node.plugin, node.options)
+        policy_error = web_llm_retry_budget_policy_error(node.options)
         if policy_error is None:
             continue
         return PhaseFailure(
@@ -401,7 +398,7 @@ def validate_llm_retry_budget_policy(materialized: MaterializedYaml) -> PhaseRep
 def validate_llm_base_url_policy(materialized: MaterializedYaml) -> PhaseReport[MaterializedYaml] | PhaseFailure:
     """Reject web-authored OpenRouter base URL overrides."""
     for component in _llm_policy_components(materialized.authored.policy.state):
-        policy_error = web_llm_base_url_policy_error(component.plugin, component.options)
+        policy_error = web_llm_base_url_policy_error(component.options)
         if policy_error is None:
             continue
         policy_message = policy_error if component.component_type == "transform" else policy_error.replace("LLM nodes", "LLM sources")
@@ -448,7 +445,7 @@ def validate_llm_base_url_policy(materialized: MaterializedYaml) -> PhaseReport[
 def validate_llm_tracing_policy(materialized: MaterializedYaml) -> PhaseReport[MaterializedYaml] | PhaseFailure:
     """Reject author-controlled LLM tracing configuration."""
     for component in _llm_policy_components(materialized.authored.policy.state):
-        policy_error = web_llm_tracing_policy_error(component.plugin, component.options)
+        policy_error = web_llm_tracing_policy_error(component.options)
         if policy_error is None:
             continue
         policy_message = policy_error if component.component_type == "transform" else policy_error.replace("LLM nodes", "LLM sources")

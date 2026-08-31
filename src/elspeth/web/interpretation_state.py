@@ -22,6 +22,7 @@ from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.plugins.infrastructure.manager import untrusted_content_transform_names
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_USER_TERM,
     backtraced_source_demand,
@@ -51,7 +52,7 @@ from elspeth.web.plugin_policy.coverage import (
 from elspeth.web.plugin_policy.coverage import (
     build_output_stream_graph as _output_stream_graph,
 )
-from elspeth.web.plugin_policy.coverage import node_has_blocking_control
+from elspeth.web.plugin_policy.coverage import node_has_blocking_control, node_has_capability
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
 INTERPRETATION_REQUIREMENTS_KEY = "interpretation_requirements"
@@ -138,26 +139,23 @@ def composer_pipeline_decision_user_term_error(*, user_term: str, context: str) 
 
 PROMPT_SHIELD_WARNING_DRAFT: Final[str] = (
     "Recommend inserting a prompt-injection shield transform "
-    "between the external-content fetch step and this LLM. The current draft routes "
-    "internet-controlled text directly into the LLM without that shield, which is a prompt-injection "
-    "exposure on untrusted remote content, but continuing without it is allowed. "
+    "between the untrusted-content producer and this LLM. The current draft routes "
+    "untrusted or externally controlled upstream content directly into the LLM without that shield, "
+    "which is a prompt-injection exposure, but continuing without it is allowed. "
 )
 PROMPT_SHIELD_AVAILABLE_DRAFT: Final[str] = (
     "An authorized prompt-injection shield IS available in this deployment. Wire "
-    "it between the external-content fetch step and this LLM: untrusted remote "
-    "text routed straight into the LLM is a prompt-injection exposure, and the "
+    "it between the untrusted-content producer and this LLM: untrusted or externally "
+    "controlled upstream content routed straight into the LLM is a prompt-injection exposure, and the "
     "shield is configured and ready to use. Wiring it in is strongly recommended, "
     "but you may proceed without it. "
 )
-# Provenance-honest siblings for an LLM with NO externally-fetched content
-# upstream. The remote-content constants above assert an "external-content
-# fetch step" and "internet-controlled text"; staged verbatim onto an
-# operator-supplied-data pipeline those claims are false for the graph, the
-# operator's review card asserts a step that does not exist, and the planner
-# cannot tell (the honest computed lead is discarded on staging — the draft
-# alone is transcribed). Every draft-choosing site must select by provenance:
-# untrusted remote producers present -> the constants above (verbatim,
-# unchanged — they are security advisories); none -> these.
+# Provenance-honest siblings for an LLM with no declared untrusted-content
+# producer upstream. The constants above describe a declared producer; staged
+# verbatim onto an operator-supplied-data pipeline that claim would be false
+# for the graph. Every draft-choosing site therefore selects by the closed
+# ContentTrust declaration: untrusted producers present -> the constants
+# above; none -> these.
 PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT: Final[str] = (
     "Recommend inserting a prompt-injection shield transform "
     "in front of this LLM if its input data may carry adversarial text. This pipeline has no "
@@ -191,22 +189,6 @@ RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX: Final[str] = "Raw-html cleanup review d
 # the caps throttle LLM churn, never server-staged obligations
 # (elspeth-558fa5a321).
 BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX: Final[str] = "backend_auto_surface:"
-
-# Transform plugins whose output is externally-controlled remote content for
-# prompt-injection-defence purposes. web_scrape returns whatever the fetched
-# page served, which is by definition untrusted. Document extraction is the
-# same threat class: aws_textract_document_analysis returns whatever text the
-# uploaded document contained, the pipeline author never writes it, and it
-# lands in an LLM prompt.
-#
-# Membership here is FAIL-OPEN by construction — an unlisted producer is
-# treated as trusted (see _producer_reaches_untrusted, which falls through to
-# its own upstream). A new plugin that surfaces externally-controlled text
-# must be added here, or every downstream LLM silently reports that it
-# consumes no untrusted content.
-_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS: Final[frozenset[str]] = frozenset(
-    {"web_scrape", "aws_textract_document_analysis", "aws_textract_inline_analysis"}
-)
 
 AUTHORING_METADATA_OPTION_KEYS: frozenset[str] = frozenset(
     {
@@ -528,7 +510,7 @@ def prompt_shield_recommendation_warning_pairs(
     """Return always-on advisory warnings for unshielded LLM nodes.
 
     The review is now ALWAYS-ON per LLM node, decoupled from whether an
-    untrusted remote producer (web_scrape) is upstream:
+    untrusted-content producer is upstream:
 
     - **State A** (an authorized shield is reachable upstream) — silent, no warning.
     - **State B** (``shield_available is True``) — an authorized shield IS
@@ -546,25 +528,25 @@ def prompt_shield_recommendation_warning_pairs(
     graph = _output_stream_graph(state.nodes)
     warnings: list[tuple[str, str]] = []
     for node in state.nodes:
-        if node.plugin != "llm":
+        if not node_has_capability(node, PluginCapability.LLM):
             continue
         if _llm_has_authorized_shield_upstream(node, graph):
             continue  # State A — already shielded, silent
         if _llm_has_shield_recommendation(node):
             continue  # review already staged on this node
-        untrusted_producers = _llm_untrusted_remote_content_producers(node, graph)
+        untrusted_producers = _llm_untrusted_content_producers(node, graph)
         if untrusted_producers:
             # Name the producer actually found. Hardcoding "web_scrape" made the
             # sentence assert a plugin that need not be in the pipeline at all.
             named = " and ".join(sorted(untrusted_producers))
             lead = (
-                f"LLM node {node.id!r} consumes externally-fetched content from a {named} upstream "
-                "without an authorized prompt-injection shield between them. "
+                f"LLM node {node.id!r} consumes untrusted or externally controlled upstream content "
+                f"produced by {named} without an authorized prompt-injection shield between them. "
             )
             draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_available is True else PROMPT_SHIELD_WARNING_DRAFT
         else:
-            # Provenance-honest draft: no fetch step exists in this graph, so
-            # the remote-content constants' claims would be false for it —
+            # Provenance-honest draft: no declared untrusted producer exists in
+            # this graph, so the producer-specific constants would be false —
             # and the staged review card carries the DRAFT alone, discarding
             # this computed lead, so the draft itself must tell the truth.
             lead = f"LLM node {node.id!r} has no authorized prompt-injection shield in front of it. "
@@ -573,7 +555,7 @@ def prompt_shield_recommendation_warning_pairs(
     return tuple(warnings)
 
 
-def _llm_untrusted_remote_content_producers(
+def _llm_untrusted_content_producers(
     node: NodeSpec,
     graph: _OutputStreamGraph,
 ) -> frozenset[str]:
@@ -589,7 +571,7 @@ def _llm_untrusted_remote_content_producers(
     not in the pipeline.
     """
 
-    if node.plugin != "llm":
+    if not node_has_capability(node, PluginCapability.LLM):
         return frozenset()
     return _stream_reaches_untrusted(node.input, graph, frozenset())
 
@@ -617,7 +599,7 @@ def _producer_reaches_untrusted(producer: NodeSpec, graph: _OutputStreamGraph, v
     if _is_effective_prompt_shield(producer):
         return frozenset()
     plugin = producer.plugin
-    if plugin is not None and plugin in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS:
+    if plugin is not None and plugin in untrusted_content_transform_names():
         return frozenset({plugin})
     if producer.node_type == "queue":
         reached: set[str] = set()
@@ -644,7 +626,7 @@ def _llm_has_authorized_shield_upstream(
     predecessor path is fail-safe (NOT proven safe), so the advisory still fires.
     """
 
-    if node.plugin != "llm":
+    if not node_has_capability(node, PluginCapability.LLM):
         return False
     return _stream_proves_shield(node.input, graph, frozenset())
 
@@ -664,7 +646,7 @@ def _producer_proves_shield(producer: NodeSpec, graph: _OutputStreamGraph, visit
     visited = visited | {producer.id}
     if _is_effective_prompt_shield(producer):
         return True
-    if producer.plugin in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS:
+    if producer.plugin in untrusted_content_transform_names():
         return False
     if producer.node_type == "queue":
         predecessors = graph.queue_predecessors[producer.id] if producer.id in graph.queue_predecessors else ()
@@ -696,7 +678,7 @@ def prompt_shield_state_for_node(
     ``False`` (State C, fail-safe).
     """
 
-    if node.plugin != "llm":
+    if not node_has_capability(node, PluginCapability.LLM):
         return "A"
     graph = _output_stream_graph(all_nodes)
     if _llm_has_authorized_shield_upstream(node, graph):
@@ -740,7 +722,7 @@ def refine_prompt_shield_warnings_for_availability(
         return result
     # C->B upgrades per provenance variant; the replace pairs must stay
     # variant-aligned so a local-content warning never acquires the
-    # remote-content fetch-step claim.
+    # producer-specific untrusted-content claim.
     upgrades = (
         (PROMPT_SHIELD_WARNING_DRAFT, PROMPT_SHIELD_AVAILABLE_DRAFT),
         (PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT, PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT),
@@ -1812,8 +1794,7 @@ def _prompt_shield_artifact_hash(node: NodeSpec, all_nodes: Sequence[NodeSpec]) 
     """Material-scoped hash for the prompt-shield recommendation review.
 
     The review accepts the recommendation that an authorized prompt-injection
-    shield (currently azure_prompt_shield) be inserted between an
-    untrusted-remote-content producer (currently web_scrape) and this LLM.
+    shield be inserted between an untrusted-content producer and this LLM.
     The hash binds to exactly that adjudication:
 
     - this LLM's node id (the review attaches to a specific node)
@@ -1862,7 +1843,7 @@ def _prompt_shield_producer_paths(producer: NodeSpec, graph: _OutputStreamGraph,
     if producer.id in visited:
         return [(head,)]  # cycle — stop, still record this producer
     visited = visited | {producer.id}
-    if _is_effective_prompt_shield(producer) or producer.plugin in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS:
+    if _is_effective_prompt_shield(producer) or producer.plugin in untrusted_content_transform_names():
         return [(head,)]  # adjudication boundary reached
     if producer.node_type == "queue":
         predecessors = graph.queue_predecessors[producer.id] if producer.id in graph.queue_predecessors else ()
@@ -2328,7 +2309,7 @@ def _reconcile_node_options(
         if (
             kind is InterpretationKind.PIPELINE_DECISION
             and user_term == PROMPT_SHIELD_USER_TERM
-            and proposed.plugin == "llm"
+            and node_has_capability(proposed, PluginCapability.LLM)
             and _llm_has_authorized_shield_upstream(proposed, proposed_graph)
         ):
             continue

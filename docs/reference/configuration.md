@@ -1325,7 +1325,7 @@ bytes.
 
 The untrusted-content guidance above applies identically: inline-extracted
 text taints downstream `llm` nodes, and the web surface counts this plugin
-among untrusted remote-content producers.
+among untrusted-content producers.
 
 ### Required controls and error routing
 

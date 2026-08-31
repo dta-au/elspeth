@@ -2754,7 +2754,14 @@ def _plugin_bearing_sections() -> dict[str, str]:
 
 
 def _declared_emitted_options(plugin_name: str) -> dict[str, list[tuple[str, str]]]:
-    """Return ``{option_name: [(plugin_kind, reason), ...]}`` declared for ``plugin_name``.
+    """Return output-reaching options declared for ``plugin_name``.
+
+    Literal values rendered into output come from ``EmittedToOutput`` metadata.
+    Transform options whose values NAME emitted row fields come from the
+    existing ``BaseTransform.output_naming_config_keys`` authority. Those names
+    are output too: env expansion can turn ``${VAR}`` into a valid field name,
+    after which plugin validation accepts the host value and the transform
+    writes it as a row key and downstream artifact header.
 
     Unioned across all three registries, deliberately, because there is no
     name-to-kind lookup: the registries are three disjoint maps, and ``csv``,
@@ -2789,7 +2796,15 @@ def _declared_emitted_options(plugin_name: str) -> dict[str, list[tuple[str, str
         for plugin_class in plugin_classes:
             if plugin_class.name != plugin_name:
                 continue
-            for option_name, reason in emitted_option_fields(plugin_class.get_config_model()).items():
+            option_reasons = emitted_option_fields(plugin_class.get_config_model())
+            if kind == "transform":
+                for option_name in plugin_class.output_naming_config_keys:
+                    if option_name not in option_reasons:
+                        option_reasons[option_name] = (
+                            "this option names an emitted row field, so an expanded host value becomes "
+                            "a key in row data and a column in downstream artifacts"
+                        )
+            for option_name, reason in option_reasons.items():
                 declared.setdefault(option_name, []).append((kind, reason))
     return declared
 
@@ -2804,8 +2819,9 @@ def _declared_emitted_options(plugin_name: str) -> dict[str, list[tuple[str, str
     suppresses=("R5",),
     invariant=(
         "raises ValueError when any plugin-bearing entry holds an environment-variable placeholder in an "
-        "option its plugin declares EmittedToOutput; entries whose plugin name or options are not the "
-        "expected scalar/mapping shape are skipped here and rejected by ElspethSettings validation"
+        "option its plugin declares output-reaching through EmittedToOutput or output_naming_config_keys; "
+        "entries whose plugin name or options are not the expected scalar/mapping shape are skipped here "
+        "and rejected by ElspethSettings validation"
     ),
     test_ref="tests/unit/core/test_config.py::TestEnvPlaceholderGuardIsDerived::test_rejection_message_names_the_declaring_kind",
     test_fingerprint="9652da87ae0e45512fe4a3930e051c885157bf68475824f7be22a67765204789",
@@ -2819,10 +2835,12 @@ def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mappi
     cannot be bypassed by handing it an already-expanded host value.
 
     DERIVED, NOT RESTATED. Both the sections and the forbidden fields come from
-    the system's own declarations: the sections from ``ElspethSettings``, and
-    the fields from the :class:`~elspeth.contracts.emitted_option.EmittedToOutput`
-    markers on each plugin's config model — the same declarations the plugin's
-    own validator enforces. This function names no plugin and no option.
+    the system's own declarations: the sections from ``ElspethSettings``;
+    literal emitted values from
+    :class:`~elspeth.contracts.emitted_option.EmittedToOutput` markers on each
+    plugin's config model; and transform-authored output field names from
+    ``BaseTransform.output_naming_config_keys``. This function names no plugin
+    and no option.
 
     It replaced a hand-maintained ``{plugin: {field, ...}}`` map that held ONE
     plugin and two fields, and was therefore a no-op for every other plugin.
@@ -2838,9 +2856,10 @@ def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mappi
     never trips on a presentation field like ``title``.
 
     Raises:
-        ValueError: An option declared ``EmittedToOutput`` holds an env
-            placeholder. The message names the declaring plugin kind, because a
-            union across registries can refuse a source option on a sink's
+        ValueError: An option declared output-reaching through
+            ``EmittedToOutput`` or ``output_naming_config_keys`` holds an env
+            placeholder. The message names the declaring plugin kind, because
+            a union across registries can refuse a source option on a sink's
             declaration and an unexplained refusal is worse than the refusal.
     """
     for section_name, shape in sorted(_plugin_bearing_sections().items()):
