@@ -38,6 +38,27 @@ _UNSUPPORTED_COALESCE_FIELDS = frozenset(
         "select_branch",
     }
 )
+# Importer-owned classification of every current runtime envelope field. These
+# sets name fields the parser actually consumes; they are deliberately NOT
+# derived from ``model_fields`` because doing so would authorize a newly added
+# runtime field before the importer had code to preserve it. The helper below
+# intersects this classification with the live runtime models, so deletions are
+# also fail-closed. Plugin-owned ``options`` values remain open, while their
+# mapping keys must obey the JSON persistence contract below.
+_CONSUMED_RUNTIME_FIELDS_BY_SECTION: dict[str, frozenset[str]] = {
+    "aggregations": frozenset(
+        {"name", "plugin", "input", "on_success", "on_error", "trigger", "output_mode", "expected_output_count", "options"}
+    ),
+    "coalesce": frozenset({"name", "branches", "policy", "merge", "timeout_seconds", "on_success"}),
+    "gates": frozenset({"name", "input", "condition", "routes", "on_error", "fork_to"}),
+    "row_unions": frozenset({"name", "branches", "on_success", "timeout_seconds"}),
+    "sinks": frozenset({"plugin", "options", "on_write_failure"}),
+    "sources": frozenset({"plugin", "on_success", "options"}),
+    "transforms": frozenset({"name", "plugin", "input", "on_success", "on_error", "options"}),
+}
+_DECLINED_RUNTIME_FIELDS_BY_SECTION: dict[str, frozenset[str]] = {
+    "coalesce": _UNSUPPORTED_COALESCE_FIELDS,
+}
 _COLLECTOR_FIELDS = frozenset({"name", "plugin", "input", "on_success", "on_error", "options"})
 _SCOPE_FIELDS = frozenset({"name", "opener", "closer", "policy"})
 # Recognised top-level pipeline sections. A parsed document that is a
@@ -256,6 +277,26 @@ def _optional_mapping(value: Any, path: str) -> Mapping[str, Any]:
     return _require_mapping(value, path)
 
 
+def _reject_non_string_mapping_keys(value: object, path: str) -> None:
+    """Reject keys that JSON persistence would stringify ambiguously."""
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise RuntimeYamlImportError(f"{path} contains non-string mapping key {key!r}")
+            _reject_non_string_mapping_keys(item, f"{path}.{key}")
+        return
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, item in enumerate(value):
+            _reject_non_string_mapping_keys(item, f"{path}[{index}]")
+
+
+def _json_mapping(value: Any, path: str) -> Mapping[str, Any]:
+    """Copy a mapping after proving every nested key is JSON-safe."""
+    mapping = dict(_optional_mapping(value, path))
+    _reject_non_string_mapping_keys(mapping, path)
+    return mapping
+
+
 def _reject_unknown_runtime_fields(
     entry: Mapping[Any, Any],
     *,
@@ -289,11 +330,17 @@ def _reject_unknown_runtime_fields(
         "sources": frozenset(SourceSettings.model_fields),
         "transforms": frozenset(TransformSettings.model_fields),
     }
-    allowed = fields_by_section[section_name] | compatibility_fields
-    unknown = sorted(set(entry) - allowed, key=lambda field: (type(field).__name__, repr(field)))
-    if not unknown:
+    model_fields = fields_by_section[section_name]
+    classified_model_fields = _CONSUMED_RUNTIME_FIELDS_BY_SECTION[section_name] | _DECLINED_RUNTIME_FIELDS_BY_SECTION.get(
+        section_name, frozenset()
+    )
+    entry_fields = set(entry)
+    unknown = entry_fields - model_fields - compatibility_fields
+    unclassified_modelled = (entry_fields & model_fields) - classified_model_fields
+    rejected = sorted(unknown | unclassified_modelled, key=lambda field: (type(field).__name__, repr(field)))
+    if not rejected:
         return
-    raise RuntimeYamlImportError(f"{path} contains unknown or inapplicable field(s): {unknown}")
+    raise RuntimeYamlImportError(f"{path} contains unknown or inapplicable field(s): {rejected}")
 
 
 @trust_boundary(
@@ -504,7 +551,7 @@ def _source_from_runtime_entry(source_name: str, entry: Any) -> SourceSpec:
         path=path,
         compatibility_fields=frozenset({"on_validation_failure"}),
     )
-    options = dict(_optional_mapping(source.get("options"), f"{path}.options"))
+    options = dict(_json_mapping(source.get("options"), f"{path}.options"))
     if "blob_ref" in options:
         raise RuntimeYamlImportError(f"{path}.options.blob_ref must be supplied via source_blob_ids")
     on_validation_failure = source.get("on_validation_failure")
@@ -660,7 +707,7 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
             continue
         runtime_section_name = "aggregations" if node_type == "aggregation" else "transforms"
         _reject_unknown_runtime_fields(entry, section_name=runtime_section_name, path=path)
-        options = dict(_optional_mapping(entry.get("options"), f"{path}.options"))
+        options = _json_mapping(entry.get("options"), f"{path}.options")
         expected_output_count = entry.get("expected_output_count")
         if expected_output_count is not None and (not isinstance(expected_output_count, int) or isinstance(expected_output_count, bool)):
             raise RuntimeYamlImportError(f"{path}.expected_output_count must be an integer when provided")
@@ -679,7 +726,7 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
                 branches=None,
                 policy=None,
                 merge=None,
-                trigger=dict(_optional_mapping(entry.get("trigger"), f"{path}.trigger")) if entry.get("trigger") is not None else None,
+                trigger=_json_mapping(entry.get("trigger"), f"{path}.trigger") if entry.get("trigger") is not None else None,
                 output_mode=_optional_str(entry, "output_mode"),
                 expected_output_count=expected_output_count,
             )
@@ -730,7 +777,7 @@ def _collector_nodes_from_runtime_lists(collectors_section: Any, scopes_section:
                     input=_require_str(entry, "input", path),
                     on_success=_require_str(entry, "on_success", path),
                     on_error=_optional_str(entry, "on_error"),
-                    options=dict(_optional_mapping(entry.get("options"), f"{path}.options")),
+                    options=_json_mapping(entry.get("options"), f"{path}.options"),
                     condition=None,
                     routes=None,
                     fork_to=None,
@@ -788,7 +835,7 @@ def _outputs_from_runtime_sinks(sinks: Any) -> tuple[OutputSpec, ...]:
             OutputSpec(
                 name=sink_name,
                 plugin=_require_str(entry, "plugin", path),
-                options=dict(_optional_mapping(entry.get("options"), f"{path}.options")),
+                options=_json_mapping(entry.get("options"), f"{path}.options"),
                 on_write_failure=_require_str(entry, "on_write_failure", path),
             )
         )

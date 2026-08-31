@@ -8196,6 +8196,36 @@ commencment_gates: []
         assert await service.get_current_state(session.id) is None
 
     @pytest.mark.asyncio
+    async def test_post_state_yaml_rejects_json_key_collision_before_persistence(self, tmp_path) -> None:
+        """Distinct YAML keys must not collapse during session JSON storage."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+
+        session = await service.create_session("alice", "Replay", "local")
+        yaml_text = """
+sources:
+  source:
+    plugin: csv
+    on_success: main
+    options:
+      schema:
+        mode: observed
+      labels:
+        1: integer-key
+        "1": string-key
+sinks:
+  main:
+    plugin: csv
+    on_write_failure: discard
+"""
+
+        resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "sources.source.options.labels contains non-string mapping key 1"
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
     async def test_post_state_yaml_rejects_aliased_yaml(self, tmp_path) -> None:
         """Hardening (T-1): anchors/aliases are rejected outright (billion-laughs
         defense) rather than silently expanded server-side."""

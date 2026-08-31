@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from elspeth.core.config import ElspethSettings
+from elspeth.core.config import ElspethSettings, SourceSettings
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec, queue_node_contract_error
 from elspeth.web.composer.yaml_generator import generate_public_yaml, generate_yaml
 from elspeth.web.composer.yaml_importer import (
@@ -319,6 +319,34 @@ def test_source_from_runtime_entry_rejects_conflicting_validation_failure_spelli
                 "options": {"on_validation_failure": "quarantine"},
             },
         )
+
+
+def test_source_from_runtime_entry_rejects_new_unclassified_runtime_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A future runtime field stays closed until the importer handles it."""
+    monkeypatch.setitem(SourceSettings.model_fields, "future_control", SourceSettings.model_fields["plugin"])
+
+    with pytest.raises(RuntimeYamlImportError, match="future_control"):
+        _source_from_runtime_entry(
+            "s",
+            {
+                "plugin": "csv",
+                "on_success": "out",
+                "options": {},
+                "future_control": "must-survive",
+            },
+        )
+
+
+def test_composition_state_from_runtime_yaml_rejects_nested_non_string_option_key() -> None:
+    """JSON persistence must not collapse YAML ``1`` and ``"1"`` keys."""
+    doc = _minimal_pipeline_doc().replace(
+        "      path: in.csv\n",
+        '      path: in.csv\n      labels:\n        1: integer-key\n        "1": string-key\n',
+        1,
+    )
+
+    with pytest.raises(RuntimeYamlImportError, match=r"sources\.primary\.options\.labels.*non-string mapping key 1"):
+        composition_state_from_runtime_yaml(doc)
 
 
 @pytest.mark.parametrize("authored", ["", None, 17])
