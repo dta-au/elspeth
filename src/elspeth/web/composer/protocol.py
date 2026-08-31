@@ -221,6 +221,10 @@ class ComposerResult:
     # regresses to duplication — unrepresentable.
     persisted_assistant_content: str | None = None
     persisted_tool_call_turn: bool = False
+    # Positive proof that the persisted pair above belongs to the terminal
+    # model turn whose prose ``raw_assistant_content`` carries. False is
+    # deliberately inconclusive: distinct turns may produce identical bytes.
+    persisted_assistant_matches_terminal_model_turn: bool = False
     # Number of forced repair turns the proof step injected into this compose
     # invocation. Capped at 2 by the loop. 0 means first-pass success; 1 or 2
     # means the model was given proof_diagnostics back as a synthesized
@@ -326,6 +330,23 @@ class ComposerResult:
                 f"id={'set' if self.persisted_assistant_message_id is not None else 'None'}, "
                 f"content={'set' if self.persisted_assistant_content is not None else 'None'}."
             )
+        if self.persisted_assistant_matches_terminal_model_turn:
+            if self.persisted_assistant_message_id is None or self.persisted_assistant_content is None:
+                raise ValueError(
+                    "ComposerResult same-turn invariant violated: persisted assistant id and content "
+                    "must both be present when persisted_assistant_matches_terminal_model_turn is true."
+                )
+            if not self.persisted_tool_call_turn:
+                raise ValueError(
+                    "ComposerResult same-turn invariant violated: persisted_tool_call_turn must be true "
+                    "when persisted_assistant_matches_terminal_model_turn is true."
+                )
+            if self.raw_assistant_content != self.persisted_assistant_content:
+                raise ValueError(
+                    "ComposerResult same-turn invariant violated: raw_assistant_content must equal persisted_assistant_content."
+                )
+            if not self.message.startswith(self.persisted_assistant_content):
+                raise ValueError("ComposerResult same-turn invariant violated: message must start with persisted_assistant_content.")
 
 
 class ComposerServiceError(Exception):
@@ -496,10 +517,10 @@ class ComposerPluginCrashError(ComposerServiceError):
     ``ComposerConvergenceError``. If the ordering is inverted the generic
     handler would launder the crash into a 502, reintroducing the
     silent-laundering behaviour the narrowed catch was designed to
-    eliminate. The invariant is mechanically enforced by
-    ``scripts/cicd/enforce_composer_catch_order.py`` (rule CCO1), which
-    scans ``web/`` for any ``try`` block where a superclass handler
-    precedes one of its ``ComposerServiceError`` subclasses.
+    eliminate. The ``composer.catch_order`` lint rule mechanically enforces
+    the invariant by scanning ``web/`` for any ``try`` block where a
+    superclass handler precedes one of its ``ComposerServiceError``
+    subclasses.
     """
 
     _FROZEN_ATTRS: ClassVar[frozenset[str]] = frozenset(

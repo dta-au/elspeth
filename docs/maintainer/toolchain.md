@@ -11,9 +11,10 @@ Until 2026-08-30 this material sat in `AGENTS.md` itself, which meant the
 maintainer's tool choices read as project mandates. It was split out under
 [ADR-043](../architecture/adr/043-project-tooling.md) so that the public
 covenant stays short and harness-neutral. The Filigree and Loomweave blocks
-below are installer-written: their installers rewrite the block between the
-`<!-- <tool>:instructions -->` markers on every run, and those blocks now
-live here rather than in `AGENTS.md`.
+below are installer-written mirrors: their installers rewrite the block
+between the `<!-- <tool>:instructions -->` markers on every run. Their exact
+placement is installer-owned and may also include `AGENTS.md` or `CLAUDE.md`;
+this document must not claim exclusive custody of those blocks.
 
 The tools named here are the ones the maintainer's agents currently carry
 standing instructions for. The first-party `elspeth-lints` package and its

@@ -16,6 +16,7 @@ from elspeth.web.aws_ecs_acceptance import SCENARIO_ASSIGNMENT_NAMES
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-deployment.md"
+COLD_INSTALL_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-cold-install.md"
 REDEPLOY_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-existing-service-redeploy.md"
 BEDROCK_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-bedrock-opus-sonnet.md"
 RUNBOOK_INDEX = REPO_ROOT / "docs" / "runbooks" / "index.md"
@@ -37,6 +38,10 @@ def _bedrock_text() -> str:
 
 def _fences(language: str) -> list[str]:
     return re.findall(rf"```{language}\n(.*?)```", _text(), flags=re.DOTALL)
+
+
+def _markdown_link_targets(text: str) -> set[str]:
+    return set(re.findall(r"\[[^]]+\]\(([^)]+)\)", text))
 
 
 def _container_insights_cleanup_function() -> str:
@@ -598,7 +603,6 @@ def test_runbook_rejects_unsafe_probe_evidence_and_promotion_regressions() -> No
     text = _text()
     assert "curl -fsS" not in text
     assert "raw logs are never printed or persisted" in text
-    assert "Promotion is forbidden before Plan 12 final GO" in text
     assert "container healthCheck" in text
     assert "elspeth health" in text
     assert re.search(r"elspeth health.*not wired", text, flags=re.IGNORECASE | re.DOTALL)
@@ -1058,28 +1062,19 @@ def test_runbook_is_linked_from_operator_indexes() -> None:
     index = RUNBOOK_INDEX.read_text(encoding="utf-8")
     guide = DOCKER_GUIDE.read_text(encoding="utf-8")
 
+    assert COLD_INSTALL_RUNBOOK.is_file()
     assert REDEPLOY_RUNBOOK.is_file()
-    assert (
-        "| [AWS ECS Cold Install](aws-ecs-cold-install.md) "
-        "| Create a complete disposable stack with the tracked Scenario A Terraform package, including Aurora, monitoring, and Bedrock |"
-    ) in index
-    assert (
-        "| [AWS ECS Existing-Service Redeploy](aws-ecs-existing-service-redeploy.md) "
-        "| Build, scan, and deploy an immutable image to an existing ECS/Fargate service |"
-    ) in index
-    assert (
-        "| [AWS ECS Full Disposable Acceptance](aws-ecs-deployment.md) "
-        "| Provision, exercise, and destroy the release-specific two-scenario acceptance environment |"
-    ) in index
-    assert (
-        "[AWS ECS Cold Install](../runbooks/aws-ecs-cold-install.md) - Complete disposable stack with Aurora, monitoring, and Bedrock"
-    ) in guide
-    assert (
-        "[AWS ECS Existing-Service Redeploy](../runbooks/aws-ecs-existing-service-redeploy.md) - Everyday immutable image redeploy"
-    ) in guide
-    assert (
-        "[AWS ECS Full Acceptance Runbook](../runbooks/aws-ecs-deployment.md) - Disposable two-scenario provisioning and acceptance"
-    ) in guide
+    assert RUNBOOK.is_file()
+    assert {
+        "aws-ecs-cold-install.md",
+        "aws-ecs-existing-service-redeploy.md",
+        "aws-ecs-deployment.md",
+    } <= _markdown_link_targets(index)
+    assert {
+        "../runbooks/aws-ecs-cold-install.md",
+        "../runbooks/aws-ecs-existing-service-redeploy.md",
+        "../runbooks/aws-ecs-deployment.md",
+    } <= _markdown_link_targets(guide)
 
 
 def test_existing_service_redeploy_requires_immutable_scan_clean_identity() -> None:

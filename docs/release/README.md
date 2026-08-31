@@ -1,18 +1,17 @@
 # `docs/release/` — Release Histories and Snapshots
 
-**Last reviewed:** 2026-07-23 (0.7.1)
+**Last reviewed:** 2026-08-31 (0.8.0)
 **Audience:** Anyone navigating to release-level documentation
 **Register:** Lightly technical / directory-index
 
-This directory holds release-level documentation: cumulative progress reports,
-velocity records, public-sector evaluation material, and the long-lived
-assurance narrative.
+This directory holds the current evaluator guides and the long-lived assurance
+narrative.
 
 The directory is intentionally small. **Current** documents reflect the release
-currently being prepared (0.7.1). Superseded point-in-time release docs and frozen historical
-snapshots are no longer part of the active public docs tree; use git history or
-maintainer-local archives when historical provenance is needed. New readers
-should start with the current tier below.
+currently being prepared (0.8.0). Superseded point-in-time release docs and
+frozen historical snapshots are no longer part of the active public docs tree;
+use git history or maintainer-local archives when historical provenance is
+needed. New readers should start with the current tier below.
 
 ---
 
@@ -22,7 +21,7 @@ If you only have time for one document, pick the row that matches your role.
 
 | If you are… | Read first | Then |
 |---|---|---|
-| **An Australian public-service executive or assurance reader** evaluating the platform for pilot adoption | [`executive-summary.md`](executive-summary.md) | [`guarantees.md`](guarantees.md) for contractual claims |
+| **An executive or assurance reader** evaluating the platform | [Project overview](../../README.md) | [`guarantees.md`](guarantees.md) for contractual claims |
 | **Engineering leadership** scoping or sequencing work against the platform | [`platform-architecture.md`](platform-architecture.md) | Then `/CHANGELOG.md` for release-by-release implementation detail |
 | **An engineer joining the project** | [`platform-architecture.md`](platform-architecture.md) | Then [`guarantees.md`](guarantees.md) for the contracts the code must uphold |
 | **An auditor or integrator** verifying assurance claims | [`guarantees.md`](guarantees.md) (the assurance surface) | Then `/CHANGELOG.md` (RC-3+) for the line-by-line release record |
@@ -40,17 +39,15 @@ Before diving into the documents below, know which sources they aggregate. **If 
 
 ---
 
-## Current documents (0.7.1, July 2026)
+## Current documents (0.8.0, August 2026)
 
 | Document | What it answers | Intended reader |
 |----------|-----------------|-----------------|
-| [`executive-summary.md`](executive-summary.md) *(DRAFT — awaiting operator sign-off)* | Capability and assurance summary; what the platform does, what it does not yet guarantee, what an evaluator should consider next. | **Public-service executives, programme sponsors, assurance and risk staff.** Australian public-service / institutional register. |
 | [`composer-guide.md`](composer-guide.md) | What the Composer can do, how guided/freeform authoring works, what readiness checks mean, and how a user completes or recovers a composition. | **Evaluators, programme teams, operators, and technical reviewers.** Public-facing / lightly technical. |
 | [`platform-architecture.md`](platform-architecture.md) | Current runtime surfaces, trust boundaries, audit-first behaviour, configuration validation, external-system boundaries, and adopter responsibilities. | **Evaluators, technical leaders, architects, and assurance reviewers.** Public-facing / technical. |
-| [`assessment-mapping.md`](assessment-mapping.md) | How the current evidence set maps to likely public-sector evaluation questions, without claiming formal conformance. | **Assurance, risk, security, delivery governance, and agency evaluation teams.** Evidence map. |
 | [`sink-effect-recovery.md`](../runbooks/sink-effect-recovery.md) | The durable sink-effect recovery protocol, target-ledger requirements, and operator decisions after interrupted publication. | **Operators, plugin maintainers, and database owners.** Recovery runbook. |
 
-The executive summary is the single executive-tier entry point. Engineering
+The root project overview is the broad evaluator entry point. Engineering
 readers should use the platform architecture and root changelog for current
 implementation context.
 
@@ -58,15 +55,7 @@ implementation context.
 
 | Document | What it answers | Status |
 |----------|-----------------|--------|
-| [`guarantees.md`](guarantees.md) | Audit, lineage, and trust-model guarantees ELSPETH makes. | **Layered assurance appendix.** §1–§10 preserve the original RC-3 contract language; §11–§14 add RC-5.2 authentication, secret-reference, multi-user-session, and composer-authoring guarantees; §15 adds durable token scheduling guarantees. The 0.7.1 refresh keeps this as the current assurance baseline. |
-
-## Release PDF pack
-
-The [`pdf/`](pdf/) pipeline contains the legacy RC-5.2 PDF/UA-1 release pack
-sources. It remains useful as a build/reference pipeline, but it has not been
-rebuilt as a 0.7.1 public release pack. Treat the Markdown documents in this
-directory, the root changelog, and root architecture overview as the current
-0.7.1 release sources until a new PDF pack is generated.
+| [`guarantees.md`](guarantees.md) | Audit, lineage, and trust-model guarantees ELSPETH makes. | **Layered assurance appendix.** §1–§10 preserve the original RC-3 contract language; §11–§14 add RC-5.2 authentication, secret-reference, multi-user-session, and composer-authoring guarantees; §15 adds durable token scheduling guarantees; §16 adds the 0.7.1 AWS ECS telemetry boundary. See the root changelog for later release changes. |
 
 ## Archived snapshots
 

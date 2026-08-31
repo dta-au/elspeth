@@ -326,6 +326,10 @@ class _PersistOutcome:
     # without it fails at construction rather than silently duplicating.
     persisted_assistant_content: str | None
     persisted_tool_call_turn: bool
+    # True only when P4 persisted the current dispatch's assistant prose
+    # without substituting backend-owned content. REQUIRED (no default): P5
+    # must not infer turn identity from row presence or byte equality.
+    persisted_assistant_matches_current_dispatch: bool
     unwind_audit_failed: bool
     failed_turn: FailedTurnMetadata | None
 
@@ -347,6 +351,14 @@ class _PersistOutcome:
                 "prose (elspeth-d581b3da7f). "
                 f"id={'set' if self.persisted_assistant_message_id is not None else 'None'}, "
                 f"content={'set' if self.persisted_assistant_content is not None else 'None'}."
+            )
+        if self.persisted_assistant_matches_current_dispatch and (
+            self.persisted_assistant_message_id is None or self.persisted_assistant_content is None or not self.persisted_tool_call_turn
+        ):
+            raise AuditIntegrityError(
+                "Tier 1: _PersistOutcome current-dispatch invariant violated — "
+                "persisted_assistant_matches_current_dispatch requires a complete "
+                "persisted assistant pair and persisted_tool_call_turn=True."
             )
 
 

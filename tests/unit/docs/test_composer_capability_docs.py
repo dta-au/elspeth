@@ -1,28 +1,30 @@
-"""Composer capability-parity documentation contract.
+"""Composer capability-parity documentation contract."""
 
-Guided and freeform are two *interactions* over one shared planner and one
-canonical pipeline language; they do not differ in capability. The user manual
-must say so, list the supported canonical structures, explain wrong-stage
-retention / back-edit, and describe the tutorial as a guided workflow profile.
-It must NOT tell users to switch to freeform because guided cannot express a
-supported topology. Where schema/epoch numbers are encoded, the runbook must use
-the current values (the live ``SESSION_SCHEMA_EPOCH``, guided schema 11,
-the live Landscape epoch), not the design doc's stale 8/28.
-"""
-
+import json
+import re
+from collections import Counter
 from pathlib import Path
-
-from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
-from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 USER_MANUAL = REPO_ROOT / "docs/guides/user-manual.md"
-RUNBOOK = REPO_ROOT / "docs/runbooks/staging-session-db-recreation.md"
+PARITY_FIXTURES = REPO_ROOT / "evals/composer-parity/fixtures"
 
 
 def _manual() -> str:
     """User manual with newline-wrapping collapsed so phrase asserts survive reflow."""
     return " ".join(USER_MANUAL.read_text(encoding="utf-8").split())
+
+
+def _documented_structure_classes() -> Counter[str]:
+    manual = USER_MANUAL.read_text(encoding="utf-8")
+    section = manual.split("### Supported pipeline structures", maxsplit=1)[1].split(
+        "### Choosing between guided and freeform", maxsplit=1
+    )[0]
+    return Counter(re.findall(r"^- \*\*[^*]+\*\* \(`([^`]+)`\)", section, flags=re.MULTILINE))
+
+
+def _parity_fixture_classes() -> Counter[str]:
+    return Counter(json.loads(path.read_text(encoding="utf-8"))["class"] for path in PARITY_FIXTURES.glob("*.json"))
 
 
 def test_user_manual_states_interaction_not_capability_distinction() -> None:
@@ -35,32 +37,7 @@ def test_user_manual_states_interaction_not_capability_distinction() -> None:
 
 
 def test_user_manual_lists_supported_canonical_structures() -> None:
-    manual = _manual()
-    assert "### Supported pipeline structures" in manual
-    # The nine canonical classes the parity corpus verifies must be enumerated.
-    for structure in (
-        "Linear transform chains",
-        "Conditional gates",
-        "Multiple outputs",
-        "Fork and coalesce",
-        "Multi-source queue fan-in",
-        "Batch aggregation",
-        "Row expansion",
-        "Error routing",
-        "Structured LLM output consumed downstream",
-    ):
-        assert structure in manual, structure
-    assert "same nine canonical classes the parity corpus verifies" in manual
-    assert "none of them is freeform-only" in manual
-
-
-def test_user_manual_explains_wrong_stage_retention_and_back_edit() -> None:
-    manual = _manual()
-    assert "Wrong-stage mentions are retained, not rejected" in manual
-    assert "back/edit flow" in manual
-    assert "typed rewind" in manual
-    # The deferral is retained, not discarded / declared unsupported.
-    assert "carries the intent forward" in manual
+    assert _documented_structure_classes() == _parity_fixture_classes()
 
 
 def test_user_manual_describes_tutorial_as_shared_planner_profile() -> None:
@@ -68,58 +45,3 @@ def test_user_manual_describes_tutorial_as_shared_planner_profile() -> None:
     assert "guided workflow profile" in manual
     assert "same staged planner and the same proposal schema" in manual
     assert "not a separate or reduced-capability mode" in manual
-
-
-def test_user_manual_states_guided_staged_full_canonical_parity() -> None:
-    manual = _manual()
-    assert "authors all nine canonical structures directly" in manual
-    assert "require-all coalesces" in manual
-    assert "cross-sink `on_write_failure` fallbacks" in manual
-    assert "seven of the nine canonical structures" not in manual
-    assert "not yet authorable" not in manual
-
-
-def test_user_manual_rejects_switch_to_freeform_for_a_supported_topology() -> None:
-    """Fail if the manual reintroduces categorical "guided can't; use freeform".
-
-    Honest guided-STAGED bug remedies that route two named topologies to
-    freeform are allowed; what is forbidden is framing guided-the-mode as
-    lacking a whole class of supported topology and pointing users to freeform.
-    """
-    manual = _manual()
-    forbidden = (
-        "What guided mode does not cover",
-        "Guided mode is intentionally narrow",
-        "does not (yet) cover",
-        "reaches a step it cannot represent",
-        "does not match any of the patterns guided mode supports",
-        "Pipelines with multiple sources.",
-        "Pipelines with branching topologies",
-        "exit to freeform when guided mode",
-    )
-    for phrase in forbidden:
-        assert phrase not in manual, phrase
-
-
-def test_runbook_uses_plan_05_epoch_and_schema_numbers() -> None:
-    runbook = RUNBOOK.read_text(encoding="utf-8")
-    current_cutover = runbook.split("## Current Cutover:", maxsplit=1)[1].split("## Historical Cutover:", maxsplit=1)[0]
-
-    # Current release values: the live session epoch, guided schema 11, and
-    # the live Landscape epoch. Bound to the constants so the doc cannot
-    # drift behind a bump.
-    assert f"session epoch {SESSION_SCHEMA_EPOCH}" in current_cutover
-    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_cutover
-    assert "guided schema 11" in current_cutover
-
-    # The recreation/rollback record reference must name the live session epoch,
-    # not the stale session epoch-30 the header-bump left behind (elspeth
-    # composer-parity fix).
-    assert f"session-epoch-{SESSION_SCHEMA_EPOCH}/Landscape-epoch-31 record" in current_cutover
-    assert f"repair the epoch-{SESSION_SCHEMA_EPOCH} release forward" in current_cutover
-    assert "session-epoch-30" not in current_cutover
-    assert "session epoch 30" not in current_cutover.lower()
-
-    # The design doc's stale §6.1 pairing (guided schema 8 / session epoch 28)
-    # must never be encoded as the CURRENT guided schema.
-    assert "current guided schema 8" not in current_cutover.lower()

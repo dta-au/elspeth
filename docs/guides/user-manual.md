@@ -652,22 +652,32 @@ blank proposal.
 
 Both guided and freeform author the full canonical set of pipeline structures:
 
-- **Linear transform chains** — a source through one or more transforms to a
+- **Linear transform chains** (`linear_transform`) — a source through one or
+  more transforms to a
   sink.
-- **Conditional gates** — route rows down different paths by a condition.
-- **Multiple outputs** — fan a stream out to several sinks, including a
+- **Conditional gates** (`conditional_gate`) — route rows down different paths
+  by a condition.
+- **Multiple outputs** (`multi_output`) — fan a stream out to several sinks,
+  including a
   write-failure fallback to another output.
-- **Fork and coalesce** — split a stream into parallel branches and merge them
-  back, including require-all union merges.
-- **Multi-source queue fan-in** — several sources feeding one downstream queue.
-- **Batch aggregation** — compute statistics over batches or groups.
-- **Row expansion** — expand one row into many (deaggregation, JSON explode).
-- **Error routing** — send failed rows to a dedicated failure output.
-- **Structured LLM output consumed downstream** — a typed multi-field LLM result
-  that later stages read by field.
+- **Fork and coalesce** (`fork_coalesce`) — split a stream into parallel branches
+  and merge them back, including require-all union merges.
+- **Fork and row union** (`row_union`) — wait for every correlated fork branch,
+  then release the original rows unchanged in declared branch order for
+  downstream processing.
+- **Multi-source queue fan-in** (`multi_source_queue`) — several sources feeding
+  one downstream queue.
+- **Batch aggregation** (`aggregation`) — compute statistics over batches or
+  groups.
+- **Row expansion** (`row_expansion`) — expand one row into many (deaggregation,
+  JSON explode).
+- **Error routing** (`error_routing`) — send failed rows to a dedicated failure
+  output.
+- **Structured LLM output consumed downstream** (`structured_llm`) — a typed
+  multi-field LLM result that later stages read by field.
 
-These are the same nine canonical classes the parity corpus verifies across
-every authoring surface; none of them is freeform-only.
+These are the canonical classes the live parity corpus verifies across every
+authoring surface; none of them is freeform-only.
 
 ### Choosing between guided and freeform
 
@@ -742,13 +752,6 @@ copy. It may preselect or explain the next relevant decision, but it does not
 substitute a tutorial-only planner, remove capabilities from the planner schema,
 or rewrite the guided rules. Whatever you author in the tutorial transfers
 directly to a real guided session.
-
-### Staged-conversation topology coverage
-
-The staged guided conversation authors all nine canonical structures directly,
-including require-all coalesces and cross-sink `on_write_failure` fallbacks.
-Those shapes use the same shared planner, validation, and commit path as
-freeform and the single-turn `/guided/plan` endpoint.
 
 ### See also
 

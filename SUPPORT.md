@@ -2,9 +2,9 @@
 
 ## Current Support Status
 
-ELSPETH 0.7.1 is currently a pre-production platform outside the
-scoped interim ATO statement described in `docs/release/executive-summary.md`.
-It is not offered with a public service-level agreement.
+ELSPETH is currently a pre-release platform and is not offered with a public
+service-level agreement. See the [project overview](README.md) for the current
+release status.
 
 ## Where To Get Help
 
@@ -14,10 +14,9 @@ It is not offered with a public service-level agreement.
   expected behaviour, actual behaviour, and relevant logs.
 - For security-sensitive issues, follow `SECURITY.md` instead of opening a
   public issue with details.
-- For public-sector evaluation, start with
-  `docs/release/executive-summary.md`,
-  `docs/release/assessment-mapping.md`, `docs/release/guarantees.md`, and the
-  `docs/release/README.md` release-documentation index.
+- For evaluation, start with the [project overview](README.md), then use the
+  [release documentation index](docs/release/README.md) and
+  [Audit and Lineage Guarantees](docs/release/guarantees.md).
 
 ## What Maintainers Need
 

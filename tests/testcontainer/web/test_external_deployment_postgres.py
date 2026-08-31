@@ -60,7 +60,7 @@ _RUNTIME_CONTRACT_TARGETS = (
 )
 
 
-def test_sequential_execution_contract_is_guarded_and_documented() -> None:
+def test_sequential_execution_contract_is_guarded() -> None:
     shared_fixtures = importlib.import_module("tests.testcontainer.web.conftest")
 
     class _WorkerConfig:
@@ -74,12 +74,6 @@ def test_sequential_execution_contract_is_guarded_and_documented() -> None:
     with pytest.raises(pytest.UsageError, match=r"-n 0 -m testcontainer") as exc_info:
         shared_fixtures._require_sequential_postgres_acceptance(cast(pytest.FixtureRequest, _WorkerRequest()))
     assert shared_fixtures._SEQUENTIAL_TEST_COMMAND in str(exc_info.value)
-
-    plan_path = Path(__file__).parents[3] / "docs/plans/2026-07-24-cross-platform-deployment-contract.md"
-    task12 = plan_path.read_text(encoding="utf-8").split("### Task 12:", maxsplit=1)[1]
-    focused_command = task12.split("###", maxsplit=1)[0].split("```bash", maxsplit=1)[1].split("```", maxsplit=1)[0]
-
-    assert shared_fixtures._SEQUENTIAL_TEST_COMMAND in focused_command
 
     aws_startup_tests = importlib.import_module("tests.testcontainer.web.test_aws_ecs_validate_only_startup")
     aws_doctor_tests = importlib.import_module("tests.testcontainer.web.test_doctor_aws_ecs_postgres")

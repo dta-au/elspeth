@@ -355,7 +355,15 @@ def _coerce_key(value: object) -> str:
 _VALUE_FIELD_TYPES: dict[type, Literal["str", "int", "float", "bool"]] = {str: "str", bool: "bool", int: "int", float: "float"}
 
 
-def _derive_joined_field_types(cfg: ReferenceJoinConfig, index: ReferenceIndex) -> dict[str, FieldDefinition]:
+@dataclass(frozen=True, slots=True)
+class _JoinedFieldDerivation:
+    """Public field definition plus the runtime evidence that produced it."""
+
+    definition: FieldDefinition
+    known_non_null_runtime_types: frozenset[type]
+
+
+def _derive_joined_field_types(cfg: ReferenceJoinConfig, index: ReferenceIndex) -> dict[str, _JoinedFieldDerivation]:
     """Derive each joined field's declarable type from the resolved index.
 
     Under ``on_miss: fail`` the emitted set is CLOSED — a row either takes a
@@ -368,43 +376,47 @@ def _derive_joined_field_types(cfg: ReferenceJoinConfig, index: ReferenceIndex) 
     a None it happens to hold is not a value this join can write.
     ``default`` adds the configured default to the set, because a key miss is
     always possible, and every entry can emit there — an unresolved field takes
-    the default rather than failing the row. ``null`` abstains outright: any
-    row may miss and take a None. Unification is conservative — mixed concrete
-    types declare ``any`` (an honest abstention), never a guess; a None in the
-    set makes the field nullable rather than widening its type.
+    the default rather than failing the row. ``null`` keeps the known hit values
+    and makes the field nullable, because any row may miss and take a None.
+    Unification is conservative — mixed concrete types declare ``any`` (an
+    honest abstention), never a guess; a None in the set makes the field
+    nullable rather than widening its type.
     """
     emitting = list(index.entries.values())
     if cfg.on_miss == "fail":
         emitting = [entry_values for entry_values in emitting if all(entry_values[name] is not _UNRESOLVED for name in cfg.output)]
-    derived: dict[str, FieldDefinition] = {}
+    derived: dict[str, _JoinedFieldDerivation] = {}
     for name in sorted(cfg.output):
-        if cfg.on_miss == "null":
-            derived[name] = FieldDefinition(name=name, field_type="any", required=True, nullable=True)
-            continue
         values = [entry_values[name] for entry_values in emitting if entry_values[name] is not _UNRESOLVED]
         if cfg.on_miss == "default":
             values.append(cfg.default_values[name])
-        types: set[Literal["str", "int", "float", "bool", "any"]] = {
-            _VALUE_FIELD_TYPES[type(value)] if type(value) in _VALUE_FIELD_TYPES else "any" for value in values if value is not None
-        }
-        field_type: Literal["str", "int", "float", "bool", "any"] = next(iter(types)) if len(types) == 1 else "any"
-        derived[name] = FieldDefinition(
-            name=name,
-            field_type=field_type,
-            required=True,
-            nullable=any(value is None for value in values),
+        runtime_types = frozenset(type(value) for value in values if value is not None)
+        field_type: Literal["str", "int", "float", "bool", "any"] = "any"
+        if len(runtime_types) == 1:
+            runtime_type = next(iter(runtime_types))
+            field_type = _VALUE_FIELD_TYPES[runtime_type] if runtime_type in _VALUE_FIELD_TYPES else "any"
+        derived[name] = _JoinedFieldDerivation(
+            definition=FieldDefinition(
+                name=name,
+                field_type=field_type,
+                required=True,
+                nullable=cfg.on_miss == "null" or any(value is None for value in values),
+            ),
+            known_non_null_runtime_types=runtime_types,
         )
     return derived
 
 
-def _validate_declared_output_types(cfg: ReferenceJoinConfig, derived: Mapping[str, FieldDefinition]) -> None:
+def _validate_declared_output_types(cfg: ReferenceJoinConfig, derived: Mapping[str, _JoinedFieldDerivation]) -> None:
     """Refuse an authored joined-field declaration the resolved table proves wrong.
 
-    A compatible declaration is honored, never clobbered; either side saying
-    ``any`` is an abstention and cannot refute the other. What IS refutable is
-    refused here at config load — the alternative was silently overwriting the
-    author, which forced a TRUE declaration wrong and steered the correction
-    downstream as type erasure (elspeth-cd5cb844bc).
+    A compatible declaration is honored, never clobbered. Authored ``any`` is
+    an explicit abstention. Derived public ``any`` retains private evidence so
+    a vacuous emitted set cannot refute the author, while known heterogeneous
+    or unrepresentable runtime types can. What IS refutable is refused here at
+    config load — the alternative was silently overwriting the author, which
+    forced a TRUE declaration wrong and steered the correction downstream as
+    type erasure (elspeth-cd5cb844bc).
 
     ``required`` is refused rather than honored for a different reason: every
     joined field is named in the output ``guaranteed_fields``, and honoring
@@ -424,13 +436,22 @@ def _validate_declared_output_types(cfg: ReferenceJoinConfig, derived: Mapping[s
     for declared in cfg.schema_config.fields or ():
         if declared.name not in derived:
             continue
-        derived_field = derived[declared.name]
-        if "any" not in (declared.field_type, derived_field.field_type) and declared.field_type != derived_field.field_type:
-            raise ValueError(
-                f"schema declares {declared.name!r} as {declared.field_type}, but the resolved reference table "
-                f"can only emit {derived_field.field_type} for it. Fix the declaration or the table; a declared "
-                "type is honored, never silently overwritten."
-            )
+        derivation = derived[declared.name]
+        derived_field = derivation.definition
+        runtime_types = derivation.known_non_null_runtime_types
+        if declared.field_type != "any" and runtime_types:
+            matching_runtime_type = False
+            if len(runtime_types) == 1:
+                runtime_type = next(iter(runtime_types))
+                if runtime_type in _VALUE_FIELD_TYPES:
+                    matching_runtime_type = _VALUE_FIELD_TYPES[runtime_type] == declared.field_type
+            if not matching_runtime_type:
+                runtime_type_names = sorted(runtime_type.__name__ for runtime_type in runtime_types)
+                evidence = f"the resolved reference table can emit non-null runtime types {runtime_type_names}"
+                raise ValueError(
+                    f"schema declares {declared.name!r} as {declared.field_type}, but {evidence}. "
+                    "Fix the declaration or the table; a declared type is honored, never silently overwritten."
+                )
         if derived_field.nullable and not declared.nullable:
             reason = (
                 "on_miss is 'null', so any row that misses takes a None"
@@ -461,7 +482,7 @@ def _reference_join_added_output_fields(cfg: ReferenceJoinConfig, index: Referen
     """
     derived = _derive_joined_field_types(cfg, index)
     declared_by_name = {field.name: field for field in cfg.schema_config.fields or ()}
-    return tuple(declared_by_name[name] if name in declared_by_name else derived[name] for name in sorted(cfg.output))
+    return tuple(declared_by_name[name] if name in declared_by_name else derived[name].definition for name in sorted(cfg.output))
 
 
 def _build_reference_join_output_schema_config(cfg: ReferenceJoinConfig, index: ReferenceIndex) -> SchemaConfig:
@@ -495,7 +516,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:94e210ea3f3c3fec"
+    source_file_hash: str | None = "sha256:24109a08dac93c6f"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (

@@ -18,7 +18,6 @@ the explain-tool pointer when some entry resolved to nothing.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -204,7 +203,11 @@ class TestValidationGuidanceCustody:
         redaction snapshot's ``sensitive_path_count`` drops with it.
         """
         payload = _invalid_source_options_set_pipeline(_mock_catalog())
-        assert "plugin schema" in json.dumps(payload["validation_guidance"]).lower()
+        explanation, suggested_fix = explain_validation_code("plugin_options_invalid")
+        assert payload["validation_guidance"]["codes"]["plugin_options_invalid"] == {
+            "explanation": explanation,
+            "suggested_fix": suggested_fix,
+        }
 
         persisted = redact_tool_call_response("set_pipeline", payload, telemetry=NoopRedactionTelemetry())
 

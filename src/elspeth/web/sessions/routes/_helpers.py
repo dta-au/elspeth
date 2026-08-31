@@ -1456,26 +1456,25 @@ def composer_turn_end_assistant_row(result: ComposerResult) -> TransitionAssista
     ``TrustedSystemNoticeSegment``, so the disclosure keeps its backend
     provenance instead of being published as model prose.
 
-    Recognising the re-emission takes BOTH conditions below, and the equality
-    is the one doing the work:
+    Recognising the re-emission starts with the producer-minted
+    ``persisted_assistant_matches_terminal_model_turn`` identity proof. When
+    true, two byte-level invariants make the subtraction exact:
 
-    * ``raw_assistant_content == persisted_assistant_content`` — the result's
-      own pre-synthesis prose is exactly what the committed row holds, which is
-      what makes this an augmentation OF that row rather than a later turn.
+    * ``raw_assistant_content == persisted_assistant_content`` — the terminal
+      turn's pre-synthesis prose is exactly what the committed row holds.
     * ``message.startswith(...)`` — the augmentation-prefix contract, so the
       split is exact.
 
-    The prefix test ALONE would be vacuous: a tool-call turn commonly carries no
-    prose, the row then holds ``""``, and every message starts with ``""``. It
-    would also strip genuine prose on the ``[tool call, then text-only final
-    turn]`` sequence, where the id and content still point at the EARLIER row
-    while ``message`` holds the LATER turn's text — reachable through the
-    B-4D-3 last-chance finalize in ``_classify_and_budget_turn``. The equality
-    declines both, and it declines the advisor-repair branch too, whose row
-    deliberately holds a fixed public message rather than the turn's prose.
+    Bytes alone cannot establish turn identity: a tool-call turn commonly
+    carries no prose, making the prefix test vacuous, while the B-4D-3
+    last-chance finalize can produce later-turn prose byte-identical to an
+    earlier persisted row. The explicit flag declines both later-turn shapes,
+    and it declines the advisor-repair branch too, whose row deliberately holds
+    a fixed public message rather than the turn's prose.
 
-    Every way of getting this wrong therefore fails toward persisting the full
-    message — the pre-fix behaviour — never toward dropping model prose.
+    A false identity flag fails toward persisting the full message — the
+    pre-fix behaviour — never toward dropping model prose. A true flag with
+    inconsistent bytes is an owned audit-invariant violation and fails closed.
 
     Returns ``TransitionAssistantDraft`` because it already IS this pair with
     the audit-boundary type assertions, and because returning a value rather
@@ -1483,9 +1482,14 @@ def composer_turn_end_assistant_row(result: ComposerResult) -> TransitionAssista
     auto-commit-revoked branch, so a pair computed once at the top of the
     handler goes stale. Call this next to the writer that consumes it.
     """
+    if not result.persisted_assistant_matches_terminal_model_turn:
+        return TransitionAssistantDraft(content=result.message, raw_content=result.raw_assistant_content)
     persisted = result.persisted_assistant_content
     if persisted is None or result.raw_assistant_content != persisted or not result.message.startswith(persisted):
-        return TransitionAssistantDraft(content=result.message, raw_content=result.raw_assistant_content)
+        raise AuditIntegrityError(
+            "Tier 1: ComposerResult claims the persisted assistant row matches "
+            "the terminal model turn, but its content/prefix invariants disagree."
+        )
     suffix = result.message[len(persisted) :]
     if not suffix:
         # Unreachable by construction: the only producer that satisfies the

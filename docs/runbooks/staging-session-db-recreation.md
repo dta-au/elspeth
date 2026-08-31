@@ -111,7 +111,7 @@ and epochs; forward and backward compatibility decisions; and an explicit
 the freshly recreated current databases. Rollback across this boundary is
 unsupported: keep the service drained, repair the epoch-47 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-47/Landscape-epoch-31 record when binding candidate and rollback
+session-epoch-47/Landscape-epoch-36 record when binding candidate and rollback
 decisions.
 
 Deployments crossing the 0.7.0 boundary from an older release must also account
@@ -578,16 +578,18 @@ sudo systemctl status "$SERVICE" --no-pager --lines=20
 
 `initialize_session_schema()` recreates the file on service startup. If either health check fails, inspect `journalctl -u elspeth-web.service --no-pager -n 80` before retrying.
 
-After health checks pass, prove the recreated session store carries the current
-hard-cut sentinel before creating any session:
+After health checks pass, prove both recreated stores carry the current hard-cut
+sentinels before creating any session. If `LANDSCAPE_PATH` is not already set,
+resolve it with the Phase 5b procedure above before running these probes:
 
 ```bash
-sqlite3 "$DB_PATH" 'PRAGMA user_version;'  # expect 47 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 47 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 36 (== SQLITE_SCHEMA_EPOCH)
 ```
 
-An epoch-35, epoch-36, epoch-37, epoch-38, epoch-39, or epoch-40 result is not repairable in place: keep the service drained,
-recreate the session database with the current release, and rerun the probe.
-Then create a new session through the API or UI and confirm no
+Any predecessor session or Landscape epoch is not repairable in place: keep the
+service drained, recreate both stores with the current release, and rerun the
+probes. Then create a new session through the API or UI and confirm no
 `SessionSchemaError` appears in the service journal.
 
 #### 0.7.0 epoch + smoke verification

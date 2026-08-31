@@ -549,10 +549,10 @@ class TraversalNode:
       `metadata` is typed as `tuple[Any, ...]` to admit `_SensitiveMarker`
       instances in the metadata position. _SensitiveMarker is a regular
       (non-frozen) class - it holds a `summarizer` callable that we never
-      mutate after construction. The freeze-guard CI tool
-      (scripts/cicd/enforce_freeze_guards.py) only flags forbidden patterns
-      in __post_init__; this dataclass intentionally has no __post_init__
-      and no `freeze_fields()` call. The design assumption is:
+      mutate after construction. The ``immutability.freeze_guards`` lint
+      rule only flags forbidden patterns in __post_init__; this dataclass
+      intentionally has no __post_init__ and no `freeze_fields()` call. The
+      design assumption is:
         1. _SensitiveMarker instances are constructed once (at Annotated[...]
            definition time, module load) and never mutated;
         2. TraversalNode is produced inside walk_model_schema and discarded
