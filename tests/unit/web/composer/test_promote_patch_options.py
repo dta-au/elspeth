@@ -157,6 +157,7 @@ def _state_with_llm_node(node_id: str = "llm1", options: dict[str, Any] | None =
                     "model": "anthropic/claude-haiku-4.5",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                     "prompt_template": "Summarise {{ row.text }}.",
+                    "required_input_fields": ["text"],
                     "schema": {"mode": "observed"},
                 },
                 condition=None,
@@ -408,6 +409,7 @@ class TestPromotePatchNodeOptionsArgErrorRouting:
                 "model": "anthropic/claude-haiku-4.5",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                 "prompt_template": "Old {{ row.text }}.",
+                "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
                 INTERPRETATION_REQUIREMENTS_KEY: [
                     {
@@ -503,6 +505,7 @@ class TestPromotePatchNodeOptionsArgErrorRouting:
                         "model": "anthropic/claude-haiku-4.5",
                         "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                         "prompt_template": "Read {{ row.content }}.",
+                        "required_input_fields": ["content"],
                         "schema": {"mode": "observed"},
                     },
                     condition=None,

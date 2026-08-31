@@ -1165,6 +1165,7 @@ def test_guided_tutorial_shape_short_form_review_builds_a_valid_candidate(tmp_pa
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                     "prompt_template": "Summarise {{ row.page_content }}",
+                    "required_input_fields": ["page_content"],
                     "interpretation_requirements": [_short_form_shield_review()],
                 },
             },

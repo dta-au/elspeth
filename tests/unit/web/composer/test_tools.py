@@ -2060,9 +2060,10 @@ class TestUpsertNode:
                 "on_error": "discard",
                 "options": {
                     "provider": "openrouter",
-                    "model": "openai/gpt-4o-mini",
+                    "model": "openai/gpt-4o",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                     "prompt_template": "Summarise {{ row.content }}.",
+                    "required_input_fields": ["content"],
                     "schema": {"mode": "observed"},
                 },
             },
@@ -8941,7 +8942,7 @@ class TestTransformLlmRetryBudgetPolicy:
         options = _llm_options_with_api_key({"secret_ref": "OPENROUTER_API_KEY"})
         options.update(
             {
-                "prompt_template": "Classify {{ text }}.",
+                "prompt_template": "Classify {{ row.text }}.",
                 "required_input_fields": [],
                 "queries": [
                     {
@@ -9130,7 +9131,7 @@ def _llm_options_with_api_key(api_key: Any) -> dict[str, Any]:
     """Return LLM transform options that are otherwise valid."""
     return {
         "provider": "openrouter",
-        "model": "openai/gpt-4o-mini",
+        "model": "openai/gpt-4o",
         "api_key": api_key,
         "prompt_template": "Classify the current row.",
         "schema": {"mode": "observed"},
@@ -10165,9 +10166,10 @@ class TestSetPipeline:
                 "on_error": "discard",
                 "options": {
                     "provider": "openrouter",
-                    "model": "openai/gpt-4o-mini",
+                    "model": "openai/gpt-4o",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                     "prompt_template": "Classify pending interpretation: {{ row.text }}",
+                    "required_input_fields": ["text"],
                     "schema": {"mode": "observed"},
                     PROMPT_TEMPLATE_PARTS_KEY: [
                         {"kind": "text", "text": "Classify "},
@@ -11129,9 +11131,10 @@ class TestSetPipeline:
                     "on_error": "discard",
                     "options": {
                         "provider": "openrouter",
-                        "model": "openai/gpt-4o-mini",
+                        "model": "openai/gpt-4o",
                         "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                         "prompt_template": "Rate {{ row.color }} for teal pairing.",
+                        "required_input_fields": ["color"],
                         "schema": {
                             "mode": "fixed",
                             "fields": ["color: str", "teal_pairing_rating: str"],
@@ -13847,6 +13850,24 @@ class TestPrevalidatePluginOptions:
         assert "api_key" in result
         assert "template" in result
 
+    def test_llm_secret_ref_does_not_hide_prompt_field_declaration_error(self) -> None:
+        """A deferred credential must not suppress unrelated model validation."""
+        result = _prevalidate_plugin_options(
+            "transform",
+            "llm",
+            {
+                "provider": "openrouter",
+                "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                "model": "openai/gpt-4o",
+                "prompt_template": "Summarise {{ row.text }}",
+                "schema": {"mode": "observed"},
+            },
+        )
+
+        assert result is not None
+        assert "required_input_fields is not declared" in result
+        assert "api_key" not in result
+
     def test_llm_openrouter_invalid_model_surfaces_structural_hint_without_raw_value(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -13875,6 +13896,35 @@ class TestPrevalidatePluginOptions:
             },
         )
         assert result is not None
+        assert result == (
+            "Invalid options for transform 'llm': configured value is not in catalog "
+            "'openrouter'; pick a valid value via the list_models composer tool"
+        )
+        assert "anthropic/claude-3-opus" not in result
+
+    def test_llm_secret_ref_still_runs_value_source_validation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Placeholder validation must continue into catalog-backed checks."""
+        monkeypatch.setattr(
+            "elspeth.engine.orchestrator.preflight.get_catalog_values",
+            lambda catalog_id: frozenset({"openai/gpt-4o"}),
+        )
+
+        result = _prevalidate_plugin_options(
+            "transform",
+            "llm",
+            {
+                "provider": "openrouter",
+                "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                "model": "anthropic/claude-3-opus",
+                "prompt_template": "Analyze: {{ row.text }}",
+                "schema": {"mode": "observed"},
+                "required_input_fields": [],
+            },
+        )
+
         assert result == (
             "Invalid options for transform 'llm': configured value is not in catalog "
             "'openrouter'; pick a valid value via the list_models composer tool"
@@ -14283,7 +14333,8 @@ class TestPrevalidatePluginOptions:
                 "provider": "openrouter",
                 "model": "openai/gpt-4o",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
-                "prompt_template": "Classify: {{text}}",
+                "prompt_template": "Classify: {{ row.text }}",
+                "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
             },
         )

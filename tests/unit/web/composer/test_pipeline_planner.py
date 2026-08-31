@@ -519,7 +519,7 @@ def _pipeline_with_short_form_llm_review(data_dir: Path) -> dict[str, Any]:
             "on_success": "rows",
             "options": {
                 "path": str(data_dir / "blobs" / _TEST_SESSION_ID / "input.csv"),
-                "schema": {"mode": "observed"},
+                "schema": {"mode": "flexible", "fields": ["text: str"]},
             },
             "on_validation_failure": "discard",
         },
@@ -537,6 +537,7 @@ def _pipeline_with_short_form_llm_review(data_dir: Path) -> dict[str, Any]:
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                     "prompt_template": "Summarise {{ row.text }}",
+                    "required_input_fields": ["text"],
                     "interpretation_requirements": [
                         {
                             "kind": "pipeline_decision",
