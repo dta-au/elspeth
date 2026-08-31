@@ -195,13 +195,22 @@ def finish_composer_request_metrics(
     token: Token[_RequestMetricsState | None],
     *,
     status: ComposerRequestTerminalStatus,
+    primary_error: BaseException | None = None,
 ) -> None:
-    """Project one request aggregate and restore the prior task context."""
+    """Project one request aggregate and restore the prior task context.
+
+    A stale or cross-context token is a first-party pairing bug and therefore
+    propagates on an otherwise successful request. During failure unwinding,
+    however, telemetry remains subordinate: the pairing defect is recorded
+    without replacing the request's primary exception.
+    """
 
     state = _REQUEST_METRICS_STATE.get()
     try:
         _REQUEST_METRICS_STATE.reset(token)
     except (RuntimeError, ValueError) as exc:
+        if primary_error is None:
+            raise
         _log_projection_failure(operation="request", error_type=type(exc).__name__)
         return
     if state is None or status not in _REQUEST_STATUSES:

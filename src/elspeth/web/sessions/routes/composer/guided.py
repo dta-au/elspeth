@@ -1745,12 +1745,24 @@ async def post_guided_start(
                 if isinstance(exc, AuditIntegrityError)
                 else "operation_failed"
             )
-            if isinstance(exc, AuditIntegrityError):
+            if failure_code != "stale_conflict":
+                # Every failure that terminates this route, not just the
+                # integrity ones. The durable row records THAT the operation
+                # failed and the coded response stays exactly replayable, but
+                # neither carries where it broke: before this widened, an
+                # unclassified first-party bug settled as ``operation_failed``
+                # and its traceback was discarded, leaving no server-side
+                # record of the defect at all. ``stale_conflict`` is excluded
+                # deliberately — a settlement conflict is an expected
+                # concurrency outcome with its own 409 contract, not a fault
+                # to page on. ``_safe_frame_strings`` emits file/line/function
+                # only, never exception values.
                 slog.error(
                     "guided.operation_terminal_failure",
                     session_id=str(session_id),
                     user_id=user.user_id,
                     exc_class=type(exc).__name__,
+                    failure_code=failure_code,
                     site="post_guided_start",
                     frames=_safe_frame_strings(exc),
                     # R2-F16b: the response carries ``X-Request-ID`` but this
@@ -2002,12 +2014,18 @@ async def post_guided_convert(
             if isinstance(exc, AuditIntegrityError)
             else "operation_failed"
         )
-        if isinstance(exc, AuditIntegrityError):
+        if failure_code != "stale_conflict":
+            # Widened with post_guided_start, and for the same reason: an
+            # unclassified first-party bug used to settle as
+            # ``operation_failed`` with its traceback discarded and no
+            # server-side record of where it broke. ``stale_conflict`` stays
+            # out as an expected concurrency outcome.
             slog.error(
                 "guided.operation_terminal_failure",
                 session_id=str(session_id),
                 user_id=user.user_id,
                 exc_class=type(exc).__name__,
+                failure_code=failure_code,
                 site="post_guided_convert",
                 frames=_safe_frame_strings(exc),
                 # See the post_guided_start site (R2-F16b): correlates this log

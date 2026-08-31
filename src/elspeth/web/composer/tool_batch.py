@@ -33,6 +33,9 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedToolBatch,
     _AdmittedToolCall,
     _AdmittedToolFunction,
+    _AdvisorCallSuccess,
+    _AdvisorFirstPartyFailure,
+    _AdvisorProviderFailure,
     _CallModelOutcome,
     _DispatchOutcome,
     _ToolBatchCancellationRequested,
@@ -660,6 +663,7 @@ async def run_tool_batch(
     tool_outcomes: list[_ToolOutcome] = []
     plugin_crash: ComposerPluginCrashError | None = None
     plugin_crash_cause: BaseException | None = None
+    advisor_failure: Exception | None = None
     advisor_compose_timeout: Literal["pre_call", "in_flight"] | None = None
     pre_state_id: str | None = current_state_id
     ctx.service._phase3_last_expected_current_state_id = pre_state_id
@@ -1679,7 +1683,7 @@ async def run_tool_batch(
             advisor_calls_used += 1
 
             try:
-                guidance, advisor_meta = await ctx.service._call_advisor_with_audit(
+                advisor_outcome = await ctx.service._call_advisor_for_tool(
                     arguments,
                     recorder=recorder,
                     timeout=effective_advisor_timeout,
@@ -1748,20 +1752,16 @@ async def run_tool_batch(
                 )
                 turn_has_discovery = True
                 continue
-            except Exception as advisor_exc:
-                # Tier 3 boundary: outbound LLM call failed. Convert
-                # to a structured tool-result error so the composer
-                # LLM gets feedback rather than a silent stall. The
-                # inner ComposerLLMCall record was already fired by
-                # _call_advisor_with_audit's finally block, so the
-                # audit trail captures the failure mode regardless.
-                # Budget was already consumed above (F2) — the
-                # outbound call attempt counts whether or not it
-                # produced guidance.
+
+            if type(advisor_outcome) is _AdvisorProviderFailure:
+                # The service owns the Tier-3 provider taxonomy and returns
+                # this explicit recoverable outcome. Budget was already
+                # consumed above: the outbound attempt counts whether or not
+                # it produced guidance.
                 advisor_error_payload = {
                     "status": "ADVISOR_ERROR",
                     "error": "Advisor call failed; no guidance returned.",
-                    "error_class": type(advisor_exc).__name__,
+                    "error_class": advisor_outcome.error_class,
                     "budget_used": advisor_calls_used,
                     "budget_remaining": budget - advisor_calls_used,
                 }
@@ -1793,6 +1793,27 @@ async def run_tool_batch(
                 )
                 turn_has_discovery = True
                 continue
+
+            if type(advisor_outcome) is _AdvisorFirstPartyFailure:
+                # A controlled-code fault is not provider feedback. Close the
+                # outer dispatch truthfully, carry it through P4, and let the
+                # driver re-raise this exact exception object after the tool
+                # row has been published.
+                first_party_exc = advisor_outcome.original_exc
+                recorder.record(finish_plugin_crash(audit, exc=first_party_exc))
+                _append_tool_outcome(
+                    response=None,
+                    error_class=type(first_party_exc).__name__,
+                    error_message=type(first_party_exc).__name__,
+                    post_version=state.version,
+                )
+                advisor_failure = first_party_exc
+                break
+
+            if type(advisor_outcome) is not _AdvisorCallSuccess:
+                raise AuditIntegrityError("Advisor call returned an unknown owned outcome")
+            guidance = advisor_outcome.guidance
+            advisor_meta = advisor_outcome.metadata
 
             success_payload = {
                 "status": "SUCCESS",
@@ -2401,6 +2422,7 @@ async def run_tool_batch(
         all_cache_hits=all_cache_hits,
         plugin_crash=plugin_crash,
         plugin_crash_cause=plugin_crash_cause,
+        advisor_failure=advisor_failure,
         advisor_compose_timeout=advisor_compose_timeout,
         assistant_message=assistant_message,
         raw_assistant_content=raw_assistant_content,

@@ -2312,10 +2312,15 @@ async def _track_compose_inflight(
         terminal_status = "failed"
         raise
     finally:
+        primary_error = sys.exception()
         try:
             registry.end_request(sid)
         finally:
-            finish_composer_request_metrics(metrics_token, status=terminal_status)
+            finish_composer_request_metrics(
+                metrics_token,
+                status=terminal_status,
+                primary_error=primary_error,
+            )
 
 
 async def _state_data_from_composer_state(

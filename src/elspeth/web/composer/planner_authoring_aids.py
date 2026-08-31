@@ -1686,11 +1686,11 @@ def build_schema_contract_evidence(
             omission_candidates.append({"plugin_id": label, "reason": "entry_budget_exceeded"})
             continue
         kind = pair[0]
-        try:
-            schema = catalog.get_schema(kind, pair[1])
-        except ValueError:
-            omission_candidates.append({"plugin_id": label, "reason": "schema_unavailable"})
-            continue
+        # Availability is settled against this same snapshot above and
+        # get_schema re-derives it before touching first-party catalog and
+        # profile code, so a ValueError escaping here is an internal defect
+        # — it propagates rather than being recorded as an omission.
+        schema = catalog.get_schema(kind, pair[1])
         if schema.plugin_type != kind or schema.name != pair[1]:
             omission_candidates.append({"plugin_id": label, "reason": "schema_identity_mismatch"})
             continue

@@ -1765,6 +1765,83 @@ def test_guided_full_cancellation_fence_loss_checks_for_a_winner_before_preservi
     )
 
 
+@pytest.mark.parametrize(
+    ("lookup_failure", "expected_exc_class"),
+    (
+        (AuditIntegrityError("winner replay failed its integrity check"), "AuditIntegrityError"),
+        (RuntimeError("winner rejoin defect"), "RuntimeError"),
+    ),
+    ids=("integrity", "first_party_defect"),
+)
+def test_guided_full_cancellation_fence_loss_propagates_a_failed_winner_lookup(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+    lookup_failure: Exception,
+    expected_exc_class: str,
+) -> None:
+    """A failed winner rejoin outranks the cancellation it was enriching.
+
+    Parity with the ordinary-failure arm, which already propagates here: this
+    route lost the fence, so it has no durable write of its own in doubt —
+    what is in doubt is the operation record it just failed to read. Noting
+    that and reporting ``cancelled`` filed a Tier-1 corruption signal, or a
+    first-party defect in the rejoin, as a log line under a routine terminal
+    event. The bounded secondary note still lands first.
+    """
+    from structlog.testing import capture_logs
+
+    class _BlockingPlanner:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def plan_guided_full_pipeline(self, **_kwargs):
+            self.started.set()
+            await asyncio.Event().wait()
+
+    planner = _BlockingPlanner()
+    real_reserve = reserve_or_replay_guided_operation
+
+    async def lose_failure_fence(command):
+        raise GuidedOperationFenceLostError(command.fence)
+
+    async def failing_winner_lookup(**kwargs):
+        if kwargs.get("reserve_if_absent") is False:
+            raise lookup_failure
+        return await real_reserve(**kwargs)
+
+    composer_test_client.app.state.composer_service = planner
+    monkeypatch.setattr(
+        composer_test_client.app.state.session_service,
+        "fail_guided_operation_with_audit",
+        lose_failure_fence,
+    )
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", failing_winner_lookup)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided cancel lookup fault"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000081"
+
+    async def cancel_request() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Cancel into a broken winner rejoin."},
+                )
+            )
+            await asyncio.wait_for(planner.started.wait(), timeout=3)
+            request_task.cancel("cancellation must not outrank a broken rejoin")
+            with pytest.raises(type(lookup_failure)) as exc_info:
+                await request_task
+            assert exc_info.value is lookup_failure
+
+    with capture_logs() as logs:
+        asyncio.run(cancel_request())
+
+    secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
+    assert len(secondary_events) == 1
+    assert secondary_events[0]["site"] == "fence_lost_winner_lookup"
+    assert secondary_events[0]["secondary_exc_class"] == expected_exc_class
+
+
 def test_guided_full_takeover_fences_stale_worker_and_joins_one_winner(
     composer_test_client,
 ) -> None:

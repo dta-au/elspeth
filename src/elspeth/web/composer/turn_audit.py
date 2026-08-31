@@ -24,7 +24,6 @@ from elspeth.web.composer._compose_loop_carriers import (
     _ToolOutcome,
 )
 from elspeth.web.composer.bounded_json import bounded_json_loads
-from elspeth.web.composer.protocol import ComposerPluginCrashError
 from elspeth.web.composer.tool_error_payloads import (
     INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
     unknown_tool_arguments_redaction,
@@ -43,7 +42,7 @@ async def persist_turn_audit(
     assistant_message: _AdmittedAssistantMessage,
     raw_assistant_content: str | None,
     assistant_tool_calls: tuple[_AdmittedToolCall, ...],
-    plugin_crash: ComposerPluginCrashError | None,
+    crash_pending: bool,
     session_id: str | None,
     current_state_id: str | None,
     persisted_tool_call_turn: bool,
@@ -68,11 +67,9 @@ async def persist_turn_audit(
        Unwind-audit invariants are checked after the persist returns;
        failures raise additional AuditIntegrityError(s).
 
-    Plugin-crash propagation (the post-persist re-raise of a
-    ``ComposerPluginCrashError`` captured in P3) is intentionally
-    *not* in this helper: the driver decides whether to raise based
-    on ``dispatch.plugin_crash is not None`` so the carrier never
-    carries a "post-crash" disposition.
+    Crash propagation is intentionally *not* in this helper. P3 supplies a
+    discriminated carrier (plugin crash or first-party advisor failure), and
+    the driver raises it only after this phase publishes the closed row.
 
     ``assistant_row_uses_current_dispatch`` is the caller-owned P4
     disposition for whether ``assistant_message`` still contains the current
@@ -134,7 +131,7 @@ async def persist_turn_audit(
                 )
         else:
             decoded_args = {"_raw_arguments": tc.function.arguments}
-        is_arg_error = tool_outcome.error_class is not None and not (plugin_crash is not None and index == len(tool_outcomes) - 1)
+        is_arg_error = tool_outcome.error_class is not None and not (crash_pending and index == len(tool_outcomes) - 1)
         if is_arg_error:
             arg_error_projection = redact_arg_error_response(
                 error_class=tool_outcome.error_class,
@@ -197,7 +194,7 @@ async def persist_turn_audit(
                     if tool_outcome.error_class is None
                     else (
                         ComposerToolStatus.PLUGIN_CRASH
-                        if plugin_crash is not None and index == len(tool_outcomes) - 1
+                        if crash_pending and index == len(tool_outcomes) - 1
                         else ComposerToolStatus.ARG_ERROR
                     )
                 ),
@@ -226,7 +223,7 @@ async def persist_turn_audit(
                 parent_composition_state_id=current_state_id,
                 expected_current_state_id=current_state_id,
                 writer_principal="compose_loop",
-                plugin_crash_pending=plugin_crash is not None,
+                plugin_crash_pending=crash_pending,
             )
         except AuditIntegrityError as exc:
             exc.failed_turn = FailedTurnMetadata(
@@ -243,7 +240,7 @@ async def persist_turn_audit(
             tool_calls_attempted=len(assistant_tool_calls),
             tool_responses_persisted=0 if audit_outcome.assistant_id is None else len(redacted_tool_rows),
         )
-        if audit_outcome.assistant_id is None and plugin_crash is None:
+        if audit_outcome.assistant_id is None and not crash_pending:
             raise AuditIntegrityError(
                 "persist_compose_turn_async returned unwind_audit_failed without an in-flight plugin crash",
                 failed_turn=failed_turn,

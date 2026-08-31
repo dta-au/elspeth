@@ -2414,6 +2414,84 @@ def test_noncanonical_schema_serializer_fails_closed() -> None:
     assert payload["data"]["next_tool"] == "get_plugin_assistance"
 
 
+def _node_component_read(current_state: CompositionState) -> tuple[_ParsedToolCall, ToolResult]:
+    result = ToolResult(
+        success=True,
+        updated_state=current_state,
+        validation=current_state.validate(),
+        affected_nodes=(),
+        data={"node": {"id": "map-1"}},
+    )
+    call = _ParsedToolCall(
+        call_id="call-1",
+        name="get_pipeline_state",
+        raw_arguments='{"component":"map_fields"}',
+        arguments={"component": "map_fields"},
+    )
+    return call, result
+
+
+def test_malformed_projection_node_candidate_raises_instead_of_failing_closed() -> None:
+    """A node candidate in the policy-owned server-computed projection that
+    cannot honour the fixed block contract is an internal invariant failure:
+    it must raise, not be laundered into surface_projection_unavailable."""
+    current_state = _empty_state()
+    call, result = _node_component_read(current_state)
+
+    with pytest.raises(TypeError):
+        _serialize_provider_discovery_result(
+            call=call,
+            result=result,
+            surface=PlannerSurface.GUIDED_STAGED,
+            provider_current_state={"nodes": ["malformed-candidate"]},
+        )
+
+
+def test_unmatched_projection_node_read_still_fails_closed() -> None:
+    """Well-formed candidates that simply do not match the selected id keep
+    the closed surface_projection_unavailable outcome."""
+    current_state = _empty_state()
+    call, result = _node_component_read(current_state)
+
+    payload = json.loads(
+        _serialize_provider_discovery_result(
+            call=call,
+            result=result,
+            surface=PlannerSurface.GUIDED_STAGED,
+            provider_current_state={"nodes": [{"id": "other-node"}]},
+        )
+    )
+
+    assert payload["success"] is False
+    assert payload["data"]["error_code"] == "surface_projection_unavailable"
+
+
+def test_malformed_projection_output_candidate_raises_instead_of_failing_closed() -> None:
+    """Owned output candidates obey the same invariant posture as nodes."""
+    current_state = _empty_state()
+    result = ToolResult(
+        success=True,
+        updated_state=current_state,
+        validation=current_state.validate(),
+        affected_nodes=(),
+        data={"output": {"sink_name": "rows"}},
+    )
+    call = _ParsedToolCall(
+        call_id="call-output",
+        name="get_pipeline_state",
+        raw_arguments='{"component":"rows"}',
+        arguments={"component": "rows"},
+    )
+
+    with pytest.raises(TypeError):
+        _serialize_provider_discovery_result(
+            call=call,
+            result=result,
+            surface=PlannerSurface.GUIDED_STAGED,
+            provider_current_state={"outputs": ["malformed-candidate"]},
+        )
+
+
 @pytest.mark.asyncio
 async def test_schema_fact_survives_rejection_while_issue_specific_discovery_adds_information(
     tmp_path: Path,

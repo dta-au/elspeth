@@ -668,6 +668,53 @@ async def test_guided_start_integrity_failure_is_terminal_and_safe_to_replay(tmp
 
 
 @pytest.mark.asyncio
+async def test_guided_start_unclassified_failure_is_recorded_with_its_failure_code(tmp_path) -> None:
+    """A first-party bug settles AND leaves a server-side record.
+
+    The durable row and the replayable coded response say only THAT the
+    operation failed. Before the diagnostic widened past the integrity arm,
+    an unclassified defect discarded its traceback entirely, so the one 500
+    an operator had to work from named no site, no class and no frames. The
+    response contract is deliberately unchanged — settlement succeeded, so
+    the coded answer stays exactly replayable.
+    """
+    from structlog.testing import capture_logs
+
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "T", "local")
+    operation_id = str(uuid.uuid4())
+    payload = {"profile": "tutorial", "operation_id": operation_id}
+
+    with (
+        capture_logs() as logs,
+        patch.object(
+            service,
+            "seed_or_complete_guided_start_operation",
+            side_effect=TypeError("unclassified first-party defect"),
+        ),
+    ):
+        first = client.post(f"/api/sessions/{session.id}/guided/start", json=payload)
+    replay = client.post(f"/api/sessions/{session.id}/guided/start", json=payload)
+
+    expected = {
+        "detail": {
+            "error_type": "guided_operation_terminal_failure",
+            "failure_code": "operation_failed",
+            "detail": "The operation failed.",
+        }
+    }
+    assert first.status_code == replay.status_code == 500
+    assert first.json() == replay.json() == expected
+    event = next(entry for entry in logs if entry.get("event") == "guided.operation_terminal_failure")
+    assert event["exc_class"] == "TypeError"
+    assert event["failure_code"] == "operation_failed"
+    assert event["site"] == "post_guided_start"
+    assert event["frames"]
+    assert "unclassified first-party defect" not in repr(event)
+
+
+@pytest.mark.asyncio
 async def test_guided_start_terminal_failure_log_correlates_to_the_response_header(tmp_path) -> None:
     """R2-F16b: the ``X-Request-ID`` an operator quotes must find the log line.
 
