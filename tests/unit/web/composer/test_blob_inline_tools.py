@@ -307,6 +307,66 @@ class TestListComposerBlobs:
 
 
 class TestWireBlobInlineRef:
+    @pytest.mark.parametrize(
+        ("node_type", "overrides"),
+        (
+            ("gate", {"condition": "True", "routes": {"true": "classified", "false": "classified"}}),
+            ("coalesce", {"branches": ("left", "right"), "policy": "require_all", "merge": "union", "on_success": "classified"}),
+            ("row_union", {"input": "left", "branches": {"left": "left", "right": "right"}, "on_success": "unioned"}),
+            ("queue", {"input": "structural"}),
+        ),
+    )
+    def test_rejects_structural_node_without_runtime_plugin_options(
+        self,
+        blob_env: dict[str, Any],
+        node_type: str,
+        overrides: dict[str, Any],
+    ) -> None:
+        """A successful wire must survive into the canonical runtime dict.
+
+        Structural nodes do not have plugin options in runtime YAML. Before
+        this guard, gate/coalesce markers vanished during lowering while
+        row_union/queue markers left an invalid state behind after the tool
+        had already reported success.
+        """
+        blob = _create_blob(blob_env, content="structural-node marker")
+        fields: dict[str, Any] = {
+            "id": "structural",
+            "node_type": node_type,
+            "plugin": None,
+            "input": "rows",
+            "on_success": None,
+            "on_error": None,
+            "options": {},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            "branches": None,
+            "policy": None,
+            "merge": None,
+        }
+        state = replace(_inline_ref_state(), nodes=(NodeSpec(**{**fields, **overrides}),))
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": "node:structural.options.payload",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.updated_state.nodes[0].options == {}
+        assert result.data["error"] == (
+            "Inline blob references can only be wired into source, transform, aggregation, collector, or output plugin options."
+        )
+
     def test_candidate_runs_canonical_review_invariant_before_publication(
         self,
         blob_env: dict[str, Any],

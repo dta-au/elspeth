@@ -523,6 +523,10 @@ def _apply_inline_blob_marker(state: CompositionState, field_path: str, marker: 
         found = False
         for node in state.nodes:
             if node.id == node_id:
+                if node.node_type not in ("transform", "aggregation", "collector") or node.plugin is None:
+                    raise ValueError(
+                        "Inline blob references can only be wired into source, transform, aggregation, collector, or output plugin options."
+                    )
                 if node.plugin == "llm" and keys[0] == INTERPRETATION_REQUIREMENTS_KEY:
                     raise ValueError(
                         "wire_blob_inline_ref cannot write LLM interpretation_requirements; "
@@ -711,7 +715,8 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
                 "type": "string",
                 "description": (
                     "Canonical path: source.options.<field>, source:<name>.options.<field>, "
-                    "node:<node_id>.options.<field>, or output:<name>.options.<field>."
+                    "node:<node_id>.options.<field> for a transform, aggregation, or collector, "
+                    "or output:<name>.options.<field>."
                 ),
             },
             "blob_id": {"type": "string", "format": "uuid", "description": "Ready blob ID to wire as inline content."},

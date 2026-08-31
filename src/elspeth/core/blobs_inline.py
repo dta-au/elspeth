@@ -44,10 +44,11 @@ from elspeth.contracts.blobs_inline import (
 # execution path loads is that same dict serialized). Asking it what it emits
 # gives: options-bearing sections are ``sources``, ``transforms``,
 # ``aggregations``, ``collectors`` and ``sinks``; ``gates`` and ``coalesce``
-# are emitted but PROVABLY INERT — the composer refuses options on them, so
-# both keys below have never matched anything. They are kept rather than
-# removed: deleting a key this walk currently accepts is a behaviour change
-# bought for tidiness, and a persisted record is cheap to keep tolerating.
+# are emitted without options. The blob authoring tool also rejects every
+# plugin-free structural node before mutation, because no inline marker could
+# survive into runtime YAML. Both legacy keys below are kept as tolerant
+# defence-in-depth for a non-canonical persisted dict rather than removed for
+# tidiness.
 # ``collectors`` was the live gap (elspeth-ca79b2c63a).
 #
 # Do NOT replace this with ``core/config.py``'s ``_plugin_bearing_sections()``,
