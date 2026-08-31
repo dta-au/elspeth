@@ -589,7 +589,8 @@ def resolve_guaranteed_field_type(
     a farther declaration describes a value that no longer flows), and the
     walk recurses only through nodes that did NOT declare it, following the
     same topology the guarantee walk traverses (transparent gates,
-    pass-through transforms, queue/row_union fan-in, coalesce branches).
+    value-preserving pass-through/forwarding transforms, queue/row_union
+    fan-in, coalesce branches).
 
     Two structural arms extend "declaration" beyond ``fields:`` entries
     (elspeth-e6e552ce34): an OBSERVED source with a structural cell type
@@ -680,8 +681,16 @@ def _resolve_guaranteed_field_type_uncached(
             )
         return None
 
+    forwards_field_unchanged = (
+        node_info.forwards_input_fields
+        and node_info.preserves_input_values
+        and field_name not in node_info.removed_input_fields
+        and (config is None or config.allows_extra_fields)
+    )
     recurses = (
-        node_info.node_type in (NodeType.GATE, NodeType.QUEUE, NodeType.ROW_UNION, NodeType.COALESCE) or node_info.passes_through_input
+        node_info.node_type in (NodeType.GATE, NodeType.QUEUE, NodeType.ROW_UNION, NodeType.COALESCE)
+        or node_info.passes_through_input
+        or forwards_field_unchanged
     )
     if not recurses:
         return None

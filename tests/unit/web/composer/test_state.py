@@ -8655,6 +8655,49 @@ class TestSchemaContractValidation:
         assert sink_contract.producer_guarantees == ("b", "keep")
         assert sink_contract.satisfied is True
 
+    def test_open_mapper_forwarded_type_mismatch_is_rejected(self) -> None:
+        """Composer mirrors runtime type evidence carried by an open forwarder."""
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "fixed", "fields": ["a: str", "keep: str"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "mapped",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"a": "b"},
+                    "select_only": False,
+                    "schema": {"mode": "flexible", "fields": ["a: str"]},
+                },
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "typed",
+                "mapped",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"keep": "keep"},
+                    "select_only": True,
+                    "schema": {"mode": "flexible", "fields": ["keep: int"]},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        mismatch = [entry for entry in result.errors if entry.error_code == "edge_field_type_incompatible"]
+        assert mismatch
+        assert "keep (consumer expects int, producer emits str)" in mismatch[0].message
+
     def test_rule_d_fires_on_a_required_fields_rename_onto_a_guaranteed_field(self) -> None:
         """Third declaration channel (adversarial review of a7c783423): required_fields.
 

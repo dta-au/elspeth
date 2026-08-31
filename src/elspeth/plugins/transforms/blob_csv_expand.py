@@ -25,7 +25,7 @@ from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.sources.field_normalization import ExternalHeaderError, resolve_field_names
+from elspeth.plugins.sources.field_normalization import ExternalHeaderError, is_normalized_field_name, resolve_field_names
 from elspeth.plugins.transforms.blob_expand_contract import (
     BLOB_REF_FIELD_DESCRIPTION,
     DEFAULT_BLOB_REF_FIELD,
@@ -303,7 +303,7 @@ class BlobCSVExpand(BaseTransform):
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ae36b059ccabbfd3"
+    source_file_hash: str | None = "sha256:22860bd59bc2c415"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
@@ -327,6 +327,7 @@ class BlobCSVExpand(BaseTransform):
     capability_tags: tuple[str, ...] = ("csv", "blob", "tabular", "fan-out")
     creates_tokens = True
     passes_through_input = True
+    preserves_input_values = True
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
@@ -375,12 +376,14 @@ class BlobCSVExpand(BaseTransform):
         # The blob arm is untouched: it reads a hash, not the document, so it
         # keeps the stronger class-level promise. `named_text_field` is the
         # arm-aware spelling and is None on the blob arm, so this cannot claim
-        # to remove a column that arm never reads.
+        # to remove a column that arm never reads. An original-header spelling
+        # makes the inline arm abstain because only row lineage can name the
+        # normalized removal.
         removed_text_field = cfg.named_text_field if cfg.source == "field" else None
         if removed_text_field is not None:
             self.passes_through_input = False
-            self.forwards_input_fields = True
-            self.removed_input_fields = frozenset({removed_text_field})
+            self.forwards_input_fields = is_normalized_field_name(removed_text_field)
+            self.removed_input_fields = frozenset({removed_text_field}) if self.forwards_input_fields else frozenset()
 
         self.input_schema = create_schema_from_config(cfg.schema_config, "BlobCSVExpandInput", allow_coercion=False)
         self._output_schema_config = _build_blob_csv_output_schema_config(cfg.schema_config, cfg)
@@ -485,14 +488,15 @@ class BlobCSVExpand(BaseTransform):
         # Drop the consumed source document AFTER parsing, and after the
         # collision check has seen it: the emitted rows must not carry the whole
         # document, but a CSV header colliding with the text column is still a
-        # genuine collision on the row that arrived. Only the inline arm removes
-        # anything — `self.removed_input_fields` is empty on the blob arm, so
-        # this is a no-op there rather than an arm test repeated in two places.
+        # genuine collision on the row that arrived. Only the inline arm
+        # removes anything; this runtime removal stays separate from the
+        # static declaration, which may abstain for an original-header name.
         # `base` carries NORMALIZED keys while the configured name may be the
         # original header, so resolve it through the contract exactly as
         # line_explode/json_explode do. `_load_field_text` already routed a row
         # on which the name does not resolve, so on this path the key exists.
-        for removed in self.removed_input_fields:
+        runtime_removed_fields = (self._text_field,) if self._source == "field" else ()
+        for removed in runtime_removed_fields:
             normalized_removed = removed if removed in base else row.contract.resolve_name(removed)
             del base[normalized_removed]
 

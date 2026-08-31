@@ -24,11 +24,14 @@ from pydantic import Field, field_validator, model_validator
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
+from elspeth.contracts.errors import PluginContractViolation
+from elspeth.contracts.field_collision import detect_field_collisions
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.sources.field_normalization import is_normalized_field_name
 
 if TYPE_CHECKING:
     from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -296,7 +299,7 @@ class LineExplode(BaseTransform):
     name = "line_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1affe90c77cd763a"
+    source_file_hash: str | None = "sha256:b28e69f0fa4f5d77"
     config_model = LineExplodeConfig
     usage_when_to_use: str = (
         "Use to split one newline-framed text field into rows while preserving the rest of the input "
@@ -319,6 +322,7 @@ class LineExplode(BaseTransform):
 """
     capability_tags: tuple[str, ...] = ("text", "lines", "fan-out", "deaggregation")
     creates_tokens = True
+    preserves_input_values = True
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
@@ -344,9 +348,11 @@ class LineExplode(BaseTransform):
         # upstream llm's <response_field>_usage / _model — really do reach the
         # next consumer. `passes_through_input` cannot say that (source_field
         # is dropped), which is what hid those columns from the extras firewall
-        # (elspeth-15c72686f2).
-        self.forwards_input_fields = True
-        self.removed_input_fields = frozenset({cfg.source_field})
+        # (elspeth-15c72686f2). An original-header spelling cannot name the
+        # normalized key removed at runtime, so the static declaration
+        # abstains while process() resolves that key from row lineage.
+        self.forwards_input_fields = is_normalized_field_name(cfg.source_field)
+        self.removed_input_fields = frozenset({cfg.source_field}) if self.forwards_input_fields else frozenset()
 
         fields = [cfg.output_field]
         if cfg.include_index:
@@ -364,6 +370,10 @@ class LineExplode(BaseTransform):
         return _build_line_explode_input_requirements(
             source_field=self._source_field,
         )
+
+    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Inject one valid line so the value-preservation harness reaches emission."""
+        return [self._augment_invariant_probe_row(probe, field_name=self._source_field, value="only-line")]
 
     def output_semantics(self) -> OutputSemanticDeclaration:
         return _build_line_explode_output_semantics(
@@ -477,6 +487,12 @@ class LineExplode(BaseTransform):
             normalized_source_field = self._source_field
         else:
             normalized_source_field = row.contract.resolve_name(self._source_field)
+        collisions = detect_field_collisions(set(row_data) - {normalized_source_field}, self.declared_output_fields)
+        if collisions:
+            raise PluginContractViolation(
+                f"Transform '{self.name}' would overwrite existing input fields {collisions}. "
+                "This is a pipeline configuration error — the transform's output fields collide with fields already present in the row."
+            )
         base = {k: v for k, v in row_data.items() if k != normalized_source_field}
 
         output_rows: list[dict[str, Any]] = []

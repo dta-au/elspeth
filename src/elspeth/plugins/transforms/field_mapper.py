@@ -26,7 +26,7 @@ from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.sentinels import MISSING
 from elspeth.plugins.infrastructure.utils import get_nested_field
-from elspeth.plugins.sources.field_normalization import ExternalHeaderError, normalize_field_name
+from elspeth.plugins.sources.field_normalization import ExternalHeaderError, is_normalized_field_name, normalize_field_name
 
 
 def _names_a_row_key(name: str) -> bool:
@@ -57,10 +57,7 @@ def _names_a_row_key(name: str) -> bool:
     from an algorithm bug propagates, so the error class a bad mapping key
     raises at construction is unchanged.
     """
-    try:
-        return normalize_field_name(name) == name
-    except ExternalHeaderError:
-        return False
+    return is_normalized_field_name(name)
 
 
 def _is_static_normalized_source(source: str) -> bool:
@@ -310,8 +307,9 @@ class FieldMapper(BaseTransform):
 
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
+    preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:79de7f8d5fa10ecc"
+    source_file_hash: str | None = "sha256:c29647b8ca4c81e1"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "

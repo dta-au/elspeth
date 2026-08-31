@@ -512,12 +512,14 @@ class BaseTransform(ABC):
     # (type_coerce and value_transform both declare passes_through_input=True
     # while doing exactly that). This flag carries the value half:
     #
-    # True means process() NEVER changes the value of any field present on the
-    # input row — it may only ADD new fields (and, for row-filtering
-    # declarers, drop whole rows). Under that promise the build-time
+    # True means process() NEVER changes the value of any input field that
+    # survives on its output row — it may ADD new fields, remove the fields
+    # named by ``removed_input_fields``, and drop whole rows. Under that promise the build-time
     # type-resolution walk (resolve_guaranteed_field_type,
     # core/dag/guarantees.py) may recurse through this transform even when its
     # schema config declares no fields (observed mode), instead of abstaining.
+    # Forwarding recursion additionally requires the field not be removed and
+    # the output contract remain open.
     # That recursion is what lets a provably-wrong downstream type declaration
     # fail at build rather than killing every row at the consumer's input
     # preflight.

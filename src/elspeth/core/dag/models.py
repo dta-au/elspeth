@@ -283,9 +283,10 @@ class NodeInfo:
     # Value-preservation declaration (elspeth-e6e552ce34). Populated for the
     # plugin-bearing kinds — TRANSFORM, AGGREGATION, COLLECTOR — by the builder
     # from TransformProtocol.preserves_input_values. True means process() never
-    # changes the VALUE of a field present on the input row (adding NEW fields
-    # is fine) — the promise that lets resolve_guaranteed_field_type recurse
-    # through an undeclaring pass-through instead of abstaining. Scoped like
+    # changes the VALUE of a surviving input field (adding NEW fields and the
+    # declared removals are fine) — the promise that lets
+    # resolve_guaranteed_field_type recurse through an undeclaring
+    # pass-through or forwarding node instead of abstaining. Scoped like
     # passes_through_input rather than like declared_output_fields: the walk's
     # abstention guard reads it at every pass-through-capable kind
     # (elspeth-48aeea6ad9 widened it from TRANSFORM-only, where an

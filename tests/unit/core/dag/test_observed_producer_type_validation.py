@@ -33,7 +33,7 @@ import pytest
 
 from elspeth.contracts import PluginSchema
 from elspeth.contracts.enums import NodeType, RoutingMode
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.guarantees import resolve_guaranteed_field_type
 from elspeth.core.dag.models import GraphValidationError
@@ -70,6 +70,27 @@ def _append_passthrough(
         plugin_name="passthrough",
         output_schema_config=config,
         passes_through_input=True,
+        preserves_input_values=preserves_input_values,
+    )
+    graph.add_edge(upstream, node_id, label="continue")
+
+
+def _append_forwarder(
+    graph: ExecutionGraph,
+    node_id: str,
+    upstream: str,
+    *,
+    preserves_input_values: bool,
+    removed_input_fields: frozenset[str] = frozenset(),
+    config: SchemaConfig | None = _OBSERVED_BARE,
+) -> None:
+    graph.add_node(
+        node_id,
+        node_type=NodeType.TRANSFORM,
+        plugin_name="field_mapper",
+        output_schema_config=config,
+        forwards_input_fields=True,
+        removed_input_fields=removed_input_fields,
         preserves_input_values=preserves_input_values,
     )
     graph.add_edge(upstream, node_id, label="continue")
@@ -229,6 +250,50 @@ class TestValuePreservingPassThroughResolution:
         assert resolved is not None
         assert resolved.field_type == "float"
         assert resolved.declared_by == frozenset({"declares"})
+
+
+class TestValuePreservingForwarderResolution:
+    """Forwarded type evidence follows the same presence contract guards."""
+
+    def test_open_preserving_forwarder_recurses_to_source(self) -> None:
+        graph = _observed_source_graph()
+        _append_forwarder(graph, "keep", "src", preserves_input_values=True)
+
+        resolved = resolve_guaranteed_field_type(graph, "keep", "id")
+
+        assert resolved is not None
+        assert resolved.field_type == "str"
+        assert resolved.declared_by == frozenset({"src"})
+
+    def test_non_preserving_forwarder_abstains(self) -> None:
+        graph = _observed_source_graph()
+        _append_forwarder(graph, "rewrite", "src", preserves_input_values=False)
+
+        assert resolve_guaranteed_field_type(graph, "rewrite", "id") is None
+
+    def test_removed_field_abstains(self) -> None:
+        graph = _observed_source_graph()
+        _append_forwarder(
+            graph,
+            "drop",
+            "src",
+            preserves_input_values=True,
+            removed_input_fields=frozenset({"id"}),
+        )
+
+        assert resolve_guaranteed_field_type(graph, "drop", "id") is None
+
+    def test_fixed_output_contract_is_a_type_firewall(self) -> None:
+        graph = _observed_source_graph()
+        _append_forwarder(
+            graph,
+            "closed",
+            "src",
+            preserves_input_values=True,
+            config=SchemaConfig(mode="fixed", fields=(FieldDefinition("other", "str"),)),
+        )
+
+        assert resolve_guaranteed_field_type(graph, "closed", "id") is None
 
     def test_coalesce_unanimity_still_required(self) -> None:
         """Two branches resolving to different structural types abstain —

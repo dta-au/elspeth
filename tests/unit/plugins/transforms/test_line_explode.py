@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 
 from elspeth.contracts.plugin_context import PluginContext
-from elspeth.testing import make_pipeline_row
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.testing import make_field, make_pipeline_row
 from tests.fixtures.factories import make_context
 
 DYNAMIC_SCHEMA = {"mode": "observed"}
@@ -45,6 +46,34 @@ def test_line_explode_splits_string_into_indexed_rows(ctx: PluginContext) -> Non
         {"source_url": "https://www.wardline.dev/", "html_line": "<body>", "line_index": 1},
         {"source_url": "https://www.wardline.dev/", "html_line": "<h1>Wardline</h1>", "line_index": 2},
     ]
+
+
+def test_line_explode_original_header_abstains_and_keeps_collision_guard(ctx: PluginContext) -> None:
+    """Runtime lineage owns an unnameable removal without permitting overwrite."""
+    from elspeth.contracts.errors import PluginContractViolation
+    from elspeth.plugins.transforms.line_explode import LineExplode
+
+    transform = LineExplode(
+        {
+            "schema": DYNAMIC_SCHEMA,
+            "source_field": "Body Text",
+            "output_field": "line",
+            "include_index": False,
+        }
+    )
+    contract = SchemaContract(
+        mode="OBSERVED",
+        fields=(
+            make_field("body_text", str, original_name="Body Text"),
+            make_field("line", str, original_name="line"),
+        ),
+        locked=True,
+    )
+
+    assert transform.forwards_input_fields is False
+    assert transform.removed_input_fields == frozenset()
+    with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+        transform.process(PipelineRow({"body_text": "one\ntwo", "line": "existing"}, contract), ctx)
 
 
 def test_line_explode_preserves_empty_lines(ctx: PluginContext) -> None:

@@ -5582,6 +5582,75 @@ def _check_schema_contracts(
             return False
         return schema_config is not None and not schema_config.is_observed
 
+    def _resolved_producer_field_type(
+        producer: ProducerEntry,
+        field_name: str,
+        *,
+        visited: frozenset[str] = frozenset(),
+    ) -> str | None:
+        """Resolve a declared type through truthful value-preserving forwarders."""
+        if producer.producer_id in visited:
+            return None
+        owner = _producer_owner(producer)
+        raw_schema = get_raw_schema_config(producer.options, owner=owner)
+        if is_source_producer_id(producer.producer_id):
+            if raw_schema is None or raw_schema.fields is None:
+                return None
+            for field in raw_schema.fields:
+                if field.name == field_name:
+                    return None if field.field_type == "any" else field.field_type
+            return None
+
+        producer_node = node_by_id[producer.producer_id]
+        if producer_node.node_type not in {"transform", "aggregation"} or producer_node.plugin is None:
+            return None
+
+        transform: TransformProtocol | None = None
+        try:
+            from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+            transform = get_shared_plugin_manager().create_transform(
+                producer_node.plugin,
+                prepare_validation_probe_options(producer_node.options, plugin=producer_node.plugin),
+            )
+            output_config = transform._output_schema_config
+            if output_config is not None and output_config.fields is not None:
+                for field in output_config.fields:
+                    if field.name == field_name:
+                        return None if field.field_type == "any" else field.field_type
+
+            forwards_field_unchanged = (
+                transform.forwards_input_fields
+                and transform.preserves_input_values
+                and field_name not in transform.removed_input_fields
+                and (output_config is None or output_config.allows_extra_fields)
+            )
+            if not ((transform.passes_through_input and transform.preserves_input_values) or forwards_field_unchanged):
+                return None
+        except Exception as exc:
+            if _is_config_probe_exception(exc):
+                return None
+            raise
+        finally:
+            if transform is not None:
+                transform.close()
+
+        upstream = resolver.find_producer_for(producer_node.input)
+        if upstream is None:
+            return None
+        upstream = _walk_producer_entry_to_real_producer(
+            upstream,
+            connection_name=producer_node.input,
+            warnings=[],
+        )
+        if upstream is None:
+            return None
+        return _resolved_producer_field_type(
+            upstream,
+            field_name,
+            visited=visited | {producer.producer_id},
+        )
+
     def _edge_field_type_conflict(producer: ProducerEntry, consumer: NodeSpec | OutputSpec) -> ValidationEntry | None:
         """Mirror the runtime's Phase-2 edge TYPE check on declared field specs.
 
@@ -5628,10 +5697,11 @@ def _check_schema_contracts(
         loop's job and extras belong to the Rule A/B walkers; reporting either
         here would double-attribute one defect.
 
-        Callers gate on ``_producer_is_typed_source``, which is the runtime's
-        own Phase-2 bypass — observed sources and transform/gate/coalesce
-        producers resolve to a dynamic effective producer schema at runtime and
-        are skipped there, so they are skipped here too.
+        A direct typed source settles its own fields. A transform with an open
+        output may additionally carry an ancestor declaration only when its
+        explicit forwarding and value-preservation contracts prove the field
+        survives unchanged. Removed fields, fixed output firewalls, rewriting
+        transforms, and unresolved fan-in all abstain.
         """
         if isinstance(consumer, OutputSpec):
             consumer_id = f"output:{consumer.name}"
@@ -5640,7 +5710,6 @@ def _check_schema_contracts(
             consumer_id = consumer.id
             consumer_component = f"node:{consumer.id}"
         try:
-            producer_schema_config = get_raw_schema_config(producer.options, owner=_producer_owner(producer))
             consumer_options = consumer.options
             consumer_owner = consumer_component
             if isinstance(consumer, NodeSpec) and consumer.node_type == "aggregation":
@@ -5651,24 +5720,22 @@ def _check_schema_contracts(
             # ``contract_config_invalid`` parsers; do not double-report.
             return None
 
-        if producer_schema_config is None or consumer_schema_config is None:
+        if consumer_schema_config is None:
             return None
         if consumer_schema_config.is_observed:
             return None
-        if producer_schema_config.fields is None or consumer_schema_config.fields is None:
+        if consumer_schema_config.fields is None:
             return None
 
-        producer_types = {field.name: field.field_type for field in producer_schema_config.fields}
         # ``any`` is a declared abstention on BOTH sides — the author has said
         # the type is not pinned, so no conflict is mechanically provable.
-        mismatches = [
-            (field.name, field.field_type, producer_types[field.name])
-            for field in consumer_schema_config.fields
-            if field.name in producer_types
-            and field.field_type != "any"
-            and producer_types[field.name] != "any"
-            and producer_types[field.name] != field.field_type
-        ]
+        mismatches: list[tuple[str, str, str]] = []
+        for field_def in consumer_schema_config.fields:
+            if field_def.field_type == "any":
+                continue
+            producer_type = _resolved_producer_field_type(producer, field_def.name)
+            if producer_type is not None and producer_type != field_def.field_type:
+                mismatches.append((field_def.name, field_def.field_type, producer_type))
         if not mismatches:
             return None
         detail = ", ".join(f"{name} (consumer expects {expected}, producer emits {actual})" for name, expected, actual in mismatches)
@@ -5770,11 +5837,11 @@ def _check_schema_contracts(
 
         producer_is_typed_source = _producer_is_typed_source(actual_producer)
         contract_required = consumer_required
+        type_error = _edge_field_type_conflict(actual_producer, node)
+        if type_error is not None:
+            errors.append(type_error)
         if producer_is_typed_source:
             contract_required = consumer_required | consumer_effective_required
-            type_error = _edge_field_type_conflict(actual_producer, node)
-            if type_error is not None:
-                errors.append(type_error)
             if declared_string_input:
                 string_type_error = _string_input_field_type_conflict(actual_producer, node, declared_string_input)
                 if string_type_error is not None:
@@ -6046,14 +6113,12 @@ def _check_schema_contracts(
             assert producer_vote is not None  # No error => guarantees resolved.
             producer_participates, producer_guaranteed = producer_vote
 
-            # Field-TYPE conflict on the producer -> sink edge, gated exactly as
-            # the node-consumer call above: only a typed (fixed/flexible) SOURCE
-            # presents a static schema the runtime's Phase-2 check reads; a
-            # transform/gate/coalesce producer is dynamic and skipped there too.
-            if _producer_is_typed_source(actual_producer):
-                sink_type_error = _edge_field_type_conflict(actual_producer, output)
-                if sink_type_error is not None:
-                    errors.append(sink_type_error)
+            # Field-TYPE conflict on the producer -> sink edge. Direct typed
+            # declarations and safely forwarded ancestor types share the same
+            # resolver as node consumers above.
+            sink_type_error = _edge_field_type_conflict(actual_producer, output)
+            if sink_type_error is not None:
+                errors.append(sink_type_error)
 
             # ADR-007 parity: mirror the runtime abstention clause in
             # validate_sink_required_fields (core/dag/schema_validation.py).

@@ -243,12 +243,32 @@ class TestJSONExplodeHappyPath:
         )
         row = PipelineRow({"id": 1, "line_items": ["a", "b"]}, contract)
 
+        assert transform.forwards_input_fields is False
+        assert transform.removed_input_fields == frozenset()
+
         result = transform.process(row, ctx)
 
         assert result.status == "success"
         assert result.rows is not None
         assert result.rows[0].to_dict() == {"id": 1, "item": "a", "item_index": 0}
         assert result.rows[1].to_dict() == {"id": 1, "item": "b", "item_index": 1}
+
+    def test_original_array_header_keeps_runtime_collision_guard(self, ctx: PluginContext) -> None:
+        from elspeth.contracts.errors import PluginContractViolation
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        transform = JSONExplode({"schema": DYNAMIC_SCHEMA, "array_field": "Line Items"})
+        contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field("line_items", object, original_name="Line Items"),
+                make_field("item", str, original_name="item"),
+            ),
+            locked=True,
+        )
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            transform.process(PipelineRow({"line_items": ["a"], "item": "existing"}, contract), ctx)
 
     def test_backward_probe_rows_drop_array_field(self, ctx: PluginContext) -> None:
         """Backward invariant probe drives the real deaggregation path."""

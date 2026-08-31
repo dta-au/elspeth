@@ -410,6 +410,10 @@ def test_the_field_arm_consumes_a_text_column_named_by_its_original_header() -> 
     )
     row = PipelineRow({"url": "https://example.test/a.json", "content_body": document}, contract)
 
+    assert transform.forwards_input_fields is False
+    assert transform.removed_input_fields == frozenset()
+    assert transform.preserves_input_values is True
+
     result = transform.process(row, make_context())
 
     assert result.status == "success", result.reason
