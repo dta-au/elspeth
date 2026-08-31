@@ -664,6 +664,26 @@ def _assert_operator_ruled_topology(args: dict[str, Any]) -> None:
 
 
 class TestForkCoalesceExemplar:
+    def test_llm_exemplar_teaches_source_to_target_mapping_direction(self, tmp_path: Path) -> None:
+        """At least one rename key is an arriving LLM response field.
+
+        Identity-only mappings are direction-blind: they let an author reverse
+        ``source -> target`` without any visible difference.  The worked LLM
+        exemplar must keep a real rename whose key is produced by an LLM arm
+        and whose value is the tidied output name (elspeth-d4ae04b374).
+        """
+        view, _snapshot = _profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        llm_response_fields = {node["options"]["response_field"] for node in args["nodes"] if node.get("plugin") == "llm"}
+        cleanup = next(node for node in args["nodes"] if node.get("plugin") == "field_mapper")
+        renames = {source: target for source, target in cleanup["options"]["mapping"].items() if source != target}
+
+        assert renames
+        assert set(renames) <= llm_response_fields
+        assert set(renames.values()).isdisjoint(llm_response_fields)
+
     def test_fork_coalesce_exemplar_validates_under_the_live_profile_posture(self, tmp_path: Path) -> None:
         """The exact fork -> two-llm -> coalesce exemplar bytes must build."""
         (tmp_path / "outputs").mkdir(exist_ok=True)

@@ -828,9 +828,10 @@ class TestOutputSchemaConfig:
     def test_unresolved_original_header_abstains_from_passthrough_declarations(self) -> None:
         """The unnameable removal costs the whole passthrough declaration set.
 
-        Regression: elspeth-a2bf676e6f. ``{"Amount USD": "Amount USD"}`` deletes a
-        normalized key only ``contract.resolve_name`` can name at runtime, so the
-        constructor cannot say WHICH forwarded column stopped being emitted.
+        Regression: elspeth-a2bf676e6f. ``{"Amount USD": "amount_usd"}``
+        deletes a normalized key only ``contract.resolve_name`` can name at
+        runtime, so the constructor cannot say WHICH other forwarded column
+        stopped being emitted. The rename target itself remains a known output.
 
         Dropping the declarations is NOT the safe direction, and an earlier
         revision of this fix did exactly that. ``fields`` feeds two OPPOSED
@@ -846,7 +847,7 @@ class TestOutputSchemaConfig:
 
         transform = FieldMapper(
             {
-                "mapping": {"Amount USD": "Amount USD"},
+                "mapping": {"Amount USD": "amount_usd"},
                 "select_only": False,
                 "schema": {"mode": "fixed", "fields": ["amount_usd: float", "kept: str"]},
             }
@@ -855,10 +856,27 @@ class TestOutputSchemaConfig:
         assert transform._output_schema_config is not None
         by_name = {field.name: field for field in transform._output_schema_config.fields or ()}
         assert set(by_name) == {"amount_usd", "kept"}
-        assert not any(field.required for field in by_name.values())
-        assert transform._output_schema_config.get_effective_guaranteed_fields() == frozenset()
+        assert by_name["amount_usd"].required is True
+        assert by_name["kept"].required is False
+        assert transform._output_schema_config.get_effective_guaranteed_fields() == frozenset({"amount_usd"})
 
-        result = transform.process(make_pipeline_row({"amount_usd": 1.5, "kept": "x"}), make_context())
+        # Model the original-header lineage the test claims to exercise.  A
+        # generic make_pipeline_row gives ``amount_usd`` the same original and
+        # normalized name; under that fixture ``Amount USD`` is genuinely
+        # absent and the historical non-strict skip merely hid the mismatch.
+        row = PipelineRow(
+            {"amount_usd": 1.5, "kept": "x"},
+            SchemaContract(
+                mode="FIXED",
+                fields=(
+                    make_field("amount_usd", float, original_name="Amount USD", required=True),
+                    make_field("kept", str, required=True),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, make_context())
 
         assert result.status == "success"
         assert result.row is not None
@@ -2059,11 +2077,23 @@ class TestFieldMapperDerivedInputRequirement:
 
         assert "recommended_pairing" not in config.declared_input_fields
 
-    def test_dotted_sources_abstain(self) -> None:
-        """A dotted source is a nested READ, never a row key."""
+    def test_dotted_sources_require_their_top_level_container(self) -> None:
+        """A flat contract can assert the root needed by a nested read.
+
+        The contract cannot promise the nested leaf, but ``meta.origin`` can
+        never resolve unless the top-level ``meta`` field arrives.  Omitting
+        that root left the executor's pre-emission guard blind and allowed the
+        default non-strict path to drop the configured output silently.
+        """
         config = self._config(mapping={"meta.origin": "origin", "colour": "colour"})
 
-        assert config.declared_input_fields == frozenset({"colour"})
+        assert config.declared_input_fields == frozenset({"colour", "meta"})
+
+    def test_dotted_source_with_unresolved_original_root_still_abstains(self) -> None:
+        """An original-header root has no safe normalized config-time name."""
+        config = self._config(mapping={"Meta.origin": "origin"})
+
+        assert config.declared_input_fields == frozenset()
 
     @pytest.mark.parametrize("source", ["First Name", "B", "Name", "userID", "class"])
     def test_non_fixed_point_sources_abstain(self, source: str) -> None:
@@ -2101,3 +2131,55 @@ class TestFieldMapperDerivedInputRequirement:
         )
 
         assert transform.declared_input_fields == frozenset({"colour", "complementary_colour"})
+
+    @pytest.mark.parametrize("source", ["meta.origin", "Name"])
+    def test_unrepresentable_missing_source_routes_even_when_non_strict(self, source: str) -> None:
+        """Every configured source is asserted even when flat metadata cannot name it.
+
+        Dotted leaves and original-header aliases cannot be represented fully
+        in ``declared_input_fields``.  Their runtime fallback must therefore
+        route a missing value instead of preserving the historical silent-skip
+        behaviour behind ``strict: false``.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "mapping": {source: "target"},
+                "strict": False,
+            }
+        )
+
+        result = transform.process(make_pipeline_row({"other": "value"}), make_context())
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "missing_field"
+        assert result.reason["field"] == source
+
+    def test_original_header_source_still_resolves_when_present(self) -> None:
+        """Runtime lineage resolution, not guessed normalization, owns aliases."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "mapping": {"Name": "display_name"},
+                "strict": False,
+            }
+        )
+        row = PipelineRow(
+            {"name": "Ada"},
+            SchemaContract(
+                mode="OBSERVED",
+                fields=(make_field("name", str, original_name="Name", required=True),),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, make_context())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict() == {"display_name": "Ada"}

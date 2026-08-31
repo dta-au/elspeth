@@ -79,6 +79,25 @@ def _is_static_normalized_source(source: str) -> bool:
     return "." not in source and _names_a_row_key(source)
 
 
+def _declared_input_field_for_source(source: str) -> str | None:
+    """Project a mapping source onto the flat input-contract vocabulary.
+
+    A plain normalization fixed point names its row field directly.  A dotted
+    source is a nested read, but the flat contract can still assert the
+    top-level container needed for that read (``meta.origin`` requires
+    ``meta``).  Original-header spellings remain unprojectable: their actual
+    normalized row key is resolved from runtime lineage, and guessing it here
+    would false-reject rows produced through an explicit source field mapping.
+
+    This is deliberately a different predicate from
+    ``_is_static_normalized_source``.  Output/removal math needs the complete
+    source name and must abstain for every dotted read; the input declaration
+    only needs the root field that makes the read possible.
+    """
+    root = source.split(".", 1)[0]
+    return root if _names_a_row_key(root) else None
+
+
 def _canonical_row_key(name: str) -> str:
     """The row key a mapping literal collapses to when ``process`` uses it.
 
@@ -175,19 +194,22 @@ class FieldMapperConfig(TransformDataConfig):
         upstreams — right for a promise the author wrote by hand, wrong for one
         inferred from a rename.
 
-        Sources config time cannot resolve to a row key ABSTAIN, via the same
-        predicate the rest of this plugin's contract math uses: a DOTTED source
-        is a nested read rather than a row key, and a non-fixed-point of
-        ``normalize_field_name`` reaches ``process`` through
-        ``contract.resolve_name``, so which key it names is unknowable until a
-        row arrives (elspeth-f262a8c678).
+        A DOTTED source contributes its normalization-stable top-level
+        container: the flat contract cannot state ``meta.origin``, but it can
+        and must state ``meta``. A non-fixed-point of ``normalize_field_name``
+        still abstains because it reaches ``process`` through
+        ``contract.resolve_name``, so which normalized key it names is
+        unknowable until a row arrives (elspeth-f262a8c678). Missing sources in
+        that unrepresentable class route at runtime even when ``strict`` is
+        false; abstention is not permission to drop a configured output.
 
         Note the DIRECTION. This requires mapping SOURCES only. Requiring rename
         TARGETS on input is the elspeth-d6eeb3a71d trap — they are fields this
         node CREATES, which is why ``self_created_input_fields`` demotes every
         one of them.
         """
-        return super().declared_input_fields | frozenset(source for source in self.mapping if _is_static_normalized_source(source))
+        derived = frozenset(declared for source in self.mapping if (declared := _declared_input_field_for_source(source)) is not None)
+        return super().declared_input_fields | derived
 
     @model_validator(mode="after")
     def _reject_duplicate_targets(self) -> FieldMapperConfig:
@@ -282,7 +304,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:81d619809f29ad7b"
+    source_file_hash: str | None = "sha256:c2580df91866b56c"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -754,11 +776,17 @@ class FieldMapper(BaseTransform):
                 value = MISSING
 
             if value is MISSING:
-                if self._strict:
+                # Normalized top-level sources are asserted through
+                # declared_input_fields and the executor rejects them before
+                # process(). Dotted leaves and original-header aliases cannot
+                # be represented fully in that flat contract, so their runtime
+                # fallback must fail even under strict=False; otherwise a
+                # configured mapping silently disappears from the emitted row.
+                if self._strict or not self._is_static_normalized_source(source):
                     return TransformResult.error(
                         {"reason": "missing_field", "field": source, "message": f"Required field '{source}' not found in row"}
                     )
-                continue  # Skip missing fields in non-strict mode
+                continue  # Executor pre-emission normally makes this branch unreachable.
 
             # Remove old key if it exists (for rename within same dict)
             if not self._select_only and "." not in source and source in row:
