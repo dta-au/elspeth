@@ -365,9 +365,16 @@ _SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
     # Session 891b7b1e turn 2: the planner sent source: null intending
     # 'keep the existing source' and burned a repair turn on the rejection.
     "set_pipeline is a FULL replacement: source: null never means 'keep "
-    "the current source'. A rebuild must re-supply the source explicitly — "
-    "copy the existing blob_id (from get_pipeline_state or list_blobs) "
-    "into source.blob_id, or resend inline_blob.",
+    "the current source'. Re-supply the complete existing `source` "
+    "configuration or named `sources` map from "
+    "get_pipeline_state(component='set_pipeline_arguments'). If that reports "
+    "round_trip_unavailable, never fabricate or rebind source custody: use "
+    "narrow patch tools when the requested task permits, otherwise surface "
+    "the named gap. Plugin-backed sources must be preserved in that shape; "
+    "do not assume the current source is blob-bound. Retain source.blob_id "
+    "only for an existing singular blob-bound source whose block carries "
+    "one; use source.inline_blob only when intentionally supplying new "
+    "literal data.",
     # Session 891b7b1e turn 1: the planner fabricated rows at the user's
     # request, then narrated its own content as 'the system auto-generated
     # placeholder content' — a provenance inversion in an audit-grade tool.

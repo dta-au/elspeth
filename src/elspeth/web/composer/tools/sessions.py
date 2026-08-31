@@ -522,12 +522,22 @@ def _no_source_configured_repair(state: CompositionState) -> str:
 
     singular_default = set(state.sources) == {"source"}
     container = "`source` configuration" if singular_default else "named `sources` map"
+    serialized, error = _serialize_set_pipeline_arguments(state)
+    if error is not None or serialized is None:
+        return (
+            f"{prefix} The existing {container} cannot be represented as lossless set_pipeline arguments: "
+            "get_pipeline_state(component='set_pipeline_arguments') returns error_code `round_trip_unavailable`. "
+            "Inspect the current configuration with get_pipeline_state(component='source'); do not fabricate source fields "
+            "or blob identities, and do not rebind any source. If the requested change is limited to existing source options, "
+            "use patch_source_options with the current source_name; use the matching narrow patch tool for node/output-only "
+            "changes. For a true full rebuild, surface the `round_trip_unavailable` gap and stop instead of guessing."
+        )
+
     guidance = f"{prefix} Re-supply the complete existing {container} from get_pipeline_state(component='set_pipeline_arguments')."
     if not singular_default:
         return guidance
 
-    serialized, error = _serialize_set_pipeline_arguments(state)
-    if error is not None or serialized is None or "source" not in serialized:
+    if "source" not in serialized:
         return guidance
     serialized_source = serialized["source"]
     if type(serialized_source) is not dict or "blob_id" not in serialized_source:

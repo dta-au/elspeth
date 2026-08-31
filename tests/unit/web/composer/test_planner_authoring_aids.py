@@ -2498,9 +2498,21 @@ class TestSession891b7b1eLiveReviewEdits:
     def test_custody_rules_state_full_replacement_source_resupply(self) -> None:
         """elspeth-6cadbff05f: source: null never means 'keep the source'."""
         view, _snapshot = _trained_view()
-        rendered = "\n".join(build_planner_authoring_aids(view)["source_custody"]["rules"])
-        assert "FULL replacement" in rendered
-        assert "source: null never means" in rendered
+        rules = build_planner_authoring_aids(view)["source_custody"]["rules"]
+
+        rebuild_rule = next(rule for rule in rules if rule.startswith("set_pipeline is a FULL replacement"))
+        assert "source: null never means" in rebuild_rule
+        assert "complete existing `source` configuration" in rebuild_rule
+        assert "named `sources` map" in rebuild_rule
+        assert "get_pipeline_state(component='set_pipeline_arguments')" in rebuild_rule
+        assert "Plugin-backed sources must be preserved" in rebuild_rule
+        assert "do not assume the current source is blob-bound" in rebuild_rule
+        assert "round_trip_unavailable" in rebuild_rule
+        assert "never fabricate or rebind source custody" in rebuild_rule
+        assert "use narrow patch tools when the requested task permits" in rebuild_rule
+        assert "surface the named gap" in rebuild_rule
+        assert "source.blob_id only for an existing singular blob-bound source whose block carries one" in rebuild_rule
+        assert "source.inline_blob only when intentionally supplying new literal data" in rebuild_rule
 
     def test_custody_verbatim_rule_names_the_user_requested_sample_exception(self) -> None:
         """Planner-authored samples must be an explicit, provenance-preserving exception."""

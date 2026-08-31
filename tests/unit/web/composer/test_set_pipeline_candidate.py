@@ -175,7 +175,7 @@ def test_rejected_candidate_reports_only_the_real_error_not_stale_state(tmp_path
 
 
 @pytest.mark.parametrize(
-    ("sources", "expected_container", "expects_blob_advice"),
+    ("sources", "expected_container", "expects_blob_advice", "expects_round_trip_gap"),
     [
         pytest.param(
             {
@@ -187,6 +187,7 @@ def test_rejected_candidate_reports_only_the_real_error_not_stale_state(tmp_path
                 )
             },
             "`source` configuration",
+            False,
             False,
             id="singular-plugin-backed",
         ),
@@ -200,6 +201,7 @@ def test_rejected_candidate_reports_only_the_real_error_not_stale_state(tmp_path
                 )
             },
             "named `sources` map",
+            False,
             False,
             id="named-plugin-backed",
         ),
@@ -219,7 +221,27 @@ def test_rejected_candidate_reports_only_the_real_error_not_stale_state(tmp_path
             },
             "`source` configuration",
             True,
+            False,
             id="singular-blob-bound",
+        ),
+        pytest.param(
+            {
+                "orders": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={
+                        "path": "blobs/session/orders.csv",
+                        "blob_ref": "11111111-1111-4111-8111-111111111111",
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                )
+            },
+            "named `sources` map",
+            False,
+            True,
+            id="named-blob-backed-round-trip-unavailable",
         ),
     ],
 )
@@ -228,6 +250,7 @@ def test_no_source_internal_defense_uses_prior_source_shape_for_repair_guidance(
     sources: dict[str, SourceSpec],
     expected_container: str,
     expects_blob_advice: bool,
+    expects_round_trip_gap: bool,
 ) -> None:
     """The handler's defensive branch stays accurate behind schema admission."""
     validated_without_source = sessions_tools.SetPipelineArgumentsModel.model_construct(
@@ -259,10 +282,26 @@ def test_no_source_internal_defense_uses_prior_source_shape_for_repair_guidance(
     )
 
     error = candidate.result.data["error"]
-    assert "complete existing" in error
     assert expected_container in error
     assert ("blob_id" in error) is expects_blob_advice
     assert ("inline_blob" in error) is expects_blob_advice
+    if expects_round_trip_gap:
+        assert error == (
+            "set_pipeline requires exactly one non-null source or sources object. "
+            "This tool is a full replacement; omission or null never keeps existing source configuration. "
+            "The existing named `sources` map cannot be represented as lossless set_pipeline arguments: "
+            "get_pipeline_state(component='set_pipeline_arguments') returns error_code `round_trip_unavailable`. "
+            "Inspect the current configuration with get_pipeline_state(component='source'); do not fabricate source fields "
+            "or blob identities, and do not rebind any source. If the requested change is limited to existing source options, "
+            "use patch_source_options with the current source_name; use the matching narrow patch tool for node/output-only "
+            "changes. For a true full rebuild, surface the `round_trip_unavailable` gap and stop instead of guessing."
+        )
+        assert "Re-supply the complete existing" not in error
+    else:
+        assert "complete existing" in error
+        assert "round_trip_unavailable" not in error
+        assert "get_pipeline_state(component='set_pipeline_arguments')" in error
+        assert "get_pipeline_state(component='source')" not in error
 
 
 def _trained_context(*, data_dir: Path | None = None, **kwargs: Any) -> ToolContext:
