@@ -24,7 +24,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.protocol import ComposerPluginCrashError
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate as real_build_set_pipeline_candidate
@@ -70,6 +70,12 @@ class _ScriptedLLM:
         if not self._responses:
             return _fake_llm_response(content="Done.")
         return self._responses.pop(0)
+
+
+async def _clean_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
+    """Keep proposal-prevalidation tests independent of the real advisor."""
+
+    return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
 
 
 class _FinalRejectingCatalog(PolicyCatalogView):
@@ -176,6 +182,7 @@ def _harness(tmp_path: Path) -> _Harness:
             sessions_service=sessions,
             session_engine=engine,
         )
+    service._run_advisor_checkpoint = _clean_advisor_checkpoint  # type: ignore[method-assign]
     return _Harness(
         engine=engine,
         sessions=sessions,
