@@ -8,9 +8,9 @@ so the planner's text landed in the operator's transcript twice (live session
 891b7b1e: two rows 99ms apart, the second carrying the trusted notice).
 
 ``composer_turn_end_assistant_row`` is the single authority both routes call.
-These tests pin its decision table, including the two shapes that make a
-flag-only or prefix-only fix unsafe, and the segment classification the split
-row depends on.
+These tests pin its decision table, including the shapes that make a generic
+persisted-turn flag or byte equality unsafe, and the segment classification the
+split row depends on.
 """
 
 from __future__ import annotations
@@ -64,6 +64,7 @@ def _result(
     message: str,
     raw_assistant_content: str | None = None,
     persisted_assistant_content: str | None = None,
+    persisted_assistant_matches_terminal_model_turn: bool = False,
     runtime_preflight: ValidationResult | None = None,
 ) -> ComposerResult:
     """A ComposerResult in the shape the compose loop hands the turn-end writer."""
@@ -75,6 +76,7 @@ def _result(
         persisted_assistant_message_id=(None if persisted_assistant_content is None else "assistant-row-1"),
         persisted_assistant_content=persisted_assistant_content,
         persisted_tool_call_turn=persisted_assistant_content is not None,
+        persisted_assistant_matches_terminal_model_turn=persisted_assistant_matches_terminal_model_turn,
     )
 
 
@@ -85,6 +87,7 @@ def test_staged_handoff_row_carries_only_the_backend_suffix() -> None:
             message=_HANDOFF_MESSAGE,
             raw_assistant_content=_PROSE,
             persisted_assistant_content=_PROSE,
+            persisted_assistant_matches_terminal_model_turn=True,
         )
     )
 
@@ -109,6 +112,7 @@ def test_split_row_still_publishes_the_notice_as_backend_chrome() -> None:
             message=_HANDOFF_MESSAGE,
             raw_assistant_content=_PROSE,
             persisted_assistant_content=_PROSE,
+            persisted_assistant_matches_terminal_model_turn=True,
         )
     )
 
@@ -129,8 +133,8 @@ def test_text_only_final_turn_keeps_its_prose() -> None:
     """
     # The later prose deliberately STARTS WITH the earlier row's content. The
     # prefix test alone would strip here and hand the transcript
-    # " Here is the finished pipeline." with the model's opening deleted; only
-    # the raw==persisted equality declines, because this turn's own prose is
+    # " Here is the finished pipeline." with the model's opening deleted. The
+    # explicit same-turn identity remains false because this turn's prose is
     # not what that row holds.
     earlier_row = "Working on it."
     later_prose = f"{earlier_row} Here is the finished pipeline."
@@ -144,6 +148,23 @@ def test_text_only_final_turn_keeps_its_prose() -> None:
 
     assert draft.content == later_prose
     assert draft.raw_content is None
+
+
+def test_later_turn_repeated_prose_keeps_the_full_synthesized_message() -> None:
+    """Equal bytes do not prove the persisted row belongs to the terminal turn."""
+    repeated_prose = "The pipeline is ready for review."
+    synthesized = f"{repeated_prose}\n\nBackend qualification."
+
+    draft = composer_turn_end_assistant_row(
+        _result(
+            message=synthesized,
+            raw_assistant_content=repeated_prose,
+            persisted_assistant_content=repeated_prose,
+        )
+    )
+
+    assert draft.content == synthesized
+    assert draft.raw_content == repeated_prose
 
 
 def test_empty_persisted_content_does_not_swallow_the_message() -> None:
@@ -209,8 +230,60 @@ def test_exact_duplicate_fails_closed_instead_of_writing_an_empty_row() -> None:
                 message=_PROSE,
                 raw_assistant_content=_PROSE,
                 persisted_assistant_content=_PROSE,
+                persisted_assistant_matches_terminal_model_turn=True,
                 runtime_preflight=_FAILED_PREFLIGHT,
             )
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        (
+            {"persisted_assistant_matches_terminal_model_turn": True},
+            "persisted assistant id and content",
+        ),
+        (
+            {
+                "persisted_assistant_message_id": "assistant-row-1",
+                "persisted_assistant_content": _PROSE,
+                "persisted_assistant_matches_terminal_model_turn": True,
+            },
+            "persisted_tool_call_turn",
+        ),
+        (
+            {
+                "raw_assistant_content": "Different terminal prose.",
+                "persisted_assistant_message_id": "assistant-row-1",
+                "persisted_assistant_content": _PROSE,
+                "persisted_tool_call_turn": True,
+                "persisted_assistant_matches_terminal_model_turn": True,
+            },
+            "raw_assistant_content",
+        ),
+        (
+            {
+                "raw_assistant_content": "Unrelated persisted prose.",
+                "persisted_assistant_message_id": "assistant-row-1",
+                "persisted_assistant_content": "Unrelated persisted prose.",
+                "persisted_tool_call_turn": True,
+                "persisted_assistant_matches_terminal_model_turn": True,
+            },
+            "message must start",
+        ),
+    ],
+    ids=["no-persisted-pair", "not-tool-call-turn", "raw-mismatch", "prefix-mismatch"],
+)
+def test_same_turn_identity_requires_jointly_consistent_fields(
+    kwargs: dict[str, object],
+    match: str,
+) -> None:
+    """The positive discriminator is one-way proof, so every premise is required."""
+    with pytest.raises(ValueError, match=match):
+        ComposerResult(
+            message=_HANDOFF_MESSAGE,
+            state=_EMPTY_STATE,
+            **kwargs,
         )
 
 

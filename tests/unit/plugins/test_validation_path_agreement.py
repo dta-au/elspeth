@@ -429,6 +429,19 @@ _TRANSFORM_REJECTION_CASES = [
         "never silently overwritten",
         id="reference_join-declared-type-refuted-by-table",
     ),
+    pytest.param(
+        "reference_join",
+        {
+            "schema": {"mode": "flexible", "fields": ["code: str"]},
+            "reference_content": '[{"sku":"hats","code":1},{"sku":"coats","code":"X"}]',
+            "reference_format": "json",
+            "key_field": "product",
+            "reference_key_name": "sku",
+            "output": {"code": "ref['code']"},
+        },
+        "never silently overwritten",
+        id="reference_join-declared-type-refuted-by-heterogeneous-table",
+    ),
 ]
 
 _SOURCE_REJECTION_CASES = [

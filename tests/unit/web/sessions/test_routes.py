@@ -13837,6 +13837,7 @@ def test_send_message_does_not_re_emit_the_already_persisted_turn_prose(tmp_path
             persisted_assistant_message_id=outcome.assistant_id,
             persisted_assistant_content=prose,
             persisted_tool_call_turn=True,
+            persisted_assistant_matches_terminal_model_turn=True,
         )
 
     composer = SimpleNamespace()
