@@ -141,7 +141,8 @@ _TEST_SESSION_ID = "11111111-1111-4111-8111-111111111111"
 # paid for by reference_join + the two blob expanders (+911 B net). Re-set
 # 2026-08-31 (John): 100 -> 102 KiB, paid for by the provider set-pipeline
 # envelope plus state-aware, surface-scoped source-rebuild guidance (current
-# fixed scaffold: 103,596 B).
+# fixed scaffold then: 103,596 B). Held at 102 KiB on 2026-09-01: pipeline-level
+# schema guidance replaced nested repetition (107,420 -> 103,378 B).
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = 102 * 1024
 
 
@@ -773,6 +774,8 @@ def test_planner_palette_is_pinned_read_only_and_terminal_schema_is_exact() -> N
     serialized = canonical_json(terminal)
     assert "rationale" not in serialized
     assert '"base"' not in serialized
+    assert serialized.count("Inside interpretation_requirements, only kind, user_term, and draft are authorable.") == 1
+    assert serialized.count("One short sentence of plain prose saying what this step does") == 1
 
 
 @pytest.mark.asyncio
@@ -1816,7 +1819,14 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
         "messages": [request["messages"][0], {"role": "user", "content": canonical_json(fixed_payload)}],
         "tools": request["tools"],
     }
-    assert len(canonical_json(fixed_scaffolding).encode("utf-8")) <= _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES
+    fixed_scaffolding_bytes = len(canonical_json(fixed_scaffolding).encode("utf-8"))
+    component_bytes = {
+        "system": len(canonical_json(request["messages"][0]).encode("utf-8")),
+        "fixed_user": len(canonical_json(fixed_scaffolding["messages"][1]).encode("utf-8")),
+        "tools": len(canonical_json(request["tools"]).encode("utf-8")),
+        "terminal_tool": len(canonical_json(request["tools"][-1]).encode("utf-8")),
+    }
+    assert fixed_scaffolding_bytes <= _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES, component_bytes
 
 
 @pytest.mark.asyncio
