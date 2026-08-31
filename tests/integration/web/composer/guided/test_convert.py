@@ -467,6 +467,74 @@ class TestConvertEmptySession:
         assert "request_id" in events[0]
         assert "diagnostic retained for audit" not in repr(events[0])
 
+    def test_unclassified_failure_is_recorded_with_its_failure_code_and_frames(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        """A first-party bug settles AND leaves a server-side record.
+
+        The durable row and the replayable coded response say only THAT the
+        operation failed. Before the diagnostic widened past the integrity
+        arm, an unclassified defect discarded its traceback entirely, so the
+        one 500 an operator had to work from named no site, no class and no
+        frames. The response contract is deliberately unchanged — settlement
+        succeeded, so the coded answer stays exactly replayable.
+        """
+        client = composer_test_client
+        session_id = _create_session(client)
+        operation_id = str(uuid4())
+
+        from structlog.testing import capture_logs
+
+        with (
+            capture_logs() as cap_logs,
+            patch(
+                "elspeth.web.sessions.routes.composer.guided._build_get_guided_turn",
+                side_effect=InvariantError("tier-3 diagnostic must not escape"),
+            ),
+        ):
+            first = _convert_raw(client, session_id, operation_id=operation_id)
+
+        assert first.status_code == 500
+        assert first.json()["detail"]["failure_code"] == "operation_failed"
+        events = [entry for entry in cap_logs if entry.get("event") == "guided.operation_terminal_failure"]
+        assert len(events) == 1
+        assert events[0]["exc_class"] == "InvariantError"
+        assert events[0]["failure_code"] == "operation_failed"
+        assert events[0]["site"] == "post_guided_convert"
+        assert events[0]["frames"]
+        # The widened log carries frames, never the exception's own text.
+        assert "tier-3 diagnostic" not in repr(events[0])
+
+    def test_settlement_conflict_is_not_logged_as_a_terminal_failure(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        """A settlement conflict stays out of the error log.
+
+        Pins the one exclusion the widened diagnostic makes: a stale conflict
+        is an expected concurrency outcome answered by its own 409 contract,
+        so paging on it would bury the defects the widening exists to surface.
+        """
+        client = composer_test_client
+        session_id = _create_session(client)
+
+        from structlog.testing import capture_logs
+
+        with (
+            capture_logs() as cap_logs,
+            patch.object(
+                client.app.state.session_service,
+                "save_state_for_guided_operation",
+                side_effect=GuidedOperationSettlementConflictError(),
+            ),
+        ):
+            response = _convert_raw(client, session_id, operation_id=str(uuid4()))
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["failure_code"] == "stale_conflict"
+        assert [entry for entry in cap_logs if entry.get("event") == "guided.operation_terminal_failure"] == []
+
     def test_expected_head_conflict_is_terminal_409_and_exactly_replayed(self, composer_test_client: TestClient) -> None:
         client = composer_test_client
         session_id = _create_session(client)
