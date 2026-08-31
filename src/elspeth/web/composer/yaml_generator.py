@@ -668,7 +668,100 @@ def generate_yaml(state: CompositionState) -> str:
     return yaml.dump(doc, default_flow_style=False, sort_keys=False)
 
 
+class PublicExportRedaction(TypedDict):
+    """What the public projection stripped, per component (top-level options).
+
+    Keys are component names; values are the sorted top-level option keys the
+    projection removed (storage path carriers and blob linkage). Components
+    that lost nothing are absent, so an empty mapping pair means the export
+    is complete as-is.
+    """
+
+    sources: dict[str, list[str]]
+    outputs: dict[str, list[str]]
+
+
+# Exported marker bytes: the YAML import guard
+# (`web/sessions/routes/composer/state.py`) recognises these exact prefixes,
+# so exporter and importer share one authority. Do not re-derive them.
+PUBLIC_EXPORT_REDACTION_HEADER = "# ELSPETH public export — custody-redacted; NOT runnable as exported."
+PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX = "# redacted-source: "
+PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX = "# redacted-output: "
+PUBLIC_EXPORT_REBIND_GUIDANCE = (
+    "Re-bind each redacted source on import by uploading its data to the target session and passing "
+    'source_blob_ids={"<source name>": "<session blob id>"}; sink paths are re-authored on import.'
+)
+
+_PUBLIC_SOURCE_LINKAGE_KEYS = frozenset({"blob_ref", "blob_id"})
+
+
+def public_export_redaction(state: CompositionState) -> PublicExportRedaction:
+    """Account for what :func:`generate_public_yaml` strips from ``state``.
+
+    Derived from the same key-set authorities the projection itself uses
+    (``_PUBLIC_STORAGE_OPTION_KEYS`` and the blob-linkage keys), over the same
+    blob-ref-reattached export state, so the account cannot drift from the
+    scrub (elspeth-06f92da0d9). Top-level option keys only: that is where the
+    schema-defined source/sink storage carriers live; recursive scrubs of
+    nested custody subtrees stay undocumented here because they carry no
+    re-bindable user data.
+    """
+    export_state = reattach_guided_blob_refs_for_public_export(state)
+    sources: dict[str, list[str]] = {}
+    for source_name, source in export_state.sources.items():
+        stripped = sorted(key for key in source.options if key in _PUBLIC_STORAGE_OPTION_KEYS or key in _PUBLIC_SOURCE_LINKAGE_KEYS)
+        if stripped:
+            sources[source_name] = stripped
+    outputs: dict[str, list[str]] = {}
+    for output in export_state.outputs:
+        stripped = sorted(key for key in output.options if key in _PUBLIC_STORAGE_OPTION_KEYS or key == "blob_id")
+        if stripped:
+            outputs[output.name] = stripped
+    return {"sources": sources, "outputs": outputs}
+
+
+# The marker prose uses category labels, not raw option-key names: the
+# custody-egress guards (MCP server, shareable reviews) pin the literal
+# key tokens (e.g. "blob_ref") absent from public YAML text, and an
+# explanatory comment must not weaken those greps. The structured route
+# response (`StateYamlRedaction`) carries the exact key names instead.
+_MARKER_LABELS = {
+    "path": "local-path",
+    "file": "local-path",
+    "persist_directory": "persist-directory",
+    "blob_ref": "blob-linkage",
+    "blob_id": "blob-linkage",
+}
+
+
+def _marker_labels(keys: list[str]) -> str:
+    return ",".join(sorted({_MARKER_LABELS[key] for key in keys}))
+
+
+def public_export_redaction_header(state: CompositionState) -> str:
+    """Header comment block naming the redactions, or ``""`` when none apply."""
+    redaction = public_export_redaction(state)
+    if not redaction["sources"] and not redaction["outputs"]:
+        return ""
+    lines = [PUBLIC_EXPORT_REDACTION_HEADER]
+    for source_name, keys in redaction["sources"].items():
+        lines.append(f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}{source_name} stripped={_marker_labels(keys)}")
+    for output_name, keys in redaction["outputs"].items():
+        lines.append(f"{PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX}{output_name} stripped={_marker_labels(keys)}")
+    lines.append(f"# {PUBLIC_EXPORT_REBIND_GUIDANCE}")
+    return "\n".join(lines) + "\n"
+
+
 def generate_public_yaml(state: CompositionState) -> str:
-    """Convert a CompositionState to deterministic public export/share/MCP YAML."""
+    """Convert a CompositionState to deterministic public export/share/MCP YAML.
+
+    When the public projection stripped custody data (source paths / blob
+    linkage, sink paths), the text carries a leading comment block naming
+    exactly what was removed and how to re-bind it — the redaction is
+    deliberate and stays, but it must never be presented bare
+    (elspeth-06f92da0d9). Determinism is preserved: the header derives from
+    the same state as the body.
+    """
     doc = generate_public_pipeline_dict(state)
-    return yaml.dump(doc, default_flow_style=False, sort_keys=False)
+    body = yaml.dump(doc, default_flow_style=False, sort_keys=False)
+    return public_export_redaction_header(state) + body

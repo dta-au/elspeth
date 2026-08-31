@@ -19,11 +19,15 @@ from elspeth.web.composer.state import (
     SourceSpec,
 )
 from elspeth.web.composer.yaml_generator import (
+    PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX,
+    PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX,
+    PUBLIC_EXPORT_REDACTION_HEADER,
     _generate_pipeline_dict,
     generate_pipeline_dict,
     generate_public_pipeline_dict,
     generate_public_yaml,
     generate_yaml,
+    public_export_redaction,
 )
 from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY, SOURCE_AUTHORING_KEY
@@ -2034,3 +2038,89 @@ class TestProfileLoweringProvenanceStrip:
         transforms = self._transforms_by_name(doc)
         assert "resolved_prompt_template_hash" not in transforms["profiled"]["options"]
         assert transforms["plain"]["options"]["resolved_prompt_template_hash"] == "b" * 64
+
+
+class TestPublicExportRedactionMarker:
+    """The public export names its own redaction (elspeth-06f92da0d9).
+
+    The custody scrub is deliberate and stays; what these tests pin is that
+    a redacted export is never presented bare: the text opens with a header
+    comment naming what was stripped per component, and
+    ``public_export_redaction`` reports the same facts structurally. Blob
+    UUIDs never appear (scrub ruling 2304d57fb).
+    """
+
+    @staticmethod
+    def _redacted_state() -> CompositionState:
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="out",
+                options={
+                    "path": "/data/blobs/session/20b944e3_input.csv",
+                    "blob_ref": "20b944e3-fd46-434f-b9a2-4fb508db30f0",
+                    "schema": {"mode": "observed"},
+                },
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="out",
+                    plugin="csv",
+                    options={"path": "outputs/out.csv"},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    @staticmethod
+    def _clean_state() -> CompositionState:
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="out",
+                options={"schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(OutputSpec(name="out", plugin="json", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def test_redacted_export_opens_with_marker_header(self) -> None:
+        rendered = generate_public_yaml(self._redacted_state())
+
+        assert rendered.startswith(PUBLIC_EXPORT_REDACTION_HEADER)
+        assert f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}source stripped=blob_ref,path" in rendered
+        assert f"{PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX}out stripped=path" in rendered
+        assert "source_blob_ids" in rendered  # the re-bind guidance names the import argument
+        # The marker must never leak the stripped values themselves.
+        assert "20b944e3" not in rendered
+        assert "/data/blobs" not in rendered
+
+    def test_header_is_comment_only_and_body_parses_unchanged(self) -> None:
+        state = self._redacted_state()
+
+        rendered = generate_public_yaml(state)
+
+        assert yaml.safe_load(rendered) == generate_public_pipeline_dict(state)
+        assert generate_public_yaml(state) == rendered  # deterministic
+
+    def test_clean_export_carries_no_marker(self) -> None:
+        rendered = generate_public_yaml(self._clean_state())
+
+        assert PUBLIC_EXPORT_REDACTION_HEADER not in rendered
+        assert not rendered.startswith("#")
+
+    def test_public_export_redaction_reports_stripped_keys_per_component(self) -> None:
+        assert public_export_redaction(self._redacted_state()) == {
+            "sources": {"source": ["blob_ref", "path"]},
+            "outputs": {"out": ["path"]},
+        }
+        assert public_export_redaction(self._clean_state()) == {"sources": {}, "outputs": {}}

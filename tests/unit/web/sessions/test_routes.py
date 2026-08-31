@@ -58,6 +58,7 @@ from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResu
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
+from elspeth.web.composer.yaml_generator import PUBLIC_EXPORT_REBIND_GUIDANCE, PUBLIC_EXPORT_REDACTION_HEADER
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.accounting import RunAccountingBatch
@@ -8363,6 +8364,83 @@ sinks:
         assert "path" not in exported_source_options
         assert "mode" not in exported_source_options
         assert exported_source_options["schema"] == {"mode": "observed"}
+        # elspeth-06f92da0d9: the deliberate redaction is never presented
+        # bare — the response names what was stripped (names only, no blob
+        # identity: the sidecar scrub above still holds) and the YAML text
+        # opens with the matching marker comment.
+        # The summary names custody carriers (storage paths, blob linkage);
+        # the bind_source "mode" marker is web-layer bookkeeping and stays out.
+        assert body["redaction"] == {
+            "stripped_source_options": {"source": ["blob_ref", "path"]},
+            "stripped_output_options": {"out": ["path"]},
+            "blob_linked_sources": ["source"],
+            "rebind_guidance": PUBLIC_EXPORT_REBIND_GUIDANCE,
+        }
+        assert body["yaml"].startswith(PUBLIC_EXPORT_REDACTION_HEADER)
+
+    @pytest.mark.asyncio
+    async def test_reimport_of_redacted_export_without_rebind_gets_guidance_not_pydantic(self, tmp_path: Path) -> None:
+        """Round-trip fence (elspeth-06f92da0d9): POSTing a custody-redacted
+        export back without ``source_blob_ids`` must 400 with re-bind guidance
+        instead of sailing through Stage-1 into a strict-lane
+        "path Field required"."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        blob_id = "98b1357d-5aab-4fb3-85b4-5ad643912e84"
+        session = await service.create_session("alice", "Redacted round trip", "local")
+        app.state.blob_service = SimpleNamespace(
+            get_blob=AsyncMock(
+                spec=BlobServiceProtocol.get_blob,
+                return_value=_ready_blob_record(
+                    blob_id=uuid.UUID(blob_id),
+                    session_id=session.id,
+                    storage_path="/data/blobs/session/contact_form_submissions.csv",
+                ),
+            )
+        )
+        await service.save_composition_state(
+            session.id,
+            CompositionStateData(
+                source={
+                    "plugin": "csv",
+                    "on_success": "out",
+                    "options": {
+                        "path": "/data/blobs/session/contact_form_submissions.csv",
+                        "blob_ref": blob_id,
+                        "schema": {"mode": "observed"},
+                    },
+                    "on_validation_failure": "discard",
+                },
+                outputs=[
+                    {
+                        "name": "out",
+                        "plugin": "csv",
+                        "options": {"path": "outputs/out.csv", "schema": {"mode": "observed"}},
+                        "on_write_failure": "discard",
+                    }
+                ],
+                metadata_={"name": "Redacted round trip", "description": ""},
+                is_valid=True,
+            ),
+            provenance="session_seed",
+        )
+
+        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+            return ValidationResult(is_valid=True, checks=[], errors=[])
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
+            exported = client.get(f"/api/sessions/{session.id}/state/yaml")
+            assert exported.status_code == 200, exported.text
+            reimported = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={"yaml": exported.json()["yaml"]},
+            )
+
+        assert reimported.status_code == 400, reimported.text
+        detail = reimported.json()["detail"]
+        assert "custody-redacted" in detail
+        assert "source_blob_ids" in detail
+        assert "path Field required" not in detail
 
     @pytest.mark.asyncio
     async def test_yaml_export_scrubs_guided_blob_from_reviewed_public_sentinel(self, tmp_path: Path) -> None:
