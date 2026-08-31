@@ -567,6 +567,23 @@ def test_resolved_source_contract_survives_unrelated_source_patch() -> None:
     assert carried["accepted_artifact_hash"] == source_data_contract_artifact_hash(["colour"])
 
 
+def test_deleting_resolved_source_contract_guarantee_reopens_review() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+
+    result = _execute_patch_source_options(
+        {"patch": {"schema": {"mode": "observed"}}},
+        previous,
+        _trained_context(),
+    )
+
+    assert result.success, result.data
+    source = result.updated_state.sources["source"]
+    assert "guaranteed_fields" not in source.options["schema"]
+    requirement = source.options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert requirement["status"] == "pending"
+    assert isinstance(materialize_state_for_execution(result.updated_state), InterpretationReviewPending)
+
+
 def test_exact_payload_round_trips_resolved_source_contract() -> None:
     previous = _resolved_source_contract_state(required_fields=["colour"])
     exact = _exact_arguments(previous)
@@ -577,6 +594,21 @@ def test_exact_payload_round_trips_resolved_source_contract() -> None:
     carried = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY][0]
     assert carried["status"] == "resolved"
     assert carried["event_id"] == "event-1"
+
+
+def test_exact_round_trip_rejects_incoherent_stored_source_contract_evidence() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    source = previous.sources["source"]
+    options = deep_thaw(source.options)
+    options[INTERPRETATION_REQUIREMENTS_KEY][0]["accepted_value"] = build_source_data_contract_draft(["size"], None)
+    forged = previous.with_named_source("source", replace(source, options=options))
+    exact = _exact_arguments(forged)
+
+    result = _execute_set_pipeline(deep_thaw(exact.data), forged, _trained_context())
+
+    assert not result.success
+    assert result.updated_state is forged
+    assert result.data["error_code"] == "review_reconciliation_failed"
 
 
 def test_public_set_pipeline_cannot_forge_resolved_source_contract_artifact() -> None:

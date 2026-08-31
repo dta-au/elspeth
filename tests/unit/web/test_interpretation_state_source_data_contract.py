@@ -130,6 +130,15 @@ class TestSiteStaging:
         state = _state(_resolved_contract_options(["colour"]), required=["colour"])
         assert _contract_sites(state) == []
 
+    def test_incoherent_accepted_value_and_hash_reopens_the_card(self) -> None:
+        options = _resolved_contract_options(["colour"])
+        options[INTERPRETATION_REQUIREMENTS_KEY][0]["accepted_value"] = build_source_data_contract_draft(["size"], None)
+
+        sites = _contract_sites(_state(options, required=["colour"]))
+
+        assert len(sites) == 1
+        assert sites[0].component_id == "source"
+
     def test_demand_growth_reopens_the_card(self) -> None:
         # Acknowledged {colour}; the pipeline now also requires 'size' from
         # the source — the acknowledged FIELD SET no longer matches the
