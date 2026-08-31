@@ -10,7 +10,7 @@ invented_source (materialize_state_for_execution returns the pending site).
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, Literal
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.web.composer.source_demand import (
@@ -18,7 +18,7 @@ from elspeth.web.composer.source_demand import (
     build_source_data_contract_draft,
     source_data_contract_artifact_hash,
 )
-from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     SOURCE_AUTHORING_KEY,
@@ -185,6 +185,63 @@ def _fan_in_source(options: dict[str, Any]) -> SourceSpec:
     return SourceSpec(plugin="csv", on_success="q", options=options, on_validation_failure="discard")
 
 
+def _fork_fan_in_state(node_type: Literal["coalesce", "row_union"]) -> CompositionState:
+    is_coalesce = node_type == "coalesce"
+    source = SourceSpec(
+        plugin="csv",
+        on_success="input",
+        options=_resolved_contract_options(["colour"]),
+        on_validation_failure="discard",
+    )
+    gate = NodeSpec(
+        id="split",
+        node_type="gate",
+        plugin=None,
+        input="input",
+        on_success=None,
+        on_error="discard",
+        options={},
+        condition="True",
+        routes={"true": "fork", "false": "fork"},
+        fork_to=("a", "b"),
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    fan_in = NodeSpec(
+        id="joined" if is_coalesce else "u",
+        node_type=node_type,
+        plugin=None,
+        input="a",
+        on_success=None if is_coalesce else "joined",
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches={"a": "a", "b": "b"},
+        policy="require_all" if is_coalesce else None,
+        merge="union" if is_coalesce else None,
+    )
+    consumer = replace(_llm_node(required=["colour", "size"]), input="joined", on_success="output")
+    return CompositionState(
+        source=None,
+        sources={"source": source},
+        nodes=(gate, fan_in, consumer),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="output",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
 class TestFanInSiteLifecycle:
     """AND-attributed fan-in demand: one card per feeding source, no re-ask loop.
 
@@ -256,6 +313,27 @@ class TestFanInSiteLifecycle:
         assert current_source_data_contract_demand(state, "src_a") == ("colour", "size")
         assert current_source_data_contract_demand(state, "src_b") == ("colour", "size")
         assert sorted(site.component_id for site in _contract_sites(state)) == ["source:src_a", "source:src_b"]
+
+    def test_row_union_growth_after_sole_guarantee_reopens_source_card(self) -> None:
+        state = _fork_fan_in_state("row_union")
+        result = state.validate()
+        assert [error for error in result.errors if error.error_code != "schema_contract_violation"] == []
+        assert [(contract.from_id, contract.to_id, contract.missing_fields) for contract in result.edge_contracts] == [
+            ("u", "rate", ("size",)),
+        ]
+        assert current_source_data_contract_demand(state, "source") == ("colour", "size")
+        assert [site.component_id for site in _contract_sites(state)] == ["source"]
+
+    def test_coalesce_growth_after_sole_guarantee_reopens_source_card(self) -> None:
+        state = _fork_fan_in_state("coalesce")
+
+        result = state.validate()
+        assert [error for error in result.errors if error.error_code != "schema_contract_violation"] == []
+        assert [(contract.from_id, contract.to_id, contract.missing_fields) for contract in result.edge_contracts] == [
+            ("joined", "rate", ("size",)),
+        ]
+        assert current_source_data_contract_demand(state, "source") == ("colour", "size")
+        assert [site.component_id for site in _contract_sites(state)] == ["source"]
 
 
 class TestReadinessBlocking:
