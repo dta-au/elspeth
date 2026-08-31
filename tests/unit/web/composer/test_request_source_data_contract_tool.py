@@ -16,6 +16,7 @@ import pytest
 
 from elspeth.contracts.composer_interpretation import InterpretationEventRecord, InterpretationKind
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.service import _orphaned_interpretation_review_validation
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_USER_TERM,
     build_source_data_contract_draft,
@@ -209,3 +210,13 @@ def test_tool_schema_advertises_the_kind() -> None:
         "source_data_contract",
     ]
     assert _RequestInterpretationReviewArgumentsModel.model_json_schema()["properties"]["kind"]["enum"] == kinds
+
+
+def test_orphan_validation_classifies_source_data_contract_as_source() -> None:
+    result = _orphaned_interpretation_review_validation(
+        (("source:upload", SOURCE_DATA_CONTRACT_USER_TERM, InterpretationKind.SOURCE_DATA_CONTRACT),)
+    )
+
+    assert [(error.component_id, error.component_type) for error in result.errors] == [("source:upload", "source")]
+    assert [(blocker.component_id, blocker.component_type) for blocker in result.readiness.blockers] == [("source:upload", "source")]
+    assert result.checks[0].affected_nodes == ()

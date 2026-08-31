@@ -960,11 +960,11 @@ def _orphaned_interpretation_review_validation(
     wording, which would point the user at a card that does not exist.
 
     The gate fires for EVERY interpretation kind that
-    ``_missing_pending_interpretation_review_sites`` can surface — vague_term,
-    invented_source, and pipeline_decision — not just legacy vague_term tokens.
+    ``_missing_pending_interpretation_review_sites`` can surface, including
+    both source-level kinds, not just legacy vague_term tokens.
     ``component_type`` is therefore derived per-site from the kind
-    (``INVENTED_SOURCE`` is a source-level handoff, every other kind is a
-    transform-level one) so the persisted ``ValidationError`` / readiness
+    (``INVENTED_SOURCE`` and ``SOURCE_DATA_CONTRACT`` are source-level
+    handoffs; node review kinds are transform-level) so the persisted ``ValidationError`` / readiness
     blocker carries the correct component type into the audit trail; and
     ``affected_nodes`` excludes source sites, mirroring the runtime preflight's
     canonical handling (``execution/validation.py`` ``InterpretationReviewPending``
@@ -972,7 +972,7 @@ def _orphaned_interpretation_review_validation(
     """
 
     def _component_type_for_kind(kind: InterpretationKind) -> Literal["source", "transform"]:
-        return "source" if kind is InterpretationKind.INVENTED_SOURCE else "transform"
+        return "source" if kind in {InterpretationKind.INVENTED_SOURCE, InterpretationKind.SOURCE_DATA_CONTRACT} else "transform"
 
     site_detail = ", ".join(f"{kind.value}:{component_id}:{term}" for component_id, term, kind in missing_sites)
     detail = f"The pipeline carries an unresolvable interpretation handoff with no matching pending review and cannot run: {site_detail}."
