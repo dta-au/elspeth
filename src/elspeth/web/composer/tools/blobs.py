@@ -172,10 +172,19 @@ class BlobContentPayload(TypedDict):
     values that guard has already narrowed.
 
     Read them as a PAIR.  ``creation_modality`` alone is not an authorship
-    statement: ``verbatim`` is written by the composer for content copied
-    from the user's own message, by the upload route for operator files, and
-    by run-output capture for pipeline artifacts.  ``created_by`` is what
-    separates those three.
+    statement: four unrelated paths write ``verbatim`` — the composer, for
+    content copied out of the user's own message; ``create_blob`` behind the
+    upload route; ``create_pending_blob`` for pipeline output; and
+    ``copy_blobs_for_fork``.  ``created_by`` is what separates them.
+
+    Both fields report what the row RECORDS, which is not always what
+    happened: fork copy preserves ``created_by`` but resets the modality to
+    ``verbatim`` and nulls the five ``creating_*`` columns, so an
+    LLM-generated blob carried across a session fork records as verbatim.
+    That is a defect in the fork writer, not something this read path can
+    detect — and it is the reason no derived "the assistant authored this"
+    flag is offered here: such a flag would confidently deny authorship of
+    content the assistant really did invent.
     """
 
     blob_id: str
