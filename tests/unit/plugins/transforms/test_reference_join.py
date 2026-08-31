@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from pydantic import ValidationError
 
 from elspeth.core.template_materialization import TemplateOptionMaterializer
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
@@ -561,6 +562,12 @@ class TestJoinedOutputFieldTypes:
         transform = build(reference_content=table, reference_format="json", output={"code": "ref['code']"})
         assert _declared_output_field(transform, "code").field_type == "any"
 
+        for product in ("hats", "coats"):
+            result = transform.process(make_pipeline_row({"product": product}), make_source_context())
+            assert result.row is not None
+            validated = transform.output_schema.model_validate(result.row.to_dict(), strict=True)
+            assert validated.code == result.row["code"]
+
     def test_a_structured_value_abstains_to_any(self) -> None:
         transform = build(
             reference_content=PRODUCTS_JSON,
@@ -577,12 +584,25 @@ class TestJoinedOutputFieldTypes:
         assert field.field_type == "str", "the type comes from the non-null values"
         assert field.nullable is True, "the table holds a null this join will emit"
 
-    def test_on_miss_null_keeps_the_honest_any(self) -> None:
-        """Any row may miss and take a None; the abstention is deliberate."""
+        result = transform.process(make_pipeline_row({"product": "coats"}), make_source_context())
+        assert result.row is not None
+        validated = transform.output_schema.model_validate(result.row.to_dict(), strict=True)
+        assert validated.note is None
+        with pytest.raises(ValidationError):
+            transform.output_schema.model_validate({"product": "coats"}, strict=True)
+
+    def test_on_miss_null_keeps_known_hit_type_and_validates_hits_and_misses(self) -> None:
         transform = build(on_miss="null")
         field = _declared_output_field(transform, "product_description")
-        assert field.field_type == "any"
+        assert field.field_type == "str"
+        assert field.required is True
         assert field.nullable is True
+
+        for product, expected in (("hats", "A fine hat"), ("gloves", None)):
+            result = transform.process(make_pipeline_row({"product": product}), make_source_context())
+            assert result.row is not None
+            validated = transform.output_schema.model_validate(result.row.to_dict(), strict=True)
+            assert validated.product_description == expected
 
     def test_on_miss_default_unifies_with_a_matching_default(self) -> None:
         transform = build(on_miss="default", default_values={"product_description": "n/a"})
@@ -704,16 +724,37 @@ class TestAuthorDeclarationsOnJoinedFields:
         transform = build(schema={"mode": "flexible", "fields": ["product_description: any"]})
         assert _declared_output_field(transform, "product_description").field_type == "any"
 
-    def test_a_declaration_against_a_derived_any_survives(self) -> None:
-        """Mixed entries abstain; an abstention cannot refute the author."""
+    def test_a_concrete_declaration_against_known_heterogeneous_values_is_refused(self) -> None:
         table = json.dumps([{"sku": "hats", "code": 1}, {"sku": "coats", "code": "X"}])
+        with pytest.raises(PluginConfigError) as exc:
+            build(
+                reference_content=table,
+                reference_format="json",
+                output={"code": "ref['code']"},
+                schema={"mode": "flexible", "fields": ["code: str"]},
+            )
+        assert "code" in str(exc.value)
+
+    def test_a_concrete_declaration_against_known_unrepresentable_values_is_refused(self) -> None:
+        table = json.dumps([{"sku": "hats", "payload": {"code": 1}}, {"sku": "coats", "payload": ["X"]}])
+        with pytest.raises(PluginConfigError) as exc:
+            build(
+                reference_content=table,
+                reference_format="json",
+                output={"payload": "ref['payload']"},
+                schema={"mode": "flexible", "fields": ["payload: str"]},
+            )
+        assert "payload" in str(exc.value)
+
+    def test_a_concrete_declaration_survives_closed_vacuous_evidence(self) -> None:
+        table = json.dumps([{"sku": "hats", "a": 1}, {"sku": "coats", "b": 2}])
         transform = build(
             reference_content=table,
             reference_format="json",
-            output={"code": "ref['code']"},
-            schema={"mode": "flexible", "fields": ["code: str"]},
+            output={"a": "ref['a']", "b": "ref['b']"},
+            schema={"mode": "flexible", "fields": ["a: str"]},
         )
-        assert _declared_output_field(transform, "code").field_type == "str"
+        assert _declared_output_field(transform, "a").field_type == "str"
 
     def test_a_non_join_field_keeps_its_declaration_either_way(self) -> None:
         transform = build(schema={"mode": "flexible", "fields": ["order_id: int"]})
