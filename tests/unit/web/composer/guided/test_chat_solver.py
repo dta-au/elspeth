@@ -2059,6 +2059,66 @@ async def test_deferred_repair_non_retain_retry_uses_clarification_retention(
 
 
 @pytest.mark.asyncio
+async def test_settled_retain_repair_allows_follow_on_sink_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Settling retains clears their error before the held sink is repaired."""
+    calls_seen = 0
+
+    async def repairing_retain_then_sink(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = [
+                SimpleNamespace(
+                    id="c_sink_invalid",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_CONFIG_INVALID_SINK_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_valid",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_rejected",
+                    function=SimpleNamespace(
+                        name="retain_deferred_intent",
+                        arguments=json.dumps({"target_stage": "topology"}),
+                    ),
+                ),
+            ]
+        elif calls_seen == 2:
+            calls = [
+                SimpleNamespace(
+                    id="c_retain_corrected",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+                )
+            ]
+        else:
+            calls = [
+                SimpleNamespace(
+                    id="c_sink_corrected",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_SINK_ARGUMENTS)),
+                )
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_retain_then_sink)
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save the rows and retain two topology requirements.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+    assert outcome.sink.outputs[0].plugin == "json"
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert calls_seen == 3
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["source", "sink"])
 async def test_form_directed_revision_keeps_retain_from_pair_with_withheld_resolution(
     monkeypatch: pytest.MonkeyPatch,

@@ -2807,6 +2807,12 @@ async def maybe_resolve_step_1_source_chat(
                         first_pass_slots=pending_deferred_repair_slots,
                         repaired_actions=tuple(parsed_actions),
                     )
+                    # A retain-bearing retry with no shape failures settles
+                    # this repair transaction. Later repair rounds (for a
+                    # held current-stage resolution) must not see stale slots
+                    # or re-raise the already-resolved retain error.
+                    pending_deferred_repair_slots = None
+                    pending_deferred_repair_error = None
                 if deferred_actions and not source_calls and pending_grouped_source_call is not None:
                     # A targeted retry may resend only the rejected retain.
                     # Restore the provider-independent current-stage sibling
@@ -3767,6 +3773,8 @@ async def maybe_resolve_step_2_sink_chat(
                         first_pass_slots=pending_deferred_repair_slots,
                         repaired_actions=tuple(parsed_actions),
                     )
+                    pending_deferred_repair_slots = None
+                    pending_deferred_repair_error = None
                 if deferred_actions and not sink_calls and pending_grouped_sink_call is not None:
                     # Targeted retain repair preserves the owned sink sibling;
                     # if the model replays the whole group, the fresh sink call
