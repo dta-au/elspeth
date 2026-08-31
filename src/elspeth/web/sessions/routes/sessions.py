@@ -764,7 +764,26 @@ def register_session_routes(router: APIRouter) -> None:
                             staged.session.id,
                             fence.operation_id,
                         )
-                    except (AuditIntegrityError, BlobError, SQLAlchemyError, OSError) as cleanup_exc:
+                    except AuditIntegrityError as integrity_exc:
+                        # A Tier-1 integrity failure inside compensation
+                        # outranks the primary coded failure and must reach
+                        # the app-level ``AuditIntegrityError`` handler with
+                        # its type intact; demoting it to a note under the
+                        # generic terminal-failure envelope loses both the
+                        # handler's structured record and the failed-turn
+                        # metadata the client reads. The residue record still
+                        # lands first, because leaked child blobs stay
+                        # operator-actionable either way.
+                        _log_last_resort_diagnostic(
+                            slog.error,
+                            "session.fork_blob_cleanup_failed",
+                            session_id=str(session_id),
+                            child_session_id=str(staged.session.id),
+                            operation_id=fence.operation_id,
+                            exc_class=type(integrity_exc).__name__,
+                        )
+                        raise
+                    except (BlobError, SQLAlchemyError, OSError) as cleanup_exc:
                         # The exception note alone is not a record: the tail
                         # below surfaces the PRIMARY failure through
                         # raise_guided_operation_failure, which raises a new
