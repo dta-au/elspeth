@@ -438,11 +438,11 @@ def close_failure(resource: _SupportsClose, *, check: str) -> CheckFailureRecord
     ``AcceptanceCheckError``. Only the exception class name is retained.
     """
 
+    active = sys.exc_info()[1]
     try:
         resource.close()
     except Exception as exc:
         record = CheckFailureRecord(check=check, exception_type=type(exc).__name__)
-        active = sys.exc_info()[1]
         if active is not None:
             active.add_note(f"acceptance resource close also failed during unwind: check={check} cause_class={record.exception_type}")
         return record

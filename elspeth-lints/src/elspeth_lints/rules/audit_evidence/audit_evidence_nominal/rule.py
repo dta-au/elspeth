@@ -22,13 +22,14 @@ from elspeth_lints.rules.audit_evidence.shared import (
     allowlist_path_for_root,
     class_allowlist_governance_findings_for_root,
     display_path,
+    enclosing_names,
     iter_python_paths,
     load_class_allowlist,
+    parent_map,
 )
 
 # ADR-010 requires nominal inheritance from THIS class specifically; a base merely
 # named ``AuditEvidenceBase`` (a local or wrongly-imported class) does not satisfy it.
-_CANONICAL_AUDIT_EVIDENCE_MODULE = "elspeth.contracts.audit_evidence"
 _AUDIT_EVIDENCE_BASE_NAME = "AuditEvidenceBase"
 # The canonical module defines the base locally; a subclass there inherits it
 # without an import, and that local reference IS the real base (cannot be spoofed
@@ -93,15 +94,28 @@ def scan_tree(tree: ast.AST, file_path: str) -> list[Finding]:
     return _findings_for_indexes([_index_file(tree, file_path)])
 
 
-# A class is identified by the display path of its defining file plus its name.
-_ClassKey = tuple[str, str]
+# A class is identified by the display path of its defining file plus its
+# lexical path. A simple name is not unique: top-level and nested classes may
+# legitimately share one without sharing inheritance.
+_ScopePath = tuple[str, ...]
+_ClassKey = tuple[str, _ScopePath]
 
 
 @dataclass(frozen=True, slots=True)
 class _ClassRecord:
     node: ast.ClassDef
     key: _ClassKey
+    lookup_prefixes: tuple[_ScopePath, ...]
     defines_to_audit_dict: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _NameResolution:
+    """The first tracked binding for one name along a class header's lookup path."""
+
+    class_key: _ClassKey | None = None
+    imported_class: tuple[str, str] | None = None
+    module_alias: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,44 +124,80 @@ class _FileIndex:
 
     file_path: str
     in_canonical_module: bool
-    # Local names bound to the canonical AuditEvidenceBase, and aliases bound
-    # to its module (``import elspeth.contracts.audit_evidence as M``).
-    base_bindings: tuple[frozenset[str], frozenset[str]]
-    # ``from elspeth.x.y import Name [as local]`` → local: (module suffix, Name)
-    from_imports: dict[str, tuple[str, str]]
-    # ``import elspeth.x.y as m`` → m: module suffix
-    module_aliases: dict[str, str]
+    # execution namespace → local import name → (module suffix, imported name)
+    from_imports: dict[_ScopePath, dict[str, tuple[str, str]]]
+    # execution namespace → module alias → module suffix
+    module_aliases: dict[_ScopePath, dict[str, str]]
     classes: tuple[_ClassRecord, ...]
 
 
 def _index_file(tree: ast.AST, file_path: str) -> _FileIndex:
-    from_imports: dict[str, tuple[str, str]] = {}
-    module_aliases: dict[str, str] = {}
+    parents = parent_map(tree)
+    from_imports: dict[_ScopePath, dict[str, tuple[str, str]]] = {}
+    module_aliases: dict[_ScopePath, dict[str, str]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             suffix = _module_suffix(node.module)
             if suffix is None:
                 continue
+            scope = enclosing_names(node, parents)
+            scoped_imports = from_imports.setdefault(scope, {})
             for alias in node.names:
-                from_imports[alias.asname or alias.name] = (suffix, alias.name)
+                scoped_imports[alias.asname or alias.name] = (suffix, alias.name)
         elif isinstance(node, ast.Import):
+            scope = enclosing_names(node, parents)
+            scoped_aliases = module_aliases.setdefault(scope, {})
             for alias in node.names:
                 suffix = _module_suffix(alias.name)
                 if suffix is not None and alias.asname:
-                    module_aliases[alias.asname] = suffix
-    classes = tuple(
-        _ClassRecord(node=node, key=(file_path, node.name), defines_to_audit_dict=_class_defines_to_audit_dict(node))
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ClassDef)
-    )
+                    scoped_aliases[alias.asname] = suffix
+    classes: list[_ClassRecord] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            lookup_prefixes = _class_base_lookup_prefixes(node, parents)
+            classes.append(
+                _ClassRecord(
+                    node=node,
+                    key=(file_path, (*lookup_prefixes[0], node.name)),
+                    lookup_prefixes=lookup_prefixes,
+                    defines_to_audit_dict=_class_defines_to_audit_dict(node),
+                )
+            )
     return _FileIndex(
         file_path=file_path,
         in_canonical_module=file_path.endswith(_CANONICAL_MODULE_SUFFIX),
-        base_bindings=_audit_evidence_base_bindings(tree),
         from_imports=from_imports,
         module_aliases=module_aliases,
-        classes=classes,
+        classes=tuple(classes),
     )
+
+
+def _class_base_lookup_prefixes(node: ast.ClassDef, parents: dict[int, ast.AST]) -> tuple[_ScopePath, ...]:
+    """Return execution namespaces searched while evaluating ``node``'s bases.
+
+    The immediately containing class or function namespace is visible. Beyond
+    it, Python closes over function scopes but never enclosing class scopes,
+    before finally consulting the module namespace.
+    """
+    definitions: list[ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef] = []
+    current = parents.get(id(node))
+    while current is not None:
+        if isinstance(current, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            definitions.append(current)
+        current = parents.get(id(current))
+    definitions.reverse()
+
+    current_namespace = tuple(definition.name for definition in definitions)
+    prefixes: list[_ScopePath] = [current_namespace]
+    for index in range(len(definitions) - 1, -1, -1):
+        if not isinstance(definitions[index], (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        function_namespace = tuple(definition.name for definition in definitions[: index + 1])
+        if function_namespace not in prefixes:
+            prefixes.append(function_namespace)
+    if () not in prefixes:
+        prefixes.append(())
+    return tuple(prefixes)
 
 
 def _module_suffix(module: str | None) -> str | None:
@@ -168,7 +218,7 @@ def _module_suffix(module: str | None) -> str | None:
 def _findings_for_indexes(indexes: list[_FileIndex]) -> list[Finding]:
     evidence = _resolve_evidence_classes(indexes)
     return [
-        _finding(index.file_path, record.node)
+        _finding(index.file_path, record.node, record.key[1])
         for index in indexes
         for record in index.classes
         if record.defines_to_audit_dict and record.key not in evidence
@@ -189,7 +239,7 @@ def _resolve_evidence_classes(indexes: list[_FileIndex]) -> set[_ClassKey]:
     evidence: set[_ClassKey] = set()
     for index in indexes:
         for record in index.classes:
-            if _bases_include_audit_evidence_base(record.node.bases, index.base_bindings, in_canonical_module=index.in_canonical_module):
+            if any(_base_is_canonical(base, record, index) for base in record.node.bases):
                 evidence.add(record.key)
     changed = True
     while changed:
@@ -198,7 +248,7 @@ def _resolve_evidence_classes(indexes: list[_FileIndex]) -> set[_ClassKey]:
             for record in index.classes:
                 if record.key in evidence:
                     continue
-                if any(_resolve_base(base, index, files_by_suffix) in evidence for base in record.node.bases):
+                if any(_resolve_base(base, record, index, files_by_suffix) in evidence for base in record.node.bases):
                     evidence.add(record.key)
                     changed = True
     return evidence
@@ -222,70 +272,66 @@ def _suffixes_of(file_path: str) -> list[str]:
     return ["/".join(parts[i:]) for i in range(len(parts))]
 
 
-def _resolve_base(base: ast.expr, index: _FileIndex, files_by_suffix: dict[str, str | None]) -> _ClassKey | None:
+def _resolve_base(
+    base: ast.expr,
+    record: _ClassRecord,
+    index: _FileIndex,
+    files_by_suffix: dict[str, str | None],
+) -> _ClassKey | None:
     """Resolve a base expression to the class it names, or None if unprovable."""
     if isinstance(base, ast.Name):
-        imported = index.from_imports.get(base.id)
-        if imported is not None:
-            suffix, name = imported
+        resolution = _resolve_name(base.id, record, index)
+        if resolution.class_key is not None:
+            return resolution.class_key
+        if resolution.imported_class is not None:
+            suffix, name = resolution.imported_class
             imported_file = files_by_suffix.get(suffix)
-            return None if imported_file is None else (imported_file, name)
-        return (index.file_path, base.id)
+            return None if imported_file is None else (imported_file, (name,))
+        return None
     if isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name):
-        alias_suffix = index.module_aliases.get(base.value.id)
+        alias_suffix = _resolve_name(base.value.id, record, index).module_alias
         if alias_suffix is None:
             return None
         alias_file = files_by_suffix.get(alias_suffix)
-        return None if alias_file is None else (alias_file, base.attr)
+        return None if alias_file is None else (alias_file, (base.attr,))
     return None
 
 
-def _audit_evidence_base_bindings(tree: ast.AST) -> tuple[frozenset[str], frozenset[str]]:
-    """Collect the local names / module aliases that resolve to the canonical base.
+def _resolve_name(name: str, record: _ClassRecord, index: _FileIndex) -> _NameResolution:
+    """Resolve the first tracked binding for ``name`` along Python's lookup path.
 
-    Returns ``(local_names, module_aliases)`` where local_names are bound by
-    ``from elspeth.contracts.audit_evidence import AuditEvidenceBase [as X]`` and
-    module_aliases by ``import elspeth.contracts.audit_evidence as M``.
+    A class definition in the current namespace shadows an import with the same
+    local name. Multiple class definitions at the first matching namespace are
+    ambiguous and resolve to nothing, so inheritance remains fail closed.
     """
-    local_names: set[str] = set()
-    module_aliases: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module == _CANONICAL_AUDIT_EVIDENCE_MODULE:
-            for alias in node.names:
-                if alias.name == _AUDIT_EVIDENCE_BASE_NAME:
-                    local_names.add(alias.asname or alias.name)
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name == _CANONICAL_AUDIT_EVIDENCE_MODULE and alias.asname:
-                    module_aliases.add(alias.asname)
-    return frozenset(local_names), frozenset(module_aliases)
+    for prefix in record.lookup_prefixes:
+        local_key = (index.file_path, (*prefix, name))
+        matching_count = sum(candidate.key == local_key for candidate in index.classes)
+        if matching_count == 1:
+            return _NameResolution(class_key=local_key)
+        if matching_count > 1:
+            return _NameResolution()
+        imported_class = index.from_imports.get(prefix, {}).get(name)
+        if imported_class is not None:
+            return _NameResolution(imported_class=imported_class)
+        module_alias = index.module_aliases.get(prefix, {}).get(name)
+        if module_alias is not None:
+            return _NameResolution(module_alias=module_alias)
+    return _NameResolution()
 
 
-def _bases_include_audit_evidence_base(
-    bases: list[ast.expr],
-    bindings: tuple[frozenset[str], frozenset[str]],
-    *,
-    in_canonical_module: bool,
-) -> bool:
-    """True only when a base resolves to the canonical AuditEvidenceBase.
-
-    A base merely named ``AuditEvidenceBase`` does NOT count unless it was
-    imported from the canonical module (or is the local definition inside the
-    canonical module itself). This closes the spoofing bypass where a local
-    ``class AuditEvidenceBase`` satisfied the nominal-inheritance gate.
-    """
-    local_names, module_aliases = bindings
-    for base in bases:
-        if isinstance(base, ast.Name):
-            if base.id in local_names or (in_canonical_module and base.id == _AUDIT_EVIDENCE_BASE_NAME):
-                return True
-        elif (
-            isinstance(base, ast.Attribute)
-            and base.attr == _AUDIT_EVIDENCE_BASE_NAME
-            and isinstance(base.value, ast.Name)
-            and base.value.id in module_aliases
-        ):
-            return True
+def _base_is_canonical(base: ast.expr, record: _ClassRecord, index: _FileIndex) -> bool:
+    """Return whether ``base`` resolves to the canonical AuditEvidenceBase."""
+    if isinstance(base, ast.Name):
+        resolution = _resolve_name(base.id, record, index)
+        if resolution.class_key is not None:
+            return index.in_canonical_module and resolution.class_key == (
+                index.file_path,
+                (_AUDIT_EVIDENCE_BASE_NAME,),
+            )
+        return resolution.imported_class == (_CANONICAL_MODULE_SUFFIX, _AUDIT_EVIDENCE_BASE_NAME)
+    if isinstance(base, ast.Attribute) and base.attr == _AUDIT_EVIDENCE_BASE_NAME and isinstance(base.value, ast.Name):
+        return _resolve_name(base.value.id, record, index).module_alias == _CANONICAL_MODULE_SUFFIX
     return False
 
 
@@ -309,14 +355,15 @@ def _class_defines_to_audit_dict(class_node: ast.ClassDef) -> bool:
     return False
 
 
-def _finding(file_path: str, node: ast.ClassDef) -> Finding:
-    key = f"{file_path}:{LEGACY_RULE_ID}:{node.name}"
+def _finding(file_path: str, node: ast.ClassDef, qualified_name: tuple[str, ...]) -> Finding:
+    display_name = ".".join(qualified_name)
+    key = f"{file_path}:{LEGACY_RULE_ID}:{display_name}"
     return Finding(
         rule_id=LEGACY_RULE_ID,
         file_path=file_path,
         line=node.lineno,
         column=node.col_offset,
-        message=f"{node.name} defines to_audit_dict without inheriting AuditEvidenceBase",
+        message=f"{display_name} defines to_audit_dict without inheriting AuditEvidenceBase",
         fingerprint=key,
         severity=RULE_METADATA.severity,
         suggestion=SUGGESTION,

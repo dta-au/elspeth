@@ -7,7 +7,7 @@
 // ============================================================================
 
 import type { AuditCharacteristicFlag } from "../components/catalog/auditCharacteristics";
-import type { FieldTier } from "./guided";
+import type { FieldTier, VisibilityPredicate } from "./guided";
 import type { FailedTurn } from "./recovery";
 
 // ── Auth ────────────────────────────────────────────────────────────────────
@@ -442,7 +442,11 @@ export interface PluginSummary {
  *  view was entirely untiered (elspeth-a6ea581e8a). A field the catalog
  *  knows but does not tier reads as "common" (see `optionTier` in
  *  components/chat/guided/optionTiers.ts): visible, never demoted. */
-export type CatalogKnobField = { name: string; tier?: FieldTier };
+export type CatalogKnobField = {
+  name: string;
+  tier?: FieldTier;
+  visible_when?: VisibilityPredicate;
+};
 
 /** Detailed plugin schema info including configuration JSON Schema. */
 export interface PluginSchemaInfo {

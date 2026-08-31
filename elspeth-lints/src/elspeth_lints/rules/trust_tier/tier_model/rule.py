@@ -1186,12 +1186,13 @@ class TierModelVisitor(ast.NodeVisitor):
 
     @classmethod
     def _is_constructed_record(cls, node: ast.AST | None) -> bool:
-        """True for a call that builds a record object rather than a bare string."""
-        if not isinstance(node, ast.Call):
-            return False
-        if isinstance(node.func, ast.Name):
-            return node.func.id not in cls._RECORD_BUILTIN_CALLS
-        return isinstance(node.func, ast.Attribute)
+        """True for a direct non-builtin call that builds a record."""
+        return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id not in cls._RECORD_BUILTIN_CALLS
+
+    @classmethod
+    def _is_explicit_error_record(cls, node: ast.AST | None) -> bool:
+        """True when syntax proves an explicit record rather than a scalar."""
+        return node is not None and (cls._is_error_entry_call(node) or cls._is_constructed_record(node))
 
     @classmethod
     def _is_validator_accumulator(cls, receiver: ast.expr) -> bool:
@@ -1212,16 +1213,16 @@ class TierModelVisitor(ast.NodeVisitor):
         failure into the enclosing validator's result the same way a
         ``TransformResult.error`` routed to completion does. Two closed
         vocabularies bound it: the receiver must be a validator accumulator by
-        name, and the recorded value must be a constructed record (directly or
+        name, and the recorded value must be an explicit record (directly or
         via a local bound in the handler) — ``errors.append(str(exc))`` and
         ``seen.append(_normalise(exc))`` are still swallows. A call carrying an
         ``error_code=`` keyword is accepted on any receiver.
         """
         record_names: set[str] = set()
         for child in nodes:
-            if isinstance(child, ast.Assign) and self._is_constructed_record(child.value):
+            if isinstance(child, ast.Assign) and self._is_explicit_error_record(child.value):
                 record_names.update(target.id for target in child.targets if isinstance(target, ast.Name))
-            elif isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name) and self._is_constructed_record(child.value):
+            elif isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name) and self._is_explicit_error_record(child.value):
                 record_names.add(child.target.id)
         for child in nodes:
             if not (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr in {"append", "add"}):
@@ -1233,7 +1234,7 @@ class TierModelVisitor(ast.NodeVisitor):
                 return True
             if not self._is_validator_accumulator(child.func.value):
                 continue
-            if self._is_constructed_record(recorded):
+            if self._is_explicit_error_record(recorded):
                 return True
             if isinstance(recorded, ast.Name) and recorded.id in record_names:
                 return True

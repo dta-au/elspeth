@@ -173,6 +173,56 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
   const seedCatalog = (schemas: Record<string, unknown>) =>
     usePluginCatalogStore.setState({ key: "alice:fp-1", principal: "alice", fingerprint: "fp-1", schemas } as never);
 
+  const DISCRIMINATED_TIER_SCHEMA = {
+    name: "llm",
+    plugin_type: "transform",
+    description: "",
+    json_schema: {},
+    knob_schema: {
+      fields: [
+        { name: "provider", tier: "common" },
+        {
+          name: "max_tokens",
+          tier: "advanced",
+          visible_when: { field: "provider", equals: "azure" },
+        },
+        {
+          name: "max_tokens",
+          tier: "common",
+          visible_when: { field: "provider", equals: "gateway" },
+        },
+      ],
+    },
+  } as const;
+
+  it.each([
+    ["azure", true],
+    ["gateway", false],
+  ] as const)("uses the active %s provider variant's max_tokens tier", (provider, maxTokensIsAdvanced) => {
+    seedCatalog({ "transform:llm": DISCRIMINATED_TIER_SCHEMA });
+    render(
+      <OptionRows
+        options={{ provider, max_tokens: 32 }}
+        ariaLabel={`${provider} options`}
+        plugin={{ kind: "transform", name: "llm" }}
+      />,
+    );
+    const region = screen.getByRole("region", { name: `${provider} options` });
+    const visibleTerms = within(region)
+      .getAllByRole("term")
+      .filter((term) => term.closest("details") === null)
+      .map((term) => term.textContent);
+
+    if (maxTokensIsAdvanced) {
+      expect(visibleTerms).toEqual(["Provider"]);
+      const advanced = within(region).getByText("Advanced settings (1)").closest("details");
+      expect(within(advanced as HTMLElement).getByText("Max Tokens")).toBeInTheDocument();
+    } else {
+      expect(visibleTerms).toEqual(["Provider", "Max Tokens"]);
+      expect(within(region).queryByText(/Advanced settings/)).not.toBeInTheDocument();
+    }
+  });
+
   it("orders visible rows by the schema and sends advanced-tier + unknown keys to the disclosure", () => {
     seedCatalog({ "transform:llm": LLM_SCHEMA });
     render(<OptionRows options={OPTIONS} ariaLabel="assess options" plugin={{ kind: "transform", name: "llm" }} />);

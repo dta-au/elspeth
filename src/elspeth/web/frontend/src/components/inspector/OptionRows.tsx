@@ -167,22 +167,28 @@ export function OptionRows({
     visibleKeys = FALLBACK_VISIBLE_OPTION_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(options, key));
     advancedKeys = candidateKeys.filter((key) => !FALLBACK_VISIBLE_OPTION_KEYS.includes(key));
   } else {
+    // A discriminated schema repeats same-named fields once per variant. Only
+    // the active copy participates in tiering, using SchemaFormTurn's exact
+    // visible_when predicate semantics against the authored options. Otherwise
+    // registry order would decide the tier through a last-wins Map.
+    //
     // Absent tier = "common": a field the catalog KNOWS but does not tier is
     // visible, never demoted. The operator-profile policy views hand-build
-    // their projections and shipped fields with no `tier` at all — the live
-    // `transform:llm` view was entirely untiered, which emptied `visibleKeys`
-    // and buried the prompt under the advanced disclosure. Same posture as
-    // `optionTier` in components/chat/guided/optionTiers.ts
-    // (elspeth-a6ea581e8a). The default sits where the tier is READ so both
-    // comparisons below stay plain equality and a third one inherits it;
-    // this is a readability choice, not a behavioural one — a key the schema
-    // does not list never reaches those filters (they walk `schemaOrder`), so
-    // defaulting at the comparison would partition identically.
-    const tierByKey = new Map(schema.knob_schema.fields.map((field) => [field.name, field.tier ?? "common"]));
-    const schemaOrder = schema.knob_schema.fields.map((field) => field.name);
-    const present = (key: string): boolean => candidateKeys.includes(key);
-    const essentials = schemaOrder.filter((key) => present(key) && tierByKey.get(key) === "essential");
-    const commons = schemaOrder.filter((key) => present(key) && tierByKey.get(key) === "common");
+    // their projections and have shipped fields with no `tier`; this keeps the
+    // same posture as `optionTier` in components/chat/guided/optionTiers.ts
+    // (elspeth-a6ea581e8a). A key no active schema field lists remains advanced.
+    const activeFields = schema.knob_schema.fields.filter(
+      (field) =>
+        field.visible_when === undefined
+        || options[field.visible_when.field] === field.visible_when.equals,
+    );
+    const presentFields = activeFields.filter((field) => candidateKeys.includes(field.name));
+    const essentials = presentFields
+      .filter((field) => (field.tier ?? "common") === "essential")
+      .map((field) => field.name);
+    const commons = presentFields
+      .filter((field) => (field.tier ?? "common") === "common")
+      .map((field) => field.name);
     visibleKeys = [...essentials, ...commons];
     advancedKeys = candidateKeys.filter((key) => !visibleKeys.includes(key));
   }
