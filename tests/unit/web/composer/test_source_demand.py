@@ -34,7 +34,11 @@ def _llm_node(
 ) -> NodeSpec:
     options: dict[str, Any] = {
         "prompt_template": "Rate {{ row.colour }}",
-        "model": "gpt-test",
+        # Composer persists the public operator-profile alias; provider/model
+        # bindings stay private until lowering.  Keep this helper on the real
+        # authoring shape so Stage-1's profile probe can establish the LLM's
+        # pass-through contract.
+        "profile": "test",
         "schema": {"mode": "observed"},
     }
     if required is not None:
