@@ -1548,9 +1548,11 @@ def _proof_repair_is_applicable(state: CompositionState) -> bool:
 def _empty_state_uploaded_blob_repair_message(ready_blobs: tuple[Mapping[str, Any], ...], *, next_turn: int) -> str:
     """Build a bounded repair prompt for empty-state stalls with ready uploads.
 
-    The message contains the same metadata exposed by ``list_blobs``: blob id,
-    filename, MIME type, byte size, creator, and status. It never includes raw
-    blob bytes, storage paths, or full content hashes.
+    The message contains a subset of the metadata exposed by ``list_blobs``:
+    blob id, filename, MIME type, byte size, creator, and status. It omits
+    ``creation_modality`` because the caller has already filtered to
+    ``created_by == "user"`` uploads, for which the modality is uniform. It
+    never includes raw blob bytes, storage paths, or full content hashes.
     """
     rendered_blobs = []
     for blob in ready_blobs[:5]:
