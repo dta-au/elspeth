@@ -571,6 +571,7 @@ class SinkEffectCoordinator:
                 effect_id=effect.effect_id,
                 request=request,
                 lease=lease,
+                heartbeat=heartbeat,
                 descriptor=commit_result.descriptor,
                 evidence=commit_result.evidence,
                 accepted_ordinals=tuple(commit_result.accepted_ordinals),
@@ -607,6 +608,7 @@ class SinkEffectCoordinator:
                 effect_id=effect.effect_id,
                 request=request,
                 lease=lease,
+                heartbeat=heartbeat,
                 descriptor=reconciliation.descriptor,
                 evidence=reconciliation.evidence,
                 accepted_ordinals=accepted_ordinals,
@@ -635,6 +637,7 @@ class SinkEffectCoordinator:
             effect_id=effect.effect_id,
             request=request,
             lease=lease,
+            heartbeat=heartbeat,
             descriptor=commit.descriptor,
             evidence=commit.evidence,
             accepted_ordinals=tuple(commit.accepted_ordinals),
@@ -753,6 +756,7 @@ class SinkEffectCoordinator:
                 effect_id=plan.effect_id,
                 request=request,
                 lease=lease,
+                heartbeat=heartbeat,
                 descriptor=result.descriptor,
                 evidence=result.evidence,
                 accepted_ordinals=accepted_ordinals,
@@ -768,6 +772,7 @@ class SinkEffectCoordinator:
                 effect_id=plan.effect_id,
                 request=request,
                 lease=lease,
+                heartbeat=heartbeat,
                 descriptor=result.descriptor,
                 evidence=result.evidence,
                 accepted_ordinals=accepted_ordinals,
@@ -1402,6 +1407,7 @@ class SinkEffectCoordinator:
         effect_id: str,
         request: SinkEffectExecutionRequest,
         lease: SinkEffectLease,
+        heartbeat: _SinkEffectLeaseHeartbeat,
         descriptor: ArtifactDescriptor,
         evidence: Mapping[str, object],
         accepted_ordinals: tuple[int, ...],
@@ -1415,6 +1421,13 @@ class SinkEffectCoordinator:
             members = tuple(by_ordinal[ordinal] for ordinal in accepted_ordinals)
         except KeyError as exc:
             raise LandscapeRecordError(f"sink result accepted unknown member ordinal {exc.args[0]}") from exc
+        # Retire and join the background renewer before our own terminal CAS.
+        # A beat after FINALIZED would correctly fail the repository's live-
+        # lease fence but would be our retirement, not a rival takeover. The
+        # synchronous final refresh proves exact authority at the handoff;
+        # finalize rechecks owner, generation, and expiry under its row locks.
+        heartbeat.stop()
+        heartbeat.refresh_and_check()
         return self._effects.finalize(
             SinkEffectFinalizeRequest(
                 effect_id=effect_id,

@@ -992,7 +992,7 @@ async def test_guided_start_replay_rejects_cross_session_result_locator(tmp_path
 @pytest.mark.asyncio
 async def test_guided_start_joins_active_operation_outside_compose_lock(tmp_path) -> None:
     from elspeth.web.sessions.guided_operations import guided_operation_request_hash
-    from elspeth.web.sessions.protocol import GuidedOperationClaimed
+    from elspeth.web.sessions.protocol import GuidedOperationActive, GuidedOperationClaimed
     from elspeth.web.sessions.routes.guided_operations import guided_response_hash
     from elspeth.web.sessions.schemas import GetGuidedResponse, StartGuidedRequest
 
@@ -1023,24 +1023,46 @@ async def test_guided_start_joins_active_operation_outside_compose_lock(tmp_path
     )
     assert isinstance(claim, GuidedOperationClaimed)
 
-    joining = asyncio.create_task(
-        asyncio.to_thread(
-            client.post,
-            f"/api/sessions/{session.id}/guided/start",
-            json=payload,
-        )
-    )
-    await asyncio.sleep(0.1)
-    expected_response = GetGuidedResponse.model_validate_json(seeded.content)
-    await service.complete_existing_state_guided_operation(
-        claim.fence,
-        state_id=current.id,
-        expected_current_state_id=current.id,
-        expected_current_state_version=current.version,
-        actor="composer_route",
-        response_hash_factory=lambda _record: guided_response_hash(expected_response),
-    )
-    joined = await asyncio.wait_for(joining, timeout=2)
+    join_observed = asyncio.Event()
+    original_get = service.get_guided_operation
+    compose_lock = await app.state.session_compose_lock_registry.get_lock(str(session.id))
+    active_reads = 0
+
+    async def observe_active_join(*args, **kwargs):
+        nonlocal active_reads
+        outcome = await original_get(*args, **kwargs)
+        if kwargs["operation_id"] == operation_id and isinstance(outcome, GuidedOperationActive):
+            active_reads += 1
+            # The route performs one conflict-only lookup before entering the
+            # reserve/replay helper.  The second Active read proves the helper
+            # itself has entered its join loop while the compose lock is held.
+            if active_reads == 2:
+                join_observed.set()
+        return outcome
+
+    with patch.object(service, "get_guided_operation", side_effect=observe_active_join):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as joining_client:
+            # Hold the per-session compose lock throughout the retry.  An
+            # active-operation join must observe and replay its durable winner
+            # without waiting for mutable-state admission.
+            async with compose_lock:
+                joining = asyncio.create_task(
+                    joining_client.post(
+                        f"/api/sessions/{session.id}/guided/start",
+                        json=payload,
+                    )
+                )
+                await asyncio.wait_for(join_observed.wait(), timeout=5)
+                expected_response = GetGuidedResponse.model_validate_json(seeded.content)
+                await service.complete_existing_state_guided_operation(
+                    claim.fence,
+                    state_id=current.id,
+                    expected_current_state_id=current.id,
+                    expected_current_state_version=current.version,
+                    actor="composer_route",
+                    response_hash_factory=lambda _record: guided_response_hash(expected_response),
+                )
+                joined = await asyncio.wait_for(joining, timeout=5)
 
     assert joined.status_code == 200
     assert joined.json() == seeded.json()

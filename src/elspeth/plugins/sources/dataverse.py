@@ -38,7 +38,11 @@ from elspeth.plugins.infrastructure.clients.dataverse import (
     validate_additional_domain,
 )
 from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_url
-from elspeth.plugins.infrastructure.config_base import DataPluginConfig, declared_source_schema_field_names
+from elspeth.plugins.infrastructure.config_base import (
+    DataPluginConfig,
+    NormalizedFieldMappingOption,
+    declared_source_schema_field_names,
+)
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
@@ -142,7 +146,7 @@ class DataverseSourceConfig(DataPluginConfig):
     )
 
     # Field handling
-    field_mapping: dict[str, str] | None = Field(
+    field_mapping: NormalizedFieldMappingOption = Field(
         default=None,
         description="Manual field name overrides",
     )
@@ -275,7 +279,7 @@ class DataverseSource(BaseSource):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3a76dd69821d21a9"
+    source_file_hash: str | None = "sha256:3bdedfd268c84048"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 

@@ -5,10 +5,11 @@ from __future__ import annotations
 import keyword
 import re
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
 from pydantic import Field, field_validator, model_validator
 
+from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 
@@ -87,7 +88,13 @@ class RAGRetrievalConfig(TransformDataConfig):
             return SchemaConfig.from_dict(v)
         return v
 
-    output_prefix: str = Field(description="Prefix used for fields emitted by retrieval, such as contexts and scores.")
+    output_prefix: Annotated[
+        str,
+        EmittedToOutput(
+            "rag_retrieval builds its emitted field names from this prefix, so the value becomes "
+            "part of row-data keys and downstream artifact columns"
+        ),
+    ] = Field(description="Prefix used for fields emitted by retrieval, such as contexts and scores.")
     query_field: str = Field(description="Input row field containing the retrieval query text.")
     query_template: str | None = Field(
         default=None,
@@ -109,7 +116,10 @@ class RAGRetrievalConfig(TransformDataConfig):
         default="numbered",
         description="Formatting style used when combining retrieved contexts into output text.",
     )
-    context_separator: str = Field(default="\n---\n", description="Separator inserted between retrieved contexts when applicable.")
+    context_separator: Annotated[
+        str,
+        EmittedToOutput("rag_retrieval inserts this separator into the combined context value written to row data"),
+    ] = Field(default="\n---\n", description="Separator inserted between retrieved contexts when applicable.")
     max_context_length: int | None = Field(
         default=None,
         ge=1,

@@ -11,7 +11,6 @@ web.catalog, composer_mcp.session).
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
 import time
@@ -43,6 +42,7 @@ from elspeth.contracts.composer_audit import (
 )
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import yaml_generator
@@ -1013,7 +1013,7 @@ def _build_stdio_server(catalog: CatalogService, scratch_dir: Path, data_dir: Pa
     session_id = uuid.uuid4().hex[:12]
 
     async def stdio_runtime_preflight(state: CompositionState) -> ValidationResult:
-        return await asyncio.to_thread(
+        return await run_sync_in_worker(
             validate_pipeline,
             state,
             settings,

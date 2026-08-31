@@ -4,9 +4,10 @@ JSONExplode transforms one row containing an array field into multiple rows,
 one for each element in the array. This is the inverse of aggregation.
 
 THREE-TIER TRUST MODEL:
-- JSONExplode TRUSTS that pipeline data types are correct
-- Type violations (missing field, wrong type) indicate UPSTREAM BUGS and crash
-- No TransformResult.error() for type violations - they are bugs to fix
+- A missing array field is an upstream contract violation and raises ``KeyError``
+- A present field with the wrong value type is a row-level data failure
+- Wrong value types return ``TransformResult.error()`` so ``on_error`` can route
+  them without coercing or fabricating array elements
 """
 
 import pytest
@@ -291,12 +292,12 @@ class TestJSONExplodeHappyPath:
 
 
 class TestJSONExplodeTypeViolations:
-    """Tests for type violations - these should CRASH, not return errors.
+    """Distinguish missing-field contract violations from wrong-type row failures.
 
     Per three-tier trust model:
-    - Source validates that array field exists and is a list
-    - Transform trusts source did its job
-    - Type violations are UPSTREAM BUGS that should crash
+    - A missing array field remains an upstream bug and raises ``KeyError``
+    - A present field with the wrong value type returns a non-retryable error
+    - Strings and mappings are rejected rather than iterated into fabricated rows
     """
 
     @pytest.fixture

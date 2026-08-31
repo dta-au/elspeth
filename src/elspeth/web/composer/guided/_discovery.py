@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.tool_calls import is_valid_provider_replay_tool_call_id
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import (
@@ -69,19 +70,33 @@ def _assistant_tool_calls_message(message: Any, tool_calls: Any) -> dict[str, An
     the tool-call request to precede the ``role=tool`` results in the next
     round, and every ``tool_call_id`` it names must be answered. We rebuild it
     explicitly (rather than re-appending the raw provider object) so the wire
-    shape is deterministic and provider-agnostic.
+    shape is deterministic and provider-agnostic. IDs are admitted as opaque,
+    non-blank, turn-unique strings and copied exactly: provider signatures may
+    make them longer than ELSPETH's persisted-ID limit.
     """
+    admitted_calls: list[dict[str, Any]] = []
+    call_ids: set[str] = set()
+    for tool_call in tool_calls:
+        call_id = tool_call.id
+        if not is_valid_provider_replay_tool_call_id(call_id):
+            raise GuidedSolverResponseShapeError("guided discovery response contains an invalid provider tool-call ID")
+        if call_id in call_ids:
+            raise GuidedSolverResponseShapeError("guided discovery response contains duplicate provider tool-call IDs")
+        call_ids.add(call_id)
+        admitted_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": tool_call.function.name,
+                    "arguments": tool_call.function.arguments,
+                },
+            }
+        )
     return {
         "role": "assistant",
         "content": message.content,
-        "tool_calls": [
-            {
-                "id": tool_call.id,
-                "type": "function",
-                "function": {"name": tool_call.function.name, "arguments": tool_call.function.arguments},
-            }
-            for tool_call in tool_calls
-        ],
+        "tool_calls": admitted_calls,
     }
 
 

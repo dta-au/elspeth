@@ -845,6 +845,35 @@ class TestStep4WireEmitter:
             "expected_output_count": None,
         }
 
+    def test_unbound_llm_probe_preserves_degraded_cardinality_fallback(self) -> None:
+        """An invalid draft without profile/provider/model still renders safely."""
+
+        node = NodeSpec(
+            id="summarize",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="results",
+            on_error="discard",
+            options={
+                "schema": {"mode": "observed"},
+                "prompt_template": "Summarise this row.",
+                "response_field": "summary",
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+        assert _node_cardinality(node, executable_node=node) == {
+            "input": "one",
+            "output": "zero_or_many",
+            "expected_output_count": None,
+        }
+
     @staticmethod
     def _gate_node(*, condition: str, routes: dict[str, str], fork_to: tuple[str, ...] | None = None) -> NodeSpec:
         return NodeSpec(
@@ -937,11 +966,11 @@ class TestStep4WireEmitter:
         assert wire_gate["behavior"]["condition"] == "row['score'] >= 9"
         assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
 
-    def test_profile_bound_authored_fallback_renders_degraded_cardinality_without_raising(self) -> None:
-        # inv-f6 F6 hardening: an authored-only validation_state (operator
-        # profile options never lowered because authored validation already
-        # errs) must render a degraded wire review — the row-cardinality
-        # probe must not crash on the plugin's runtime config rejection.
+    def test_profile_bound_authored_probe_renders_runtime_cardinality(self) -> None:
+        # Profile-authored LLM options are projected through the same inert
+        # provider/model binding used by Stage-1 validation. The probe now
+        # constructs the real transform contract instead of falling back to
+        # a degraded cardinality claim.
         state = CompositionState(
             source=None,
             sources={
@@ -994,7 +1023,7 @@ class TestStep4WireEmitter:
         llm = next(node for node in turn["payload"]["nodes"] if node["plugin"] == "llm")
         assert llm["row_cardinality"] == {
             "input": "one",
-            "output": "zero_or_many",
+            "output": "one",
             "expected_output_count": None,
         }
 

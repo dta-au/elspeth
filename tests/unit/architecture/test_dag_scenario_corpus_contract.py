@@ -653,7 +653,7 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "68837dc46eb087e82e00191d178f05781ab9f0a5016
 # -> 73c47a4d86c6606e80c405cdb0a7039921c60b255ced886ed5d390384b0822ee, captured
 # from test_checkpoint_reopen_resume_has_exact_restart_evidence's own failure
 # output), then this digest. No oracle_freeze snapshot moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "6a154845dfb79763e28b30b0e517b78d9b40b6f3739bf39b2181d45343e67736"
+EXPECTED_CASE_REGISTRY_SHA256 = "72a33f744d5ce03e12167601573ab470dfb3ade2e2d5566918c4bc814593601a"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

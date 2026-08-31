@@ -49,6 +49,19 @@ HeaderModeOption = Annotated[
     EmittedToOutput("a sink writes these names as the artifact's header row, so the value reaches the output bytes"),
 ]
 
+# Shared normalization options for every source/transform that turns external
+# tabular names into pipeline row keys. Several plugin config classes cannot
+# share ``TabularSourceDataConfig`` but do share the same wire fields; aliases
+# keep the output-emission fact attached across those independent declarations.
+NormalizedColumnsOption = Annotated[
+    list[str] | None,
+    EmittedToOutput("each configured column becomes an output row field name and a column in downstream artifacts"),
+]
+NormalizedFieldMappingOption = Annotated[
+    dict[str, str] | None,
+    EmittedToOutput("field-mapping values become normalized output row keys and columns in downstream artifacts"),
+]
+
 # --- Composer-surface help text -------------------------------------------
 #
 # ``Field(description=...)`` is the CLI/YAML truth and stays as-is: it
@@ -542,11 +555,11 @@ class TabularSourceDataConfig(SourceDataConfig):
     provides clean names for headerless files (mutually exclusive path).
     """
 
-    columns: list[str] | None = Field(
+    columns: NormalizedColumnsOption = Field(
         default=None,
         description="Explicit normalized column names for headerless tabular input.",
     )
-    field_mapping: dict[str, str] | None = Field(
+    field_mapping: NormalizedFieldMappingOption = Field(
         default=None,
         description="Optional mapping from observed source field names to normalized pipeline field names.",
     )

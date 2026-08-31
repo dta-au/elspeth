@@ -38,6 +38,55 @@ def _catalog() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
     return PolicyCatalogView.for_trained_operator(catalog, snapshot), snapshot
 
 
+def _provider_tool_call(call_id: str, name: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=call_id,
+        function=SimpleNamespace(name=name, arguments="{}"),
+    )
+
+
+@pytest.mark.parametrize(
+    "call_id",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("\u2003", id="whitespace"),
+    ],
+)
+def test_assistant_tool_calls_message_rejects_invalid_provider_call_id(call_id: str) -> None:
+    with pytest.raises(GuidedSolverResponseShapeError, match="tool-call ID"):
+        discovery_module._assistant_tool_calls_message(
+            SimpleNamespace(content=None),
+            (_provider_tool_call(call_id, "list_sinks"),),
+        )
+
+
+def test_assistant_tool_calls_message_rejects_duplicate_provider_call_ids() -> None:
+    with pytest.raises(GuidedSolverResponseShapeError, match="duplicate provider tool-call IDs"):
+        discovery_module._assistant_tool_calls_message(
+            SimpleNamespace(content=None),
+            (
+                _provider_tool_call("duplicate", "list_sinks"),
+                _provider_tool_call("duplicate", "get_plugin_schema"),
+            ),
+        )
+
+
+def test_assistant_tool_calls_message_preserves_valid_distinct_call_order() -> None:
+    signed_call_id = "call_1__thought__" + "eA" * 150
+    message = discovery_module._assistant_tool_calls_message(
+        SimpleNamespace(content="provider text"),
+        (
+            _provider_tool_call(signed_call_id, "list_sinks"),
+            _provider_tool_call("second", "get_plugin_schema"),
+        ),
+    )
+
+    assert message["content"] == "provider text"
+    assert len(signed_call_id) > 256
+    assert [call["id"] for call in message["tool_calls"]] == [signed_call_id, "second"]
+    assert [call["function"]["name"] for call in message["tool_calls"]] == ["list_sinks", "get_plugin_schema"]
+
+
 def _dispatch(
     name: str,
     arguments: dict[str, object],

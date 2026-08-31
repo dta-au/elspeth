@@ -1206,6 +1206,20 @@ export function ChatPanel({
         }
         return false;
       }
+
+      // A non-null id that is absent from the freeform transcript belongs to
+      // another progress domain (notably the guided operation retained when
+      // exitToFreeform performs its final progress load) or is stale. The one
+      // legitimate freeform gap is before the canonical user row replaces the
+      // optimistic local row; keep terminal failure/cancellation visible while
+      // that current row is still explicitly pending or failed.
+      const tail = chatTurns[chatTurns.length - 1];
+      return !(
+        tail !== undefined &&
+        tail.kind === "user" &&
+        (tail.primaryMessage.local_status === "pending" ||
+          tail.primaryMessage.local_status === "failed")
+      );
     }
     // request_id is nullable for the idle snapshot and for failures before a
     // user row is persisted. Preserve the original tail-derived fallback for

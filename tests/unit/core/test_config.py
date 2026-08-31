@@ -3956,15 +3956,127 @@ class TestEnvPlaceholderGuardIsDerived:
             f"exists to make impossible."
         )
 
-    def test_every_output_naming_option_is_rejected_before_expansion(self) -> None:
-        """An env-expanded output-field name is emitted just as surely as a value.
+    @pytest.mark.parametrize(
+        ("section_name", "plugin_name", "option_name"),
+        [
+            ("transforms", "rag_retrieval", "output_prefix"),
+            ("transforms", "rag_retrieval", "context_separator"),
+            ("transforms", "batch_classifier_metrics", "actual_field"),
+            ("transforms", "batch_classifier_metrics", "predicted_field"),
+            ("transforms", "batch_outlier_annotator", "value_field"),
+            ("transforms", "batch_outlier_annotator", "z_threshold"),
+            ("transforms", "batch_outlier_annotator", "robust_z_threshold"),
+            ("transforms", "pdf_rasterize", "page_blob_ref_field"),
+            ("transforms", "pdf_rasterize", "page_number_field"),
+            ("transforms", "pdf_rasterize", "document_id_field"),
+            ("transforms", "pdf_rasterize", "page_mime_type_field"),
+            ("transforms", "pdf_rasterize", "page_size_bytes_field"),
+            ("transforms", "pdf_rasterize", "page_width_field"),
+            ("transforms", "pdf_rasterize", "page_height_field"),
+            ("transforms", "web_scrape", "content_field"),
+            ("transforms", "web_scrape", "fingerprint_field"),
+            ("transforms", "report_assemble", "output_field"),
+            ("transforms", "blob_csv_expand", "columns"),
+            ("transforms", "blob_csv_expand", "field_mapping"),
+            ("transforms", "blob_json_expand", "field_mapping"),
+            ("transforms", "field_mapper", "mapping"),
+            ("sources", "csv", "columns"),
+            ("sources", "csv", "field_mapping"),
+            ("sources", "aws_s3", "columns"),
+            ("sources", "aws_s3", "field_mapping"),
+            ("sources", "azure_blob", "columns"),
+            ("sources", "azure_blob", "field_mapping"),
+            ("sources", "json", "field_mapping"),
+            ("sources", "dataverse", "field_mapping"),
+            ("sinks", "dataverse", "field_mapping"),
+            ("sources", "text", "column"),
+            ("sources", "llm", "response_field"),
+            ("sources", "blob_rows", "blobs"),
+        ],
+    )
+    def test_adjudicated_output_emitters_are_not_silently_undeclared(
+        self,
+        section_name: str,
+        plugin_name: str,
+        option_name: str,
+    ) -> None:
+        """Named pin for emitters the registry-derived sweep cannot discover.
 
-        ``BaseTransform.output_naming_config_keys`` is the existing registry-wide
-        authority for options whose authored values name columns the transform
-        writes.  Those values pass through env expansion before plugin validation,
-        so ``${VAR}`` can become a valid field name and reach row data and artifact
-        headers.  The pre-expansion guard must derive from this authority rather
-        than relying on a second hand-maintained set of field-name annotations.
+        ``test_every_declared_emitted_option_is_rejected_by_the_loader`` proves
+        that declarations are enforced, but deleting or forgetting a declaration
+        removes the case from that derived test. Each source/transform option
+        here has an execution path that writes its value into row data: directly
+        as a separator or metadata value, as a numeric value after config
+        coercion, or as a field name that becomes a row key and artifact column
+        after env expansion.
+
+        Dataverse deliberately pins one cross-kind consequence: its source
+        ``field_mapping`` declaration also protects the same-named sink option
+        because declarations are unioned by plugin name. Only sink ``lookups``
+        and the broader policy for outbound OData identity remain deferred.
+        """
+        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        option_value: object
+        if option_name == "columns":
+            option_value = [self.PLACEHOLDER]
+        elif option_name in {"field_mapping", "mapping"}:
+            option_value = {"observed": self.PLACEHOLDER}
+        elif option_name == "blobs":
+            option_value = [
+                {
+                    "blob_id": "11111111-1111-1111-1111-111111111111",
+                    "payload_ref": "a" * 64,
+                    "filename": self.PLACEHOLDER,
+                    "mime_type": "application/pdf",
+                    "size_bytes": 1,
+                }
+            ]
+        else:
+            option_value = self.PLACEHOLDER
+
+        entry = {
+            "name": "probe",
+            "plugin": plugin_name,
+            "options": {option_name: option_value},
+        }
+        raw_config = {section_name: {"probe": entry} if section_name in {"sources", "sinks"} else [entry]}
+
+        with pytest.raises(ValueError, match="environment-variable placeholders"):
+            _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+
+    def test_dataverse_sink_cross_kind_guard_accepts_a_clean_field_mapping(self) -> None:
+        """The conservative cross-kind restriction targets placeholders, not mapping use.
+
+        Dataverse sink mapping values name outbound OData fields rather than
+        pipeline artifact columns. The same-named source declaration currently
+        protects them through the deliberate plugin-name union. This positive
+        control keeps that fail-closed consequence narrow: clean sink mappings
+        remain valid, while sink ``lookups`` and broader outbound-identity policy
+        are explicitly outside this bounded repair.
+        """
+        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        raw_config = {
+            "sinks": {
+                "probe": {
+                    "name": "probe",
+                    "plugin": "dataverse",
+                    "options": {"field_mapping": {"observed": "destination"}},
+                }
+            }
+        }
+
+        _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+
+    def test_every_output_naming_option_is_rejected_by_the_loader(self) -> None:
+        """Reuse the transform registry's truth-tested output-name authority.
+
+        ``BaseTransform.output_naming_config_keys`` already classifies options
+        whose value names a field the transform writes. The transform invariant
+        suite proves those declarations against the fields actually created, so
+        the env guard must derive from them rather than restating the same field
+        list as ``EmittedToOutput`` annotations on every config model.
         """
         from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
         from elspeth.plugins.infrastructure.base import BaseTransform

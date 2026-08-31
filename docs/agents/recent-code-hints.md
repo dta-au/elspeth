@@ -1448,6 +1448,35 @@ the same commit; the rules live there, the history lives here.
   vocabulary and stays untouched).
   See [CONTRIBUTING: Convention: audit and lineage recording](../../CONTRIBUTING.md#convention-audit-and-lineage-recording).
 
+- **2026-08-27 — secret WIRING is deny-by-default behind a server-authored
+  destination allowlist, with a THIRD execute-time 428 ack** (elspeth-f3c1aafd25).
+  The authority is `web/secrets/wiring_policy.py::secret_wiring_authorization_error`
+  (exact `(secret, component_type, plugin, option_key)` match;
+  `component_type` vocab is `source|transform|sink` — same as
+  `_secret_ref_placement_error`, aggregation nodes are `transform`); the
+  operator surface is `WebSettings.secret_wiring_allowlist` (default `()` =
+  deny everything). Enforced at THREE derived seams: (a) `wire_secret_ref`
+  (all three arms, before the marker write; `ToolContext.secret_wiring_policy`,
+  `None` = deny — a test whose wiring must SUCCEED, or that tests a LATER gate
+  like placement/endpoint policy, must pass an authorizing policy or it now
+  fails at authorization first); (b) `validate_secret_evidence` emits
+  `unauthorized_secret_ref` under the `secret_refs` blocker for markers from
+  ANY entry path — but the authorization walk runs over
+  `policy.authored_state`, NOT the lowered state: operator-profile lowering
+  injects credential markers server-side and those are exempt by design — do
+  not "fix" it to walk `policy.state`; (c) `/execute` raises
+  `ExecutionSecretApprovalRequired` → 428
+  `execution_secret_approval_required` + `secret_guard` payload
+  (`web/execution/secret_guard.py`, mirrors the fanout guard; evaluated over
+  the authored `composition_state` for the same exemption; fires BEFORE the
+  fanout guard, so a wired-secret + fanout test must acquire the secret ack
+  first and send BOTH tokens on the final execute). The composer repair loop
+  has a dedicated non-retryable notice for `unauthorized_secret_ref` — the
+  planner cannot repair operator policy; do not add advice telling it to
+  retry wiring. `_WebSettingsStub`-style settings fakes need
+  `secret_wiring_allowlist: tuple = ()` or service construction breaks.
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
 - **2026-08-27 — server-owned option metadata is a THREE-surface parity set: planner projection, echo-tolerant write gates, and disclosure provenance** (elspeth-c67fbbbd83, elspeth-4496f61e30)
   The keys are `source_authoring`, `interpretation_requirements`, `prompt_template_parts`,
   `resolved_prompt_template_hash` — always derived from `AUTHORING_METADATA_OPTION_KEYS` /
@@ -1684,9 +1713,10 @@ the same commit; the rules live there, the history lives here.
   The R2-F15 pair (one resolve + one retain) is generalized to a GROUP at both solver sites (`chat_solver.py` step-1/step-2). `GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY` (8) caps one reply's retain calls (breach = shape error into the existing clarification-retention net); the durable bound stays `GUIDED_MAX_DEFERRED_INTENTS` (256) at settlement.
   1. The renames are TOTAL, no compat shims: `GuidedChat*Outcome.action`->`actions`, `Step{1,2}*Resolved*.deferred_action`->`deferred_actions`, `DeferredRequestRetained.retained_intent_id`->`retained_intent_ids`, `DeferredRequestAuthority.new_intent_id`->`new_intent_ids`, `GuidedStateOperationCommand.retained_deferred_intent_id`->`retained_deferred_intent_ids: tuple[UUID, ...] = ()` (absent = EMPTY TUPLE, never None). Constructing any of them with the singular name is a TypeError.
   2. `manage_deferred_intent` stays SINGULAR by design; a multi-call reply containing it is still a shape rejection. Do not fold it into the group.
-  3. `apply_deferred_request` FOLDS N actions against the EVOLVING guided state (`_apply_one_deferred_action`), so action 2 can legitimately contradict action 1 retained in the same Send; the composed chat takes the FIRST non-success disposition's status/error_class.
+  3. `apply_deferred_request` FOLDS N actions against the EVOLVING guided state (`_apply_one_deferred_action`), so action 2 can legitimately contradict action 1 retained in the same Send; the composed chat takes the FIRST non-success disposition's status/error_class. The route authority must mint EXACTLY one distinct id per action — neither a shortage nor a surplus is valid custody.
   4. Settlement custody (`service.py::_verify_guided_deferred_intent_append`) verifies K ordered appends whose ids match the claimed tuple EXACTLY; a set/count comparison is a mutation the wrong-order test kills.
-  5. The repair thread answers EVERY call id with per-call errors (`rejected_calls=`/`errors=` aligned tuples). Step-3/wire chats never offer `retain_deferred_intent`, so there is deliberately no third solver site to sweep.
+  5. The repair thread answers EVERY call id with per-call errors (`rejected_calls=`/`errors=` aligned tuples), but protocol completeness is not action custody. The solver carries one explicit closed state: `IDLE`; `RETAIN_OPEN(slots, first_error, held_resolution)`; or `RESOLUTION_OPEN(actions)`. Parsed-valid siblings live in ordered repair slots across the retry, and an admitted current-stage resolution sibling is held in an owned carrier. A targeted retry is ONLY the one corrected retain when exactly one slot was rejected. With two or more rejected slots the model must replay the complete original group; that replay preserves every known retain slot at its original index and byte-exactly matches the held resolution function name/arguments (or its absence). Settlement always uses the owned held resolution, never the retry's provider object, then atomically moves to `RESOLUTION_OPEN` and drops the slots, first error, and held call. A reply with no valid retain cohort does NOT replace `RETAIN_OPEN`: re-raise the owned first shape error so the caller durably retains the whole original Send for clarification. Never equality-deduplicate actions — two identical calls still mean two actions.
+  6. `RESOLUTION_OPEN` is immutable custody, not a convenience tuple. Only a valid corrected current-stage resolution by itself, or a full replay whose ordered actions match exactly (including duplicate count), may resolve. Prose, empty replies, retain-only replies, management, reselection, hallucinated calls, malformed or mismatched replays, and reply/discovery cap exits return the exact actions in a withheld-resolution outcome. Step-2 may execute allowed read-only discovery while the state stays open; iteration exhaustion withholds the same tuple. Step-3/wire chats never offer `retain_deferred_intent`, so there is deliberately no third solver site to sweep.
   See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
 
 - **2026-08-26 — §7 rule 5's fork closer kinds are NOT interchangeable: a ROW_UNION-bound fork inside any bound region is a build-time rejection** (elspeth-9db785ace7)

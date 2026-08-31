@@ -135,11 +135,11 @@ class TestBatchStatsHappyPath:
         assert result.reason["reason"] == "empty_batch"
 
     def test_non_numeric_values_fail_the_whole_batch_with_a_recorded_reason(self, ctx: PluginContext) -> None:
-        """BatchStats raises TypeError on non-numeric values (no coercion).
+        """BatchStats returns a recorded batch error for non-numeric values.
 
-        Per CLAUDE.md Tier 2 trust model: transforms receive pipeline data that
-        should already be type-validated. Wrong types indicate upstream bugs
-        and must raise TypeError, not be silently skipped.
+        Under the batch-granularity ruling, a wrong value type fails the whole
+        batch with a non-retryable ``TransformResult.error``. It is neither
+        coerced nor silently skipped when computing the statistics.
         """
         from elspeth.plugins.transforms.batch_stats import BatchStats
 

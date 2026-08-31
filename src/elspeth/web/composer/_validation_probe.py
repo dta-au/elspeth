@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS
 from elspeth.core.secrets import redact_secret_refs_for_validation
 
 
@@ -16,13 +17,16 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
     call site cannot silently opt out of the deployment-injected stubs below —
     a forgotten argument is a TypeError, not a quietly zeroed contract.
 
-    For ``plugin="llm"`` with no authored ``provider``, an inert gateway
-    provider block is supplied for the probe. A composer llm node (transform
-    and source alike — both are named "llm") never carries its provider block:
-    the operator profile injects ``provider``/``endpoint``/``api_key`` at
-    lowering (``plugin_policy/profiles.py::lower_options``), after Stage 1 has
-    already run. Probing construction on the authored options alone therefore
-    failed on ``provider: Field required`` for EVERY composer llm node, and
+    For a profile-authored ``plugin="llm"`` with no private binding fields, an
+    inert gateway provider/model block is supplied for the probe. A
+    profile-authored composer llm node (transform and source alike — both are
+    named "llm") carries only its public ``profile`` alias: lowering removes
+    that alias and injects the private ``provider``/``model``/credential binding
+    (``plugin_policy/profiles.py::lower_options``), after Stage 1 has already
+    run. The validation-only projection mirrors that executable shape by
+    removing ``profile`` and supplying inert bindings. Probing construction on
+    authored options alone otherwise fails on the missing private fields (and
+    on ``profile`` being extra executable input), and
     ``_effective_producer_vote``'s known-pass-through fail-closed arm turned
     that permanent condition into "participates with zero guarantees" — a
     false ``guarantees: [(none)]`` reject for any required-fields consumer
@@ -44,15 +48,17 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
     thawed = cast(dict[str, Any], deep_thaw(options))
     runtime_options = strip_authoring_options(thawed)
     prepared = redact_secret_refs_for_validation(runtime_options)
-    if plugin == "llm" and "provider" not in prepared:
+    if plugin == "llm" and "profile" in prepared and not set(prepared).intersection(LLM_PROFILE_PRIVATE_FIELDS):
         from elspeth.plugins.llm.config_validation import GATEWAY_SUPPORTED_CAPABILITIES
 
-        # Plain assignment, not setdefault: with no authored provider the
-        # whole provider block is the stub's to own — a stray endpoint or
-        # api_key without a provider is not a configuration the runtime can
-        # ever see (lowering writes the full block), so preserving one here
-        # would probe a config that exists on no surface.
+        # ``profile`` is public authoring input, not executable plugin config;
+        # trusted lowering consumes it before writing the private provider and
+        # model binding. The branch arms only when every private field is
+        # absent: a malformed profile-plus-private-field draft stays malformed
+        # and fails closed instead of borrowing this stub.
+        del prepared["profile"]
         prepared["provider"] = "gateway"
+        prepared["model"] = "validation-probe-model"
         prepared["endpoint"] = "https://validation-probe.invalid/v1"
         prepared["api_key"] = "validation-probe-placeholder"
         prepared["required_capabilities"] = tuple(sorted(GATEWAY_SUPPORTED_CAPABILITIES))

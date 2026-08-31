@@ -47,7 +47,7 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
-from elspeth.plugins.infrastructure.config_base import TransformDataConfig
+from elspeth.plugins.infrastructure.config_base import NormalizedFieldMappingOption, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources.field_normalization import ExternalHeaderError, is_normalized_field_name, normalize_field_name
@@ -117,7 +117,7 @@ class BlobJSONExpandConfig(TransformDataConfig):
             "so nothing else can tell downstream validation which fields the emitted rows will have."
         ),
     )
-    field_mapping: dict[str, str] | None = Field(
+    field_mapping: NormalizedFieldMappingOption = Field(
         default=None, description="Optional mapping from normalized JSON record keys to final pipeline field names."
     )
     encoding: str = Field(default="utf-8", description="Encoding used to decode the JSON blob.")
@@ -374,7 +374,7 @@ class BlobJSONExpand(BaseTransform):
     name = "blob_json_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:12a3170c84f28e00"
+    source_file_hash: str | None = "sha256:2b3d30aed1e467df"
     config_model = BlobJSONExpandConfig
     usage_when_to_use: str = (
         "Use when a row carries a JSON document — either a payload-store reference from blob_fetch or JSON text in a "

@@ -2745,14 +2745,17 @@ def _plugin_bearing_sections() -> dict[str, str]:
 
 
 def _declared_emitted_options(plugin_name: str) -> dict[str, list[tuple[str, str]]]:
-    """Return output-reaching options declared for ``plugin_name``.
+    """Return ``{option_name: [(plugin_kind, reason), ...]}`` for ``plugin_name``.
 
-    Literal values rendered into output come from ``EmittedToOutput`` metadata.
-    Transform options whose values NAME emitted row fields come from the
-    existing ``BaseTransform.output_naming_config_keys`` authority. Those names
-    are output too: env expansion can turn ``${VAR}`` into a valid field name,
-    after which plugin validation accepts the host value and the transform
-    writes it as a row key and downstream artifact header.
+    Literal values that reach output come from ``EmittedToOutput`` metadata on
+    plugin config fields. Transform options whose value names a field the
+    transform writes come from ``BaseTransform.output_naming_config_keys`` —
+    the existing authority whose declarations are checked against actual
+    created fields by the transform invariant suite. Those names are output
+    too: env expansion can turn ``${VAR}`` into a valid field name, after which
+    plugin validation accepts the host value and the transform writes it as a
+    row key and downstream artifact header. The union avoids a second
+    hand-maintained copy of every output-field option in config annotations.
 
     Unioned across all three registries, deliberately, because there is no
     name-to-kind lookup: the registries are three disjoint maps, and ``csv``,
@@ -2787,16 +2790,20 @@ def _declared_emitted_options(plugin_name: str) -> dict[str, list[tuple[str, str
         for plugin_class in plugin_classes:
             if plugin_class.name != plugin_name:
                 continue
-            option_reasons = emitted_option_fields(plugin_class.get_config_model())
+            explicitly_emitted = emitted_option_fields(plugin_class.get_config_model())
+            for option_name, reason in explicitly_emitted.items():
+                declared.setdefault(option_name, []).append((kind, reason))
             if kind == "transform":
                 for option_name in plugin_class.output_naming_config_keys:
-                    if option_name not in option_reasons:
-                        option_reasons[option_name] = (
-                            "this option names an emitted row field, so an expanded host value becomes "
-                            "a key in row data and a column in downstream artifacts"
+                    if option_name in explicitly_emitted:
+                        continue
+                    declared.setdefault(option_name, []).append(
+                        (
+                            kind,
+                            "this option names a field the transform writes, so its value becomes "
+                            "a key in row data and a column in downstream artifacts",
                         )
-            for option_name, reason in option_reasons.items():
-                declared.setdefault(option_name, []).append((kind, reason))
+                    )
     return declared
 
 
@@ -2827,11 +2834,11 @@ def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mappi
 
     DERIVED, NOT RESTATED. Both the sections and the forbidden fields come from
     the system's own declarations: the sections from ``ElspethSettings``;
-    literal emitted values from
+    literal output values from
     :class:`~elspeth.contracts.emitted_option.EmittedToOutput` markers on each
-    plugin's config model; and transform-authored output field names from
-    ``BaseTransform.output_naming_config_keys``. This function names no plugin
-    and no option.
+    plugin's config model; and transform output-field names from the
+    truth-tested ``BaseTransform.output_naming_config_keys`` authority. This
+    function names no plugin and no option.
 
     It replaced a hand-maintained ``{plugin: {field, ...}}`` map that held ONE
     plugin and two fields, and was therefore a no-op for every other plugin.

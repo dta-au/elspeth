@@ -1257,6 +1257,33 @@ class TestStdioServerConstruction:
         passed = {check["name"] for check in preflight["checks"] if check["passed"]}
         assert {"path_allowlist", "plugin_instantiation", "graph_structure", "schema_compatibility"} <= passed
 
+    @pytest.mark.asyncio
+    async def test_stdio_runtime_preflight_uses_bounded_worker_pool(
+        self,
+        tmp_path: Path,
+        data_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Stdio preflight must not bypass the bounded sync-worker bridge."""
+        from elspeth.composer_mcp import server as server_module
+
+        calls: list[Any] = []
+
+        async def recording_worker(func: Any, *args: object, **kwargs: object) -> Any:
+            calls.append(func)
+            return func(*args, **kwargs)
+
+        async def reject_default_executor(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("stdio runtime preflight bypassed run_sync_in_worker")
+
+        monkeypatch.setattr(server_module, "run_sync_in_worker", recording_worker)
+        monkeypatch.setattr(asyncio, "to_thread", reject_default_executor)
+
+        data = await self._preview_with_sink_path(tmp_path, data_dir, "bounded-worker", "outputs/out.csv")
+
+        assert calls == [server_module.validate_pipeline]
+        assert data["runtime_preflight"]["is_valid"] is True
+
     @pytest.mark.parametrize(
         ("label", "sink_path"),
         [("traversal", "outputs/../../evil.csv"), ("absolute", "/etc/elspeth-evil.csv")],

@@ -52,6 +52,7 @@ from elspeth.web.app import (
 from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.aws_ecs_startup import AwsEcsSchemaNotReadyError, AwsEcsStartupContractError
 from elspeth.web.composer.boot_probe import ComposerBootConfigError
+from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import _JSON_COLLECTION_FIELDS, WebSettings, settings_from_env
 from elspeth.web.dependencies import get_settings
 from elspeth.web.deployment_contract import DeploymentConfigurationError
@@ -1308,6 +1309,72 @@ class TestExecutionWiring:
         assert "/api/runs/{run_id}" in route_paths
         assert "/api/runs/{run_id}/cancel" in route_paths
         assert "/ws/runs/{run_id}" in route_paths
+
+    def test_session_runtime_preflight_honors_secret_wiring_allowlist(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-session-runtime-preflight-fingerprint")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-session-runtime-preflight-secret")
+        app = create_app(
+            _settings(
+                tmp_path,
+                secret_wiring_allowlist=(
+                    {
+                        "secret": "OPENROUTER_API_KEY",
+                        "component_type": "source",
+                        "plugin": "csv",
+                        "option_key": "api_key",
+                    },
+                ),
+            )
+        )
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="primary",
+                options={"api_key": {"secret_ref": "OPENROUTER_API_KEY"}},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        plugin_snapshot = app.state.plugin_snapshot_factory.for_user_id("alice")
+        runtime_preflight = app.state.session_service._runtime_preflight
+
+        assert runtime_preflight is not None
+        result = runtime_preflight(state, "alice", "session-1", plugin_snapshot)
+
+        secret_check = next(check for check in result.checks if check.name == "secret_refs")
+        assert secret_check.passed is True
+        assert all(error.error_code != "unauthorized_secret_ref" for error in result.errors)
+
+    def test_session_runtime_preflight_keeps_empty_secret_wiring_allowlist_fail_closed(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-session-runtime-preflight-fingerprint")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-session-runtime-preflight-secret")
+        app = create_app(_settings(tmp_path))
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="primary",
+                options={"api_key": {"secret_ref": "OPENROUTER_API_KEY"}},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        plugin_snapshot = app.state.plugin_snapshot_factory.for_user_id("alice")
+        runtime_preflight = app.state.session_service._runtime_preflight
+
+        assert runtime_preflight is not None
+        result = runtime_preflight(state, "alice", "session-1", plugin_snapshot)
+
+        secret_check = next(check for check in result.checks if check.name == "secret_refs")
+        assert secret_check.passed is False
+        assert [error.error_code for error in result.errors] == ["unauthorized_secret_ref"]
 
 
 class TestOidcDiscoveryStartup:
