@@ -726,6 +726,19 @@ class TestStep3MutationTierMigration:
             assert intent_word in str(splice["description"])
         assert "option-only" in str(patch_node["description"])
 
+    def test_set_pipeline_names_every_narrow_edit_tool_it_defers_to(self) -> None:
+        """The narrow-edit steer names tools, not "the dedicated patch tool".
+
+        A planner that reads an unnamed route has to probe for it. Session
+        891b7b1e spent a turn doing exactly that and then fell back to a full
+        replace (elspeth-ee89aca5d0).
+        """
+        description = str(self._get("set_pipeline")["description"])
+
+        for named_tool in ("patch_node_options", "splice_transform", "upsert_node", "upsert_edge"):
+            assert named_tool in description
+        assert "dedicated patch tool" not in description
+
     def test_core_skill_routes_each_edit_shape_to_one_supported_tool(self) -> None:
         skill = (Path(__file__).parents[4] / "src/elspeth/web/composer/skills/pipeline_composer.md").read_text(encoding="utf-8")
 
@@ -735,6 +748,32 @@ class TestStep3MutationTierMigration:
         assert "`patch_node_options`" in skill
         assert "intentional full rebuild" in skill
         assert "`set_pipeline`" in skill
+        # Adding/rewiring a node in an EXISTING pipeline is its own row. Without
+        # it the planner has no named route for that shape and falls back to a
+        # full replace (elspeth-ee89aca5d0).
+        assert "Add or rewire a node in an existing pipeline" in skill
+        assert "`upsert_node` / `upsert_edge`" in skill
+
+    def test_core_skill_keeps_the_full_rebuild_steer_scoped_to_new_builds(self) -> None:
+        """The new edit row must not read as licence for tool-by-tool NEW builds.
+
+        The 2026-07-22 stress test (planner_authoring_aids:13-14) found 0 of 6
+        cold planners converged constructing a new pipeline tool-by-tool, which
+        is why the batching section exists. Widening the edit table must leave
+        that steer intact and explicitly bounded to new builds.
+        """
+        # Prose is hard-wrapped, so match on whitespace-normalized text: a
+        # reflow must not read as a doctrine change.
+        skill = " ".join(
+            (Path(__file__).parents[4] / "src/elspeth/web/composer/skills/pipeline_composer.md").read_text(encoding="utf-8").split()
+        )
+
+        assert "governs NEW builds only" in skill
+        assert "Do not build a complex new pipeline tool-by-tool" in skill
+        assert "not by switching into a one-component-at-a-time construction loop" in skill
+        # The carve-out is what keeps the prohibition from reading as general.
+        assert "Editing a pipeline that already exists is not a new build" in skill
+        assert "A new build never walks this table row by row" in skill
 
     def test_upsert_node_required(self) -> None:
         defn = self._get("upsert_node")

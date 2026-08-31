@@ -1685,8 +1685,9 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
     handler=_handle_set_pipeline,
     kind=ToolKind.MUTATION,
     description=(
-        "Atomically create or fully rebuild a pipeline. For a narrow edit to an existing pipeline, "
-        "use the dedicated patch tool; use `splice_transform` to insert one transform on a direct linear path."
+        "Atomically create or fully rebuild a pipeline. For a narrow edit to an existing pipeline, name the "
+        "tool that matches the edit: `patch_node_options` for an option-only change, `splice_transform` to "
+        "insert one transform on a direct linear path, `upsert_node` / `upsert_edge` to add or rewire a node."
     ),
     json_schema={
         "type": "object",
