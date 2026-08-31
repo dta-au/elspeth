@@ -3987,6 +3987,7 @@ class TestEnvPlaceholderGuardIsDerived:
             ("sources", "azure_blob", "field_mapping"),
             ("sources", "json", "field_mapping"),
             ("sources", "dataverse", "field_mapping"),
+            ("sinks", "dataverse", "field_mapping"),
             ("sources", "text", "column"),
             ("sources", "llm", "response_field"),
             ("sources", "blob_rows", "blobs"),
@@ -4002,10 +4003,16 @@ class TestEnvPlaceholderGuardIsDerived:
 
         ``test_every_declared_emitted_option_is_rejected_by_the_loader`` proves
         that declarations are enforced, but deleting or forgetting a declaration
-        removes the case from that derived test. Each option here has an execution
-        path that writes its value into row data: directly as a separator or
-        metadata value, as a numeric value after config coercion, or as a field
-        name that becomes a row key and artifact column after env expansion.
+        removes the case from that derived test. Each source/transform option
+        here has an execution path that writes its value into row data: directly
+        as a separator or metadata value, as a numeric value after config
+        coercion, or as a field name that becomes a row key and artifact column
+        after env expansion.
+
+        Dataverse deliberately pins one cross-kind consequence: its source
+        ``field_mapping`` declaration also protects the same-named sink option
+        because declarations are unioned by plugin name. Only sink ``lookups``
+        and the broader policy for outbound OData identity remain deferred.
         """
         from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
 
@@ -4032,10 +4039,34 @@ class TestEnvPlaceholderGuardIsDerived:
             "plugin": plugin_name,
             "options": {option_name: option_value},
         }
-        raw_config = {section_name: {"probe": entry} if section_name == "sources" else [entry]}
+        raw_config = {section_name: {"probe": entry} if section_name in {"sources", "sinks"} else [entry]}
 
         with pytest.raises(ValueError, match="environment-variable placeholders"):
             _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+
+    def test_dataverse_sink_cross_kind_guard_accepts_a_clean_field_mapping(self) -> None:
+        """The conservative cross-kind restriction targets placeholders, not mapping use.
+
+        Dataverse sink mapping values name outbound OData fields rather than
+        pipeline artifact columns. The same-named source declaration currently
+        protects them through the deliberate plugin-name union. This positive
+        control keeps that fail-closed consequence narrow: clean sink mappings
+        remain valid, while sink ``lookups`` and broader outbound-identity policy
+        are explicitly outside this bounded repair.
+        """
+        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        raw_config = {
+            "sinks": {
+                "probe": {
+                    "name": "probe",
+                    "plugin": "dataverse",
+                    "options": {"field_mapping": {"observed": "destination"}},
+                }
+            }
+        }
+
+        _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
 
     def test_every_output_naming_option_is_rejected_by_the_loader(self) -> None:
         """Reuse the transform registry's truth-tested output-name authority.
