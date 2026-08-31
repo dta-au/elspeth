@@ -182,7 +182,10 @@ export function buildProducerRegistry(
         origin: "success",
       });
     }
-    if (node.on_error) {
+    // Collector failure is a structural whole-group verdict. The universal
+    // CompositionState shape can carry malformed legacy on_error data, but
+    // drawing it would promise a runtime route that does not exist.
+    if (node.node_type !== "collector" && node.on_error) {
       registerProducer(node.on_error, {
         nodeId: node.id,
         edgeType: "error",
@@ -1190,8 +1193,18 @@ export function GraphView() {
     const sourceIds = new Set(Object.keys(compositionState.sources));
     const toGraphNodeId = (id: string): string =>
       sourceIds.has(id) ? sourceComponentId(id) : id;
+    const collectorIds = new Set(
+      compositionState.nodes
+        .filter((node) => node.node_type === "collector")
+        .map((node) => node.id),
+    );
 
-    const explicitEdges = compositionState.edges;
+    // Collector on_error is inexpressible. A universal/legacy composition
+    // shape can still carry a stale explicit edge, but projecting it would
+    // promise group-failure routing the runtime never performs.
+    const explicitEdges = compositionState.edges.filter(
+      (edge) => edge.edge_type !== "on_error" || !collectorIds.has(edge.from_node),
+    );
     const rfEdges: PipelineGraphEdgeModel[] = explicitEdges.map((edge, i) => ({
       id: `e-${edge.from_node}-${edge.to_node}-${i}`,
       source: toGraphNodeId(edge.from_node),
@@ -1701,6 +1714,7 @@ export function GraphView() {
         });
       }
       if (
+        node.node_type !== "collector" &&
         node.on_error &&
         nodeIds.has(node.on_error) &&
         !existingConnections.has(edgeSemanticIdentity(

@@ -591,6 +591,13 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "aggregation node outside any bound region instead.",
     ),
     (
+        r"collector_has_on_error_invalid|Collector '(.+)' does not accept 'on_error'",
+        "A collector failure is a whole-group verdict settled through the scope's group policy and nesting; "
+        "there is no per-row collector error route.",
+        "Remove on_error from the collector. Use scope_policy to choose require_all or best_effort group "
+        "arrival semantics; nesting determines whether a failed group escalates outward or terminates.",
+    ),
+    (
         r"collector_missing_plugin|Collector '(.+)' is missing required field 'plugin'",
         "A collector node needs a batch-transform plugin to reassemble its group.",
         "Set plugin on the collector node to a batch-aware transform (the same plugin contract aggregations use).",
@@ -604,7 +611,7 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"collector_config_invalid|Collector '(.+)' does not accept field",
         "The collector node carries fields outside its shape (gate, coalesce, or aggregation fields).",
-        "Re-emit the collector with only plugin/input/on_success/on_error/options plus its scope "
+        "Re-emit the collector with only plugin/input/on_success/options plus its scope "
         "binding fields (scope_name/scope_opener/scope_policy).",
     ),
     (
@@ -1317,6 +1324,7 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # facts before the candidate ever reaches validation or projection.
     "guided_collector_opener_unresolved",
     "collector_has_trigger_invalid",
+    "collector_has_on_error_invalid",
     "collector_missing_plugin",
     "collector_plugin_not_batch_aware",
     "collector_config_invalid",

@@ -461,6 +461,50 @@ describe("GraphView", () => {
     expect(screen.getByText("error")).toBeInTheDocument();
   });
 
+  it("does not render or announce a legacy collector on_error edge", () => {
+    useSessionStore.setState({
+      compositionState: makeState({
+        sources: {},
+        nodes: [
+          makeNode({
+            id: "stitch",
+            node_type: "collector",
+            plugin: "batch_stats",
+            input: "pages",
+            on_success: "assembled",
+            on_error: "legacy_errors",
+            scope_name: "document_pages",
+            scope_opener: "explode",
+            scope_policy: "require_all",
+          }),
+        ],
+        outputs: [
+          { name: "assembled", plugin: "json", options: {} },
+          { name: "legacy_errors", plugin: "json", options: {} },
+        ],
+        edges: [
+          makeEdge({
+            id: "legacy-collector-error",
+            from_node: "stitch",
+            to_node: "legacy_errors",
+            edge_type: "on_error",
+          }),
+        ],
+      }),
+    });
+
+    render(<GraphView />);
+
+    expect(screen.getByTestId("edge-inferred-sink-stitch-assembled-success-success")).toBeInTheDocument();
+    expect(screen.queryByTestId("edge-e-stitch-legacy_errors-0")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("edge-inferred-sink-stitch-legacy_errors-error-error")).not.toBeInTheDocument();
+    const connections = within(screen.getByRole("list", {
+      name: "Pipeline branch connections",
+    }));
+    expect(connections.getByText("stitch to assembled: success (success)")).toBeInTheDocument();
+    expect(connections.queryByText("stitch to legacy_errors: error (error)")).not.toBeInTheDocument();
+  });
+
   it("shows minimap for >8 nodes", () => {
     const nodes = Array.from({ length: 9 }, (_, i) =>
       makeNode({ id: `n${i}`, node_type: "transform", plugin: "p" }),

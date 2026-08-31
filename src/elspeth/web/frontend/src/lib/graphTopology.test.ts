@@ -138,6 +138,36 @@ describe("buildConnectionProducers", () => {
     });
     expect(buildConnectionProducers(state).has(DISCARD_CONNECTION)).toBe(false);
   });
+
+  it("never projects a malformed collector on_error as a canvas or accessible edge", () => {
+    // CompositionState keeps a universal nullable on_error slot for every
+    // node kind, so a legacy/malformed state can still carry a value. The
+    // authoring boundary rejects it; graph derivation must also fail closed
+    // instead of promising a collector route the runtime cannot take.
+    const state = makeComposition(1, {
+      sources: {},
+      nodes: [{
+        id: "stitch",
+        node_type: "collector",
+        plugin: "batch_stats",
+        options: {},
+        input: "pages",
+        on_success: "assembled",
+        on_error: "legacy_errors",
+        scope_name: "document_pages",
+        scope_opener: "explode",
+        scope_policy: "require_all",
+      }],
+      outputs: [{ name: "assembled", plugin: "json", options: {} }],
+    });
+
+    const topology = buildConnectionProducers(state);
+    const graphView = buildProducerRegistry(state);
+    expect(topology.get("assembled")).toEqual(["stitch"]);
+    expect(graphView.get("assembled")?.map((producer) => producer.nodeId)).toEqual(["stitch"]);
+    expect(topology.has("legacy_errors")).toBe(false);
+    expect(graphView.has("legacy_errors")).toBe(false);
+  });
 });
 
 // The shared fixture for the cross-check below. Declared once and used by BOTH

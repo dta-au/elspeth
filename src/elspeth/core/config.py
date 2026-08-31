@@ -1309,7 +1309,9 @@ class CollectorSettings(BaseModel):
     deliberately has NO trigger config — count/timeout/condition are
     inexpressible on a closer (a timeout on a closer converts a liveness bug
     into a silently short group; spec §5). Flush order is the opener's
-    expansion ordinal, never arrival order.
+    expansion ordinal, never arrival order. It also has no ``on_error`` route:
+    plugin failure is a whole-group verdict settled through scope policy and
+    nesting.
 
     Example YAML:
         collectors:
@@ -1317,9 +1319,6 @@ class CollectorSettings(BaseModel):
             plugin: stitch_pages
             input: pages
             on_success: assembled_out
-            # on_error is optional: omitted (None) derives the route from
-            # structure (spec §7 rule 9) — losses settle through the scope's
-            # group machinery.
     """
 
     model_config = {"frozen": True, "extra": "forbid"}
@@ -1328,15 +1327,20 @@ class CollectorSettings(BaseModel):
     plugin: str = Field(description="Batch-transform plugin name (same plugin contract as aggregations)")
     input: str = Field(description="Named input connection the bound region's members arrive on")
     on_success: str = Field(description="Connection name or sink name for the flushed group output")
-    on_error: str | None = Field(
-        default=None,
-        description=(
-            "Sink name for rows that fail batch processing, 'discard', or omitted (None): "
-            "the route derives from structure — losses settle through the scope's group "
-            "machinery (spec §7 rule 9)"
-        ),
-    )
     options: dict[str, Any] = Field(default_factory=dict, description="Plugin-specific configuration options")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_on_error(cls, data: Any) -> Any:
+        """Reject the deleted collector route with its structural replacement."""
+        if type(data) is not dict or "on_error" not in data:
+            return data
+        raw_name = data.get("name")
+        name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else "<unnamed>"
+        raise ValueError(
+            f"Collector '{name}' does not accept on_error. Collector failures are whole-group "
+            "verdicts settled through scope policy and nesting. Remove on_error."
+        )
 
     @field_validator("name")
     @classmethod
@@ -1370,19 +1374,6 @@ class CollectorSettings(BaseModel):
             raise ValueError("Collector on_success must be a connection name or sink name")
         value = v.strip()
         return _validate_connection_or_sink_name(value, field_label="Collector on_success connection name")
-
-    @field_validator("on_error")
-    @classmethod
-    def validate_on_error(cls, v: str | None) -> str | None:
-        """on_error is optional: None derives the route from structure (spec §7 rule 9)."""
-        if v is None:
-            return None
-        if not v.strip():
-            raise ValueError("Collector on_error must be a sink name, 'discard', or omitted")
-        value = v.strip()
-        if value == "discard":
-            return value
-        return _validate_connection_or_sink_name(value, field_label="Collector on_error sink name")
 
 
 class ScopeSettings(BaseModel):

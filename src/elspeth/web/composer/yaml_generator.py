@@ -357,14 +357,17 @@ def _generate_pipeline_dict(
                 )
             if c["on_success"] is None:
                 raise PipelineLoweringError(f"Collector '{c['id']}' has on_success=None — a collector requires a flush destination")
+            if c["on_error"] is not None:
+                raise PipelineLoweringError(
+                    f"Collector '{c['id']}' does not accept on_error — collector failures are "
+                    "whole-group verdicts settled through scope policy and nesting"
+                )
             entry = {
                 "name": c["id"],
                 "plugin": c["plugin"],
                 "input": c["input"],
                 "on_success": c["on_success"],
             }
-            if c["on_error"] is not None:
-                entry["on_error"] = c["on_error"]
             if c["options"]:
                 entry["options"] = _strip_web_metadata(dict(c["options"]))
             doc["collectors"].append(entry)

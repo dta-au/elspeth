@@ -105,6 +105,7 @@ _COLLECTOR_FAMILY_CODES = (
     "collector_scope_policy_invalid",
     "scope_opener_unknown",
     "collector_has_trigger_invalid",
+    "collector_has_on_error_invalid",
     "collector_missing_plugin",
     "collector_plugin_not_batch_aware",
     "collector_config_invalid",
@@ -176,6 +177,12 @@ class TestCollectorIntrinsics:
         [entry] = _errors_for(state, "collector_has_trigger_invalid")
         assert "end_of_group" in entry.message
 
+    def test_on_error_is_rejected_because_group_failure_is_structural(self) -> None:
+        state = _state(_transform("explode", "rows", "pages"), _collector(on_error="discard"))
+        [entry] = _errors_for(state, "collector_has_on_error_invalid")
+        assert "whole-group" in entry.message
+        assert "Remove on_error" in entry.message
+
     def test_missing_plugin_is_rejected(self) -> None:
         state = _state(_transform("explode", "rows", "pages"), _collector(plugin=None))
         assert _errors_for(state, "collector_missing_plugin")
@@ -216,10 +223,6 @@ class TestCollectorIntrinsics:
         state = _state(_transform("explode", "rows", "pages"), _collector(scope_name="continue"))
         [entry] = _errors_for(state, "scope_name_invalid")
         assert "reserved" in entry.message
-
-    def test_collector_labels_run_the_runtime_label_rules(self) -> None:
-        state = _state(_transform("explode", "rows", "pages"), _collector(on_error="continue"))
-        assert any(entry.component == "node:page_stitcher" for entry in _errors_for(state, "connection_label_invalid"))
 
     def test_scope_fields_on_a_transform_are_rejected(self) -> None:
         bad = NodeSpec(
@@ -368,7 +371,6 @@ collectors:
     plugin: batch_stats
     input: pages
     on_success: out
-    on_error: discard
     options:
       schema:
         mode: observed
@@ -394,7 +396,7 @@ class TestImporterAndGenerator:
         assert collector.plugin == "batch_stats"
         assert collector.input == "pages"
         assert collector.on_success == "out"
-        assert collector.on_error == "discard"
+        assert collector.on_error is None
         assert collector.scope_name == "document_pages"
         assert collector.scope_opener == "explode"
         assert collector.scope_policy == "require_all"
@@ -417,6 +419,11 @@ class TestImporterAndGenerator:
         with pytest.raises(RuntimeYamlImportError, match="unknown or inapplicable"):
             composition_state_from_runtime_yaml(yaml_text)
 
+    def test_import_rejects_collector_on_error_as_inapplicable(self) -> None:
+        yaml_text = _ROUND_TRIP_YAML.replace("    on_success: out\n", "    on_success: out\n    on_error: discard\n")
+        with pytest.raises(RuntimeYamlImportError, match=r"page_stitcher.*whole-group.*Remove on_error"):
+            composition_state_from_runtime_yaml(yaml_text)
+
     def test_full_round_trip_preserves_collectors_and_scopes(self) -> None:
         original = load_settings_from_yaml_string(_ROUND_TRIP_YAML)
         state = composition_state_from_runtime_yaml(_ROUND_TRIP_YAML)
@@ -433,4 +440,9 @@ class TestImporterAndGenerator:
     def test_generator_refuses_to_lower_a_pluginless_collector(self) -> None:
         state = _state(_transform("explode", "rows", "pages"), _collector(plugin=None))
         with pytest.raises(PipelineLoweringError, match="plugin"):
+            generate_yaml(state)
+
+    def test_generator_refuses_to_silently_drop_collector_on_error(self) -> None:
+        state = _state(_transform("explode", "rows", "pages"), _collector(on_error="discard"))
+        with pytest.raises(PipelineLoweringError, match="does not accept on_error"):
             generate_yaml(state)

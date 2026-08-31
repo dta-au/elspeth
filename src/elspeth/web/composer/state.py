@@ -391,11 +391,6 @@ def _routing_label_errors(
                 add(component, "Collector on_success must be a connection name or sink name")
             else:
                 label(component, node.on_success, "Collector on_success connection name")
-            if node.on_error is not None:
-                if not node.on_error.strip():
-                    add(component, "Collector on_error must be a sink name, 'discard', or omitted")
-                elif node.on_error != _DISCARD_ROUTE_TARGET:
-                    label(component, node.on_error, "Collector on_error sink name")
         elif node.node_type in ("coalesce", "row_union"):
             kind = "Coalesce" if node.node_type == "coalesce" else "row_union"
             raw_branches = node.branches
@@ -964,7 +959,8 @@ def _collector_intrinsic_errors(node: NodeSpec, *, nodes: tuple[NodeSpec, ...]) 
 
     Mirrors, at composition time, the runtime rejections a collector NodeSpec
     would otherwise only meet at settings load or DAG build:
-    ``CollectorSettings`` (plugin required, no trigger, extra="forbid"),
+    ``CollectorSettings`` (plugin required, no trigger or on_error,
+    extra="forbid"),
     ``ScopeSettings`` (name rules, closed policy vocabulary), the builder's
     is_batch_aware requirement, and spec §7 rule 1 (a collector requires its
     scope binding). Cross-node scope checks (duplicate scope names/openers,
@@ -1012,6 +1008,18 @@ def _collector_intrinsic_errors(node: NodeSpec, *, nodes: tuple[NodeSpec, ...]) 
             )
         )
 
+    if node.on_error is not None:
+        errors.append(
+            _err(
+                component,
+                f"Collector '{node.id}' does not accept 'on_error': collector failures are whole-group "
+                "verdicts settled through the scope's group policy and nesting, not per-row diversions. "
+                "Remove on_error.",
+                "high",
+                "collector_has_on_error_invalid",
+            )
+        )
+
     # timeout_seconds is deliberately absent here: the shared
     # node_timeout_unsupported check in validate() owns that field for every
     # non-barrier node type, collectors included.
@@ -1031,7 +1039,7 @@ def _collector_intrinsic_errors(node: NodeSpec, *, nodes: tuple[NodeSpec, ...]) 
             _err(
                 component,
                 f"Collector '{node.id}' does not accept field(s): {present}. A collector carries "
-                "plugin/input/on_success/on_error/options plus its scope binding "
+                "plugin/input/on_success/options plus its scope binding "
                 "(scope_name/scope_opener/scope_policy).",
                 "high",
                 "collector_config_invalid",
@@ -2847,11 +2855,6 @@ def _validate_runtime_route_destinations(
         # Mirror the builder's collector on_success resolution ("Collector
         # '{name}' on_success '{target}' is neither a sink nor a known
         # connection"): a sink or a consumed connection, like a transform.
-        # on_error carries NO dangling check on purpose — CollectorSettings
-        # validates only its label shape, and the builder builds no
-        # collector on_error edge (an omitted on_error derives the route
-        # from structure, spec §7 rule 9), so rejecting a name here would
-        # be composer-red/runtime-green.
         if (
             node.node_type == "collector"
             and node.on_success is not None
@@ -2993,10 +2996,17 @@ def edge_lowering_error(edge: EdgeSpec, *, from_kind: ComponentKind | None, to_k
         return None
     if edge_type in ("route_true", "route_false", "fork"):
         return f"Only gates can use '{edge_type}' edges; '{edge.from_node}' is a {from_kind}."
-    if from_kind in ("transform", "aggregation", "collector"):
+    if from_kind in ("transform", "aggregation"):
         if edge_type == "on_error" and to_kind is not None and to_kind != "output":
             return (
                 f"{from_kind.capitalize()} '{edge.from_node}' on_error must route to a sink or 'discard'; '{edge.to_node}' is a {to_kind}."
+            )
+        return None
+    if from_kind == "collector":
+        if edge_type == "on_error":
+            return (
+                f"Collector '{edge.from_node}' has no on_error route: collector failures are whole-group "
+                "verdicts settled through scope policy and nesting."
             )
         return None
     if from_kind == "coalesce":

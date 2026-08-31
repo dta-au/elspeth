@@ -47,7 +47,6 @@ def _with_collector_scope(**scope_overrides: object) -> dict[str, object]:
                 "plugin": "batch_stats",
                 "input": "pages",
                 "on_success": "out",
-                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}},
             },
         ],
@@ -60,29 +59,28 @@ def _with_collector_scope(**scope_overrides: object) -> dict[str, object]:
 
 class TestCollectorSettings:
     def test_valid_collector_parses(self) -> None:
-        c = CollectorSettings(name="page_stitcher", plugin="stitch_pages", input="pages", on_success="assembled_out", on_error="discard")
+        c = CollectorSettings(name="page_stitcher", plugin="stitch_pages", input="pages", on_success="assembled_out")
         assert c.name == "page_stitcher"
         assert c.options == {}
 
     def test_collector_has_no_trigger_field(self) -> None:
         # Closers flush on end_of_group ONLY (spec §5): a trigger key is extra=forbid rejected.
         with pytest.raises(ValidationError, match="trigger"):
-            CollectorSettings(name="c", plugin="p", input="i", on_success="o", on_error="discard", trigger={"count": 5})
+            CollectorSettings(name="c", plugin="p", input="i", on_success="o", trigger={"count": 5})
 
     def test_collector_name_reserved_rejected(self) -> None:
         with pytest.raises(ValidationError, match="reserved"):
-            CollectorSettings(name="continue", plugin="p", input="i", on_success="o", on_error="discard")
+            CollectorSettings(name="continue", plugin="p", input="i", on_success="o")
 
-    def test_collector_on_error_defaults_to_none_derives_from_structure(self) -> None:
-        # 2026-08-22 synthesis: on_error is optional; None = the route derives
-        # from structure (spec §7 rule 9) — losses settle through the scope's
-        # group machinery, realized by WS3/WS4.
-        c = CollectorSettings(name="c", plugin="p", input="i", on_success="o")
-        assert c.on_error is None
+    def test_collector_on_error_is_inexpressible(self) -> None:
+        # A collector failure is a whole-group verdict settled through scope
+        # policy and nesting. A per-row sink route would misstate that contract,
+        # so authored YAML must fail loudly rather than retain an inert field.
+        with pytest.raises(ValidationError, match=r"whole-group.*Remove on_error"):
+            CollectorSettings(name="c", plugin="p", input="i", on_success="o", on_error="discard")
 
-    def test_collector_on_error_must_be_sink_or_discard_shaped_when_given(self) -> None:
-        with pytest.raises(ValidationError, match="on_error"):
-            CollectorSettings(name="c", plugin="p", input="i", on_success="o", on_error="  ")
+    def test_collector_json_schema_does_not_advertise_on_error(self) -> None:
+        assert "on_error" not in CollectorSettings.model_json_schema()["properties"]
 
 
 class TestScopeSettings:
@@ -149,7 +147,6 @@ class TestElspethSettingsCrossRefs:
                 "plugin": "batch_stats",
                 "input": "pages",
                 "on_success": "out",
-                "on_error": "discard",
                 "options": {"schema": {"mode": "observed"}},
             }
         )

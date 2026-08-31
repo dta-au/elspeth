@@ -256,9 +256,9 @@ const LEGAL_NODE_FLOWS: Readonly<Record<string, ReadonlySet<string>>> = {
   queue: new Set(["queue_continue"]),
   coalesce: new Set(["coalesce_success"]),
   row_union: new Set(["row_union_success"]),
-  // on_error is optional on a collector (group failure is structural), so
-  // node_error is legal but not required — the flow-count arm below owns that.
-  collector: new Set(["node_success", "node_error"]),
+  // Collector failures are whole-group verdicts settled structurally through
+  // scope policy and nesting, so only the success projection is legal.
+  collector: new Set(["node_success"]),
 };
 const LEGAL_FLOW_TARGETS: Readonly<
   Record<string, ReadonlySet<ProposalEndpointKind>>
@@ -648,7 +648,16 @@ function validateProposalPayload(value: unknown, path: string): void {
     if (fromId === null || toId === null) invalid(edge.path, "unresolved endpoint");
     const expectedFrom = edge.flow.kind.startsWith("source_") ? "source" : edge.flow.kind === "output_write_failure" ? "output" : "node";
     if (edge.from.kind !== expectedFrom) invalid(`${edge.path}.flow`, "illegal for source endpoint kind");
-    if (edge.from.kind === "node" && !LEGAL_NODE_FLOWS[nodeById.get(fromId)!.nodeType].has(edge.flow.kind)) invalid(`${edge.path}.flow`, "illegal for node_type");
+    if (edge.from.kind === "node") {
+      const nodeType = nodeById.get(fromId)!.nodeType;
+      if (nodeType === "collector" && edge.flow.kind === "node_error") {
+        invalid(
+          `${edge.path}.flow`,
+          "declares unsupported collector on_error; collector failures are whole-group verdicts settled through scope policy and nesting",
+        );
+      }
+      if (!LEGAL_NODE_FLOWS[nodeType].has(edge.flow.kind)) invalid(`${edge.path}.flow`, "illegal for node_type");
+    }
     if (!LEGAL_FLOW_TARGETS[edge.flow.kind].has(edge.to.kind)) invalid(`${edge.path}.flow`, "illegal for target endpoint kind");
     if (fromId === toId) invalid(edge.path, "self-loop");
     if (
@@ -742,12 +751,8 @@ function validateProposalPayload(value: unknown, path: string): void {
     if (node.nodeType === "transform" || node.nodeType === "aggregation") {
       if (kinds.length !== 2 || kinds.filter((kind) => kind === "node_success").length !== 1 || kinds.filter((kind) => kind === "node_error").length !== 1) invalid(path, "node lacks exact success/error flows");
     } else if (node.nodeType === "collector") {
-      // Mirrors protocol.py: exactly one success flow, AT MOST one error flow
-      // (on_error is optional — group failure is structural, ADR-042 §6).
-      const successCount = kinds.filter((kind) => kind === "node_success").length;
-      const errorCount = kinds.filter((kind) => kind === "node_error").length;
-      if (successCount !== 1 || errorCount > 1 || kinds.length !== successCount + errorCount) {
-        invalid(path, "collector requires one success flow and at most one error flow");
+      if (kinds.length !== 1 || kinds[0] !== "node_success") {
+        invalid(path, "collector requires exactly one success flow and no error flow");
       }
       const opener = node.behavior.openerStableId;
       if (opener === undefined || !nodeById.has(opener)) {

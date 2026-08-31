@@ -268,7 +268,10 @@ function nodeRows(state: CompositionState): SpecRow[] {
       output_mode: node.output_mode ?? null,
       timeout_seconds: node.timeout_seconds ?? null,
       on_success: node.on_success,
-      on_error: node.on_error,
+      // A legacy/malformed universal NodeSpec can carry collector on_error,
+      // but collectors reject the field and runtime group failure is
+      // structural. Do not present a route that cannot execute.
+      on_error: node.node_type === "collector" ? null : node.on_error,
       routes: node.routes ?? null,
       fork_to: node.fork_to ?? null,
     },

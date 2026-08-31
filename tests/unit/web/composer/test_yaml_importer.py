@@ -1053,7 +1053,7 @@ _SECTION_PROBE_YAML: dict[str, str] = {
     "checkpoint": "checkpoint:\n  enabled: true\n",
     "coalesce": "coalesce:\n- name: co\n  branches: {}\n  on_success: out\n",
     "collection_probes": "collection_probes:\n- collection: c\n  plugin: chroma\n  options: {}\n",
-    "collectors": "collectors:\n- name: col\n  plugin: passthrough\n  input: out\n  on_success: out\n  on_error: discard\n  options: {}\n",
+    "collectors": "collectors:\n- name: col\n  plugin: passthrough\n  input: out\n  on_success: out\n  options: {}\n",
     "commencement_gates": 'commencement_gates:\n- name: ready\n  condition: "1 > 0"\n',
     "concurrency": "concurrency:\n  max_workers: 2\n",
     "default_llm_profile": "default_llm_profile: fast\n",

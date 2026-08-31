@@ -563,9 +563,9 @@ class BatchStats(BaseTransform):
         except BatchRowTypeError as exc:
             # Requirement 2 of the ruling: the batch records that it failed and
             # WHY — which row, which field, what was found where a number was
-            # required. NOT quarantined: no batch-shaped node can name a
-            # reachable error sink today (elspeth-d2e3f29d10), so this failure
-            # is recorded and counted but the batch data still reaches nothing.
+            # required. The structural caller owns disposition: an aggregation
+            # applies its declared error route, while a collector turns this
+            # into a whole-group failure settled by scope policy and nesting.
             return TransformResult.error(exc.as_reason(), retryable=False)
 
     def _aggregate_all_groups(self, rows: list[PipelineRow]) -> TransformResult:
