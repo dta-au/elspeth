@@ -1624,6 +1624,18 @@ async def run_tool_batch(
             # outbound advisor call is made.
             advisor_calls_used += 1
 
+            # The advisor's own Tier-3 failure surface, named by the module
+            # that raises it. Round-2 judge ruling: the previous
+            # ``except Exception`` here converted EVERY exception from the
+            # protected call into an ADVISOR_ERROR tool result and a
+            # ``finish_success`` record, so a defect in controlled code — an
+            # AuditIntegrityError out of the recorder included — was reported
+            # to the composer LLM as a provider outage and the turn continued.
+            # Anything outside this taxonomy now keeps unwinding.
+            from elspeth.web.composer.service import advisor_provider_failure_types
+
+            advisor_provider_failures = advisor_provider_failure_types()
+
             try:
                 guidance, advisor_meta = await ctx.service._call_advisor_with_audit(
                     arguments,
@@ -1694,8 +1706,8 @@ async def run_tool_batch(
                 )
                 turn_has_discovery = True
                 continue
-            except Exception as advisor_exc:
-                # Tier 3 boundary: outbound LLM call failed. Convert
+            except advisor_provider_failures as advisor_exc:
+                # Tier 3 boundary: the outbound LLM call failed. Convert
                 # to a structured tool-result error so the composer
                 # LLM gets feedback rather than a silent stall. The
                 # inner ComposerLLMCall record was already fired by
