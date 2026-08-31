@@ -29,7 +29,7 @@ from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.protocol import (
-    INTERPRETATION_KIND_VALUES,
+    REQUEST_INTERPRETATION_REVIEW_KIND_VALUES,
     ToolArgumentError,
 )
 from elspeth.web.composer.state import (
@@ -215,10 +215,12 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
             "Ask the user to review an LLM-authored assumption before it is "
             "finalised into the pipeline. This session-aware, kind-tagged "
             "review surface handles vague terms, invented source data, "
-            "LLM prompt templates, and pipeline-shaping decisions. Use "
+            "pipeline-shaping decisions, model choices, and source data "
+            "contracts. Prompt-template reviews are surfaced automatically "
+            "by the backend; never request one through this tool. Use "
             "affected_node_id='source' for "
-            "invented_source; use the LLM node id for vague_term and "
-            "llm_prompt_template; use the implementing node id for "
+            "invented_source and source_data_contract; use the LLM node id "
+            "for vague_term and llm_model_choice; use the implementing node id for "
             "pipeline_decision. Surface ONE assumption per call. The user "
             "will see your draft and resolve it in the review surface. Do not ask "
             "the user in assistant prose; this tool is the review surface. If "
@@ -227,11 +229,9 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
             "Do not call this merely because a concrete operator is present "
             "(e.g., 'rate 1-10'), but do call it when you authored the scale "
             "semantics, rubric, thresholds, category meaning, or subjective "
-            "criterion definition behind that operator. Prompt-template review "
-            "is not a substitute for an authored rubric/definition review. "
-            "For LLM prompt templates, copying the user's supplied prompt "
-            "verbatim is user-authored; creating a prompt template from the "
-            "user's goal, data, or prose is LLM-authored and must be reviewed. "
+            "criterion definition behind that operator. The backend's automatic "
+            "prompt-template review is not a substitute for an authored "
+            "rubric/definition review. "
             "Do not call this for terms the user already defined in the "
             "conversation."
         ),
@@ -242,11 +242,14 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
             "properties": {
                 "affected_node_id": {
                     "type": "string",
-                    "description": "Component id. Use 'source' for invented source data; use the LLM node id for vague terms and prompt templates.",
+                    "description": (
+                        "Component id. Use 'source' or 'source:<name>' for invented source data and source data contracts; "
+                        "use the LLM node id for vague terms and model choices."
+                    ),
                 },
                 "kind": {
                     "type": "string",
-                    "enum": list(INTERPRETATION_KIND_VALUES),
+                    "enum": list(REQUEST_INTERPRETATION_REVIEW_KIND_VALUES),
                     "description": (
                         "Class of assumption being surfaced for review. source_data_contract asks the user to "
                         "acknowledge the data contract for an uploaded/path-bound source the pipeline requires "

@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import Any, Final, cast
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.blobs import ALLOWED_MIME_TYPES
@@ -25,6 +25,7 @@ from elspeth.contracts.trust_boundary import observation_boundary, trust_boundar
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.protocol import (
     REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
+    REQUEST_INTERPRETATION_REVIEW_KIND_VALUES,
     REQUEST_INTERPRETATION_REVIEW_KINDS,
     SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION,
     SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION,
@@ -193,7 +194,8 @@ class _RequestInterpretationReviewArgumentsModel(BaseModel):
 
     * ``affected_node_id`` — short identifier; 256-char cap matches the wire
       cap used by ``upsert_node.id``.
-    * ``kind`` — closed interpretation class for the review row.
+    * ``kind`` — closed request-tool interpretation class; backend-only
+      prompt-template surfacing is excluded by the field validator.
     * ``user_term`` and ``llm_draft`` — capped at 8192 chars to defend against
       pathological inputs that would distend the audit row beyond the
       schema's 8192-byte expectation (see ``interpretation_events_table``
@@ -212,11 +214,22 @@ class _RequestInterpretationReviewArgumentsModel(BaseModel):
     """
 
     affected_node_id: str = Field(min_length=1, max_length=256)
-    kind: InterpretationKind
+    kind: InterpretationKind = Field(json_schema_extra={"enum": list(REQUEST_INTERPRETATION_REVIEW_KIND_VALUES)})
     user_term: str = Field(min_length=1, max_length=8192)
     llm_draft: str | None = Field(default=None, min_length=1, max_length=8192)
 
     model_config = ConfigDict(extra="forbid")
+
+    @field_validator("kind")
+    @classmethod
+    def _kind_must_be_requestable(cls, value: InterpretationKind) -> InterpretationKind:
+        if value not in REQUEST_INTERPRETATION_REVIEW_KINDS:
+            raise ToolArgumentError(
+                argument="kind",
+                expected=REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
+                actual_type=("llm_prompt_template — surfaced automatically by the backend at turn finalization; do not request it"),
+            )
+        return value
 
 
 def _validate_source_artifact_review_content(value: str) -> None:
@@ -2760,18 +2773,6 @@ async def _handle_request_interpretation_review(
             "request_interpretation_review arguments",
         ),
     )
-    # Backend owns prompt-template surfacing (elspeth-e51216d305 Case B). The
-    # ``llm_prompt_template`` review is auto-staged on every LLM node and the
-    # BACKEND surfaces its EVENT against the FINAL frozen skeleton at turn
-    # finalization, so it can never go stale against a later skeleton mutation.
-    # The LLM must NOT surface it mid-build via this tool; reject the kind at
-    # the Tier-3 boundary immediately after the parse, before any service call.
-    if parsed.kind not in REQUEST_INTERPRETATION_REVIEW_KINDS:
-        raise ToolArgumentError(
-            argument="kind",
-            expected=REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
-            actual_type=("llm_prompt_template — surfaced automatically by the backend at turn finalization; do not request it"),
-        )
     # F-34 credential prefilter: Tier-3 boundary check before any DB write.
     # ``reject_credential_shaped_content`` raises ``ValueError``; we wrap
     # as ToolArgumentError so the compose loop's ARG_ERROR routing catches

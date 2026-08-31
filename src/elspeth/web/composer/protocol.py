@@ -65,7 +65,6 @@ if frozenset(REQUEST_INTERPRETATION_REVIEW_KINDS) & _BACKEND_ONLY_INTERPRETATION
     REQUEST_INTERPRETATION_REVIEW_KINDS
 ) | _BACKEND_ONLY_INTERPRETATION_REVIEW_KINDS != frozenset(InterpretationKind):
     raise RuntimeError("every InterpretationKind must be classified as requestable or backend-only")
-INTERPRETATION_KIND_VALUES: Final[tuple[str, ...]] = tuple(kind.value for kind in InterpretationKind)
 REQUEST_INTERPRETATION_REVIEW_KIND_VALUES: Final[tuple[str, ...]] = tuple(kind.value for kind in REQUEST_INTERPRETATION_REVIEW_KINDS)
 REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION: Final[str] = ", ".join(REQUEST_INTERPRETATION_REVIEW_KIND_VALUES)
 

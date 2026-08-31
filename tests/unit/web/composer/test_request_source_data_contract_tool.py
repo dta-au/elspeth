@@ -25,6 +25,7 @@ from elspeth.web.composer.tools._dispatch import get_tool_definitions
 from elspeth.web.composer.tools.sessions import (
     _assert_affected_component,
     _handle_request_interpretation_review,
+    _RequestInterpretationReviewArgumentsModel,
 )
 
 
@@ -181,7 +182,30 @@ async def test_backend_only_kind_rejection_lists_every_requestable_kind() -> Non
     assert caught.value.expected == expected_kinds
 
 
+def test_request_boundary_decoder_rejects_backend_only_kind_with_requestable_vocabulary() -> None:
+    expected_kinds = ", ".join(kind.value for kind in InterpretationKind if kind is not InterpretationKind.LLM_PROMPT_TEMPLATE)
+
+    with pytest.raises(ToolArgumentError) as caught:
+        _RequestInterpretationReviewArgumentsModel.model_validate(
+            {
+                "affected_node_id": "rate",
+                "kind": InterpretationKind.LLM_PROMPT_TEMPLATE.value,
+                "user_term": "llm_prompt_template:rate",
+            }
+        )
+
+    assert caught.value.argument == "kind"
+    assert caught.value.expected == expected_kinds
+
+
 def test_tool_schema_advertises_the_kind() -> None:
     definitions = {defn["name"]: defn for defn in get_tool_definitions()}
     kinds = definitions["request_interpretation_review"]["parameters"]["properties"]["kind"]["enum"]
-    assert "source_data_contract" in kinds
+    assert kinds == [
+        "vague_term",
+        "invented_source",
+        "pipeline_decision",
+        "llm_model_choice",
+        "source_data_contract",
+    ]
+    assert _RequestInterpretationReviewArgumentsModel.model_json_schema()["properties"]["kind"]["enum"] == kinds
