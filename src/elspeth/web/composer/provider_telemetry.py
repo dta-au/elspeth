@@ -199,11 +199,10 @@ def finish_composer_request_metrics(
     """Project one request aggregate and restore the prior task context."""
 
     state = _REQUEST_METRICS_STATE.get()
-    try:
-        _REQUEST_METRICS_STATE.reset(token)
-    except (RuntimeError, ValueError) as exc:
-        _log_projection_failure(operation="request", error_type=type(exc).__name__)
-        return
+    # A failing Token.reset (stale or cross-context token) is a broken
+    # begin/finish pairing — a first-party bookkeeping bug that propagates.
+    # Only the metric emission below is subordinate to the audit outcome.
+    _REQUEST_METRICS_STATE.reset(token)
     if state is None or status not in _REQUEST_STATUSES:
         _log_projection_failure(operation="request", error_type="InvalidProjectionInput")
         return
