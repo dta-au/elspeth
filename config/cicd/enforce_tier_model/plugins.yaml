@@ -616,25 +616,25 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[16]/body[11]/body[4]/body[1]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:48df13bde0e03d86e8f3202957d4daafc73049fdaa4e90ae19c12c7627cea4e2'
-- key: plugins/infrastructure/batching/mixin.py:R4:BatchTransformMixin:_process_and_complete:fp=bf027f2d61c56c68
+- key: plugins/infrastructure/batching/mixin.py:R4:BatchTransformMixin:_process_and_complete:fp=f4156f4a5d78f78b
   owner: john
   reason: |-
     In BatchTransformMixin._process_and_complete (mixin.py:279), the broad except Exception runs on a worker thread that cannot let an exception propagate directly (the orchestrator thread would block forever on the waiter). The handler captures the original exception and traceback.format_exc() into an ExceptionResult, transports it through _complete_ticket/the waiter channel, and the orchestrator thread re-raises it — preserving crash-on-bug semantics required by plugin-ownership policy, just on the correct thread. The original exception and traceback are retained, so chaining and auditability are intact. This is the recognized thread-boundary transport idiom, not silent swallowing. Matches the existing rationale.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:10:42.659365+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.86
+  judge_recorded_at: '2026-08-31T16:43:53.363845+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM: the broad except is not swallowing — it captures the exception and traceback into an ExceptionResult that is transported through the waiter channel to the orchestrator thread, which re-raises it. This is the thread-boundary transport idiom: a worker thread cannot let exceptions propagate directly without deadlocking the orchestrator waiter. The original exception object and formatted traceback are preserved, so crash-on-bug semantics and audit chaining are intact — the crash happens on the correct thread. The rationale is site-specific and the visible code confirms the mechanism (ExceptionResult construction, _complete_ticket transport, no default substitution).
+    PRESCRIBED FORM — the broad catch transports, rather than suppresses, an exception that cannot propagate directly from the worker thread. BatchTransformMixin._process_and_complete stores the original exception and formatted traceback in ExceptionResult and passes it through BatchTransformMixin._complete_ticket; the named downstream control is verified at engine/batch_adapter.py:230, where SharedBatchAdapter._wait_for detects ExceptionResult and re-raises its original exception at line 233. This preserves crash-on-plugin-bug semantics across the thread boundary and directly addresses R4's suppression concern.
   judge_signature_version: 2
   scope_fingerprint: 93634dc847a387fb6e5ecfc8c2b261c022847882ac6e8ea40e273ef78352ae2d
-  judge_transport: openrouter
-  ast_path: 'body[14]/body[18]/body[2]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:7bcf7d95808ebc723605f2dd8a6fcd9fa0106881a0184cdd7bab442930b0828f'
+  judge_transport: codex_cli
+  ast_path: 'body[15]/body[18]/body[2]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:534f3ab3d56da2e11eda153fa778566b074a7d100f8bade9027075d751c92a7d'
 - key: plugins/infrastructure/batching/mixin.py:R6:BatchTransformMixin:_complete_ticket:fp=f6b5a60d4c2ae50c
   owner: john
   reason: |-
@@ -1074,25 +1074,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[14]/body[4]/body[5]/body[2]/test'
   judge_metadata_signature: 'hmac-sha256:v2:7039aaf0a6c5912dd6368dd9c2822c622b7d3680d54e11d98e3d45d47d63ccc4'
-- key: plugins/infrastructure/templates.py:R5:_DefiniteBindingAnalyzer:_scan_assignment_target:fp=43591960608d78c6
+- key: plugins/infrastructure/templates.py:R5:_DefiniteBindingAnalyzer:_scan_assignment_target:fp=269bf193d713431a
   owner: john
   reason: |-
     isinstance(target, nodes.NSRef) is a nominal check against jinja2's concrete NSRef node class on an Assign/AssignBlock target that jinja2's parser types as Name | NSRef | Tuple | ... (`{% set ns.attr = v %}` produces NSRef). The analyzer runs on jinja2's parsed AST of an operator-authored template; the class dispatch is the same mechanism jinja2's NodeVisitor uses for every other node kind in this analyzer (visit_<Class>), applied here to an assignment TARGET, which NodeVisitor's visit() would otherwise treat as a load and mis-record. An NSRef target is a load of the namespace name (`ns` must already be bound), so the check is what turns `{% set ns.a = 1 %}` without a prior `{% set ns = namespace() %}` into a preflight-detected unbound name (test id namespace-unbound-nsref).
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T13:30:06.299305+00:00'
+  judge_recorded_at: '2026-08-31T16:48:53.568747+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is nominal semantic dispatch over Jinja's parser-produced assignment-target variants, not a defensive revalidation that hides a contract violation. The code treats `nodes.NSRef` specially because namespace-attribute assignment has different binding semantics: it records the namespace name as used and flags it when unbound, while `_stored_names` separately handles stored `nodes.Name` targets. The rationale is site-specific and consistent with the visible code, and the finding is not a function-scoped Tier-3 shape guard suitable for `@trust_boundary`.
+    RULE MISFIRES — the check nominally discriminates Jinja2's concrete `nodes.NSRef` assignment-target variant within a parser-produced AST, rather than defensively revalidating a fixed ELSPETH-owned contract or hiding a malformed value. The visible branch uses that distinction to apply NSRef-specific binding semantics and records an unbound namespace instead of coercing, fabricating, or suppressing an error. This is not a raw Tier-3 parameter boundary suitable for `@trust_boundary`; the parameter is an already-parsed AST node whose concrete variant must be dispatched.
   judge_signature_version: 2
   scope_fingerprint: c4ed806fafcbd61ee54459c4c1c3c1fc7fc2523a9364135103ee915b4d8c453f
   judge_transport: codex_cli
-  ast_path: 'body[10]/body[21]/body[0]/test/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:7bbdef2b1506ddbf12f7c693706252044818634a6af9190a8d5e3033205c020f'
+  ast_path: 'body[11]/body[21]/body[0]/test/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:e62d43787e176fc85e851dc066f00b973cff6f8eac1c1824e020b8dbee477403'
 - key: plugins/infrastructure/templates.py:R5:_stored_names:fp=0b8533b0752fe8ac
   owner: john
   reason: |-
@@ -1131,25 +1131,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[35]/body[4]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:79ed4068b62a95f61aa029a1e2045679684c6209443b6999bfbf4ea6098d9002'
-- key: plugins/llm/model_catalog.py:R6:prime_openrouter_catalog_from_live:fp=a8f2d0a78bb006d1
+- key: plugins/llm/model_catalog.py:R6:prime_openrouter_catalog_from_live:fp=0f6deaa723b5596c
   owner: john
   reason: |-
     The httpx.RequestError is not swallowed — it is bound as `exc`, its class is emitted on the structured log channel (_slog.warning "openrouter_catalog_prime_transport_error" with url, exc_class and the action taken), and its effect is carried structurally: _clear_live_openrouter_catalog() runs so a failed re-prime cannot leave a stale live snapshot alive behind a "falling back" warning, and the False return is consumed by the one caller, web/app.py::_boot_prime_openrouter_catalog, which logs openrouter_catalog_boot_prime_failed with the probe latency. The fallback also reaches the audit trail, not just the logs: read_openrouter_catalog_snapshot_id then reports source="bundled", which the run-create writer persists to the Landscape `runs` table (openrouter_catalog_source / openrouter_catalog_sha256), so an auditor can reconstruct that a bundled catalog — not the live one — blessed every decision made in that process. Nothing about this failure is silent on any channel. Raising instead is the wrong outcome and is the specific thing this function is designed against: the caller is the FastAPI boot lifespan, so a raise crashes the web server on a transient OpenRouter outage, and the module's documented two-tier design requires the CLI and offline validate paths to work with the bundled catalog. R6 fires only because the explicit outcome is spelled as the documented `bool` return, which the rule classifies as a default value.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T13:38:39.569014+00:00'
+  judge_recorded_at: '2026-08-31T16:57:37.981982+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM: R6’s concern applies, but the narrow `RequestError` path clears the stale snapshot and returns the function’s documented explicit failure result at `plugins/llm/model_catalog.py:386`. I verified that `web/app.py::_boot_prime_openrouter_catalog` consumes that result and records the failed prime at `web/app.py:445`, so the signal is not lost. I also verified that `read_openrouter_catalog_snapshot_id` maps the cleared snapshot to `source="bundled"` and documents the corresponding Landscape run fields at `plugins/llm/model_catalog.py:221`. The decorator alternative does not apply because R6 is not one of its suppressible rules.
+    PRESCRIBED FORM — the caught RequestError is a recoverable external transport failure, and the function returns its documented explicit error result rather than silently fabricating success: it logs the exception class, clears the stale live snapshot, and returns False. The named caller is verified at web/app.py:450-462, where it consumes the boolean and records the failed prime, while web/app.py:732-745 resolves the bundled snapshot identity and passes its source and hash into the execution service for later run auditing. R6 therefore overmatches this deliberate non-raising result contract; the trust-boundary decorator is inapplicable because R6 is not suppressible by it.
   judge_signature_version: 2
   scope_fingerprint: 58b250dc1c77e3c0bc371ab0d06efde379e85c021237bdd9d30420a1a27d5a57
   judge_transport: codex_cli
-  ast_path: 'body[34]/body[2]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:af154863cf603f482d36665eb42af78c1740df3165e084a21c9df11bfa81514d'
+  ast_path: 'body[35]/body[2]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:c718d30daae1dec20410f9140ac7f0ea7bc02edb491584f306beff32283f1df4'
 - key: plugins/llm/model_catalog.py:R8:_module_:fp=4dec8f01fefcd5fb
   owner: john
   reason: |-
@@ -2397,25 +2397,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[67]/body[29]/body[0]/body[0]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:048d3e15ae0def85927d3b5f1695ae1bc77da8717a857d472abfb362d6b1f793'
-- key: plugins/transforms/blob_fetch.py:R1:BlobFetch:process:fp=b2588d7814331464
-  owner: john
-  reason: |-
-    `response.headers` is the third-party HTTP header mapping. This `.get` reads only the raw Content-Type for a bounded error diagnostic after `_normalized_content_type(response)` has already made the authorization decision; absence produces the explicit empty diagnostic value and cannot turn an unsupported response into an accepted one.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-29'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T02:41:07.004481+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
-  judge_rationale: |-
-    RULE MISFIRES — `response.headers` contains external-origin HTTP metadata whose keys are not guaranteed by an ELSPETH contract, so a missing `content-type` is not a first-party schema bug hidden by `.get()`. The control-location claim is verified: `_normalized_content_type` at plugins/transforms/blob_fetch.py:204-218 converts absence to an empty normalized value, and `BlobFetch.process` at lines 494-496 rejects that value before the flagged error-only diagnostic is constructed. The decorator alternative does not apply because the flagged subject is a locally obtained `response`, not data rooted in a parameter of `BlobFetch.process`.
-  judge_signature_version: 2
-  scope_fingerprint: d23c2ae1181265eba6ca5b0d30a845c43726a0bc2a2a25ae21b7527849cb118a
-  judge_transport: codex_cli
-  ast_path: 'body[36]/body[18]/body[4]/body[0]/value/args[0]/values[1]/values[1]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:4ce70576a6eab57a1fab9fc65089446c008aef7627e08ecdb37d7aaa8c7eb950'
 - key: plugins/transforms/llm/langfuse.py:R4:ActiveLangfuseTracer:flush:fp=efc3be07b90da7b5
   owner: john
   reason: |-
@@ -2473,3 +2454,41 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[22]/body[18]/body[1]/body[1]/test/operand'
   judge_metadata_signature: 'hmac-sha256:v2:8be96f6be8924a876738d3b2356e966162b1758407cdeb5bbe8ce635598db2f2'
+- key: plugins/infrastructure/telemetry.py:R6:emit_resource_cleanup_failed:fp=814c11050e1d9462
+  owner: john
+  reason: |-
+    `emit_resource_cleanup_failed` constructs the owned `ResourceCleanupFailed` event outside the handler and contains only the typed `TelemetryExporterError` raised when the cleanup-health event cannot be delivered; it records that secondary channel loss through the independent logger. Every other ordinary, Tier-1, and process-control failure propagates, as pinned by `tests/unit/plugins/infrastructure/test_telemetry.py::test_cleanup_telemetry_logs_typed_delivery_failure`, `tests/unit/plugins/infrastructure/test_telemetry.py::test_cleanup_telemetry_reraises_programming_errors`, and `tests/unit/plugins/infrastructure/test_telemetry.py::test_cleanup_telemetry_does_not_suppress_unsuppressible_failures`.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T18:40:26.138452+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.94
+  judge_rationale: |-
+    PRESCRIBED FORM — the handler catches only the typed TelemetryExporterError and explicitly records that telemetry-channel failure through the last-resort logger; it is not a silent broad exception net. TelemetryManager raises this exact type after repeated total exporter delivery failure (telemetry/manager.py:389), while event construction remains outside the handler and all programming, Tier-1, and process-control exceptions propagate because no broader exception clause exists. This conforms to the telemetry-best-effort and logging-last-resort policy.
+  judge_signature_version: 2
+  scope_fingerprint: 6e5d613c0b47534f8807e4cb5be455626cf908065cc77b3937381e6611cd08d1
+  judge_transport: codex_cli
+  ast_path: 'body[13]/body[2]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:10d3cb51abc663b1fd0fda3d72cc7e3a33c87e759e2573b9b5efec181b27b50d'
+- key: plugins/transforms/aws/textract_client.py:R4:_TextractAuditedClient:_emit_after_audit:fp=df84bca463bcd7a5
+  owner: john
+  reason: |-
+    `_TextractAuditedClient._emit_after_audit` constructs and hashes the owned `ExternalCallCompleted` event before the try, then contains only callback delivery after `TextractClient.start_document_analysis`, `TextractClient.get_document_analysis`, or `TextractInlineClient.analyze_document` has synchronously completed `AuditedClientBase._record_call`. Tier-1 errors and the named programming-error family propagate; residual exporter failures are recorded with traceback and run/state/call correlation. Audit primacy and ordering are pinned by `tests/unit/plugins/transforms/aws/test_textract_client.py::test_start_records_before_telemetry_and_returns_job_id`, `tests/unit/plugins/transforms/aws/test_textract_client.py::test_audit_failure_suppresses_telemetry`, `tests/unit/plugins/transforms/aws/test_textract_inline_client.py::test_analyze_records_before_telemetry_and_returns_frozen_semantic_response`, and `tests/unit/plugins/transforms/aws/test_textract_inline_client.py::test_analyze_audit_failure_suppresses_telemetry`.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T18:48:44.218269+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.91
+  judge_rationale: |-
+    PRESCRIBED FORM — the broad catch contains only post-audit telemetry delivery, the policy-designated best-effort channel. In plugins/transforms/aws/textract_client.py:395 event construction remains outside the try, while lines 414-427 re-raise Tier-1 and named programming errors and log residual callback failures with traceback and correlation. All three visible callers invoke AuditedClientBase._record_call before _emit_after_audit (lines 559-575, 667-683, and 822-838), and plugins/infrastructure/clients/base.py:119 shows that symbol synchronously delegates to the audit recorder. R4 is not eligible for the trust-boundary decorator.
+  judge_signature_version: 2
+  scope_fingerprint: 50ff6e4609f7657ec18e02c81b57b6629d99b1006068d69ab81775f62c5c4d6d
+  judge_transport: codex_cli
+  ast_path: 'body[48]/body[3]/body[1]/handlers[2]'
+  judge_metadata_signature: 'hmac-sha256:v2:a212ed8c6c533a19d9294964a16de579dea001c063482661025c9de03ac77020'

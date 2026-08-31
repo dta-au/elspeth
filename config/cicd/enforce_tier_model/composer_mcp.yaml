@@ -7,4 +7,23 @@ per_file_rules:
     also uses isinstance to narrow the result type
   expires: null
   max_hits: 14
-allow_hits: []
+allow_hits:
+- key: composer_mcp/server.py:R6:create_server:call_tool:fp=1771b2f5033962ca
+  owner: john
+  reason: |-
+    The caught ValueError/TypeError is not swallowed: every completed handler path assigns `canonicalization_failed`; the first branch in `create_server.call_tool` then returns `_argument_error_result(...)`, an explicit `CallToolResult(isError=True)`, before validation or dispatch. If sentinel construction itself fails, that exception escapes. `tests/unit/composer_mcp/test_call_tool_audit.py::test_argument_canonicalization_failure_records_arg_error` pins the ARG_ERROR response and audit record.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T18:18:38.490071+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.96
+  judge_rationale: |-
+    PRESCRIBED FORM — the R6 concern applies, but `create_server.call_tool` does not silently lose the canonicalization failure: composer_mcp/server.py:742-751 records it, and the first reachable branch at lines 794-797 returns the explicit `_argument_error_result`. That helper constructs `CallToolResult(isError=True)` at lines 764-783, while the `finally` path records the ARG_ERROR audit payload at lines 904-968; failures during sentinel construction remain uncaught. The named test could not be read because it lies outside the judge tool's permitted roots, so it is not credited, but the visible implementation independently establishes the required explicit error result on every completed handler path.
+  judge_signature_version: 2
+  scope_fingerprint: 53f76357686392e51977ad7458528f569067352aa167e234b22075885451e0fa
+  judge_transport: codex_cli
+  ast_path: 'body[63]/body[13]/body[5]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:ed13b0e8672f2083134327961fecf833a2ce758ef96e6c65004bba169e025b1c'

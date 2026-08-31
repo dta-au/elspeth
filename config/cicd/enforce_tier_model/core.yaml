@@ -1837,25 +1837,25 @@ allow_hits:
     - pattern: dotenv_secret_assignment
       byte_count: 25
       redacted_hash: bc60c33b8c3b578f
-- key: core/landscape/database.py:R1:LandscapeDB:_configure_sqlite:_emit_begin:fp=e68905c6e519fc47
+- key: core/landscape/database.py:R1:LandscapeDB:_configure_sqlite:_emit_begin:fp=a9a9e13d637812fc
   owner: john
   reason: |-
     `src/elspeth/core/landscape/database.py:645` reads an optional SQLAlchemy execution option, not Tier-1 audit data: `if conn.get_execution_options().get(WRITE_INTENT_OPTION, False):`. The enclosing SQLite `begin` listener selects `BEGIN IMMEDIATE` only when the engine-side write helper has explicitly set `WRITE_INTENT_OPTION`; absence is the documented plain-transaction path, not malformed/corrupt data to crash on. The paired writer path at `src/elspeth/core/landscape/database.py:172-174` sets that transient framework option with `conn.execution_options(**{WRITE_INTENT_OPTION: True})` immediately before `conn.begin()`. This suppression is valid only for this optional SQLAlchemy execution-options probe inside `_emit_begin`; if the site drifts to reading Landscape rows, checkpoints, audit JSON, or any persisted Tier-1 record with `.get()`, it must be reified or allowed to crash instead.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:09:46.723578+00:00'
+  judge_recorded_at: '2026-08-31T15:56:26.318567+00:00'
   judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.99
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — `conn.get_execution_options()` is SQLAlchemy transaction metadata, not a persisted Tier-1 Landscape record, and `WRITE_INTENT_OPTION` is intentionally optional. The visible listener assigns `BEGIN IMMEDIATE` when the option is present and true, while absence selects the documented plain `BEGIN` transaction path, so `.get(..., False)` expresses the option’s semantics rather than concealing corruption. This is not a Tier-3 parameter-rooted boundary case, so the structural decorator does not apply.
+    RULE MISFIRES: the execution-options mapping is transient SQLAlchemy control state, not a persisted Tier-1 audit record, and absence of `WRITE_INTENT_OPTION` deliberately selects the documented plain DEFERRED transaction path. The control-location claim is verified: `begin_write` at `src/elspeth/core/landscape/database.py:248` sets `WRITE_INTENT_OPTION=True` at line 270 immediately before `conn.begin()` at line 271, while `_emit_begin` consumes that optional marker at line 1108. Thus `.get(..., False)` expresses the optional flag's contract rather than hiding a missing required key, and this site is not a Tier-3 parameter-rooted boundary eligible for the decorator.
   judge_signature_version: 2
   scope_fingerprint: cb1ecba71e0e4af4fbb8f8d9b5e34790b33b2d571c3fd742242f31da87e81b10
   judge_transport: codex_cli
-  ast_path: 'body[62]/body[3]/body[4]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:3cdef0465dda1d9a2eec8eb7071ea4a7d1d8f650ab9093234a927f7f89cb0e0b'
+  ast_path: 'body[65]/body[3]/body[4]/body[1]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:35137f973e9ebe8eee23057da7c4f9e98cc282676afecbfd4d9eedc7b020edbd'
 - key: core/landscape/database.py:R1:_shared_connection_lock:fp=ab07aeb69017aa64
   owner: john
   reason: |-
@@ -2335,25 +2335,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[21]/body[6]/test'
   judge_metadata_signature: 'hmac-sha256:v2:f089ab585623ea207a39613500a0640cca61eb45970924c8bd0eb4768b179287'
-- key: core/canonical.py:R5:_normalize_value:fp=6f7e787f51dc6d90
+- key: core/canonical.py:R5:_normalize_value:fp=926b3883e52a37ca
   owner: john
   reason: |-
     R5 `isinstance(obj, datetime)` — the stdlib arm, and it is fenced on BOTH sides by ordering constraints. Above it: pd.Timestamp (line 117) and the pd.NA/pd.NaT sentinel arm (line 124), both of which are datetime subclasses or instances and would be wrongly captured here if they came later — pd.NaT in particular would be rendered as a real timestamp instead of the intended missing value. Below it: `date` at line 133, which is datetime's SUPERCLASS, so swapping those two would silently truncate every timestamp in the audit trail to a bare date. Naive datetimes are assumed UTC by explicit documented policy rather than rejected. Invalidated by any reordering of the arms between lines 117 and 133.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:05:35.691055+00:00'
+  judge_recorded_at: '2026-08-31T15:47:58.871798+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance(obj, datetime)` is an ordered runtime type-dispatch arm in a canonical serializer, not a defensive re-check that hides a fixed-contract violation. The visible code independently confirms the site-specific ordering requirement: `pd.Timestamp` and the `pd.NaT` singleton are handled first, while `date`—the superclass of `datetime`—is handled afterward, preserving timestamp precision and missing-value semantics. R5 therefore does not apply at this location, and the excerpt does not establish a function-scoped Tier-3 parameter boundary requiring `@trust_boundary`.
+    RULE MISFIRES — this `isinstance` is ordered type discrimination for canonical serialization, not a defensive re-check that hides a fixed-contract violation. The visible code independently supports the site-specific rationale: `pd.Timestamp` and the missing-value sentinels are handled first, while `datetime` must precede its superclass `date` to avoid silently discarding timestamp information. Because the check selects meaning-preserving representations among deliberately supported runtime types rather than supplying a default or suppressing malformed data, R5's premise does not apply here.
   judge_signature_version: 2
   scope_fingerprint: 3c2781757519f60a3aa1490e6ec88460576985cc99aed79aa976aabad62b28bb
   judge_transport: codex_cli
-  ast_path: 'body[20]/body[10]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:890541840d391c9570bf3187b3fa42a2640ddf258c0107209051087989a0edc4'
+  ast_path: 'body[21]/body[10]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:1ae15800f6e7b6c7a4ad69a5525492c04f2a49f95eab05c4421cbf21923b5e07'
 - key: core/canonical.py:R5:_normalize_value:fp=15b7fa55371044f2
   owner: john
   reason: |-
@@ -3814,25 +3814,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[27]/body[2]/body[1]/test/values[0]'
   judge_metadata_signature: 'hmac-sha256:v2:469f85126036ad8d466ccf3cd68555802ce4a9a20af3f92ecb7f999ce4e955c1'
-- key: core/expression_parser.py:R5:_ExpressionEvaluator:visit_Attribute:fp=6d5c4aeb817f680a
+- key: core/expression_parser.py:R5:_ExpressionEvaluator:visit_Attribute:fp=4c3f2a5158001013
   owner: john
   reason: |-
     R5 `isinstance(node.value, ast.Name)` in `visit_Attribute`'s namespace-mode branch — the evaluator half of the receiver check the validator performs at line 255. It is not redundant with the validator: the evaluator must independently confirm that `.get` is being taken on a top-level allowed name before returning the bound method, because returning `value.get` for any other receiver would hand the expression a live callable over an arbitrary object. Namespace mode is the commencement-gate path (`collections`, `dependency_runs`, `env`), where the context is a namespace dict rather than the row itself, so the single-name identity test on the line above cannot apply. Invalidated if namespace mode is removed, or if `.get` is admitted on nested values.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:22:34.344024+00:00'
+  judge_recorded_at: '2026-08-31T15:51:29.730580+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.94
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance(node.value, ast.Name)` check discriminates the parsed expression’s syntactic form; it is not defensively revalidating Tier-1/Tier-2 data or hiding a contract violation. The visible branch uses that discrimination together with `_allowed_names` to admit `.get` only on an allowed top-level namespace and otherwise raises `ExpressionSecurityError`, so it is an explicit security gate rather than silent recovery or coercion. The `node` parameter is a typed AST representation rather than raw external data being promoted at this method, so the `@trust_boundary` structural alternative does not apply.
+    PRESCRIBED FORM — the `isinstance` participates in a fail-closed receiver-authorization check rather than coercing, defaulting, or suppressing a contract failure. At core/expression_parser.py:589, a non-`ast.Name` or disallowed receiver falls through to a typed `ExpressionSecurityError`, preventing exposure of a live `.get` callable; the companion `_ExpressionValidator.visit_Attribute` control was verified at core/expression_parser.py:276. Although construction validates the AST at core/expression_parser.py:839, this evaluator check independently preserves the same security invariant with offensive raise-on-invalid-state behavior.
   judge_signature_version: 2
   scope_fingerprint: f7f842d60e25084cb7a9884325b7c2f6132c64a5ded104e5cdff96a5b64ff932
   judge_transport: codex_cli
-  ast_path: 'body[26]/body[7]/body[2]/body[1]/test/values[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:7a0000d34803db10609194ceb20a72534c848ceba3c1a96dd67ae77cfb338586'
+  ast_path: 'body[27]/body[7]/body[2]/body[1]/test/values[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:10c8ad6f56b7928ab15ff3ef97795580bc59857b64c812ededc67b9816d54256'
 - key: core/expression_parser.py:R5:_ExpressionEvaluator:visit_BoolOp:fp=beec2454d7f81345
   owner: john
   reason: |-
@@ -4441,25 +4441,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[35]/body[35]/body[0]/test'
   judge_metadata_signature: 'hmac-sha256:v2:4fbdd1d88a4558ed890e22fa4272dd8ffe9c2c88907d13f37533c401e1fe2672'
-- key: core/landscape/journal.py:R5:LandscapeJournal:_payload_ref_columns_from_context:fp=ace16816637bc538
+- key: core/landscape/journal.py:R5:LandscapeJournal:_payload_ref_columns_from_context:fp=05b9ee73db2e8699
   owner: john
   reason: |-
     journal.py:756 `if isinstance(parameters, Mapping):`. FLAGGED PATTERN: isinstance against an abstract base class. This site reads the RAW parameters SQLAlchemy passes to the execution hook, before `_normalize_parameters` has touched them, and that is why it tests the `Mapping` ABC rather than `dict`: the concrete container here is the dialect's and the driver's choice, not ELSPETH's, so the honest test is the contract-level one — 'this exposes keys I can iterate' — rather than a bet on a concrete class. Measured on the pinned SQLAlchemy 2.0.45, that breadth is not currently load-bearing: the parameter containers in play, `immutabledict` included, all subclass `dict` (`isinstance(immutabledict({'a': 1}), dict)` is True), so a `dict` test would match the same values today. `Mapping` is chosen because it stays correct without that coincidence holding. The mirror-image site at line 841 tests `dict` and is the reverse case — it runs AFTER normalisation over a value ELSPETH itself constructed, so the exact type is known and the narrow test is the honest one there. The two are deliberately different tests over the same conceptual value at two different points in the pipeline, and neither should be rewritten to match the other. The narrowing is a last-resort ordering rather than a guess: the function prefers `compiled.positiontup` (the authoritative compiled column order), falls back to the mapping's keys only when `positiontup` is empty, and falls back again to `compiled.params`. Iterating a `Mapping` yields its keys, which are the bind-parameter names this function must return. It is also not doing defensive Tier-3 parsing — the genuinely untrusted structural probe in this same function is the `.table` access guarded by `except AttributeError` at line 749, which is separately allowlisted; by the time control reaches line 756 the statement has already been confirmed to target the `calls` table. INVALIDATED IF: `parameters` starts arriving pre-normalised (the `Mapping` breadth would then be unmotivated and should narrow to `dict` to match 841); or the `positiontup` preference is removed, which would promote this fallback to the primary column-order source and demand a stronger check than 'is it a mapping'.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:32:16.275975+00:00'
+  judge_recorded_at: '2026-08-31T16:00:04.607258+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.94
+  judge_confidence: 0.96
   judge_rationale: |-
-    RULE MISFIRES — `parameters` is the raw, shape-unguaranteed container supplied to the SQLAlchemy execution hook, so the `Mapping` check discriminates a valid third-party-selected container shape rather than defensively rechecking an ELSPETH-owned fixed contract. The visible code independently supports the site-specific rationale: it first uses authoritative `compiled.positiontup`, iterates mapping keys only as a fallback, and otherwise falls back to `compiled.params`. This does not suppress, coerce, or fabricate data, and the nearby `calls`-table check is visibly reached before the flagged branch. The Tier-3 decorator contract does not apply because this is container-shape discrimination over Tier-1 journal execution parameters, not promotion of external-origin data through a Tier-3 boundary.
+    RULE MISFIRES — the check discriminates the raw parameter-container representation supplied by SQLAlchemy before ELSPETH normalization; it does not defensively revalidate or coerce the Tier-1 parameter values carried inside it. The visible ordering confirms that `compiled.positiontup` is preferred, `Mapping` keys are used only for a contract-permitted mapping representation, and `compiled.params` handles the remaining representation, so no malformed fixed-contract value is silently hidden. This is not a Tier-3 data-boundary case suitable for `@trust_boundary`, because the parameter contents remain ELSPETH-authored Tier-1 data even though SQLAlchemy chooses their courier container.
   judge_signature_version: 2
   scope_fingerprint: fda6e8405cbba0c393fc42eb3e24e4ab8c0df4d9846f262974679520659e8acc
   judge_transport: codex_cli
-  ast_path: 'body[34]/body[30]/body[7]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:6eeff4a7ae93cf9877671e47ee877b8d1e648c847ac4522eee5c57fbd8d1f960'
+  ast_path: 'body[35]/body[30]/body[7]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:80bcbb19004d4c7b4673038a898e110069b41dc790e75f7782bacc434ce0eb2e'
 - key: core/landscape/run_coordination_repository.py:R6:RunCoordinationRepository:release_seat:fp=c9655dac735a5346
   owner: john
   reason: |-
@@ -4783,25 +4783,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[38]/body[0]/test/values[1]'
   judge_metadata_signature: 'hmac-sha256:v2:2465a34d0fd2aa229b667be5a94d86eb21a1e302bc29cea7277c81f9a4a34a6e'
-- key: core/templates.py:R5:_call_keyword_value:fp=e08bd7eae036827c
+- key: core/templates.py:R5:_call_keyword_value:fp=9291a86c7cccd8d6
   owner: john
   reason: |-
     isinstance(node.dyn_kwargs, DictNode) is the Call-side twin of the Filter-side check in _filter_keyword_value: jinja2 models filter kwargs and call kwargs on separate node classes, so the two helpers cannot be merged without duck-typing the .kwargs/.dyn_kwargs slots, which ADR-032 forbids as a dispatch control. DictNode is the aliased concrete jinja2.nodes.Dict class. A non-literal splat yields None here and is separately reported by _has_unknown_kwarg_values, so the pair stays fail-visible. Tier-1 parse-tree value. It would be invalidated by jinja2 unifying Call and Filter keyword storage, at which point the two helpers should collapse deliberately rather than by accident.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:38:41.321272+00:00'
+  judge_recorded_at: '2026-08-31T16:02:33.293426+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.93
+  judge_confidence: 0.94
   judge_rationale: |-
-    RULE MISFIRES — the concrete `DictNode` check discriminates the literal-dictionary variant of Jinja's declared `dyn_kwargs` representation; it does not defensively revalidate a shape that the fixed `Call` contract promises must always be a dictionary. The visible code preserves the non-literal case as `None`, and the site-specific rationale states that `_has_unknown_kwarg_values` separately reports that case, so this branch does not silently promote an unknown splat as trusted literal keyword data. This is post-parse AST variant handling rather than an R5 Tier-3 parameter boundary, so the decorator contract does not apply.
+    RULE MISFIRES — the check discriminates between legitimate Jinja AST variants for `Call.dyn_kwargs`: a concrete `DictNode` permits literal keyword extraction, while another node type or `None` means no literal value is available. The visible `None` return and the rationale’s named `_has_unknown_kwarg_values` reporting path make this semantic AST dispatch rather than a defensive revalidation or silent contract repair. This is not a Tier-3 promotion boundary over raw parameter data, so the `@trust_boundary` decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 97ecf7d9a75b256fab886fa922cee895f3756be83752b27f8676e3be900d0776
   judge_transport: codex_cli
-  ast_path: 'body[29]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:6bb6bc324d572d0ccd89f0c744bde733542ae250fa0feae7fccd3a0eb8bce327'
+  ast_path: 'body[30]/body[1]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:c9679eb459dd74aca714b8e204f68fd4992115041886f8a0a4419c64ee5024f8'
 - key: core/templates.py:R5:_callblock_api_splat_targets:fp=5828f08c6dc3ffa6
   owner: john
   reason: |-
@@ -6968,3 +6968,155 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[96]/body[9]/test/operand'
   judge_metadata_signature: 'hmac-sha256:v2:328e64f1cc8317b996f14504a91544e2d42225e9e103afc4b26d82f6e022b624'
+- key: core/schema_shape.py:R5:_proven_pg_catalog_text_builtin_calls:fp=7d9a5c717a246c24
+  owner: john
+  reason: |-
+    `isinstance(bind, Connection)` is the first arm of an exhaustive dispatch over SQLAlchemy's declared `Inspector.bind` union, used only to select resource handling; the true arm directly queries through `_text_builtin_identity_rows_on_connection`, while non-Connection values continue to the Engine, None, or `assert_never` arms, so no malformed bind is defaulted here. `tests/testcontainer/web/test_schema_probe_postgres.py::test_catalog_proof_resists_shadowed_oid_equality` pins the Connection arm and fail-closed proof behavior.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T18:21:37.565765+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    RULE MISFIRES — the `isinstance(bind, Connection)` check is the first branch of an exhaustive dispatch over the declared `Engine | Connection | None` union, selecting the resource-handling path rather than defensively revalidating or defaulting malformed data. The visible `Engine` and `None` branches cover the other declared variants, while `assert_never(bind)` makes an unexpected object fail loudly; the named test `tests/testcontainer/web/test_schema_probe_postgres.py::test_catalog_proof_resists_shadowed_oid_equality` specifically pins the Connection branch and fail-closed behavior. This is not a Tier-3 parameter boundary eligible for `@trust_boundary`, because the subject is SQLAlchemy's fixed-contract `Inspector.bind`, not external-origin data requiring promotion.
+  judge_signature_version: 2
+  scope_fingerprint: 1425f81e4dae64f09634c37b2aac9cccab7ca61e3da30c3072e31a10584d7078
+  judge_transport: codex_cli
+  ast_path: 'body[36]/body[2]/body[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:674eceffff6893f7f4011e04bfde863850c374f4229331bb6d2c78df837384b0'
+- key: core/schema_shape.py:R5:_proven_pg_catalog_text_builtin_calls:fp=d573da22dee79d0e
+  owner: john
+  reason: |-
+    `isinstance(bind, Engine)` is the second arm of the same exhaustive documented union; a real Engine is converted to a scoped Connection and passed to `_text_builtin_identity_rows_on_connection`, while None alone returns the empty proof and any other non-None object reaches `assert_never`. `tests/testcontainer/web/test_schema_probe_postgres.py::test_fresh_create_reaches_current[session]` pins the Engine-backed schema probe through this path.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T18:22:20.694446+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.96
+  judge_rationale: |-
+    PRESCRIBED FORM: The code exhaustively discriminates SQLAlchemy's declared `Engine | Connection | None` union, converts the `Engine` arm to a scoped `Connection`, treats only `None` as empty proof, and sends every other value to `assert_never`. This is offensive runtime enforcement that lets a contract violation crash rather than masking or coercing it; the decorator is inapplicable because `bind` is not external Tier-3 data.
+  judge_signature_version: 2
+  scope_fingerprint: 1425f81e4dae64f09634c37b2aac9cccab7ca61e3da30c3072e31a10584d7078
+  judge_transport: codex_cli
+  ast_path: 'body[36]/body[2]/body[0]/orelse[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:0f018bed5e1e5e9b2f7ca7cf4451f74406c94c8234e5e6c34101341f472a1b92'
+- key: core/templates.py:R1:_row_api_container_entries:fp=1d01a02a221cb95d
+  owner: john
+  reason: |-
+    RULE MISFIRES: `row_api_container_aliases` is a sparse, locally built static-analysis index, and `base_name` comes from an arbitrary parsed template access path, so absence is the expected result for a name that is not a known row-API carrier. On every path, an absent base contributes no carrier entries, while a present base is narrowed by `_carrier_relative_entries`; no required field or template value is defaulted. `tests/unit/core/test_templates.py::TestExtractJinja2Fields::test_nested_or_assigned_carried_row_get_alias_reported_by_usage` pins recognized nested carriers, and `tests/unit/core/test_templates.py::TestExtractJinja2Fields::test_container_sibling_local_dict_lookup_not_dynamic` pins the legitimate absent/non-carrier case.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T18:22:53.528678+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    RULE MISFIRES: `row_api_container_aliases` is a deliberately sparse first-party index, and the flagged lookup asks whether an arbitrary parsed access-path base has any carrier entries; absence is therefore a valid negative result rather than a missing required field. The visible code neither fabricates a template value nor silently promotes malformed data: a missing entry simply contributes no carrier result, while a present entry is narrowed through `_carrier_relative_entries`. Although the function is a declared Tier-3 boundary for `node`, this R1 subject is rooted in the separate internal index parameter, so the decorator's structural R1 suppression does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 5f0446ac9b0303b7f6069d726367dcb0c0c2a16eb535fe04fcf4cfa8f27e022f
+  judge_transport: codex_cli
+  ast_path: 'body[61]/body[2]/body[1]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:6eb251c81b1bf8e894654484091f16bf690491f2f25c4b4bff12c99c6063c6a5'
+- key: core/templates.py:R1:_row_api_container_entries:fp=f6e989bfde752123
+  owner: john
+  reason: |-
+    RULE MISFIRES: this lookup queries the same intentionally sparse analysis index for a parsed Jinja `Name`; many valid template names are not row-API carriers. The present branch returns a copy of the known carrier entries and the absent branch returns the function's declared empty analysis result, not a fabricated user value or substitute for a required key. `tests/unit/core/test_templates.py::TestExtractJinja2Fields::test_container_carried_row_get_alias_reported_by_usage` pins the present case, and `tests/unit/core/test_templates.py::TestExtractJinja2Fields::test_container_sibling_local_dict_lookup_not_dynamic` pins absence as an ordinary local value.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T18:23:20.700799+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES: `row_api_container_aliases` is visibly used as a sparse analysis index, so absence of `node.name` means that the parsed name has no known carrier entries rather than that a required fixed-contract key is missing. Returning a fresh empty mapping preserves that analysis meaning and neither fabricates an external value nor conceals malformed Tier-1 or Tier-2 data. Although this is R1 inside a function accepting external `node`, the flagged subject is rooted in the separate `row_api_container_aliases` parameter, and the visible decorator suppresses only R5, so the structural decorator nudge does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 5f0446ac9b0303b7f6069d726367dcb0c0c2a16eb535fe04fcf4cfa8f27e022f
+  judge_transport: codex_cli
+  ast_path: 'body[61]/body[0]/body[0]/value/args[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:79c98b5615f6f6be0307878409b9e0d8becf607de3526278cd2d4fc5dbad3f35'
+- key: core/templates.py:R1:_row_api_container_entries:fp=f8e800aee236c6ba
+  owner: john
+  reason: |-
+    RULE MISFIRES: `base_name` is the root of an arbitrary dynamic template access pattern, while `row_api_container_aliases` contains only carriers proven by the fixpoint analysis. Missing roots therefore legitimately contribute no entries; present roots are conservatively wildcard-matched by `_carrier_pattern_relative_entries`. This does not hide a required mapping key or default pipeline data. `tests/unit/core/test_templates.py::TestExtractJinja2Fields::test_dynamic_key_row_get_carriers_reported_by_usage` pins the present wildcard-carrier path, and `tests/unit/core/test_templates.py::TestExtractJinja2Fields::test_container_sibling_local_dict_lookup_not_dynamic` pins the non-carrier outcome.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T18:24:19.299505+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    RULE MISFIRES: `row_api_container_aliases` is visibly a partial analysis index of proven carrier roots, while `base_name` comes from an arbitrary dynamic access pattern, so an absent key means “not a carrier” rather than a broken required-key contract. The guarded result is used only to contribute conservative relative entries, with absence contributing none; it neither fabricates pipeline data nor conceals malformed Tier-1/Tier-2 data. The existing trust-boundary decorator is visible and suppresses R5 for `node`, but this R1 subject is the separate internal analysis mapping parameter, so the structural decorator nudge does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 5f0446ac9b0303b7f6069d726367dcb0c0c2a16eb535fe04fcf4cfa8f27e022f
+  judge_transport: codex_cli
+  ast_path: 'body[61]/body[4]/body[1]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:6cdeafbd564d5d27c4da6b7fd357ae62c9247473ee5a83d1d68ba18bca4b31c4'
+- key: core/templates.py:R5:_callblock_argument_bindings:fp=306d2a73257a58d1
+  owner: john
+  reason: |-
+    RULE MISFIRES: `caller_call.dyn_kwargs` is a Jinja AST union for an optional arbitrary `**` expression, and `DictNode` is the nominal literal-mapping arm whose keys can be enumerated statically. The true branch binds only literal keyword values through `_literal_kwarg_values`; every other shape creates no speculative binding rather than being coerced or accepted as a mapping contract. `tests/unit/core/test_templates.py::TestExtractJinja2Fields::test_macro_or_callblock_row_value_splats_reported_by_usage` pins non-literal callblock splats as dynamic, while `tests/unit/core/test_templates.py::TestExtractJinja2Fields::test_dynamic_key_row_get_carriers_reported_by_usage` pins fail-visible dynamic literal-key behavior.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T18:26:08.609655+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.96
+  judge_rationale: |-
+    RULE MISFIRES: `caller_call.dyn_kwargs` is a declared Jinja AST sum-type position, and the `isinstance(..., DictNode)` check discriminates the nominal literal-dictionary arm rather than defensively revalidating a fixed mapping contract. The visible code only enumerates statically knowable keyword bindings for that arm and neither coerces another shape nor fabricates a mapping or default. This is AST variant dispatch, not a Tier-3 promotion boundary, so the function-scoped decorator contract does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 38d8a623ed4f8a982bbaee3338d8c92a8f05a46538ddc66e057516e1dfaba62a
+  judge_transport: codex_cli
+  ast_path: 'body[52]/body[1]/body[0]/body[1]/body[5]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:66f74a9286307a006dd33a1eee1966db3a56648e2840fa440ccc3b98d07e1997'
+- key: core/templates.py:R5:_callblock_argument_bindings:fp=e2e6c2067bb612f7
+  owner: john
+  reason: |-
+    RULE MISFIRES: the loop visits every Jinja `Call` inside a macro, so most callees are legitimately not the injected direct `caller` name. Nominally selecting `Name` and then requiring `.name == 'caller'` identifies exactly the callblock binding form; non-Name callees are ignored as other call expressions, not treated as malformed-but-valid caller bindings. `tests/unit/core/test_templates.py::TestExtractJinja2Fields::test_callblock_caller_row_arg_reported_by_usage` pins the direct binding, and `tests/unit/core/test_templates.py::TestExtractJinja2Fields::test_carried_callblock_macro_alias_reported_by_usage` pins it when the enclosing macro is invoked through a carrier.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T18:26:37.372751+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES: the `isinstance(caller_call.node, Name)` expression performs nominal AST-variant selection among legitimate Jinja `Call` callee forms, rather than defensively revalidating a fixed contract or hiding a malformed value. The visible loop examines every `Call` in the macro and then selects only direct calls whose callee is the `Name` node `caller`; other callee variants are intentionally irrelevant, while the separately fixed-contract `CallBlock.args` elements are accessed directly and allowed to crash on corruption. This is not a Tier-3 boundary guard rooted in a raw external parameter, so the structural decorator contract does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 38d8a623ed4f8a982bbaee3338d8c92a8f05a46538ddc66e057516e1dfaba62a
+  judge_transport: codex_cli
+  ast_path: 'body[52]/body[1]/body[0]/body[1]/body[0]/test/values[0]/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:4a7e020e6289c542f06d0754a6754eab72f1391b02d15611345fce0e0a56a565'
+- key: core/templates.py:R5:_callblock_row_splat_targets:fp=3f07be90a9b059e4
+  owner: john
+  reason: |-
+    RULE MISFIRES: this is the same nominal Jinja-AST dispatch over all macro calls, used here to select only direct `caller(...)` invocations before tracing row splats. A non-`Name` callee cannot be the direct injected caller form and is skipped without fabricating a row target; a matching `Name('caller')` continues into conservative splat analysis. `tests/unit/core/test_templates.py::TestExtractJinja2Fields::test_macro_or_callblock_splat_row_arg_reported_by_usage` pins literal row splats, and `tests/unit/core/test_templates.py::TestExtractJinja2Fields::test_macro_aliased_splat_row_arg_reported_by_usage` pins carried splat inputs.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T18:27:07.551017+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    RULE MISFIRES: the `isinstance(caller_call.node, Name)` check is nominal dispatch among valid Jinja AST node variants, not a defensive re-check of a fixed contract or concealment of malformed Tier-2 data. The visible code uses the check solely to select direct `caller(...)` invocations for conservative splat analysis; non-`Name` callees are legitimate alternate syntax and are skipped without coercion, fabrication, or silent contract recovery. The adjacent comment contrasts this intentional discrimination with trusting the parser-declared `CallBlock.args` shape, reinforcing that the check addresses semantic AST variants rather than corruption. This is not a function-scoped Tier-3 boundary suppression case, so the decorator contract does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: ce75b68683c2694af3581d7576ef593433c7f043ed7fd2d31e69e69be7706dc2
+  judge_transport: codex_cli
+  ast_path: 'body[54]/body[1]/body[0]/body[1]/body[0]/test/values[0]/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:fb9d5944903d625d0b64e0d269a2daa0174bd3dd2c6ffc7794096fb4f7fbb6f6'

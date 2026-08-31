@@ -227,25 +227,29 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[22]/body[6]/body[1]/body[0]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:241ac6bd8d87440bcb045dd2226d9f3381f9580c8051580c962c17ba5799bda9'
-- key: web/sessions/_auto_title.py:R6:maybe_auto_title_session:fp=819a9041915266f8
+- key: web/sessions/_auto_title.py:R6:maybe_auto_title_session:fp=df37ac20bba7f20c
   owner: john
   reason: |-
     maybe_generate_auto_title is a best-effort UI metadata helper, not part of the legal audit path or session correctness. The except (LiteLLMAPIError, TimeoutError, asyncio.CancelledError) catches expected provider/scheduling failures from the external title-generation call, records the failure through _record_auto_title_failure(exc), and returns without changing the session title. Unexpected local exceptions are not caught. The explicit outcome is "auto title unavailable; keep existing title", with operational failure accounting, so the handler does not silently drop a user-visible or audit-significant decision.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:16:44.669626+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
+  judge_recorded_at: '2026-08-31T17:43:39.979214+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM. The except clause catches a narrow, named set of expected external/scheduling failures from a Tier-3 LLM provider call (LiteLLM), records the failure via _record_auto_title_failure(exc) so operational telemetry distinguishes 'provider declined' from 'feature broke', and returns without altering session state. This is not silent swallowing: the failure is recorded and the outcome ('keep existing title') is explicit. Unexpected exceptions and DB write failures propagate, per the docstring, so genuine bugs still crash. R6's concern (errors swallowed without re-raise or explicit error result) is addressed by the recorded failure signal at a legitimate Tier-3 boundary.
+    PRESCRIBED FORM — this narrow handler implements an explicitly non-raising, best-effort UI-metadata outcome: expected provider, malformed-response, timeout, and cancellation failures leave the existing session title unchanged while unexpected local exceptions remain uncaught. The claimed recording control is verified at web/sessions/_auto_title.py:135, where `_record_auto_title_failure` increments the bounded operational failure counter, and the caller at web/sessions/routes/messages.py:1014 documents and enforces that programmer bugs and DB-write failures surface through `auto_title_task.result()` while scheduling timeout cancellation is intentionally non-fatal. The visible code and rationale therefore establish recorded, non-silent handling without affecting the legal audit path or session correctness; R6 is not eligible for `@trust_boundary` suppression.
   judge_signature_version: 2
-  scope_fingerprint: 7fe0cbd412938e127381485603b434ab0ce9bd3bb3213734118101d43ab3fac9
-  judge_transport: openrouter
-  ast_path: 'body[17]/body[5]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:d1de63b4ddba2741738363ee9b01ede3d2597cdc40a32928a3e7bec4450f9520'
+  scope_fingerprint: cba25207b6ae98560871184a4b18a98d3358a359d586a49d471c130f4c162c32
+  judge_transport: codex_cli
+  ast_path: 'body[35]/body[6]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:16344d4ef23dc643ed97a1f917f239f60f48f4f7d7b9b5ff6aed7e1cac2aa35c'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 16
+      redacted_hash: b5e583047f0bcb33
 - key: web/auth/middleware.py:R6:get_current_user:fp=8d3c9a32b105fc87
   owner: john
   reason: |-
@@ -444,7 +448,7 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[107]/body[3]/orelse[2]/value'
   judge_metadata_signature: 'hmac-sha256:v2:bfc9253204dd28425845e6432808f128129397ba24887290a8641ab07f53b3d6'
-- key: web/sessions/routes/_helpers.py:R6:_state_data_from_composer_state:fp=d02de84e8892db6b
+- key: web/sessions/routes/_helpers.py:R6:_state_data_from_composer_state:fp=e4522badfaccb597
   owner: john
   reason: |-
     This is a prescribed boundary conversion, not Tier-1 audit-data handling. In `src/elspeth/web/sessions/routes/_helpers.py:1612-1620`, `_state_data_from_composer_state` validates caller-supplied composer authoring state with `authoring = state.validate()`. If validation itself raises `ValueError`, `TypeError`, or `KeyError`, the function does not ignore the failure: it records boundary telemetry with `_record_composer_authoring_validation_telemetry("exception", ..., exception_class=type(val_err).__name__)` and reifies the exception into an invalid `ValidationSummary` via `authoring = ValidationSummary(is_valid=False, errors=(ValidationEntry("validation", "validation_failed", "high"),),)`. That makes the malformed composer state a validation result for the web/composer boundary. Drift that changed this to Tier-1 database/checkpoint/audit data, removed the telemetry emission, or continued with `is_valid=True` would invalidate this suppression.
@@ -452,17 +456,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T01:38:33.761113+00:00'
+  judge_recorded_at: '2026-08-31T17:44:06.090142+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.95
   judge_rationale: |-
-    PRESCRIBED FORM — the visible handler does not silently swallow the validation exceptions: it converts them into an explicit `ValidationSummary` with `is_valid=False` and a high-severity `validation_failed` entry. The excerpt is consistent with the rationale's claim that composer-authored state is being validated at a boundary, and downstream runtime preflight is gated on `authoring.is_valid`; telemetry is supplementary rather than the error result itself. R6 is not eligible for the `@trust_boundary` decorator's R1/R5 suppression mechanism.
+    PRESCRIBED FORM: the caught validation exceptions are not silently ignored; the code converts them into an explicit invalid `ValidationSummary` with `is_valid=False` and a high-severity `validation_failed` entry. The rationale plainly identifies `state` as caller-supplied composer authoring data, and the visible control flow prevents runtime preflight when that explicit validation result is invalid. Telemetry alone would not justify suppression, but the explicit error result satisfies R6’s prescribed remediation.
   judge_signature_version: 2
-  scope_fingerprint: 69d3beee7f3334a4238546335467a47c480db0cb6d81a1338ab20b636ad2bca6
+  scope_fingerprint: b3a95208d6bebc47125a266ed1ef16731bae2637e65b4249be4c8587374e1f4a
   judge_transport: codex_cli
-  ast_path: 'body[165]/body[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:532fef4633624b98536f13474af4d386ca907f5fdbfd37140b9728cbb9255ab0'
+  ast_path: 'body[166]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:0c3516fb9451c6168e6541796482f37b8343c1d74ad01e94de67ab7d900caa05'
 - key: web/sessions/routes/composer/proposals.py:R6:accept_composition_proposal:fp=04c0714bc54d44de
   owner: john
   reason: |-
@@ -710,25 +714,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[69]/body[14]/test'
   judge_metadata_signature: 'hmac-sha256:v2:723e4768a42c65fee66e8a3b87779a4b3849bad25bd78610193e4d518bff6f17'
-- key: web/composer/tools/blobs.py:R6:_execute_update_blob:fp=48a3abe3a57d4553
+- key: web/composer/tools/blobs.py:R6:_execute_update_blob:fp=c7585414b6045971
   owner: john
   reason: |-
     in `_execute_update_blob` (tools/blobs.py) the flagged `except OSError as rollback_exc:` (1493) is the inner best-effort rollback of the `except Exception as primary_exc:` handler (1490-1502). When the post-`os.replace` restore `storage_path.write_bytes(old_content)` itself fails with OSError, the handler attaches a diagnostic note to the ORIGINAL exception — `primary_exc.add_note(...)` (1494-1501) — recording that the storage file and DB row may now be inconsistent and manual reconciliation is required, then the enclosing `except Exception` re-raises the primary fault via `raise` at line 1502. The exception therefore terminates execution (line 1502); nothing is swallowed or downgraded to a default. The OSError scope is intentionally narrow (comment 1481-1489): programmer-error types (TypeError/AttributeError/AssertionError) must propagate rather than be caught as I/O rollback failures, and Exception (not BaseException) preserves KeyboardInterrupt/SystemExit — asserted by test_blob_rollback_does_not_catch_keyboard_interrupt. This is prescribed graceful-unwind context attachment before propagation. Invalidated if line 1502 `raise` is removed/altered so primary_exc no longer propagates, or if the inner handler starts returning a success/normal result instead of re-raising.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:02:52.159413+00:00'
+  judge_recorded_at: '2026-08-31T17:16:23.254660+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM — the visible code shows that the narrowly caught rollback OSError is preserved as a diagnostic note on `primary_exc`, after which the bare `raise` at blobs.py:1646 propagates that original exception and terminates the operation. Thus the handler neither returns a normal/default result nor silently loses the rollback failure; it adds graceful-unwind context while retaining the primary fault and the possible storage/DB inconsistency. The narrow OSError catch is also consistent with the stated policy of allowing programmer errors and BaseException subclasses to propagate.
+    RULE MISFIRES — the inner OSError handler is not silent recovery: it attaches the rollback failure and resulting inconsistency details to the original exception, after which the visible unconditional `raise` re-propagates that original exception. The code returns neither a default nor a success result, and the narrowly caught rollback error remains observable in the terminating exception’s diagnostic notes. The claimed propagation control is directly visible within `_execute_update_blob`, so no external control-location claim is needed to justify the exemption.
   judge_signature_version: 2
   scope_fingerprint: dc66c456d10fb2edfe4540d3c31a82559ce325cc8c4c7e4319db37c74005b8fa
   judge_transport: codex_cli
-  ast_path: 'body[78]/body[11]/body[12]/body[1]/handlers[2]/body[0]/body[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:3fc297c12c01fb5540d175b619b54dd2de4563826cfd962386de7c67e2d567a5'
+  ast_path: 'body[79]/body[11]/body[12]/body[1]/handlers[2]/body[0]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:82af369559c298026ef35cde8976e8a80e2ad8ed56650c0765c85915b9e87c5a'
 - key: web/execution/service.py:R9:ExecutionServiceImpl:cleanup_session_lock:fp=bc0c96aa44ec93f1
   owner: john
   reason: |-
@@ -976,25 +980,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[38]/body[1]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:9a72559bfa08df4ca6deb56f1fa0dc7921264c14d06884c388e6a5c1a03ee069'
-- key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=5196acc000bd6a7a
+- key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=284ede8e2ecd8c90
   owner: john
   reason: |-
     RULE MISFIRES (legitimate AST type-dispatch). These isinstance() calls in `_row_fields_referenced_by_condition` are structural type-dispatch over a Python `ast` parse tree (`ast.walk(ast.parse(condition, mode="eval"))`), not defensive guards on first-party typed data. Classifying nodes by type — `isinstance(node, ast.Subscript)`, `isinstance(node.value, ast.Name)`, `isinstance(node.slice, ast.Constant)`, `isinstance(node, ast.Call)`, `isinstance(node.func, ast.Attribute)`, etc. — is the canonical, library-intended way to walk an AST, and the tier-model deep-dive skill explicitly endorses isinstance for type dispatch. There is no first-party typed contract being bypassed: the function extracts `row['field']` / `row.get('field')` references from the tree to report which row fields a gate condition touches. The `condition` string itself is Tier-3 (composer/operator-authored gate expression), but the isinstance checks classify Python AST node *types*, not the external value's shape. R5 is a purely syntactic detector that fires on every isinstance regardless of intent; this is a false positive, and a signed allowlist entry is the designed, auditable record that this particular isinstance is legitimate AST dispatch rather than defensive suppression. Rewriting to match/case would not improve correctness (the checks are correct), would mix structural patterns with the existing value guards (`node.value.id == "row"`, `node.func.attr == "get"`, `len(node.args) == 1`) awkwardly, and rests on an unverified assumption that class patterns escape R5 — so the honest signed suppression is the right disposition.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:04:12.171585+00:00'
+  judge_recorded_at: '2026-08-31T17:18:50.116454+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES: the flagged `isinstance(node.func.value, ast.Name)` is nominal type dispatch within a heterogeneous Python AST produced by `ast.parse` and traversed by `ast.walk`, not a defensive re-check that masks a fixed-contract violation. The surrounding value checks identify the specific syntax `row.get('field')`, and no error is swallowed, value coerced, or default fabricated. Although the rationale is duplicated across related findings, this excerpt independently establishes the same site-specific AST-dispatch justification; the check is not a Tier-3 shape guard rooted directly in `condition` for which a trust-boundary decorator suppression is appropriate.
+    RULE MISFIRES — the flagged expression classifies an object produced by `ast.walk(ast.parse(condition, mode="eval"))` against the concrete standard-library AST class `ast.Name`; it does not defensively re-check data governed by a fixed ELSPETH contract or conceal a contract violation. The surrounding checks consistently perform nominal AST node dispatch before inspecting node-specific fields, so the visible code independently supports the site-specific justification despite the duplicated rationale. The trust-boundary decorator is inapplicable because the checked subject is a parsed AST node used for type dispatch, not the external `condition` value whose shape is being guarded or promoted.
   judge_signature_version: 2
   scope_fingerprint: 8334f8dde16d85ca8d79dad8c834fe69a8fb8401f97a5feceaacf45a589a7d10
   judge_transport: codex_cli
-  ast_path: 'body[74]/body[2]/body[1]/test/values[3]'
-  judge_metadata_signature: 'hmac-sha256:v2:339ccb08e6e6f73a18352962fd578fd53c7f99a065370f145c1014ae2d6bace7'
+  ast_path: 'body[78]/body[2]/body[1]/test/values[3]'
+  judge_metadata_signature: 'hmac-sha256:v2:677895e25bd21fd3b55a464f5b5e46cc63d7eccf359d4b30755b2ebec78fba0d'
 - key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=b5c3454f664716c2
   owner: john
   reason: |-
@@ -1014,25 +1018,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[74]/body[2]/body[0]/test/values[3]'
   judge_metadata_signature: 'hmac-sha256:v2:b83b795a96439a5a7142a8c6c87fb506387b896e49f737fa0ef18e993e3c751d'
-- key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=d15144662411d053
+- key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=2ca768f36b941c10
   owner: john
   reason: |-
     RULE MISFIRES (legitimate AST type-dispatch). These isinstance() calls in `_row_fields_referenced_by_condition` are structural type-dispatch over a Python `ast` parse tree (`ast.walk(ast.parse(condition, mode="eval"))`), not defensive guards on first-party typed data. Classifying nodes by type — `isinstance(node, ast.Subscript)`, `isinstance(node.value, ast.Name)`, `isinstance(node.slice, ast.Constant)`, `isinstance(node, ast.Call)`, `isinstance(node.func, ast.Attribute)`, etc. — is the canonical, library-intended way to walk an AST, and the tier-model deep-dive skill explicitly endorses isinstance for type dispatch. There is no first-party typed contract being bypassed: the function extracts `row['field']` / `row.get('field')` references from the tree to report which row fields a gate condition touches. The `condition` string itself is Tier-3 (composer/operator-authored gate expression), but the isinstance checks classify Python AST node *types*, not the external value's shape. R5 is a purely syntactic detector that fires on every isinstance regardless of intent; this is a false positive, and a signed allowlist entry is the designed, auditable record that this particular isinstance is legitimate AST dispatch rather than defensive suppression. Rewriting to match/case would not improve correctness (the checks are correct), would mix structural patterns with the existing value guards (`node.value.id == "row"`, `node.func.attr == "get"`, `len(node.args) == 1`) awkwardly, and rests on an unverified assumption that class patterns escape R5 — so the honest signed suppression is the right disposition.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:03:53.112449+00:00'
+  judge_recorded_at: '2026-08-31T17:21:08.460415+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES: the flagged `isinstance(node.func, ast.Attribute)` is nominal type dispatch over nodes produced by `ast.parse` and `ast.walk`, not a defensive re-check that masks a fixed-contract violation. The surrounding predicates discriminate AST variants and then inspect variant-specific fields to identify `row.get(...)` references; they neither suppress malformed input nor coerce or fabricate data. Although `condition` is externally authored, the flagged subject is a parser-produced AST node under the `ast` API contract rather than unpromoted Tier-3 shape, so the trust-boundary decorator is not applicable; the duplicated rationale does not undermine the independently visible site-specific evidence.
+    RULE MISFIRES — `isinstance(node.func, ast.Attribute)` discriminates among the documented heterogeneous node classes produced by `ast.parse` and traversed by `ast.walk`; it does not suppress a malformed value or defensively re-check a fixed ELSPETH contract. The surrounding value checks then identify the specific `row.get(...)` expression shape, so the visible code independently supports legitimate AST type dispatch despite the duplicated rationale. The decorator contract does not apply because the checked subject is the parser-produced AST node, not the shape of the external `condition` parameter itself.
   judge_signature_version: 2
   scope_fingerprint: 8334f8dde16d85ca8d79dad8c834fe69a8fb8401f97a5feceaacf45a589a7d10
   judge_transport: codex_cli
-  ast_path: 'body[74]/body[2]/body[1]/test/values[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:bda22a7272a52ea7864dbe10028e9bd98afa935118105a9ad845775137469cf8'
+  ast_path: 'body[78]/body[2]/body[1]/test/values[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:f1c0c0e6272cd5d7ae06fd1d763432dce0022299b3d5b352359b34fc401042e2'
 - key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=fb46238306c66110
   owner: john
   reason: |-
@@ -1109,25 +1113,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[74]/body[2]/body[0]/test/values[4]'
   judge_metadata_signature: 'hmac-sha256:v2:7c18ea44719051a9b4689a2693a241fee10df223bcfdeca13342c96d35f9a006'
-- key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=5fe1808e0e3d142b
+- key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=7831c5e93fa902ba
   owner: john
   reason: |-
     RULE MISFIRES (legitimate AST type-dispatch). These isinstance() calls in `_row_fields_referenced_by_condition` are structural type-dispatch over a Python `ast` parse tree (`ast.walk(ast.parse(condition, mode="eval"))`), not defensive guards on first-party typed data. Classifying nodes by type — `isinstance(node, ast.Subscript)`, `isinstance(node.value, ast.Name)`, `isinstance(node.slice, ast.Constant)`, `isinstance(node, ast.Call)`, `isinstance(node.func, ast.Attribute)`, etc. — is the canonical, library-intended way to walk an AST, and the tier-model deep-dive skill explicitly endorses isinstance for type dispatch. There is no first-party typed contract being bypassed: the function extracts `row['field']` / `row.get('field')` references from the tree to report which row fields a gate condition touches. The `condition` string itself is Tier-3 (composer/operator-authored gate expression), but the isinstance checks classify Python AST node *types*, not the external value's shape. R5 is a purely syntactic detector that fires on every isinstance regardless of intent; this is a false positive, and a signed allowlist entry is the designed, auditable record that this particular isinstance is legitimate AST dispatch rather than defensive suppression. Rewriting to match/case would not improve correctness (the checks are correct), would mix structural patterns with the existing value guards (`node.value.id == "row"`, `node.func.attr == "get"`, `len(node.args) == 1`) awkwardly, and rests on an unverified assumption that class patterns escape R5 — so the honest signed suppression is the right disposition.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:05:37.576949+00:00'
+  judge_recorded_at: '2026-08-31T17:19:41.768712+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES: the flagged `isinstance(node.args[0], ast.Constant)` is nominal type dispatch over the heterogeneous Python AST produced by `ast.parse` and traversed by `ast.walk`, not a defensive re-check that masks a fixed-contract violation. The surrounding predicates then inspect values only after narrowing to the appropriate AST node classes, which is consistent with extracting supported `row.get('field')` syntax rather than coercing, fabricating, or silently recovering from malformed data. Although the rationale is duplicated across several findings, the visible code independently establishes this site-specific justification. The trust-boundary decorator is inapplicable because the checked subject is an AST node being classified for syntax traversal, not the external parameter's shape being guarded for promotion to Tier 2.
+    RULE MISFIRES — the flagged `isinstance(node.args[0], ast.Constant)` classifies nodes produced by `ast.parse` and traversed by `ast.walk`; it does not defensively re-check the shape of Tier-1 or Tier-2 application data or suppress a contract failure. The surrounding predicates confirm canonical AST type dispatch used to recognize the `row.get(<string literal>)` syntax before accessing node-specific attributes. Although `condition` may be external-origin, the finding's subject is an AST node constructed by Python's parser rather than an unvalidated external parameter requiring promotion, so the `@trust_boundary` structural alternative is not applicable. The duplicated rationale wording adds no evidence, but the visible code independently establishes the exception.
   judge_signature_version: 2
   scope_fingerprint: 8334f8dde16d85ca8d79dad8c834fe69a8fb8401f97a5feceaacf45a589a7d10
   judge_transport: codex_cli
-  ast_path: 'body[74]/body[2]/body[1]/test/values[6]'
-  judge_metadata_signature: 'hmac-sha256:v2:6dfc77d6fb82f1c133ec941e6210b8b7476314db3311b9928967bc315bd1ce16'
+  ast_path: 'body[78]/body[2]/body[1]/test/values[6]'
+  judge_metadata_signature: 'hmac-sha256:v2:490a201fe5e15f75da34860dda95e9d66abb2dee53b892a5aade80ea54f258f2'
 - key: web/composer/tutorial_service.py:R6:_read_audited_artifact_bytes:fp=02edc6487edf7909
   owner: john
   reason: |-
@@ -1394,25 +1398,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[84]/body[9]/body[10]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:1a6282da26a25eab2b8d8dc034f8e1e2a35248e80960fcbafe86898f925448bc'
-- key: web/execution/routes.py:R6:create_execution_router:websocket_run_progress:fp=5de17b68dcaf1724
+- key: web/execution/routes.py:R6:create_execution_router:websocket_run_progress:fp=c542cfa87e752538
   owner: john
   reason: |-
     This is a prescribed endpoint-boundary translation, not a silent Tier-1 recovery path. In `websocket_run_progress`, the idle-timeout recheck calls the authoritative status/accounting loader at `src/elspeth/web/execution/routes.py:1365` and catches only `_RunStatusNotFoundError` or the integrity pair at `1369`: `except (ValidationError, _RunStatusIntegrityError) as integrity_exc:`. The integrity branch does not continue with suspect audit/accounting data; it records the internal failure with context (`slog.error(... phase="idle_recheck", error=str(integrity_exc))`, lines 1374-1379), closes the WebSocket as an internal error (`await websocket.close(code=1011, reason="Run status failed internal accounting validation")`, line 1380), and terminates the loop (`break`, line 1381). The enclosing seed path uses the same form at lines 1325-1339. Suppression is valid only while this site remains a WebSocket boundary that logs the integrity exception detail, sends close code 1011, and terminates instead of fabricating or sending a normal run status.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T23:05:28.485410+00:00'
+  judge_recorded_at: '2026-08-31T17:31:24.729930+00:00'
   judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.94
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — the handler does not silently swallow the integrity failure: it emits an explicit WebSocket internal-error result with close code 1011 and then terminates the loop. The visible branch neither fabricates a normal run status nor continues using suspect Tier-1 accounting data, and its narrow exception tuple matches the rationale’s claimed endpoint-boundary translation. The decorator alternative is inapplicable because this is R6, not R1 or R5.
+    RULE MISFIRES — this handler does not silently swallow the integrity failure: it sends the explicit WebSocket internal-error result 1011 and terminates the loop at web/execution/routes.py:1563-1575. I verified that `_load_run_status_snapshot_with_accounting` at web/execution/routes.py:581-624 raises `_RunStatusIntegrityError` for corrupt accounting and propagates `ValidationError`, while the parallel seed handler at web/execution/routes.py:1514-1533 applies the same log, 1011 close, and termination semantics. The exception is therefore translated at the endpoint boundary without fabricating or continuing with suspect Tier-1 data, satisfying R6's explicit-error-result requirement.
   judge_signature_version: 2
   scope_fingerprint: 83f60eb3783033a0c8f77f6fbe28d16b631e737396d9c069574dd6989ce41bf0
   judge_transport: codex_cli
-  ast_path: 'body[82]/body[9]/body[10]/body[7]/body[0]/handlers[0]/body[0]/handlers[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:47b01165f33082849f423344e4e263a2d678e611cfff2ce34b376fabb06d8546'
+  ast_path: 'body[84]/body[9]/body[10]/body[7]/body[0]/handlers[0]/body[0]/handlers[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:acea9243346cab210149b915a9cd76414c6b0e1bf71faae2d622d4c212a80f5b'
 - key: web/execution/routes.py:R6:create_execution_router:websocket_run_progress:fp=45b68594a9d5d113
   owner: john
   reason: |-
@@ -3806,63 +3810,63 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[37]/body[1]/value/left'
   judge_metadata_signature: 'hmac-sha256:v2:1e1bd4b5a1c566b0b19d53af60eb09968d600d21e53467d4df5c41ecf73e0d22'
-- key: web/composer/planner_authoring_aids.py:R1:_usable_llm_profile_alias:fp=d98911cff6313e48
+- key: web/composer/planner_authoring_aids.py:R1:_usable_llm_profile_alias:fp=0d94d8c5556152f4
   owner: john
   reason: |-
     R1 `dict(snapshot.selected_profile_aliases).get(llm_id)`. The receiver is NOT external data: `snapshot` is `PluginAvailabilitySnapshot`, an ELSPETH-owned frozen dataclass (`web/plugin_policy/models.py`). The finding is nonetheless correct to surface and wrong to remove, because that type encodes plugin->alias as a PARTIAL pair list whose value is itself optional: `selected_profile_aliases: tuple[tuple[PluginId, str | None], ...]`. A plugin the operator never gave a profile selection contributes NO pair; a plugin whose selection was cleared contributes `(plugin_id, None)`. Both spell the same fact -- 'this deployment has selected no alias for this plugin' -- so the membership rewrite is NOT equivalent here: `llm_id in mapping` is True for the explicit-None case that must still fall through. `.get()` collapsing both shapes to None is the honest reading of the field's own type. What it protects: the aid must teach this deployment's real operator profile alias or fall back to its first usable one, never invent an alias name. The fallback on the next line, `dict(snapshot.usable_profile_aliases)[llm_id][0]`, is deliberately a REQUIRED-key subscript -- `llm_id` was taken from that same tuple four statements above, so a snapshot that is genuinely inconsistent still crashes; only the documented 'nothing selected' fact is defaulted.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T15:27:19.002348+00:00'
+  judge_recorded_at: '2026-08-31T16:59:02.635605+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.96
   judge_rationale: |-
-    RULE MISFIRES — The flagged `.get()` does not hide a missing-key bug: the stated first-party field contract is intentionally partial and gives both an absent pair and an explicit `None` the same domain meaning, “no selected alias.” The visible code preserves that meaning without fabricating an alias, then uses required-key access on `usable_profile_aliases`, so an inconsistent snapshot still raises rather than being silently recovered. The function accepts a first-party `PolicyCatalogView`, not an external-data parameter, so the `@trust_boundary` structural alternative does not apply.
+    RULE MISFIRES — `selected_profile_aliases` is an ELSPETH-owned, explicitly partial mapping whose contract distinguishes neither an absent pair nor a pair containing `None`: both mean that no alias is selected. The site-specific rationale directly addresses R1 and is consistent with the visible flow, where only that documented absence selects the first usable alias, while the required-key subscript on `usable_profile_aliases` still crashes if the snapshot is internally inconsistent. This is not an external-parameter trust boundary, so the decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 4ebddddaa4076ae6c181ba68388df4c95507aa3c99bb81d39381f411b6065375
   judge_transport: codex_cli
-  ast_path: 'body[75]/body[4]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:1a32889fe4c310c621df744a2846b693072f0724301979d3fa90fe321d85b746'
-- key: web/composer/planner_authoring_aids.py:R1:build_planner_authoring_aids:fp=94bcf2d280209d8b
+  ast_path: 'body[76]/body[4]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:607758e28db58ca4d2daf0b1877544aa6ab2fe930109e0c7740ea64f43d1a494'
+- key: web/composer/planner_authoring_aids.py:R1:build_planner_authoring_aids:fp=5b0b50e178151cda
   owner: john
   reason: |-
     R1 `_AIDS_MEMO.get(key)` -- the second read, the double-checked lookup taken after the ~50ms catalog sweep has completed and the lock has been re-acquired. Missing is not merely tolerable here, it is the EXPECTED outcome: this read exists solely to discover the rarer case that another worker populated the same snapshot key while this one was building, so that the losing builder defers to the stored value instead of evicting and replacing it. A required-key read would turn the normal, uncontended path -- nobody else wrote the key -- into a KeyError on every cold build. Same Tier-1 module-private memo and same unambiguous None as the first read; the bounded eviction (`_AIDS_MEMO_MAX`) immediately below runs only on that miss.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T15:27:16.579060+00:00'
+  judge_recorded_at: '2026-08-31T16:59:19.897977+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — `_AIDS_MEMO` is a sparse process-local cache whose contract makes key absence an expected cache miss, not a missing required field concealed by a default. The second `_AIDS_MEMO.get(key)` is specifically the post-build, lock-protected race check: a present value means another worker won, while `None` leads to bounded eviction and insertion of `built`; direct indexing would incorrectly raise on the ordinary uncontended path. This neither fabricates data nor suppresses malformed Tier-1/Tier-2 content, and the function has no external-data parameter rooted at the finding, so the trust-boundary decorator does not apply.
+    RULE MISFIRES — `_AIDS_MEMO` is a module-private bounded cache, not Tier-1 audit data or a fixed-schema record, and absence of `key` is an intentional cache-miss state. The second `_AIDS_MEMO.get(key)` occurs under the lock after building and distinguishes whether another worker populated the cache; the visible branch then stores `built` only when the key remains absent. Because the function has no external-data parameter and the subject is internal cache state, the `@trust_boundary` decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: ad1f7abc7c2aac00e46d71c326e5144d803c432987e96e19e1994ea11ab511d5
   judge_transport: codex_cli
-  ast_path: 'body[139]/body[4]/body[1]/body[0]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:91aceb7f71b1b8872460d209f6c7b18f6d157b8e83156d964818ec2e6e3b8f1e'
-- key: web/composer/planner_authoring_aids.py:R1:build_planner_authoring_aids:fp=e8a1a9509c77b3e0
+  ast_path: 'body[140]/body[4]/body[1]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:bcca1048b9f9fa215a0d75f83ba58a7d0855d42f111e013e843fc957aa693d73'
+- key: web/composer/planner_authoring_aids.py:R1:build_planner_authoring_aids:fp=799afd8731a15d75
   owner: john
   reason: |-
     R1 `_AIDS_MEMO.get(key)` -- the first, uncontended cache read under `_AIDS_MEMO_LOCK`. `_AIDS_MEMO: dict[str, _PlannerAuthoringAids]` is a module-private bounded memo (Tier-1, never external), keyed by `f"{catalog.snapshot.snapshot_hash}:{catalog_source}:{catalog_sha256}"` -- an UNBOUNDED key space, since every policy rotation and every OpenRouter catalog re-prime mints a fresh key. A missing key is therefore not a broken contract but the cache MISS this function exists to service, and `if cached is None:` on the next line is that miss handler, which runs the full `_build_planner_authoring_aids` catalog sweep. The None is unambiguous: the only write is `_AIDS_MEMO[key] = cached = built`, so a stored value is never None and `.get()`'s None means 'not cached' and nothing else.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T15:27:12.073983+00:00'
+  judge_recorded_at: '2026-08-31T16:59:39.629247+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — `_AIDS_MEMO` is a bounded partial cache, so absence of a dynamically derived key is an expected cache miss rather than a missing required Tier-1 field. The visible code initializes the private mapping empty, uses both flagged lookups to detect misses, and only stores the non-optional `built` value at `_AIDS_MEMO[key]`, making `None` an unambiguous absence sentinel. This is not silent recovery from malformed fixed-contract data, and the subject is not rooted in an external function parameter, so the trust-boundary decorator does not apply.
+    RULE MISFIRES — `_AIDS_MEMO.get(key)` is an explicit cache lookup where key absence represents a normal cache miss, not a missing required field under a fixed Tier-1 schema. The visible code confirms that the module-private memo starts empty, is bounded, and only stores `_PlannerAuthoringAids` values at `_AIDS_MEMO[key] = cached = built`, so `None` unambiguously selects the build path rather than suppressing corruption or fabricating data. This is not an external-parameter trust boundary, so the decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: ad1f7abc7c2aac00e46d71c326e5144d803c432987e96e19e1994ea11ab511d5
   judge_transport: codex_cli
-  ast_path: 'body[139]/body[3]/body[0]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:22582275e51586bf274d2b3092c8a36cfc39526a4c6cd6aa5025e32c90711304'
+  ast_path: 'body[140]/body[3]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:836f7663ebc8d5b023c4804964f55b6c22c3259a0b1d5f819e93b0ca85c2b35d'
 - key: web/composer/provider_telemetry.py:R1:_record_provider_call_facts:fp=fc66fa9669294962
   owner: john
   reason: |-
@@ -4384,17 +4388,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T01:18:34.885783+00:00'
+  judge_recorded_at: '2026-08-31T17:03:40.249507+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM — the caught parse failure is not lost: `_validate_aggregation_trigger` converts the identical `TriggerConfig.model_validate(deep_thaw(trigger))` failure into a blocking `aggregation_trigger_invalid` `ValidationEntry` at web/composer/state.py:3295-3315. The same `validate()` pass invokes that control for every aggregation node whose trigger is non-None at web/composer/state.py:7404-7431, so the later `continue` only prevents the row-union topology scan from misclassifying an already-recorded malformed trigger and avoids double attribution. R6 is not suppressible by `@trust_boundary`, so no decorator nudge applies.
+    PRESCRIBED FORM — the local `continue` does not lose or fabricate the malformed Tier-3 trigger; it avoids classifying an unparseable trigger as a separate row-union topology defect. I verified `_validate_aggregation_trigger` at web/composer/state.py:3295, which uses the identical `TriggerConfig` parser and converts `PydanticValidationError` into a high-severity `aggregation_trigger_invalid` entry. The same `validate()` pass invokes that control for every aggregation having a non-None trigger at web/composer/state.py:7428, before the flagged secondary scan at web/composer/state.py:7943, so every path reaching this swallowed exception has already recorded the owning aggregation's blocking error. R6 is not eligible for the `@trust_boundary` decorator, which only structurally suppresses R1 and R5.
   judge_signature_version: 2
-  scope_fingerprint: c31ad0e8a65df290a75a463424dc1f2d9717e9a749309fbd94208f9bc4b97afc
+  scope_fingerprint: 9b47fdca1449d58d9723e174588fcd8b82b85c481a922695c154321130a46215
   judge_transport: codex_cli
   ast_path: 'body[154]/body[23]/body[40]/body[1]/body[7]/body[5]/body[2]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:f6e829f09065098f2530848f70dff1fc265af323a8b509d3d6a00f1d3a88464e'
+  judge_metadata_signature: 'hmac-sha256:v2:2df305f129bc4b703cd5774eee4449f65b4022b113360cdef189d5b6d5a20794'
 - key: web/composer/state.py:R6:_check_schema_contracts:_edge_field_type_conflict:fp=b10550fe1e7e52ac
   owner: john
   reason: |-
@@ -4661,44 +4665,44 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[48]/body[3]/body[6]/value'
   judge_metadata_signature: 'hmac-sha256:v2:5fc6a2eae8fbf108faf606cf3e873d251f04ad2f34bfb9ae0a6c69752ba24bb3'
-- key: web/composer/tools/sessions.py:R5:build_set_pipeline_candidate:_legacy_source_rejection:fp=715d517dfd7cfdeb
+- key: web/composer/tools/sessions.py:R5:build_set_pipeline_candidate:_legacy_source_rejection:fp=a716c784a33dbbc2
   owner: john
   reason: |-
     R5 fires on `isinstance(resolved, ToolResult)` in `_legacy_source_rejection`, discriminating the owned closed union `_ResolvedSourceBlob | ToolResult` returned by `_resolve_source_blob`. Both arms are ELSPETH-declared concrete classes, so this is the ADR-032 internal-boundary case where nominal `isinstance` is the prescribed control; the inline comment records why the exact-type idiom was rejected here specifically — mypy gives `type(x) is C` no negative-branch narrowing on a union, which would strip the types off the three `resolved.` reads below, and `ToolResult` is subclassed by test doubles that an exact-type check would silently misroute into the blob arm. Neither arm is a default: a `ToolResult` returns the failure candidate, the other constructs the resolved binding. Invalidated if the union gains a third member without a matching arm, or if `_resolve_source_blob` starts returning an unowned type.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T16:32:20.588863+00:00'
+  judge_recorded_at: '2026-08-31T17:22:30.795337+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES — the visible code uses nominal `isinstance` to discriminate the ELSPETH-owned closed union `_ResolvedSourceBlob | ToolResult`, not to defensively revalidate Tier-2 data or conceal a contract violation. The rationale specifically explains why exact-type discrimination is unsuitable: it would defeat negative-branch narrowing and misroute permitted `ToolResult` subclasses, while both branches remain explicit and fabricate no value. The subject is the owned return from `_resolve_source_blob`, not external data rooted at a function parameter, so the `@trust_boundary` alternative does not apply.
+    RULE MISFIRES — the visible code uses nominal `isinstance` to discriminate the declared closed union `_ResolvedSourceBlob | ToolResult` returned by `_resolve_source_blob`, rather than defensively rechecking or concealing a contract violation. The `ToolResult` arm is returned as a failure candidate, while the other arm is consumed through its declared blob fields; no default, coercion, fabrication, or swallowed error is present. The rationale is site-specific and consistently explains why the concrete-class check, including subclass admission, is intentional. The subject is an internal call result rather than external data rooted at a function parameter, so the structural trust-boundary decorator does not apply.
   judge_signature_version: 2
   scope_fingerprint: 4bce5acf1f27197f44c73555f6557169006cc69a9cf89a6d1e46518300a9fb91
   judge_transport: codex_cli
-  ast_path: 'body[44]/body[23]/body[24]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:ac131d31db88d6beafebda645ef3df0411f7731ff6eedb15d798dab8ace2b271'
-- key: web/composer/tools/sessions.py:R6:build_set_pipeline_candidate:fp=b821e2eb0da3c630
+  ast_path: 'body[45]/body[23]/body[24]/body[1]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:52c1d33085e5c75d983f442ce16f86ab06512896573f7a3bb5ff5001857028dd'
+- key: web/composer/tools/sessions.py:R6:build_set_pipeline_candidate:fp=043b999bb3d21646
   owner: john
   reason: |-
     R6 on `except ValueError as exc:` around `canonical_sink_local_paths(output.options)`. The value is Tier-3: `output.options` is an LLM/planner-authored sink option block arriving as `set_pipeline` tool-call arguments, and `canonical_sink_local_paths` raises `ValueError` for an option the planner may legitimately author wrong (a bare relative sink path containing '..' segments, which must not be rooted into the managed outputs pool). The handler is not a swallow: it converts the rejection into the explicit, planner-repairable error result the tool contract requires, and this loop is the per-component collector, so a `raise` here would abandon the remaining outputs' checks and return one defect where the planner needs the full repair set. Controls, by symbol: (1) `_record_component_rejection` appends `_failure_result(state, f"Output '{output.sink_name}': {exc}", error_code="plugin_options_invalid")` -- the exception text reaches the planner under a closed error code, nothing is discarded; (2) `uncanonical_output_indexes` records the index so the second `enumerate(validated.outputs)` loop `continue`s past it rather than reading the absent `canonical_out_options[index]`, which is what keeps the swallow from degrading into a later KeyError on a half-canonicalised output; (3) `_collected_component_failure` merges every recorded rejection into the returned `SetPipelineCandidate`, whose `acceptable` is then false, so neither caller can mistake the handled ValueError for success -- `pipeline_planner.plan_pipeline` raises `_PipelineCandidateRejected(candidate.result)` and `tool_batch` raises `AuditIntegrityError` on an unacceptable candidate. What it protects: the S2 sink-path allowlist. An output whose paths did not canonicalise is excluded from the trusted `canonical_out_options` map, so no unvalidated path can reach `_validate_sink_path` or the stored `OutputSpec` by way of this handler.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T16:37:24.795756+00:00'
+  judge_recorded_at: '2026-08-31T17:25:28.177529+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM — R6 fires, but the handler converts the recoverable path-canonicalization rejection into an explicit failure result rather than swallowing it: `canonical_sink_local_paths` rejects `..` segments at web/composer/guided/stage_transitions.py:1218, while `_record_component_rejection` preserves the exception text and closed `plugin_options_invalid` code at web/composer/tools/sessions.py:1351. The failed index is excluded from subsequent option use at sessions.py:1366, and `_collected_component_failure` returns the recorded rejection before any `OutputSpec` construction at sessions.py:1451, so no half-canonicalized output proceeds. This visible local control establishes the rule-prescribed explicit error-result form without relying on the rationale's additional caller claims.
+    PRESCRIBED FORM — R6 mischaracterizes this handler as silent: the caught `ValueError` is converted into a closed-code failure result and passed to `_record_component_rejection` at web/composer/tools/sessions.py:1398. The verified controls record that result at sessions.py:657, skip the uncanonicalized output at sessions.py:1413, and return `_collected_component_failure` before spec construction at sessions.py:1492; pipeline_planner.py:3223 also rejects any resulting unacceptable candidate. Nothing is discarded or allowed to reach `_validate_sink_path` or `OutputSpec` without canonicalization, so this is the prescribed explicit error-result handling for recoverable Tier-3 input. The decorator alternative does not apply because R6 is not suppressible by `@trust_boundary`.
   judge_signature_version: 2
-  scope_fingerprint: f9c25968fac27910e30886550d5660397086383985d12ee7d3beb9c7dc70f3a6
+  scope_fingerprint: 2efabf0b6fa08f78fac3b59224f373f1d5912d4fffc31a28649de285e6c6118d
   judge_transport: codex_cli
-  ast_path: 'body[44]/body[32]/body[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:f0d475986770798356bd950a52e1d5c80c0f49f0eac489c8fd41a077e69d8630'
+  ast_path: 'body[45]/body[32]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:35dae97a4664c517b80e7dad35f4ca6ff892d771e51055fbb9b3174a9b828f0a'
 - key: web/composer/tools/sources.py:R5:_execute_set_source_from_blobs:fp=f8f181992d2175d3
   owner: john
   reason: |-
@@ -5079,26 +5083,26 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[45]/body[3]/test'
   judge_metadata_signature: 'hmac-sha256:v2:6fbb61657ffd5c51fc6a8c4c47355a76a4e999187b854bd5fc98c091746c5afe'
-- key: web/execution/_validation_diagnostics.py:R5:_infer_component_type_from_plugin_error:fp=8da984cd9507e98a
+- key: web/execution/_validation_diagnostics.py:R5:_infer_component_type_from_plugin_error:fp=4e99de25e7b391f1
   owner: john
   reason: |-
     R5 `isinstance(exc, PluginConfigError)`. Nominal discrimination of a CLOSED, ELSPETH-owned exception union declared in the signature: `exc: PluginNotFoundError | PluginConfigError`. Both classes are defined in this tree — `PluginNotFoundError` in `plugins/infrastructure/manager.py` (deriving from `ValueError`) and `PluginConfigError` in `plugins/infrastructure/config_base.py` (deriving from `Exception`) — and they are disjoint, so the test is unambiguous. The value is Tier-1: the exception object is constructed in-process by the plugin loader, never parsed. `type(exc) is PluginConfigError` would be a REGRESSION rather than a tightening here: a plugin-defined subclass of `PluginConfigError` carries the same `component_type` attribute this branch reads, and the exact-type form would drop it to the `return None` arm, silently losing component attribution on the validation-diagnostics surface the operator uses to find the misconfigured node. Nominally typing what ELSPETH owns is ADR-032's prescribed form for exactly this case. Pinned by `tests/unit/web/execution/test_validation_trust_tier.py::_ADJUDICATION_CANDIDATES`.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T16:43:43.286844+00:00'
+  judge_recorded_at: '2026-08-31T17:28:14.082895+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
+  judge_confidence: 0.95
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance` is nominal discrimination between two valid members of the explicitly declared, closed ELSPETH-owned exception union, not a defensive re-check that suppresses a contract violation. The branch directly reads `PluginConfigError.component_type` and otherwise returns `None`, so the visible code supports variant-specific handling without coercion, fabrication, or swallowed failure. The cited `_ADJUDICATION_CANDIDATES` is not a pytest test nodeid and therefore is not credited as a pinning test, but the code and site-specific rationale independently establish the exemption. This is not a Tier-3 parameter boundary, so the trust-boundary decorator does not apply.
+    RULE MISFIRES — the check nominally discriminates between the two ELSPETH-owned exception alternatives explicitly declared in the parameter union; it is not defensive revalidation of pipeline data or recovery from malformed input. The branch preserves subclass semantics, reads `component_type` only for `PluginConfigError`, and returns `None` for the expected disjoint `PluginNotFoundError` alternative without coercing, fabricating, or swallowing an exception. This is not a Tier-3 boundary function, so the decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 86b0ccb03a3d518262b2618d24ab4d4d1872d47438f380c0960d96c2fdb14429
   judge_transport: codex_cli
-  ast_path: 'body[27]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:5927eeae20037ff8e498fd60de703b6a9349f4239ba05373f4ea03f81146d804'
-- key: web/execution/_validation_diagnostics.py:R5:_reframe_settings_missing_parts:fp=8ffdc05907310e19
+  ast_path: 'body[28]/body[1]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:a8a1d17ecb6b1fd1bec4b0cd7925157742c7628fd8d390fdd96940ccce84aeeb'
+- key: web/execution/_validation_diagnostics.py:R5:_reframe_settings_missing_parts:fp=d843f7bdbc3a50ed
   owner: john
   reason: |-
     R5 `isinstance(part, str)` in the same already-adjudicated helper (rule misfire, decorator mechanism ruled inapplicable, signature staled by the module move). `part` is `loc[0]`, and a pydantic `loc` tuple holds `int | str` members — the int arm is a sequence index, only the str arm can name a settings section. The check is therefore union discrimination on a value pydantic authored, and it is also what makes the following `part in _SETTINGS_MISSING_PART_REFRAMES` membership test total. Nothing is fabricated on the negative arm: a non-str member is simply not a section name and the entry is skipped. Pinned by `tests/unit/web/execution/test_validation_trust_tier.py::_ADJUDICATION_CANDIDATES`.
@@ -5106,17 +5110,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T01:28:53.444409+00:00'
+  judge_recorded_at: '2026-08-31T17:28:57.157894+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
+  judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES — the stated Pydantic `loc` contract permits `int | str`, so `isinstance(part, str)` discriminates a genuine union rather than defensively rechecking a guaranteed string contract. The visible code uses only the string arm as a settings-section key and skips the non-string arm without coercion, fabrication, or suppression of the original validation error. This is not a function-scoped Tier-3 shape guard requiring the decorator; the prior adjudications are not relied upon as evidence.
+    RULE MISFIRES — the stated Pydantic `loc` contract intentionally permits `int | str`, so the visible `isinstance(part, str)` discriminates a declared union rather than defensively rechecking a guaranteed string. The negative arm merely excludes sequence-index locations and neither fabricates a value nor conceals a contract violation. This helper receives a structured `PydanticValidationError`, not a raw Tier-3 parameter whose malformed shape is being promoted, so the function-scoped trust-boundary decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 1a998790d39d85f4a50179d564d915ca64c73576e24bc5a67e1d6b83cfa75bd5
   judge_transport: codex_cli
-  ast_path: 'body[15]/body[2]/body[4]/test/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:a55c0a8cc4ea32392cb564b0f0e242a2d78a25c3bdb93a904e21e3866a7b1355'
+  ast_path: 'body[16]/body[2]/body[4]/test/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:ae7e9d468d90c015bafbc0a6e48bacdc14e620902b180b666db4928ad7ab0945'
 - key: web/execution/accounting.py:R6:load_run_accounting_map_from_db:fp=56896f8577f7d6ba
   owner: john
   reason: |-
@@ -5845,19 +5849,19 @@ allow_hits:
     R5 `isinstance(exc, GuidedOperationSettlementConflictError)` in that handler's failure-code classification. Exception-HIERARCHY dispatch on a caught exception object (Tier-1, ELSPETH-owned): the question is 'is this any settlement conflict', so subclass membership is the intended semantics and `type(...) is` would silently reclassify a future subclass as `operation_failed`, corrupting the durable failure code an operator reads. Fail-closed: an unrecognised exception falls through to `operation_failed`, the most conservative code, and the operation still fails. Control by symbol: `raise_guided_operation_failure`, whose `_SAFE_FAILURES` table is the closed mapping from code to HTTP envelope and which raises `AuditIntegrityError` on any code it does not know. Pinned by tests/integration/web/composer/guided/test_chat_schema8_atomic.py::test_provider_head_drift_fails_closed_without_settling_chat and ::test_exact_replay_fails_closed_when_current_turn_payload_is_tampered, which assert the `stale_conflict` classification reaches the response envelope.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T17:31:02.210307+00:00'
+  judge_recorded_at: '2026-08-31T17:53:18.467745+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.96
   judge_rationale: |-
-    RULE MISFIRES — the flagged `isinstance` is exception-hierarchy dispatch used to select a durable failure classification, not a defensive shape check that masks a contract violation. The visible handler preserves failure semantics by classifying settlement-conflict subclasses as `stale_conflict`, integrity-error subclasses as `integrity_error`, and all other exceptions as `operation_failed`, after which the operation still fails. The code comments and site-specific rationale independently explain why subclass membership is intentional, so the exemption does not depend on the separately cited control-location claim. The decorator is inapplicable because the subject is a caught exception rather than external data rooted at a function parameter.
+    RULE MISFIRES — the flagged `isinstance` performs exception-hierarchy dispatch on a caught ELSPETH exception, not defensive shape validation or error suppression. The visible branch records one of three closed failure codes and still terminates the operation; `guided_chat_atomic.py:2079-2095` confirms every successful failure-recording path invokes `raise_guided_operation_failure`, while `routes/guided_operations.py:145-189` verifies that symbol maps only `_SAFE_FAILURES` codes and raises `AuditIntegrityError` for an unknown code. Subclass membership is therefore the intended classification semantics, and the source independently establishes conformance without relying on the cited tests, which were outside the permitted read scope. The decorator does not apply because the checked subject is the caught `exc`, not data rooted in an external function parameter.
   judge_signature_version: 2
-  scope_fingerprint: 664b22a4f64f36c0804c5c1a634a1802796818ca5cfe936caea6c9bc3037239a
+  scope_fingerprint: 3d510029e7e14cd3dbfac32c7258365c56639c0c02efd9dae65ed9d9db2e7216
   judge_transport: codex_cli
   ast_path: 'body[61]/body[14]/body[5]/body[12]/handlers[2]/body[0]/value/test'
-  judge_metadata_signature: 'hmac-sha256:v2:9eae3c2bd09798dc4d450ccf28ce141bd96039e2d7b83a6bc8defdd2434644ec'
+  judge_metadata_signature: 'hmac-sha256:v2:cde006aa962c3706f6f2165d54a0a3e494f78a29079612d7a952b171d065bf35'
 - key: web/sessions/routes/composer/guided_chat_atomic.py:R5:post_guided_chat_schema8:fp=2df199c4ec1669ca
   owner: john
   reason: |-
@@ -5951,19 +5955,19 @@ allow_hits:
     R6 `except (PluginConfigError, InvariantError, TypeError, ValueError)` — the general rejected-transition arm of `guided_route._schema8_answer_and_project_next`. Explicit error result with the same shape as its two siblings: `_with_pair_disposition` over a `SYNTHETIC_UNAVAILABLE` `StepChatResult` with `error_class="StepTransitionRejected"`, and the authoritative turn restored (`next_turn = current_turn`, `prepared_next = planned_current`). This is the load-bearing degradation for LLM-authored answers that the schema-8 transition refuses — the composer invariant is that the planner authors and the SERVER validates and rejects, so a rejected answer must become a visible not-applied turn, never a 500 and never a server-repaired graph. The four exception types are the closed rejection set of ELSPETH's own transition machinery. Control by symbol: `_schema8_answer_and_project_next` returns the new state only on success, so `resulting_state` keeps its pre-transition value and `transition_succeeded` stays False — the settlement below therefore writes the unchanged pipeline. Pinned by tests/integration/web/composer/guided/test_chat_schema8_atomic.py::test_underspecified_sink_prefill_degrades_at_chat_time_instead_of_staging and ::test_invalid_sink_prefill_never_reaches_operator_logs.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T17:45:06.424717+00:00'
+  judge_recorded_at: '2026-08-31T17:53:48.904752+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.94
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — R6’s premise is false because the handler constructs an explicit `SYNTHETIC_UNAVAILABLE` error result with `error_class="StepTransitionRejected"`, and the settlement records that result. The control claim is verified: `guided_chat_atomic.py:1576-1580` initializes the pre-transition pipeline state and failure flag, while `guided.py:2503-2601` returns a projected state only after the transition completes; the exception arm does not replace `resulting_state` or mark success. The named tests were outside the permitted read scope and are not credited, but they are not load-bearing because the visible control flow independently establishes the explicit not-applied result and unchanged pipeline.
+    RULE MISFIRES — the visible handler does not silently swallow the closed rejection set: it constructs an explicit `SYNTHETIC_UNAVAILABLE` `StepChatResult` with `error_class="StepTransitionRejected"` and restores `next_turn` and `prepared_next` to their authoritative pre-transition values. This directly satisfies R6's explicit-error-result alternative, while `transition_succeeded` remains unset on the exception path and the excerpt shows no fabricated or repaired graph state. The decorator alternative is inapplicable because R6 is not suppressible by `@trust_boundary`.
   judge_signature_version: 2
-  scope_fingerprint: 664b22a4f64f36c0804c5c1a634a1802796818ca5cfe936caea6c9bc3037239a
+  scope_fingerprint: 3d510029e7e14cd3dbfac32c7258365c56639c0c02efd9dae65ed9d9db2e7216
   judge_transport: codex_cli
   ast_path: 'body[61]/body[14]/body[5]/body[12]/body[6]/body[41]/orelse[0]/orelse[0]/orelse[0]/body[0]/handlers[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:50899921573876d044d89f2589bdee9bf2d15765c9b73c9c8db866b7cbd9b9e1'
+  judge_metadata_signature: 'hmac-sha256:v2:8b53e6f7e1e7f4eb6a8e3ab51f6e415dec2ebf87a00973e889ddbc58f7fbb700'
 - key: web/sessions/routes/composer/guided_chat_atomic.py:R6:post_guided_chat_schema8:fp=eceee1bc3136fbd3
   owner: john
   reason: |-
@@ -6002,26 +6006,26 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[23]/body[17]/body[0]/test'
   judge_metadata_signature: 'hmac-sha256:v2:6d86428dae704cf8328bb81aeec8b72d41ac42e3bb12cf101f9c2ac1417f7aab'
-- key: web/sessions/routes/composer/state.py:R6:_composition_plugin_policy_findings:fp=93a07ec303e050bf
+- key: web/sessions/routes/composer/state.py:R6:_composition_plugin_policy_findings:fp=f11d140b21dd7fa3
   owner: john
   reason: |-
     R6 `except ValueError: findings.append((component_id, f"{kind}:{plugin_name}", PluginUnavailableReason.NOT_INSTALLED)); continue` in `_composition_plugin_policy_findings`. Explicit error RESULT, not a swallow: the handler's whole purpose is to convert a malformed plugin identifier into a first-class finding in the returned list, and that list is the fail-closed input to `_reject_imported_plugin_policy`, which raises HTTPException 422 naming the component. So the exception becomes a rejection, not a default. Raising `ValueError` directly would be strictly worse: this function is called on PASTED/IMPORTED YAML (`import_state_yaml`) where a bad plugin name is expected user input, and an uncaught ValueError would 500 instead of returning the 422 that tells the operator which component is wrong. `PluginId.__post_init__` raises `ValueError` exactly when its `(source|transform|sink):[a-z][a-z0-9_]*` regex rejects the name, so the caught condition is precisely 'this name cannot denote any installed plugin', which `NOT_INSTALLED` states honestly. Controls by symbol: `PluginId.__post_init__` (the closed regex that defines the failure) and `_reject_imported_plugin_policy` (turns any finding into a 422 before persistence). Behavioural coverage of the reject path: tests/unit/web/sessions/test_routes.py::TestYamlEndpoint::test_post_state_yaml_with_disabled_plugin_is_atomic and ::test_saved_disabled_state_is_readable_and_exported_as_authored. NOTE for the hub: the malformed-name arm specifically has no direct test — filed as an observation by this lane rather than left silent.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T18:05:26.868980+00:00'
+  judge_recorded_at: '2026-08-31T18:09:34.662404+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM — the ValueError is converted into an explicit PluginUnavailableReason.NOT_INSTALLED finding, satisfying R6 rather than silently swallowing the failure. The returned finding is rejected with HTTP 422 by _reject_imported_plugin_policy before persistence on both import paths (web/sessions/routes/composer/state.py:102, :576, and :760), while the historical-export caller at :949 explicitly uses findings to skip unsafe preflight. PluginId.__post_init__ raises only when the closed identifier grammar fails (web/plugin_policy/models.py:31), so the result accurately reports that the identifier cannot denote an installed plugin. The cited tests do not directly exercise this malformed-name arm, as the rationale candidly records, but that gap does not contradict the explicit result and verified control flow visible here.
+    PRESCRIBED FORM — the `ValueError` is converted into an explicit `NOT_INSTALLED` finding rather than silently discarded or replaced with a success/default value. The visible `_reject_imported_plugin_policy` control consumes those findings on every non-empty path and raises HTTP 422 with the component and plugin identifiers before returning, so the flagged handler implements the explicit error-result form permitted by R6. The rationale appropriately discloses that the malformed-name arm lacks a direct test, but that gap does not contradict the fail-closed control flow visible here.
   judge_signature_version: 2
   scope_fingerprint: 7ee91690abe5717f1afe4187126e6082aef3b4747ce5038f653e453a99a17974
   judge_transport: codex_cli
-  ast_path: 'body[23]/body[3]/body[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:888ce3edcae2b34013e76623bd95f01568ad0d0885fba85a442c5619443522b4'
-- key: web/sessions/routes/composer/state.py:R6:revert_state:fp=49254b5e9d2a8d25
+  ast_path: 'body[24]/body[3]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:f479e3c63acae6911b4491cdd50b9b9bda12c8bd545fe9a0186c5c144d65e862'
+- key: web/sessions/routes/composer/state.py:R6:revert_state:fp=a069b0d3229a6240
   owner: john
   reason: |-
     R6 `except GuidedOperationSettlementConflictError:` around `service.revert_state_for_guided_operation` in `revert_state`. Not a swallow — the handler body ends in `raise_guided_operation_failure(failure)`, which is typed `-> Never`. It is flagged only because the raise is one call-frame away rather than a literal `raise` statement. The handler does the required work first: `service.fail_guided_operation(reserved.fence, failure_code="stale_conflict", actor="composer_route")` records the durable terminal failure under the operation's own fence, and only then is the closed HTTP envelope raised. Converting this into a bare re-raise would leave the reserved lease held with no failure row — the wedge the guided-operation protocol exists to prevent — and would emit an untyped 500 instead of the `stale_conflict` envelope the client uses to distinguish 'someone else moved the head' from a server fault. `GuidedOperationSettlementConflictError` is an owned Tier-1 typed signal from the settlement CAS. Controls by symbol: `raise_guided_operation_failure` (`-> Never`; raises `AuditIntegrityError` on an unknown code) and `service.fail_guided_operation` (the durable record). Pinned by tests/integration/web/composer/guided/test_arbitrary_dag_review.py (two concurrent POST /state/revert: the loser receives `detail.failure_code == "stale_conflict"` and the operation row records it) and tests/integration/web/composer/guided/test_convert.py, which patches settlement to raise this exception and asserts the same code.
@@ -6029,17 +6033,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T02:11:57.009147+00:00'
+  judge_recorded_at: '2026-08-31T18:12:45.297428+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES — the handler does not swallow the settlement conflict: `raise_guided_operation_failure` is declared `-> Never` and unconditionally raises either `AuditIntegrityError` for an unknown code or `HTTPException` for a known terminal failure (src/elspeth/web/sessions/routes/guided_operations.py:145). Before that raise, `fail_guided_operation` reaches an atomic fenced update that changes the operation to `failed`, clears its lease, and records a failure event (src/elspeth/web/sessions/service.py:5145). Thus the visible and verified controls independently establish explicit durable failure followed by an exception; the unverified file-level test claims are not needed for this verdict.
+    RULE MISFIRES — the handler does not swallow the settlement conflict: after the visible durable-failure call, it invokes `raise_guided_operation_failure(failure)` on every continuing path. I verified `raise_guided_operation_failure` at `src/elspeth/web/sessions/routes/guided_operations.py:145`; it is declared `-> Never`, validates the closed failure code at line 170, and raises `HTTPException` at line 189. Thus R6 matched only because the explicit typed raise occurs through a helper rather than a literal `raise` statement; the cited test claims are not needed to establish this disposition.
   judge_signature_version: 2
   scope_fingerprint: bc6cb9b1a2f7c2463fba2eba6552da3d9b3ffedf1353b30ee97d4171fa5fa9a7
   judge_transport: codex_cli
-  ast_path: 'body[38]/body[10]/body[0]/handlers[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:c5f5984d03e8e1e2e70d16205d35510f1f08d188f9c60b991d98deb5b762beac'
+  ast_path: 'body[43]/body[10]/body[0]/handlers[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:7c89d07863e1001945483500c7bb708113b98fa6670355966dd0ad68e48d6e8c'
 - key: web/sessions/routes/guided_operations.py:R5:reserve_or_replay_guided_operation:fp=a8256abcbd382136
   owner: john
   reason: |-
@@ -6200,25 +6204,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[154]/body[6]/body[3]/body[0]/handlers[1]'
   judge_metadata_signature: 'hmac-sha256:v2:23b44c8e6dda39b2a753a41d340696b45035620c4d0a99cdc28a9a54a13fb931'
-- key: web/sessions/service.py:R5:SessionServiceImpl:stage_guided_full_pipeline_proposal:fp=3fd663cd220b9564
+- key: web/sessions/service.py:R5:SessionServiceImpl:stage_guided_full_pipeline_proposal:fp=23891b1ad1ea6737
   owner: john
   reason: |-
     R5 `isinstance(staged_source, Mapping)` reading the planner-authored pipeline's source block (Tier-3 LLM output) to extract `blob_id` for the deferred-custody equality check. MEASURED population (2026-08-29, this tree): FROZEN ONLY. `staged_source` is `proposal.pipeline['source']`, and `PipelineProposal.__post_init__` runs `_validate_and_freeze_canonical_mapping(self.pipeline, 'pipeline')` and then `freeze_fields(self, 'pipeline', 'covered_deferred_intent_ids')`. Probed against that helper: the mapping and every nested mapping come back as `mappingproxy` and nested arrays as `FrozenJsonArray` -- an exact dict is not constructible here, so the earlier 'spans both representations' claim is WITHDRAWN as false. So an exact `type(x) is dict` / `is list` narrowing would not reject 'one half' of the population as the earlier text claimed -- it would reject ALL live traffic, because for a `mappingproxy` both `type(x) is dict` and `isinstance(x, dict)` are False and `deep_freeze` renders sequences as tuples. The 'spans both representations' claim is WITHDRAWN as false; the correct reading is stronger, not weaker. ADR-032 keeps the ABC spelling: a persisted composition state is Tier-3 on read-back, so this is a parse, and the tolerant structural-container test is the house structural-container / nominal-element split (`GuidedSession._validated_component_mapping` precedent, and the in-file mappingproxy note inside `_surfacing_prompt_structure_hash`). Polarity is unchanged and fail-closed: any non-mapping (or absent `blob_id`) yields `staged_blob_id=None`, which fails the exact equality against `custody_preparation.blob_id` and raises AuditIntegrityError -- the tolerant read feeds a strict gate, never an acceptance.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T18:16:29.436045+00:00'
+  judge_recorded_at: '2026-08-31T18:14:06.650126+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.95
+  judge_confidence: 0.94
   judge_rationale: |-
-    RULE MISFIRES — `proposal.pipeline["source"]` retains planner-authored Tier-3 content despite storage in a frozen first-party object, and the cited canonical-mapping validation does not establish that the nested `source` value is itself a mapping. The R5 check therefore performs required shape discrimination rather than defensively rechecking a fixed contract. The visible strict gate at `SessionServiceImpl.stage_guided_full_pipeline_proposal` immediately compares the extracted value with `custody_preparation.blob_id` and raises `AuditIntegrityError` for a non-mapping, missing `blob_id`, or mismatch, so the guard fails closed without fabrication or silent acceptance. The excerpt does not expose the function signature or decorators, so the decorator alternative cannot be established safely.
+    RULE MISFIRES — the `Mapping` check is the shape discriminator for the externally authored `proposal.pipeline["source"]` value, whose specific nested shape is not established merely by freezing the enclosing canonical mapping. The visible code handles failure closed: a non-mapping or missing `blob_id` produces only a local sentinel, then the exact custody equality gate raises `AuditIntegrityError`; it neither accepts malformed data nor fabricates persisted evidence. The rationale also specifically explains why `Mapping` is required for the live frozen `mappingproxy` representation, and the excerpt does not expose the method decorator context, so no decorator nudge is justified.
   judge_signature_version: 2
   scope_fingerprint: 32438c4f4df26880f45d5ac53aa93f321e29c3326537b6887d367fe2523e6e2b
   judge_transport: codex_cli
-  ast_path: 'body[152]/body[117]/body[18]/body[5]/value/test/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:f81dddd3034d216d0696c30cc46af30f07ccfe677437177b4698473c4f490743'
+  ast_path: 'body[154]/body[117]/body[18]/body[5]/value/test/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:1a567e6e7e539c3ba83f7a3d48dfda3810725775a1cff379db44bbe100431ecb'
 - key: web/sessions/service.py:R6:SessionServiceImpl:_load_staged_fork_on_connection:fp=58ecad78bfdad7be
   owner: john
   reason: |-
@@ -6295,44 +6299,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[11]/body[3]'
   judge_metadata_signature: 'hmac-sha256:v2:7b3871d1077462a9e3cc39528a04c58e879367b1e591293b31af2553d9a2c5e5'
-- key: web/composer/guided/_discovery.py:R5:_execute_discovery_call:fp=476eaf2fbb79ba07
-  owner: john
-  reason: |-
-    After the preceding guard, provider arguments are either `str` or `None`; this narrowing parses only a non-empty string and maps the explicit absent/blank case to the tool protocol's empty object. Invalid JSON is audited and raised as `GuidedSolverResponseShapeError`, not silently replaced.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-29'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T02:44:42.631674+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.93
-  judge_rationale: |-
-    RULE MISFIRES — `raw_arguments` is provider-authored Tier-3 data, and the visible preceding guard explicitly rejects any non-`str`, non-`None` shape with `GuidedSolverResponseShapeError`. The flagged `isinstance` then discriminates the validated optional value so that only a non-empty string is parsed; malformed JSON is audited and raised, while the rationale plainly identifies `None` or blank as the tool protocol’s empty-object representation rather than silent recovery from invalid JSON. Because the excerpt omits the function signature and decorators, the structural-decorator test cannot be established and no decorator recommendation is appropriate.
-  judge_signature_version: 2
-  scope_fingerprint: a5ba77648055a2a41c5ea8154e865bfcbfd74df89e41ad99537fd22cfbe06b8e
-  judge_transport: codex_cli
-  ast_path: 'body[16]/body[5]/body[0]/value/test/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:3c66cc000fbaad3374f0927cb41c73419bbf2b3c553037cea77517c045ba3996'
-- key: web/composer/guided/_discovery.py:R5:_execute_discovery_call:fp=ef2fdcaca87787d5
-  owner: john
-  reason: |-
-    `json.loads` returns unowned provider content. A non-object result is recorded by `_record_shape_arg_error` and raises `GuidedSolverResponseShapeError`; only a Mapping is copied into an owned dict and dispatched. Arrays/scalars cannot reach discovery tools.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-29'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T02:47:13.548273+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — `parsed` is provider-authored Tier-3 content returned by `json.loads`, and the flagged `isinstance(parsed, Mapping)` is the required boundary check that promotes only object-shaped content. The visible code records the non-object shape when a recorder is present and always raises the correctly typed `GuidedSolverResponseShapeError`, so arrays and scalars cannot be copied into the owned `arguments` dict or dispatched. Because the excerpt does not show the function signature or decorators, the structural-decorator conditions cannot be established safely.
-  judge_signature_version: 2
-  scope_fingerprint: a5ba77648055a2a41c5ea8154e865bfcbfd74df89e41ad99537fd22cfbe06b8e
-  judge_transport: codex_cli
-  ast_path: 'body[16]/body[6]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:58e12e18daca8d0390169bbdf38ce945e50a7f255beeaf80964007ffbf16bf25'
 - key: web/composer/guided/emitters.py:R6:_wire_schema:fp=0cc3659594180b2c
   owner: john
   reason: |-
@@ -6390,7 +6356,7 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[184]/body[2]/test/values[0]/operand'
   judge_metadata_signature: 'hmac-sha256:v2:8ddd793d4cac970b4a10dccb45f97777a95ede1996f1056e87a140b17e74b345'
-- key: web/composer/planner_authoring_aids.py:R6:build_schema_contract_evidence:fp=82dca06d91637d83
+- key: web/composer/planner_authoring_aids.py:R6:build_schema_contract_evidence:fp=dd7e7962ec69ad1f
   owner: john
   reason: |-
     `_SchemaContractProjectionUnsupported` is the typed abstention result for a catalog schema this planner surface cannot safely project. The plugin is appended to `omission_candidates` with `schema_projection_unsupported`; the final envelope reports the omission and never emits partial schema evidence for it.
@@ -6398,17 +6364,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T02:47:26.139569+00:00'
+  judge_recorded_at: '2026-08-31T16:59:58.206785+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM: the caught `_SchemaContractProjectionUnsupported` is a specific typed abstention signal, and the visible handler converts it into an explicit omission result containing the plugin identity and `schema_projection_unsupported` reason. The `continue` prevents partial schema evidence for that plugin from entering `entries`, while `omission_candidates` is visibly processed into the final `omitted` collection, so this is recorded quarantine rather than silent swallowing. R6 therefore fires syntactically, but the code and site-specific rationale together establish the rule's permitted explicit-result form.
+    PRESCRIBED FORM: the caught `_SchemaContractProjectionUnsupported` is converted into the explicit recorded omission `{"plugin_id": label, "reason": "schema_projection_unsupported"}`, after which processing continues without adding a partial evidence entry. The visible code independently supports the site-specific rationale: `entries.append(entry)` occurs only after successful projection, while failures enter `omission_candidates`, which is then used to build the final `omitted` collection. This satisfies R6's explicit error/result alternative rather than silently swallowing the exception, and R6 is not eligible for the `@trust_boundary` decorator.
   judge_signature_version: 2
   scope_fingerprint: ab1fc7acb0e0972214f3082fcf84d3c1c034ab532663987b24fdce5746d74c1a
   judge_transport: codex_cli
-  ast_path: 'body[116]/body[9]/body[6]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:02f34a174f309ee14be63df4b2765318002303d17c1b3219d2b038bb4556fd19'
+  ast_path: 'body[117]/body[9]/body[6]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:c352c67ee7e213e7dd790c624373c09c9f2dc48d596dfd243ec620cdcc46ea3a'
 - key: web/composer/protocol.py:R6:ToolArgumentError:code:fp=5a8ebe1f2576739b
   owner: john
   reason: |-
@@ -6474,17 +6440,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T03:23:45.049688+00:00'
+  judge_recorded_at: '2026-08-31T17:06:45.151785+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM — The broad catch retains the original BaseException unchanged and clears the proposal output at web/composer/tool_batch.py:1242-1247; it does not suppress, coerce, or fabricate a result. The named control is verified: _do_dispatch re-raises that same exception at web/composer/tool_batch.py:2003-2022 and is invoked through dispatch_with_audit at web/composer/tool_batch.py:2092-2099. dispatch_with_audit records every BaseException path in its finally block and permits propagation at web/composer/audit.py:915-929 and 1030-1129, so the delayed re-raise preserves the one-time operation and canonical audit record.
+    PRESCRIBED FORM — R4’s broad catch is a deferred re-raise, not suppression: web/composer/tool_batch.py:1296 retains the same BaseException while clearing proposal output. The named `_do_dispatch` control is verified at web/composer/tool_batch.py:2073-2076, where it raises that exception before executing the tool, and lines 2146-2153 invoke it through `dispatch_with_audit`; web/composer/audit.py:915-1130 records the failure from its `finally` path while allowing it to propagate. The visible set_pipeline flow is consistent with one-time finalization not being rerun or published, so the broad capture is the prescribed recorded-crash form.
   judge_signature_version: 2
-  scope_fingerprint: eb0f6b4bb7a912ce872939f50c9fd9d6fff4f40168894d156d1f9912b29c0ebf
+  scope_fingerprint: a21c137611bafc7a4f0b05a0a42fa63fbb0d644a54eadc6dd9b6742f1850e63b
   judge_transport: codex_cli
   ast_path: 'body[58]/body[45]/body[28]/body[11]/body[0]/orelse[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:5d34608c499c90ebbdab47f2d6d772650801203d008c43a6f20d2c354bd5f5ee'
+  judge_metadata_signature: 'hmac-sha256:v2:3a7c9b060bd161d740f00dc6761ee9e549ee13ac02b297cdb317b8c0335e4def'
 - key: web/composer/tool_batch.py:R4:run_tool_batch:fp=47a248e93be3e9c5
   owner: john
   reason: |-
@@ -6493,17 +6459,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T03:24:39.804602+00:00'
+  judge_recorded_at: '2026-08-31T17:09:25.276336+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM — the broad handler does not suppress or fabricate a result: `proposal_redacted_arguments = None` prevents proposal publication, and `_do_dispatch` re-raises the stored exception at web/composer/tool_batch.py:2021. The verified `dispatch_with_audit` control records ordinary exceptions and uncaught `BaseException` subclasses in its `finally` path before propagation (web/composer/audit.py:1030 and web/composer/audit.py:1073), and the call site routes through that control at web/composer/tool_batch.py:2092. R4 is not suppressible by `@trust_boundary`, so no decorator contract applies.
+    PRESCRIBED FORM — R4's broad `BaseException` catch is containment rather than suppression: at tool_batch.py:1389-1391 it preserves the exception and clears `proposal_redacted_arguments`, preventing entry into the proposal-publication guard at line 1397. The named `_do_dispatch` control re-raises that stored exception at tool_batch.py:2075-2076, and it is passed to `dispatch_with_audit` at lines 2146-2153; that helper records CANCELLED or PLUGIN_CRASH in its `finally` block at audit.py:1073-1129 before propagation. The rationale and visible code therefore establish an audited re-raise through the canonical dispatch path, not silent recovery, and R4 is not eligible for the Tier-3 decorator.
   judge_signature_version: 2
-  scope_fingerprint: eb0f6b4bb7a912ce872939f50c9fd9d6fff4f40168894d156d1f9912b29c0ebf
+  scope_fingerprint: a21c137611bafc7a4f0b05a0a42fa63fbb0d644a54eadc6dd9b6742f1850e63b
   judge_transport: codex_cli
   ast_path: 'body[58]/body[45]/body[28]/body[13]/body[0]/handlers[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:818e33f76191487ee74edeec4fdab608c443133221524ca9f7873e8a722594d2'
+  judge_metadata_signature: 'hmac-sha256:v2:22e503395ee81b0d1bfc6fd288fd9bcf748d11ea4722845a66140771599cd79c'
 - key: web/composer/tool_batch.py:R4:run_tool_batch:fp=6ba379415b56acc5
   owner: john
   reason: |-
@@ -6512,17 +6478,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T03:23:35.112654+00:00'
+  judge_recorded_at: '2026-08-31T17:12:21.528100+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM — the broad catch at web/composer/tool_batch.py:1064-1068 retains the exact exception solely to move it across the audit seam, rather than suppressing or replacing it. The named control is verified: `_do_dispatch` re-raises `preproposal_exception` before dispatch work at web/composer/tool_batch.py:2021-2024, and `dispatch_with_audit` records ARG_ERROR or PLUGIN_CRASH in its `finally` path at web/composer/audit.py:1030-1060 and 1073-1129 before propagation. The visible proposal path also disables publication when this exception exists, so the rationale is site-specific and consistent with the code.
+    PRESCRIBED FORM — the broad catch transports rather than suppresses the exact exception. I verified that `preproposal_exception` is bound into `_do_dispatch` and re-raised at web/composer/tool_batch.py:2057, and that `dispatch_with_audit` records ARG_ERROR, CANCELLED, or PLUGIN_CRASH before propagation at web/composer/audit.py:1030 and web/composer/audit.py:1073. The flagged branch is limited to non-approval `set_pipeline` finalization, so the visible flow does not publish a proposal or state before reaching that audited dispatch seam.
   judge_signature_version: 2
-  scope_fingerprint: eb0f6b4bb7a912ce872939f50c9fd9d6fff4f40168894d156d1f9912b29c0ebf
+  scope_fingerprint: a21c137611bafc7a4f0b05a0a42fa63fbb0d644a54eadc6dd9b6742f1850e63b
   judge_transport: codex_cli
   ast_path: 'body[58]/body[45]/body[27]/body[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:0b99e8fed57d49c596d1891955e1cbc5539dab390a6e7854654205d168c1b100'
+  judge_metadata_signature: 'hmac-sha256:v2:4f9590a9ed48127f62610b247a73ab7e144bd616af247e08c167e68edd6aec7b'
 - key: web/composer/tools/_common.py:R6:_trusted_requirement_id_for_kind:fp=8984d23c7d49cf5f
   owner: john
   reason: |-
@@ -6542,7 +6508,7 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[52]/body[2]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:b57e9570c2f79e12033880b7bb66e440fe5cd4a062dc34a7eaa1343c5b2960e1'
-- key: web/composer/tools/generation.py:R6:compute_proof_diagnostics:_memoized_resolver:fp=fbcb754da33797c9
+- key: web/composer/tools/generation.py:R6:compute_proof_diagnostics:_memoized_resolver:fp=3f88e3f4b880c6b3
   owner: john
   reason: |-
     A non-UUID blob reference is not treated as resolved: the handler assigns a distinct `('raw', original)` cache key and passes the original value to the authoritative resolver, which returns unresolved/None diagnostics. Canonical, noncanonical, and raw identities cannot alias in the memoization cache.
@@ -6550,17 +6516,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T03:27:33.855052+00:00'
+  judge_recorded_at: '2026-08-31T17:22:04.243864+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES — the caught ValueError is the expected discriminator for a non-UUID string, not an integrity signal silently discarded. The except branch preserves the original value under a distinct ("raw", resolved_blob_id) cache identity, and the visible call to uncached_resolver(resolved_blob_id) then forwards that unchanged value to the resolver; canonical, noncanonical, and raw identities therefore cannot alias. Type-contract failures other than UUID parse rejection are not caught, so this site does not fabricate a value or conceal an unexpected failure.
+    RULE MISFIRES — the caught ValueError is used as explicit parse discrimination, not silently discarded as a failed integrity control. The visible code assigns non-UUID input a distinct ("raw", resolved_blob_id) cache identity and still invokes uncached_resolver(resolved_blob_id), while UUID and noncanonical UUID identities remain separately keyed, so the exception does not fabricate a value, alias identities, or bypass resolution. R6 is not eligible for the trust-boundary decorator.
   judge_signature_version: 2
   scope_fingerprint: 893d390c62968b8bff3cc0023438dcef2fab4da5780c6e8b68e96deaf0a816d6
   judge_transport: codex_cli
-  ast_path: 'body[88]/body[6]/body[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:4fc2566371fa1c58777f472833885b0bb7e01a1ba580abcfd2055a854f48f614'
+  ast_path: 'body[92]/body[6]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:766fe62f5b6468abe75c66e934ffb1b350f041e951bdd3fcdb986a47fd425314'
 - key: web/composer/turn_audit.py:R6:persist_turn_audit:fp=313271caf351d850
   owner: john
   reason: |-
@@ -6569,17 +6535,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T03:27:30.649328+00:00'
+  judge_recorded_at: '2026-08-31T17:25:54.195589+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM: the caught decoding failure is not silently discarded; the branch creates an explicit audit projection containing `INVALID_TOOL_ARGUMENTS_REDACTION_STATUS` and the existing `tool_outcome.error_class`, while omitting the malformed raw arguments. The visible guard limits this fallback to outcomes already classified as errors, and successfully decoded input follows the separate `else` path, so this conforms to R6's allowance for an explicit error/quarantine result. R6 is not suppressible through `@trust_boundary`, so no decorator nudge applies.
+    PRESCRIBED FORM — the caught decoding failure is not silent: the branch records `INVALID_TOOL_ARGUMENTS_REDACTION_STATUS` together with the pre-existing `error_class`, and it is reachable only for a tool outcome already classified as erroneous. The visible code preserves the fact that arguments were malformed without persisting raw malformed text or fabricating decoded argument values, while successfully decoded data follows the separate redaction path. R6 therefore fires syntactically, but this site implements an explicit, auditable error projection rather than suppressing an integrity failure.
   judge_signature_version: 2
-  scope_fingerprint: 03ecc5ad79401b2644f69da0e68942afb1592d99642531e47481cf2f09da78df
+  scope_fingerprint: d7ef949a48363a0a254c05e8d5fa23648cb27818c35a987305b9dce01ad02dd9
   judge_transport: codex_cli
   ast_path: 'body[13]/body[8]/body[3]/orelse[0]/body[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:e89e30070ab9a810cc1a6574ae545291573e8a1414fbd2d5442a532a0af0235d'
+  judge_metadata_signature: 'hmac-sha256:v2:20b2bca04d9d577d40a6922cda8dcff38242e369de63e188123e78df24f75d8f'
 - key: web/execution/completion_gates.py:R5:parse_completion_gates:fp=c73fbc7bae488a7b
   owner: john
   reason: |-
@@ -6835,17 +6801,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T03:40:19.960768+00:00'
+  judge_recorded_at: '2026-08-31T17:46:07.178295+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
+  judge_confidence: 0.95
   judge_rationale: |-
-    PRESCRIBED FORM — the suppression is narrowly inside `recompose`'s existing `CancelledError` handler and absorbs only the secondary cancellation raised while awaiting the shielded audit persistence, not the original route cancellation. The control is verified in web/sessions/routes/composer/compose.py:663: `recompose` sets the terminal state to cancelled and then either converts a client disconnect to HTTP 499 or re-raises the original cancellation at lines 685–693; the mirrored `send_message` handler explicitly documents the same shield semantics at web/sessions/routes/messages.py:957. Thus the R7 pattern cannot turn cancellation into success, and the rationale is site-specific and consistent with every visible path.
+    PRESCRIBED FORM: the `recompose` cancellation gate is verified at web/sessions/routes/composer/compose.py:665-695. The suppression is narrowly scoped to `CancelledError` from the shielded persistence await; ordinary persistence failures still propagate, and the handler then either converts the original disconnect cancellation to 499 or re-raises it, so cancellation cannot become success. R7 therefore identifies a real suppression construct, but the visible control flow and site-specific rationale establish deliberate preservation of the original cancellation outcome rather than silent recovery.
   judge_signature_version: 2
-  scope_fingerprint: d97d1cc854ef3281ed6b81aedd4743e8ad0c9616e5ddd3e47bb5aff65a92d708
+  scope_fingerprint: e5d71301e15844faa41b9500c57efac4e62c1fe4b817a506cc4e2c1d65b726e7
   judge_transport: codex_cli
   ast_path: 'body[6]/body[8]/body[15]/handlers[1]/body[1]/body[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:2ec224d5874710d540ddfa50bab40b38629f127570e084831a5bef9cbedaf79e'
+  judge_metadata_signature: 'hmac-sha256:v2:2760809ffe1070c5ea11d56ed3f309da49c9c4b49ad8ce064fa5b7ecf3a2d6df'
 - key: web/sessions/routes/composer/compose.py:R7:recompose:fp=f55e37887dfa85bf
   owner: john
   reason: |-
@@ -6854,17 +6820,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T03:38:36.916736+00:00'
+  judge_recorded_at: '2026-08-31T17:46:30.995207+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM: the suppressed `CancelledError` is limited to awaiting the shielded terminal-progress publication while an earlier cancellation is already being handled. The visible code does not convert cancellation into normal completion: it records `terminal_status = "cancelled"`, converts a client disconnect to HTTP 499, and otherwise re-raises the original cancellation. R7 therefore applies syntactically, but this narrowly contained suppression preserves the cancellation outcome while permitting terminal publication to continue.
+    PRESCRIBED FORM — the suppression is narrowly limited to `CancelledError` raised while awaiting the shielded terminal progress publication during an already-active cancellation path. The visible code cannot return normally: it records `terminal_status = "cancelled"` and then either raises HTTP 499 for a client disconnect or re-raises the original cancellation, so the primary control signal is not swallowed or converted into success. The rationale specifically addresses R7’s silent-suppression concern and is consistent with the code.
   judge_signature_version: 2
-  scope_fingerprint: d97d1cc854ef3281ed6b81aedd4743e8ad0c9616e5ddd3e47bb5aff65a92d708
+  scope_fingerprint: e5d71301e15844faa41b9500c57efac4e62c1fe4b817a506cc4e2c1d65b726e7
   judge_transport: codex_cli
   ast_path: 'body[6]/body[8]/body[15]/handlers[1]/body[2]'
-  judge_metadata_signature: 'hmac-sha256:v2:53e9b71492d26ff6677601a75ab3cff0c7352ef84a80ca8e221978901b2528b1'
+  judge_metadata_signature: 'hmac-sha256:v2:bb69c3785003fd61d77c289ad86f8b665480f71b7bca5faa7c00552d621b3f8a'
 - key: web/sessions/routes/composer/guided_chat_atomic.py:R4:post_guided_chat_schema8:fp=709fc6bd813f3118
   owner: john
   reason: |-
@@ -6987,17 +6953,17 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-11-29'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T03:44:20.127054+00:00'
+  judge_recorded_at: '2026-08-31T18:13:31.693223+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM — the suppression is narrowly limited to the `CancelledError` re-raised by awaiting the shielded progress publication, while the shielded coroutine continues independently. The enclosing handler already possesses the original cancellation signal, records `terminal_status = "cancelled"`, and then either converts a recognized client disconnect to HTTP 499 with the original exception chained or re-raises the cancellation; therefore the cancellation is not silently lost. R7 applies syntactically, but the visible code and site-specific rationale together establish deliberate preservation of both the terminal write and cancellation semantics.
+    PRESCRIBED FORM — the suppression is narrowly limited to `asyncio.CancelledError` from awaiting the shielded `_publish_progress` operation, while exceptions raised by the progress write itself are not generally suppressed. The visible control flow preserves the cancellation signal on every covered path: `_is_client_disconnect_cancel` converts it to HTTP 499 with the original exception chained, and the remaining path re-raises it at line 1010. This is therefore intentional cancellation containment rather than silent recovery, and R7 is not eligible for the `@trust_boundary` decorator.
   judge_signature_version: 2
-  scope_fingerprint: e7059011d2d87852d7641fc85a545597500ff8af1f7f2403da833067c910fc53
+  scope_fingerprint: c256e1c9a914748151111b50e1088054b57e97109ac548925f81be4bd840d065
   judge_transport: codex_cli
   ast_path: 'body[8]/body[0]/body[6]/body[15]/handlers[2]/body[2]'
-  judge_metadata_signature: 'hmac-sha256:v2:009abf67c1fc98bae4b2b168139be5564c8abd1a81bb12020ec5a10e8e329393'
+  judge_metadata_signature: 'hmac-sha256:v2:ebab42f411c726227a8f4596cb212c73be115677a0da29aacd979b06faa5f422'
 - key: web/sessions/routes/sessions.py:R4:register_session_routes:fork_from_message:fp=33e3f47786e5eeaf
   owner: john
   reason: |-
@@ -7055,6 +7021,424 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[154]/body[6]/body[3]/body[0]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:509e3811706bee77ce756a62af2f86d2e7ed5231ed3b83c102a41180a807c44c'
+- key: web/_aws_ecs_acceptance/s3.py:R6:verify_s3:fp=9b828fbccbb21873
+  owner: john
+  reason: |-
+    S3ConditionalWriteRejectedError is the expected explicit success outcome of the deliberately divergent same-key collision probe. The handler records collision_rejected=True; every other probe exception records failure_check, and verify_s3 raises check_failure_error before returning whenever that state is set. tests/unit/web/aws_ecs_acceptance/test_s3.py::test_verify_s3_round_trips_with_bounded_default_chain_plugin_configs_and_cleans_up pins the exact rejection path, true receipt field, and cleanup.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T18:57:39.575013+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — the flagged handler does not silently suppress an error: the deliberately divergent collision probe expects S3ConditionalWriteRejectedError and records that successful rejection as collision_rejected=True at web/_aws_ecs_acceptance/s3.py:352-353, which is returned explicitly at lines 402-407. Unexpected exceptions and silent acceptance instead set failure_check at lines 354-358, and the named verify_s3 control raises check_failure_error at lines 399-400; this control was verified directly. The claimed test was outside the judge tool's permitted read scope, but it is not load-bearing because the visible code independently establishes the expected-signal and explicit-result behavior.
+  judge_signature_version: 2
+  scope_fingerprint: e5cf56347a63f6b1131b8d737c17f98f2cdff834c0a73d6ae9f680e539fd00ad
+  judge_transport: codex_cli
+  ast_path: 'body[27]/body[18]/body[4]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:4df3925c2759d50628589348d3e206ce63375fa26a2e1f151cc2b3b6b1a706ba'
+- key: web/blobs/service.py:R6:_restore_staged_blob_deletion:fp=c7f88db745463cff
+  owner: john
+  reason: |-
+    This OSError is a secondary rollback failure while primary_exc is already active. _restore_staged_blob_deletion attaches the rollback class and manual-reconciliation warning to that primary exception; every caller (_stage_blob_deletion, BlobServiceImpl._delete_blob_row_locked through delete_blob/cleanup_blobs_for_fork, and _execute_delete_blob_locked) invokes it inside the active handler and immediately bare-raises the primary, so no path reports success. tests/unit/web/blobs/test_service.py::TestBlobRollbackNotes::test_restore_staged_deletion_refuses_to_overwrite_replacement_and_annotates_primary pins the failed-restore note, and tests/unit/web/blobs/test_service.py::TestDeleteBlob::test_delete_blob_commit_failure_restores_file_and_row_after_restart pins primary-failure propagation through the transaction owner.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T19:07:22.770604+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.94
+  judge_rationale: |-
+    PRESCRIBED FORM — the caught OSError is a secondary rollback failure that is preserved on the active primary exception with an explicit divergence and manual-reconciliation note, rather than silently converted into success. Every source call site is inside an exception handler followed by a bare raise: `_stage_blob_deletion` and the `BlobServiceImpl` delete/cleanup paths at web/blobs/service.py:599, web/blobs/service.py:2489, web/blobs/service.py:2558, and web/blobs/service.py:3225, plus `_execute_delete_blob_locked` at web/composer/tools/blobs.py:1970; fork cleanup subsequently records the propagated failure as an explicit `BlobForkCleanupError`. The named tests were outside the judge tool's permitted read roots and were not credited, but the exhaustively inspected source references independently establish that no covered path reports success after this rollback failure.
+  judge_signature_version: 2
+  scope_fingerprint: fd9602f2a47a093eb131db3c5818ef95bd9a136e4c68df504266594a807bfbe3
+  judge_transport: codex_cli
+  ast_path: 'body[68]/body[3]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:fc99d0f330af9bbe668c8ddad7d935d05657bfeba0abd0804fd41800ff137510'
+- key: web/composer/state.py:R5:_routing_label_errors:fp=cffa6ca0f84acd15
+  owner: john
+  reason: |-
+    This Tier-3 advisory checks only string branch connections so _label_message is never called on an unowned malformed value; CompositionState.validate, its same and only caller, subsequently rejects every non-string coalesce or row_union connection through the intrinsic per-branch type checks with coalesce_branches_invalid or row_union_branch_invalid. tests/unit/web/composer/test_state.py::test_coalesce_non_string_branch_connection_is_rejected_at_composition_time and tests/unit/web/composer/test_state.py::TestCompositionStateRowUnion::test_malformed_row_union_branch_values_return_errors_without_sorting_type_error pin that fail-closed control.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T19:31:52.122231+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — `_routing_label_errors` is already marked as a non-raising Tier-3 boundary for `nodes`, suppressing R5, with the complete non-raising metadata contract at web/composer/state.py:267-279. The flagged guard only prevents malformed external branch values from reaching the advisory label checker, while the decorator invariant explicitly assigns their rejection to `CompositionState.validate`; therefore this is the intended boundary discrimination rather than defensive revalidation of trusted data. Because the structural decorator is already present, no decorator nudge applies.
+  judge_signature_version: 2
+  scope_fingerprint: 0e59f68d6f778300f327cf76b91d8b29b81268d47d2b91c08611d955a2e13f34
+  judge_transport: codex_cli
+  ast_path: 'body[51]/body[5]/body[2]/orelse[0]/orelse[0]/orelse[0]/orelse[0]/body[5]/body[0]/test/values[1]/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:d86c4d7ec0c8860b51a96309144cb66aa0b9ab0862a425c21cec71c14acc7147'
+- key: web/schema_probe.py:R2:_sqlstate:fp=5c9289fd0c9f3413
+  owner: john
+  reason: |-
+    OperationalError.orig is a third-party DBAPI exception with driver-specific optional attributes, so getattr with a None sentinel is the required Tier-3 parse rather than a default for owned state. _sqlstate returns a code only after a nominal str check; otherwise _run_locked takes the generic redacted SchemaInitError path. tests/testcontainer/web/test_schema_probe_postgres.py::test_lock_timeout_maps_to_redacted_busy_error and tests/unit/web/test_schema_probe.py::test_non_busy_lock_operational_error_is_static_redacted_and_invalidates pin recognized and non-busy outcomes.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T19:59:46.097286+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — `OperationalError.orig` carries a third-party DBAPI exception whose `sqlstate` and `pgcode` attributes are driver-specific and unguaranteed, so the flagged sentinel-defaulted `getattr` is prescribed external-boundary extraction rather than defensive access to owned state. The visible `_sqlstate` code reads the optional attributes, accepts only a nominal `str`, and otherwise returns `None` without coercing or fabricating a SQLSTATE, consistent with its non-raising Tier-3 boundary invariant. R2 is not suppressible by the `@trust_boundary` decorator, whose structural suppression scope is limited to R1 and R5, so no decorator recommendation applies.
+  judge_signature_version: 2
+  scope_fingerprint: a766990267f5f49b051c314cd37f1141e6a23a056c57f0b62e73cee047330455
+  judge_transport: codex_cli
+  ast_path: 'body[44]/body[1]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:ffb00d82a0f548db94505966868353d559d5e9f44056f12e82aeae9d085e981a'
+- key: web/sessions/routes/_helpers.py:R6:_handle_convergence_error:fp=9a9811f4dfea644d
+  owner: john
+  reason: |-
+    R6 flags the SQLAlchemyError handler around the convergence partial-state recovery write. The primary result is already a 422; the handler records the secondary DB failure and makes it an explicit response outcome via partial_state_save_failed=True and partial_state_save_error=<class>, while non-SQLAlchemy invariant failures still escape. Pinned by tests/unit/web/sessions/test_routes.py::TestRecomposeConvergencePartialState::test_recompose_convergence_save_operational_error_preserves_422_body and tests/unit/web/sessions/test_routes.py::TestRecomposeConvergencePartialState::test_recompose_convergence_save_failure_redacts_sqlalchemy_internals.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T20:04:35.929996+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    PRESCRIBED FORM — the SQLAlchemyError is not silently swallowed: the handler adds explicit failure fields, including the exception class without sensitive database details, and returns that response body at web/sessions/routes/_helpers.py:2909. The catch is narrowly typed, while unrelated invariant failures remain able to escape, so this satisfies R6's explicit-error-result form for a secondary persistence failure without fabricating success. R6 is not eligible for the trust-boundary decorator.
+  judge_signature_version: 2
+  scope_fingerprint: a68e9412a5ce20d85a4ea574af5bcc1f0228764aaa16a91aa1d72f1b43f1c416
+  judge_transport: codex_cli
+  ast_path: 'body[177]/body[6]/body[0]/handlers[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:5640d6884024bb0fa13302a3fe6355469d5800825d048d3c5b5b3330ef86ae12'
+- key: web/sessions/routes/_helpers.py:R6:_handle_plugin_crash:fp=66321789e91c3688
+  owner: john
+  reason: |-
+    R6 flags the SQLAlchemyError handler around the plugin-crash partial-state recovery write. The primary plugin-crash 500 must not be replaced by a secondary DB error; the handler logs the class and exposes the explicit failed-recovery fields, while TypeError and other first-party invariant failures remain uncaught. Pinned by tests/unit/web/sessions/test_routes.py::TestComposePluginCrashResponse::test_compose_plugin_crash_save_failure_sets_partial_state_save_failed_flag and tests/unit/web/sessions/test_routes.py::TestComposePluginCrashResponse::test_compose_plugin_crash_save_typeerror_propagates_tier1_crash.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T20:11:57.565145+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.96
+  judge_rationale: |-
+    PRESCRIBED FORM — the SQLAlchemyError is narrowly contained only during a secondary partial-state recovery write so it cannot replace the primary plugin-crash response. The handler does not silently recover: it records an explicit failure result in response_body through partial_state_save_failed and partial_state_save_error, while unrelated first-party invariant failures remain outside this catch. The visible code therefore satisfies R6's explicit-error-result alternative, and logging is appropriate as a last-resort diagnostic when the persistence channel itself has failed.
+  judge_signature_version: 2
+  scope_fingerprint: 7aaaba48182006ddc5bd7aab525745e27c0684e306c77175c6e33f5770b89b7e
+  judge_transport: codex_cli
+  ast_path: 'body[178]/body[4]/body[0]/handlers[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:2f6b20f9bb050f470b21fc765d7651cecc9b1e0673488177f8c14bdad9f79ad6'
+- key: web/sessions/routes/_helpers.py:R6:_handle_runtime_preflight_failure:fp=71fef55c00974903
+  owner: john
+  reason: |-
+    R6 flags the SQLAlchemyError handler around the runtime-preflight partial-state recovery write. The primary runtime-preflight 500 is already fixed; the handler records the audit-system failure and returns explicit failed-recovery fields without exposing SQL, parameters, or cause text. Pinned by tests/unit/web/sessions/test_routes.py::test_runtime_preflight_handler_save_failure_sets_partial_state_save_failed_flag.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T20:12:20.748494+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.96
+  judge_rationale: |-
+    PRESCRIBED FORM — the SQLAlchemyError is not silently discarded: the handler logs only redacted context and explicitly marks the recovery result with partial_state_save_failed and the exception class. This directly satisfies R6's permitted explicit-error-result form, and the cited test nodeid specifically pins that failure-state behavior. The decorator alternative does not apply because this is R6, not R1 or R5.
+  judge_signature_version: 2
+  scope_fingerprint: c5736b6d1ae159f8bda3483e27e0ffcb018cc1d91fa9ab266f6fe4b3cb472a7a
+  judge_transport: codex_cli
+  ast_path: 'body[179]/body[4]/body[0]/handlers[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:25cf0a86207d3346b2d9eea647060c66e92953a2913d1f2185c7cefb5f16b29f'
+- key: web/sessions/routes/_helpers.py:R7:_cancel_on_client_disconnect:fp=87b12f9c61cefbe6
+  owner: john
+  reason: |-
+    PRESCRIBED FORM — R7 flags the controlled sleep(0) that delivers a pending cancellation after the guarded block has already completed. This branch in _cancel_on_client_disconnect is reachable only when triggered is true and task.cancelling() is positive; triggered is set only immediately before _watch_disconnect calls task.cancel with the private marker. The suppress acknowledges delivery of that locally requested signal, task.uncancel balances one request, and the immediate task.cancelling() recheck raises CancelledError if any additional external request remains. Thus no cancellation is silently lost, while the completed compose result is protected from a late client-disconnect signal during its persistence tail.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T20:17:37.670215+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.96
+  judge_rationale: |-
+    PRESCRIBED FORM — the R7 suppression contains only the controlled delivery of the locally requested cancellation at `await asyncio.sleep(0)`, after the guarded work has completed. The visible code balances exactly one request with `task.uncancel()` and immediately checks `task.cancelling()` again, raising `CancelledError` when any additional cancellation remains, so the signal is not silently lost. This is explicit cancellation arbitration rather than silent recovery, and R7 is not eligible for the trust-boundary decorator.
+  judge_signature_version: 2
+  scope_fingerprint: 8e8dbdbd4ce3ede7342d450ad6dfe483ebbf8abd4b42c76ec4f6aaa63495f77a
+  judge_transport: codex_cli
+  ast_path: 'body[164]/body[6]/orelse[2]/body[0]/body[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:eccfa1921fcaf5e49c5a67e3065b0efcc5f854b09416b779eddd8a7a3e9d6c9e'
+- key: web/sessions/routes/_helpers.py:R7:_cancel_on_client_disconnect:fp=a236078f11290373
+  owner: john
+  reason: |-
+    PRESCRIBED FORM — R7 flags suppression of CancelledError while awaiting the observation-only watcher during normal-exit teardown. If the watcher is still live, _cancel_on_client_disconnect calls watcher.cancel immediately before this await, so CancelledError is the expected task-cancellation acknowledgement rather than a hidden failure. If the enclosing route task is externally cancelled at the await, its cancellation count remains positive; the immediately following task.cancelling() control either consumes only the disconnect request when triggered or raises CancelledError, preserving every external cancellation. The complete distinction and outcome are visible locally in the same symbol.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T20:18:01.965391+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    PRESCRIBED FORM — the visible code suppresses only the `CancelledError` produced while awaiting the explicitly cancelled observation-only `watcher`, then immediately checks `task.cancelling()` to distinguish cancellation of the enclosing route task. The control is locally verifiable in `_cancel_on_client_disconnect`: `watcher.cancel()` precedes the flagged await, and the checks at lines 2235–2250 consume only the disconnect-triggered request while re-raising when any external cancellation remains. This is deliberate cancellation acknowledgement with an explicit preservation gate, not silent loss of an operational failure.
+  judge_signature_version: 2
+  scope_fingerprint: 8e8dbdbd4ce3ede7342d450ad6dfe483ebbf8abd4b42c76ec4f6aaa63495f77a
+  judge_transport: codex_cli
+  ast_path: 'body[164]/body[6]/orelse[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:fe93d78af6e789226fd4b6adb22e512b9c33622b3a10594917d888db693f3e47'
+- key: web/sessions/routes/composer/guided_plan.py:R4:_publish_guided_full_terminal_preserving_primary:fp=c928a730920663fa
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: this broad catch is confined to failure of the secondary ComposerProgressSink after the caller has supplied an established primary_outcome; it records the sink exception through _note_guided_full_secondary_failure and returns so UI cleanup cannot replace that outcome, while non-Exception BaseException values still escape. tests/integration/web/composer/guided/test_guided_full.py::test_guided_full_replayable_winner_survives_terminal_progress_publication_failure[runtime_error] pins the caught path, and tests/integration/web/composer/guided/test_guided_full.py::test_guided_full_main_fence_primary_survives_cancelled_terminal_progress_cleanup pins the separately handled CancelledError path.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T20:38:52.562462+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.94
+  judge_rationale: |-
+    PRESCRIBED FORM: R4 applies, but this catch records a secondary terminal-progress failure without allowing it to replace an already established authoritative outcome. The callers in `post_guided_plan` at guided_plan.py:559, :573, and :580 pass either an established failure code or `durable_complete`, while `_note_guided_full_secondary_failure` at guided_plan.py:153 records the secondary exception; injected task cancellation is re-raised and other `BaseException` values escape. The visible code therefore supports the rationale’s deliberate primary-outcome preservation rather than silent suppression of the primary control.
+  judge_signature_version: 2
+  scope_fingerprint: 34eecab64a8935292133f6d3f350d521bc237c973a15b766b9eb1b4051ca4ad7
+  judge_transport: codex_cli
+  ast_path: 'body[29]/body[1]/handlers[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:1941479a998ea72b48c18c73c60eac20d9caf38d39928c7beb96efaed58b0494'
+- key: web/sessions/routes/composer/guided_plan.py:R5:_guided_full_failure_code:fp=1915dda41439f9a6
+  owner: john
+  reason: |-
+    RULE MISFIRES: exc is deliberately typed BaseException and this isinstance is exception-taxonomy dispatch, not a defensive re-check of an owned value; the dedicated GuidedOperationSettlementConflictError signal maps an expected locked-head race to the closed stale_conflict outcome and unknown exception types still fail closed as operation_failed. The producer contract is pinned by tests/unit/web/sessions/test_guided_operations_service.py::test_guided_seed_rejects_cross_service_head_drift_before_writes.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T20:45:45.914063+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES: `_guided_full_failure_code` deliberately accepts `BaseException` and uses ordered `isinstance` checks to classify exception taxonomy, rather than defensively revalidating a value whose concrete type is fixed by an owned contract. The visible sibling branches, including superclass-order-sensitive handling for `ComposerPluginCrashError`, independently establish this dispatch purpose, so the cited test is not load-bearing for the R5 exemption. This is not an R1/R5 external-parameter boundary eligible for the decorator because `exc` is an exception-dispatch input, not Tier-3 source data.
+  judge_signature_version: 2
+  scope_fingerprint: 22321b71db9ed3138b2b9406cbdabcb58aba3541670fdd592c6b50c00fa7a159
+  judge_transport: codex_cli
+  ast_path: 'body[30]/body[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:138e7e44ff488d52e8c235626f8dd4e3bff6689b3d4115ea76f38eebedfc24dd'
+- key: web/sessions/routes/composer/guided_plan.py:R5:_guided_full_failure_code:fp=5397a72a1c086df0
+  owner: john
+  reason: |-
+    RULE MISFIRES: this is ordered exception-class dispatch over BaseException, and the narrow ComposerPluginCrashError arm must precede its ComposerServiceError superclass so a first-party plugin crash becomes operation_failed rather than a retryable provider fault. ComposerPluginCrashError's superclass relation is pinned by tests/unit/elspeth_lints/test_composer_rules.py::test_catch_order_declared_map_matches_real_composer_exception_mro; the branch ordering itself is visible here and unknown types still fall through to operation_failed.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T20:53:32.382841+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.91
+  judge_rationale: |-
+    RULE MISFIRES: the flagged `isinstance` is ordered exception-class dispatch over the deliberately broad `BaseException` parameter, not a defensive re-check that hides a fixed-contract violation. The visible code places `ComposerPluginCrashError` before its stated `ComposerServiceError` superclass and maps the narrower first-party failure to `operation_failed` rather than laundering it into a retryable provider fault. No Tier-3 boundary decorator applies because `exc` is an exception-routing input, not external-origin data being promoted into Tier 2.
+  judge_signature_version: 2
+  scope_fingerprint: 22321b71db9ed3138b2b9406cbdabcb58aba3541670fdd592c6b50c00fa7a159
+  judge_transport: codex_cli
+  ast_path: 'body[30]/body[2]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:e77713b5cb8d1ed7be4dca58f2c2a997f9468cf40bef26f64884249ce5e3b83b'
+- key: web/sessions/routes/composer/guided_plan.py:R5:_guided_full_failure_code:fp=62513aa8788ed93b
+  owner: john
+  reason: |-
+    RULE MISFIRES: ComposerServiceError is the declared composer-service failure family, and this arm performs exception-taxonomy dispatch over BaseException after the narrower ComposerPluginCrashError arm, mapping provider/service failures to provider_unavailable while unmatched exceptions remain operation_failed. The family and narrow-before-broad MRO are pinned by tests/unit/elspeth_lints/test_composer_rules.py::test_catch_order_declared_map_matches_real_composer_exception_mro.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T20:58:39.417799+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.93
+  judge_rationale: |-
+    RULE MISFIRES: `_guided_full_failure_code` receives `BaseException` and performs nominal exception-taxonomy dispatch, so the flagged `isinstance` is not a defensive shape re-check masking a fixed-contract violation. `ComposerServiceError` is explicitly the base exception at web/composer/protocol.py:352-353, `ComposerPluginCrashError` subclasses it at web/composer/protocol.py:486, and web/sessions/routes/composer/guided_plan.py:224-238 visibly places the narrow plugin arm before the broad service-family arm. The named test was outside the permitted read scope and is therefore not credited, but the load-bearing hierarchy and ordering are established directly by the visible source. The decorator contract does not apply because `exc` is an internal exception-taxonomy input, not an external Tier-3 payload.
+  judge_signature_version: 2
+  scope_fingerprint: 22321b71db9ed3138b2b9406cbdabcb58aba3541670fdd592c6b50c00fa7a159
+  judge_transport: codex_cli
+  ast_path: 'body[30]/body[6]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:ae1bb541569f96c35f9ca2911be1de5b8e1f52a6e8ca8fb65b1ef315d500b6e3'
+- key: web/sessions/routes/composer/guided_plan.py:R5:_guided_full_failure_code:fp=766a3dab78262850
+  owner: john
+  reason: |-
+    RULE MISFIRES: after the integrity and quota subclasses have been classified, this BlobError family arm deliberately maps remaining structured blob lifecycle failures to custody_error; the runtime check dispatches an open BaseException input and does not fabricate or coerce a value. tests/integration/web/composer/guided/test_guided_full.py::test_guided_full_blob_failures_keep_custody_and_integrity_distinct pins a remaining BlobError subtype as custody_error, and tests/unit/web/blobs/test_protocol.py::TestBlobExceptionFamilyInvariants::test_every_family_member_inherits_blob_error pins the family contract.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T21:01:13.175826+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.96
+  judge_rationale: |-
+    RULE MISFIRES: `_guided_full_failure_code` is an exception-family classifier over an open `BaseException`, not a defensive shape re-check of data under a fixed contract. The ordering at guided_plan.py:219-237 explicitly separates blob integrity and quota subclasses before the `BlobError` fallback, while blobs.py:250-401 confirms the nominal exception hierarchy; the fallback therefore classifies remaining structured lifecycle failures without coercion, fabrication, or silent suppression. The named tests were outside the permitted read scope and are not credited, but the visible definitions independently establish the rationale’s site-specific claim.
+  judge_signature_version: 2
+  scope_fingerprint: 22321b71db9ed3138b2b9406cbdabcb58aba3541670fdd592c6b50c00fa7a159
+  judge_transport: codex_cli
+  ast_path: 'body[30]/body[5]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:2a3c7bdf4a15830f3e65761e639e54388324a19ff08cfa09bd9f83ebbef3054b'
+- key: web/sessions/routes/composer/guided_plan.py:R5:_guided_full_failure_code:fp=9b768ec02eac4c81
+  owner: john
+  reason: |-
+    RULE MISFIRES: BlobQuotaExceededError is a declared BlobError subtype with a distinct, actionable quota outcome, so this narrow-before-broad isinstance is exception-taxonomy dispatch over the function's BaseException input rather than masking an owned-value contract violation. The producer signal is pinned by tests/unit/web/blobs/test_service.py::TestBlobQuota::test_quota_rejects_when_exceeded, and _SAFE_FAILURES rejects unknown codes before any HTTP envelope is emitted.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T21:08:43.471952+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.96
+  judge_rationale: |-
+    RULE MISFIRES: `_guided_full_failure_code` accepts `BaseException` and performs explicit exception-taxonomy dispatch; the narrow quota arm precedes the broad blob-error arm to preserve a distinct outcome, not to suppress or coerce a contract violation. `contracts/blobs.py:250,337` confirms that `BlobQuotaExceededError` is a declared `BlobError` subtype. The claimed `_SAFE_FAILURES` control is verified at `web/sessions/routes/guided_operations.py:81` and `web/sessions/routes/guided_operations.py:170`: quota has a closed HTTP mapping and unknown codes raise `AuditIntegrityError` before envelope construction. This is not an R5 Tier-3 parameter boundary suitable for the decorator.
+  judge_signature_version: 2
+  scope_fingerprint: 22321b71db9ed3138b2b9406cbdabcb58aba3541670fdd592c6b50c00fa7a159
+  judge_transport: codex_cli
+  ast_path: 'body[30]/body[4]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:80985746da87b87ffc0075e1270d6b6f14889c186fa138999e0e45e0169ec04b'
+- key: web/sessions/routes/composer/guided_plan.py:R5:_guided_full_failure_code:fp=da8dc16ac7bb00a8
+  owner: john
+  reason: |-
+    RULE MISFIRES: this union check classifies the two explicit BlobError subclasses whose contracts denote missing or mismatched committed bytes as integrity_error before the broader BlobError custody arm; it is exception dispatch over BaseException, not defensive validation. tests/integration/web/composer/guided/test_guided_full.py::test_guided_full_blob_failures_keep_custody_and_integrity_distinct pins BlobIntegrityError, while tests/unit/web/blobs/test_service.py::TestCopyBlobsForFork::test_translates_source_deleted_between_exists_check_and_read pins BlobContentMissingError as the missing-content signal.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T21:09:05.104863+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES: the flagged `isinstance` is explicit exception dispatch over a `BaseException`, not defensive shape validation or recovery that could conceal a fixed-contract violation. The visible ordering assigns `BlobIntegrityError` and `BlobContentMissingError` to `integrity_error` before the broader `BlobError` custody classification, and it neither coerces, defaults, nor swallows the exception. The rationale is site-specific and names behavioral tests for both exception categories; no external-data boundary decorator applies to this dispatcher.
+  judge_signature_version: 2
+  scope_fingerprint: 22321b71db9ed3138b2b9406cbdabcb58aba3541670fdd592c6b50c00fa7a159
+  judge_transport: codex_cli
+  ast_path: 'body[30]/body[3]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:e45ff353bedbbb27e9b6f3d6bc28a06589ea0bbbb6a2cf174064b827a6dbd6a4'
+- key: web/sessions/routes/composer/guided_plan.py:R5:_guided_full_failure_code:fp=ebd53e9c16a6b903
+  owner: john
+  reason: |-
+    RULE MISFIRES: this check enters the explicit PipelinePlannerError taxonomy so its closed code and detail_codes can be translated without exposing exception text; unknown planner codes and all unmatched exceptions fall through to operation_failed. tests/integration/web/composer/guided/test_guided_full.py::test_guided_full_planner_failure_mapping_is_closed, tests/integration/web/composer/guided/test_guided_full.py::test_guided_full_policy_refusal_outranks_the_planner_code, and tests/integration/web/composer/test_freeform_planner_failure_translation.py::test_every_reachable_failure_code_has_an_http_envelope_on_both_surfaces pin the complete planner-code paths and the _SAFE_FAILURES envelope coverage.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T21:11:55.228218+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.96
+  judge_rationale: |-
+    RULE MISFIRES: at guided_plan.py:219-278, `exc` is deliberately declared as `BaseException`, and the function performs nominal exception-taxonomy dispatch rather than rechecking a contractually guaranteed `PipelinePlannerError` shape. The caller at guided_plan.py:712-778 uses the resulting closed failure code to record the durable audit failure and produce a safe typed envelope; the flagged `isinstance` neither coerces malformed data nor hides a contract violation. The additional test claims are not needed for this disposition because the visible control flow independently establishes the rule misfire.
+  judge_signature_version: 2
+  scope_fingerprint: 22321b71db9ed3138b2b9406cbdabcb58aba3541670fdd592c6b50c00fa7a159
+  judge_transport: codex_cli
+  ast_path: 'body[30]/body[7]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:72931d01be9ad73ac60bca4b967bb90a44892277ad6f290d8df0b916d99bbc8a'
+- key: web/sessions/service.py:R5:SessionServiceImpl:_prepare_or_create_pending_interpretation_event:_sync:fp=1f8d753fa07282b5
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: sources is JSON unwrapped from the composition_states row selected by both state and session inside _session_write_lock; its externally authored contents are not made trustworthy by database storage. This Mapping guard is the writer-boundary shape check before named-source lookup and raises ValueError before any interpretation event insert. tests/unit/web/sessions/test_interpretation_events_service.py::test_create_pending_interpretation_event_accepts_invented_source_component pins the valid shape, while ::test_create_pending_interpretation_event_rejects_invented_source_without_authoring pins fail-closed rejection with no event row.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T21:34:18.094237+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.9
+  judge_rationale: |-
+    PRESCRIBED FORM: the persisted `sources` contents are expressly identified as externally authored and remain Tier-3 despite database storage, while the visible writer path at web/sessions/service.py:7441 and :7465-7467 checks their shape and raises `ValueError` before proceeding rather than coercing, fabricating, or silently recovering. The state-and-session query and `_session_write_lock` control are visible and consistent with the rationale; the named tests were unavailable within the permitted read roots and therefore are not credited, but the fail-closed behavior is established by the excerpt itself. The decorator alternative does not apply because the flagged subject is obtained from the database inside `_sync`, not rooted in an external-data function parameter.
+  judge_signature_version: 2
+  scope_fingerprint: 7da68107560ffd197f6fc33b28ed1c62a8d52a453722c514076dcdcb779fd3f7
+  judge_transport: codex_cli
+  ast_path: 'body[154]/body[71]/body[8]/body[2]/body[5]/body[2]/value/test/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:19e974cc72902492d4b9a607450fc0f1b0329f4d2d8e2078c637a6a1d857c0d4'
+- key: web/sessions/service.py:R5:SessionServiceImpl:_prepare_or_create_pending_interpretation_event:_sync:fp=a6c80ad403dd4505
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: source is the externally authored named-source value read from persisted JSON, not an ELSPETH-owned typed return. The Mapping check offensively rejects a malformed or absent source with ValueError before options access or event insertion. tests/unit/web/sessions/test_interpretation_events_service.py::test_create_pending_interpretation_event_accepts_invented_source_component and ::test_create_pending_interpretation_event_rejects_invented_source_without_authoring pin the accepted and rejected writer-boundary outcomes.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T21:36:31.490783+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.89
+  judge_rationale: |-
+    RULE MISFIRES: The rationale plainly identifies `source` as externally authored content carried through persisted JSON, and the visible code is consistent: `state_row.sources` is unwrapped and the named entry is shape-checked at web/sessions/service.py:7456-7467 before `source["options"]` is read. The failed Mapping check raises `ValueError` and cannot silently coerce, fabricate, or pass malformed content onward, so this is required Tier-3 boundary enforcement. The subject is derived from a database row rather than an external-data function parameter suitable for the decorator contract, so no decorator nudge applies. The named tests were outside the permitted read roots, but they are not load-bearing because the rejection path and its ordering before insertion are visible in the code.
+  judge_signature_version: 2
+  scope_fingerprint: 7da68107560ffd197f6fc33b28ed1c62a8d52a453722c514076dcdcb779fd3f7
+  judge_transport: codex_cli
+  ast_path: 'body[154]/body[71]/body[8]/body[2]/body[5]/body[3]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:eed3cdd5b8baef371dd65ec575c62bf9392a9033c0a4e369f607be51e7bdc38d'
+- key: web/sessions/service.py:R5:SessionServiceImpl:_prepare_or_create_pending_interpretation_event:_sync:fp=d8eaf9c3a8f5a333
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: source_authoring is nested metadata recovered from externally authored persisted source JSON. The Mapping guard is required before direct content_hash access and raises a specific ValueError inside the locked writer boundary, so malformed metadata cannot produce an interpretation event. tests/unit/web/sessions/test_interpretation_events_service.py::test_create_pending_interpretation_event_accepts_invented_source_component and ::test_create_pending_interpretation_event_rejects_invented_source_without_authoring pin that authoring metadata is mandatory before insertion.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T21:40:33.146591+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    RULE MISFIRES: persisted composer options are explicitly classified as untyped Tier-3 data round-tripped through session storage (web/interpretation_state.py:314-326), consistent with the stated external authorship. At web/sessions/service.py:7442-7479, the Mapping guard raises before `content_hash` is accessed and before any interpretation row is inserted, with no coercion, fabrication, or silent recovery. The cited tests were outside the permitted read scope, but the visible implementation independently establishes the boundary behavior. The decorator alternative does not apply because `_sync` obtains the subject from a database read rather than from an external-data function parameter.
+  judge_signature_version: 2
+  scope_fingerprint: 7da68107560ffd197f6fc33b28ed1c62a8d52a453722c514076dcdcb779fd3f7
+  judge_transport: codex_cli
+  ast_path: 'body[154]/body[71]/body[8]/body[2]/body[5]/body[7]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:2be21d5eb3ab09efb10e85aa5341cb728f98105556f34292b76e3fa0704ca6ca'
+- key: web/sessions/service.py:R5:SessionServiceImpl:_prepare_or_create_pending_interpretation_event:_sync:fp=fe79b5c591a924c0
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: source_options is a nested value from externally authored persisted JSON. This Mapping guard, paired with the mandatory SOURCE_AUTHORING_KEY check, raises ValueError before any interpretation event insert rather than coercing or defaulting malformed input. tests/unit/web/sessions/test_interpretation_events_service.py::test_create_pending_interpretation_event_rejects_invented_source_without_authoring pins the rejection and empty event set; ::test_create_pending_interpretation_event_accepts_invented_source_component pins the valid path.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T21:43:12.135374+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.9
+  judge_rationale: |-
+    PRESCRIBED FORM: `source_options` is persisted, web-authored external-origin data, consistent with the explicit provenance documented at web/composer/reviewed_source_authority.py:40-58 and the authoring-marker description at web/composer/state.py:76-82. At web/sessions/service.py:7468-7475, the R5 guard rejects a non-mapping or missing mandatory authoring key with `ValueError` before downstream interpretation or insertion, without coercing, fabricating, or silently recovering. The decorator alternative does not apply because `_sync` receives only an optional connection and the guarded value is derived from the persisted row rather than from an external-data parameter.
+  judge_signature_version: 2
+  scope_fingerprint: 7da68107560ffd197f6fc33b28ed1c62a8d52a453722c514076dcdcb779fd3f7
+  judge_transport: codex_cli
+  ast_path: 'body[154]/body[71]/body[8]/body[2]/body[5]/body[5]/test/values[0]/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:ee3e11fdb024ec475f703cea2c2f13b5fd2f5519b2cc736e219473647eda28fb'
+- key: web/sessions/service.py:R6:SessionServiceImpl:archive_session:_sync:fp=a25339d18f9c9409
+  owner: john
+  reason: |-
+    RULE MISFIRES: the inner OSError is not silently lost: this handler attaches the failed restoration and manual-cleanup context to primary_exc, and the enclosing _sync exception handler executes its unconditional bare raise immediately afterward on every path. The original archive failure remains the raised exception with the restoration failure in its traceback note.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-29'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-31T21:43:37.364514+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES: the caught restoration OSError is explicitly preserved by adding its type, message, affected paths, session identifier, and manual-cleanup requirement to the primary exception. The enclosing SessionServiceImpl.archive_session._sync handler visibly reaches an unconditional bare raise after the restoration attempt on every path, so the original archive failure is propagated rather than silently suppressed. This is not an R1/R5 parameter-rooted Tier-3 boundary case, so the trust-boundary decorator does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 31a934d10f610d467901f21d13d0c371b18e3ccaee2a0c08d8994c3cbb4a7194
+  judge_transport: codex_cli
+  ast_path: 'body[154]/body[55]/body[2]/body[2]/handlers[0]/body[0]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:a39bbcc1cfabef8f0cdc872f2233d1bc5fc7c8f6a0c5b3dcf26360b55ecf0f51'
 per_file_rules:
 - pattern: web/composer/tools/_common.py
   rules:
