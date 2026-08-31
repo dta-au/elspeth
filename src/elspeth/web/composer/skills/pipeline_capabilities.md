@@ -53,7 +53,11 @@ repetition window but does not un-supply anything already read: a fact stays
 supplied for the whole request, so repair through step 3's structured-repair
 reads, which carry what a re-read cannot. Where your palette also carries
 state-mutating tools, a turn's calls apply in order against the state each one
-leaves behind, so a mutation and the read that confirms it may share one turn.
+leaves behind. When a successful mutation result includes `applied_component`,
+that field is the authoritative post-change state of everything it names; do
+not call `get_pipeline_state` to confirm those components. Use
+`get_pipeline_state` only for an untouched component, a whole-document
+question, or a successful mutation that omits the echo.
 
 An absent policy-visible plugin is different from an unsupported pipeline
 shape. Say that a plugin is unavailable or policy-denied only when live
