@@ -2136,6 +2136,24 @@ class TestModelCustody:
         assert "multi_query" in rules
         assert "does NOT create row fields" in rules
 
+    def test_known_business_columns_are_declared_at_the_sink_not_left_to_row_one(self) -> None:
+        """The planner must not promise a stable output shape and author an observed sink.
+
+        ``guaranteed_fields`` is a producer-presence contract, a coalesce has
+        no authored schema option, and a sink consumes rows rather than
+        producing them.  The stable CSV header therefore belongs in the
+        sink's explicit ``fields`` declaration (with an exact projection when
+        the user asked for exactly those columns), never in copied guarantee
+        metadata on every downstream component.
+        """
+        view, _snapshot = _trained_view()
+
+        rules = " ".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        assert "first accepted row" in rules
+        assert "sink schema.fields" in rules
+        assert "plugin-free coalesce" in rules
+        assert "guaranteed_fields on a sink" in rules
+
 
 class TestLlmSourceGenerationAid:
     def test_source_only_generation_uses_llm_source_without_transform_advice(self, tmp_path: Path) -> None:
@@ -2317,6 +2335,15 @@ class TestCoalesceVocabulary:
 
         coalesce = next(node for node in args["nodes"] if node["node_type"] == "coalesce")
         assert coalesce["input"] in set(coalesce["branches"].values())
+
+    def test_exemplar_does_not_put_a_noop_schema_on_the_structural_coalesce(self, tmp_path: Path) -> None:
+        """CoalesceSettings has no schema field; export drops NodeSpec options."""
+        view, _snapshot = _profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        coalesce = next(node for node in args["nodes"] if node["node_type"] == "coalesce")
+        assert coalesce["options"] == {}
 
 
 class TestNamedButMissingFile:

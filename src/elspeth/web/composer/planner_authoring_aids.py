@@ -826,6 +826,24 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "Sink hygiene: the auto-appended <response_field>_usage / _model audit "
     "fields ride the row automatically — do not map or require them into "
     "sinks unless the user asked for token/model reporting.",
+    # elspeth-15b400881f: the live planner named the three business columns in
+    # its reply but left the CSV sink observed, so the first accepted row — not
+    # reviewed configuration — chose the persisted header.  Keep the ownership
+    # distinctions in the same rule: an LLM plugin owns its emitted-field
+    # guarantee, a structural coalesce has no schema option to annotate, and a
+    # sink's fields are a consumer/output-shape declaration rather than a
+    # producer guarantee.
+    "When the user-facing output has known named business columns, declare "
+    "them in sink schema.fields with their types; do NOT leave that sink in "
+    "mode: observed after promising those columns, because an observed CSV "
+    "sink locks its header from the first accepted row. If the user asked for "
+    "exactly those columns, put a schema-proven select-only projection "
+    "immediately before the sink and use mode: fixed in the requested column "
+    "order; use mode: flexible only when additional columns are intentional. "
+    "Do not copy producer contracts onto structural components: a plugin-free coalesce "
+    "derives its effective guarantees from its branches and has no authored "
+    "schema option, while guaranteed_fields on a sink is not a header "
+    "declaration because a sink consumes rows rather than producing them.",
 )
 
 
@@ -2527,7 +2545,10 @@ def fork_coalesce_exemplar_args(
                 "branches": coalesce_branches,
                 "policy": "require_all",
                 "merge": "union",
-                "options": {"schema": {"mode": "observed"}},
+                # Structural CoalesceSettings owns no plugin schema.  A
+                # NodeSpec options.schema here is inert composer metadata and
+                # yaml_generator intentionally drops it at runtime lowering.
+                "options": {},
             },
             *control_nodes_after,
             {
