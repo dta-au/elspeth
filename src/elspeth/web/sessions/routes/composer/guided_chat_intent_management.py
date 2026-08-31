@@ -318,6 +318,19 @@ def _message_names_identifier(message: str, identifier: str) -> bool:
     return re.search(rf"(?<![a-z0-9_]){re.escape(identifier)}(?![a-z0-9_])", message.casefold()) is not None
 
 
+def _message_names_node_kind(message: str, node_kind: str) -> bool:
+    """Match a canonical node-kind word or its regular ``s`` plural.
+
+    This is deliberately separate from :func:`_message_names_identifier`:
+    ``collectors`` names a category in user prose, but it does not name a
+    catalog plugin whose exact identifier is ``collector``. All currently
+    taught node kinds pluralize by appending ``s`` (including ``coalesce`` ->
+    ``coalesces``); aliases and embedded identifiers remain out of scope.
+    """
+
+    return _message_names_identifier(message, node_kind) or _message_names_identifier(message, f"{node_kind}s")
+
+
 def _has_unmentioned_unavailable_action_identity(
     action: DeferredIntentAction,
     *,
@@ -398,8 +411,9 @@ def _retained_unverified_chat(
 def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepChatResult:
     """Explain an unavailable model-authored catalog identity the user never named.
 
-    The message is COMPOSED, not selected: a shared frame open, one teaching
-    clause per node kind the message names, and a shared frame close (filigree
+    The message is COMPOSED, not selected: a shared frame open; at most one
+    plugin-free clause plus the collector and aggregation clauses when the
+    message names those kinds; and a shared frame close (filigree
     elspeth-270e81443d, review comment 7977 §7.1). A message naming a collector
     AND a structural node gets BOTH clauses, and the frame is emitted once
     either way. Three reasons the collector teaching composes rather than
@@ -423,7 +437,7 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
       clause, plus a true but unsolicited collector definition) and HOMONYMS
       ("the garbage collector is slow" and "add a data collector for the survey"
       both emit the full EXPAND-scope paragraph, verified). Detecting negation
-      is banned — `_message_names_identifier` is a word-boundary regex with no
+      is banned — `_message_names_node_kind` is a word-boundary matcher with no
       notion of it, and a negation parse would fail in the opposite direction on
       "no gate, add a collector". Homonym disambiguation is worse still: it
       needs to know what the user meant. Tolerating both is the price of never
@@ -457,8 +471,8 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
     docstring did — WS6 requires every `node_type` dispatch site to carry "a
     collector arm or a deliberate documented exclusion", and the collector arm
     above already satisfies it. (This function is not really such a dispatch
-    site either: `_message_names_identifier` is a word-boundary regex over user
-    prose, not a dispatch on `node_type`.) Its field list is NOT the collector's and was
+    site either: `_message_names_node_kind` is a singular/plural word matcher
+    over user prose, not a dispatch on `node_type`.) Its field list is NOT the collector's and was
     verified separately against `state.py`'s aggregation arm, because the
     obvious guess is wrong in both directions: an aggregation's mandatory
     fields are `plugin` and `on_error` (`aggregation_missing_plugin`,
@@ -480,12 +494,10 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
     topology kind mistaken for an ordinary transform). A transform IS an
     ordinary transform, so there is no wrong inference to correct.
 
-    KNOWN GAPS in this arm, neither introduced here, both worth a reader's
-    caution. PLURALS silently miss: `_message_names_identifier` is
-    word-boundary, so "add collectors" and "add aggregations" emit no clause —
-    the tolerance argument above covers false POSITIVES only, and this is the
-    false negative. And the aggregation clause's "IS backed by a batch-transform
-    plugin" is enforced for a COLLECTOR at composer time
+    Node-kind matching deliberately accepts the exact canonical word and its
+    regular ``s`` plural, but no aliases or embedded identifiers. One known gap
+    remains worth a reader's caution: the aggregation clause's "IS backed by a
+    batch-transform plugin" is enforced for a COLLECTOR at composer time
     (`collector_plugin_not_batch_aware`) but for an aggregation only at RUN time
     (`orchestrator/aggregation.py`) — `CompositionState.validate()` accepts an
     aggregation whose plugin is not batch-aware. The sentence states the
@@ -503,18 +515,18 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
     """
     clauses: list[str] = []
     structural_node = next(
-        (node_type for node_type in _STRUCTURAL_NODE_TYPES if _message_names_identifier(user_message, node_type)),
+        (node_type for node_type in _STRUCTURAL_NODE_TYPES if _message_names_node_kind(user_message, node_type)),
         None,
     )
     if structural_node is not None:
         clauses.append(f"A {structural_node} is a built-in topology node, not a transform plugin. ")
-    if _message_names_identifier(user_message, "collector"):
+    if _message_names_node_kind(user_message, "collector"):
         clauses.append(
             "A collector is a built-in topology node that IS backed by a batch-transform plugin, and it closes "
             "an EXPAND scope — it needs scope_name, scope_opener and scope_policy. Name the batch behaviour you "
             "want and the scope it should close. "
         )
-    if _message_names_identifier(user_message, "aggregation"):
+    if _message_names_node_kind(user_message, "aggregation"):
         clauses.append(
             "An aggregation is a built-in topology node that IS backed by a batch-transform plugin, and it "
             "needs on_error; a trigger is optional and only ADDS early flushes, because the end-of-source "
