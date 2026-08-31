@@ -111,8 +111,9 @@ class TestFieldMapper:
         assert result.row is not None
         assert result.row.to_dict() == {"price": 12.5}
 
-    def test_rename_over_existing_field_updates_output_contract(self, ctx: PluginContext) -> None:
-        """An overwrite rename must not keep the overwritten field's stale type."""
+    def test_rename_over_existing_field_is_rejected_before_mutation(self, ctx: PluginContext) -> None:
+        """Direct process calls enforce the same no-overwrite contract as the executor."""
+        from elspeth.contracts.errors import PluginContractViolation
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         transform = FieldMapper(
@@ -131,15 +132,8 @@ class TestFieldMapper:
         )
         row = PipelineRow({"name": "Alice", "age": 40}, contract)
 
-        result = transform.process(row, ctx)
-
-        assert result.status == "success"
-        assert result.row is not None
-        assert result.row.to_dict() == {"age": "Alice"}
-        age_field = result.row.contract.get_field("age")
-        assert age_field.original_name == "Name"
-        assert age_field.python_type is str
-        assert result.row.contract.validate(result.row.to_dict()) == []
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            transform.process(row, ctx)
 
     def test_select_fields_only(self, ctx: PluginContext) -> None:
         """Only include specified fields (drop others)."""
@@ -931,13 +925,15 @@ class TestOutputSchemaConfig:
         assert by_name["b"].field_type == "str", "the target's authored declaration must survive when the source carries none"
 
     def test_rename_collision_is_described_by_the_source_that_lands_there(self) -> None:
-        """When a rename target is also an authored field, the SOURCE wins.
+        """Projection describes the attempted value even though runtime rejects it.
 
-        Regression: elspeth-a2bf676e6f. ``{"a": "b"}`` overwrites ``b`` with
-        ``a``'s value, so ``a``'s declaration describes the emitted column.
+        Regression: elspeth-a2bf676e6f. If ``{"a": "b"}`` could emit, ``a``'s
+        declaration would describe the value landing in ``b``.
         Preferring the target's authored declaration silently re-typed the
-        column and let the declared-output restamp stamp the wrong type over it.
+        attempted write. The independent collision contract then rejects the
+        occupied target before mutation.
         """
+        from elspeth.contracts.errors import PluginContractViolation
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         transform = FieldMapper(
@@ -952,12 +948,8 @@ class TestOutputSchemaConfig:
         by_name = {field.name: field for field in transform._output_schema_config.fields or ()}
         assert by_name["b"].field_type == "int"
 
-        result = transform.process(make_pipeline_row({"a": 1, "b": "orig"}), make_context())
-
-        assert result.status == "success"
-        assert result.row is not None
-        assert result.row.to_dict() == {"b": 1}
-        _run_post_emission_check(transform, result.row)
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            transform.process(make_pipeline_row({"a": 1, "b": "orig"}), make_context())
 
     def test_passthrough_keeps_unmapped_declarations_when_every_source_is_nameable(self) -> None:
         """The abstention above is scoped to unnameable removals, not to renames.
@@ -1895,13 +1887,14 @@ class TestSelectOnlyCannotTripTheCollisionGate:
         )
 
     def test_strict_select_only_declares_without_any_schema_promise(self) -> None:
-        """The elspeth-6ea3619737 family-1 shape: strict guarantees every target.
+        """The elspeth-6ea3619737 family-1 shape guarantees every target.
 
-        No ``guaranteed_fields``, no declared fields — ``strict: true`` alone
-        promises the source (a row missing it fails), so the target is honestly
-        declared. This is the config that lost 100% of rows under the
-        declaration-keyed gate; its safety now lives in the capability key,
-        pinned end-to-end in
+        No ``guaranteed_fields`` and no declared fields are needed: engine
+        dispatch requires every configured mapping source before ``process``,
+        so each successful row contains every target. ``strict: true`` remains
+        in this regression shape but is no longer the authority. This is the
+        config that lost 100% of rows under the declaration-keyed gate; its
+        safety now lives in the capability key, pinned end-to-end in
         ``tests/unit/engine/test_executors.py::TestTransformExecutor::
         test_select_only_field_mapper_rename_onto_occupied_name_survives_preflight``.
         """
@@ -2029,6 +2022,73 @@ class TestOpenBranchDeclarationChannelStability:
         transform = self._mapper({"mode": "observed"})
 
         assert transform.declared_output_fields == frozenset({"c"})
+
+    def test_open_branch_runtime_resolves_original_header_collisions(self) -> None:
+        """Lineage makes the uncertain collision decision at row time.
+
+        Static collision gates cannot know whether ``Name`` resolves to the
+        target itself (a runtime identity) or to another row key (a destructive
+        overwrite). The mapper must reject only the latter before mutation.
+        """
+        from elspeth.contracts.errors import PluginContractViolation
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        destructive = FieldMapper({"mapping": {"Name": "full_name"}, "schema": {"mode": "observed"}})
+        dynamic_identity = FieldMapper({"mapping": {"Name": "name"}, "schema": {"mode": "observed"}})
+        destructive_row = PipelineRow(
+            {"name": "Ada", "full_name": "Existing"},
+            SchemaContract(
+                mode="OBSERVED",
+                fields=(
+                    make_field("name", str, original_name="Name", required=False, source="inferred"),
+                    make_field("full_name", str, original_name="full_name", required=False, source="inferred"),
+                ),
+                locked=True,
+            ),
+        )
+        identity_row = PipelineRow(
+            {"name": "Ada"},
+            SchemaContract(
+                mode="OBSERVED",
+                fields=(make_field("name", str, original_name="Name", required=False, source="inferred"),),
+                locked=True,
+            ),
+        )
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            destructive.process(destructive_row, make_context())
+
+        result = dynamic_identity.process(identity_row, make_context())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict() == {"name": "Ada"}
+
+    def test_runtime_lineage_cannot_hide_an_overlapping_rename_graph(self) -> None:
+        """A resolved source key may reveal the overlap config could not see."""
+        from elspeth.contracts.errors import PluginContractViolation
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"a": "b", "Weird Header": "c"},
+                "schema": {"mode": "observed"},
+            }
+        )
+        row = PipelineRow(
+            {"a": "first", "b": "second"},
+            SchemaContract(
+                mode="OBSERVED",
+                fields=(
+                    make_field("a", str, original_name="a", required=False, source="inferred"),
+                    make_field("b", str, original_name="Weird Header", required=False, source="inferred"),
+                ),
+                locked=True,
+            ),
+        )
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            transform.process(row, make_context())
 
 
 class TestFieldMapperDerivedInputRequirement:

@@ -476,6 +476,11 @@ class BaseTransform(ABC):
     # It says nothing about which rows are emitted — batch_outlier_annotator
     # declares True while dropping whole rows, which is why this is a separate
     # declaration rather than a relaxation of `passes_through_input`.
+    # With an extras-allowing output contract, presence-guarantee walks may
+    # therefore propagate predecessor guarantees through this declaration
+    # after subtracting ``removed_input_fields``; every successful row carries
+    # that lower bound. A fixed output contract is a firewall. Extras-direction
+    # walks use the same presence fact with the opposite safety polarity.
     #
     # `removed_input_fields` is per-INSTANCE (it is computed from config —
     # line_explode's `source_field`, field_mapper's rename sources), so

@@ -17,6 +17,7 @@ from pydantic import Field, model_validator
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
+from elspeth.contracts.errors import PluginContractViolation
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
 from elspeth.contracts.schema_contract import PipelineRow
@@ -171,8 +172,8 @@ class FieldMapperConfig(TransformDataConfig):
     strict: bool = Field(
         default=False,
         description=(
-            "When true, fail if any mapped source field is missing from an input row. "
-            "Dotted and unresolved original-header sources also route on a miss when false."
+            "Controls direct process() calls for a missing normalized source. Normal engine execution requires every "
+            "configured source before process(); dotted and unresolved original-header misses always route."
         ),
     )
 
@@ -310,7 +311,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4f4ac18326922086"
+    source_file_hash: str | None = "sha256:79de7f8d5fa10ecc"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -628,6 +629,39 @@ class FieldMapper(BaseTransform):
         """
         # Keep a normalized dict view only for validation and dotted-path lookups.
         row_data = row.to_dict()
+
+        # The generic executor collision gate handles every statically
+        # nameable open-branch rename. An original-header source is the one
+        # class it cannot adjudicate: construction cannot know whether lineage
+        # resolves it to the target itself (a runtime identity) or to another
+        # row key (a destructive overwrite). Decide that distinction against
+        # this row before mutating the copied payload. This also catches a
+        # rename graph hidden by source ``field_mapping`` — a later original
+        # header resolving to an earlier target — before mapping order can
+        # delete a target the output contract guarantees.
+        if not self._select_only:
+            collisions: set[str] = set()
+            for source, target in self._mapping.items():
+                if target not in row_data or source not in row:
+                    continue
+                if "." in source:
+                    # Dotted reads never consume the flat target field.
+                    collisions.add(target)
+                    continue
+                try:
+                    resolved_source = row.contract.resolve_name(source)
+                except KeyError:
+                    # OBSERVED/FLEXIBLE extras are addressed by their literal
+                    # payload key, matching PipelineRow.__getitem__.
+                    resolved_source = source
+                if resolved_source != target:
+                    collisions.add(target)
+            if collisions:
+                raise PluginContractViolation(
+                    f"Transform '{self.name}' would overwrite existing input fields "
+                    f"{sorted(collisions)}. This is a pipeline configuration error — the transform's "
+                    f"output fields collide with fields already present in the row."
+                )
 
         # Start with empty or copy depending on select_only
         if self._select_only:

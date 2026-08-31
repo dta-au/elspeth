@@ -265,13 +265,14 @@ class NodeInfo:
     # nodes; non-False value on any non-TRANSFORM node raises GraphValidationError.
     passes_through_input: bool = False
 
-    # Field-forwarding declaration for the EXTRAS direction (elspeth-15c72686f2).
+    # Field-forwarding declaration (elspeth-15c72686f2).
     # Populated for TRANSFORM and AGGREGATION nodes by the builder from
-    # TransformProtocol.forwards_input_fields / removed_input_fields. Consumed
-    # ONLY by walk_definite_emitted_fields, the extras-direction walk — never by
-    # the presence-direction walk_effective_guarantee_vote, whose callers read a
-    # wider guarantee set as PERMISSION (missing-arm forgiveness, sink required
-    # fields) rather than as grounds to reject.
+    # TransformProtocol.forwards_input_fields / removed_input_fields. Both the
+    # presence and definite-emits walks propagate predecessor lower bounds
+    # through the named subtraction when the node's output contract allows
+    # extras; a fixed contract is a firewall. This is sound for permission
+    # consumers: every SUCCESS row carries those fields even when the transform
+    # may drop whole rows; it is not a completeness claim.
     #
     # Scoped like passes_through_input (TRANSFORM+AGGREGATION) rather than like
     # declared_output_fields (TRANSFORM-only): batch_outlier_annotator is wired

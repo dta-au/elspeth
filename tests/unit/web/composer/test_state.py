@@ -5988,17 +5988,13 @@ class TestSchemaContractValidation:
         assert sink_contract.satisfied is False
         assert "text" in sink_contract.missing_fields
 
-    def test_sink_required_fields_abstaining_producer_defers_to_runtime(self) -> None:
-        """An abstaining producer must not fail the sink required-fields check.
+    def test_sink_required_fields_accepts_mapper_derived_target_guarantee(self) -> None:
+        """Configured mapping sources make every target present on success.
 
-        Mirror of the runtime abstention clause in
-        ``core/dag/schema_validation.py::validate_sink_required_fields``:
-        when the producer's guarantee vote is (no fields, did not participate),
-        the static check defers to per-row runtime validation instead of
-        rejecting. A select_only field_mapper with an observed schema and no
-        local guaranteed_fields abstains exactly this way — the tutorial's
-        accepted transform chain (elspeth-3283f2eaec) was permanently blocked
-        because the composer hard-failed where the runtime would build and run.
+        The executor dispatches any row missing a configured source before
+        ``process``. The mapper therefore participates with its derived target
+        guarantees even when its authored observed schema has no local
+        ``guaranteed_fields``.
         """
         state = self._empty_state()
         state = state.with_source(
@@ -6033,24 +6029,13 @@ class TestSchemaContractValidation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         result = state.validate()
         assert result.is_valid, result.errors
-        # No static claim either way: the edge renders as "not yet checked",
-        # not as a satisfied contract the composer cannot actually vouch for.
-        assert not any(ec.to_id == "output:main" for ec in result.edge_contracts)
+        sink_contract = next(ec for ec in result.edge_contracts if ec.to_id == "output:main")
+        assert sink_contract.producer_guarantees == ("summary", "url")
+        assert sink_contract.satisfied is True
 
-    @pytest.mark.parametrize(
-        ("proven_sources", "expected_targets", "expected_missing"),
-        [
-            (("raw_url", "raw_summary"), ("summary", "url"), ()),
-            (("raw_url",), ("url",), ("summary",)),
-        ],
-    )
-    def test_guided_select_only_mapper_declares_only_proven_guarantees(
-        self,
-        proven_sources: tuple[str, ...],
-        expected_targets: tuple[str, ...],
-        expected_missing: tuple[str, ...],
-    ) -> None:
-        """Guided cleanup earns a positive verdict without guessing missing fields."""
+    @pytest.mark.parametrize("proven_sources", [("raw_url", "raw_summary"), ("raw_url",)])
+    def test_guided_select_only_mapper_declares_all_derived_target_guarantees(self, proven_sources: tuple[str, ...]) -> None:
+        """Upstream schema lower bounds do not narrow successful-row outputs."""
         state = self._empty_state()
         state = state.with_source(
             self._make_source(
@@ -6085,10 +6070,10 @@ class TestSchemaContractValidation:
 
         result = state.validate()
         sink_contract = next(ec for ec in result.edge_contracts if ec.to_id == "output:main")
-        assert result.is_valid is (not expected_missing)
-        assert sink_contract.satisfied is (not expected_missing)
-        assert sink_contract.producer_guarantees == expected_targets
-        assert sink_contract.missing_fields == expected_missing
+        assert result.is_valid
+        assert sink_contract.satisfied is True
+        assert sink_contract.producer_guarantees == ("summary", "url")
+        assert sink_contract.missing_fields == ()
 
     def test_sink_required_fields_inherited_participation_still_fails(self) -> None:
         """A pass-through downstream of a participating producer cannot abstain.
@@ -8590,6 +8575,85 @@ class TestSchemaContractValidation:
         rule_d_errors = [e for e in result.errors if e.component == "node:rename" and e.error_code == "transform_contract_violation"]
         assert rule_d_errors, f"Expected a Rule D rejection naming c, got: {[e.message for e in result.errors]}"
         assert "[c] already arrive(s) on its input row" in rule_d_errors[0].message
+
+    def test_rule_d_abstains_when_original_header_collision_depends_on_runtime_lineage(self) -> None:
+        """Static validation must not reject a possible runtime identity.
+
+        Composer knows ``full_name`` arrives but cannot know whether ``Name``
+        resolves to that same field or to a different normalized/source-mapped
+        key. FieldMapper's row-aware guard owns the uncertain collision; Rule D
+        remains reserved for provable collisions.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "observed", "guaranteed_fields": ["name", "full_name"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"Name": "full_name"},
+                    "select_only": False,
+                    "schema": {"mode": "observed"},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        rule_d_errors = [e for e in result.errors if e.component == "node:rename" and e.error_code == "transform_contract_violation"]
+        assert not rule_d_errors, [e.message for e in rule_d_errors]
+
+    def test_open_mapper_propagates_guaranteed_passthrough_to_sink_contract(self) -> None:
+        """The local target lower bound composes with forwarded predecessor fields."""
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "fixed", "fields": ["a: str", "keep: str"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"a": "b"},
+                    "select_only": False,
+                    "schema": {"mode": "observed"},
+                },
+            )
+        )
+        state = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={
+                    "schema": {
+                        "mode": "fixed",
+                        "fields": ["keep: str", "b: str?"],
+                        "required_input_fields": ["keep"],
+                    }
+                },
+                on_write_failure="discard",
+            )
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+        sink_contract = next(contract for contract in result.edge_contracts if contract.to_id == "output:main")
+        assert sink_contract.producer_guarantees == ("b", "keep")
+        assert sink_contract.satisfied is True
 
     def test_rule_d_fires_on_a_required_fields_rename_onto_a_guaranteed_field(self) -> None:
         """Third declaration channel (adversarial review of a7c783423): required_fields.

@@ -1623,6 +1623,111 @@ class TestTransformExecutor:
         with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
             executor.execute_transform(transform, token, ctx)
 
+    def test_open_branch_unresolved_original_header_collision_still_raises(self) -> None:
+        """Removal-name abstention must not disarm the independent write gate.
+
+        An original-header source is resolved only against row lineage, so the
+        mapper cannot truthfully declare which input key it removes and leaves
+        ``forwards_input_fields`` false. The open branch still deep-copies the
+        row before writing ``full_name``; an existing target is therefore a
+        real silent overwrite, not the fresh-dict behavior of ``select_only``.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = FieldMapper(
+            {
+                "mapping": {"Name": "full_name"},
+                "select_only": False,
+                "schema": {"mode": "observed"},
+            }
+        )
+        transform.node_id = "fm_open_original"
+        transform.on_error = "discard"
+        contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field("name", python_type=str, original_name="Name", required=False, source="inferred"),
+                make_field("full_name", python_type=str, original_name="full_name", required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        token = _make_token(
+            data={"name": "Ada", "full_name": "Existing"},
+            token_id="tok_open_original",
+            contract=contract,
+        )
+        ctx = make_context()
+        transform.on_start(ctx)
+
+        assert transform.forwards_input_fields is False
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            executor.execute_transform(transform, token, ctx)
+
+    def test_field_mapper_mapping_source_is_dispatched_as_a_required_input(self) -> None:
+        """The executor enforces d4's derived source before non-strict process()."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = FieldMapper(
+            {
+                "mapping": {"maybe_field": "output"},
+                "select_only": True,
+                "strict": False,
+                "schema": {"mode": "observed"},
+            }
+        )
+        transform.node_id = "fm_required_source"
+        transform.on_error = "discard"
+        ctx = make_context()
+        transform.on_start(ctx)
+
+        missing_contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(make_field("other", python_type=str, original_name="other", required=False, source="inferred"),),
+            locked=True,
+        )
+        present_contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field(
+                    "maybe_field",
+                    python_type=str,
+                    original_name="maybe_field",
+                    required=False,
+                    source="inferred",
+                ),
+            ),
+            locked=True,
+        )
+
+        with pytest.raises(DeclaredRequiredInputFieldsViolation, match="maybe_field"):
+            executor.execute_transform(
+                transform,
+                _make_token(
+                    data={"other": "value"},
+                    token_id="tok_missing_mapping_source",
+                    contract=missing_contract,
+                ),
+                ctx,
+            )
+
+        result, updated_token, error_sink = executor.execute_transform(
+            transform,
+            _make_token(
+                data={"maybe_field": "value"},
+                token_id="tok_present_mapping_source",
+                contract=present_contract,
+            ),
+            ctx,
+        )
+
+        assert result.status == "success"
+        assert error_sink is None
+        assert updated_token.row_data.to_dict() == {"output": "value"}
+
     def test_empty_declared_output_fields_skips_collision_check(self) -> None:
         """Transform with empty declared_output_fields passes through without collision check.
 

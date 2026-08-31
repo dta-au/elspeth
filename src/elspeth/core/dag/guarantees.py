@@ -144,9 +144,12 @@ def get_effective_guaranteed_fields(graph: ExecutionGraph, node_id: str) -> froz
     """Get effective output guarantees for a node (propagation-aware).
 
     Per ADR-007, this method is the propagation-aware implementation.
-    For a TRANSFORM node whose plugin declared ``passes_through_input=True``,
-    the effective guarantees are the intersection of its participating
-    predecessors' guarantees unioned with the node's own declared fields.
+    For a TRANSFORM node whose plugin declared ``passes_through_input=True`` or
+    ``forwards_input_fields=True``, the effective guarantees are the
+    intersection of its participating predecessors' guarantees unioned with
+    the node's own declared fields. A forwarding node first subtracts its
+    ``removed_input_fields`` from each predecessor vote; a fixed output
+    contract stops that forwarding as an extras firewall.
     For all other nodes, returns the node's own declarations (same as
     ``get_guaranteed_fields``).
 
@@ -300,7 +303,7 @@ def walk_effective_guarantee_vote(
                 )
             else:
                 result = EffectiveGuaranteeVote(fields=frozenset(), participated=False, closed=False)
-    elif node_info.passes_through_input or is_transparent_gate:
+    elif node_info.passes_through_input or (node_info.forwards_input_fields and not own_closed) or is_transparent_gate:
         predecessors = list(graph._graph.predecessors(node_id))
         if not predecessors and is_transparent_gate:
             # Hand-built test graphs may install a gate without wiring its
@@ -314,9 +317,10 @@ def walk_effective_guarantee_vote(
             )
         else:
             predecessor_votes = [walk_effective_guarantee_vote(graph, pred_id, cache, field_cache) for pred_id in predecessors]
+            removals = frozenset() if node_info.passes_through_input else node_info.removed_input_fields
             result_fields = compose_propagation(
                 own_fields,
-                [vote.fields if vote.participated else None for vote in predecessor_votes],
+                [vote.fields - removals if vote.participated else None for vote in predecessor_votes],
             )
             # Closedness does NOT compose the way participation does, and this
             # is the asymmetry that made the elspeth-9c5ff8fa7d family a false
@@ -374,8 +378,8 @@ def walk_effective_guaranteed_fields(
     and re-walking. Public callers go through ``get_effective_guaranteed_fields``
     which allocates a fresh per-call cache.
 
-    For pass-through transforms, delegates the aggregation step to
-    ``compose_propagation`` (ADR-009 §Clause 1). Predecessor
+    For pass-through and forwarding transforms, delegates the aggregation step
+    to ``compose_propagation`` (ADR-009 §Clause 1). Predecessor
     participation is checked via ``SchemaConfig.participates_in_propagation``
     — the canonical predicate that both this walker and the composer's
     preview walker consult.

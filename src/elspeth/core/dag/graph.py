@@ -215,9 +215,9 @@ class ExecutionGraph:
             forwards_input_fields: For TRANSFORM/AGGREGATION nodes only — True
                 iff every SUCCESS row carries every input field EXCEPT
                 removed_input_fields. Weaker than passes_through_input, which
-                admits no removals and no dropped rows; read only by the
-                extras-direction walk_definite_emitted_fields
-                (elspeth-15c72686f2). No derivation from schema config when
+                admits no removals and no dropped rows; read by both the
+                presence and extras-direction walks (elspeth-15c72686f2). No
+                derivation from schema config when
                 omitted, for the same reason its declaration siblings above
                 cite: the removal set is computed from plugin options
                 (line_explode's source_field, field_mapper's rename sources)

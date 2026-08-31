@@ -327,18 +327,18 @@ class TestDefiniteEmitsIsSeparateFromTheGuaranteeWalk:
     def _explode_node(self, graph: ExecutionGraph) -> str:
         return next(node_id for node_id in graph._graph.nodes if graph.get_node_info(node_id).plugin_name == "line_explode")
 
-    def test_presence_walk_is_unchanged_at_a_forwarding_node(self) -> None:
-        """The permissive direction must NOT widen.
+    def test_presence_walk_propagates_forwarded_guarantees(self) -> None:
+        """A forwarding declaration is a success-row presence guarantee.
 
-        ``get_effective_guaranteed_fields`` feeds sink required-field
-        clearance, ``check_compatibility``'s missing-arm forgiveness, and the
-        forgiven-field type walk — all of which read a wider set as PERMISSION.
-        Widening it to close this gap would have loosened three gates to fix one.
+        Whole rows may be dropped, but every row the transform successfully
+        emits retains its predecessor fields except the named removals. The
+        presence walk may therefore carry the upstream lower bound through the
+        same subtraction without claiming a complete emit set.
         """
         graph = self._explode_graph()
         explode_node = self._explode_node(graph)
 
-        assert get_effective_guaranteed_fields(graph, explode_node) == frozenset({"sentence"})
+        assert get_effective_guaranteed_fields(graph, explode_node) == frozenset({"sentence"}) | _METADATA_EXTRAS
 
     def test_extras_walk_sees_the_forwarded_metadata(self) -> None:
         graph = self._explode_graph()
@@ -561,6 +561,54 @@ class TestForwardingParityAcrossTheDeclaringClass:
             sink=TextSink(_locked_text_sink_options(field="body")),
             sink_name="body_rows",
         )
+
+    def test_field_mapper_forwards_an_unmapped_required_sink_field(self) -> None:
+        """A local target guarantee must not hide a guaranteed passthrough field.
+
+        The mapper emits ``b`` itself and forwards upstream ``keep``. Treating
+        its local guarantee as the complete presence answer rejects this
+        runnable graph even though the extras walk independently sees both.
+        """
+        source_options = {
+            "path": "data/in.csv",
+            "schema": {"mode": "fixed", "fields": ["a: str", "keep: str"]},
+            "on_validation_failure": "discard",
+        }
+        mapper_options = {
+            "mapping": {"a": "b"},
+            "select_only": False,
+            "schema": {"mode": "observed"},
+        }
+        sink_options = {
+            "path": "outputs/keep.txt",
+            "field": "keep",
+            "schema": {"mode": "fixed", "fields": ["keep: str", "b: str?"]},
+            "mode": "write",
+            "collision_policy": "auto_increment",
+        }
+
+        graph = _build_graph(
+            source_plugin=CSVSource(source_options),
+            source_plugin_name="csv",
+            source_options=source_options,
+            source_connection="rows",
+            transforms=[
+                _wired(
+                    FieldMapper(mapper_options),
+                    name="mapped",
+                    plugin_name="field_mapper",
+                    input_conn="rows",
+                    on_success="mapped_rows",
+                    options=mapper_options,
+                )
+            ],
+            sink=TextSink(sink_options),
+            sink_name="mapped_rows",
+        )
+        mapper_node = next(node_id for node_id in graph._graph.nodes if graph.get_node_info(node_id).plugin_name == "field_mapper")
+
+        assert get_effective_guaranteed_fields(graph, mapper_node) == frozenset({"b", "keep"})
+        assert get_definite_emitted_fields(graph, mapper_node) == frozenset({"b", "keep"})
 
 
 class TestForwardingRespectsTheNodesOwnExtrasFirewall:

@@ -4432,12 +4432,15 @@ def _check_schema_contracts(
             if transform is not None:
                 transform.close()
 
-        if is_pass_through_instance:
+        forwards_input = transform.forwards_input_fields
+        forwards_through_open_contract = forwards_input and (output_schema_config is None or output_schema_config.allows_extra_fields)
+        if is_pass_through_instance or forwards_through_open_contract:
             base = output_schema_config.get_effective_guaranteed_fields() if output_schema_config is not None else frozenset()
             inherited_participates, inherited_fields = _connection_propagation_vote(
                 producer_node.input,
                 visited_fan_in_ids=visited_fan_in_ids,
             )
+            removals = frozenset() if is_pass_through_instance else transform.removed_input_fields
             # ADR-009 §Clause 1: share the aggregation rule with graph.py.
             # Composer's producer-graph is single-upstream at this level
             # (coalesce absorbs fan-in via pre-computed output), so we pass a
@@ -4453,7 +4456,7 @@ def _check_schema_contracts(
             # validate_sink_required_fields rejects accordingly).
             return (
                 own_participates or inherited_participates,
-                compose_propagation(base, [inherited_fields if inherited_participates else None]),
+                compose_propagation(base, [inherited_fields - removals if inherited_participates else None]),
             )
 
         if output_schema_config is None:
@@ -6138,9 +6141,10 @@ def _check_schema_contracts(
     # is framework drift, not an author-repairable schema choice.
     #
     # Why this is plugin-scoped rather than generic: ``_output_schema_config.
-    # guaranteed_fields`` has plugin-specific semantics. For field_mapper it
-    # IS the actual emit set (computed by ``_build_field_mapper_output_schema_config``
-    # from the mapping). For additive plugins like ``line_explode``/``web_scrape``
+    # guaranteed_fields`` has plugin-specific semantics. For a select-only
+    # field_mapper it IS the actual emit set (computed by
+    # ``_build_field_mapper_output_schema_config`` from the mapping). For
+    # additive plugins like ``line_explode``/``web_scrape``
     # it is a *lower bound* on emission (only the fields the transform itself
     # adds — passes-through input fields are not enumerated), so a generic
     # ``get_effective_guaranteed_fields() - guaranteed_fields`` check would
