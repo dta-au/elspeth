@@ -351,6 +351,22 @@ _SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
     "facts or blob metadata handed you) binds through source options.path, "
     "copied verbatim. source.blob_id accepts ONLY the UUID a blob tool "
     "returned this session — a path in blob_id is always rejected.",
+    # Session 891b7b1e turn 2: the planner sent source: null intending
+    # 'keep the existing source' and burned a repair turn on the rejection.
+    "set_pipeline is a FULL replacement: source: null never means 'keep "
+    "the current source'. A rebuild must re-supply the source explicitly — "
+    "copy the existing blob_id (from get_pipeline_state or list_blobs) "
+    "into source.blob_id, or resend inline_blob.",
+    # Session 891b7b1e turn 1: the planner fabricated rows at the user's
+    # request, then narrated its own content as 'the system auto-generated
+    # placeholder content' — a provenance inversion in an audit-grade tool.
+    "Content YOU fabricated at the user's request ('make up N rows', "
+    "'invent sample complaints') is planner-authored, not discovered: bind "
+    "it via inline_blob, stage the invented_source interpretation review, "
+    "and narrate it in FIRST PERSON — 'I generated this content as you "
+    "asked' — never as something 'the system' produced or you found. "
+    "Reading a blob you authored this turn back through get_blob_content "
+    "does not make its content external.",
 )
 
 _INLINE_EXEMPLAR_FILENAME: Final[str] = "stock_levels.csv"
@@ -712,12 +728,37 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "flattened out of the reply.",
     "Downstream nodes may require only that response field (plus fields "
     "passed through from the node's input). To obtain several named result "
-    "fields from one llm node, use the plugin's multi_query mechanism — its "
-    "schema declares the per-query output fields, and it is the ONLY blessed "
-    "multi-field shape.",
+    "fields from one llm node, use one of the TWO blessed shapes: the "
+    "plugin's multi_query mechanism (its schema declares the per-query "
+    "output fields), or — in single-prompt mode — the top-level "
+    "response_format + output_fields pair, whose extracted fields land "
+    "UNPREFIXED: each entry becomes a row field named exactly its suffix.",
     "If a prompt asks for structured JSON anyway, the JSON arrives as one "
     "string in the response field; wire a schema-proven parser transform "
     "when downstream nodes need its keys as row fields.",
+    # Session 891b7b1e: a free-text 'reply with only the category word'
+    # prompt fed reference_join key_field with on_miss:fail + on_error:
+    # discard — one 'Billing.' or lowercase reply silently drops the row.
+    # The API-native constraint exists and was untaught.
+    "When an llm node's output field feeds a downstream EXACT-MATCH "
+    "consumer — a reference_join key_field, a gate condition comparing "
+    "against literals, or any lookup key — declare that field via "
+    "output_fields with type: 'enum' and the closed values list, and set "
+    "response_format: 'structured' so the constraint is API-enforced "
+    "(off-vocabulary replies become structurally impossible). Never rely "
+    "on a free-text prompt instruction for a value another node matches "
+    "exactly: reference_join has no normalization option, so one "
+    "mis-spelled, punctuated, or re-cased reply errors the join and, "
+    "under on_error: 'discard', silently drops the row.",
+    # Session 891b7b1e: hitting an Any/str edge mismatch, the planner
+    # widened field_mapper AND the sink's fixed schema to 'any' instead of
+    # narrowing once at a type_coerce.
+    "A producer's any-typed field (json_explode, blob_json_expand, "
+    "value_transform outputs) is narrowed by inserting a type_coerce "
+    "transform (options.conversions: [{field, to}]) with its defined "
+    "per-conversion error path — never by widening every downstream "
+    "consumer's declared type to 'any', which erases the contract the "
+    "consumers rely on.",
     # ── multi_query QueryDefinition contract (run-2 G2: the blessed-shape
     # mandate above shipped without the shape's contract) ─────────────────
     "queries is a mapping of query name to a query OBJECT (list form needs "
@@ -782,7 +823,10 @@ _REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
     "Do not author rows for llm_prompt_template or llm_model_choice — "
     "required LLM reviews auto-stage on every llm node. The planner-owned "
     "kinds are vague_term (wired via prompt_template_parts), registered "
-    "pipeline_decision, and invented_source.",
+    "pipeline_decision, and invented_source. Auto-staged LLM reviews "
+    "surface at TURN END against the final frozen pipeline skeleton — an "
+    "intermediate valid=True preview mid-turn is not a completion signal; "
+    "finish mutating and the backend surfaces the reviews itself.",
     "NEVER author a pipeline_decision row with user_term "
     "required_control_auto_wired — that disclosure is staged exclusively by "
     "the server's required-control auto-wire pass, and a hand-authored row "
@@ -2566,7 +2610,14 @@ def fork_row_union_exemplar_args(
                 "plugin": "field_mapper",
                 "input": "unioned_rows",
                 "on_success": "main",
-                "on_error": "discard",
+                # Deliberately NOT 'discard': the aids corpus must carry at
+                # least one validated non-discard failure route, or every
+                # worked exemplar teaches silent row loss as the house style
+                # (elspeth-0aace271b4 I2). 'discard' costs the failed row's
+                # CONTENT — the audit trail keeps only the record of the
+                # drop — so the retention-shaped edge routes to a declared
+                # quarantine sink instead.
+                "on_error": "failed_rows",
                 "options": {
                     "schema": {
                         "mode": "flexible",
@@ -2591,7 +2642,19 @@ def fork_row_union_exemplar_args(
                     "collision_policy": "auto_increment",
                 },
                 "on_write_failure": "discard",
-            }
+            },
+            {
+                "sink_name": "failed_rows",
+                "plugin": "json",
+                "options": {
+                    "path": "outputs/row_union_failed_rows.json",
+                    "format": "json",
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            },
         ],
         "metadata": {
             "name": "Fork and release row variants",
