@@ -399,11 +399,11 @@ describe("workspace pane state", () => {
 
       act(() => {
         result.current.selectArtifactTab("run");
-        result.current.openInspector("audit");
+        result.current.openInspector("history");
       });
 
       expect(result.current.activeArtifactTab).toBe("run");
-      expect(result.current.activeInspectorTab).toBe("audit");
+      expect(result.current.activeInspectorTab).toBe("history");
       expect(result.current.inspectorOpen).toBe(true);
       expect(localStorage.getItem(WORKSPACE_LAYOUT_STORAGE_KEY)).toBeNull();
 
@@ -507,7 +507,7 @@ describe("workspace pane state", () => {
       act(() => {
         if (committedController === null) throw new Error("controller not committed");
         committedController.selectArtifactTab("run");
-        committedController.openInspector("audit");
+        committedController.openInspector("history");
       });
       observations.length = 0;
 

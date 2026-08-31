@@ -238,6 +238,50 @@
   animation: artifact-tab-badge-pulse 1.6s ease-in-out infinite;
 }
 
+/* The Checks tab's badge is PERSISTENT — unlike the Run dot it outlives any
+   toast — so per the contract above the glyph form is mandatory for every
+   settled verdict: the finding count, ✓ for the all-clear, ! for a
+   zero-count failure. It follows the .status-badge tint-plus-tone-text
+   pairing already proven for contrast on every surface in both themes;
+   the dot forms (neutral "not checked", busy pulse below) carry no verdict
+   and stay colour-quiet on purpose — green means checked-and-clean, never
+   merely "nothing red yet". */
+.artifact-tab-badge--glyph {
+  width: auto;
+  height: auto;
+  min-width: 1.4em;
+  padding: 0 0.35em;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.5;
+  text-align: center;
+  background-color: var(--color-surface-elevated);
+}
+
+.artifact-tab-badge--glyph[data-tone="success"] {
+  background-color: var(--color-success-bg);
+  color: var(--color-success);
+}
+
+.artifact-tab-badge--glyph[data-tone="warning"] {
+  background-color: var(--color-warning-bg);
+  color: var(--color-warning);
+}
+
+.artifact-tab-badge--glyph[data-tone="error"] {
+  background-color: var(--color-error-bg);
+  color: var(--color-error);
+}
+
+/* In-flight checks share the live pulse; reduced-motion stills it below,
+   which degrades busy to the same neutral dot — deliberate, matching the
+   Run badge's reduced-motion contract (the settled verdict that follows is
+   what carries information, and it always arrives in glyph form). */
+.artifact-tab-badge[data-tone="busy"] {
+  animation: artifact-tab-badge-pulse 1.6s ease-in-out infinite;
+}
+
 @keyframes artifact-tab-badge-pulse {
   0%,
   100% {
@@ -255,6 +299,15 @@
   min-width: 0;
   min-height: 0;
   overflow: auto;
+}
+
+/* Checks panel: a plain vertical stack — the validation banner and audit
+   readiness panel each carry their own card chrome. */
+.checks-view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  padding: var(--space-md);
 }
 
 .artifact-workspace-panel[hidden] {
@@ -447,61 +500,6 @@
   margin-inline-start: var(--workspace-bar-gap);
 }
 
-.workspace-status-controls {
-  display: flex;
-  gap: var(--workspace-bar-gap);
-  align-items: center;
-}
-
-.workspace-status-control {
-  display: inline-flex;
-  gap: var(--space-1-5);
-  align-items: center;
-
-  /* One control register for the whole strip. These chips used to sit at
-     --size-control-compact beside 44px .btn completion buttons, leaving a 4px
-     step at BOTH edges of one 8px-padded row, so the strip read as two bars
-     that failed to align. Promoted rather than demoting the primaries: the
-     collapse control below is pinned to --size-control expressly to register
-     against this row (elspeth-5413e4221e). */
-  min-height: var(--size-control);
-}
-
-/* "busy" is not-yet-known; "warning" is known-to-be-wrong. Sharing the amber
-   border made an ordinary in-flight readiness check ("Audit Checking") read as
-   a genuine warning on a screen with nothing wrong with it. --color-info is
-   the hue this app already spends on in-progress (--color-status-running is
-   the same token) (elspeth-7161879770).
-
-   Settled verdicts also carry a fill tint (recut 2026-08-15, operator
-   decision): green when good, amber/red when not, using the same 10-14%
-   alpha semantic-bg tokens the inline banners spend, so a glance at the bar
-   answers "is this pipeline clean" without reading the chip text. The text
-   itself stays the information carrier (WCAG 1.4.1) — the tint is
-   reinforcement, never the sole signal. busy and neutral deliberately keep
-   the plain surface: in-flight and not-yet-checked are neither good nor
-   bad, and tinting them would dilute the verdict states. warning and error
-   stay DISTINCT hues (amber vs red) — that split is the same deliberate
-   information the border colors already encode. */
-.workspace-status-control[data-tone="busy"] {
-  border-color: var(--color-info, currentcolor);
-}
-
-.workspace-status-control[data-tone="success"] {
-  border-color: var(--color-success-border, currentcolor);
-  background-color: var(--color-success-bg, transparent);
-}
-
-.workspace-status-control[data-tone="warning"] {
-  border-color: var(--color-warning, currentcolor);
-  background-color: var(--color-warning-bg, transparent);
-}
-
-.workspace-status-control[data-tone="error"] {
-  border-color: var(--color-error, currentcolor);
-  background-color: var(--color-error-bg, transparent);
-}
-
 /* The More-actions popover that used to hold the bar's right edge was
    retired 2026-08-15 (its last item, the Plugin catalog, moved to
    .artifact-toolbar-actions above); the bar's clusters now sit
@@ -602,7 +600,7 @@
   background: var(--color-surface, Canvas);
 }
 
-/* Same busy/warning split as .workspace-status-control (elspeth-7161879770).
+/* Same busy/warning split the retired status chips used (elspeth-7161879770).
    TWO tone sources, both live, per ComposerWorkspace's collapsedStatus prop
    contract: a {text, tone} projection stamps data-tone on the affordance
    wrapper itself, while the production App-owned ReactNode carries its tone
@@ -903,8 +901,7 @@
    Deriving the height from the token — no vertical padding, content centred —
    is the same construction .artifact-workspace-toolbar uses, so all of them
    compress together (elspeth-7bd392c0dc). */
-.workspace-inspector-header,
-.workspace-inspector-tabs {
+.workspace-inspector-header {
   display: flex;
   flex: 0 0 auto;
   gap: var(--space-sm);
@@ -912,9 +909,6 @@
   justify-content: space-between;
   min-height: var(--size-workspace-band);
   padding: 0 var(--artifact-gutter);
-}
-
-.workspace-inspector-header {
   border-bottom: 1px solid var(--color-border, currentcolor);
 }
 
@@ -930,10 +924,6 @@
   line-height: var(--line-height-heading);
 }
 
-.workspace-inspector-tabs {
-  justify-content: flex-start;
-  border-bottom: 1px solid var(--color-border, currentcolor);
-}
 
 .workspace-inspector-body {
   flex: 1 1 auto;
@@ -944,9 +934,6 @@
   overscroll-behavior: contain;
 }
 
-.workspace-inspector-body > [role="tabpanel"] {
-  min-width: 0;
-}
 
 .composer-workspace[data-layout-mode="narrow"] {
   /* Tabs, the selected view, the bar row. */
@@ -1027,8 +1014,7 @@
 .composer-workspace .workspace-action-bar-slot[hidden],
 .composer-workspace .workspace-collapse-control[hidden],
 .composer-workspace .workspace-action-bar-main[hidden],
-.composer-workspace .workspace-inspector[hidden],
-.composer-workspace .workspace-inspector-body > [role="tabpanel"][hidden] {
+.composer-workspace .workspace-inspector[hidden] {
   display: none;
 }
 
@@ -1042,7 +1028,8 @@
     transition: none;
   }
 
-  .artifact-tab-badge[data-tone="live"] {
+  .artifact-tab-badge[data-tone="live"],
+  .artifact-tab-badge[data-tone="busy"] {
     animation: none;
   }
 }

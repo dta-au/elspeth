@@ -8,6 +8,8 @@ import {
   useState,
 } from "react";
 
+import { useAuditReadinessSync } from "@/components/audit/useAuditReadinessSync";
+import { projectCompletedGuidedHistory } from "@/components/chat/guided/GuidedHistory";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { InlineRunResults } from "@/components/execution/InlineRunResults";
 import { CatalogButton } from "@/components/sidebar/CatalogButton";
@@ -21,17 +23,26 @@ import {
   isCurrentWorkspaceViewIntent,
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
+import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { RunStatus } from "@/types/index";
 import { useWorkspacePaneController } from "./WorkspacePaneContext";
+import { ChecksView } from "./ChecksView";
 import { PipelineSpecView } from "./PipelineSpecView";
+import {
+  projectAuditWorkspaceStatus,
+  projectChecksWorkspaceStatus,
+  projectValidationWorkspaceStatus,
+  type WorkspaceStatus,
+} from "./workspaceStatus";
 import { ARTIFACT_TABS, type ArtifactTab } from "./workspaceTypes";
 
 const TAB_LABELS: Record<ArtifactTab, string> = {
   graph: "Graph",
   spec: "Spec",
   yaml: "YAML",
+  checks: "Checks",
   run: "Run",
 };
 
@@ -111,7 +122,11 @@ function admitArtifactRequest(event: Event): RequestArtifactViewDetail | null {
   }
 }
 
-function activeArtifact(tab: ArtifactTab, runAvailable: boolean): JSX.Element {
+function activeArtifact(
+  tab: ArtifactTab,
+  runAvailable: boolean,
+  checksValidationContent: React.ReactNode,
+): JSX.Element {
   switch (tab) {
     case "graph":
       return <GraphView />;
@@ -119,8 +134,33 @@ function activeArtifact(tab: ArtifactTab, runAvailable: boolean): JSX.Element {
       return <PipelineSpecView />;
     case "yaml":
       return <YamlView />;
+    case "checks":
+      return <ChecksView validationContent={checksValidationContent} />;
     case "run":
       return <InlineRunResults showEmptyState runAvailable={runAvailable} />;
+  }
+}
+
+/** Visible glyph inside the persistent Checks-tab badge. The Run dot may stay
+ *  colour-only because it never outlives its announcing toast (workspace.css
+ *  badge contract); the Checks badge is permanent, so every settled verdict
+ *  carries a non-colour form — the finding count, ✓ for the all-clear, ! for
+ *  a zero-count failure. Only the no-verdict tones (neutral, busy) remain
+ *  plain dots. */
+function checksBadgeGlyph(status: WorkspaceStatus): string | null {
+  if (status.issueCount > 0) return String(status.issueCount);
+  switch (status.tone) {
+    case "success":
+      return "✓";
+    case "error":
+    case "warning":
+      // One shared glyph: today a zero-count warning is unreachable (every
+      // warning tone carries at least one counted row), so "!" only ever
+      // renders red. A future zero-count warning path would need its own
+      // glyph to keep the tones distinguishable without colour.
+      return "!";
+    default:
+      return null;
   }
 }
 
@@ -143,6 +183,7 @@ function badgeTone(status: RunStatus): "success" | "warning" | "error" | "neutra
 export function ArtifactWorkspace({
   runAvailable = false,
   catalogAvailable = false,
+  checksValidationContent,
 }: {
   /** True only when the REQUEST_RUN_EVENT owner (ExecuteButton) is mounted —
    *  App passes capabilities.completion; the tutorial shell leaves it false. */
@@ -151,6 +192,9 @@ export function ArtifactWorkspace({
    *  availability fact that used to gate the action bar's More-actions
    *  popover (!guidedBuildActive); the tutorial shell leaves it false. */
   catalogAvailable?: boolean;
+  /** Tutorial-shell content override for the Checks tab's validation half
+   *  (PipelineValidationSummary); see ChecksView. */
+  checksValidationContent?: React.ReactNode;
 } = {}): JSX.Element {
   const activeSessionId = useSessionStore((state) => state.activeSessionId);
   return (
@@ -158,6 +202,7 @@ export function ArtifactWorkspace({
       activeSessionId={activeSessionId}
       runAvailable={runAvailable}
       catalogAvailable={catalogAvailable}
+      checksValidationContent={checksValidationContent}
     />
   );
 }
@@ -166,10 +211,12 @@ export function ArtifactWorkspaceSurface({
   activeSessionId,
   runAvailable = false,
   catalogAvailable = false,
+  checksValidationContent,
 }: {
   activeSessionId: string | null;
   runAvailable?: boolean;
   catalogAvailable?: boolean;
+  checksValidationContent?: React.ReactNode;
 }): JSX.Element {
   const { state, actions } = useWorkspacePaneController();
   const { activeArtifactTab, availableArtifactTabs } = state;
@@ -177,6 +224,7 @@ export function ArtifactWorkspaceSurface({
     graph: null,
     spec: null,
     yaml: null,
+    checks: null,
     run: null,
   });
   const previousActiveTabRef = useRef(activeArtifactTab);
@@ -211,6 +259,48 @@ export function ArtifactWorkspaceSurface({
   const runLive = runAttached && !wsDisconnected;
   const acknowledgeRunOutcome = useExecutionStore(
     (s) => s.acknowledgeRunOutcome,
+  );
+
+  // Checks-tab badge inputs: the same primitive store reads the retired
+  // action-bar chips made (WorkspaceActionBar pre-Checks), merged into one
+  // ambient worst-of status by projectChecksWorkspaceStatus.
+  const validationResult = useExecutionStore((s) => s.validationResult);
+  const isValidating = useExecutionStore((s) => s.isValidating);
+  const validationError = useExecutionStore((s) => s.validationError);
+  const compositionVersion = useSessionStore(
+    (s) => s.compositionState?.version ?? null,
+  );
+  const snapshotsBySession = useAuditReadinessStore(
+    (s) => s.snapshotsBySession,
+  );
+  const auditErrorsBySession = useAuditReadinessStore(
+    (s) => s.errorBySession,
+  );
+  const hasGuidedHistory = useSessionStore(
+    (s) =>
+      s.guidedSession !== null &&
+      projectCompletedGuidedHistory(
+        s.guidedSession.history,
+        s.guidedSession.step,
+        s.guidedSession.terminal,
+      ).length > 0,
+  );
+  // Ambient audit sync for the badge: while the Checks panel is mounted its
+  // own useAuditReadinessSync instance owns the fetch, so this one stands
+  // down — exactly one instance syncs at a time.
+  useAuditReadinessSync(activeArtifactTab !== "checks");
+  const checksStatus = projectChecksWorkspaceStatus(
+    projectValidationWorkspaceStatus(
+      validationResult,
+      isValidating,
+      validationError,
+    ),
+    projectAuditWorkspaceStatus({
+      activeSessionId,
+      compositionVersion,
+      snapshotsBySession,
+      errorBySession: auditErrorsBySession,
+    }),
   );
 
   // While the Run tab is active AND the artifact pane is actually visible,
@@ -415,6 +505,17 @@ export function ArtifactWorkspaceSurface({
                 aria-selected={selected}
                 tabIndex={selected ? 0 : -1}
                 disabled={!available}
+                /* The Checks tab's accessible name carries the live merged
+                   status ("Checks: 3 issues") — visible label + ": " + status,
+                   the same composition the retired action-bar chips used, so
+                   the visible "Checks" stays contained in the name (WCAG
+                   2.5.3, elspeth-a41fd9d32b lineage). Only while available:
+                   a gated tab has nothing checked and stays plain "Checks". */
+                aria-label={
+                  tab === "checks" && available
+                    ? checksStatus.accessibleLabel
+                    : undefined
+                }
                 onClick={() => selectTab(tab)}
                 onKeyDown={handleTabKeyDown}
               >
@@ -434,6 +535,21 @@ export function ArtifactWorkspaceSurface({
                     }
                   />
                 )}
+                {/* Ambient checks light — aria-hidden because the tab's
+                    aria-label above already speaks the same status. */}
+                {tab === "checks" && available && (
+                  <span
+                    className={
+                      checksBadgeGlyph(checksStatus) === null
+                        ? "artifact-tab-badge"
+                        : "artifact-tab-badge artifact-tab-badge--glyph"
+                    }
+                    aria-hidden="true"
+                    data-tone={checksStatus.tone}
+                  >
+                    {checksBadgeGlyph(checksStatus)}
+                  </span>
+                )}
               </Button>
             );
           })}
@@ -449,6 +565,23 @@ export function ArtifactWorkspaceSurface({
             gestures are already bound (empty-click deselects, double-click
             zooms). */}
         <div className="artifact-toolbar-actions">
+          {/* Sole opener of the History drawer since the action-bar chips
+              retired with the Checks tab: gated on the same completed-history
+              fact the drawer itself closes on, and its id is the drawer's
+              focus-restore fallback (WorkspaceInspector). */}
+          {hasGuidedHistory && (
+            <Button
+              compact
+              id="artifact-history-trigger"
+              aria-expanded={state.inspectorOpen}
+              aria-controls="workspace-inspector"
+              onClick={(event) =>
+                actions.openInspector("history", event.currentTarget)
+              }
+            >
+              History
+            </Button>
+          )}
           {catalogAvailable && <CatalogButton />}
           <Button compact onClick={focusGraph}>
             Focus graph
@@ -496,7 +629,7 @@ export function ArtifactWorkspaceSurface({
                 key={`${activeSessionId ?? "no-session"}:${tab}`}
                 label={`${activeLabel} artifact`}
               >
-                {activeArtifact(tab, runAvailable)}
+                {activeArtifact(tab, runAvailable, checksValidationContent)}
               </ErrorBoundary>
             )}
           </div>

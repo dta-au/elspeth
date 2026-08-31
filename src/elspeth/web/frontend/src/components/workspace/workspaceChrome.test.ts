@@ -137,12 +137,12 @@ describe("workspace inspector drawer (elspeth-4e54200207)", () => {
     expect(declaration(narrowSlot, "grid-column")).toBe("1");
   });
 
-  it("compresses both drawer bands with the shared workspace band token", () => {
+  it("compresses the drawer band with the shared workspace band token", () => {
     // elspeth-7bd392c0dc: the bands were hard-built from 8px padding plus a
     // 36px control, so the density regime compressed the artifact toolbar
     // beside them to 45px while they stayed at 53. Same construction as
     // .artifact-workspace-toolbar: height from the token, no vertical padding.
-    const bands = ".workspace-inspector-header, .workspace-inspector-tabs";
+    const bands = ".workspace-inspector-header";
     expect(declaration(bands, "min-height")).toBe(
       declaration(".artifact-workspace-toolbar", "min-height"),
     );
@@ -175,7 +175,6 @@ describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
   const gapBearingSelectors = [
     ".workspace-action-bar",
     ".workspace-action-bar .completion-bar",
-    ".workspace-status-controls",
   ];
 
   it.each(gapBearingSelectors)("drives %s's gap from one property", (selector) => {
@@ -303,27 +302,35 @@ describe("workspace completion group (recut 2026-08-15, supersedes elspeth-c6fd7
     );
   });
 
-  it("tints settled status-chip verdicts with the matching semantic pair", () => {
-    // Recut 2026-08-15: success/warning/error chips carry the banner-family
-    // alpha background beside their border so the good/bad verdict reads at
-    // a glance (text stays the information carrier, WCAG 1.4.1). busy and
-    // neutral deliberately stay untinted — in-flight and not-yet-checked are
-    // neither good nor bad. The pair must come from the SAME semantic family
-    // or the chip's border and fill would disagree about the verdict.
-    const chip = ".workspace-status-control";
-    expect(declaration(`${chip}[data-tone="success"]`, "background-color")).toBe(
-      "var(--color-success-bg, transparent)",
+  it("tints settled Checks-badge verdicts with the matching semantic pair", () => {
+    // Recut 2026-08-15, relocated with the chips-to-Checks-tab move: the
+    // settled verdict surface is now the Checks tab's glyph badge. Each tone
+    // pairs the banner-family alpha background with the SAME family's text
+    // colour, so fill and glyph cannot disagree about the verdict (the
+    // glyph — count, checkmark, or bang — stays the information carrier,
+    // WCAG 1.4.1). busy and neutral deliberately stay dots on the base
+    // badge rule: in-flight and not-yet-checked are neither good nor bad.
+    const glyph = ".artifact-tab-badge--glyph";
+    expect(declaration(`${glyph}[data-tone="success"]`, "background-color")).toBe(
+      "var(--color-success-bg)",
     );
-    expect(declaration(`${chip}[data-tone="success"]`, "border-color")).toContain(
-      "--color-success",
+    expect(declaration(`${glyph}[data-tone="success"]`, "color")).toBe(
+      "var(--color-success)",
     );
-    expect(declaration(`${chip}[data-tone="warning"]`, "background-color")).toBe(
-      "var(--color-warning-bg, transparent)",
+    expect(declaration(`${glyph}[data-tone="warning"]`, "background-color")).toBe(
+      "var(--color-warning-bg)",
     );
-    expect(declaration(`${chip}[data-tone="error"]`, "background-color")).toBe(
-      "var(--color-error-bg, transparent)",
+    expect(declaration(`${glyph}[data-tone="warning"]`, "color")).toBe(
+      "var(--color-warning)",
     );
-    expect(ruleFor(`${chip}[data-tone="busy"]`)).not.toContain("background");
+    expect(declaration(`${glyph}[data-tone="error"]`, "background-color")).toBe(
+      "var(--color-error-bg)",
+    );
+    expect(declaration(`${glyph}[data-tone="error"]`, "color")).toBe(
+      "var(--color-error)",
+    );
+    expect(cssWithoutComments).not.toContain(`${glyph}[data-tone="busy"]`);
+    expect(cssWithoutComments).not.toContain(`${glyph}[data-tone="neutral"]`);
   });
 
   it("centers the members instead of stretching them to the bar's height", () => {
@@ -534,14 +541,11 @@ describe("artifact column gutter (elspeth-87195dda2c)", () => {
     expect(declaration(selector, property)).toBe(expected);
   });
 
-  it("keeps the inspector bands on the same inline inset as the toolbar", () => {
+  it("keeps the inspector band on the same inline inset as the toolbar", () => {
     // Already pinned pairwise by the band-height test above; restated on the
     // gutter axis so a band that leaves the gutter is named by THIS failure.
     expect(
-      declaration(
-        ".workspace-inspector-header, .workspace-inspector-tabs",
-        "padding",
-      ),
+      declaration(".workspace-inspector-header", "padding"),
     ).toBe(declaration(".artifact-workspace-toolbar", "padding"));
   });
 });

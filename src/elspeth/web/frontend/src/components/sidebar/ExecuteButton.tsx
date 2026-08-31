@@ -486,7 +486,7 @@ export function primaryRunBlockReason(input: {
 const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
   running: "The pipeline is already running.",
   interpretation: INTERPRETATION_PENDING_RUN_BLOCK_TITLE,
-  validation: "Fix the validation errors shown in the Audit panel before running.",
+  validation: "Fix the validation errors shown in the Checks tab before running.",
   readiness: "The backend has not admitted this pipeline for execution.",
   not_validated: "This pipeline hasn't been validated yet.",
 };

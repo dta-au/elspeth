@@ -1,6 +1,7 @@
 /// <reference types="vitest" />
-import { defineConfig } from "vite";
+import { defineConfig, searchForWorkspaceRoot } from "vite";
 import react from "@vitejs/plugin-react";
+import fs from "fs";
 import path from "path";
 
 const backendPort = process.env.PLAYWRIGHT_BACKEND_PORT ?? "8451";
@@ -34,6 +35,20 @@ export default defineConfig({
     css: false,
   },
   server: {
+    // Git worktrees symlink node_modules to the main checkout, whose REAL
+    // path falls outside the worktree's workspace root — without the explicit
+    // realpath entry the dev server 404s every file served from node_modules
+    // by URL (the @fontsource woff2s), so worktree e2e runs render fallback
+    // fonts and produce visual baselines the main checkout can't reproduce.
+    // In the main checkout realpath(node_modules) is already inside the
+    // workspace root, so this is a no-op there. Dev-server only; no effect
+    // on builds.
+    fs: {
+      allow: [
+        searchForWorkspaceRoot(process.cwd()),
+        fs.realpathSync(path.resolve(__dirname, "node_modules")),
+      ],
+    },
     port: frontendPort,
     proxy: {
       "/api": {

@@ -958,7 +958,7 @@ describe("ExecuteButton", () => {
     render(<ExecuteButton />);
 
     const reason = screen.getByText(
-      "Fix the validation errors shown in the Audit panel before running.",
+      "Fix the validation errors shown in the Checks tab before running.",
       { selector: "p" },
     );
     expect(reason).toHaveAttribute("data-run-block-reason", "validation");

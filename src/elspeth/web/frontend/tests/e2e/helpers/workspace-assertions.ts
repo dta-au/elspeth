@@ -124,8 +124,10 @@ export async function expectPrimaryControlsInViewport(
   for (const name of ["Graph", "Spec", "YAML", "Run"] as const) {
     await expectControlReachable(composer.artifactTab(name));
   }
-  await expectControlReachable(composer.validationStatus());
-  await expectControlReachable(composer.auditStatus());
+  // The Checks tab replaced the action-bar status chips; it is present in
+  // every mount (disabled while there is nothing to check) and must be
+  // reachable like its siblings.
+  await expectControlReachable(composer.checksTab());
 
   const completionControls: Array<[Locator, boolean]> = [
     [composer.saveForReview(), capabilities.completion],
@@ -145,14 +147,6 @@ export async function expectPrimaryControlsInViewport(
     await expectControlReachable(composer.catalogButton());
   }
   await expectControlReachable(composer.focusGraph());
-
-  await composer.validationStatus().click();
-  await expect(composer.inspector()).toBeVisible();
-  for (const name of ["Validation", "Audit"] as const) {
-    await expectControlReachable(composer.inspectorTab(name));
-  }
-  await expectControlReachable(composer.closeInspector());
-  await composer.closeInspector().click();
 
   await expectControlReachable(composer.collapseAuthoring());
   await composer.collapseAuthoring().click();

@@ -222,7 +222,7 @@ test.describe("Composer workspace browser accessibility", () => {
     }
   });
 
-  test("restores focus from the inspector and a confirmation dialog", async ({
+  test("selects the Checks tab by keyboard and restores focus from a confirmation dialog", async ({
     page,
   }) => {
     const { composer, sessionId } = await openScenario(
@@ -232,13 +232,16 @@ test.describe("Composer workspace browser accessibility", () => {
     );
     try {
       await expect(page.locator(".react-flow__node")).toHaveCount(2);
-      const validation = composer.validationStatus();
-      await expect(validation).toHaveAccessibleName("Validation: Passed");
-      await validation.focus();
-      await validation.press("Enter");
-      await expect(composer.inspectorTab("Validation")).toBeFocused();
-      await page.keyboard.press("Escape");
-      await expect(validation).toBeFocused();
+      const checks = composer.checksTab();
+      await expect(checks).toHaveAccessibleName("Checks: Ready");
+      await checks.focus();
+      await checks.press("Enter");
+      await expect(checks).toBeFocused();
+      await expect(checks).toHaveAttribute("aria-selected", "true");
+      await expect(
+        page.getByRole("region", { name: "Audit readiness" }),
+      ).toBeVisible();
+      await composer.artifactTab("Graph").click();
 
       const run = composer.runPipeline();
       await expect(run).toBeEnabled();
@@ -269,7 +272,7 @@ test.describe("Composer workspace browser accessibility", () => {
       for (const control of [
         composer.chatInput(),
         composer.artifactTab("Graph"),
-        composer.validationStatus(),
+        composer.checksTab(),
         composer.runPipeline(),
         composer.collapseAuthoring(),
       ]) {
@@ -298,20 +301,21 @@ test.describe("Composer workspace browser accessibility", () => {
     try {
       await composer.goto(sessionId);
       await composer.waitForChatReady();
-      await expect(composer.auditStatus()).toHaveAccessibleName(
-        "Audit: Checking",
+      // While the audit half is gated the merged name is either still
+      // in-flight or carrying validation's own count — both are legal
+      // orderings of two independent checks, and the point of this pin is
+      // that the name is one of the STABLE projections, never raw detail.
+      await expect(composer.checksTab()).toHaveAccessibleName(
+        /^Checks: (Checking|24 issues)$/,
       );
-      await composer.auditStatus().click();
+      await composer.checksTab().click();
       const auditRegion = page.getByRole("region", { name: "Audit readiness" });
       await expect(auditRegion).toHaveAttribute("aria-busy", "true");
       await expect(auditRegion).toContainText("Checking audit readiness");
 
       auditGate.release();
-      await expect(composer.validationStatus()).toHaveAccessibleName(
-        "Validation: 24 errors",
-      );
-      await expect(composer.auditStatus()).toHaveAccessibleName(
-        "Audit: 2 issues",
+      await expect(composer.checksTab()).toHaveAccessibleName(
+        "Checks: 25 issues",
       );
       await expect(
         auditRegion.getByRole("button", {
@@ -324,7 +328,7 @@ test.describe("Composer workspace browser accessibility", () => {
     }
   });
 
-  test("has no target Axe violations when populated and with the inspector open", async ({
+  test("has no target Axe violations when populated and with the Checks tab open", async ({
     page,
   }) => {
     const { composer, sessionId } = await openScenario(
@@ -334,17 +338,19 @@ test.describe("Composer workspace browser accessibility", () => {
     );
     try {
       await expect(page.locator(".react-flow__node")).toHaveCount(2);
-      await expect(composer.validationStatus()).toHaveAccessibleName(
-        "Validation: 24 errors",
+      await expect(composer.checksTab()).toHaveAccessibleName(
+        "Checks: 25 issues",
       );
       await page.evaluate(async () => {
         await document.fonts.ready;
       });
       await expectNoTargetAxeViolations(page);
 
-      await composer.validationStatus().click();
-      await expect(composer.inspector()).toBeVisible();
-      await expect(composer.inspectorTab("Validation")).toBeFocused();
+      await composer.checksTab().click();
+      await expect(composer.checksTab()).toBeFocused();
+      await expect(
+        page.getByRole("region", { name: "Audit readiness" }),
+      ).toBeVisible();
       await expectNoTargetAxeViolations(page);
     } finally {
       await deleteWorkspaceScenario(page, sessionId);

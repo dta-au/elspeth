@@ -21,6 +21,8 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "@/api/client";
+import * as auditApi from "@/api/auditReadiness";
+import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { makeComposition, makeValidationResult } from "@/test/composerFixtures";
@@ -38,6 +40,7 @@ import {
   ArtifactWorkspaceSurface,
 } from "./ArtifactWorkspace";
 import { WorkspacePaneProvider } from "./WorkspacePaneContext";
+import { WorkspaceInspector } from "./WorkspaceInspector";
 
 vi.mock("@xyflow/react", () => ({
   MarkerType: { ArrowClosed: "arrowclosed" },
@@ -225,8 +228,8 @@ describe("ArtifactWorkspace", () => {
     expect(panel).toHaveAttribute("id", "artifact-panel-graph");
     expect(panel).toHaveAttribute("aria-labelledby", "artifact-tab-graph");
     expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
-    expect(screen.getAllByRole("tabpanel", { hidden: true })).toHaveLength(4);
-    for (const tab of ["graph", "spec", "yaml", "run"] as const) {
+    expect(screen.getAllByRole("tabpanel", { hidden: true })).toHaveLength(5);
+    for (const tab of ["graph", "spec", "yaml", "checks", "run"] as const) {
       const tabElement = screen.getByRole("tab", {
         name: tab === "yaml" ? "YAML" : `${tab[0]!.toUpperCase()}${tab.slice(1)}`,
       });
@@ -249,12 +252,13 @@ describe("ArtifactWorkspace", () => {
     );
   });
 
-  it("disables Spec and YAML without composition content but keeps Graph and Run available", () => {
+  it("disables Spec, YAML, and Checks without composition content but keeps Graph and Run available", () => {
     renderArtifactWorkspace();
 
     expect(screen.getByRole("tab", { name: "Graph" })).toBeEnabled();
     expect(screen.getByRole("tab", { name: "Spec" })).toBeDisabled();
     expect(screen.getByRole("tab", { name: "YAML" })).toBeDisabled();
+    expect(screen.getByRole("tab", { name: "Checks" })).toBeDisabled();
     expect(screen.getByRole("tab", { name: "Run" })).toBeEnabled();
   });
 
@@ -285,6 +289,9 @@ describe("ArtifactWorkspace", () => {
     renderArtifactWorkspace();
 
     expect(screen.getByRole("tab", { name: "YAML" })).toBeEnabled();
+    // Checks assesses a composed pipeline; a pending proposal alone has
+    // nothing to check yet, so the tab stays gated like Spec.
+    expect(screen.getByRole("tab", { name: "Checks" })).toBeDisabled();
   });
 
   it("selects on focus while clicking and roving with wrap, Home, and End", async () => {
@@ -1443,5 +1450,200 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
     } finally {
       window.removeEventListener(OPEN_CATALOG_EVENT, opened);
     }
+  });
+
+  describe("Checks tab", () => {
+    function checksAuditSnapshot(
+      rowOverrides: Record<string, "ok" | "warning" | "error"> = {},
+    ) {
+      return {
+        session_id: "session-1",
+        composition_version: 1,
+        checked_at: "2026-08-30T00:00:00Z",
+        rows: [
+          "validation",
+          "plugin_trust",
+          "provenance",
+          "retention",
+          "llm_interpretations",
+          "secrets",
+        ].map((id) => ({
+          id,
+          label: id,
+          status: rowOverrides[id] ?? "ok",
+          summary: "Ready",
+          detail: null,
+          component_ids: [],
+        })),
+        validation_result: makeValidationResult(),
+      };
+    }
+
+    beforeEach(() => {
+      useSessionStore.setState({ compositionState: makeComposition(1) });
+      useAuditReadinessStore.setState({
+        snapshotsBySession: { "session-1": checksAuditSnapshot() as never },
+        errorBySession: {},
+      } as never);
+      useExecutionStore.setState({
+        validationResult: makeValidationResult(),
+      } as never);
+      vi.spyOn(auditApi, "fetchAuditReadiness").mockResolvedValue(
+        checksAuditSnapshot() as never,
+      );
+    });
+
+    it("sits between YAML and Run and renders both check surfaces in its own panel", async () => {
+      const user = userEvent.setup();
+      renderArtifactWorkspace();
+
+      const tabs = within(
+        screen.getByRole("tablist", { name: "Pipeline artifacts" }),
+      ).getAllByRole("tab");
+      expect(tabs.map((tab) => tab.id)).toEqual([
+        "artifact-tab-graph",
+        "artifact-tab-spec",
+        "artifact-tab-yaml",
+        "artifact-tab-checks",
+        "artifact-tab-run",
+      ]);
+
+      await user.click(screen.getByRole("tab", { name: /^Checks/ }));
+      const panel = await screen.findByRole("tabpanel", { name: /^Checks/ });
+      expect(panel).toHaveAttribute("id", "artifact-panel-checks");
+      // Audit readiness (collapsed all-green card) and the validation banner
+      // both live inline in the panel — no drawer, no separate opener.
+      expect(await within(panel).findByText(/Audit ready/)).toBeInTheDocument();
+    });
+
+    it("announces the merged all-clear in the tab name with a non-color glyph badge", () => {
+      renderArtifactWorkspace();
+
+      const checks = screen.getByRole("tab", { name: "Checks: Ready" });
+      const badge = checks.querySelector(".artifact-tab-badge");
+      expect(badge).not.toBeNull();
+      expect(badge).toHaveAttribute("data-tone", "success");
+      expect(badge).toHaveAttribute("aria-hidden", "true");
+      expect(badge).toHaveTextContent("✓");
+    });
+
+    it("sums validation errors and audit issues into the badge count and tab name", () => {
+      useExecutionStore.setState({
+        validationResult: makeValidationResult({
+          is_valid: false,
+          errors: [
+            {
+              component_id: "select_columns",
+              component_type: "transform",
+              message: "Invalid",
+              suggestion: null,
+            },
+            {
+              component_id: null,
+              component_type: null,
+              message: "Also invalid",
+              suggestion: null,
+            },
+          ],
+        }),
+      } as never);
+      useAuditReadinessStore.setState({
+        snapshotsBySession: {
+          "session-1": checksAuditSnapshot({ provenance: "warning" }) as never,
+        },
+      } as never);
+      renderArtifactWorkspace();
+
+      const checks = screen.getByRole("tab", { name: "Checks: 3 issues" });
+      const badge = checks.querySelector(".artifact-tab-badge");
+      expect(badge).toHaveAttribute("data-tone", "error");
+      expect(badge).toHaveTextContent("3");
+    });
+
+    it("keeps the ambient badge live without the Checks tab ever being visited", async () => {
+      // The retired chips fetched nothing themselves — the always-mounted
+      // (hidden) inspector panel did. With the panel now mounted only inside
+      // the Checks tab, the badge owner must own the ambient sync or the
+      // badge pulses "Checking" forever on a never-visited tab.
+      useAuditReadinessStore.setState({
+        snapshotsBySession: {},
+        errorBySession: {},
+      } as never);
+      renderArtifactWorkspace();
+
+      expect(
+        await screen.findByRole("tab", { name: "Checks: Ready" }),
+      ).toBeInTheDocument();
+      expect(auditApi.fetchAuditReadiness).toHaveBeenCalledWith(
+        "session-1",
+        expect.anything(),
+      );
+    });
+
+    it("keeps the disabled empty-composition tab a plain unbadged Checks", () => {
+      useSessionStore.setState({ compositionState: null });
+      renderArtifactWorkspace();
+
+      const checks = screen.getByRole("tab", { name: "Checks" });
+      expect(checks).toBeDisabled();
+      expect(checks.querySelector(".artifact-tab-badge")).toBeNull();
+    });
+  });
+
+  describe("history trigger", () => {
+    function guidedSessionWithHistory() {
+      return {
+        step: "step_3_transforms" as const,
+        history: [
+          {
+            step: "step_1_source" as const,
+            turn_type: "single_select" as const,
+            payload_hash: "payload",
+            response_hash: "response",
+            summary: "Use a CSV source",
+            emitter: "server" as const,
+          },
+        ],
+        terminal: null,
+        chat_history: [],
+        chat_turn_seq: 0,
+        profile: null,
+      };
+    }
+
+    it("omits the trigger without completed guided history", () => {
+      renderArtifactWorkspace();
+      expect(screen.queryByRole("button", { name: "History" })).toBeNull();
+    });
+
+    it("mounts the trigger before the terminal-edge Focus graph control", () => {
+      useSessionStore.setState({
+        guidedSession: guidedSessionWithHistory(),
+      } as never);
+      renderArtifactWorkspace({ catalogAvailable: true });
+
+      const history = screen.getByRole("button", { name: "History" });
+      expect(history).toHaveAttribute("id", "artifact-history-trigger");
+      const focusGraph = screen.getByRole("button", { name: "Focus graph" });
+      expect(history.parentElement).toBe(focusGraph.parentElement);
+      expect(
+        history.compareDocumentPosition(focusGraph) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    it("opens the history drawer from the trigger", async () => {
+      useSessionStore.setState({
+        guidedSession: guidedSessionWithHistory(),
+      } as never);
+      const user = userEvent.setup();
+      renderArtifactWorkspace({ inspector: <WorkspaceInspector /> });
+
+      await user.click(screen.getByRole("button", { name: "History" }));
+
+      expect(
+        screen.getByRole("complementary", { name: "History" }),
+      ).toBeVisible();
+    });
   });
 });
