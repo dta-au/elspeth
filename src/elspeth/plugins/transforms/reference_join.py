@@ -440,7 +440,11 @@ def _validate_declared_output_types(cfg: ReferenceJoinConfig, derived: Mapping[s
         derived_field = derivation.definition
         runtime_types = derivation.known_non_null_runtime_types
         if declared.field_type != "any" and runtime_types:
-            matching_runtime_type = len(runtime_types) == 1 and _VALUE_FIELD_TYPES.get(next(iter(runtime_types))) == declared.field_type
+            matching_runtime_type = False
+            if len(runtime_types) == 1:
+                runtime_type = next(iter(runtime_types))
+                if runtime_type in _VALUE_FIELD_TYPES:
+                    matching_runtime_type = _VALUE_FIELD_TYPES[runtime_type] == declared.field_type
             if not matching_runtime_type:
                 runtime_type_names = sorted(runtime_type.__name__ for runtime_type in runtime_types)
                 evidence = f"the resolved reference table can emit non-null runtime types {runtime_type_names}"
@@ -512,7 +516,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:93170775ae243b90"
+    source_file_hash: str | None = "sha256:24109a08dac93c6f"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
