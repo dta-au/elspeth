@@ -38,9 +38,9 @@ Expected: exactly the three `_sourceless_set_pipeline` callers fail before final
 
 **Step 2: Replace only the invalid fixture**
 
-- Rename `_sourceless_set_pipeline` to `_unknown_source_plugin_set_pipeline`.
-- Submit a singular source object with `plugin: definitely_not_a_plugin` and `on_success: rows`, plus empty nodes, edges, and outputs.
-- Update the three callers to assert the semantic rejection code `plugin_not_installed`, its catalogued guidance, absence of an explain-tool advertisement, and redaction custody.
+- Rename `_sourceless_set_pipeline` to `_invalid_source_options_set_pipeline`.
+- Submit a singular CSV source object with `on_success: rows`, schema-valid tool arguments, and the semantically invalid plugin option `path: 123`, plus empty nodes, edges, and outputs.
+- Update the three callers to assert the semantic rejection code `plugin_options_invalid`, its catalogued guidance, absence of an explain-tool advertisement, and redaction custody.
 - Do not import the larger `_valid_pipeline_args` fixture and do not change production code.
 
 **Step 3: Verify GREEN**
