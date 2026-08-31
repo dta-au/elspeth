@@ -530,10 +530,23 @@ async def test_08b_resolve_existing_event_with_consumed_placeholder_returns_422(
     assert response.json()["detail"]["code"] == "interpretation_placeholder_unavailable"
 
 
+@pytest.mark.parametrize(
+    ("reviewed_fields", "current_fields", "remove_source", "expected_current"),
+    [
+        pytest.param(["colour"], ["colour", "size"], False, "[colour, size]", id="demand-grows"),
+        pytest.param(["colour", "size"], ["colour"], False, "[colour]", id="demand-shrinks"),
+        pytest.param(["colour"], [], False, "no active demanded fields", id="demand-disappears"),
+        pytest.param(["colour"], ["colour"], True, "no active demanded fields", id="source-removed"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_resolve_source_data_contract_drift_names_source_and_field_change(
     test_client: TestClient,
     tmp_path: Path,
+    reviewed_fields: list[str],
+    current_fields: list[str],
+    remove_source: bool,
+    expected_current: str,
 ) -> None:
     csv_path = tmp_path / "upload.csv"
     csv_path.write_text("colour,size\nred,10\n", encoding="utf-8")
@@ -542,7 +555,7 @@ async def test_resolve_source_data_contract_drift_names_source_and_field_change(
     with test_client.app.state.phase3_engine.begin() as conn:
         _make_session(conn, session_id=str(session_id), user_id="alice")
 
-    surfaced = _uploaded_source_contract_state(str(csv_path), required_fields=["colour"])
+    surfaced = _uploaded_source_contract_state(str(csv_path), required_fields=reviewed_fields)
     surfaced_state = await service.save_composition_state(
         session_id,
         CompositionStateData(
@@ -560,18 +573,18 @@ async def test_resolve_source_data_contract_drift_names_source_and_field_change(
         tool_call_id="call_data_contract",
         user_term=SOURCE_DATA_CONTRACT_USER_TERM,
         kind=InterpretationKind.SOURCE_DATA_CONTRACT,
-        llm_draft=build_source_data_contract_draft(["colour"], ("colour", "size")),
+        llm_draft=build_source_data_contract_draft(reviewed_fields, ("colour", "size")),
         model_identifier="anthropic/test-model",
         model_version="1",
         provider="anthropic",
         composer_skill_hash="0" * 64,
     )
 
-    drifted = _uploaded_source_contract_state(str(csv_path), required_fields=["colour", "size"])
+    drifted = _uploaded_source_contract_state(str(csv_path), required_fields=current_fields)
     await service.save_composition_state(
         session_id,
         CompositionStateData(
-            sources=drifted["sources"],
+            sources={} if remove_source else drifted["sources"],
             nodes=drifted["nodes"],
             metadata_={"name": "Data contract route test", "description": ""},
             is_valid=False,
@@ -588,8 +601,9 @@ async def test_resolve_source_data_contract_drift_names_source_and_field_change(
     assert response.status_code == 422, response.text
     detail = response.json()["detail"]
     assert detail["code"] == "interpretation_source_data_contract_drift"
+    reviewed = f"[{', '.join(reviewed_fields)}]"
     assert detail["message"] == (
-        "The demanded-field contract for source 'source' changed from [colour] to [colour, size] "
+        f"The demanded-field contract for source 'source' changed from {reviewed} to {expected_current} "
         "after this review was shown. Reload the session and review the current source data contract."
     )
     assert "LLM" not in detail["message"]
