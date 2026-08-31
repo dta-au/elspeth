@@ -197,6 +197,7 @@ class TestBlockedTerminalBranchAttribution:
             recorder=BufferingRecorder(),
             repair_turns_used=0,
             persisted_assistant_message_id=None,
+            persisted_assistant_content=None,
             persisted_tool_call_turn=False,
             runtime_preflight=runtime_preflight,
             outstanding_findings=None,

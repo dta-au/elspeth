@@ -1904,6 +1904,7 @@ async def test_finalization_auto_surfaces_prompt_template_and_does_not_orphan_bl
         progress=None,
         repair_turns_used=0,
         persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
         persisted_tool_call_turn=False,
         advisor_checkpoint_passes_used=0,
     )
@@ -3378,6 +3379,7 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
         progress=None,
         repair_turns_used=0,
         persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
         persisted_tool_call_turn=False,
         advisor_checkpoint_passes_used=0,
     )
@@ -3519,6 +3521,7 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
         progress=None,
         repair_turns_used=0,
         persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
         persisted_tool_call_turn=False,
         advisor_checkpoint_passes_used=0,
     )
@@ -3601,6 +3604,7 @@ async def test_advisor_final_flag_terminal_return_surfaces_prompt_template(
         progress=None,
         repair_turns_used=0,
         persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
         persisted_tool_call_turn=False,
         # Force last-pass so (used + 1) >= max_passes -> the final-FLAG return.
         advisor_checkpoint_passes_used=composer._settings.composer_advisor_checkpoint_max_passes - 1,
@@ -3730,6 +3734,7 @@ async def test_advisor_blocked_terminal_return_still_fails_closed_on_bare_token_
         # blocked-return path under test).
         repair_turns_used=2,
         persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
         persisted_tool_call_turn=False,
         advisor_checkpoint_passes_used=0,
     )

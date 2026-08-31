@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
-from elspeth.contracts.errors import FailedTurnMetadata
+from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult
@@ -283,9 +283,38 @@ class _PersistOutcome:
 
     current_state_id: str | None
     persisted_assistant_message_id: str | None
+    # The assistant content actually committed for that row — not the turn's
+    # prose. The two diverge on the advisor-repair branch, which persists a
+    # fixed public message with ``raw_content=None``
+    # (``service._persist_turn_audit``). The turn-end writer compares against
+    # this to avoid re-emitting a row it already committed
+    # (elspeth-d581b3da7f); comparing against the turn prose would miss that
+    # branch. REQUIRED (no default) so a threading site that adds the id
+    # without it fails at construction rather than silently duplicating.
+    persisted_assistant_content: str | None
     persisted_tool_call_turn: bool
     unwind_audit_failed: bool
     failed_turn: FailedTurnMetadata | None
+
+    def __post_init__(self) -> None:
+        # Biconditional, not a one-way check: the id names a row and the
+        # content is what that row holds, so one without the other is a
+        # half-threaded state. Setting the id alone is the dangerous
+        # direction (the turn-end writer can no longer tell a re-emission
+        # from genuine later prose, and duplicates); the reverse is
+        # incoherent. Both are unrepresentable here.
+        if (self.persisted_assistant_message_id is None) != (self.persisted_assistant_content is None):
+            raise AuditIntegrityError(
+                "Tier 1: _PersistOutcome pairing invariant violated — "
+                "persisted_assistant_message_id and persisted_assistant_content "
+                "must be set or unset together. The id names the committed "
+                "assistant row and the content is what that row holds; a "
+                "half-threaded pair leaves the turn-end writer unable to "
+                "distinguish a re-emission of that row from genuine later "
+                "prose (elspeth-d581b3da7f). "
+                f"id={'set' if self.persisted_assistant_message_id is not None else 'None'}, "
+                f"content={'set' if self.persisted_assistant_content is not None else 'None'}."
+            )
 
 
 @dataclass(frozen=True, slots=True)

@@ -109,6 +109,7 @@ from elspeth.web.composer.protocol import (
     ComposerConvergenceError,
     ComposerHistoryMessage,
     ComposerPluginCrashError,
+    ComposerResult,
     ComposerRuntimePreflightError,
     ComposerService,
     ComposerServiceError,
@@ -1430,6 +1431,78 @@ def _composer_history_content(message: ChatMessageRecord) -> str:
         # out of LLM history.
         return message.raw_content
     return message.content
+
+
+def composer_turn_end_assistant_row(result: ComposerResult) -> TransitionAssistantDraft:
+    """Return the content/raw_content pair for the turn-end assistant row.
+
+    Both turn-end writers (``routes/messages.py`` send_message and
+    ``routes/composer/compose.py`` recompose) used to persist ``result.message``
+    verbatim. When the compose loop terminates AT a tool-dispatch turn — the
+    staged interpretation-review handoff is the reachable case — the model's
+    last prose IS that turn's prose, which ``turn_audit.persist_compose_turn_async``
+    has already committed as an assistant row with its ``tool_calls`` envelope.
+    The turn-end write then put the same prose in the transcript a second time,
+    with only the backend suffix to tell the copies apart, and
+    ``_composer_conversation_messages`` shows both (elspeth-d581b3da7f; live
+    session 891b7b1e persisted them 99ms apart).
+
+    The row this returns carries ONLY the backend-authored suffix, with
+    ``raw_content=""``. That is the shape ``_composer_history_content``
+    documents for backend chrome: the LLM sees an empty prior turn, so the
+    suffix stays out of prompt history, and the augmentation-prefix read-path
+    invariant still holds. ``visible_message_segments`` recognises the bare
+    suffix through its ``raw_content == ""`` arm and mints it as one
+    ``TrustedSystemNoticeSegment``, so the disclosure keeps its backend
+    provenance instead of being published as model prose.
+
+    Recognising the re-emission takes BOTH conditions below, and the equality
+    is the one doing the work:
+
+    * ``raw_assistant_content == persisted_assistant_content`` — the result's
+      own pre-synthesis prose is exactly what the committed row holds, which is
+      what makes this an augmentation OF that row rather than a later turn.
+    * ``message.startswith(...)`` — the augmentation-prefix contract, so the
+      split is exact.
+
+    The prefix test ALONE would be vacuous: a tool-call turn commonly carries no
+    prose, the row then holds ``""``, and every message starts with ``""``. It
+    would also strip genuine prose on the ``[tool call, then text-only final
+    turn]`` sequence, where the id and content still point at the EARLIER row
+    while ``message`` holds the LATER turn's text — reachable through the
+    B-4D-3 last-chance finalize in ``_classify_and_budget_turn``. The equality
+    declines both, and it declines the advisor-repair branch too, whose row
+    deliberately holds a fixed public message rather than the turn's prose.
+
+    Every way of getting this wrong therefore fails toward persisting the full
+    message — the pre-fix behaviour — never toward dropping model prose.
+
+    Returns ``TransitionAssistantDraft`` because it already IS this pair with
+    the audit-boundary type assertions, and because returning a value rather
+    than two locals keeps callers honest: both routes rebind ``result`` on the
+    auto-commit-revoked branch, so a pair computed once at the top of the
+    handler goes stale. Call this next to the writer that consumes it.
+    """
+    persisted = result.persisted_assistant_content
+    if persisted is None or result.raw_assistant_content != persisted or not result.message.startswith(persisted):
+        return TransitionAssistantDraft(content=result.message, raw_content=result.raw_assistant_content)
+    suffix = result.message[len(persisted) :]
+    if not suffix:
+        # Unreachable by construction: the only producer that satisfies the
+        # predicate is the staged-handoff branch, and it always appends a
+        # non-empty canonical suffix. Reaching here means a producer built a
+        # turn-end message byte-identical to a row already in the transcript,
+        # so the alternatives are committing an exact duplicate or committing
+        # an empty bubble. Fail closed instead — the route's failed-turn
+        # machinery reports it with the audit trail intact.
+        raise AuditIntegrityError(
+            "Tier 1: composer turn-end message is byte-identical to the "
+            "assistant row the compose loop already committed "
+            f"(id={result.persisted_assistant_message_id!r}), leaving no "
+            "backend-authored suffix to persist. Writing it would duplicate "
+            "the row verbatim in the operator's transcript."
+        )
+    return TransitionAssistantDraft(content=suffix, raw_content="")
 
 
 def _is_composer_audit_tool_message(message: ChatMessageRecord) -> bool:
