@@ -208,7 +208,7 @@ export function branchEntries(
  * queue-as-sole-canonical-producer (GraphView.tsx's `queueIds` set), the
  * row_union authoritative-outbound semantics
  * (`authoritativeRowUnionOutboundSemantics`), and the phase-1 alias dedup
- * (`inferredBranchAliases`).
+ * (`inferredBranchSemantics`).
  *
  * The ids are COMPONENT ids, the one namespace sources and nodes share:
  * a source publishes under `sourceComponentId(name)` ("source" for the default

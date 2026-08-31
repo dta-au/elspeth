@@ -713,7 +713,7 @@ describe("GraphView", () => {
       });
       render(<GraphView />);
       // Should infer edge from source to my_transform
-      expect(screen.getByTestId("edge-inferred-conn-source-my_transform")).toBeInTheDocument();
+      expect(screen.getByTestId("edge-inferred-conn-source-my_transform-success-success")).toBeInTheDocument();
     });
 
     it("infers transform→transform edge when inputs match on_success values", () => {
@@ -744,8 +744,8 @@ describe("GraphView", () => {
       });
       render(<GraphView />);
       // Should infer: source → transform1 → transform2
-      expect(screen.getByTestId("edge-inferred-conn-source-transform1")).toBeInTheDocument();
-      expect(screen.getByTestId("edge-inferred-conn-transform1-transform2")).toBeInTheDocument();
+      expect(screen.getByTestId("edge-inferred-conn-source-transform1-success-success")).toBeInTheDocument();
+      expect(screen.getByTestId("edge-inferred-conn-transform1-transform2-success-success")).toBeInTheDocument();
     });
 
     it("infers error routing via connection points", () => {
@@ -781,7 +781,7 @@ describe("GraphView", () => {
       });
       render(<GraphView />);
       // Error edge should be inferred with error styling
-      expect(screen.getByTestId("edge-inferred-conn-processor-error_handler")).toBeInTheDocument();
+      expect(screen.getByTestId("edge-inferred-conn-processor-error_handler-error-error")).toBeInTheDocument();
       // Label should be "error"
       expect(screen.getByText("error")).toBeInTheDocument();
     });
@@ -829,8 +829,8 @@ describe("GraphView", () => {
       });
       render(<GraphView />);
       // Gate → handlers via route connection matching
-      expect(screen.getByTestId("edge-inferred-conn-quality_gate-high_quality_handler")).toBeInTheDocument();
-      expect(screen.getByTestId("edge-inferred-conn-quality_gate-low_quality_handler")).toBeInTheDocument();
+      expect(screen.getByTestId("edge-inferred-conn-quality_gate-high_quality_handler-true-success")).toBeInTheDocument();
+      expect(screen.getByTestId("edge-inferred-conn-quality_gate-low_quality_handler-false-success")).toBeInTheDocument();
       // Route labels should be present
       expect(screen.getByText("true")).toBeInTheDocument();
       expect(screen.getByText("false")).toBeInTheDocument();
@@ -868,7 +868,7 @@ describe("GraphView", () => {
       // Explicit edge exists
       expect(screen.getByTestId("edge-e-source-transform1-0")).toBeInTheDocument();
       // Second edge should be inferred (not blocked by explicit edge existing)
-      expect(screen.getByTestId("edge-inferred-conn-transform1-transform2")).toBeInTheDocument();
+      expect(screen.getByTestId("edge-inferred-conn-transform1-transform2-success-success")).toBeInTheDocument();
     });
 
     it("infers transform→sink edges via direct sink references", () => {
@@ -899,8 +899,374 @@ describe("GraphView", () => {
       });
       render(<GraphView />);
       // Sink edges should be inferred
-      expect(screen.getByTestId("edge-inferred-sink-processor-results")).toBeInTheDocument();
-      expect(screen.getByTestId("edge-inferred-sink-processor-errors-error")).toBeInTheDocument();
+      expect(screen.getByTestId("edge-inferred-sink-processor-results-success-success")).toBeInTheDocument();
+      expect(screen.getByTestId("edge-inferred-sink-processor-errors-error-error")).toBeInTheDocument();
+    });
+  });
+
+  describe("parallel semantic edges with shared endpoints", () => {
+    function gate(overrides: Partial<NodeSpec> = {}): NodeSpec {
+      return {
+        id: "route_rows",
+        node_type: "gate",
+        plugin: null,
+        input: "gate_in",
+        on_success: null,
+        on_error: null,
+        options: {},
+        condition: "row['accepted']",
+        routes: {
+          accepted: "shared_rows",
+          rejected: "shared_rows",
+        },
+        ...overrides,
+      };
+    }
+
+    function edgeElements(
+      container: HTMLElement,
+      source: string,
+      target: string,
+    ): Element[] {
+      return Array.from(
+        container.querySelectorAll(
+          `[data-edge-source="${source}"][data-edge-target="${target}"]`,
+        ),
+      );
+    }
+
+    function expectDistinctVisibleLanes(edges: Element[]): void {
+      const ids = edges.map((edge) => edge.getAttribute("data-testid"));
+      expect(ids.every((id) => id !== null)).toBe(true);
+      expect(new Set(ids).size).toBe(edges.length);
+
+      const paths = edges.map((edge) =>
+        edge.querySelector("path[data-edge-path-id]")?.getAttribute("d"),
+      );
+      expect(paths.every((path) => path !== undefined && path !== null)).toBe(true);
+      expect(new Set(paths).size).toBe(edges.length);
+
+      const sourceHandles = edges.map((edge) =>
+        edge.getAttribute("data-source-handle"),
+      );
+      const targetHandles = edges.map((edge) =>
+        edge.getAttribute("data-target-handle"),
+      );
+      expect(new Set(sourceHandles).size).toBe(edges.length);
+      expect(new Set(targetHandles).size).toBe(edges.length);
+    }
+
+    function connectionTexts(prefix: string): string[] {
+      const list = screen.getByRole("list", {
+        name: "Pipeline branch connections",
+      });
+      return Array.from(list.querySelectorAll("li"), (item) =>
+        item.textContent ?? "",
+      )
+        .filter((text) => text.startsWith(prefix))
+        .sort();
+    }
+
+    it("keeps both gate route labels when one ordinary consumer reads their shared connection", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          sources: {
+            source: { plugin: "csv", options: {}, on_success: "gate_in" },
+          },
+          nodes: [
+            gate(),
+            makeNode({
+              id: "handle_rows",
+              input: "shared_rows",
+              on_success: "results",
+            }),
+          ],
+          outputs: [{ name: "results", plugin: "csv", options: {} }],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+
+      const routes = edgeElements(container, "route_rows", "handle_rows");
+      expect(routes).toHaveLength(2);
+      expect(routes.map((edge) => edge.textContent).sort()).toEqual([
+        "accepted",
+        "rejected",
+      ]);
+      expectDistinctVisibleLanes(routes);
+      expect(connectionTexts("route_rows to handle_rows:")).toEqual([
+        "route_rows to handle_rows: accepted (success)",
+        "route_rows to handle_rows: rejected (success)",
+      ]);
+    });
+
+    it("keeps both gate route labels when they target one sink directly", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          sources: {
+            source: { plugin: "csv", options: {}, on_success: "gate_in" },
+          },
+          nodes: [
+            gate({
+              routes: { accepted: "results", rejected: "results" },
+            }),
+          ],
+          outputs: [{ name: "results", plugin: "csv", options: {} }],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+
+      const routes = edgeElements(container, "route_rows", "results");
+      expect(routes).toHaveLength(2);
+      expect(routes.map((edge) => edge.textContent).sort()).toEqual([
+        "accepted",
+        "rejected",
+      ]);
+      expectDistinctVisibleLanes(routes);
+      expect(connectionTexts("route_rows to results:")).toEqual([
+        "route_rows to results: accepted (success)",
+        "route_rows to results: rejected (success)",
+      ]);
+    });
+
+    it("uses matching explicit render hints without adding inferred copies", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          sources: {
+            source: { plugin: "csv", options: {}, on_success: "gate_in" },
+          },
+          nodes: [
+            gate({
+              routes: { accepted: "results", rejected: "results" },
+            }),
+          ],
+          edges: [
+            makeEdge({
+              id: "accepted-hint",
+              from_node: "route_rows",
+              to_node: "results",
+              edge_type: "route_true",
+              label: "accepted",
+            }),
+            makeEdge({
+              id: "rejected-hint",
+              from_node: "route_rows",
+              to_node: "results",
+              edge_type: "route_false",
+              label: "rejected",
+            }),
+          ],
+          outputs: [{ name: "results", plugin: "csv", options: {} }],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+
+      const routes = edgeElements(container, "route_rows", "results");
+      expect(routes).toHaveLength(2);
+      expect(routes.map((edge) => edge.textContent).sort()).toEqual([
+        "accepted",
+        "rejected",
+      ]);
+      expect(connectionTexts("route_rows to results:")).toEqual([
+        "route_rows to results: accepted (success)",
+        "route_rows to results: rejected (success)",
+      ]);
+    });
+
+    it("completes a partial explicit route hint with only the missing semantic", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          sources: {
+            source: { plugin: "csv", options: {}, on_success: "gate_in" },
+          },
+          nodes: [
+            gate({
+              routes: { accepted: "results", rejected: "results" },
+            }),
+          ],
+          edges: [
+            makeEdge({
+              id: "accepted-hint",
+              from_node: "route_rows",
+              to_node: "results",
+              edge_type: "route_true",
+              label: "accepted",
+            }),
+          ],
+          outputs: [{ name: "results", plugin: "csv", options: {} }],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+
+      const routes = edgeElements(container, "route_rows", "results");
+      expect(routes).toHaveLength(2);
+      expect(routes.map((edge) => edge.textContent).sort()).toEqual([
+        "accepted",
+        "rejected",
+      ]);
+      expectDistinctVisibleLanes(routes);
+      expect(connectionTexts("route_rows to results:")).toEqual([
+        "route_rows to results: accepted (success)",
+        "route_rows to results: rejected (success)",
+      ]);
+    });
+
+    it("keeps converging gate routes compact at a queue without direct-edge copies", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          sources: {
+            source: { plugin: "csv", options: {}, on_success: "gate_in" },
+          },
+          nodes: [
+            gate({
+              routes: { accepted: "holding", rejected: "holding" },
+            }),
+            makeNode({
+              id: "holding",
+              node_type: "queue",
+              plugin: null,
+              input: "holding",
+              on_success: null,
+              on_error: null,
+            }),
+            makeNode({
+              id: "handle_rows",
+              input: "holding",
+              on_success: "results",
+            }),
+          ],
+          outputs: [{ name: "results", plugin: "csv", options: {} }],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+
+      const routes = edgeElements(container, "route_rows", "holding");
+      expect(routes).toHaveLength(2);
+      expect(routes.map((edge) => edge.textContent).sort()).toEqual([
+        "accepted",
+        "rejected",
+      ]);
+      expectDistinctVisibleLanes(routes);
+      expect(connectionTexts("route_rows to holding:")).toEqual([
+        "route_rows to holding: accepted (success)",
+        "route_rows to holding: rejected (success)",
+      ]);
+      expect(edgeElements(container, "holding", "handle_rows")).toHaveLength(1);
+    });
+
+    it("keeps success and error semantics when both target the same sink", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          sources: {
+            source: { plugin: "csv", options: {}, on_success: "process_in" },
+          },
+          nodes: [
+            makeNode({
+              id: "process",
+              input: "process_in",
+              on_success: "results",
+              on_error: "results",
+            }),
+          ],
+          outputs: [{ name: "results", plugin: "csv", options: {} }],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+
+      const routes = edgeElements(container, "process", "results");
+      expect(routes).toHaveLength(2);
+      expect(routes.map((edge) => edge.textContent).sort()).toEqual([
+        "error",
+        "success",
+      ]);
+      expectDistinctVisibleLanes(routes);
+      expect(connectionTexts("process to results:")).toEqual([
+        "process to results: error (error)",
+        "process to results: success (success)",
+      ]);
+    });
+
+    it("keeps a fork branch edge and a route edge that re-enters the same branch", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          sources: {
+            source: { plugin: "csv", options: {}, on_success: "gate_in" },
+          },
+          nodes: [
+            gate({
+              routes: { every: "fork", retry: "branch_a" },
+              fork_to: ["branch_a", "branch_b"],
+            }),
+            makeNode({
+              id: "merge_rows",
+              node_type: "coalesce",
+              plugin: null,
+              input: "branch_a",
+              on_success: "results",
+              branches: {
+                primary: "branch_a",
+                secondary: "branch_b",
+              },
+            }),
+          ],
+          outputs: [{ name: "results", plugin: "csv", options: {} }],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+
+      const routes = edgeElements(container, "route_rows", "merge_rows");
+      expect(routes).toHaveLength(3);
+      expect(routes.map((edge) => edge.textContent).sort()).toEqual([
+        "primary",
+        "retry",
+        "secondary",
+      ]);
+      expectDistinctVisibleLanes(routes);
+      expect(connectionTexts("route_rows to merge_rows:")).toEqual([
+        "route_rows to merge_rows: primary (success)",
+        "route_rows to merge_rows: retry (success)",
+        "route_rows to merge_rows: secondary (success)",
+      ]);
+    });
+
+    it("collapses a route and fork arm only when their full rendered semantics are identical", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          sources: {
+            source: { plugin: "csv", options: {}, on_success: "gate_in" },
+          },
+          nodes: [
+            gate({
+              routes: { every: "fork", branch_a: "branch_a" },
+              fork_to: ["branch_a"],
+            }),
+            makeNode({
+              id: "merge_rows",
+              node_type: "coalesce",
+              plugin: null,
+              input: "branch_a",
+              on_success: "results",
+              branches: ["branch_a"],
+            }),
+          ],
+          outputs: [{ name: "results", plugin: "csv", options: {} }],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+
+      const routes = edgeElements(container, "route_rows", "merge_rows");
+      expect(routes).toHaveLength(1);
+      expect(routes[0]).toHaveTextContent("branch_a");
+      expect(connectionTexts("route_rows to merge_rows:")).toEqual([
+        "route_rows to merge_rows: branch_a (success)",
+      ]);
     });
   });
 
@@ -956,16 +1322,16 @@ describe("GraphView", () => {
       const ids = renderedEdgeIds();
 
       // Both sources draw distinct edges to the queue node.
-      expect(ids).toContain("edge-inferred-queue-in-source:orders-inbound");
-      expect(ids).toContain("edge-inferred-queue-in-source:refunds-inbound");
+      expect(ids).toContain("edge-inferred-queue-in-source:orders-inbound-success-success");
+      expect(ids).toContain("edge-inferred-queue-in-source:refunds-inbound-success-success");
       // The queue draws exactly one edge to the downstream consumer of `inbound`.
-      expect(ids).toContain("edge-inferred-queue-out-inbound-normalize");
+      expect(ids).toContain("edge-inferred-queue-out-inbound-normalize-success-success");
       // NO dishonest producer -> consumer bypass edge (the current-code defect).
       expect(ids.some((id) => id.includes("source:orders-normalize"))).toBe(false);
       expect(ids.some((id) => id.includes("source:refunds-normalize"))).toBe(false);
       // The only edge terminating at the consumer comes from the queue.
-      expect(ids.filter((id) => id.endsWith("-normalize"))).toEqual([
-        "edge-inferred-queue-out-inbound-normalize",
+      expect(ids.filter((id) => id.includes("-inbound-normalize-"))).toEqual([
+        "edge-inferred-queue-out-inbound-normalize-success-success",
       ]);
       // No queue self-loop (the queue's implicit output uses its own id).
       expect(ids.some((id) => id.includes("inbound-inbound"))).toBe(false);
@@ -1135,45 +1501,45 @@ describe("GraphView", () => {
 
       const ids = renderedEdgeIds();
       expect(ids).toContain(
-        "edge-inferred-fan-in-control_score-variant_union-control",
+        "edge-inferred-fan-in-control_score-variant_union-control-success",
       );
       expect(ids).toContain(
-        "edge-inferred-fan-in-treatment_score-variant_union-treatment",
+        "edge-inferred-fan-in-treatment_score-variant_union-treatment-success",
       );
       expect(
         screen.getByTestId(
-          "edge-inferred-fan-in-control_score-variant_union-control",
+          "edge-inferred-fan-in-control_score-variant_union-control-success",
         ),
       ).toHaveTextContent("control");
       expect(
         screen.getByTestId(
-          "edge-inferred-fan-in-treatment_score-variant_union-treatment",
+          "edge-inferred-fan-in-treatment_score-variant_union-treatment-success",
         ),
       ).toHaveTextContent("treatment");
       expect(
         screen.getByTestId(
-          "edge-inferred-conn-experiment_gate-control_score",
+          "edge-inferred-conn-experiment_gate-control_score-control_raw-success",
         ),
       ).toHaveTextContent("control_raw");
       expect(
         screen.getByTestId(
-          "edge-inferred-conn-experiment_gate-treatment_score",
+          "edge-inferred-conn-experiment_gate-treatment_score-treatment_raw-success",
         ),
       ).toHaveTextContent("treatment_raw");
       expect(ids).toContain(
-        "edge-inferred-row-union-out-variant_union-compare",
+        "edge-inferred-row-union-out-variant_union-compare-success-success",
       );
 
       // The scalar placeholder input is the first branch's connection for
       // backend compatibility. Rendering it through ordinary input inference
       // would create a duplicate, unlabelled edge.
       expect(ids).not.toContain(
-        "edge-inferred-conn-control_score-variant_union",
+        "edge-inferred-conn-control_score-variant_union-success-success",
       );
       // Every route into compare comes from the union itself: no branch
       // producer bypass and no union self-loop.
-      expect(ids.filter((id) => id.endsWith("-compare"))).toEqual([
-        "edge-inferred-row-union-out-variant_union-compare",
+      expect(ids.filter((id) => id.includes("-variant_union-compare-"))).toEqual([
+        "edge-inferred-row-union-out-variant_union-compare-success-success",
       ]);
       expect(
         ids.some((id) => id.includes("variant_union-variant_union")),
@@ -1528,10 +1894,10 @@ describe("GraphView", () => {
         ids.filter((id) => id.includes("-treatment_score-variant_union")),
       ).toEqual(["edge-e-treatment_score-variant_union-1"]);
       expect(ids).not.toContain(
-        "edge-inferred-conn-control_score-variant_union",
+        "edge-inferred-conn-control_score-variant_union-success-success",
       );
-      expect(ids.filter((id) => id.endsWith("-compare"))).toEqual([
-        "edge-inferred-row-union-out-variant_union-compare",
+      expect(ids.filter((id) => id.includes("-variant_union-compare-"))).toEqual([
+        "edge-inferred-row-union-out-variant_union-compare-success-success",
       ]);
       expect(
         ids.some((id) => id.includes("variant_union-variant_union")),
@@ -1589,7 +1955,7 @@ describe("GraphView", () => {
       expect(unionOutbound[0]).toHaveTextContent("success");
       expect(unionOutbound[0]).toHaveAttribute(
         "data-testid",
-        "edge-inferred-row-union-out-variant_union-new_compare",
+        "edge-inferred-row-union-out-variant_union-new_compare-success-success",
       );
       expect(
         screen.getByTestId("edge-e-control_score-compare-1"),
@@ -1668,19 +2034,25 @@ describe("GraphView", () => {
       ];
       useSessionStore.setState({ compositionState: state });
 
-      render(<GraphView />);
+      const { container } = render(<GraphView />);
 
-      expect(
-        screen.getByTestId("edge-e-variant_union-compare-0"),
-      ).toHaveTextContent("success");
+      const unionOutbound = container.querySelectorAll(
+        '[data-edge-source="variant_union"][data-edge-target="compare"]',
+      );
+      expect(unionOutbound).toHaveLength(1);
+      expect(unionOutbound[0]).toHaveAttribute(
+        "data-testid",
+        "edge-e-variant_union-compare-0",
+      );
+      expect(unionOutbound[0]).toHaveTextContent("success");
       const connections = screen.getByRole("list", {
         name: "Pipeline branch connections",
       });
       expect(
-        within(connections).getByText(
+        within(connections).getAllByText(
           "variant_union to compare: success (success)",
         ),
-      ).toBeInTheDocument();
+      ).toHaveLength(1);
       expect(
         within(connections).queryByText(/legacy_success/),
       ).not.toBeInTheDocument();
@@ -1889,7 +2261,7 @@ describe("GraphView", () => {
       expect(
         ids.filter((id) => id.includes("-control_score-variant_union")),
       ).toEqual([
-        "edge-inferred-fan-in-control_score-variant_union-control",
+        "edge-inferred-fan-in-control_score-variant_union-control-success",
       ]);
       expect(
         Array.from(document.querySelectorAll('[data-testid^="edge-"]')).some(
@@ -1923,7 +2295,7 @@ describe("GraphView", () => {
         ),
       ).toHaveLength(0);
       expect(renderedEdgeIds()).toContain(
-        "edge-inferred-fan-in-control_score-variant_union-control",
+        "edge-inferred-fan-in-control_score-variant_union-control-success",
       );
     });
 
@@ -1960,7 +2332,7 @@ describe("GraphView", () => {
         ids.filter((id) => id.includes("-treatment_score-variant_union")),
       ).toEqual([]);
       expect(ids).toContain(
-        "edge-inferred-fan-in-control_score-variant_union-control",
+        "edge-inferred-fan-in-control_score-variant_union-control-success",
       );
     });
 
@@ -2004,12 +2376,12 @@ describe("GraphView", () => {
 
       expect(
         screen.getByTestId(
-          "edge-inferred-fan-in-control_score-variant_union-control",
+          "edge-inferred-fan-in-control_score-variant_union-control-success",
         ),
       ).toHaveTextContent("control");
       expect(
         screen.getByTestId(
-          "edge-inferred-fan-in-control_score-variant_union-treatment",
+          "edge-inferred-fan-in-control_score-variant_union-treatment-success",
         ),
       ).toHaveTextContent("treatment");
     });
@@ -2153,19 +2525,19 @@ describe("GraphView", () => {
 
       const ids = edgeIds();
       expect(ids).toContain(
-        "edge-inferred-fan-in-recommend_pairing-merge_branches-branch_a",
+        "edge-inferred-fan-in-recommend_pairing-merge_branches-branch_a-success",
       );
       expect(ids).toContain(
-        "edge-inferred-fan-in-get_hex-merge_branches-branch_b",
+        "edge-inferred-fan-in-get_hex-merge_branches-branch_b-success",
       );
       expect(
         screen.getByTestId(
-          "edge-inferred-fan-in-recommend_pairing-merge_branches-branch_a",
+          "edge-inferred-fan-in-recommend_pairing-merge_branches-branch_a-success",
         ),
       ).toHaveTextContent("branch_a");
       expect(
         screen.getByTestId(
-          "edge-inferred-fan-in-get_hex-merge_branches-branch_b",
+          "edge-inferred-fan-in-get_hex-merge_branches-branch_b-success",
         ),
       ).toHaveTextContent("branch_b");
 
@@ -2173,11 +2545,11 @@ describe("GraphView", () => {
       // that is the duplicate-arm regression, and it is the shape the bug
       // originally rendered ALONE, labelled "success" rather than "branch_a".
       expect(ids).not.toContain(
-        "edge-inferred-conn-recommend_pairing-merge_branches",
+        "edge-inferred-conn-recommend_pairing-merge_branches-success-success",
       );
       expect(inboundEdgeIds("merge_branches")).toEqual([
-        "edge-inferred-fan-in-get_hex-merge_branches-branch_b",
-        "edge-inferred-fan-in-recommend_pairing-merge_branches-branch_a",
+        "edge-inferred-fan-in-get_hex-merge_branches-branch_b-success",
+        "edge-inferred-fan-in-recommend_pairing-merge_branches-branch_a-success",
       ]);
     });
 
@@ -2210,12 +2582,12 @@ describe("GraphView", () => {
       render(<GraphView />);
 
       expect(edgeIds()).toContain(
-        "edge-inferred-conn-merge_branches-select_fields",
+        "edge-inferred-conn-merge_branches-select_fields-success-success",
       );
       // ...and the graph is one connected component: the sink is fed THROUGH
       // select_fields, not by an orphaned fragment.
       expect(inboundEdgeIds("select_fields")).toEqual([
-        "edge-inferred-conn-merge_branches-select_fields",
+        "edge-inferred-conn-merge_branches-select_fields-success-success",
       ]);
 
       // This list is the diagram's accessible topology authority. Assert all
@@ -2276,9 +2648,9 @@ describe("GraphView", () => {
       useSessionStore.setState({ compositionState: state });
       render(<GraphView />);
 
-      expect(edgeIds()).toContain("edge-inferred-conn-roll_up-select_fields");
+      expect(edgeIds()).toContain("edge-inferred-conn-roll_up-select_fields-success-success");
       expect(inboundEdgeIds("select_fields")).toEqual([
-        "edge-inferred-conn-roll_up-select_fields",
+        "edge-inferred-conn-roll_up-select_fields-success-success",
       ]);
       const connections = within(screen.getByRole("list", {
         name: "Pipeline branch connections",
@@ -2308,7 +2680,7 @@ describe("GraphView", () => {
       render(<GraphView />);
 
       expect(edgeIds()).not.toContain(
-        "edge-inferred-conn-merge_branches-select_fields",
+        "edge-inferred-conn-merge_branches-select_fields-success-success",
       );
     });
 
@@ -2369,12 +2741,12 @@ describe("GraphView", () => {
       render(<GraphView />);
 
       expect(inboundEdgeIds("merge_branches")).toEqual([
-        "edge-inferred-fan-in-get_hex-merge_branches-hex_done",
-        "edge-inferred-fan-in-recommend_pairing-merge_branches-pairing_done",
+        "edge-inferred-fan-in-get_hex-merge_branches-hex_done-success",
+        "edge-inferred-fan-in-recommend_pairing-merge_branches-pairing_done-success",
       ]);
       expect(
         screen.getByTestId(
-          "edge-inferred-fan-in-get_hex-merge_branches-hex_done",
+          "edge-inferred-fan-in-get_hex-merge_branches-hex_done-success",
         ),
       ).toHaveTextContent("hex_done");
     });
@@ -2493,8 +2865,8 @@ describe("GraphView", () => {
       // The stale hint is gone; the live alias is drawn from authority.
       expect(edgeIds()).not.toContain("edge-e-get_hex-merge_branches-0");
       expect(inboundEdgeIds("merge_branches")).toEqual([
-        "edge-inferred-fan-in-get_hex-merge_branches-branch_c",
-        "edge-inferred-fan-in-recommend_pairing-merge_branches-branch_a",
+        "edge-inferred-fan-in-get_hex-merge_branches-branch_c-success",
+        "edge-inferred-fan-in-recommend_pairing-merge_branches-branch_a-success",
       ]);
     });
 
