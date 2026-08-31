@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import replace
 from uuid import UUID
 
+import pytest
+
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentAction, DeferredIntentEditAction
@@ -657,6 +660,30 @@ def test_management_edit_contradiction_names_conflict_and_leaves_saved_instructi
     assert _RETAINED_INTENT_ID in result.chat.assistant_message
     assert "did not change" in result.chat.assistant_message
     assert result.guided.deferred_intents == (conflicting, edited)
+
+
+def test_deferred_action_fold_rejects_surplus_intent_ids() -> None:
+    """One route-minted id must correspond to exactly one deferred action."""
+    with pytest.raises(AuditIntegrityError, match="exactly as many intent ids as actions"):
+        apply_deferred_request(
+            (_action("passthrough"),),
+            None,
+            authority=DeferredRequestAuthority(
+                guided=GuidedSession.initial(),
+                catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+                originating_message=GuidedOriginatingUserMessageDraft(
+                    message_id=_MESSAGE_ID,
+                    content="Later add the passthrough transform.",
+                ),
+                new_intent_ids=(_INTENT_ID, _SECOND_INTENT_ID),
+            ),
+            chat=StepChatResult(
+                assistant_message="model-authored response",
+                status=ComposerChatTurnStatus.SUCCESS,
+                latency_ms=7,
+                error_class=None,
+            ),
+        )
 
 
 def test_two_actions_in_one_send_fold_and_compose_against_the_evolving_state() -> None:

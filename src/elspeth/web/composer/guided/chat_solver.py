@@ -811,32 +811,23 @@ _DEFERRED_INTENT_MANAGEMENT_TOOL: dict[str, Any] = {
         "name": "manage_deferred_intent",
         "description": (
             "Use only when the user explicitly asks to cancel or revise one listed pending deferred intent. "
-            "Copy the exact server-listed intent_id and paired selection_token; never invent, approximate, or mix them."
+            "Copy the exact server-listed intent_id and paired selection_token; never invent, approximate, or mix them. "
+            "For edit, include the complete replacement; for cancel, omit replacement."
         ),
         "parameters": {
-            "oneOf": [
-                {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["action", "intent_id", "selection_token"],
-                    "properties": {
-                        "action": {"type": "string", "enum": ["cancel"]},
-                        "intent_id": {"type": "string", "format": "uuid"},
-                        "selection_token": {"type": "string", "minLength": 1},
-                    },
-                },
-                {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["action", "intent_id", "selection_token", "replacement"],
-                    "properties": {
-                        "action": {"type": "string", "enum": ["edit"]},
-                        "intent_id": {"type": "string", "format": "uuid"},
-                        "selection_token": {"type": "string", "minLength": 1},
-                        "replacement": _DEFERRED_INTENT_TOOL["function"]["parameters"],
-                    },
-                },
-            ]
+            # Flat object schema on purpose: LiteLLM's Anthropic and Bedrock
+            # adapters discard a root-level oneOf, leaving the model an empty,
+            # unconstrained management tool. The owned parser below enforces
+            # cancel-without-replacement versus edit-with-replacement.
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["action", "intent_id", "selection_token"],
+            "properties": {
+                "action": {"type": "string", "enum": ["cancel", "edit"]},
+                "intent_id": {"type": "string", "format": "uuid"},
+                "selection_token": {"type": "string", "minLength": 1},
+                "replacement": _DEFERRED_INTENT_TOOL["function"]["parameters"],
+            },
         },
     },
 }
@@ -1016,6 +1007,47 @@ class _DeferredIntentRepairThread:
     calls: tuple[_RepairThreadToolCall, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _DeferredRepairIdle:
+    """No deferred-intent repair transaction is open."""
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredRetainOpen:
+    """A retain cohort has rejected slots that must be repaired atomically."""
+
+    slots: tuple[DeferredIntentAction | None, ...]
+    first_error: DeferredIntentActionShapeError
+    held_resolution: _RepairThreadToolCall | None
+
+    def __post_init__(self) -> None:
+        if type(self.slots) is not tuple or not self.slots or not any(action is None for action in self.slots):
+            raise TypeError("_DeferredRetainOpen.slots must be a non-empty tuple with at least one rejected slot")
+        if any(action is not None and type(action) is not DeferredIntentAction for action in self.slots):
+            raise TypeError("_DeferredRetainOpen.slots must contain exact actions or None")
+        if type(self.first_error) is not DeferredIntentActionShapeError:
+            raise TypeError("_DeferredRetainOpen.first_error must be exact")
+        if self.held_resolution is not None and type(self.held_resolution) is not _RepairThreadToolCall:
+            raise TypeError("_DeferredRetainOpen.held_resolution must be an exact owned call or None")
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredResolutionOpen:
+    """Exact ordered actions held while their current-stage sibling repairs."""
+
+    actions: tuple[DeferredIntentAction, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.actions) is not tuple or not self.actions or any(type(action) is not DeferredIntentAction for action in self.actions):
+            raise TypeError("_DeferredResolutionOpen.actions must be a non-empty tuple of exact actions")
+
+
+type _DeferredRepairState = _DeferredRepairIdle | _DeferredRetainOpen | _DeferredResolutionOpen
+
+
+_DEFERRED_REPAIR_IDLE: Final[_DeferredRepairIdle] = _DeferredRepairIdle()
+
+
 _MISSING_REPAIR_THREAD_FIELD: Final[object] = object()
 
 
@@ -1024,6 +1056,7 @@ def _admit_deferred_intent_repair_thread(
     tool_calls: Any,
     *,
     rejected_calls: tuple[Any, ...],
+    allow_no_rejections: bool = False,
 ) -> _DeferredIntentRepairThread | None:
     """Parse raw provider objects into the exact fields needed for replay.
 
@@ -1036,15 +1069,23 @@ def _admit_deferred_intent_repair_thread(
     if assistant_content is _MISSING_REPAIR_THREAD_FIELD or (assistant_content is not None and type(assistant_content) is not str):
         return None
     admitted_calls: list[_RepairThreadToolCall] = []
+    call_ids: set[str] = set()
     for tool_call in tool_calls:
         call_id = getattr(tool_call, "id", _MISSING_REPAIR_THREAD_FIELD)
         function = getattr(tool_call, "function", _MISSING_REPAIR_THREAD_FIELD)
-        if type(call_id) is not str or not call_id or function is _MISSING_REPAIR_THREAD_FIELD or function is None:
+        if (
+            type(call_id) is not str
+            or not call_id.strip()
+            or call_id in call_ids
+            or function is _MISSING_REPAIR_THREAD_FIELD
+            or function is None
+        ):
             return None
         name = getattr(function, "name", _MISSING_REPAIR_THREAD_FIELD)
         arguments = getattr(function, "arguments", _MISSING_REPAIR_THREAD_FIELD)
         if type(name) is not str or not name or type(arguments) is not str:
             return None
+        call_ids.add(call_id)
         admitted_calls.append(
             _RepairThreadToolCall(
                 id=call_id,
@@ -1052,12 +1093,34 @@ def _admit_deferred_intent_repair_thread(
                 is_rejected=any(tool_call is rejected for rejected in rejected_calls),
             )
         )
-    if sum(call.is_rejected for call in admitted_calls) != len(rejected_calls) or not rejected_calls:
+    if sum(call.is_rejected for call in admitted_calls) != len(rejected_calls) or (not rejected_calls and not allow_no_rejections):
         return None
     return _DeferredIntentRepairThread(
         assistant_content=assistant_content,
         calls=tuple(admitted_calls),
     )
+
+
+def _admit_replayed_resolution_function(
+    message: Any,
+    tool_calls: Any,
+    *,
+    function_name: str,
+) -> _RepairThreadToolFunction | None:
+    """Match one replayed resolution through the existing provider boundary."""
+
+    admitted = _admit_deferred_intent_repair_thread(
+        message,
+        tool_calls,
+        rejected_calls=(),
+        allow_no_rejections=True,
+    )
+    if admitted is None:
+        return None
+    matching = tuple(call.function for call in admitted.calls if call.function.name == function_name)
+    if len(matching) != 1:
+        return None
+    return matching[0]
 
 
 def _deferred_intent_repair_thread(
@@ -1071,7 +1134,8 @@ def _deferred_intent_repair_thread(
     tool-call turn is re-materialised, then EVERY call id is answered (the
     OpenAI/LiteLLM protocol 400s on an unanswered id). Each rejected retain
     call gets its own value-free shape rejection, in call order; every other
-    call is told it was withheld so the model resends the complete reply.
+    call is told it is held pending so the model can resend either the complete
+    reply or only the rejected retain call.
     Shape-error text is value-free by construction (key names, types,
     vocabulary — never user prose).
     """
@@ -1095,20 +1159,120 @@ def _deferred_intent_repair_thread(
         }
     ]
     rejection_errors = iter(errors)
+    rejected_count = sum(call.is_rejected for call in admitted.calls)
     for tool_call in admitted.calls:
         if tool_call.is_rejected:
-            content = (
-                f"retain_deferred_intent rejected: {next(rejection_errors)} "
-                "Correct the arguments and call retain_deferred_intent again with the "
-                "complete structural constraints."
+            correction_instruction = (
+                "Correct the arguments and resend ALL original calls together in their original order."
+                if rejected_count > 1
+                else "Correct the arguments and call retain_deferred_intent again with the complete structural constraints."
             )
+            content = f"retain_deferred_intent rejected: {next(rejection_errors)} {correction_instruction}"
         else:
+            replay_instruction = (
+                "Resend ALL original calls together in their original order."
+                if rejected_count > 1
+                else "Either resend ALL calls together or resend only the rejected retain_deferred_intent call."
+            )
             content = (
-                "Not applied: a grouped retain_deferred_intent call was rejected. "
-                "After correcting it, resend ALL calls together in one reply."
+                "Not applied yet: this grouped call is held pending because a retain_deferred_intent call was rejected. "
+                f"After correcting it, {replay_instruction}"
             )
         thread.append({"role": "tool", "tool_call_id": tool_call.id, "content": content})
     return thread
+
+
+def _deferred_intent_repair_slots(
+    *,
+    calls: tuple[Any, ...],
+    rejected_calls: tuple[Any, ...],
+    parsed_actions: tuple[DeferredIntentAction, ...],
+) -> tuple[DeferredIntentAction | None, ...]:
+    """Project parsed actions and rejected provider calls into call-order slots."""
+    if len(parsed_actions) + len(rejected_calls) != len(calls):
+        raise InvariantError("deferred repair slots must cover every retain call exactly once")
+    parsed = iter(parsed_actions)
+    return tuple(None if any(call is rejected for rejected in rejected_calls) else next(parsed) for call in calls)
+
+
+def _settle_deferred_retain_repair(
+    state: _DeferredRetainOpen,
+    *,
+    repaired_actions: tuple[DeferredIntentAction, ...],
+    replayed_resolution: _RepairThreadToolFunction | None,
+) -> tuple[tuple[DeferredIntentAction, ...], _RepairThreadToolCall | None] | None:
+    """Settle targeted correction or an exact full replay of known slots.
+
+    A targeted correction is safe only when exactly one slot was rejected and
+    the retry contains no current-stage resolution: provider call IDs do not
+    correlate across turns, so two or more fresh corrections cannot be mapped
+    to old slots by reply order, and a retain-only correction has no authority
+    to replace its held resolution sibling. A full replay must preserve every
+    already-valid slot at its original index and exactly replay the held
+    resolution function (or preserve its absence). The returned held call is a
+    one-expression handoff: callers always use that owned original rather than
+    the retry's provider object, then transition immediately to
+    ``_DeferredResolutionOpen``.
+    """
+
+    rejected_count = sum(action is None for action in state.slots)
+    if rejected_count == 1 and len(repaired_actions) == 1 and replayed_resolution is None:
+        repaired = iter(repaired_actions)
+        settled = tuple(next(repaired) if action is None else action for action in state.slots)
+        return settled, state.held_resolution
+    if len(repaired_actions) != len(state.slots):
+        return None
+    if any(original is not None and repaired_actions[index] != original for index, original in enumerate(state.slots)):
+        return None
+    held_resolution_function = state.held_resolution.function if state.held_resolution is not None else None
+    if replayed_resolution != held_resolution_function:
+        return None
+    return repaired_actions, state.held_resolution
+
+
+def _withhold_open_resolution(
+    state: _DeferredResolutionOpen,
+    *,
+    error_class: str = "PairedResolutionNotResent",
+) -> GuidedChatDeferredIntentWithheldResolutionOutcome:
+    """Close an unresolved resolution while preserving its exact action tuple."""
+
+    return GuidedChatDeferredIntentWithheldResolutionOutcome(
+        actions=state.actions,
+        resolution_error_class=error_class,
+    )
+
+
+def _deferred_repair_exception_outcome(
+    state: _DeferredRepairState,
+    exc: Exception,
+) -> GuidedChatDeferredIntentWithheldResolutionOutcome | None:
+    """Dispose an exceptional exit without breaking open-state custody.
+
+    Audit classification belongs to the caller's catch arm and is set before
+    this helper runs. Cancellation never reaches this helper: both solvers
+    preserve their dedicated re-raise arm.
+    """
+
+    if type(state) is _DeferredRetainOpen:
+        if exc is state.first_error:
+            raise
+        raise state.first_error from exc
+    if type(state) is _DeferredResolutionOpen:
+        return _withhold_open_resolution(state)
+    return None
+
+
+def _held_grouped_resolution_call(
+    admitted: _DeferredIntentRepairThread,
+    *,
+    function_name: str,
+) -> _RepairThreadToolCall | None:
+    """Return the owned current-stage call held across a retain-only repair."""
+    matches = tuple(call for call in admitted.calls if not call.is_rejected and call.function.name == function_name)
+    if len(matches) > 1:
+        raise InvariantError("deferred repair group must contain at most one current-stage resolution")
+    return matches[0] if matches else None
 
 
 def _terminal_shape_error_type(terminal_calls: Any) -> type[GuidedSolverResponseShapeError]:
@@ -2574,7 +2738,7 @@ async def maybe_resolve_step_1_source_chat(
     # the retry attempt.
     deferred_repair_thread: list[dict[str, Any]] = []
     shape_repair_used = False
-    deferred_repair_used = False
+    deferred_repair_state: _DeferredRepairState = _DEFERRED_REPAIR_IDLE
     max_attempts = 2
     for attempt_index in range(max_attempts):
         # SPLIT the system prompt: the stable per-step skill is the byte-stable,
@@ -2662,6 +2826,13 @@ async def maybe_resolve_step_1_source_chat(
                 retain_calls = [
                     call for call in terminal_calls if call.function is not None and call.function.name == "retain_deferred_intent"
                 ]
+                if type(deferred_repair_state) is _DeferredRetainOpen and not retain_calls:
+                    # The repair transaction is unresolved until a retain
+                    # cohort arrives. A different terminal must not replace it
+                    # and silently discard the original malformed instruction;
+                    # the caller converts this owned shape error into durable
+                    # clarification retention for the whole originating Send.
+                    raise deferred_repair_state.first_error
                 source_calls = [call for call in terminal_calls if call.function is not None and call.function.name == "resolve_source"]
                 withheld_source_calls = [
                     call for call in tool_calls if call.function is not None and call.function.name == "resolve_source"
@@ -2688,12 +2859,21 @@ async def maybe_resolve_step_1_source_chat(
                     and len(withheld_source_calls) == 1
                     and len(tool_calls) == len(retain_calls) + 1
                 )
+                if type(deferred_repair_state) is _DeferredResolutionOpen:
+                    corrected_resolution = len(source_calls) == 1 and len(tool_calls) == 1
+                    possible_full_replay = is_retained_group and len(source_calls) == 1
+                    if not (corrected_resolution or possible_full_replay):
+                        status = ComposerLLMCallStatus.SUCCESS
+                        return _withhold_open_resolution(deferred_repair_state)
                 if not (is_retained_group or is_withheld_retained_group) and (len(terminal_calls) != 1 or len(tool_calls) != 1):
                     raise _terminal_shape_error_type(terminal_calls)(
                         "step-1 chat must return exactly one terminal guided action, or one resolve_source "
                         "call grouped with retain_deferred_intent calls"
                     )
                 if len(retain_calls) > GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY:
+                    if type(deferred_repair_state) is _DeferredResolutionOpen:
+                        status = ComposerLLMCallStatus.SUCCESS
+                        return _withhold_open_resolution(deferred_repair_state)
                     raise DeferredIntentActionShapeError(
                         f"step-1 chat carries {len(retain_calls)} retain_deferred_intent calls; "
                         f"at most {GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY} are accepted in one reply"
@@ -2708,6 +2888,9 @@ async def maybe_resolve_step_1_source_chat(
                         except DeferredIntentActionShapeError as exc:
                             retain_failures.append((retain_call, exc))
                     if retain_failures:
+                        if type(deferred_repair_state) is _DeferredResolutionOpen:
+                            status = ComposerLLMCallStatus.SUCCESS
+                            return _withhold_open_resolution(deferred_repair_state)
                         # Bounded self-repair (mirrors the step-2 config-invalid
                         # resolve_sink threading): thread the value-free shape
                         # rejections back and let the model correct itself once
@@ -2723,9 +2906,24 @@ async def maybe_resolve_step_1_source_chat(
                                 rejected_calls=tuple(call for call, _ in retain_failures),
                             )
                         )
-                        if deferred_repair_used or attempt_index + 1 >= max_attempts or admitted_repair is None:
+                        if (
+                            type(deferred_repair_state) is _DeferredRetainOpen
+                            or attempt_index + 1 >= max_attempts
+                            or admitted_repair is None
+                        ):
                             raise retain_failures[0][1]
-                        deferred_repair_used = True
+                        deferred_repair_state = _DeferredRetainOpen(
+                            slots=_deferred_intent_repair_slots(
+                                calls=tuple(retain_calls),
+                                rejected_calls=tuple(call for call, _ in retain_failures),
+                                parsed_actions=tuple(parsed_actions),
+                            ),
+                            first_error=retain_failures[0][1],
+                            held_resolution=_held_grouped_resolution_call(
+                                admitted_repair,
+                                function_name="resolve_source",
+                            ),
+                        )
                         deferred_repair_thread = _deferred_intent_repair_thread(
                             admitted_repair,
                             errors=tuple(exc for _, exc in retain_failures),
@@ -2734,7 +2932,42 @@ async def maybe_resolve_step_1_source_chat(
                         error_class = type(retain_failures[0][1]).__name__
                         error_message = "malformed_response"
                         continue
-                    deferred_actions = tuple(parsed_actions)
+                    repaired_actions = tuple(parsed_actions)
+                    if type(deferred_repair_state) is _DeferredRetainOpen:
+                        replayed_resolution = (
+                            _admit_replayed_resolution_function(
+                                message,
+                                tool_calls,
+                                function_name="resolve_source",
+                            )
+                            if source_calls
+                            else None
+                        )
+                        if source_calls and replayed_resolution is None:
+                            raise deferred_repair_state.first_error
+                        retain_settlement = _settle_deferred_retain_repair(
+                            deferred_repair_state,
+                            repaired_actions=repaired_actions,
+                            replayed_resolution=replayed_resolution,
+                        )
+                        if retain_settlement is None:
+                            raise deferred_repair_state.first_error
+                        deferred_actions, held_resolution = retain_settlement
+                        if held_resolution is not None:
+                            deferred_repair_state = _DeferredResolutionOpen(deferred_actions)
+                            source_calls = [held_resolution]
+                        else:
+                            deferred_repair_state = _DEFERRED_REPAIR_IDLE
+                            source_calls = []
+                    elif type(deferred_repair_state) is _DeferredResolutionOpen:
+                        if repaired_actions != deferred_repair_state.actions:
+                            status = ComposerLLMCallStatus.SUCCESS
+                            return _withhold_open_resolution(deferred_repair_state)
+                        deferred_actions = deferred_repair_state.actions
+                    else:
+                        deferred_actions = repaired_actions
+                if deferred_actions and source_calls and type(deferred_repair_state) is _DeferredRepairIdle:
+                    deferred_repair_state = _DeferredResolutionOpen(deferred_actions)
                 if deferred_actions and is_withheld_retained_group:
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredIntentWithheldResolutionOutcome(
@@ -2744,6 +2977,8 @@ async def maybe_resolve_step_1_source_chat(
                 if deferred_actions and not source_calls:
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredIntentOutcome(actions=deferred_actions)
+                if not deferred_actions and type(deferred_repair_state) is _DeferredResolutionOpen:
+                    deferred_actions = deferred_repair_state.actions
                 function = source_calls[0].function if source_calls else terminal_calls[0].function
                 if function is None:  # pragma: no cover - filtered immediately above
                     raise GuidedSolverResponseShapeError("step-1 terminal action has no function")
@@ -2871,7 +3106,10 @@ async def maybe_resolve_step_1_source_chat(
                 status = ComposerLLMCallStatus.SUCCESS
                 if shape_repair_used:
                     record_guided_shape_repair(step="step_1_source", tool="resolve_source", outcome="repaired", attempt_index=attempt_index)
-                return Step1SourceResolvedOutcome(resolution=result, deferred_actions=deferred_actions)
+                return Step1SourceResolvedOutcome(
+                    resolution=result,
+                    deferred_actions=deferred_actions,
+                )
             # No resolve_source call: the model judged the message doesn't carry
             # enough detail to act (or it's a plain question) and answered in
             # prose instead. Validate + return that prose directly — the SAME
@@ -2883,6 +3121,14 @@ async def maybe_resolve_step_1_source_chat(
             # and must not be trusted; it falls through to the advisory fallback
             # (now grounded by _ADVISORY_NO_TOOLS_ADDENDUM) exactly as before.
             if not tool_calls:
+                if type(deferred_repair_state) is _DeferredRetainOpen:
+                    raise deferred_repair_state.first_error
+                if type(deferred_repair_state) is _DeferredResolutionOpen:
+                    # The model declined to resend the rejected source after a
+                    # grouped repair. Its already-validated retain siblings
+                    # still apply, matching the step-2 repair boundary.
+                    status = ComposerLLMCallStatus.SUCCESS
+                    return _withhold_open_resolution(deferred_repair_state)
                 content = message.content
                 if content is None or not str(content).strip():
                     # Genuinely empty/defective response (no tool call, no
@@ -2921,12 +3167,20 @@ async def maybe_resolve_step_1_source_chat(
             # Non-empty tool_calls with no resolve_source (hallucinated tool name
             # or function=None): return the empty outcome so the route falls back
             # to the tool-less advisory call, matching the step-2 contract.
+            if type(deferred_repair_state) is _DeferredRetainOpen:
+                raise deferred_repair_state.first_error
+            if type(deferred_repair_state) is _DeferredResolutionOpen:
+                status = ComposerLLMCallStatus.SUCCESS
+                return _withhold_open_resolution(deferred_repair_state)
             status = ComposerLLMCallStatus.SUCCESS
             return GuidedChatEmptyOutcome()
-        except TimeoutError:
+        except TimeoutError as exc:
             status = ComposerLLMCallStatus.TIMEOUT
             error_class = "TimeoutError"
             error_message = "TimeoutError"
+            repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
+            if repair_outcome is not None:
+                return repair_outcome
             raise
         except asyncio.CancelledError as exc:
             status = ComposerLLMCallStatus.CANCELLED
@@ -2937,26 +3191,41 @@ async def maybe_resolve_step_1_source_chat(
             status = ComposerLLMCallStatus.AUTH_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
+            repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
+            if repair_outcome is not None:
+                return repair_outcome
             raise
         except LiteLLMBadRequestError as exc:
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
+            repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
+            if repair_outcome is not None:
+                return repair_outcome
             raise
         except LiteLLMAPIError as exc:
             status = ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
+            repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
+            if repair_outcome is not None:
+                return repair_outcome
             raise
         except (IndexError, AttributeError, json.JSONDecodeError, ValueError, GuidedSolverResponseShapeError) as exc:
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
             error_class = type(exc).__name__
             error_message = "malformed_response"
+            repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
+            if repair_outcome is not None:
+                return repair_outcome
             raise
         except Exception as exc:
             status = ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
+            repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
+            if repair_outcome is not None:
+                return repair_outcome
             raise
         finally:
             _record_llm_call(
@@ -3539,13 +3808,7 @@ async def maybe_resolve_step_2_sink_chat(
     # retain_deferred_intent reply gets its shape rejection threaded back as a
     # tool result (consuming one loop iteration) instead of terminalizing the
     # whole Send.
-    deferred_repair_used = False
-    # A group's VALID parsed retains must survive their sink half never
-    # becoming acceptable: if the loop would otherwise end without a terminal
-    # outcome (config-invalid sink at the iteration cap, a prose decline, or a
-    # hallucinated-tool fallback after the grouped round), the retains apply
-    # alone rather than being silently discarded (R2-F15 review finding 3).
-    pending_deferred_actions: tuple[DeferredIntentAction, ...] = ()
+    deferred_repair_state: _DeferredRepairState = _DEFERRED_REPAIR_IDLE
     iterations = max(1, iteration_cap)
     for _iteration in range(iterations):
         request_messages = list(messages)
@@ -3564,7 +3827,18 @@ async def maybe_resolve_step_2_sink_chat(
         error_message: str | None = None
         # Visible before the (slow) provider round-trip so a poller sampling
         # mid-call sees "calling_model", not a stale prior-phase snapshot.
-        await emit_progress(progress, model_call_progress_event(user_message))
+        # The progress sink sits outside the provider audit interval. If it
+        # fails while a repair transaction is open, preserve that transaction
+        # without inventing an LLM call that never happened.
+        try:
+            await emit_progress(progress, model_call_progress_event(user_message))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
+            if repair_outcome is not None:
+                return repair_outcome
+            raise
         try:
             response = await _bounded_acompletion(kwargs, timeout_seconds)
             message = response.choices[0].message
@@ -3580,6 +3854,11 @@ async def maybe_resolve_step_2_sink_chat(
                 retain_calls = [
                     call for call in terminal_calls if call.function is not None and call.function.name == "retain_deferred_intent"
                 ]
+                if type(deferred_repair_state) is _DeferredRetainOpen and not retain_calls:
+                    # Keep the repair cohort transactional: resolution,
+                    # management, and other terminals cannot replace an
+                    # unresolved retain group from the originating Send.
+                    raise deferred_repair_state.first_error
                 sink_calls = [call for call in terminal_calls if call.function is not None and call.function.name == "resolve_sink"]
                 withheld_sink_calls = [call for call in tool_calls if call.function is not None and call.function.name == "resolve_sink"]
                 # A resolve_sink + 1..K retain_deferred_intent GROUP is the one
@@ -3602,12 +3881,21 @@ async def maybe_resolve_step_2_sink_chat(
                     and len(withheld_sink_calls) == 1
                     and len(tool_calls) == len(retain_calls) + 1
                 )
+                if type(deferred_repair_state) is _DeferredResolutionOpen:
+                    corrected_resolution = len(sink_calls) == 1 and len(tool_calls) == 1
+                    possible_full_replay = is_retained_group and len(sink_calls) == 1
+                    if not (corrected_resolution or possible_full_replay):
+                        status = ComposerLLMCallStatus.SUCCESS
+                        return _withhold_open_resolution(deferred_repair_state)
                 if not (is_retained_group or is_withheld_retained_group) and (len(terminal_calls) != 1 or len(tool_calls) != 1):
                     raise _terminal_shape_error_type(terminal_calls)(
                         "step-2 chat must return exactly one terminal guided action, or one resolve_sink "
                         "call grouped with retain_deferred_intent calls"
                     )
                 if len(retain_calls) > GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY:
+                    if type(deferred_repair_state) is _DeferredResolutionOpen:
+                        status = ComposerLLMCallStatus.SUCCESS
+                        return _withhold_open_resolution(deferred_repair_state)
                     raise DeferredIntentActionShapeError(
                         f"step-2 chat carries {len(retain_calls)} retain_deferred_intent calls; "
                         f"at most {GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY} are accepted in one reply"
@@ -3622,6 +3910,9 @@ async def maybe_resolve_step_2_sink_chat(
                         except DeferredIntentActionShapeError as exc:
                             retain_failures.append((retain_call, exc))
                     if retain_failures:
+                        if type(deferred_repair_state) is _DeferredResolutionOpen:
+                            status = ComposerLLMCallStatus.SUCCESS
+                            return _withhold_open_resolution(deferred_repair_state)
                         # Bounded self-repair (mirrors the config-invalid
                         # resolve_sink threading below): thread the value-free
                         # shape rejections back and let the model correct itself
@@ -3637,9 +3928,20 @@ async def maybe_resolve_step_2_sink_chat(
                                 rejected_calls=tuple(call for call, _ in retain_failures),
                             )
                         )
-                        if deferred_repair_used or _iteration + 1 >= iterations or admitted_repair is None:
+                        if type(deferred_repair_state) is _DeferredRetainOpen or _iteration + 1 >= iterations or admitted_repair is None:
                             raise retain_failures[0][1]
-                        deferred_repair_used = True
+                        deferred_repair_state = _DeferredRetainOpen(
+                            slots=_deferred_intent_repair_slots(
+                                calls=tuple(retain_calls),
+                                rejected_calls=tuple(call for call, _ in retain_failures),
+                                parsed_actions=tuple(parsed_actions),
+                            ),
+                            first_error=retain_failures[0][1],
+                            held_resolution=_held_grouped_resolution_call(
+                                admitted_repair,
+                                function_name="resolve_sink",
+                            ),
+                        )
                         messages.extend(
                             _deferred_intent_repair_thread(
                                 admitted_repair,
@@ -3650,7 +3952,42 @@ async def maybe_resolve_step_2_sink_chat(
                         error_class = type(retain_failures[0][1]).__name__
                         error_message = "malformed_response"
                         continue
-                    deferred_actions = tuple(parsed_actions)
+                    repaired_actions = tuple(parsed_actions)
+                    if type(deferred_repair_state) is _DeferredRetainOpen:
+                        replayed_resolution = (
+                            _admit_replayed_resolution_function(
+                                message,
+                                tool_calls,
+                                function_name="resolve_sink",
+                            )
+                            if sink_calls
+                            else None
+                        )
+                        if sink_calls and replayed_resolution is None:
+                            raise deferred_repair_state.first_error
+                        retain_settlement = _settle_deferred_retain_repair(
+                            deferred_repair_state,
+                            repaired_actions=repaired_actions,
+                            replayed_resolution=replayed_resolution,
+                        )
+                        if retain_settlement is None:
+                            raise deferred_repair_state.first_error
+                        deferred_actions, held_resolution = retain_settlement
+                        if held_resolution is not None:
+                            deferred_repair_state = _DeferredResolutionOpen(deferred_actions)
+                            sink_calls = [held_resolution]
+                        else:
+                            deferred_repair_state = _DEFERRED_REPAIR_IDLE
+                            sink_calls = []
+                    elif type(deferred_repair_state) is _DeferredResolutionOpen:
+                        if repaired_actions != deferred_repair_state.actions:
+                            status = ComposerLLMCallStatus.SUCCESS
+                            return _withhold_open_resolution(deferred_repair_state)
+                        deferred_actions = deferred_repair_state.actions
+                    else:
+                        deferred_actions = repaired_actions
+                if deferred_actions and sink_calls and type(deferred_repair_state) is _DeferredRepairIdle:
+                    deferred_repair_state = _DeferredResolutionOpen(deferred_actions)
                 if deferred_actions and is_withheld_retained_group:
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredIntentWithheldResolutionOutcome(
@@ -3660,8 +3997,8 @@ async def maybe_resolve_step_2_sink_chat(
                 if deferred_actions and not sink_calls:
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredIntentOutcome(actions=deferred_actions)
-                if deferred_actions and sink_calls:
-                    pending_deferred_actions = deferred_actions
+                if not deferred_actions and type(deferred_repair_state) is _DeferredResolutionOpen:
+                    deferred_actions = deferred_repair_state.actions
                 function = sink_calls[0].function if sink_calls else terminal_calls[0].function
                 if function is None:  # pragma: no cover - filtered immediately above
                     raise GuidedSolverResponseShapeError("step-2 terminal action has no function")
@@ -3671,14 +4008,14 @@ async def maybe_resolve_step_2_sink_chat(
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredManagementOutcome(action=management)
                 if not isinstance(arguments, str):
-                    if pending_deferred_actions:
+                    if deferred_actions:
                         # The group's retain calls are valid; keep them rather
                         # than discarding the instructions with the defective
                         # sink. The withheld resolution stays classified so the
                         # caller renders and audits the not-applied signal.
                         status = ComposerLLMCallStatus.SUCCESS
                         return GuidedChatDeferredIntentWithheldResolutionOutcome(
-                            actions=pending_deferred_actions,
+                            actions=deferred_actions,
                             resolution_error_class="PairedResolutionShapeRejected",
                         )
                     raise GuidedSolverResponseShapeError(
@@ -3687,11 +4024,11 @@ async def maybe_resolve_step_2_sink_chat(
                 try:
                     sink, assistant = _parse_step_2_sink_tool_arguments(arguments)
                 except AssistantScaffoldLeakError:
-                    if pending_deferred_actions:
+                    if deferred_actions:
                         # Same retention rule for a shape-invalid sink half.
                         status = ComposerLLMCallStatus.SUCCESS
                         return GuidedChatDeferredIntentWithheldResolutionOutcome(
-                            actions=pending_deferred_actions,
+                            actions=deferred_actions,
                             resolution_error_class="PairedResolutionShapeRejected",
                         )
                     raise
@@ -3724,11 +4061,11 @@ async def maybe_resolve_step_2_sink_chat(
                         error_class = type(exc).__name__
                         error_message = "malformed_response"
                         continue
-                    if pending_deferred_actions:
+                    if deferred_actions:
                         # Same retention rule for a shape-invalid sink half.
                         status = ComposerLLMCallStatus.SUCCESS
                         return GuidedChatDeferredIntentWithheldResolutionOutcome(
-                            actions=pending_deferred_actions,
+                            actions=deferred_actions,
                             resolution_error_class="PairedResolutionShapeRejected",
                         )
                     raise
@@ -3740,7 +4077,7 @@ async def maybe_resolve_step_2_sink_chat(
                     return Step2SinkResolvedOutcome(
                         sink=sink,
                         assistant_message=assistant,
-                        deferred_actions=deferred_actions if deferred_actions else pending_deferred_actions,
+                        deferred_actions=deferred_actions,
                     )
                 # Config-invalid resolution: thread the rejection back as the
                 # tool result so the model can correct itself within the same
@@ -3777,15 +4114,14 @@ async def maybe_resolve_step_2_sink_chat(
             # carries a hallucinated tool call is a more suspicious shape and
             # must not have its prose trusted either (falls through instead).
             if not tool_calls:
-                if pending_deferred_actions:
+                if type(deferred_repair_state) is _DeferredRetainOpen:
+                    raise deferred_repair_state.first_error
+                if type(deferred_repair_state) is _DeferredResolutionOpen:
                     # The model declined to resend the group after its sink half
                     # was rejected; the valid retains still apply rather than
                     # being silently discarded with the reply.
                     status = ComposerLLMCallStatus.SUCCESS
-                    return GuidedChatDeferredIntentWithheldResolutionOutcome(
-                        actions=pending_deferred_actions,
-                        resolution_error_class="PairedResolutionNotResent",
-                    )
+                    return _withhold_open_resolution(deferred_repair_state)
                 content = message.content
                 if content is None or not str(content).strip():
                     status = ComposerLLMCallStatus.SUCCESS
@@ -3800,15 +4136,19 @@ async def maybe_resolve_step_2_sink_chat(
             # dispatching anything.
             discovery_calls = [tc for tc in tool_calls if tc.function is not None and tc.function.name in allowed_discovery]
             if not discovery_calls or len(discovery_calls) != len(tool_calls):
-                if pending_deferred_actions:
+                if type(deferred_repair_state) is _DeferredRetainOpen:
+                    raise deferred_repair_state.first_error
+                if type(deferred_repair_state) is _DeferredResolutionOpen:
                     status = ComposerLLMCallStatus.SUCCESS
-                    return GuidedChatDeferredIntentWithheldResolutionOutcome(
-                        actions=pending_deferred_actions,
-                        resolution_error_class="PairedResolutionNotResent",
-                    )
+                    return _withhold_open_resolution(deferred_repair_state)
                 status = ComposerLLMCallStatus.SUCCESS
                 return GuidedChatEmptyOutcome()
             if len(discovery_calls) > tool_call_cap:
+                if type(deferred_repair_state) is _DeferredRetainOpen:
+                    raise deferred_repair_state.first_error
+                if type(deferred_repair_state) is _DeferredResolutionOpen:
+                    status = ComposerLLMCallStatus.SUCCESS
+                    return _withhold_open_resolution(deferred_repair_state)
                 raise GuidedToolArgumentShapeError("step-2 discovery response exceeds the per-turn tool call limit")
 
             # Thread the assistant tool-call request once, then answer every
@@ -3842,10 +4182,13 @@ async def maybe_resolve_step_2_sink_chat(
                         mark_schema_loaded(str(call_arguments["plugin_type"]), str(call_arguments["name"]))
             status = ComposerLLMCallStatus.SUCCESS
             # fall through to finally (records this round), then loop again
-        except TimeoutError:
+        except TimeoutError as exc:
             status = ComposerLLMCallStatus.TIMEOUT
             error_class = "TimeoutError"
             error_message = "TimeoutError"
+            repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
+            if repair_outcome is not None:
+                return repair_outcome
             raise
         except asyncio.CancelledError as exc:
             status = ComposerLLMCallStatus.CANCELLED
@@ -3856,16 +4199,25 @@ async def maybe_resolve_step_2_sink_chat(
             status = ComposerLLMCallStatus.AUTH_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
+            repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
+            if repair_outcome is not None:
+                return repair_outcome
             raise
         except LiteLLMBadRequestError as exc:
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
+            repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
+            if repair_outcome is not None:
+                return repair_outcome
             raise
         except LiteLLMAPIError as exc:
             status = ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
+            repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
+            if repair_outcome is not None:
+                return repair_outcome
             raise
         except (IndexError, AttributeError, json.JSONDecodeError, ValueError, GuidedSolverResponseShapeError) as exc:
             # ``GuidedSolverResponseShapeError`` from a malformed discovery-tool
@@ -3877,11 +4229,17 @@ async def maybe_resolve_step_2_sink_chat(
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
             error_class = type(exc).__name__
             error_message = "malformed_response"
+            repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
+            if repair_outcome is not None:
+                return repair_outcome
             raise
         except Exception as exc:
             status = ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
+            repair_outcome = _deferred_repair_exception_outcome(deferred_repair_state, exc)
+            if repair_outcome is not None:
+                return repair_outcome
             raise
         finally:
             _record_llm_call(
@@ -3902,10 +4260,12 @@ async def maybe_resolve_step_2_sink_chat(
     # Discovery iteration cap reached without a resolve_sink. A group's valid
     # retain calls still apply alone (R2-F15: the instructions are never
     # silently discarded); otherwise degrade to the advisory fallback.
-    if pending_deferred_actions:
-        return GuidedChatDeferredIntentWithheldResolutionOutcome(
-            actions=pending_deferred_actions,
-            resolution_error_class="PairedResolutionConfigRejected",
+    if type(deferred_repair_state) is _DeferredRetainOpen:
+        raise deferred_repair_state.first_error
+    if type(deferred_repair_state) is _DeferredResolutionOpen:
+        return _withhold_open_resolution(
+            deferred_repair_state,
+            error_class="PairedResolutionConfigRejected",
         )
     return GuidedChatEmptyOutcome()
 
