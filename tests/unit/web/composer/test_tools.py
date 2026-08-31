@@ -17306,7 +17306,7 @@ class TestPreviewProofStep:
                     input="answered_branch_a",
                     on_success="merged_rows",
                     on_error=None,
-                    options={"schema": {"mode": "observed"}},
+                    options={},
                     condition=None,
                     routes=None,
                     fork_to=None,
