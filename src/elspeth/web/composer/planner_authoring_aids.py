@@ -823,7 +823,7 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "prompt_template_parts, so a per-query token survives resolution and is "
     "rejected at the compose gate. Reviewed slots belong in the node-level "
     "template; per-query templates reference plain query variables only.",
-    "Sink hygiene: the auto-appended <response_field>_usage / _model audit "
+    "Sink hygiene: the auto-appended <response_field>_usage / _model operational row "
     "fields ride the row automatically — do not map or require them into "
     "sinks unless the user asked for token/model reporting.",
     # elspeth-15b400881f: the live planner named the three business columns in

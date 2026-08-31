@@ -7417,6 +7417,26 @@ class TestSchemaContractValidation:
         assert len(entries) == 1, result.errors
         assert entries[0].component == "node:merge_results"
 
+    def test_coalesce_rejects_options_that_runtime_lowering_would_erase(self) -> None:
+        """A structural coalesce has no plugin options contract to author.
+
+        The composer used to accept ``options.schema`` here, then silently
+        omit the entire options mapping while lowering to ``CoalesceSettings``.
+        Refuse the misleading declaration before it can persist.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+        )
+        coalesce = next(node for node in state.nodes if node.id == "merge_results")
+        state = state.with_node(replace(coalesce, options={"schema": {"mode": "observed"}}))
+
+        result = state.validate()
+
+        [entry] = [error for error in result.errors if error.error_code == "coalesce_config_invalid"]
+        assert entry.component == "node:merge_results"
+        assert "options" in entry.message
+
     def test_coalesce_merge_select_is_rejected_as_unauthorable(self) -> None:
         """``merge: select`` cannot be made runnable from the composer, so Stage 1 must say so.
 
@@ -8154,7 +8174,10 @@ class TestSchemaContractValidation:
                 None,
                 branches=("branch_a", "branch_b"),
                 merge="select",
-                options={"select_branch": "branch_a"},
+                # NodeSpec cannot author select_branch (that is the defect
+                # this unmirrorable-merge rejection explains), and structural
+                # coalesces accept no options at all.
+                options={},
             )
         )
         state = state.with_node(

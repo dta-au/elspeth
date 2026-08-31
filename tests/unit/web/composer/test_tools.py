@@ -11722,6 +11722,16 @@ class TestExplainValidationCode:
             assert policy in fix
         assert "merge" in fix
 
+    def test_coalesce_config_invalid_explains_that_options_are_not_runtime_configuration(self) -> None:
+        from elspeth.web.composer.tools.generation import explain_validation_code
+
+        resolved = explain_validation_code("coalesce_config_invalid")
+        assert resolved is not None
+        explanation, fix = resolved
+        assert "options" in explanation
+        assert "options" in fix
+        assert "branches" in fix and "policy" in fix and "merge" in fix
+
     def test_gate_on_error_unknown_sink_teaches_node_level_policy(self) -> None:
         from elspeth.web.composer.tools.generation import explain_validation_code
 
@@ -18471,6 +18481,26 @@ class TestStructuralBarrierTimeoutBoundary:
             "merge": "union",
             "timeout_seconds": timeout_seconds,
         }
+
+    @pytest.mark.parametrize("tool_name", ["upsert_node", "set_pipeline"])
+    def test_coalesce_options_are_rejected_before_mutation(self, tool_name: str) -> None:
+        """No authoring mutation may persist options that YAML lowering erases."""
+        state = _empty_state()
+        node = self._coalesce_arguments(None)
+        node["options"] = {"schema": {"mode": "observed"}}
+        arguments = node
+        if tool_name == "set_pipeline":
+            arguments = _valid_pipeline_args()
+            arguments["nodes"] = [node]
+
+        result = execute_tool(tool_name, arguments, state, _mock_catalog())
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.data is not None
+        assert result.data["error_code"] == "coalesce_config_invalid"
+        assert "options" in result.data["error"]
+        assert state.nodes == ()
 
     @pytest.mark.parametrize("invalid_timeout", [0, -1, float("nan"), float("inf")])
     @pytest.mark.parametrize("tool_name", ["upsert_node", "set_pipeline"])

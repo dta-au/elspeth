@@ -401,6 +401,11 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Update the coalesce node with upsert_node, providing the missing field.",
     ),
     (
+        r"coalesce_config_invalid|Coalesce '(.+)' does not accept options",
+        "A coalesce is a built-in structural node; it has no runtime options contract, so authored options cannot be preserved.",
+        "Remove options from the coalesce and author only its input, branches, policy, merge, and optional timeout_seconds.",
+    ),
+    (
         r"row_union_config_invalid",
         "A row_union contains plugin, options, routing, aggregation, or coalesce-only configuration that the structural barrier forbids.",
         "Keep only id, node_type='row_union', input, branches, on_success, and an optional finite positive timeout_seconds.",
@@ -1222,6 +1227,7 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "unknown_node_type",
     "coalesce_on_success_must_be_sink",
     "coalesce_missing_branches",
+    "coalesce_config_invalid",
     "coalesce_policy_invalid",
     "coalesce_merge_invalid",
     "row_union_config_invalid",

@@ -7136,6 +7136,20 @@ class CompositionState:
                         )
                     )
             elif node.node_type == "coalesce":
+                # ``CoalesceSettings`` is a built-in structural contract and
+                # has no plugin options field.  The YAML generator therefore
+                # cannot lower NodeSpec.options for this node kind.  Refuse
+                # any non-empty mapping here instead of validating authored
+                # metadata that disappears before runtime (elspeth-15b400881f).
+                if node.options:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Coalesce '{node.id}' does not accept options; author branches, policy, merge, and optional timeout_seconds instead.",
+                            "high",
+                            "coalesce_config_invalid",
+                        )
+                    )
                 if node.branches is None:
                     errors.append(
                         _err(

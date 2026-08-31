@@ -3391,6 +3391,10 @@ _ROW_UNION_INTRINSIC_ERROR_CODES: Final[frozenset[str]] = frozenset(
 
 _MUTATION_BLOCKING_INVARIANT_CODES: Final[frozenset[str]] = _ROW_UNION_INTRINSIC_ERROR_CODES | {
     "row_union_on_success_must_be_connection",
+    # Coalesce options have no runtime contract and are dropped by YAML
+    # lowering; rejecting the mutation prevents misleading state from ever
+    # persisting through either upsert_node or set_pipeline.
+    "coalesce_config_invalid",
     "node_timeout_unsupported",
     # A plugin on a gate or coalesce must never persist: upsert_node's
     # post-call hint lookup would resolve the authored token against the

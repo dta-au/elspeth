@@ -685,7 +685,7 @@ class TestForkCoalesceExemplar:
         assert set(renames.values()).isdisjoint(llm_response_fields)
 
     def test_fork_coalesce_exemplar_validates_under_the_live_profile_posture(self, tmp_path: Path) -> None:
-        """The exact fork -> two-llm -> coalesce exemplar bytes must build."""
+        """The exemplar builds with derived producer and authored consumer contracts."""
         (tmp_path / "outputs").mkdir(exist_ok=True)
         view, snapshot = _profile_view(tmp_path)
         args = fork_coalesce_exemplar_args(view)
@@ -697,6 +697,25 @@ class TestForkCoalesceExemplar:
 
         rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
         assert candidate.acceptable is True, f"fork/coalesce exemplar rejected: {rejection}"
+        state = candidate.result.updated_state
+        coalesce = next(node for node in state.nodes if node.node_type == "coalesce")
+        cleanup = next(node for node in state.nodes if node.plugin == "field_mapper")
+        output = state.outputs[0]
+
+        # The structural node contributes no authored producer claim. Its
+        # require-all/union guarantees are instead derived from branch plugin
+        # contracts, and validate() proves those guarantees satisfy the
+        # cleanup's declared input contract.
+        assert coalesce.options == {}
+        branch_output_fields = {node.options["response_field"] for node in state.nodes if node.plugin == "llm"}
+        assert branch_output_fields <= set(cleanup.options["schema"]["guaranteed_fields"])
+        assert state.validate().is_valid
+
+        # Exact emitted shape remains planner-authored at the consumer seam.
+        assert cleanup.options["select_only"] is True
+        assert output.options["schema"]["mode"] == "fixed"
+        sink_fields = [field.partition(":")[0] for field in output.options["schema"]["fields"]]
+        assert sink_fields == list(cleanup.options["mapping"].values())
 
     def test_fork_coalesce_exemplar_has_the_operator_ruled_topology(self, tmp_path: Path) -> None:
         """Two separate LLM transform nodes + coalesce merge — never a queries map."""
@@ -2153,6 +2172,14 @@ class TestModelCustody:
         assert "sink schema.fields" in rules
         assert "plugin-free coalesce" in rules
         assert "guaranteed_fields on a sink" in rules
+
+    def test_llm_usage_and_model_columns_are_named_as_operational_not_audit_fields(self) -> None:
+        """Runtime row columns must not be conflated with separate audit metadata."""
+        view, _snapshot = _trained_view()
+
+        rules = " ".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        assert "operational row fields" in rules
+        assert "_usage / _model audit fields" not in rules
 
 
 class TestLlmSourceGenerationAid:
