@@ -23,7 +23,17 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.canonical import stable_hash
-from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.protocol import (
+    REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
+    REQUEST_INTERPRETATION_REVIEW_KINDS,
+    SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION,
+    SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION,
+    SOURCE_DATA_CONTRACT_DRAFT_MISMATCH_ACTUAL_TYPE,
+    SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
+    SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE,
+    SOURCE_DATA_CONTRACT_TARGET_EXPECTATION,
+    ToolArgumentError,
+)
 from elspeth.web.composer.redaction import (
     SetPipelineArgumentsModel,
     redact_source_storage_path,
@@ -2253,24 +2263,21 @@ def _assert_affected_component(
         if source_name is None:
             raise ToolArgumentError(
                 argument="affected_node_id",
-                expected="'source' for source_data_contract or 'source:<name>' for a named source",
+                expected=SOURCE_DATA_CONTRACT_TARGET_EXPECTATION,
                 actual_type="node id",
             )
         source = state.sources.get(source_name)
         if source is None:
             raise ToolArgumentError(
                 argument="affected_node_id",
-                expected=f"an existing source component ({affected_node_id!r})",
-                actual_type="missing source",
+                expected=SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
+                actual_type=SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE,
             )
         matched_terms = _matching_interpretation_sites(state, affected_node_id, kind, user_term)
         if not matched_terms:
             raise ToolArgumentError(
                 argument="affected_node_id",
-                expected=(
-                    "a source with an outstanding data-contract demand — the pipeline must require fields "
-                    "from this source that no current acknowledgement covers"
-                ),
+                expected=SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION,
                 actual_type=f"missing pending {kind.value} review site",
             )
         # The draft is SERVER-COMPUTED from the graph's demand backtrace and
@@ -2281,8 +2288,8 @@ def _assert_affected_component(
         if llm_draft is not None and llm_draft != computed_draft:
             raise ToolArgumentError(
                 argument="llm_draft",
-                expected="omitted — the server computes the data-contract card from the graph's demand backtrace",
-                actual_type="caller-supplied draft that does not match the server-computed data contract",
+                expected=SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION,
+                actual_type=SOURCE_DATA_CONTRACT_DRAFT_MISMATCH_ACTUAL_TYPE,
             )
         return computed_draft
 
@@ -2759,10 +2766,10 @@ async def _handle_request_interpretation_review(
     # finalization, so it can never go stale against a later skeleton mutation.
     # The LLM must NOT surface it mid-build via this tool; reject the kind at
     # the Tier-3 boundary immediately after the parse, before any service call.
-    if parsed.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+    if parsed.kind not in REQUEST_INTERPRETATION_REVIEW_KINDS:
         raise ToolArgumentError(
             argument="kind",
-            expected="vague_term, invented_source, pipeline_decision, or llm_model_choice",
+            expected=REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
             actual_type=("llm_prompt_template — surfaced automatically by the backend at turn finalization; do not request it"),
         )
     # F-34 credential prefilter: Tier-3 boundary check before any DB write.

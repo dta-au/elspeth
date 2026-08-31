@@ -28,7 +28,10 @@ from sqlalchemy import Engine
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.protocol import (
+    INTERPRETATION_KIND_VALUES,
+    ToolArgumentError,
+)
 from elspeth.web.composer.state import (
     CompositionState,
     ValidationSummary,
@@ -243,14 +246,7 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
                 },
                 "kind": {
                     "type": "string",
-                    "enum": [
-                        "vague_term",
-                        "invented_source",
-                        "llm_prompt_template",
-                        "pipeline_decision",
-                        "llm_model_choice",
-                        "source_data_contract",
-                    ],
+                    "enum": list(INTERPRETATION_KIND_VALUES),
                     "description": (
                         "Class of assumption being surfaced for review. source_data_contract asks the user to "
                         "acknowledge the data contract for an uploaded/path-bound source the pipeline requires "

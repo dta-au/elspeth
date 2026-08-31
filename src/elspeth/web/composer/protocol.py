@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.protocol import GuidedOperationFence
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation
+from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressReason, ComposerProgressSink
 from elspeth.contracts.errors import FailedTurnMetadata
@@ -45,6 +46,44 @@ _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # Bare Final (not Final[str]) so mypy infers the Literal type and TypedDict
 # indexing through this constant type-checks at the history boundary.
 COMPOSER_HISTORY_USER_AUTHORED_KEY: Final = "_elspeth_user_authored"
+
+# Canonical request-tool kind policy. ``InterpretationKind`` is the closed
+# persistence/event vocabulary; this tuple is the subset the planner may send
+# through ``request_interpretation_review``. Prompt-template reviews are
+# backend-surfaced against the final frozen skeleton and therefore are not a
+# request-tool arm. The partition check makes a new enum member fail closed
+# until it is deliberately classified instead of silently inheriting policy.
+REQUEST_INTERPRETATION_REVIEW_KINDS: Final[tuple[InterpretationKind, ...]] = (
+    InterpretationKind.VAGUE_TERM,
+    InterpretationKind.INVENTED_SOURCE,
+    InterpretationKind.PIPELINE_DECISION,
+    InterpretationKind.LLM_MODEL_CHOICE,
+    InterpretationKind.SOURCE_DATA_CONTRACT,
+)
+_BACKEND_ONLY_INTERPRETATION_REVIEW_KINDS: Final[frozenset[InterpretationKind]] = frozenset({InterpretationKind.LLM_PROMPT_TEMPLATE})
+if frozenset(REQUEST_INTERPRETATION_REVIEW_KINDS) & _BACKEND_ONLY_INTERPRETATION_REVIEW_KINDS or frozenset(
+    REQUEST_INTERPRETATION_REVIEW_KINDS
+) | _BACKEND_ONLY_INTERPRETATION_REVIEW_KINDS != frozenset(InterpretationKind):
+    raise RuntimeError("every InterpretationKind must be classified as requestable or backend-only")
+INTERPRETATION_KIND_VALUES: Final[tuple[str, ...]] = tuple(kind.value for kind in InterpretationKind)
+REQUEST_INTERPRETATION_REVIEW_KIND_VALUES: Final[tuple[str, ...]] = tuple(kind.value for kind in REQUEST_INTERPRETATION_REVIEW_KINDS)
+REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION: Final[str] = ", ".join(REQUEST_INTERPRETATION_REVIEW_KIND_VALUES)
+
+# Source-data-contract repair vocabulary. Producers and the secret-safe
+# ToolArgumentError projector share these exact operator-owned strings so the
+# target, demand, and server-computed-draft instructions cannot be collapsed
+# to generic diagnostics by a stale allowlist.
+SOURCE_DATA_CONTRACT_TARGET_EXPECTATION: Final[str] = "'source' for source_data_contract or 'source:<name>' for a named source"
+SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION: Final[str] = "an existing source component"
+SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION: Final[str] = (
+    "a source with an outstanding data-contract demand — the pipeline must require fields "
+    "from this source that no current acknowledgement covers"
+)
+SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION: Final[str] = (
+    "omitted — the server computes the data-contract card from the graph's demand backtrace"
+)
+SOURCE_DATA_CONTRACT_DRAFT_MISMATCH_ACTUAL_TYPE: Final[str] = "caller-supplied draft that does not match the server-computed data contract"
+SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE: Final[str] = "missing source component"
 
 
 class ComposerHistoryMessage(TypedDict):
@@ -760,10 +799,14 @@ _SAFE_TOOL_ARGUMENT_EXPECTATIONS = frozenset(
         "id of a node whose plugin is 'llm'",
         "only the optional 'source_name' key",
         "source artifact content without template metacharacters, credential patterns, or non-printable controls",
+        REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
+        SOURCE_DATA_CONTRACT_TARGET_EXPECTATION,
+        SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
+        SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION,
+        SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION,
         "source with composer-authored source metadata",
         "the exact node review requirement draft staged in options.interpretation_requirements",
         "the exact source review requirement draft staged in source.options.interpretation_requirements",
-        "vague_term, invented_source, pipeline_decision, or llm_model_choice",
         "valid UTF-8 text",
         "well-formed interpretation authoring metadata",
         "a valid value",
@@ -782,14 +825,14 @@ _SAFE_TOOL_ARGUMENT_EXPECTATIONS = frozenset(
 ) | frozenset(_TOOL_ARGUMENT_SCHEMA_EXPECTATIONS.values())
 
 _SAFE_TOOL_ARGUMENT_EXPECTATIONS = _SAFE_TOOL_ARGUMENT_EXPECTATIONS | frozenset(
-    f"a pending {kind} interpretation requirement{suffix}"
-    for kind in ("invented_source", "llm_model_choice", "llm_prompt_template", "pipeline_decision", "vague_term")
-    for suffix in ("", " or placeholder")
+    f"a pending {kind.value} interpretation requirement{suffix}" for kind in InterpretationKind for suffix in ("", " or placeholder")
 )
 
 _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES = frozenset(
     {
         "credential-shaped content rejected at the tool boundary",
+        SOURCE_DATA_CONTRACT_DRAFT_MISMATCH_ACTUAL_TYPE,
+        SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE,
         "invalid_schema",
         "invalid_session_id",
         "invented_source event draft does not match the source review requirement draft",
@@ -823,8 +866,7 @@ _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES = frozenset(
 )
 
 _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES = _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES | frozenset(
-    f"missing pending {kind} review site"
-    for kind in ("invented_source", "llm_model_choice", "llm_prompt_template", "pipeline_decision", "vague_term")
+    f"missing pending {kind.value} review site" for kind in InterpretationKind
 )
 
 _SAFE_TOOL_ARGUMENT_TYPE_NAMES = frozenset(
@@ -878,17 +920,19 @@ def _canonical_tool_argument_expectation(value: object, argument: str) -> str:
         return "prompt_template_parts interpretation_ref or placeholder wiring"
     if "preserves raw html/fingerprint field" in lowered:
         return "a pipeline decision without preserved raw HTML/fingerprint fields"
-    for kind in ("invented_source", "llm_model_choice", "llm_prompt_template", "pipeline_decision", "vague_term"):
-        if "pending" in lowered and kind in lowered:
+    for kind in InterpretationKind:
+        if "pending" in lowered and kind.value in lowered:
             if "placeholder" in lowered:
-                return f"a pending {kind} interpretation requirement or placeholder"
-            return f"a pending {kind} interpretation requirement"
+                return f"a pending {kind.value} interpretation requirement or placeholder"
+            return f"a pending {kind.value} interpretation requirement"
     if "pending" in lowered and "placeholder" in lowered:
         return "a pending interpretation requirement or placeholder"
     if "pending" in lowered and "requirement" in lowered:
         return "a pending interpretation requirement"
     if "existing llm transform" in lowered:
         return "id of an existing LLM transform"
+    if "existing source component" in lowered:
+        return SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION
     if "options.prompt_template" in lowered:
         return "the current non-empty options.prompt_template"
     if "options.model" in lowered:
@@ -912,15 +956,17 @@ def _canonical_tool_argument_actual_type(value: object) -> str:
         return "node with incompatible plugin"
     if "invalid interpretation metadata" in lowered:
         return "invalid interpretation metadata"
-    for kind in ("invented_source", "llm_model_choice", "llm_prompt_template", "pipeline_decision", "vague_term"):
-        if "missing pending" in lowered and kind in lowered:
-            return f"missing pending {kind} review site"
+    for kind in InterpretationKind:
+        if "missing pending" in lowered and kind.value in lowered:
+            return f"missing pending {kind.value} review site"
     if "missing pending" in lowered:
         return "missing pending interpretation review site"
     if "prompt_template" in lowered:
         return "invalid prompt_template state"
     if "options.model" in lowered:
         return "invalid model state"
+    if lowered == "missing source":
+        return SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE
     if "cap" in lowered or "limit" in lowered or "would record" in lowered:
         return "interpretation request limit exceeded"
     if "missing" in lowered:
@@ -1395,7 +1441,7 @@ class ComposerService(Protocol):
 
         Surfaces a resolvable pending interpretation EVENT for every
         interpretation site on ``state`` whose writer-boundary precondition
-        holds (all five ``InterpretationKind`` members). Called by the guided
+        holds (every ``InterpretationKind`` member). Called by the guided
         route persistence seam (``post_guided_respond``) after every committed
         source or transform commit, because the guided dispatch path
         never reaches the freeform fail-closed orphan gate, and by the

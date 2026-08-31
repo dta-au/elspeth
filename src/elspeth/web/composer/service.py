@@ -2633,8 +2633,8 @@ class ComposerServiceImpl:
         time with ``UnresolvedInterpretationPlaceholderError``. This pass runs
         after every site-creating guided commit (source / transform /
         recipe-apply) and surfaces a resolvable pending EVENT for every site
-        whose writer-boundary precondition holds — covering all five
-        ``InterpretationKind`` members, not just ``llm_prompt_template``.
+        whose writer-boundary precondition holds — covering every
+        ``InterpretationKind`` member, not just ``llm_prompt_template``.
 
         Each branch reads the site's ``draft``/``user_term`` from the node or
         source requirement so the strict per-kind writer boundary
