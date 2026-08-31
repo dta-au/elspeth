@@ -851,6 +851,17 @@ class ToolResult:
             field *only when non-empty*. Eliminates the second
             round-trip the LLM would otherwise burn calling
             ``get_plugin_schema`` separately after each rejection.
+        validation_guidance: Inline repair guidance for a failed mutation —
+            the closed catalogue's ``(explanation, suggested_fix)`` for every
+            resolvable ``error_code`` in ``validation.errors``, plus the
+            ``explain_validation_error`` pointer when some entry resolved to
+            nothing. Built by ``generation.build_validation_guidance`` and
+            populated only on failed mutations by ``execute_tool``. Every
+            value is STATIC catalogue text; nothing per-request rides here.
+            ``to_dict`` emits this field *only when non-empty*. Saves the
+            turn the LLM would otherwise burn calling
+            ``explain_validation_error`` after a rejection — the same trade
+            ``plugin_schemas`` makes for option-shape failures.
         applied_component: Post-finalizer projection of the components a
             successful mutation applied — the exact ``set_pipeline``
             arguments ``get_pipeline_state(component="set_pipeline_arguments")``
@@ -871,6 +882,7 @@ class ToolResult:
     runtime_preflight: ValidationResult | None = None
     post_call_hints: tuple[str, ...] = ()
     plugin_schemas: Mapping[str, Mapping[str, Any]] | None = None
+    validation_guidance: Mapping[str, Any] | None = None
     applied_component: Mapping[str, Any] | None = None
     _validation_snapshot_hash: str | None = field(default=None, compare=False, repr=False)
     # True when this failure envelope deliberately withheld the pre-mutation
@@ -886,6 +898,8 @@ class ToolResult:
             freeze_fields(self, "data")
         if self.plugin_schemas is not None:
             freeze_fields(self, "plugin_schemas")
+        if self.validation_guidance is not None:
+            freeze_fields(self, "validation_guidance")
         if self.applied_component is not None:
             freeze_fields(self, "applied_component")
 
@@ -936,6 +950,9 @@ class ToolResult:
 
         if self.plugin_schemas:
             result["plugin_schemas"] = deep_thaw(self.plugin_schemas)
+
+        if self.validation_guidance:
+            result["validation_guidance"] = deep_thaw(self.validation_guidance)
 
         if self.applied_component:
             result["applied_component"] = deep_thaw(self.applied_component)
