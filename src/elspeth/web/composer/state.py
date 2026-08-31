@@ -445,7 +445,14 @@ def _routing_label_errors(
         try:
             validate_composer_output_name(output.name)
         except ValueError as exc:
-            add(component, str(exc), "output_name_invalid")
+            found.append(
+                ValidationEntry(
+                    component=component,
+                    message=str(exc),
+                    severity="high",
+                    error_code="output_name_invalid",
+                )
+            )
         if not output.on_write_failure or not output.on_write_failure.strip():
             add(component, "on_write_failure must be a sink name or 'discard'")
         elif output.on_write_failure != _DISCARD_ROUTE_TARGET:
