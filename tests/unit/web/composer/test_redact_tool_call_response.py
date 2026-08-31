@@ -674,6 +674,8 @@ def test_get_blob_content_redacts_tool_result_envelope_content() -> None:
             "content": "secret,row\n1,2\n",
             "truncated": False,
             "size_bytes": 15,
+            "created_by": "assistant",
+            "creation_modality": "llm_generated",
         },
     }
 
@@ -681,6 +683,11 @@ def test_get_blob_content_redacts_tool_result_envelope_content() -> None:
 
     assert result["data"]["content"] == "<redacted-blob-content>"
     assert "secret,row" not in str(result)
+    # The origin pair is closed-vocabulary metadata, not payload: it must
+    # reach the audit row intact, or the persisted record cannot answer who
+    # authored the bytes the planner then narrated (elspeth-47eba5cced).
+    assert result["data"]["created_by"] == "assistant"
+    assert result["data"]["creation_modality"] == "llm_generated"
 
 
 def test_get_blob_content_redacts_tool_result_failure_envelope() -> None:
@@ -785,6 +792,8 @@ def test_get_blob_content_populated_validation_envelope_redacts_external_scalars
             "content": "secret,row\n1,2\n",
             "truncated": False,
             "size_bytes": 15,
+            "created_by": "user",
+            "creation_modality": "verbatim",
         },
     }
 

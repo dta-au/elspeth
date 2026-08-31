@@ -818,7 +818,11 @@ class TestStep3BlobDiscoveryTierMigration:
     def test_get_blob_content(self) -> None:
         assert self._get("get_blob_content") == {
             "name": "get_blob_content",
-            "description": "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters.",
+            "description": (
+                "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters. "
+                "The result also carries the blob's recorded origin — created_by (user, assistant, or pipeline) and "
+                "creation_modality — so content the assistant generated earlier is not mistaken for a discovered file."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
