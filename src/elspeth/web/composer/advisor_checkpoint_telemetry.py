@@ -12,6 +12,15 @@ from elspeth.contracts.hashing import stable_hash
 
 AdvisorCheckpointPhase = Literal["early", "end"]
 AdvisorCheckpointTelemetryVerdict = Literal["clean", "flagged", "unavailable", "malformed"]
+# elspeth-25f7b757e7 (A2): which mechanism rendered the verdict. "prescan" is
+# the deterministic backend pre-scan (no provider call was made); "model"
+# covers everything downstream of a provider call attempt — parsed CLEAN or
+# FLAGGED, and the unavailable/malformed failure classes. Without this
+# dimension a pre-scan force-FLAG and an LLM-advisor FLAG were byte-identical
+# in the journal (``verdict="flagged"``), so the pre-scan's false-positive
+# rate — the evidence needed to defend the fail-closed posture — was
+# unmeasurable.
+AdvisorCheckpointVerdictSource = Literal["prescan", "model"]
 
 _ADVISOR_CHECKPOINT_PASSES_COUNTER = metrics.get_meter(__name__).create_counter(
     "composer.advisor_checkpoint.passes_used",
@@ -28,6 +37,7 @@ def record_advisor_checkpoint_pass(
     pass_index: int,
     verdict: AdvisorCheckpointTelemetryVerdict,
     findings_text: str,
+    source: AdvisorCheckpointVerdictSource,
 ) -> None:
     """Best-effort event and metric increment for a logical checkpoint call."""
     # The checkpoint verdict is already complete. Optional telemetry must
@@ -46,12 +56,13 @@ def record_advisor_checkpoint_pass(
             phase=phase,
             pass_index=pass_index,
             verdict=verdict,
+            source=source,
             findings_hash=findings_hash,
         )
     # Keep the metric independent from the event sink and off the correctness
     # path, matching the composer's telemetry policy.
     with suppress(Exception):
-        _ADVISOR_CHECKPOINT_PASSES_COUNTER.add(1, {"phase": phase, "verdict": verdict})
+        _ADVISOR_CHECKPOINT_PASSES_COUNTER.add(1, {"phase": phase, "verdict": verdict, "source": source})
 
 
 AdvisorTerminalPublicationBranch = Literal[
@@ -78,6 +89,7 @@ def record_advisor_terminal_publication(
     branch: AdvisorTerminalPublicationBranch,
     reason: str | None,
     preflight_shape: AdvisorPreflightShape,
+    findings_backend_authored: bool,
 ) -> None:
     """Best-effort attribution event for one advisor-cohort terminal publication.
 
@@ -89,6 +101,12 @@ def record_advisor_terminal_publication(
     attributable from one journal read. Fields are all backend-derived
     (closed vocabularies plus the session id) — no advisor findings text and
     no model prose enter this event.
+
+    ``findings_backend_authored`` (elspeth-25f7b757e7 A2): True iff the
+    published wording embeds the backend-authored deterministic pre-scan
+    finding. Only the blocked terminal can carry True — it is the one
+    publication whose wording rides the verdict; every repair-cohort branch
+    publishes fixed copy with no finding at all and passes False.
     """
     with suppress(Exception):
         slog.info(
@@ -97,8 +115,12 @@ def record_advisor_terminal_publication(
             branch=branch,
             reason=reason,
             preflight_shape=preflight_shape,
+            findings_backend_authored=findings_backend_authored,
         )
     # Keep the metric independent from the event sink and off the correctness
     # path, matching the composer's telemetry policy.
     with suppress(Exception):
-        _ADVISOR_TERMINAL_PUBLICATIONS_COUNTER.add(1, {"branch": branch, "preflight_shape": preflight_shape})
+        _ADVISOR_TERMINAL_PUBLICATIONS_COUNTER.add(
+            1,
+            {"branch": branch, "preflight_shape": preflight_shape, "findings_backend_authored": findings_backend_authored},
+        )

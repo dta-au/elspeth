@@ -88,7 +88,11 @@ from elspeth.web.composer._compose_loop_carriers import (
     _ToolBatchCancellationRequested,
     _ToolOutcome,
 )
-from elspeth.web.composer.advisor_checkpoint_telemetry import record_advisor_checkpoint_pass, record_advisor_terminal_publication
+from elspeth.web.composer.advisor_checkpoint_telemetry import (
+    AdvisorCheckpointVerdictSource,
+    record_advisor_checkpoint_pass,
+    record_advisor_terminal_publication,
+)
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import (
     BufferingRecorder,
@@ -384,6 +388,10 @@ async def _await_pipeline_staging_write_with_deferred_cancellation[T](
 _blocking_result_from_tool_invocations = _no_tool_policy.blocking_result_from_tool_invocations
 _compose_advisor_signoff_pending_message = _no_tool_policy.compose_advisor_signoff_pending_message
 _compose_advisor_signoff_unverified_message = _no_tool_policy.compose_advisor_signoff_unverified_message
+_compose_advisor_signoff_unrepairable_message = _no_tool_policy.compose_advisor_signoff_unrepairable_message
+_compose_advisor_signoff_unrepairable_unverified_message = _no_tool_policy.compose_advisor_signoff_unrepairable_unverified_message
+_compose_advisor_signoff_unrepairable_handoff_message = _no_tool_policy.compose_advisor_signoff_unrepairable_handoff_message
+_compose_advisor_signoff_unrepairable_red_message = _no_tool_policy.compose_advisor_signoff_unrepairable_red_message
 _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE = _no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_NOTICE
 _compose_advisor_pending_handoff_message = _no_tool_policy.compose_advisor_pending_handoff_message
 _compose_interpretation_review_handoff_message = _no_tool_policy.compose_interpretation_review_handoff_message
@@ -1326,14 +1334,18 @@ def _replace_advisor_repair_public_result(
     runtime_result = result.runtime_preflight
     preflight_shape = _advisor_preflight_shape(runtime_result)
     if runtime_result is None:
-        record_advisor_terminal_publication(session_id=session_id, branch="repair_unverified", reason=None, preflight_shape=preflight_shape)
+        record_advisor_terminal_publication(
+            session_id=session_id, branch="repair_unverified", reason=None, preflight_shape=preflight_shape, findings_backend_authored=False
+        )
         return replace(
             result,
             message=_ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE,
             raw_assistant_content=None,
         )
     if runtime_result.is_valid and runtime_result.readiness.completion_ready:
-        record_advisor_terminal_publication(session_id=session_id, branch="repair_success", reason=None, preflight_shape=preflight_shape)
+        record_advisor_terminal_publication(
+            session_id=session_id, branch="repair_success", reason=None, preflight_shape=preflight_shape, findings_backend_authored=False
+        )
         return replace(
             result,
             message=_ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE,
@@ -1352,7 +1364,11 @@ def _replace_advisor_repair_public_result(
             # exactly here on the bare notice), the qualified shape names the
             # validator's objection alongside the handoff.
             record_advisor_terminal_publication(
-                session_id=session_id, branch="repair_handoff_signoff_failed", reason=None, preflight_shape=preflight_shape
+                session_id=session_id,
+                branch="repair_handoff_signoff_failed",
+                reason=None,
+                preflight_shape=preflight_shape,
+                findings_backend_authored=False,
             )
             return replace(
                 result,
@@ -1369,14 +1385,20 @@ def _replace_advisor_repair_public_result(
             # stages that never ran. Name them instead of claiming ready.
             detail = _outstanding_findings_detail(outstanding_findings)
             record_advisor_terminal_publication(
-                session_id=session_id, branch="repair_review_with_findings", reason=None, preflight_shape=preflight_shape
+                session_id=session_id,
+                branch="repair_review_with_findings",
+                reason=None,
+                preflight_shape=preflight_shape,
+                findings_backend_authored=False,
             )
             return replace(
                 result,
                 message=_ADVISOR_REPAIR_REVIEW_WITH_FINDINGS_PUBLIC_MESSAGE.format(detail=detail),
                 raw_assistant_content=None,
             )
-        record_advisor_terminal_publication(session_id=session_id, branch="repair_review", reason=None, preflight_shape=preflight_shape)
+        record_advisor_terminal_publication(
+            session_id=session_id, branch="repair_review", reason=None, preflight_shape=preflight_shape, findings_backend_authored=False
+        )
         return replace(
             result,
             message=_ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE,
@@ -1384,7 +1406,11 @@ def _replace_advisor_repair_public_result(
         )
     if not runtime_result.is_valid:
         record_advisor_terminal_publication(
-            session_id=session_id, branch="repair_preflight_failure", reason=None, preflight_shape=preflight_shape
+            session_id=session_id,
+            branch="repair_preflight_failure",
+            reason=None,
+            preflight_shape=preflight_shape,
+            findings_backend_authored=False,
         )
         return replace(
             result,
@@ -1392,7 +1418,11 @@ def _replace_advisor_repair_public_result(
             raw_assistant_content="",
         )
     record_advisor_terminal_publication(
-        session_id=session_id, branch="repair_signoff_pending", reason=None, preflight_shape=preflight_shape
+        session_id=session_id,
+        branch="repair_signoff_pending",
+        reason=None,
+        preflight_shape=preflight_shape,
+        findings_backend_authored=False,
     )
     return replace(
         result,
@@ -6015,7 +6045,14 @@ class ComposerServiceImpl:
         # spent, so ``is_last_pass`` is True there and the gate always
         # terminates blocked — it can never fall through to a silent finalize
         # with no sign-off at all.
-        terminal_block = (verdict.blocking or not verdict.ok) and (is_last_pass or not allow_repair_continue or stalled_repair)
+        # elspeth-25f7b757e7 (A1): ``repair_unactionable`` blocks on the FIRST
+        # pass — the flagged surface is the user's own message, so a granted
+        # repair-continue would inject an instruction no tool call can satisfy
+        # and the identical pre-scan would re-fire next pass with the LLM
+        # advisory review never running at all.
+        terminal_block = (verdict.blocking or not verdict.ok) and (
+            is_last_pass or not allow_repair_continue or stalled_repair or verdict.repair_unactionable
+        )
         if terminal_block:
             orphan_result = await self._surface_pt_and_gate_orphans_or_none(
                 state=state,
@@ -6098,7 +6135,9 @@ class ComposerServiceImpl:
                 result=self._advisor_blocked_result(
                     session_id=session_id,
                     reason=(
-                        "flagged_final_pass"
+                        "flagged_unrepairable"
+                        if verdict.ok and verdict.repair_unactionable
+                        else "flagged_final_pass"
                         if verdict.ok and is_last_pass
                         else (
                             "flagged_no_repair"
@@ -7743,8 +7782,10 @@ class ComposerServiceImpl:
 
         ``reason`` is ``"unavailable"`` (transport outage after bounded retry),
         ``"malformed"`` (the advisor was reachable but returned no usable
-        verdict even after the format re-prompt), ``"flagged_final_pass"``, or
-        ``"flagged_no_repair"``. The result
+        verdict even after the format re-prompt), ``"flagged_final_pass"``,
+        ``"flagged_no_repair"``, or ``"flagged_unrepairable"`` (elspeth-25f7b757e7
+        A1: the pre-scan flagged the user's own chat message, a surface repair
+        cannot mutate, so the gate blocked on the first pass). The result
         is threaded with ``repair_turns_used`` plus the persisted ids so the
         route handler can persist composer_meta uniformly.
 
@@ -7783,6 +7824,7 @@ class ComposerServiceImpl:
             branch="terminal_block",
             reason=reason,
             preflight_shape=_advisor_preflight_shape(runtime_preflight),
+            findings_backend_authored=verdict.findings_backend_authored,
         )
         raw_content = ""
         validated_base = runtime_preflight if runtime_preflight is not None and runtime_preflight.is_valid else None
@@ -7822,6 +7864,27 @@ class ComposerServiceImpl:
                 findings_backend_authored=verdict.findings_backend_authored,
             )
             augmented = _compose_preflight_failure_message("", runtime_result=runtime_result)
+        if reason == "flagged_unrepairable":
+            # elspeth-25f7b757e7 (A1, fix round 1 N1): the block's cause is
+            # the user's own chat message, so every variant names the reword
+            # action — but the copy is SHAPE-AWARE on the same four
+            # discriminators as the validation arms above. The first uniform
+            # version asserted "No pipeline change is needed" over red,
+            # absent, and pending-handoff preflights: a false or unknowable
+            # pipeline claim on three of four shapes (the R2-F14 / facet B /
+            # ac85b0ab0e class), and on red it hid the validator's objection
+            # from the user who most needs it.
+            if validated_base is not None:
+                augmented = _compose_advisor_signoff_unrepairable_message("")
+            elif runtime_preflight is not None and _is_pending_interpretation_handoff(runtime_preflight):
+                augmented = _compose_advisor_signoff_unrepairable_handoff_message("")
+            elif runtime_preflight is None:
+                augmented = _compose_advisor_signoff_unrepairable_unverified_message("")
+            else:
+                # The turn's ACTUAL red preflight — never the synthesized
+                # advisor-signoff validation, whose errors carry the advisor
+                # wording rather than the validator's objection.
+                augmented = _compose_advisor_signoff_unrepairable_red_message("", runtime_result=runtime_preflight)
         _enforce_augmentation_prefix_invariant(
             branch="advisor_signoff_blocked_augmentation",
             content=raw_content,
@@ -7913,7 +7976,7 @@ class ComposerServiceImpl:
         ``phase="end"``.
         """
 
-        def completed(verdict: AdvisorCheckpointVerdict) -> AdvisorCheckpointVerdict:
+        def completed(verdict: AdvisorCheckpointVerdict, *, source: AdvisorCheckpointVerdictSource) -> AdvisorCheckpointVerdict:
             telemetry_verdict: Literal["clean", "flagged", "unavailable", "malformed"]
             if verdict.ok:
                 telemetry_verdict = "flagged" if verdict.blocking else "clean"
@@ -7925,6 +7988,7 @@ class ComposerServiceImpl:
                 pass_index=pass_index,
                 verdict=telemetry_verdict,
                 findings_text=verdict.findings_text,
+                source=source,
             )
             return verdict
 
@@ -7936,9 +8000,11 @@ class ComposerServiceImpl:
                     AdvisorCheckpointVerdict(
                         ok=True,
                         blocking=True,
-                        findings_text=prompt_injection_finding,
+                        findings_text=prompt_injection_finding.text,
                         findings_backend_authored=True,
-                    )
+                        repair_unactionable=prompt_injection_finding.user_message_surface,
+                    ),
+                    source="prescan",
                 )
         arguments = self._build_checkpoint_arguments(
             phase=phase,
@@ -7989,7 +8055,7 @@ class ComposerServiceImpl:
                 continue
             verdict = _parse_advisor_checkpoint_guidance(guidance)
             if verdict.ok:
-                return completed(verdict)
+                return completed(verdict, source="model")
             # R2-F14 (elspeth-5403f346c0): a transport-SUCCESSFUL reply that
             # simply did not state a verdict used to be terminal here — the
             # bounded retry covered exceptions only, so one formatting slip by
@@ -8010,16 +8076,20 @@ class ComposerServiceImpl:
                     blocking=False,
                     failure_class="malformed",
                     findings_text=_ADVISOR_MALFORMED_USER_DETAIL,
-                )
+                ),
+                source="model",
             )
         # Bounded retry exhausted. The call core re-raises typed LLM errors, so
-        # classify the LAST exception into a failure CLASS the END gate can act
-        # on differently (D13/P5.3): a timeout/transport/auth/rate-limit outage
-        # is UNAVAILABLE (the advisor never rendered a judgement -> escapable at
-        # budget exhaustion), while a parse/validation/shape failure (or ANY
-        # unrecognised error) is MALFORMED and MUST fail closed — a goal-pressured
-        # model could emit garbage to slip the gate. Unknown -> MALFORMED is the
-        # SAFER (fail-closed) default. The raw exception is classified ONLY into
+        # classify the LAST exception into a failure CLASS (D13/P5.3): a
+        # timeout/transport/auth/rate-limit outage is UNAVAILABLE, while a
+        # parse/validation/shape failure (or ANY unrecognised error) is
+        # MALFORMED. Both classes terminal-block identically — the class is
+        # read only to pick honest user-facing WORDING at the END gate and the
+        # telemetry verdict label (elspeth-25f7b757e7 A4: an earlier design's
+        # audited unavailable "escape" at budget exhaustion no longer exists).
+        # Unknown -> MALFORMED keeps the wording conservative — a
+        # goal-pressured model emitting garbage is described as malformed, not
+        # as an outage. The raw exception is classified ONLY into
         # ``failure_class`` (an enum-ish literal): ``findings_text`` carries no
         # provider SDK text, exception class name, message, URL, or credential, so
         # the route-level provider-error redaction policy is preserved (the END
@@ -8060,7 +8130,8 @@ class ComposerServiceImpl:
                 blocking=False,
                 failure_class=failure_class,
                 findings_text=findings_text,
-            )
+            ),
+            source="model",
         )
 
     async def _maybe_run_early_checkpoint(
@@ -8786,15 +8857,29 @@ class AdvisorCheckpointVerdict:
     # and is therefore safe on human wire surfaces. Advisor-MODEL findings
     # stay False and are never surfaced raw (R2-F13).
     findings_backend_authored: bool = False
-    # P5.3/D13: distinguishes the two ``ok=False`` failure CLASSES the gate must
-    # treat differently. ``_run_advisor_checkpoint`` collapses every exception to
-    # ``ok=False``, so ``(ok, blocking)`` alone cannot tell a malformed/parse
-    # failure (MUST fail closed) from a transport outage (MAY take the audited
-    # escape at budget exhaustion). Only the EXACT value ``"unavailable"`` is
-    # escapable; ``"none"`` (default; never read on CLEAN/FLAGGED), ``"malformed"``,
-    # or any unrecognised value fails closed. The classification is applied
-    # inline by ``_run_advisor_checkpoint``'s exception handling and read by
-    # ``_evaluate_terminal_no_tool_advisor_gate``.
+    # elspeth-25f7b757e7 (A1): True only when the deterministic pre-scan fired
+    # on the USER'S OWN chat message — the one evidence surface no composer
+    # tool call can mutate, so a repair-continue is unsatisfiable by
+    # construction and the END gate terminal-blocks on the first pass instead
+    # of spending the advisory budget re-scanning unchangeable bytes.
+    # State-surface pre-scan findings (metadata, options, routes) stay False
+    # and keep the repair path. Set only by ``_run_advisor_checkpoint``'s
+    # pre-scan arm; the reply parser never sets it.
+    repair_unactionable: bool = False
+    # P5.3/D13: distinguishes the two ``ok=False`` failure CLASSES.
+    # ``_run_advisor_checkpoint`` collapses every exception to ``ok=False``,
+    # so ``(ok, blocking)`` alone cannot tell a malformed/parse failure from
+    # a transport outage. Both classes terminal-block identically at the END
+    # gate; the class is read in exactly two places, and neither is a gate
+    # decision (elspeth-25f7b757e7 A4 — an earlier design's audited
+    # unavailable escape at budget exhaustion no longer exists): the blocked
+    # reason picks honest user-facing wording, and the checkpoint-pass
+    # telemetry picks the verdict label. Only the EXACT value
+    # ``"unavailable"`` maps to the outage wording; ``"none"`` (default;
+    # never read on CLEAN/FLAGGED), ``"malformed"``, or any unrecognised
+    # value gets the fail-closed malformed wording. The classification is
+    # applied inline by ``_run_advisor_checkpoint``'s exception handling and
+    # read by ``_evaluate_terminal_no_tool_advisor_gate``.
     failure_class: Literal["none", "unavailable", "malformed"] = "none"
 
 
@@ -8972,7 +9057,25 @@ def _advisor_prompt_option_values(options: Mapping[str, Any]) -> list[tuple[str,
     return values
 
 
-def _advisor_prompt_template_injection_finding(state: CompositionState, *, user_message: str | None = None) -> str | None:
+@dataclass(frozen=True, slots=True)
+class _AdvisorPreScanFinding:
+    """One deterministic pre-scan finding, with its triggering surface.
+
+    elspeth-25f7b757e7 (A1): the surface is carried STRUCTURALLY — never
+    recovered by parsing ``text`` — because the END gate's repair decision
+    depends on it: a finding on the user's own chat message names a surface
+    no composer tool call can mutate, so repair-continue is unsatisfiable by
+    construction; every state surface (metadata, options, routes, conditions)
+    is model-mutable and keeps the repair path.
+    """
+
+    text: str
+    user_message_surface: bool
+
+
+def _advisor_prompt_template_injection_finding(
+    state: CompositionState, *, user_message: str | None = None
+) -> _AdvisorPreScanFinding | None:
     """Pre-flight deterministic force-flag before the END advisor call runs.
 
     ``user_message`` (R2-F8a follow-up, elspeth-583c2a0792 review) extends
@@ -9005,8 +9108,23 @@ def _advisor_prompt_template_injection_finding(state: CompositionState, *, user_
     # fail-closed is the safe direction for a sign-off gate, matching the
     # raw-scanned option values below.
     if user_message and _looks_like_advisor_prompt_injection(user_message):
-        return "FLAGGED: the user's message contains advisor-instruction injection text; remove it before the completion advisory review."
+        return _AdvisorPreScanFinding(
+            text="FLAGGED: the user's message contains advisor-instruction injection text; remove it before the completion advisory review.",
+            user_message_surface=True,
+        )
+    state_finding = _state_surface_injection_finding(state)
+    if state_finding is not None:
+        return _AdvisorPreScanFinding(text=state_finding, user_message_surface=False)
+    return None
 
+
+def _state_surface_injection_finding(state: CompositionState) -> str | None:
+    """The pre-scan's STATE-surface walk: every value the advisor summary renders.
+
+    Split from :func:`_advisor_prompt_template_injection_finding` so the
+    user-message fork above can stamp the surface structurally; every finding
+    here names a model-mutable surface.
+    """
     # Pipeline metadata is genuinely free text and is rendered verbatim at the
     # top of the advisor summary — prose scan (elspeth-cd9af8e61d).
     if state.metadata.name and _looks_like_advisor_prompt_injection(state.metadata.name):
@@ -9798,8 +9916,26 @@ def _advisor_signoff_blocked_wording(
     string: fixed shape, names the triggering surface, carries no provider
     text) the finding is appended so the operator can act. Advisor-MODEL
     findings remain withheld on these branches (R2-F13: raw provider
-    findings never reach a human surface).
+    findings never enter the composer's published prose or validation-wire
+    surfaces — scoped deliberately: a flagged model's subsequent TOOL CALLS
+    can still write derived text into pipeline state the user inspects, and
+    that state channel is uncontained by design, elspeth-25f7b757e7 A4).
     """
+    if reason == "flagged_unrepairable":
+        # elspeth-25f7b757e7 (A1): the trigger is the user's own chat message,
+        # so a pipeline-edit suggestion would be wrong — the one clearing
+        # action is rewording. ``findings`` on this reason is always the
+        # backend-authored pre-scan string (the user-message arm is this
+        # reason's only producer), so surfacing it follows the same
+        # elspeth-cd9af8e61d carve-out as the flagged arms below.
+        # Fix round 1 (N1): the suggestion claims only what the gate knows.
+        # This wording pair serves the RED and ABSENT builders, where an
+        # affirmative "no pipeline change is needed" is false or unknowable;
+        # that claim lives solely in the GREEN chat notice.
+        return (
+            f"{notice} {findings}" if findings_backend_authored and findings else notice,
+            "Reword your chat message to avoid text that reads as instructions to the reviewer, then resend.",
+        )
     if reason in {"flagged_final_pass", "flagged_no_repair"}:
         if findings_backend_authored and findings:
             return (
