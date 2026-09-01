@@ -2138,6 +2138,7 @@ async def drive_try_terminate(
     repair_turns_used: int = 0,
     runtime_preflight_valid: bool = True,
     runtime_preflight_result: ValidationResult | None = None,
+    runtime_preflight_absent: bool = False,
     tolerant_preflight_result: ValidationResult | None = None,
     message: str = "rate how cool the pages are",
     deadline: float | None = None,
@@ -2223,6 +2224,11 @@ async def drive_try_terminate(
         return tolerant_stub if allow_pending_interpretation_placeholders else stubbed_preflight
 
     service._runtime_preflight = _stubbed_runtime_preflight
+    if runtime_preflight_absent:
+        # elspeth-2ae50afcd1: the fourth preflight shape — ``None``, i.e. the
+        # turn computed no preflight at all (``_turn_runtime_preflight``'s
+        # question-only / unmutated-state arm, covered in its own suite).
+        service._turn_runtime_preflight = _AsyncRecorder(return_value=None)
     # elspeth-2306940c70: a terminal END-gate block persists a durable
     # withheld-turn disclosure, so the gate needs a sessions service and a
     # UUID-shaped session id even in this advisor-focused harness.
@@ -2634,6 +2640,79 @@ def test_signoff_pending_note_mints_trusted_chrome() -> None:
     segments = visible_message_segments(content=content, raw_content=raw)
 
     assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_NOTICE)
+
+
+@pytest.mark.asyncio
+async def test_end_gate_absent_preflight_publishes_unverified_notice(make_service, clean_runnable_state):
+    """elspeth-2ae50afcd1 facet B (adjudicated 2026-09-02): the FOURTH
+    preflight shape. A question-only turn computes no preflight
+    (``runtime_preflight is None``); the blocked terminal used to ride the
+    red arm and tell the user "Runtime preflight failed" for a preflight
+    that never ran — observed live on a build whose deterministic validation
+    was green. The honest shape keeps fail-closed STRUCTURE (every readiness
+    axis withheld, elspeth-88592f5be7) with unverified WORDING: the advisory
+    review did not clear, completion is withheld, readiness was not
+    re-verified this turn."""
+    from elspeth.web.composer.no_tool_policy import (
+        _ADVISOR_SIGNOFF_PENDING_NOTICE,
+        _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
+        _PREFLIGHT_NOTICE_HEADER,
+    )
+
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(
+            ok=False, blocking=False, findings_text=_ADVISOR_UNAVAILABLE_USER_DETAIL, failure_class="unavailable"
+        )
+    )
+    outcome = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        advisor_checkpoint_passes_used=0,
+        runtime_preflight_absent=True,
+    )
+
+    assert outcome.action == "return"
+    message = outcome.result.message
+    assert _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE in message
+    assert _PREFLIGHT_NOTICE_HEADER not in message
+    assert _ADVISOR_SIGNOFF_PENDING_NOTICE not in message
+    # Fail-closed structure is UNCHANGED: unknown readiness advances nothing.
+    preflight = outcome.result.runtime_preflight
+    assert preflight is not None
+    assert preflight.is_valid is False
+    assert preflight.readiness.authoring_valid is False
+    assert preflight.readiness.execution_ready is False
+    assert preflight.readiness.completion_ready is False
+    assert [b.code for b in preflight.readiness.blockers] == ["advisor_signoff_blocked"]
+    # The reason class still names itself on the check detail.
+    detail = next(check.detail for check in preflight.checks if check.name == CHECK_ADVISOR_SIGNOFF and not check.passed)
+    assert "could not be obtained" in detail
+    assert _ADVISOR_UNAVAILABLE_USER_DETAIL in detail
+
+
+def test_signoff_unverified_note_mints_trusted_chrome() -> None:
+    """Sibling of ``test_signoff_pending_note_mints_trusted_chrome``: the
+    fourth branch of ``_advisor_blocked_result`` must publish a canonical
+    suffix, or its fixed backend copy renders as ordinary (unattributed)
+    assistant text."""
+    from elspeth.web.composer.no_tool_policy import (
+        _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
+        TrustedSystemNoticeSegment,
+        compose_advisor_signoff_unverified_message,
+        visible_message_segments,
+    )
+
+    raw = "Done — the pipeline is ready."
+    content = compose_advisor_signoff_unverified_message(raw)
+    segments = visible_message_segments(content=content, raw_content=raw)
+    assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE)
+
+    # The blocked terminal composes over withheld prose (raw_content == "");
+    # the recognizer's empty-prefix arm must mint the same chrome.
+    bare = compose_advisor_signoff_unverified_message("")
+    segments = visible_message_segments(content=bare, raw_content="")
+    assert segments == (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE),)
 
 
 @pytest.mark.asyncio

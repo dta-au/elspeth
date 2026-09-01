@@ -83,6 +83,7 @@ class TestWithheldProseDisclosure:
         "message",
         [
             no_tool_policy._ADVISOR_SIGNOFF_PENDING_NOTICE,
+            no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
             no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
             no_tool_policy.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE,
             no_tool_policy.ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE,
@@ -91,6 +92,7 @@ class TestWithheldProseDisclosure:
         ],
         ids=[
             "signoff_pending_notice",
+            "signoff_unverified_notice",
             "pending_handoff_notice",
             "repair_success",
             "repair_review",

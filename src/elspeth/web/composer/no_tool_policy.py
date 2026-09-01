@@ -115,6 +115,24 @@ _ADVISOR_SIGNOFF_PENDING_NOTICE: Final = (
 )
 _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_PENDING_NOTICE
 
+# elspeth-2ae50afcd1 facet B (operator-adjudicated 2026-09-02): the FOURTH
+# preflight shape the END advisor gate can hold — ``runtime_preflight is
+# None``, i.e. no deterministic validation ran this turn (a question-only turn
+# mutates nothing, so ``_turn_runtime_preflight`` never computes one). The
+# preflight header would assert a failure that never occurred — the same
+# dishonest-header class R2-F14 closed for the green shape, observed live on a
+# build whose deterministic validation was green — and the sign-off-pending
+# notice would stay silent about readiness where the repair cohort's sibling
+# (``ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE``, elspeth-88592f5be7) already
+# states it plainly. Fail-closed STRUCTURE is unchanged (every readiness axis
+# stays withheld); only the wording stops claiming a preflight ran.
+_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE: Final = (
+    "Completion advisory review did not clear after the available attempts. "
+    "Composer completion is withheld. Pipeline readiness was not re-verified this turn; "
+    "validation and the advisory review run again on your next message. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+)
+_ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE
+
 # elspeth-66717f0c99: the third preflight shape the END advisor gate can hold —
 # a resolvable pending-interpretation handoff. It is neither green (so
 # ``_ADVISOR_SIGNOFF_PENDING_NOTICE`` is wrong: completion is NOT withheld
@@ -532,6 +550,8 @@ def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegme
         return empty_with_blocker
     if suffix == _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_NOTICE),)
+    if suffix == _ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX:
+        return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE),)
     if suffix == _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE),)
     handoff_with_findings = _split_wrapped_diagnostic(
@@ -677,6 +697,24 @@ def compose_advisor_signoff_pending_message(content: str) -> str:
     if not content:
         return _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
     return content + _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX
+
+
+def compose_advisor_signoff_unverified_message(content: str) -> str:
+    """Build the user-facing message for an absent-preflight advisor block.
+
+    elspeth-2ae50afcd1 facet B. Deliberately NOT
+    ``compose_preflight_failure_message``: no preflight ran this turn, so a
+    "Runtime preflight failed" header would assert a failure that never
+    occurred (the same dishonest-header class R2-F14 / elspeth-5403f346c0
+    closed for the green shape). And deliberately not the sign-off-pending
+    notice: that shape rides a preflight that ran and PASSED, while this one
+    must say readiness was not re-verified. The suffix is entirely fixed
+    prose — there is no validator objection to interpolate, because no
+    validator ran.
+    """
+    if not content:
+        return _ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
+    return content + _ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX
 
 
 def compose_advisor_pending_handoff_message(content: str, *, outstanding_findings_detail: str | None = None) -> str:

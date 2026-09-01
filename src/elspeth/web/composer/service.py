@@ -383,6 +383,8 @@ async def _await_pipeline_staging_write_with_deferred_cancellation[T](
 
 _blocking_result_from_tool_invocations = _no_tool_policy.blocking_result_from_tool_invocations
 _compose_advisor_signoff_pending_message = _no_tool_policy.compose_advisor_signoff_pending_message
+_compose_advisor_signoff_unverified_message = _no_tool_policy.compose_advisor_signoff_unverified_message
+_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE = _no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_NOTICE
 _compose_advisor_pending_handoff_message = _no_tool_policy.compose_advisor_pending_handoff_message
 _compose_interpretation_review_handoff_message = _no_tool_policy.compose_interpretation_review_handoff_message
 _advisor_signoff_pending_handoff_wording = _no_tool_policy.advisor_signoff_pending_handoff_wording
@@ -7746,7 +7748,7 @@ class ComposerServiceImpl:
         is threaded with ``repair_turns_used`` plus the persisted ids so the
         route handler can persist composer_meta uniformly.
 
-        Three shapes are chosen solely from deterministic runtime validation:
+        Four shapes are chosen solely from deterministic runtime validation:
 
         * a green preflight preserves ``is_valid``, checks, errors, authoring
           validity, and execution readiness, withholding only completion;
@@ -7758,7 +7760,14 @@ class ComposerServiceImpl:
           failures in the stages the strict ledger never reached; the notice
           then names the validator's objection instead of implying the review
           cards are the only remaining step;
-        * any other red or absent preflight remains fully red under the
+        * an ABSENT preflight (``None`` — not computed this turn, the
+          elspeth-88592f5be7 "unknown, fail closed" arm) withholds every
+          readiness axis under the fully-blocking structure but publishes the
+          unverified notice instead of the runtime-preflight header: no
+          preflight ran, so "Runtime preflight failed" would assert a failure
+          the turn never produced (elspeth-2ae50afcd1 facet B,
+          operator-adjudicated 2026-09-02);
+        * any other red preflight remains fully red under the
           runtime-preflight header.
 
         The provider's findings and the primary model's terminal prose remain
@@ -7799,6 +7808,13 @@ class ComposerServiceImpl:
                 "",
                 outstanding_findings_detail=_outstanding_findings_detail(outstanding_findings),
             )
+        elif runtime_preflight is None:
+            runtime_result = _advisor_signoff_unverified_validation(
+                reason=reason,
+                findings=verdict.findings_text,
+                findings_backend_authored=verdict.findings_backend_authored,
+            )
+            augmented = _compose_advisor_signoff_unverified_message("")
         else:
             runtime_result = _advisor_signoff_blocked_validation(
                 reason=reason,
@@ -9505,12 +9521,15 @@ _ADVISOR_MALFORMED_USER_DETAIL: Final[str] = "advisor response was malformed"
 
 
 def _advisor_signoff_blocked_validation(*, reason: str, findings: str, findings_backend_authored: bool = False) -> ValidationResult:
-    """Build the fully-red shape for a red or absent runtime preflight.
+    """Build the fully-red shape for a RED runtime preflight.
 
     Returned (not raised) by the END authoritative advisor gate
     (:meth:`ComposerServiceImpl._advisor_blocked_result`) when the advisor
     A green build always takes :func:`_advisor_signoff_pending_validation`,
     regardless of advisor reason: a FLAG is not evidence execution is unsafe.
+    An ABSENT preflight takes :func:`_advisor_signoff_unverified_validation`
+    (elspeth-2ae50afcd1 facet B) — the same fully-blocking structure with
+    wording that does not claim a preflight ran.
 
     Mirrors :func:`_orphaned_interpretation_review_validation`'s shape: every
     readiness axis is blocking (``authoring_valid`` / ``execution_ready`` /
@@ -9527,6 +9546,32 @@ def _advisor_signoff_blocked_validation(*, reason: str, findings: str, findings_
         findings=findings,
         findings_backend_authored=findings_backend_authored,
     )
+    return _advisor_signoff_fully_blocking_validation(detail=detail, suggestion=suggestion)
+
+
+def _advisor_signoff_unverified_validation(*, reason: str, findings: str, findings_backend_authored: bool = False) -> ValidationResult:
+    """Build the fully-blocking shape for an ABSENT runtime preflight.
+
+    elspeth-2ae50afcd1 facet B (operator-adjudicated 2026-09-02). ``None``
+    means the preflight was NOT COMPUTED this turn — the elspeth-88592f5be7
+    tri-state's "unknown, fail closed" arm. Unknown readiness withholds every
+    axis exactly like :func:`_advisor_signoff_blocked_validation` (nothing may
+    advance), but the surfaced wording states the advisory review did not
+    clear and readiness was not re-verified, instead of reporting a preflight
+    failure the turn never produced. Same ``advisor_signoff_blocked`` code and
+    check shape, so no closed vocabulary widens.
+    """
+    detail, suggestion = _advisor_signoff_blocked_wording(
+        reason=reason,
+        findings=findings,
+        findings_backend_authored=findings_backend_authored,
+        notice=_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
+    )
+    return _advisor_signoff_fully_blocking_validation(detail=detail, suggestion=suggestion)
+
+
+def _advisor_signoff_fully_blocking_validation(*, detail: str, suggestion: str) -> ValidationResult:
+    """Shared fully-blocking wire shape for the red and absent advisor blocks."""
     return ValidationResult(
         is_valid=False,
         checks=[
@@ -9721,12 +9766,22 @@ def _advisor_arguments_with_format_reprompt(arguments: Mapping[str, Any]) -> dic
     return retry
 
 
-def _advisor_signoff_blocked_wording(*, reason: str, findings: str, findings_backend_authored: bool = False) -> tuple[str, str]:
+def _advisor_signoff_blocked_wording(
+    *,
+    reason: str,
+    findings: str,
+    findings_backend_authored: bool = False,
+    notice: str = _ADVISOR_SIGNOFF_PENDING_NOTICE,
+) -> tuple[str, str]:
     """Return the (detail, suggestion) pair for one blocked-sign-off reason.
 
-    Shared by the fully-blocking result (:func:`_advisor_signoff_blocked_validation`)
-    and the validated-but-unsigned result (:func:`_advisor_signoff_pending_validation`)
-    so the two surfaces cannot drift.
+    Shared by the fully-blocking result (:func:`_advisor_signoff_blocked_validation`),
+    the validated-but-unsigned result (:func:`_advisor_signoff_pending_validation`),
+    and the absent-preflight result (:func:`_advisor_signoff_unverified_validation`)
+    so the surfaces cannot drift. ``notice`` swaps the fixed notice the FLAGGED
+    arms embed — the unverified shape states readiness was not re-verified
+    (elspeth-2ae50afcd1 facet B) — while the could-not-be-obtained arms are
+    notice-independent and identical across all three consumers.
 
     R2-F14: ``reason`` is now the RESOLVED failure class, not a fixed literal.
     The old text interpolated ``(unavailable)`` unconditionally and then
@@ -9748,11 +9803,11 @@ def _advisor_signoff_blocked_wording(*, reason: str, findings: str, findings_bac
     if reason in {"flagged_final_pass", "flagged_no_repair"}:
         if findings_backend_authored and findings:
             return (
-                f"{_ADVISOR_SIGNOFF_PENDING_NOTICE} {findings}",
+                f"{notice} {findings}",
                 "Remove the flagged text from the named field; the advisory review runs again on your next message.",
             )
         return (
-            _ADVISOR_SIGNOFF_PENDING_NOTICE,
+            notice,
             "Review the pipeline; validation and the advisory review run again on your next message.",
         )
     if reason == "unavailable":
