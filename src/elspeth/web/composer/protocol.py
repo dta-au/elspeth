@@ -263,6 +263,17 @@ class ComposerResult:
     # model turn whose prose ``raw_assistant_content`` carries. False is
     # deliberately inconclusive: distinct turns may produce identical bytes.
     persisted_assistant_matches_terminal_model_turn: bool = False
+    # Positive proof, set only by the END advisor gate's blocked-terminal
+    # builder, that this result was already published: its message is fixed
+    # backend copy and its ``composer.advisor_terminal_publication`` event was
+    # already emitted. The repair-cohort replacer passes such a result through
+    # untouched instead of re-deriving telemetry from ``runtime_preflight`` —
+    # which for this result is the SYNTHESIZED advisor-signoff validation, not
+    # a real turn preflight (elspeth-2ae50afcd1). False is inconclusive and
+    # keeps the replacement path: the marker, not the preflight shape, is the
+    # discriminator, so a raw-prose result whose preflight merely looks
+    # advisor-blocked still gets its prose replaced.
+    advisor_terminal_published: bool = False
     # Number of forced repair turns the proof step injected into this compose
     # invocation. Capped at 2 by the loop. 0 means first-pass success; 1 or 2
     # means the model was given proof_diagnostics back as a synthesized

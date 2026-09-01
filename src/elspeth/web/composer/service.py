@@ -1307,7 +1307,20 @@ def _replace_advisor_repair_public_result(
     readiness now publishes the fixed unverified wording instead; the model's
     own prose stays withheld because it was produced inside the repair cohort.
     Only a preflight that actually ran and passed may assert readiness.
+
+    elspeth-2ae50afcd1: an END blocked terminal (``_advisor_blocked_result``)
+    passes through untouched. Its message is already fixed backend copy, its
+    ``terminal_block`` event was already emitted, and its
+    ``runtime_preflight`` is the SYNTHESIZED advisor-signoff validation — so
+    re-deriving here double-counted the branch metric and reported
+    ``preflight_shape=red`` for a turn whose preflight never ran (observed
+    live: shape "absent" then "red" 0.2 ms apart for one publication). The
+    discriminator is the producer's own marker, never the preflight shape: a
+    raw-prose result whose preflight merely carries a failed advisor check
+    still gets its prose replaced below.
     """
+    if result.advisor_terminal_published:
+        return result
     runtime_result = result.runtime_preflight
     preflight_shape = _advisor_preflight_shape(runtime_result)
     if runtime_result is None:
@@ -2985,6 +2998,12 @@ class ComposerServiceImpl:
         """
         outstanding_findings: ValidationResult | None = None
         runtime_result = result.runtime_preflight
+        # elspeth-2ae50afcd1: an already-published END blocked terminal passes
+        # through the replacer untouched, so verifying its handoff claim here
+        # would spend an engine dry-run on findings the replacer discards —
+        # the gate already ran this verification before building the result.
+        if result.advisor_terminal_published:
+            return _replace_advisor_repair_public_result(result, outstanding_findings=None, session_id=session_id)
         if runtime_result is not None and _is_pending_interpretation_handoff(runtime_result):
             outstanding_findings = await self._pending_handoff_outstanding_findings(
                 result.state,
@@ -7800,6 +7819,7 @@ class ComposerServiceImpl:
                 raw_assistant_content=raw_content,
                 tool_invocations=recorder.invocations,
                 llm_calls=recorder.llm_calls,
+                advisor_terminal_published=True,
             ),
             repair_turns_used=repair_turns_used,
             persisted_assistant_message_id=persisted_assistant_message_id,

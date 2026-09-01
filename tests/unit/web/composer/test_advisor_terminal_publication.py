@@ -184,31 +184,32 @@ class TestRepairPublicationBranchAttribution:
         assert publication_spy.calls[0]["session_id"] is None
 
 
+def _blocked_terminal(service: Any, *, runtime_preflight: Any, session_id: str | None) -> Any:
+    from elspeth.web.composer.service import AdvisorCheckpointVerdict
+    from elspeth.web.composer.tool_batch import BufferingRecorder
+
+    return service._advisor_blocked_result(
+        reason="flagged_final_pass",
+        verdict=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: still wrong"),
+        state=_empty_state(),
+        assistant_message=None,
+        recorder=BufferingRecorder(),
+        repair_turns_used=0,
+        persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
+        persisted_tool_call_turn=False,
+        runtime_preflight=runtime_preflight,
+        outstanding_findings=None,
+        session_id=session_id,
+    )
+
+
 class TestBlockedTerminalBranchAttribution:
-    def _blocked(self, service: Any, *, runtime_preflight: Any, session_id: str | None) -> Any:
-        from elspeth.web.composer.service import AdvisorCheckpointVerdict
-        from elspeth.web.composer.tool_batch import BufferingRecorder
-
-        return service._advisor_blocked_result(
-            reason="flagged_final_pass",
-            verdict=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: still wrong"),
-            state=_empty_state(),
-            assistant_message=None,
-            recorder=BufferingRecorder(),
-            repair_turns_used=0,
-            persisted_assistant_message_id=None,
-            persisted_assistant_content=None,
-            persisted_tool_call_turn=False,
-            runtime_preflight=runtime_preflight,
-            outstanding_findings=None,
-            session_id=session_id,
-        )
-
     def test_blocked_terminal_emits_reason_and_shape(self, publication_spy: _RecordingPublicationTelemetry) -> None:
         from tests.unit.web.composer.test_service import _make_settings, _mock_catalog
 
         service = service_module.ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
-        self._blocked(service, runtime_preflight=None, session_id="sess-7")
+        _blocked_terminal(service, runtime_preflight=None, session_id="sess-7")
         assert [c["branch"] for c in publication_spy.calls] == ["terminal_block"]
         assert publication_spy.calls[0]["reason"] == "flagged_final_pass"
         assert publication_spy.calls[0]["preflight_shape"] == "absent"
@@ -218,9 +219,57 @@ class TestBlockedTerminalBranchAttribution:
         from tests.unit.web.composer.test_service import _make_settings, _mock_catalog
 
         service = service_module.ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
-        self._blocked(service, runtime_preflight=_handoff_composer_result().runtime_preflight, session_id=None)
+        _blocked_terminal(service, runtime_preflight=_handoff_composer_result().runtime_preflight, session_id=None)
         assert [c["branch"] for c in publication_spy.calls] == ["terminal_block"]
         assert publication_spy.calls[0]["preflight_shape"] == "pending_handoff"
+
+
+# ---------------------------------------------------------------------------
+# elspeth-2ae50afcd1 — an already-published END blocked terminal must not be
+# re-published through the repair replacer.
+# ---------------------------------------------------------------------------
+
+
+class TestBlockedTerminalIsNotRepublished:
+    """Observed live (session 346e0671, 2026-09-01): one blocked terminal on a
+    question-only turn emitted ``terminal_block`` (preflight_shape=absent) and
+    then ``repair_preflight_failure`` (preflight_shape=red) 0.2 ms apart — the
+    replacer re-derived the shape from the SYNTHESIZED advisor-signoff
+    validation stored in ``runtime_preflight``, double-counting the branch
+    metric and reporting a red preflight for a turn whose preflight never ran.
+    ``_advisor_blocked_result`` already publishes fixed backend copy and its
+    own telemetry; the replacer must pass such a result through untouched."""
+
+    def _service(self) -> Any:
+        from tests.unit.web.composer.test_service import _make_settings, _mock_catalog
+
+        return service_module.ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+
+    def test_absent_preflight_blocked_terminal_emits_exactly_one_event(self, publication_spy: _RecordingPublicationTelemetry) -> None:
+        blocked = _blocked_terminal(self._service(), runtime_preflight=None, session_id="sess-11")
+        published = _replace_advisor_repair_public_result(blocked, session_id="sess-11")
+        assert published == blocked
+        assert [c["branch"] for c in publication_spy.calls] == ["terminal_block"]
+        assert [c["preflight_shape"] for c in publication_spy.calls] == ["absent"]
+
+    def test_handoff_preflight_blocked_terminal_emits_exactly_one_event(self, publication_spy: _RecordingPublicationTelemetry) -> None:
+        blocked = _blocked_terminal(
+            self._service(),
+            runtime_preflight=_handoff_composer_result().runtime_preflight,
+            session_id="sess-12",
+        )
+        published = _replace_advisor_repair_public_result(blocked, session_id="sess-12")
+        assert published == blocked
+        assert [c["branch"] for c in publication_spy.calls] == ["terminal_block"]
+
+    def test_blocked_terminal_carries_the_published_marker(self, publication_spy: _RecordingPublicationTelemetry) -> None:
+        """The pass-through derives from the producer's own positive proof,
+        not from re-parsing the synthesized preflight shape (a raw-prose
+        result with a genuine signoff-failed preflight must still be
+        replaced — pinned by ``test_real_advisor_failure_still_publishes_the_notice``)."""
+        blocked = _blocked_terminal(self._service(), runtime_preflight=None, session_id=None)
+        assert blocked.advisor_terminal_published is True
+        assert ComposerResult(message="prose", state=_empty_state()).advisor_terminal_published is False
 
 
 class TestTelemetryHelperShape:
