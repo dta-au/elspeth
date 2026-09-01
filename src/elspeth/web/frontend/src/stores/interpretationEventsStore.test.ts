@@ -408,6 +408,104 @@ describe("interpretationEventsStore", () => {
       expect(state.resolvedBySession["sess-1"]).toEqual([prior, fresh]);
     });
 
+    // ── elspeth-292505e1c3: refreshAll snapshot vs resolveEvent append ──────
+    //
+    // refreshAll is fired void from compose-completion paths while resolves
+    // fire from click handlers; the backend GET runs unlocked on a separate
+    // thread-pool worker, so BOTH response orderings are schedulable. The
+    // resolved slice must be write-monotonic under either interleaving:
+    // resolution is terminal server-side (audit rows are never deleted), so
+    // a row present locally but missing from a snapshot is NEWER than the
+    // snapshot's GET, not gone.
+
+    it("a stale refreshAll snapshot cannot erase a resolve that landed while its GET was in flight, nor resurrect its pending card (elspeth-292505e1c3 interleaving B)", async () => {
+      // Seed the pending card the operator is looking at.
+      const pendingX = makePendingEvent({ id: "evt-x" });
+      vi.mocked(api.listInterpretationEvents).mockResolvedValueOnce([pendingX]);
+      await useInterpretationEventsStore.getState().refreshPending("sess-1");
+
+      // A refreshAll whose GET is serviced PRE-commit: hold its response.
+      let releaseStaleGet!: (rows: InterpretationEvent[]) => void;
+      vi.mocked(api.listInterpretationEvents).mockImplementationOnce(
+        () =>
+          new Promise<InterpretationEvent[]>((resolve) => {
+            releaseStaleGet = resolve;
+          }),
+      );
+      const staleRefresh = useInterpretationEventsStore
+        .getState()
+        .refreshAll("sess-1");
+
+      // The operator resolves the card; the confirmation is now on screen.
+      const resolvedX = makePendingEvent({
+        id: "evt-x",
+        choice: "accepted_as_drafted",
+        accepted_value: "interesting and engaging",
+        resolved_at: "2026-05-18T00:01:00Z",
+      });
+      vi.mocked(api.resolveInterpretation).mockResolvedValue({
+        event: resolvedX,
+        new_state: makeCompositionState(),
+      });
+      await useInterpretationEventsStore
+        .getState()
+        .resolveEvent("sess-1", "evt-x", { choice: "accepted_as_drafted" });
+
+      // The stale snapshot (taken before the commit) now lands.
+      releaseStaleGet([pendingX]);
+      await staleRefresh;
+
+      const state = useInterpretationEventsStore.getState();
+      // The approval survives, exactly once.
+      expect(
+        state.resolvedBySession["sess-1"].map((event) => event.id),
+      ).toEqual(["evt-x"]);
+      // The pending card does not resurrect — re-clicking it would 409
+      // (InterpretationEventAlreadyResolvedError) against the backend.
+      expect(state.pendingBySession["sess-1"]).toEqual({});
+      expect(state.resolvedCountBySession["sess-1"]).toEqual({
+        accepted_as_drafted: 1,
+        amended: 0,
+        opted_out: 0,
+      });
+    });
+
+    it("does not duplicate a row that a post-commit refreshAll snapshot already delivered (elspeth-292505e1c3 interleaving A)", async () => {
+      // A refreshAll GET serviced in the post-commit window already carries
+      // the resolved row, and its set() lands before the POST response's.
+      const resolvedX = makePendingEvent({
+        id: "evt-x",
+        choice: "accepted_as_drafted",
+        accepted_value: "interesting and engaging",
+        resolved_at: "2026-05-18T00:01:00Z",
+      });
+      vi.mocked(api.listInterpretationEvents).mockResolvedValueOnce([
+        resolvedX,
+      ]);
+      await useInterpretationEventsStore.getState().refreshAll("sess-1");
+
+      vi.mocked(api.resolveInterpretation).mockResolvedValue({
+        event: resolvedX,
+        new_state: makeCompositionState(),
+      });
+      await useInterpretationEventsStore
+        .getState()
+        .resolveEvent("sess-1", "evt-x", { choice: "accepted_as_drafted" });
+
+      const state = useInterpretationEventsStore.getState();
+      // Exactly one copy — a duplicate doubles the "Got it" bubble and
+      // collides React keys (tail confirmations key on event.id).
+      expect(
+        state.resolvedBySession["sess-1"].map((event) => event.id),
+      ).toEqual(["evt-x"]);
+      // And exactly one count — the snapshot pass already counted it.
+      expect(state.resolvedCountBySession["sess-1"]).toEqual({
+        accepted_as_drafted: 1,
+        amended: 0,
+        opted_out: 0,
+      });
+    });
+
     it("increments the 'amended' counter on amended resolution", async () => {
       vi.mocked(api.listInterpretationEvents).mockResolvedValue([makePendingEvent()]);
       await useInterpretationEventsStore.getState().refreshPending("sess-1");
