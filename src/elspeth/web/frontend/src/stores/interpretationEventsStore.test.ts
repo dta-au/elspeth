@@ -7,7 +7,10 @@
 // ============================================================================
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { useInterpretationEventsStore } from "./interpretationEventsStore";
+import {
+  selectApprovedInterpretations,
+  useInterpretationEventsStore,
+} from "./interpretationEventsStore";
 import { resetStore } from "@/test/store-helpers";
 import type {
   InterpretationEvent,
@@ -90,6 +93,52 @@ describe("interpretationEventsStore", () => {
       expect(state.resolvedCountBySession).toEqual({});
       expect(state.resolvedBySession).toEqual({});
       expect(state.optedOutBySession).toEqual({});
+    });
+  });
+
+  describe("selectApprovedInterpretations (elspeth-3a8a843c47)", () => {
+    it("admits exactly the two operator-approval choices", () => {
+      const accepted = makePendingEvent({
+        id: "evt-accepted",
+        choice: "accepted_as_drafted",
+        resolved_at: "2026-05-18T00:01:00Z",
+      });
+      const amended = makePendingEvent({
+        id: "evt-amended",
+        choice: "amended",
+        accepted_value: "captivating",
+        resolved_at: "2026-05-18T00:02:00Z",
+      });
+      // The dangerous shape: a surface-specific auto_interpreted_opt_out
+      // row is CHECK-required to carry a non-null user_term and
+      // tool_call_id — field presence must never classify it as approved.
+      const autoBaked = makePendingEvent({
+        id: "evt-auto-baked",
+        choice: "opted_out",
+        interpretation_source: "auto_interpreted_opt_out",
+        accepted_value: "interesting and engaging",
+        resolved_at: "2026-05-18T00:03:00Z",
+        actor: "composer-llm",
+      });
+      const pending = makePendingEvent({ id: "evt-pending" });
+      const abandoned = makePendingEvent({
+        id: "evt-abandoned",
+        choice: "abandoned",
+        resolved_at: "2026-05-18T00:04:00Z",
+      });
+
+      const approved = selectApprovedInterpretations([
+        accepted,
+        amended,
+        autoBaked,
+        pending,
+        abandoned,
+      ]);
+
+      expect(approved.map((event) => event.id)).toEqual([
+        "evt-accepted",
+        "evt-amended",
+      ]);
     });
   });
 

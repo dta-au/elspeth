@@ -11,7 +11,10 @@ import {
 } from "react";
 import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
-import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import {
+  selectApprovedInterpretations,
+  useInterpretationEventsStore,
+} from "@/stores/interpretationEventsStore";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { useBlobStore } from "@/stores/blobStore";
 import {
@@ -1739,17 +1742,27 @@ export function ChatPanel({
         NO_RESOLVED_INTERPRETATIONS),
   );
 
-  // toolCallId -> the terms resolved against that call, in resolution order.
+  // Only operator approvals may render a "Got it" — classified by `choice`
+  // via the store's exported selector, NOT by user_term presence: the
+  // surface-specific auto_interpreted_opt_out shape is CHECK-required to
+  // carry a user_term and tool_call_id, so field presence marks a declined
+  // review as readily as an approval (elspeth-3a8a843c47).
+  const approvedInterpretations = useMemo(
+    () => selectApprovedInterpretations(resolvedInterpretations),
+    [resolvedInterpretations],
+  );
+
+  // toolCallId -> the terms approved against that call, in resolution order.
   //
-  // Rows with no user_term are skipped exactly as before: opt-out and
-  // auto-interpreted rows have nothing to echo, and the opt-out flow carries
-  // its own confirm dialog. Rows with a term but no tool_call_id cannot be
-  // anchored and fall through to `unanchoredConfirmations` below rather than
-  // being dropped — an approval the operator gave is not something to discard
-  // because we cannot place it.
+  // Approved rows always carry a user_term (the backend CHECK on
+  // user_approved rows guarantees it); the null/empty guard is wire-type
+  // narrowing, not classification. Rows with a term but no tool_call_id
+  // cannot be anchored and fall through to `unanchoredConfirmations` below
+  // rather than being dropped — an approval the operator gave is not
+  // something to discard because we cannot place it.
   const confirmationsByToolCallId = useMemo(() => {
     const byToolCall = new Map<string, string[]>();
-    for (const event of resolvedInterpretations) {
+    for (const event of approvedInterpretations) {
       const userTerm = event.user_term;
       if (userTerm === null || userTerm === "") continue;
       const toolCallId = event.tool_call_id;
@@ -1759,7 +1772,7 @@ export function ChatPanel({
       else terms.push(userTerm);
     }
     return byToolCall;
-  }, [resolvedInterpretations]);
+  }, [approvedInterpretations]);
 
   // The turns that actually reach the DOM. Hoisted out of the JSX because the
   // confirmation anchoring has to know which tool calls are on screen: the
@@ -1787,7 +1800,7 @@ export function ChatPanel({
       for (const call of turn.aggregatedToolCalls) onScreen.add(call.id);
     }
     const tail: { id: string; userTerm: string }[] = [];
-    for (const event of resolvedInterpretations) {
+    for (const event of approvedInterpretations) {
       const userTerm = event.user_term;
       if (userTerm === null || userTerm === "") continue;
       const toolCallId = event.tool_call_id;
@@ -1795,7 +1808,7 @@ export function ChatPanel({
       tail.push({ id: event.id, userTerm });
     }
     return tail;
-  }, [resolvedInterpretations, renderedTurns]);
+  }, [approvedInterpretations, renderedTurns]);
 
   // Disambiguation re-fire guards (F-10 / F-11). Subscribed via the
   // store so the widget surface updates when a guard flips — without

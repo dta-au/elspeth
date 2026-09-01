@@ -77,6 +77,31 @@ const EMPTY_COUNTS: ResolvedCounts = {
   opted_out: 0,
 };
 
+/**
+ * The resolved rows that represent an operator approval — the ONLY rows a
+ * rendering surface may present as "the operator accepted this
+ * interpretation" (ChatPanel's "Got it — using your interpretation of
+ * <term>." confirmation, NarrativeResults' per-term overlay).
+ *
+ * Classification is by `choice`, never by field presence. The
+ * surface-specific `auto_interpreted_opt_out` shape is REQUIRED by the
+ * backend CHECK constraint (ck_interpretation_events_opt_out_shape) to
+ * carry a non-null `user_term` and `tool_call_id` — the audit trail must
+ * record exactly what was baked without review — so "has a term" marks a
+ * DECLINED review as readily as an approved one (elspeth-3a8a843c47).
+ * `choice` is exact in both directions: the resolve endpoint admits only
+ * `accepted_as_drafted` and `amended`, and every auto_interpreted_* source
+ * is CHECK-forced to `choice='opted_out'`.
+ */
+export function selectApprovedInterpretations(
+  events: readonly InterpretationEvent[],
+): InterpretationEvent[] {
+  return events.filter(
+    (event) =>
+      event.choice === "accepted_as_drafted" || event.choice === "amended",
+  );
+}
+
 interface InterpretationEventsState {
   // ── Primary projections ──────────────────────────────────────────────────
   pendingBySession: Record<string, Record<string, InterpretationEvent>>;

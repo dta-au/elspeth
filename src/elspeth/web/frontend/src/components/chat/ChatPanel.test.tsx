@@ -8144,6 +8144,62 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
       /quality[\s\S]*rate_lead_quality/,
     );
   });
+
+  it("stays silent for surface-specific auto_interpreted_opt_out rows even though they carry a term and an anchor (elspeth-3a8a843c47)", () => {
+    // The dangerous shape: when the session has opted out of interpretation
+    // review and the composer LLM later calls request_interpretation_review,
+    // the backend writes a born-resolved row that
+    // ck_interpretation_events_opt_out_shape REQUIRES to carry a non-null
+    // user_term AND tool_call_id — the audit trail must record what was baked
+    // without review. Field presence therefore marks a DECLINED review, not
+    // an approval; rendering "Got it — using your interpretation of <term>."
+    // for it asserts an approval the operator explicitly refused to give.
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-auto-baked",
+              session_id: sessionFixture.id,
+              tool_call_id: "call-set-pipeline",
+              user_term: "engagement",
+              choice: "opted_out",
+              interpretation_source: "auto_interpreted_opt_out",
+              accepted_value: "trendy",
+              resolved_at: "2026-05-18T10:05:00Z",
+              actor: "composer-llm",
+            }),
+            // A genuine approval alongside it: the fix must classify by
+            // choice, not blanket-suppress the confirmation surface.
+            makeInterpretationEvent({
+              id: "evt-approved",
+              session_id: sessionFixture.id,
+              tool_call_id: "call-set-pipeline",
+              user_term: "lead_quality",
+              choice: "amended",
+              resolved_at: "2026-05-18T10:06:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingToolCall("call-set-pipeline"),
+    });
+
+    render(<ChatPanel />);
+
+    const confirmations = screen.getAllByTestId(
+      "interpretation-review-confirmation",
+    );
+    expect(confirmations).toHaveLength(1);
+    expect(confirmations[0].textContent).toMatch(/lead_quality/);
+    expect(
+      confirmations.map((node) => node.textContent).join(" "),
+    ).not.toMatch(/engagement/);
+  });
 });
 
 describe("ChatPanel chat presentation (ux-review-2026-07-02)", () => {
