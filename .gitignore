@@ -66,6 +66,7 @@ docs-archive/
 .claude/plans/
 .claude/lanes/
 .claude/handovers/
+.claude/red-team/
 .mcp.json
 !.mcp.json.example
 .codex
