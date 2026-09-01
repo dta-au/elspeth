@@ -1,3 +1,25 @@
+/* ── The scroll-owner contract (elspeth-73849d9d16) ─────────────────────────
+   Scrolling inside the composer workspace is granted AND named in one act:
+   every rule that makes a workspace box a scroll container (`overflow*: auto`)
+   also declares `--scroll-owner: <name>` in the same block. The closed name
+   vocabulary — and the cap of one visible vertical scroller per name — lives
+   in scrollOwners.ts beside this file; the e2e gate
+   (tests/e2e/helpers/workspace-assertions.ts) reads the names off the DOM's
+   computed style, so the stylesheet is the only place that says WHICH box owns
+   a scroll. A scrolling box with no name, or with a name outside the
+   vocabulary, fails the gate by construction.
+
+   `inherits: false` is the load-bearing half of this registration: custom
+   properties inherit by default, so without it every DESCENDANT of a named
+   scroller would read its ancestor's name and an unnamed nested scroller
+   could pass the gate wearing it. `syntax: "*"` keeps the value free-form
+   (initial value: the guaranteed-invalid empty string) — validity is the
+   vocabulary's job, not the parser's. */
+@property --scroll-owner {
+  syntax: "*";
+  inherits: false;
+}
+
 .composer-workspace {
   --authoring-pane-width: 360px;
 
@@ -294,6 +316,8 @@
 }
 
 .artifact-workspace-panel {
+  --scroll-owner: artifact;
+
   position: relative;
   flex: 1 1 auto;
   min-width: 0;
@@ -926,6 +950,8 @@
 
 
 .workspace-inspector-body {
+  --scroll-owner: inspector;
+
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;

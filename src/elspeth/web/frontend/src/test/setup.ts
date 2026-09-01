@@ -26,11 +26,15 @@ Object.defineProperty(window, "matchMedia", {
 Object.defineProperty(Element.prototype, "scrollTo", {
   writable: true,
   configurable: true,
-  value: function scrollTo(this: Element, options?: ScrollToOptions | number) {
+  // Deliberately NARROWER than the DOM signature, which also admits the
+  // positional scrollTo(x, y) form. This stub does not model that form, and a
+  // signature that accepted it would make a spec calling it a silent no-op
+  // instead of a type error. If a caller needs the positional form, widen this
+  // and implement it — do not let it pass quietly.
+  value: function scrollTo(this: Element, options: ScrollToOptions) {
     // Keep the observable side effect jsdom CAN model, so a spec that reads
     // scrollTop after a scroll sees the value the browser would leave.
-    if (typeof options === "object" && options !== null && options.top !== undefined) {
-      this.scrollTop = options.top;
-    }
+    if (options.top !== undefined) this.scrollTop = options.top;
+    if (options.left !== undefined) this.scrollLeft = options.left;
   },
 });

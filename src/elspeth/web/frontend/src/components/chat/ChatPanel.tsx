@@ -1,5 +1,6 @@
 // src/components/chat/ChatPanel.tsx
 import {
+  Fragment,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -11,6 +12,7 @@ import {
 import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import type { InterpretationEvent } from "@/types/interpretation";
 import { useBlobStore } from "@/stores/blobStore";
 import {
   deriveInlineSourceRowCount,
@@ -35,7 +37,11 @@ import { FreeformIntroduction } from "./FreeformIntroduction";
 import { BlobManager } from "@/components/blobs/BlobManager";
 import { CompletionSummary } from "./guided/CompletionSummary";
 import { ModeSwitchButton } from "./guided/ModeSwitchButton";
-import { PendingProposalsBanner } from "./PendingProposalsBanner";
+import {
+  PendingProposalsBanner,
+  PendingProposalsLiveRegion,
+  actionableProposals,
+} from "./PendingProposalsBanner";
 import { GuidedChatHistory } from "./guided/GuidedChatHistory";
 import { GuidedPendingStrip } from "./guided/GuidedPendingStrip";
 import { GUIDED_EXPLAIN_MESSAGE } from "./guided/explainPrompt";
@@ -69,6 +75,7 @@ import { InlineSourceCreatedTurn } from "./InlineSourceCreatedTurn";
 import { InlineSourceDisambiguationTurn } from "./InlineSourceDisambiguationTurn";
 import { InlineSourceFallbackPrompt } from "./InlineSourceFallbackPrompt";
 import { sortedSourceEntries } from "@/utils/compositionState";
+import { preferredScrollBehavior } from "@/utils/motion";
 import type {
   BlobMetadata,
   ChatMessage,
@@ -117,6 +124,41 @@ function isEmptyRedactedOptions(value: unknown): boolean {
 }
 
 const DEFAULT_PIPELINE_METADATA_NAME = "Untitled Pipeline";
+
+// Stable empty slice for the resolved-interpretations selector. A selector
+// that returns a fresh `[]` on every call compares unequal to itself under
+// zustand's referential check and re-renders ChatPanel on every store write,
+// so the miss path has to hand back ONE array.
+const NO_RESOLVED_INTERPRETATIONS: readonly InterpretationEvent[] = [];
+
+/**
+ * "Got it — using your interpretation of <term>." — the human-readable echo
+ * of an interpretation the operator approved.
+ *
+ * The canonical record is the interpretation_event row in the audit trail;
+ * this is the nudge that tells the operator, in the conversation, which
+ * assumption they just signed off. One component because it now renders from
+ * TWO places — anchored beside the turn that raised the term, and after the
+ * stream for rows that carry no usable anchor — and the two must stay the
+ * same bubble.
+ */
+function InterpretationConfirmation({ userTerm }: { userTerm: string }) {
+  return (
+    <div
+      className="message-row message-row--assistant interpretation-review-confirmation"
+      data-testid="interpretation-review-confirmation"
+      role="status"
+    >
+      <div className="bubble bubble-assistant message-bubble-content">
+        Got it — using your interpretation of{" "}
+        <em className="interpretation-review-confirmation-user-term">
+          {userTerm}
+        </em>
+        .
+      </div>
+    </div>
+  );
+}
 
 const TUTORIAL_STEP_2_COMPOSING_SUBSTEPS = [
   "Read output request",
@@ -982,6 +1024,10 @@ export function ChatPanel({
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const guidedLogRef = useRef<HTMLDivElement>(null);
+  // The docked chrome's scroll container (.chat-panel-dock) — named so the
+  // proposal-arrival reveal can scroll IT, and only it. Mutable (| null)
+  // because attachDock assigns it from a callback ref.
+  const dockRef = useRef<HTMLDivElement | null>(null);
   // Guided-chat pending focus contract (elspeth-6a9673ecd3, placement pass
   // 2026-07-23). The input stays MOUNTED (disabled) while /guided/chat is in
   // flight — the old unmount swap is retired — so into pending there is no
@@ -1158,12 +1204,17 @@ export function ChatPanel({
   // resets it — only a reload did.
   //
   // scrollTop is deliberately not used here: the smooth animation IS the
-  // affordance that tells the reader the transcript moved under them. The
+  // affordance that tells the reader the transcript moved under them — except
+  // under prefers-reduced-motion, where the reader has asked us to drop that
+  // affordance and jump (preferredScrollBehavior owns the choice). The
   // two guided call sites already scroll their container by name this way.
   const scrollTranscriptToEnd = useCallback(() => {
     const container = scrollContainerRef.current;
     if (container === null) return;
-    container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: preferredScrollBehavior(),
+    });
   }, []);
 
   function scrollToBottom() {
@@ -1662,42 +1713,89 @@ export function ChatPanel({
   // confirmations are still visible. Confirmations persist for the
   // lifetime of the ChatPanel mount; switching sessions or reloading clears
   // them, which matches the "ephemeral UI nudge" intent.
-  interface ResolveConfirmation {
-    id: string;
-    userTerm: string;
-  }
-  const [resolveConfirmations, setResolveConfirmations] = useState<
-    ReadonlyArray<ResolveConfirmation>
-  >([]);
-  // Monotonic counter for confirmation ids — useId is per-component and
-  // would collide across appended entries; crypto.randomUUID is overkill
-  // for ephemeral UI state. A ref-backed counter is identity-stable across
-  // renders and produces predictable, debuggable ids in DevTools.
-  const confirmationIdCounterRef = useRef(0);
-
-  const handleInterpretationResolved = useCallback(
-    (resolvedEvent: { user_term: string | null }) => {
-      // Skip the confirmation when user_term is null — this is the case
-      // for opt-out and auto-interpretation rows, which do not have a
-      // user term to echo. The opt-out flow has its own confirm dialog
-      // ("Stop reviewing interpretations"); a chat-stream
-      // echo would be redundant noise.
-      const userTerm = resolvedEvent.user_term;
-      if (userTerm === null || userTerm === "") return;
-      confirmationIdCounterRef.current += 1;
-      const id = `resolve-confirmation-${confirmationIdCounterRef.current}`;
-      setResolveConfirmations((prev) => [...prev, { id, userTerm }]);
-    },
-    [],
+  // Confirmations are DERIVED from the resolved interpretation events, not
+  // accumulated in component state (elspeth-51ed4fd8d5). They used to be a
+  // local useState list appended on each resolve and rendered after the whole
+  // turn stream, which produced two defects at once:
+  //
+  //   Position — append order IS the position, so a confirmation was
+  //   permanently last. Resolve a card, send another message, and the "Got
+  //   it" sat below that message reading as a reply to it; three resolutions
+  //   piled up as a block at the tail no matter which turns raised them.
+  //
+  //   Persistence — the list was seeded [] and reset on session switch, never
+  //   hydrated, so a reload erased every confirmation. In an audit-first
+  //   product the transcript then shows the assumptions being surfaced and
+  //   never shows the operator approving them.
+  //
+  // interpretationEventsStore.resolvedBySession fixes both: refreshAll
+  // populates it from the wire on session load and resolveEvent appends to it
+  // live, so one source serves both paths, and every row carries the
+  // tool_call_id that anchors it to the turn that raised the term.
+  const resolvedInterpretations = useInterpretationEventsStore((state) =>
+    activeSessionId === null
+      ? NO_RESOLVED_INTERPRETATIONS
+      : (state.resolvedBySession[activeSessionId] ??
+        NO_RESOLVED_INTERPRETATIONS),
   );
 
-  // Reset confirmations on session switch — the confirmations are
-  // per-session UI state and showing previous-session confirmations in a
-  // new session's chat would be confusing.
-  useEffect(() => {
-    setResolveConfirmations([]);
-    confirmationIdCounterRef.current = 0;
-  }, [activeSessionId]);
+  // toolCallId -> the terms resolved against that call, in resolution order.
+  //
+  // Rows with no user_term are skipped exactly as before: opt-out and
+  // auto-interpreted rows have nothing to echo, and the opt-out flow carries
+  // its own confirm dialog. Rows with a term but no tool_call_id cannot be
+  // anchored and fall through to `unanchoredConfirmations` below rather than
+  // being dropped — an approval the operator gave is not something to discard
+  // because we cannot place it.
+  const confirmationsByToolCallId = useMemo(() => {
+    const byToolCall = new Map<string, string[]>();
+    for (const event of resolvedInterpretations) {
+      const userTerm = event.user_term;
+      if (userTerm === null || userTerm === "") continue;
+      const toolCallId = event.tool_call_id;
+      if (toolCallId === null) continue;
+      const terms = byToolCall.get(toolCallId);
+      if (terms === undefined) byToolCall.set(toolCallId, [userTerm]);
+      else terms.push(userTerm);
+    }
+    return byToolCall;
+  }, [resolvedInterpretations]);
+
+  // The turns that actually reach the DOM. Hoisted out of the JSX because the
+  // confirmation anchoring has to know which tool calls are on screen: the
+  // atomic-reveal gate hides a mid-flight tail turn, and a confirmation whose
+  // anchor is hidden must fall to the tail rather than silently vanish.
+  const renderedTurns = useMemo(
+    () =>
+      chatTurns.filter(
+        (turn: ChatTurn, index: number) =>
+          turn.isComplete || !isComposing || index < chatTurns.length - 1,
+      ),
+    [chatTurns, isComposing],
+  );
+
+  // Confirmations that cannot be anchored: no tool_call_id on the row, or its
+  // call belongs to a turn that is not on screen (hidden by the atomic-reveal
+  // gate, or raised during a guided phase whose turns replay through
+  // GuidedChatHistory rather than as chatTurns). They render after the stream,
+  // which is where ALL of them used to render — the fallback is the old
+  // behaviour, kept deliberately so an approval is never dropped for want of
+  // a place to put it.
+  const tailConfirmations = useMemo(() => {
+    const onScreen = new Set<string>();
+    for (const turn of renderedTurns) {
+      for (const call of turn.aggregatedToolCalls) onScreen.add(call.id);
+    }
+    const tail: { id: string; userTerm: string }[] = [];
+    for (const event of resolvedInterpretations) {
+      const userTerm = event.user_term;
+      if (userTerm === null || userTerm === "") continue;
+      const toolCallId = event.tool_call_id;
+      if (toolCallId !== null && onScreen.has(toolCallId)) continue;
+      tail.push({ id: event.id, userTerm });
+    }
+    return tail;
+  }, [resolvedInterpretations, renderedTurns]);
 
   // Disambiguation re-fire guards (F-10 / F-11). Subscribed via the
   // store so the widget surface updates when a guard flips — without
@@ -1870,6 +1968,68 @@ export function ChatPanel({
       compositionProposals.filter((p) => !disambiguationProposalIds.has(p.id)),
     [compositionProposals, disambiguationProposalIds],
   );
+
+  // A newly-actionable proposal must be SEEN (elspeth-2d1cf8908c). The dock
+  // is a scroll container by design (elspeth-ecf973fb9f), so a banner that
+  // mounts below its fold — an open blob drawer or a tall composing card is
+  // enough — leaves the Accept control invisible with no signal a decision
+  // is waiting. When an actionable proposal id appears that the previous
+  // render did not have, scroll the dock BY NAME to the banner. Never
+  // scrollIntoView: its ancestor walk scrolls every scrollable box it finds
+  // and is the exact mechanism behind the elspeth-ecf973fb9f defect. Keyed
+  // to arrivals by VALUE (set membership, not array identity — the derived
+  // proposal arrays rebuild on unrelated store writes) so it repositions
+  // once per arrival and never fights the operator's own dock scrolling.
+  // Second trigger: a freshly-MOUNTED dock (first freeform render, or the
+  // return from a guided surface with a proposal already pending) reveals
+  // any waiting decision via attachDock — a fresh mount has no operator
+  // scroll state to fight.
+  const actionableBannerProposalIds = useMemo(
+    () => actionableProposals(bannerProposals, staleProposalIds).map((p) => p.id),
+    [bannerProposals, staleProposalIds],
+  );
+  const seenActionableBannerIdsRef = useRef<ReadonlySet<string>>(new Set());
+  const revealActionableProposals = useCallback(
+    (revealAlreadySeen: boolean) => {
+      const dock = dockRef.current;
+      // No dock on the guided surfaces: leave the seen-set unconsumed so the
+      // arrival still counts as new once the freeform body (and its dock)
+      // is mounted.
+      if (dock === null) return;
+      const seen = seenActionableBannerIdsRef.current;
+      seenActionableBannerIdsRef.current = new Set(actionableBannerProposalIds);
+      const shouldReveal = revealAlreadySeen
+        ? actionableBannerProposalIds.length > 0
+        : actionableBannerProposalIds.some((id) => !seen.has(id));
+      if (!shouldReveal) return;
+      const banner = dock.querySelector<HTMLElement>(".pending-proposals-banner");
+      if (banner === null) return;
+      const bannerTop =
+        banner.getBoundingClientRect().top -
+        dock.getBoundingClientRect().top +
+        dock.scrollTop;
+      dock.scrollTo({ top: bannerTop, behavior: preferredScrollBehavior() });
+    },
+    [actionableBannerProposalIds],
+  );
+  useEffect(() => {
+    revealActionableProposals(false);
+  }, [revealActionableProposals]);
+  // Latest-reveal ref so the dock's attach callback below stays
+  // identity-stable: a callback ref that changed per proposal-set change
+  // would detach/reattach on every arrival. Render-time ref assignment is
+  // the house idiom (guidedUploadContextRef above).
+  const revealActionableProposalsRef = useRef(revealActionableProposals);
+  revealActionableProposalsRef.current = revealActionableProposals;
+  const attachDock = useCallback((node: HTMLDivElement | null) => {
+    dockRef.current = node;
+    if (node === null) return;
+    // A freshly-mounted dock — the first freeform render, or the return
+    // from a guided surface with a proposal already pending — has no
+    // operator scroll state to respect: reveal ANY waiting decision, seen
+    // before or not. The change-effect above stays arrival-keyed.
+    revealActionableProposalsRef.current(true);
+  }, []);
 
   // ── Disambiguation action handlers ─────────────────────────────────────────
   //
@@ -2127,7 +2287,7 @@ export function ChatPanel({
         ".guided-chat-bubbles [data-seq]",
       );
       rows[rows.length - 1]?.scrollIntoView({
-        behavior: "smooth",
+        behavior: preferredScrollBehavior(),
         block: "start",
       });
     }
@@ -2166,7 +2326,7 @@ export function ChatPanel({
   useEffect(() => {
     if (!guidedLogRef.current) return;
     guidedLogRef.current.scrollIntoView({
-      behavior: "smooth",
+      behavior: preferredScrollBehavior(),
       block: "nearest",
     });
     const first = guidedLogRef.current.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
@@ -2198,7 +2358,10 @@ export function ChatPanel({
     if (errorDetails == null || errorDetails.length === 0) {
       return;
     }
-    rejectionRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    rejectionRef.current?.scrollIntoView({
+      behavior: preferredScrollBehavior(),
+      block: "nearest",
+    });
   }, [errorDetails]);
 
   const handleSend = useCallback(
@@ -2990,11 +3153,15 @@ export function ChatPanel({
           <AcknowledgementLiveRegion sessionId={activeSessionId} />
           <AcknowledgementStack
             sessionId={activeSessionId}
-            onResolved={(newState, event) => {
+            onResolved={(newState) => {
+              // The confirmation bubble is NOT pushed from here any more
+              // (elspeth-51ed4fd8d5). useInterpretationResolver already lands
+              // the resolved row in interpretationEventsStore.resolvedBySession,
+              // and the transcript derives every confirmation from that slice —
+              // so the same code path serves a live resolve and a page reload,
+              // and the row's tool_call_id anchors the echo to the turn that
+              // raised the term instead of appending it to the tail.
               applyResolvedInterpretation(newState);
-              if (event !== null) {
-                handleInterpretationResolved(event);
-              }
             }}
           />
         </>
@@ -3064,12 +3231,7 @@ export function ChatPanel({
             // composition is running. Those historical turns must still render
             // so their tool calls stay visible; only the current tail turn stays
             // behind the atomic-reveal gate.
-            chatTurns
-              .filter(
-                (turn: ChatTurn, index: number) =>
-                  turn.isComplete || !isComposing || index < chatTurns.length - 1,
-              )
-              .map((turn: ChatTurn) => {
+            renderedTurns.map((turn: ChatTurn) => {
                 const repr = turnRepresentativeMessage(turn);
                 // Attach the inline-source summary to the most recent complete
                 // agent turn — that's the turn whose audit narrative includes
@@ -3084,22 +3246,38 @@ export function ChatPanel({
                   inlineSourceSummary && turn.id === inlineSourceTargetTurnId
                     ? [inlineSourceSummary]
                     : undefined;
+                // Interpretation confirmations raised BY this turn, emitted
+                // straight after its bubble (elspeth-51ed4fd8d5). The anchor
+                // is the tool call that surfaced the term, so the echo stays
+                // beside the exchange it belongs to however long the operator
+                // takes to resolve the card, and however many turns land in
+                // between.
+                const confirmedTerms = turn.aggregatedToolCalls.flatMap(
+                  (call) => confirmationsByToolCallId.get(call.id) ?? [],
+                );
                 return (
-                  <MessageBubble
-                    key={turn.id}
-                    message={repr}
-                    isComposing={isComposing}
-                    onRetry={turn.kind === "user" ? retryMessage : undefined}
-                    onFork={turn.kind === "user" ? handleFork : undefined}
-                    proposalsByToolCallId={proposalsByToolCallId}
-                    compositionState={compositionState}
-                    staleProposalIds={staleProposalIds}
-                    proposalActionPendingIds={proposalActionPendingIds}
-                    onAcceptProposal={acceptProposal}
-                    onRejectProposal={rejectProposal}
-                    sourcesCreated={sourcesForThisTurn}
-                    onEditInlineSource={handleEditInlineSource}
-                  />
+                  <Fragment key={turn.id}>
+                    <MessageBubble
+                      message={repr}
+                      isComposing={isComposing}
+                      onRetry={turn.kind === "user" ? retryMessage : undefined}
+                      onFork={turn.kind === "user" ? handleFork : undefined}
+                      proposalsByToolCallId={proposalsByToolCallId}
+                      compositionState={compositionState}
+                      staleProposalIds={staleProposalIds}
+                      proposalActionPendingIds={proposalActionPendingIds}
+                      onAcceptProposal={acceptProposal}
+                      onRejectProposal={rejectProposal}
+                      sourcesCreated={sourcesForThisTurn}
+                      onEditInlineSource={handleEditInlineSource}
+                    />
+                    {confirmedTerms.map((userTerm) => (
+                      <InterpretationConfirmation
+                        key={`${turn.id}:${userTerm}`}
+                        userTerm={userTerm}
+                      />
+                    ))}
+                  </Fragment>
                 );
               })
           )}
@@ -3116,36 +3294,23 @@ export function ChatPanel({
             />
           )}
           {/*
-            Resolve-success confirmation bubbles (Phase 5b.18b.8).
+            Unanchorable resolve confirmations (Phase 5b.18b.8).
 
-            One assistant-styled bubble per resolved interpretation. Rendered
-            inside the role="log" region so the new bubble is announced to
-            AT users on append (aria-live="polite" on the parent). The
-            bubbles compose the same message-row--assistant +
-            bubble-assistant classes as ordinary assistant turns
-            (MessageBubble.tsx) so the confirmation visually flows with the
-            conversation — the previous chat-message* tokens here were
-            defined by no stylesheet, so these rendered as bare unstyled
-            text (elspeth-729872658a). These are NOT persisted to
-            sessionStore.messages and do NOT round-trip to the server — see
-            the handleInterpretationResolved comment above for the
-            rationale.
+            The anchored ones render beside the turn that raised them, up in
+            the turn map. These are the residue: rows carrying no tool_call_id,
+            or whose call is not on screen. Rendering them here — after the
+            stream, which is where every confirmation used to go — keeps an
+            approval visible rather than dropping it for want of an anchor.
+
+            role="status" inside the role="log" region so an arriving bubble is
+            announced (aria-live="polite" on the parent). The row composes the
+            same message-row--assistant + bubble-assistant classes as an
+            ordinary assistant turn so it flows with the conversation; the
+            chat-message* tokens this once used were defined by no stylesheet
+            and rendered as bare unstyled text (elspeth-729872658a).
           */}
-          {resolveConfirmations.map((conf) => (
-            <div
-              key={conf.id}
-              className="message-row message-row--assistant interpretation-review-confirmation"
-              data-testid="interpretation-review-confirmation"
-              role="status"
-            >
-              <div className="bubble bubble-assistant message-bubble-content">
-                Got it — using your interpretation of{" "}
-                <em className="interpretation-review-confirmation-user-term">
-                  {conf.userTerm}
-                </em>
-                .
-              </div>
-            </div>
+          {tailConfirmations.map((conf) => (
+            <InterpretationConfirmation key={conf.id} userTerm={conf.userTerm} />
           ))}
           {/*
             Inline-source disambiguation widgets (Phase 5a Task 4).
@@ -3200,7 +3365,13 @@ export function ChatPanel({
 
           Grouping is layout-only: each child keeps the DOM position, order and
           live-region semantics it had as a direct panel child. */}
-      <div className="chat-panel-dock">
+      {/* tabIndex=0 (WCAG 2.1.1): the dock is a scroll container whose hidden
+          content need not contain anything focusable — measured 67px below
+          the last focusable control, reachable by wheel or drag alone. Same
+          ruling and same idiom as the transcript scroller above. The cost is
+          one extra tab stop on the transcript-to-composer path; it is the
+          smaller loss. Focus ring in chat.css (.chat-panel-dock:focus-visible). */}
+      <div className="chat-panel-dock" tabIndex={0} ref={attachDock}>
         {/* Composing indicator — deliberately a SIBLING of the role="log"
             messages container, not a child (elspeth-76a0cc485e, WCAG 4.1.3):
             its role="status" is itself a polite live region, and nesting it
@@ -3230,6 +3401,15 @@ export function ChatPanel({
             surfaces. The widget handlers ultimately funnel through
             acceptProposal / rejectProposal so the audit chain is
             identical regardless of which surface lands the action. */}
+        {/* Persistent announcer for banner arrivals (elspeth-2d1cf8908c):
+            the banner returns null when empty, so a live-region role on the
+            banner itself would mount WITH its content — the unreliable
+            pattern AcknowledgementLiveRegion documents. This node pre-exists
+            the content; only its text mutates. */}
+        <PendingProposalsLiveRegion
+          proposals={bannerProposals}
+          staleProposalIds={staleProposalIds}
+        />
         <PendingProposalsBanner
           proposals={bannerProposals}
           staleProposalIds={staleProposalIds}
