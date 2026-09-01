@@ -139,6 +139,65 @@
   margin-bottom: 0;
 }
 
+/* Interpretation-approval register (elspeth-3574f87208). A resolve
+   confirmation is a SYSTEM attestation of an operator decision, not
+   assistant speech — it must never compose .bubble-assistant, which asserts
+   an assistant reply (unanchorable confirmations at the transcript tail read
+   as replies to the newest message). Same third-register move as
+   .trusted-system-notice: muted, bordered, left-edge accent (3px is the ONE
+   transcript accent width, elspeth-ed88648dee), success tokens because the
+   note attests a completed approval. */
+.message-row--interpretation-approval {
+  justify-content: flex-start;
+}
+
+.interpretation-approval-note {
+  max-width: min(92%, 74ch);
+  padding: var(--space-xs) var(--space-md);
+  border: 1px solid var(--color-success-border);
+  border-left: 3px solid var(--color-success);
+  border-radius: var(--radius-sm);
+  background-color: var(--color-success-bg);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-snug);
+  word-break: break-word;
+}
+
+.interpretation-approval-check {
+  color: var(--color-success);
+}
+
+.interpretation-approval-time {
+  margin-left: var(--space-sm);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+/* Labeled home for approvals that cannot anchor beside a turn — sentinel
+   (backend-auto-surfaced), guided-raised, and seed/revert/import rows
+   (elspeth-3574f87208). The border-top + heading segment the block away from
+   the dialogue so it stops reading as a reply to the newest turn; the count
+   lives in the heading, the per-row node clause stays (elspeth-52be5924d7). */
+.interpretation-approvals-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  margin-top: var(--space-lg);
+  padding-top: var(--space-md);
+  border-top: 1px solid var(--color-border);
+}
+
+.interpretation-approvals-heading {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 /* A guided synthetic-failure turn (C-2, composer first-principles review
    2026-07-04): a scaffold-guard rejection or provider-unavailability reply
    from POST /guided/chat, discriminated by ChatTurn.assistant_message_kind.

@@ -152,21 +152,54 @@ const NO_RESOLVED_INTERPRETATIONS: readonly InterpretationEvent[] = [];
  * legitimately raise the same term against two nodes. Without the node the
  * two echoes are pixel-identical and the operator cannot tell which
  * approval bound to which review.
+ *
+ * REGISTER (elspeth-3574f87208, operator ruling 2026-09-01): this is a
+ * SYSTEM attestation, not assistant speech — the assistant never uttered
+ * it; the backend wrote it on the operator's own action. It therefore must
+ * NOT compose `message-row--assistant` + `bubble-assistant` (which assert
+ * an assistant reply, and made unanchorable confirmations at the tail read
+ * as replies to the newest message). It renders in its own approval
+ * register instead — the same third-register move as `.bubble-system` /
+ * `.trusted-system-notice`. The `resolved_at` timestamp is temporal
+ * honesty: the POSITION of an anchored echo is causal attribution (which
+ * turn raised the term), while the operator may have approved it many
+ * turns later — the visible time keeps an old-turn-anchored echo from
+ * implying the decision happened back then.
  */
+const APPROVAL_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+});
+
 function InterpretationConfirmation({
   userTerm,
   affectedNodeId,
+  resolvedAt,
 }: {
   userTerm: string;
   affectedNodeId: string | null;
+  resolvedAt: string | null;
 }) {
+  // Validate BEFORE formatting: Intl.DateTimeFormat.format() THROWS
+  // RangeError on an invalid Date, so an unparseable resolved_at must drop
+  // the timestamp rather than crash the transcript.
+  const resolvedStamp = resolvedAt === null ? null : new Date(resolvedAt);
+  const resolvedLabel =
+    resolvedStamp !== null && !Number.isNaN(resolvedStamp.getTime())
+      ? APPROVAL_TIME_FORMATTER.format(resolvedStamp)
+      : null;
   return (
     <div
-      className="message-row message-row--assistant interpretation-review-confirmation"
+      className="message-row message-row--interpretation-approval interpretation-review-confirmation"
       data-testid="interpretation-review-confirmation"
       role="status"
     >
-      <div className="bubble bubble-assistant message-bubble-content">
+      <div className="interpretation-approval-note">
+        <span className="interpretation-approval-check" aria-hidden="true">
+          ✓
+        </span>{" "}
         Got it — using your interpretation of{" "}
         <em className="interpretation-review-confirmation-user-term">
           {userTerm}
@@ -181,6 +214,17 @@ function InterpretationConfirmation({
           </>
         )}
         .
+        {resolvedAt !== null && resolvedLabel !== null && (
+          <>
+            {" "}
+            <time
+              className="interpretation-approval-time"
+              dateTime={resolvedAt}
+            >
+              {resolvedLabel}
+            </time>
+          </>
+        )}
       </div>
     </div>
   );
@@ -1793,7 +1837,12 @@ export function ChatPanel({
   const confirmationsByToolCallId = useMemo(() => {
     const byToolCall = new Map<
       string,
-      { id: string; userTerm: string; affectedNodeId: string | null }[]
+      {
+        id: string;
+        userTerm: string;
+        affectedNodeId: string | null;
+        resolvedAt: string | null;
+      }[]
     >();
     for (const event of approvedInterpretations) {
       const userTerm = event.user_term;
@@ -1804,6 +1853,7 @@ export function ChatPanel({
         id: event.id,
         userTerm,
         affectedNodeId: event.affected_node_id,
+        resolvedAt: event.resolved_at,
       };
       const approvals = byToolCall.get(toolCallId);
       if (approvals === undefined) byToolCall.set(toolCallId, [approval]);
@@ -1841,6 +1891,7 @@ export function ChatPanel({
       id: string;
       userTerm: string;
       affectedNodeId: string | null;
+      resolvedAt: string | null;
     }[] = [];
     for (const event of approvedInterpretations) {
       const userTerm = event.user_term;
@@ -1851,6 +1902,7 @@ export function ChatPanel({
         id: event.id,
         userTerm,
         affectedNodeId: event.affected_node_id,
+        resolvedAt: event.resolved_at,
       });
     }
     return tail;
@@ -3335,6 +3387,7 @@ export function ChatPanel({
                         key={conf.id}
                         userTerm={conf.userTerm}
                         affectedNodeId={conf.affectedNodeId}
+                        resolvedAt={conf.resolvedAt}
                       />
                     ))}
                   </Fragment>
@@ -3363,19 +3416,40 @@ export function ChatPanel({
             approval visible rather than dropping it for want of an anchor.
 
             role="status" inside the role="log" region so an arriving bubble is
-            announced (aria-live="polite" on the parent). The row composes the
-            same message-row--assistant + bubble-assistant classes as an
-            ordinary assistant turn so it flows with the conversation; the
-            chat-message* tokens this once used were defined by no stylesheet
-            and rendered as bare unstyled text (elspeth-729872658a).
+            announced (aria-live="polite" on the parent).
+
+            The residue renders inside a LABELED SECTION, not as bare rows
+            (elspeth-3574f87208, operator ruling 2026-09-01): three structural
+            classes can never anchor — (A) backend-auto-surfaced events whose
+            sentinel tool_call_id matches no provider call by construction,
+            (B) guided-raised events whose turns persist no assistant chat
+            rows, (C) revert/import/seed events bound to states no chat row
+            references — so for any session with LLM nodes this block is the
+            NORMAL destination for server-obligation approvals, not an edge
+            case. Unsectioned, the rows read as assistant replies to the
+            newest message and grow without bound (one per resolution,
+            rehydrated on every load). The header carries the count — the
+            per-row node clause stays (elspeth-52be5924d7), so no collapse.
           */}
-          {tailConfirmations.map((conf) => (
-            <InterpretationConfirmation
-              key={conf.id}
-              userTerm={conf.userTerm}
-              affectedNodeId={conf.affectedNodeId}
-            />
-          ))}
+          {tailConfirmations.length > 0 && (
+            <section
+              className="interpretation-approvals-section"
+              data-testid="interpretation-approvals-section"
+              aria-label={`Interpretation approvals (${tailConfirmations.length})`}
+            >
+              <h3 className="interpretation-approvals-heading">
+                Interpretation approvals ({tailConfirmations.length})
+              </h3>
+              {tailConfirmations.map((conf) => (
+                <InterpretationConfirmation
+                  key={conf.id}
+                  userTerm={conf.userTerm}
+                  affectedNodeId={conf.affectedNodeId}
+                  resolvedAt={conf.resolvedAt}
+                />
+              ))}
+            </section>
+          )}
           {/*
             Inline-source disambiguation widgets (Phase 5a Task 4).
 

@@ -22,6 +22,23 @@
 
 import type { CompositionState } from "./index";
 
+// ── Wire constants ──────────────────────────────────────────────────────────
+
+/**
+ * Provenance sentinel prefix for backend-auto-surfaced review events.
+ *
+ * Mirrors `BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX` in
+ * src/elspeth/web/interpretation_state.py. A `tool_call_id` carrying this
+ * prefix records that NO LLM tool call produced the event — it is a server
+ * obligation (auto-staged prompt-template/model-choice reviews, settlement
+ * and repair surfacing) — so it can never match a provider tool call in the
+ * transcript and must never be treated as one. Consumers that split server
+ * obligations from LLM-authored surfacing key off this prefix (the ratified
+ * rule from elspeth-558fa5a321) until provenance gets its own wire field
+ * (elspeth-1934652f57).
+ */
+export const BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX = "backend_auto_surface:";
+
 // ── Enums (closed lists) ────────────────────────────────────────────────────
 
 /**

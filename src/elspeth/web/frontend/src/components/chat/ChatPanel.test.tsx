@@ -49,6 +49,7 @@ import type {
 } from "@/types/guided";
 import { COMPOSE_TIMEOUT_ABORT_REASON } from "@/config/composer";
 import type { InterpretationEvent } from "@/types/interpretation";
+import { BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX } from "@/types/interpretation";
 
 vi.mock("@/hooks/useComposer", () => ({
   useComposer: vi.fn(),
@@ -2875,7 +2876,7 @@ describe("ChatPanel mode discriminator", () => {
       session_id: "session-guided",
       composition_state_id: "state-1",
       affected_node_id: "rate_node",
-      tool_call_id: "backend_auto_surface:abc",
+      tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}abc`,
       user_term: "llm_model_choice:rate_node",
       kind: "llm_model_choice",
       llm_draft: "anthropic/claude-sonnet-4.6",
@@ -3051,7 +3052,7 @@ describe("ChatPanel mode discriminator", () => {
       session_id: "session-guided",
       composition_state_id: "state-1",
       affected_node_id: "rate_node",
-      tool_call_id: "backend_auto_surface:workspace",
+      tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}workspace`,
       user_term: "llm_model_choice:rate_node",
       kind: "llm_model_choice",
       llm_draft: "anthropic/claude-sonnet-4.6",
@@ -5376,7 +5377,7 @@ assistant_message_kind: "synthetic_failure",
             session_id: "session-guided",
             composition_state_id: "22222222-2222-2222-2222-222222222222",
             affected_node_id: "summarize_page",
-            tool_call_id: "backend_auto_surface:1",
+            tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}1`,
             user_term: "llm_prompt_template:summarize_page",
             kind: "llm_prompt_template",
             llm_draft: "Summarise {{ row.page_content }}",
@@ -8373,6 +8374,271 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
     );
     expect(confirmation.textContent).toMatch(/lead_quality/);
     expect(confirmation.textContent).toMatch(/rater/);
+  });
+
+  // ── elspeth-3574f87208: the labeled approvals section ─────────────────────
+  //
+  // Three structural classes can never anchor: backend-auto-surfaced rows
+  // (the sentinel tool_call_id matches no provider call by construction),
+  // guided-raised rows (guided turns persist no assistant chat rows), and
+  // seed/revert/import rows (bound to states no chat row references). For a
+  // session with LLM nodes these are the NORMAL case, not residue — and
+  // unsectioned they rendered as assistant bubbles below the newest turn,
+  // reading as replies to it, one per resolution, rehydrated on every load.
+  // The fix is the REGISTER: a labeled section plus a non-assistant row
+  // style. Every test here fails against the pre-ruling implementation.
+
+  it("routes a resolved backend-auto-surfaced confirmation into the labeled approvals section, off the assistant register", () => {
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-sentinel",
+              session_id: sessionFixture.id,
+              // The exact previously-uncovered shape: a RESOLVED row whose
+              // non-null tool_call_id is absent from every rendered turn.
+              tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}11111111`,
+              affected_node_id: "summarize",
+              user_term: "llm_prompt_template:summarize",
+              kind: "llm_prompt_template",
+              llm_draft: "Summarise {{ row.page_content }}",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:06:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingToolCall("call-set-pipeline"),
+    });
+
+    render(<ChatPanel />);
+
+    const section = screen.getByTestId("interpretation-approvals-section");
+    const confirmation = within(section).getByTestId(
+      "interpretation-review-confirmation",
+    );
+    expect(confirmation.textContent).toMatch(/llm_prompt_template:summarize/);
+    // The register IS the fix: the row must not assert assistant speech.
+    expect(confirmation.className).not.toMatch(/message-row--assistant/);
+    expect(confirmation.querySelector(".bubble-assistant")).toBeNull();
+    // The section still follows the whole stream — honesty comes from the
+    // labeled register, not from moving the block.
+    const laterUserTurn = screen.getByText("now rate each lead");
+    expect(
+      laterUserTurn.compareDocumentPosition(section) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("labels the approvals section with the count and lists every unanchorable approval", () => {
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-s1",
+              session_id: sessionFixture.id,
+              tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}aa`,
+              affected_node_id: "summarize",
+              user_term: "llm_prompt_template:summarize",
+              kind: "llm_prompt_template",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:06:00Z",
+            }),
+            makeInterpretationEvent({
+              id: "evt-s2",
+              session_id: sessionFixture.id,
+              tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}bb`,
+              affected_node_id: "rate",
+              user_term: "llm_model_choice:rate",
+              kind: "llm_model_choice",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:07:00Z",
+            }),
+            makeInterpretationEvent({
+              id: "evt-vanished",
+              session_id: sessionFixture.id,
+              // Provider-style id absent from rendered turns: the
+              // onScreen-miss branch, not the null branch.
+              tool_call_id: "call-vanished",
+              affected_node_id: "cleaner",
+              user_term: "drop_raw_html_fields",
+              kind: "pipeline_decision",
+              choice: "amended",
+              resolved_at: "2026-05-18T10:08:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingToolCall("call-set-pipeline"),
+    });
+
+    render(<ChatPanel />);
+
+    const section = screen.getByTestId("interpretation-approvals-section");
+    expect(
+      within(section).getByRole("heading", {
+        name: "Interpretation approvals (3)",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(section).getAllByTestId("interpretation-review-confirmation"),
+    ).toHaveLength(3);
+  });
+
+  it("keeps the anchored confirmation in the approval register too, and mounts no section when nothing is unanchorable", () => {
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-anchored",
+              session_id: sessionFixture.id,
+              tool_call_id: "call-set-pipeline",
+              user_term: "inline_source_data",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:05:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingToolCall("call-set-pipeline"),
+    });
+
+    render(<ChatPanel />);
+
+    const confirmation = screen.getByTestId(
+      "interpretation-review-confirmation",
+    );
+    // One component, one register — the anchored echo is a system
+    // attestation exactly as much as the tail one.
+    expect(confirmation.className).toMatch(
+      /message-row--interpretation-approval/,
+    );
+    expect(confirmation.className).not.toMatch(/message-row--assistant/);
+    expect(confirmation.querySelector(".bubble-assistant")).toBeNull();
+    expect(
+      screen.queryByTestId("interpretation-approvals-section"),
+    ).toBeNull();
+  });
+
+  it("shows guided-raised approvals in the approvals section on a graduated session", () => {
+    // Class (B): guided turns persist zero assistant chat rows, so a
+    // guided-raised approval has no turn to anchor to. A session that
+    // exited to freeform falls through to the freeform body (the completed
+    // branch early-returns before it), where the approval must surface in
+    // the labeled section rather than as a fake assistant reply.
+    const terminal: TerminalState = {
+      kind: "exited_to_freeform",
+      reason: "user_pressed_exit",
+      pipeline_yaml: null,
+    };
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-guided",
+              session_id: sessionFixture.id,
+              tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}wire-confirm`,
+              affected_node_id: "rate_node",
+              user_term: "llm_model_choice:rate_node",
+              kind: "llm_model_choice",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:09:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: [],
+      guidedSession: {
+        step: "step_1_source",
+        history: [],
+        terminal,
+        chat_history: [],
+        chat_turn_seq: 0,
+        profile: null,
+      },
+      guidedNextTurn: null,
+      guidedTerminal: terminal,
+    });
+
+    render(<ChatPanel />);
+
+    const section = screen.getByTestId("interpretation-approvals-section");
+    expect(
+      within(section).getByTestId("interpretation-review-confirmation")
+        .textContent,
+    ).toMatch(/rate_node/);
+  });
+
+  it("stamps a confirmation with its resolved_at time and omits the stamp when unresolved metadata is absent", () => {
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-stamped",
+              session_id: sessionFixture.id,
+              tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}cc`,
+              user_term: "llm_prompt_template:summarize",
+              kind: "llm_prompt_template",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:05:00Z",
+            }),
+            makeInterpretationEvent({
+              id: "evt-unstamped",
+              session_id: sessionFixture.id,
+              tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}dd`,
+              user_term: "llm_prompt_template:rate",
+              kind: "llm_prompt_template",
+              choice: "accepted_as_drafted",
+              resolved_at: null,
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: [],
+    });
+
+    render(<ChatPanel />);
+
+    const confirmations = screen.getAllByTestId(
+      "interpretation-review-confirmation",
+    );
+    const stamped = confirmations.find((node) =>
+      /summarize/.test(node.textContent ?? ""),
+    );
+    const unstamped = confirmations.find((node) =>
+      /rate/.test(node.textContent ?? ""),
+    );
+    expect(stamped).toBeDefined();
+    expect(unstamped).toBeDefined();
+    const time = stamped!.querySelector("time");
+    expect(time).not.toBeNull();
+    expect(time!.getAttribute("datetime")).toBe("2026-05-18T10:05:00Z");
+    expect(unstamped!.querySelector("time")).toBeNull();
   });
 });
 
