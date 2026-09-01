@@ -520,6 +520,21 @@
   padding: var(--space-sm) var(--space-lg);
   border-top: 1px solid var(--color-border);
 
+  /* The composer never yields — DECLARED, not inherited from a default
+     (elspeth-ecf973fb9f, systems review of b4405257a). This rule carried no
+     flex declaration at all; the composer survived a squeeze only because
+     flex-shrink defaults to 1 while min-height:auto froze it at its
+     content-based minimum. Emergent, unstated, and untested — and the one
+     line that breaks it is this codebase's own most-repeated idiom, spelled
+     out verbatim two rules away on .chat-panel-messages-region. Adding
+     `min-height: 0` here (the natural move the first time a textarea
+     overflows) collapsed the composer from 169px to 54px — about one control
+     row — with every test still green. The symptom MUTATES rather than
+     returning, so it reads as a new bug rather than this one.
+
+     flex-shrink: 0 states the invariant the dock's whole design rests on. */
+  flex-shrink: 0;
+
   /* The authoring pane's width is independent of the viewport (resizable
      separator; 360px is the shipped default at 1280-1535px viewports), so
      the wrap rule below must key off the pane's own width — a viewport
@@ -959,8 +974,81 @@
   display: flex;
   flex-direction: column;
   height: 100%;
-  overflow: hidden;
+  /* `clip`, NOT `hidden` (elspeth-ecf973fb9f). Both paint identically; they differ in one property
+     that is invisible until it bites — an `overflow: hidden` box IS a scroll
+     container, it merely has no scrollbar, so anything that scrolls by
+     ancestor walk (scrollIntoView, focus(), find-in-page, an AT caret) can
+     move this panel's content and leave it moved. That is not hypothetical:
+     scrollIntoView on the transcript's end sentinel was measured driving this
+     box to scrollTop 130, carrying .chat-panel-header to -49 and stranding
+     the composer above a void that survived every re-render, because a scroll
+     offset is DOM state React does not own. A `clip` box is not a scroll
+     container at all, so the offset cannot exist to begin with. The panel's
+     one intended scroller is .chat-panel-messages.
+
+     The clip is also why .chat-panel-messages:focus-visible draws its ring
+     inset — see that rule. */
+  overflow: clip;
   position: relative;
+}
+
+/* Docked chrome between the transcript and the composer (elspeth-ecf973fb9f): the composer-progress
+   card, the blob drawer, the proposal banner, the inline-source prompt
+   (ChatPanel's .chat-panel-dock).
+
+   This box exists to make the panel's vertical budget a two-party negotiation.
+   .chat-panel-messages-region is `flex: 1` with a ZERO basis, which makes it
+   greedy for surplus and — because shrinkage is distributed across basis, not
+   height — completely unable to give anything back. So once the dock grew past
+   the surplus, the only claimant left to take space from was .chat-input, and
+   the composer was pushed clean through the panel's bottom edge: measured 130px
+   below it, clipped out of existence, with the transcript at 0 as well. The
+   operator lost the transcript AND the one control that could recover the
+   session.
+
+   The composer never yields; the dock does. `flex: 0 1 auto` gives this box a
+   content-sized basis — a NON-zero scaled shrink factor — so it is the one
+   that absorbs the deficit. It wins that role because its floor is 0 while
+   .chat-input's is its min-content height; document order has nothing to do
+   with it (flex shrinkage is simultaneous and proportional, then redistributed
+   as items freeze at their clamps).
+
+   `overflow-y: auto` is the load-bearing declaration, and it does two jobs:
+   it keeps every docked surface reachable while the box is squeezed, AND it
+   is what zeroes this item's automatic minimum size. `min-height: 0` states
+   the same zero explicitly and is, on its own, REDUNDANT here — measured:
+   restoring min-height:auto with the scroller in place leaves the geometry
+   identical. It is kept as the declaration of intent, since a future author
+   who drops the scroller would otherwise silently reinstate a min-content
+   floor and with it the overflow. Do not read it as the mechanism.
+
+   `overscroll-behavior: contain` stops a wheel gesture that bottoms out here
+   from chaining into the transcript above — the same treatment, for the same
+   reason, as .chat-panel > .ack-stack. */
+.chat-panel-dock {
+  --scroll-owner: authoring-dock;
+
+  display: flex;
+  flex-direction: column;
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* The dock is keyboard-focusable (tabIndex={0} in ChatPanel) because it can
+   scroll and its hidden content need not contain anything focusable: measured
+   67px below the last focusable control, reachable by wheel or drag alone —
+   a WCAG 2.1.1 failure. Same ruling, same idiom, as .chat-panel-messages and
+   .tool-call-details pre. The ring is drawn inset because .chat-panel clips
+   overflow, so an offset ring would be invisible on all four sides.
+
+   The cost is one extra tab stop between the transcript and the composer, on
+   a path operators traverse constantly. Accepted deliberately: the
+   alternative is content no keyboard user can reach at all. */
+.chat-panel-dock:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: -2px;
 }
 
 /* Composing-state cursors. While the agent is thinking, the cursor over the
@@ -1117,7 +1205,7 @@
    buttons to the same row every time — its "auto" columns can't fall below
    the combined min-content width of BOTH buttons, so next to the
    nowrap ModelChip in .chat-panel-header-actions the Cancel button was
-   clipped by .chat-panel's overflow:hidden on narrow viewports (~320-400px).
+   clipped by .chat-panel's clip on narrow viewports (~320-400px).
    flex-wrap lets a single button occupy a line on its own, so the floor is
    one button's min-content width, not the pair's. */
 .mode-switch-confirm {
@@ -1236,16 +1324,42 @@
    the messages (ComposingIndicator, banners, ChatInput) at every pane
    width. min-height: 0 keeps the flex column shrinkable — without it the
    region refuses to shrink below content height and the whole panel
-   overflows its height:100% / overflow:hidden chain. */
+   overflows its height:100% / clip chain. */
 .chat-panel-messages-region {
   position: relative;
   display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0;
+
+  /* Floor the conversation (elspeth-ecf973fb9f, UX review of b4405257a).
+     `flex: 1` carries a ZERO basis, and flex shrinkage is distributed in
+     proportion to flex-shrink x flex-basis — so this region's scaled shrink
+     factor is zero and it takes NO part in absorbing a deficit. That is an
+     ordering, not a magnitude: the transcript is driven to exactly 0 BEFORE
+     the dock below gives up its first pixel. Measured in the default desktop
+     state (1280x900, a terminal composer card with its details open at 241px
+     plus a proposal banner at 248px): region 0, 1000px of conversation
+     hidden, dock already scrolling internally — and the operator being asked
+     to Accept or Reject a pipeline mutation with NO visible conversation.
+     For an audit-first product, approving a mutation blind is the failure
+     mode, not a comfort issue.
+
+     `min` clamps it, and the clamp is load-bearing: a bare 160px floor at a
+     367px panel clipped the composer by 7px and overflowed the panel — the
+     original defect returning. 30% yields ~110px where 160px would not fit.
+     Verified across 367 / 426 / 755px, which IS the product's full panel
+     range (the workspace floors at 367px even at a 350px viewport).
+
+     Safe only BECAUSE .chat-panel-dock is a scroll container: that zeroes the
+     dock's automatic minimum size, so it can absorb the whole deficit and the
+     composer still never yields. The floor and the dock are one mechanism. */
+  min-height: min(160px, 30%);
 }
 
 .chat-panel-messages {
+  --scroll-owner: authoring;
+
   flex: 1;
   overflow-y: auto;
   padding: var(--space-lg) 0;
@@ -2529,13 +2643,15 @@
 /* In freeform mode the stack sits above the scrolling message list; pin it so
    pending decisions stay visible while the operator scrolls the conversation. */
 .chat-panel > .ack-stack {
+  --scroll-owner: authoring-ack;
+
   position: sticky;
   top: 0;
   z-index: 2;
   /* Bound the pinned stack (elspeth-0b70269ccc). Sticky with no height cap is
      safe only while the stack stays short. At 390px the decision cards reflow
      tall — five of them measured 1213px against an 844px viewport — so the
-     stack consumed the whole flex column and .chat-panel's overflow:hidden
+     stack consumed the whole flex column and .chat-panel's clip
      occluded the composer-update card and the Files section beneath it.
      Capping with internal scroll keeps the intent ("pending decisions stay
      visible while the operator scrolls the conversation") while guaranteeing

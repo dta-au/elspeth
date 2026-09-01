@@ -1,6 +1,27 @@
 import { expect, type Locator, type Page } from "@playwright/test";
 
+import { WORKSPACE_SCROLL_OWNERS } from "@/components/workspace/scrollOwners";
+
 import type { ComposerPage } from "../page-objects/composer-page";
+
+/*
+ * The scroll-owner registry is no longer declared here (elspeth-73849d9d16).
+ * The stylesheet rule that GRANTS a scroll also NAMES its owner —
+ * `--scroll-owner: <name>` in the same block as the `overflow*: auto`, with
+ * the property registered `inherits: false` in workspace.css so a descendant
+ * cannot borrow its ancestor's name. These assertions read the names off the
+ * DOM's computed style, so which box may scroll is the stylesheet's statement
+ * alone; the predecessor of this arrangement was a selector list right here,
+ * and `.ack-stack` had already quietly diverged from it. What this file still
+ * owns is the closed NAME VOCABULARY — imported from scrollOwners.ts, where
+ * each name's meaning is documented — and the semantics enforced over it: one
+ * visible vertical scroller per name, horizontal scrolling for `artifact`
+ * alone. A scrolling box with no name, or with a name outside the vocabulary,
+ * is a defect by construction.
+ */
+
+/** "" when the stylesheet named no owner for a scrolling box. */
+type ScrollOwner = string;
 
 interface ScrollCandidate {
   selector: string;
@@ -11,7 +32,7 @@ interface ScrollCandidate {
   clientWidth: number;
   scrollHeight: number;
   clientHeight: number;
-  owner: "authoring" | "artifact" | "inspector" | "unexpected";
+  owner: ScrollOwner;
   vertical: boolean;
   horizontal: boolean;
 }
@@ -164,7 +185,9 @@ export async function expectIntendedPaneScrollers(
   } = {},
 ): Promise<void> {
   const report = await page.getByTestId("composer-workspace").evaluate(
-    (workspace): { candidates: ScrollCandidate[]; outerOverflow: ScrollCandidate[] } => {
+    (
+      workspace,
+    ): { candidates: ScrollCandidate[]; outerOverflow: ScrollCandidate[] } => {
       const result: ScrollCandidate[] = [];
       const describe = (
         element: HTMLElement,
@@ -172,16 +195,12 @@ export async function expectIntendedPaneScrollers(
         horizontal: boolean,
       ): ScrollCandidate => {
         const style = getComputedStyle(element);
-        const owner = element.matches(
-          ".chat-panel-messages, .guided-authoring-scroll",
-        )
-          ? "authoring"
-          : element.matches(".artifact-workspace-panel:not([hidden])")
-            ? "artifact"
-            : element.matches(".workspace-inspector-body") &&
-                element.closest<HTMLElement>(".workspace-inspector")?.hidden === false
-              ? "inspector"
-              : "unexpected";
+        // The stylesheet's own statement of ownership, from the rule that
+        // granted the scroll. Hidden-subtree filtering already happened at
+        // enumeration, so no per-owner visibility qualifiers are needed here.
+        const owner: ScrollCandidate["owner"] = style
+          .getPropertyValue("--scroll-owner")
+          .trim();
         return {
           selector:
             element.getAttribute("aria-label") ??
@@ -250,8 +269,19 @@ export async function expectIntendedPaneScrollers(
     outerOverflow,
     `outer desktop surfaces must not scroll: ${JSON.stringify(outerOverflow)}`,
   ).toEqual([]);
-  const unexpected = candidates.filter((candidate) => candidate.owner === "unexpected");
-  expect(unexpected, `unexpected routine scrollers: ${JSON.stringify(unexpected)}`).toEqual([]);
+  const unnamed = candidates.filter((candidate) => candidate.owner === "");
+  expect(
+    unnamed,
+    `scroller whose granting CSS rule declares no --scroll-owner: ${JSON.stringify(unnamed)}`,
+  ).toEqual([]);
+  const vocabulary: readonly string[] = WORKSPACE_SCROLL_OWNERS;
+  const undeclared = candidates.filter(
+    (candidate) => candidate.owner !== "" && !vocabulary.includes(candidate.owner),
+  );
+  expect(
+    undeclared,
+    `--scroll-owner name missing from the WORKSPACE_SCROLL_OWNERS vocabulary (scrollOwners.ts): ${JSON.stringify(undeclared)}`,
+  ).toEqual([]);
 
   const unexpectedHorizontal = candidates.filter(
     (candidate) => candidate.horizontal && candidate.owner !== "artifact",
@@ -260,7 +290,7 @@ export async function expectIntendedPaneScrollers(
     unexpectedHorizontal,
     `only the active artifact body may scroll horizontally: ${JSON.stringify(unexpectedHorizontal)}`,
   ).toEqual([]);
-  for (const owner of ["authoring", "artifact", "inspector"] as const) {
+  for (const owner of WORKSPACE_SCROLL_OWNERS) {
     const verticalOwners = candidates.filter(
       (candidate) => candidate.owner === owner && candidate.vertical,
     );
@@ -283,6 +313,99 @@ export async function expectIntendedPaneScrollers(
         candidate.className.split(/\s+/).includes("workspace-inspector-body"),
       ),
     ).toBe(true);
+  }
+}
+
+/**
+ * The composer frame contract.
+ *
+ * Written from the INVARIANT, not from any defect: the chat panel's chrome is
+ * fixed to its own frame, and no box in the workspace outside the
+ * CSS-declared scroll owners ever holds a scroll offset. Both statements are true
+ * of a correct build regardless of how a future regression is spelled, which
+ * is what a criterion has to be to outlive the bug that prompted it — a gate
+ * asserting "nobody calls scrollIntoView" dies the day someone scrolls a box
+ * by a different wrong mechanism; "the composer is at the panel's bottom edge"
+ * does not.
+ *
+ * This exists because the same defect was reported three times and fixed
+ * wrongly twice (elspeth-ecf973fb9f). `overflow: hidden` leaves a box
+ * programmatically scrollable, so an ancestor-walking scroll — scrollIntoView,
+ * focus(), find-in-page, an AT caret — could give .chat-panel an offset that
+ * no re-render cleared: the header rode off the top edge and the composer was
+ * stranded above a void until reload. Nothing in the system carried that fact
+ * to a human. expectIntendedPaneScrollers could not see it either, because it
+ * only ever enumerated boxes whose overflow is auto or scroll.
+ */
+export async function expectComposerFrameContract(page: Page): Promise<void> {
+  const frame = await page.getByTestId("composer-workspace").evaluate(
+    (workspace, vocabulary: readonly string[]) => {
+      const latched: { className: string; scrollTop: number; scrollLeft: number }[] = [];
+      for (const element of workspace.querySelectorAll<HTMLElement>("*")) {
+        if (element.scrollTop === 0 && element.scrollLeft === 0) continue;
+        // A box may HOLD an offset only while it is a currently rendered
+        // named scroll owner. The rendered qualifier is what the old
+        // registry spelled `.artifact-workspace-panel:not([hidden])`, made
+        // uniform: artifact tab panels stay mounted under [hidden], and a
+        // hidden panel is not entitled to a scroll offset. getComputedStyle
+        // still reports --scroll-owner on a display:none box (probed), so
+        // the name alone must not exempt it.
+        const rendered =
+          !element.hidden && element.closest("[hidden]") === null;
+        if (
+          rendered &&
+          vocabulary.includes(
+            getComputedStyle(element).getPropertyValue("--scroll-owner").trim(),
+          )
+        ) {
+          continue;
+        }
+        latched.push({
+          className: element.className,
+          scrollTop: element.scrollTop,
+          scrollLeft: element.scrollLeft,
+        });
+      }
+      const panel = workspace.querySelector<HTMLElement>("#chat-main");
+      if (panel === null || panel.hidden) return { latched, edges: null };
+      const header = panel.querySelector<HTMLElement>(".chat-panel-header");
+      const input = panel.querySelector<HTMLElement>(".chat-input");
+      const panelBox = panel.getBoundingClientRect();
+      return {
+        latched,
+        edges: {
+          headerOffset:
+            header === null
+              ? null
+              : header.getBoundingClientRect().top - panelBox.top,
+          inputOffset:
+            input === null
+              ? null
+              : panelBox.bottom - input.getBoundingClientRect().bottom,
+        },
+      };
+    },
+    WORKSPACE_SCROLL_OWNERS,
+  );
+
+  expect(
+    frame.latched,
+    `no workspace box outside the CSS-declared scroll owners may hold a scroll offset: ${JSON.stringify(frame.latched)}`,
+  ).toEqual([]);
+
+  if (frame.edges === null) return;
+  // Sub-pixel layout rounding is real; a latch is tens of pixels.
+  if (frame.edges.headerOffset !== null) {
+    expect(
+      Math.abs(frame.edges.headerOffset),
+      "the chat panel header must sit on the panel's top edge",
+    ).toBeLessThanOrEqual(1);
+  }
+  if (frame.edges.inputOffset !== null) {
+    expect(
+      Math.abs(frame.edges.inputOffset),
+      "the composer must sit on the panel's bottom edge",
+    ).toBeLessThanOrEqual(1);
   }
 }
 

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import type { CompositionProposal } from "@/types/api";
 import { Button } from "@/components/ui";
@@ -10,6 +10,77 @@ interface PendingProposalsBannerProps {
   proposalActionPendingIds: string[];
   onAccept: (proposalId: string) => void;
   onReject: (proposalId: string) => void;
+}
+
+/**
+ * Single authority for which proposals the banner can act on: pending and
+ * not stale. Exported so ChatPanel's arrival mechanics — the live-region
+ * announce text and the dock's scroll-to-banner trigger
+ * (elspeth-2d1cf8908c) — derive from the same predicate the banner renders
+ * from, never a second definition.
+ */
+export function actionableProposals(
+  proposals: readonly CompositionProposal[],
+  staleProposalIds: readonly string[],
+): CompositionProposal[] {
+  return proposals.filter(
+    (p) => p.status === "pending" && !staleProposalIds.includes(p.id),
+  );
+}
+
+/** Announce text for the live region ("" at zero — clears without announcing). */
+export function pendingProposalsAnnounceText(count: number): string {
+  if (count === 0) return "";
+  return count === 1
+    ? "1 pending change needs your approval"
+    : `${count} pending changes need your approval`;
+}
+
+export interface PendingProposalsLiveRegionProps {
+  proposals: CompositionProposal[];
+  staleProposalIds: string[];
+}
+
+/**
+ * Persistent, ALWAYS-mounted `role="status"` live region for the pending
+ * proposals banner (elspeth-2d1cf8908c).
+ *
+ * The banner itself returns null when nothing is actionable, so a live-region
+ * role on its <section> would enter the DOM *with its content already present*
+ * on the 0→1 transition — the WAI-ARIA-documented unreliable pattern (a polite
+ * live region must pre-exist its content for the change to be announced).
+ * Same idiom as AcknowledgementLiveRegion: ChatPanel mounts this node
+ * regardless of pending count and only the text mutates, so "announce on
+ * appearance" (0→1) and "announce on count change" (N→M) are both reliable
+ * content mutations inside a stable node.
+ */
+export function PendingProposalsLiveRegion({
+  proposals,
+  staleProposalIds,
+}: PendingProposalsLiveRegionProps) {
+  const announceText = pendingProposalsAnnounceText(
+    actionableProposals(proposals, staleProposalIds).length,
+  );
+  // Mount silent, land the text one commit later. ChatPanel mounts this node
+  // per surface branch, so a guided→freeform switch (or a reload) with a
+  // proposal already pending would otherwise mount the region WITH its
+  // content — the same unreliable pattern the always-mounted companion
+  // exists to avoid. Deferring the initial text to a passive effect makes
+  // every announcement — the mounting surface included — a content mutation
+  // inside an already-inserted node.
+  const [renderedText, setRenderedText] = useState("");
+  useEffect(() => {
+    setRenderedText(announceText);
+  }, [announceText]);
+  return (
+    <div
+      role="status"
+      className="visually-hidden"
+      data-testid="pending-proposals-live-region"
+    >
+      {renderedText}
+    </div>
+  );
 }
 
 /**
@@ -36,9 +107,7 @@ export function PendingProposalsBanner({
   onReject,
 }: PendingProposalsBannerProps) {
   const [rejectConfirmId, setRejectConfirmId] = useState<string | null>(null);
-  const actionable = proposals.filter(
-    (p) => p.status === "pending" && !staleProposalIds.includes(p.id),
-  );
+  const actionable = actionableProposals(proposals, staleProposalIds);
   if (actionable.length === 0) {
     return null;
   }

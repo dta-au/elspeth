@@ -741,6 +741,208 @@ describe("ChatPanel", () => {
     expect(screen.getByText("Replace the pipeline.")).toBeInTheDocument();
     expect(screen.getByText("Stale proposal")).toBeInTheDocument();
   });
+
+  // ── Dock arrival mechanics (elspeth-2d1cf8908c) ──────────────────────────
+  //
+  // The dock is a scroll container by design (elspeth-ecf973fb9f), so a
+  // PendingProposalsBanner mounting below its fold is silent: no live-region
+  // announcement (the banner returns null when empty, so a role on the banner
+  // itself would mount WITH its content — the unreliable pattern) and nothing
+  // scrolling the dock to the new approval control. These pin both halves:
+  // the persistent announcer and the scroll-the-dock-BY-NAME arrival scroll
+  // (never scrollIntoView — its ancestor walk is the elspeth-ecf973fb9f bug).
+  function makeArrivalProposal(id: string): CompositionProposal {
+    return {
+      id,
+      session_id: "session-1",
+      tool_call_id: `call-${id}`,
+      tool_name: "set_pipeline",
+      status: "pending",
+      summary: "Replace the pipeline.",
+      rationale: "Requested by the current composer turn.",
+      affects: ["graph"],
+      arguments_redacted_json: {},
+      base_state_id: null,
+      committed_state_id: null,
+      audit_event_id: `event-${id}`,
+      created_at: "2026-05-14T00:00:00Z",
+      updated_at: "2026-05-14T00:00:00Z",
+    };
+  }
+
+  function renderIdleFreeformPanel() {
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(),
+      retryMessage: vi.fn(),
+      cancelComposition: vi.fn(),
+      isComposing: false,
+      compositionState: null,
+      error: null,
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      messages: [],
+    });
+    const { container } = render(<ChatPanel />);
+    const dock = container.querySelector<HTMLElement>(".chat-panel-dock");
+    expect(dock).not.toBeNull();
+    return dock as HTMLElement;
+  }
+
+  it("scrolls the dock by name when a new actionable proposal arrives", async () => {
+    const dock = renderIdleFreeformPanel();
+    const scrollSpy = vi.spyOn(dock, "scrollTo");
+
+    act(() => {
+      useSessionStore.setState({
+        compositionProposals: [makeArrivalProposal("proposal-1")],
+      });
+    });
+
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalledTimes(1));
+    // The banner must be the scroll target's reason — and the mechanism must
+    // be the named dock, never an ancestor-walking scrollIntoView.
+    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
+
+    // Arrival-keyed, not identity-keyed: an unrelated store change re-renders
+    // the panel (and rebuilds the derived proposal arrays) but must not
+    // re-scroll a banner the operator may have scrolled away from.
+    act(() => {
+      useSessionStore.setState({
+        messages: [
+          {
+            id: "msg-1",
+            session_id: "session-1",
+            role: "user",
+            content: "hello",
+            tool_calls: null,
+            created_at: "2026-05-14T00:00:02Z",
+          },
+        ],
+      });
+    });
+    expect(scrollSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not scroll the dock when the arriving proposal is stale", () => {
+    const dock = renderIdleFreeformPanel();
+    const scrollSpy = vi.spyOn(dock, "scrollTo");
+
+    act(() => {
+      useSessionStore.setState({
+        compositionProposals: [makeArrivalProposal("proposal-1")],
+        staleProposalIds: ["proposal-1"],
+      });
+    });
+
+    expect(scrollSpy).not.toHaveBeenCalled();
+  });
+
+  it("downgrades the arrival scroll to behavior:'auto' under prefers-reduced-motion (elspeth-5b42a9ae1e)", async () => {
+    // The imperative scrollTo API is NOT auto-downgraded by the OS
+    // preference the way CSS animations behind the media query are — every
+    // JS scroll must consult it via preferredScrollBehavior(). This pins
+    // one representative site; the helper's own spec pins the mechanism.
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+      matches: query === "(prefers-reduced-motion: reduce)",
+      media: query,
+    })) as unknown as typeof window.matchMedia;
+    try {
+      const dock = renderIdleFreeformPanel();
+      const scrollSpy = vi.spyOn(dock, "scrollTo");
+
+      act(() => {
+        useSessionStore.setState({
+          compositionProposals: [makeArrivalProposal("proposal-1")],
+        });
+      });
+
+      await waitFor(() => expect(scrollSpy).toHaveBeenCalledTimes(1));
+      expect(scrollSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ behavior: "auto" }),
+      );
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
+  });
+
+  it("reveals a pending proposal when the freeform surface returns from guided mode", () => {
+    // A proposal already pending while the GUIDED surface is up: the dock is
+    // not mounted there, so the arrival was never surfaced. Returning to
+    // freeform mounts the dock — a fresh scroll container with no operator
+    // scroll state to respect — and must reveal the waiting decision.
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(),
+      retryMessage: vi.fn(),
+      cancelComposition: vi.fn(),
+      isComposing: false,
+      compositionState: null,
+      error: null,
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      messages: [],
+      compositionProposals: [makeArrivalProposal("proposal-1")],
+      guidedSession: {
+        step: "step_1_source",
+        history: [],
+        terminal: null,
+        chat_history: [],
+        chat_turn_seq: 0,
+        profile: null,
+      },
+      guidedNextTurn: {
+        type: "single_select",
+        step_index: 0,
+        turn_token: "a".repeat(64),
+        payload: {
+          question: "Which source plugin should we use?",
+          options: [{ id: "csv", label: "CSV", hint: null }],
+          allow_custom: false,
+          source_blob_compatible_option_ids: ["csv"],
+        },
+      },
+    });
+    const { container } = render(<ChatPanel />);
+    expect(container.querySelector(".chat-panel-dock")).toBeNull();
+
+    // The dock element does not exist until the switch commit, so the scroll
+    // must be observed at the prototype and attributed by receiver.
+    const protoScrollSpy = vi.spyOn(Element.prototype, "scrollTo");
+    try {
+      act(() => {
+        useSessionStore.setState({ guidedSession: null, guidedNextTurn: null });
+      });
+
+      const dock = container.querySelector<HTMLElement>(".chat-panel-dock");
+      expect(dock).not.toBeNull();
+      expect(protoScrollSpy.mock.contexts).toContain(dock);
+      expect(
+        screen.getByTestId("pending-proposals-live-region"),
+      ).toHaveTextContent("1 pending change needs your approval");
+    } finally {
+      protoScrollSpy.mockRestore();
+    }
+  });
+
+  it("announces a proposal arrival through the persistent live region", () => {
+    renderIdleFreeformPanel();
+
+    // The region pre-exists its content — that is the property that makes the
+    // 0→1 announcement reliable.
+    const region = screen.getByTestId("pending-proposals-live-region");
+    expect(region).toHaveAttribute("role", "status");
+    expect(region).toHaveTextContent("");
+
+    act(() => {
+      useSessionStore.setState({
+        compositionProposals: [makeArrivalProposal("proposal-1")],
+      });
+    });
+
+    expect(region).toHaveTextContent("1 pending change needs your approval");
+  });
 });
 
 // ── Mode discriminator tests (Task 8.1) ─────────────────────────────────────────
@@ -7661,6 +7863,158 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
       { choice: "accepted_as_drafted" },
     );
   });
+
+  // ── elspeth-51ed4fd8d5: anchoring and survival ────────────────────────────
+  //
+  // The confirmation used to be ChatPanel-local state appended to a list and
+  // rendered after the whole turn stream. Append order WAS the position, so
+  // the bubble was permanently last: resolve a card, send another message, and
+  // "Got it" sat below that message reading as a reply to it, with several
+  // resolutions piling up as a block at the tail. It was also never hydrated,
+  // so a reload erased the operator's approvals from the transcript entirely.
+  //
+  // Both tests below fail against that implementation, and neither is
+  // satisfied by "a confirmation is somewhere on screen" — the two assertions
+  // the old tests made.
+
+  function messagesRaisingToolCall(toolCallId: string): ChatMessage[] {
+    const mk = (
+      overrides: Partial<ChatMessage> & {
+        id: string;
+        role: ChatMessage["role"];
+      },
+    ): ChatMessage =>
+      ({
+        session_id: sessionFixture.id,
+        content: "",
+        tool_calls: null,
+        created_at: "2026-05-18T10:00:00Z",
+        ...overrides,
+      }) as ChatMessage;
+    return [
+      mk({ id: "u1", role: "user", content: "make me a leads csv" }),
+      mk({
+        id: "a1",
+        role: "assistant",
+        tool_calls: [
+          {
+            id: toolCallId,
+            type: "function",
+            function: { name: "set_pipeline", arguments: "{}" },
+          },
+        ],
+      }),
+      mk({ id: "a2", role: "assistant", content: "Pipeline update ready." }),
+      mk({ id: "u2", role: "user", content: "now rate each lead" }),
+    ];
+  }
+
+  it("anchors the confirmation to the turn that raised the term, not the tail", () => {
+    // The resolved row arrives the way refreshAll delivers it on load.
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              session_id: sessionFixture.id,
+              tool_call_id: "call-set-pipeline",
+              user_term: "inline_source_data",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:05:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingToolCall("call-set-pipeline"),
+    });
+
+    render(<ChatPanel />);
+
+    const confirmation = screen.getByTestId(
+      "interpretation-review-confirmation",
+    );
+    expect(confirmation.textContent).toMatch(/inline_source_data/);
+
+    // Document order is the assertion — MessageBubble is mocked in this file,
+    // so its wrapper classes are not available to anchor on and would be a
+    // mock artefact if they were.
+    //
+    // The reported defect exactly: the confirmation must come BEFORE the user
+    // turn that was sent afterwards, or it reads as a reply to that turn.
+    const laterUserTurn = screen.getByText("now rate each lead");
+    expect(
+      confirmation.compareDocumentPosition(laterUserTurn) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // …and AFTER the turn that raised it, so it reads as that turn's closure
+    // rather than as a preamble to it.
+    const agentTurn = screen.getByText("Pipeline update ready.");
+    expect(
+      agentTurn.compareDocumentPosition(confirmation) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("rebuilds confirmations from the store, so a reload does not erase them", () => {
+    // No interaction at all — this is a fresh mount reading what refreshAll
+    // fetched, i.e. the state after a page reload. The old implementation
+    // rendered nothing here: its list was seeded [] and only ever appended to
+    // by an onResolved callback that a reload never fires.
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-1",
+              session_id: sessionFixture.id,
+              tool_call_id: "call-set-pipeline",
+              user_term: "quality",
+              choice: "accepted_as_drafted",
+            }),
+            makeInterpretationEvent({
+              id: "evt-2",
+              session_id: sessionFixture.id,
+              // No anchor available: still shown, after the stream, rather
+              // than dropped — an approval the operator gave is not discarded
+              // for want of a place to put it.
+              tool_call_id: null,
+              user_term: "rate_lead_quality",
+              choice: "amended",
+            }),
+            makeInterpretationEvent({
+              id: "evt-3",
+              session_id: sessionFixture.id,
+              // Opt-out rows carry no term and must stay silent — the opt-out
+              // flow has its own confirm dialog.
+              tool_call_id: null,
+              user_term: null,
+              choice: "opted_out",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingToolCall("call-set-pipeline"),
+    });
+
+    render(<ChatPanel />);
+
+    const confirmations = screen.getAllByTestId(
+      "interpretation-review-confirmation",
+    );
+    expect(confirmations).toHaveLength(2);
+    expect(confirmations.map((node) => node.textContent).join(" ")).toMatch(
+      /quality[\s\S]*rate_lead_quality/,
+    );
+  });
 });
 
 describe("ChatPanel chat presentation (ux-review-2026-07-02)", () => {
@@ -8215,16 +8569,151 @@ describe("ChatPanel jump-to-latest pill (elspeth-4ad68a3769)", () => {
   });
 
   it("keeps the pill's jump behaviour through the new structure", () => {
-    renderScrolledUpPanel();
+    const { scroll } = renderScrolledUpPanel();
 
     const pill = screen.getByRole("button", { name: "Scroll to bottom" });
     fireEvent.click(pill);
 
-    expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({
-      behavior: "smooth",
-    });
+    // The transcript lands at its end (the helper stubs scrollHeight 1000).
+    expect(scroll.scrollTop).toBe(1000);
     expect(
       screen.queryByRole("button", { name: "Scroll to bottom" }),
     ).toBeNull();
+  });
+
+  it("scrolls the transcript BY NAME, never by walking ancestors", () => {
+    // This assertion is the whole defect, so it is worth stating plainly:
+    // scrollIntoView scrolls every scrollable ancestor of its target, and
+    // `overflow: hidden` does not make a box unscrollable — it only hides the
+    // scrollbar. All three freeform call sites used to fire it at a sentinel
+    // inside the transcript, and whenever the docked chrome pushed
+    // .chat-panel's content past its own box the call scrolled the PANEL:
+    // measured in Chrome at scrollTop 0 -> 130, .chat-panel-header carried to
+    // -49, the composer left floating above a void that no re-render could
+    // clear because a scroll offset is not React state. Only a reload fixed it.
+    //
+    // Asserting "the transcript ended up at the bottom" would NOT catch that —
+    // the old code satisfied it too, on its way past. The observable that
+    // separates a correct scroll from the defect is the INSTRUMENT: a scroller
+    // named directly cannot move anything above it. So this pins zero
+    // scrollIntoView calls on the freeform path, and it is the assertion that
+    // fails if anyone reaches for the convenient API again.
+    const walkSpy = vi.fn();
+    Element.prototype.scrollIntoView = walkSpy;
+
+    const { scroll } = renderScrolledUpPanel();
+    fireEvent.click(screen.getByRole("button", { name: "Scroll to bottom" }));
+
+    expect(walkSpy).not.toHaveBeenCalled();
+    expect(scroll.scrollTop).toBe(1000);
+  });
+
+  it("pins the panel as a clip box and the dock as the yielding claimant", () => {
+    // jsdom computes no layout, so the two rules that make the fix structural
+    // are unobservable to a DOM test — same stylesheet-reading idiom as the
+    // positioning-contract test above, for the same reason.
+    // Comments are stripped first: both rules below CARRY a comment that
+    // quotes the declaration it replaced, so a naive match reads the prose as
+    // the code and the negative assertion below inverts.
+    const css = readFileSync(
+      join(process.cwd(), "src/components/chat/chat.css"),
+      "utf8",
+    ).replace(/\/\*[\s\S]*?\*\//g, "");
+    // EVERY body for the selector, not the first. A regex that stops at the
+    // first match would miss a later override — inside an @media block, say —
+    // which is precisely the regression these assertions exist to catch.
+    const ruleBodies = (selector: string): string[] => {
+      const bodies: string[] = [];
+      const pattern = new RegExp(`(^|[\\s,}])${selector}\\s*\\{([^{}]*)\\}`, "gm");
+      for (const match of css.matchAll(pattern)) bodies.push(match[2]);
+      return bodies;
+    };
+    const declaration = (bodies: string[], property: string): string | null => {
+      // The LAST declaration across all matching rules is the one that wins,
+      // which also lets a `hidden`-then-`clip` progressive-enhancement pair be
+      // written correctly in future without failing this test.
+      // The value class must admit functional notation — `min(160px, 30%)`
+      // is a value this stylesheet actually ships, and a narrower class
+      // silently skips it and reports an EARLIER declaration as the winner.
+      const pattern = new RegExp(`(?:^|[;{\\s])${property}:\\s*([^;{}]+?);`, "g");
+      let winner: string | null = null;
+      for (const body of bodies) {
+        for (const match of body.matchAll(pattern)) winner = match[1].trim();
+      }
+      return winner;
+    };
+
+    // `clip` is load-bearing, not a synonym for `hidden`: a clip box is not a
+    // scroll container, so no ancestor walk — scrollIntoView, focus(),
+    // find-in-page, an AT caret — can give this panel a scroll offset at all.
+    // Reverting this one word restores the defect even with the call sites
+    // fixed, because the panel becomes scrollable again.
+    const panelRules = ruleBodies("\\.chat-panel");
+    expect(panelRules.length).toBeGreaterThan(0);
+    expect(declaration(panelRules, "overflow")).toBe("clip");
+
+    // The dock absorbs the deficit so .chat-input never does. overflow-y:auto
+    // is the mechanism — it zeroes the dock's automatic minimum size AND
+    // keeps every docked surface reachable while the box is squeezed. Drop it
+    // and the composer is pushed through the panel's bottom edge again
+    // (measured 944px below it at a short panel, clipped away entirely).
+    const dock = ruleBodies("\\.chat-panel-dock");
+    expect(declaration(dock, "flex")).toBe("0 1 auto");
+    expect(declaration(dock, "overflow-y")).toBe("auto");
+    // Scroll chaining out of the dock into the transcript, same treatment as
+    // .chat-panel > .ack-stack.
+    expect(declaration(dock, "overscroll-behavior")).toBe("contain");
+
+    // The composer never yields — DECLARED. Without this, .chat-input is
+    // shrinkable (flex-shrink defaults to 1) and survives only on
+    // min-height:auto freezing it at its content minimum. Adding this
+    // codebase's own `min-height: 0` idiom to that rule collapsed it from
+    // 169px to 54px with every other test still green.
+    expect(declaration(ruleBodies("\\.chat-input"), "flex-shrink")).toBe("0");
+
+    // The transcript never reaches zero. `flex: 1` carries a zero basis, so
+    // this region contributes NOTHING to shrinking and is driven to 0 before
+    // the dock yields a pixel — leaving the operator approving a pipeline
+    // mutation with no visible conversation. The min() clamp is load-bearing:
+    // a bare 160px floor overflowed the panel at 367px.
+    const regionFloor = declaration(
+      ruleBodies("\\.chat-panel-messages-region"),
+      "min-height",
+    );
+    expect(regionFloor).toMatch(/^min\(/);
+  });
+
+  it("docks every optional surface, and never the composer, inside the dock", () => {
+    // The dock only settles the budget if the composer is OUTSIDE it: a
+    // .chat-input that shrank with the dock would be squeezed away instead of
+    // pushed away — the same operator-facing loss by a different route.
+    const { container } = renderScrolledUpPanel();
+
+    const panel = container.querySelector<HTMLElement>("#chat-main");
+    const dock = container.querySelector<HTMLElement>(".chat-panel-dock");
+    expect(dock).not.toBeNull();
+    expect(dock!.parentElement).toBe(panel);
+
+    const input = screen.getByTestId("chat-input");
+    expect(dock!.contains(input)).toBe(false);
+    // …and it renders BELOW the dock. Document order rather than
+    // lastElementChild: the ChatInput mock in this file returns a fragment, so
+    // the panel's last element child is an artefact of the mock's shape.
+    //
+    // Order is NOT why the dock is what gets squeezed — flex shrinkage is
+    // simultaneous and proportional to flex-shrink x flex-basis, then
+    // redistributed as items freeze at their clamps. The dock yields because
+    // its floor is 0 (it is a scroll container) while .chat-input's is
+    // declared flex-shrink: 0. Both facts are asserted in the stylesheet test.
+    expect(
+      dock!.compareDocumentPosition(input) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // The optional surfaces are inside it. The composer-progress card is the
+    // one that grows without bound (its details default OPEN on a terminal
+    // phase), so it is the load-bearing member of the group.
+    const indicator = panel!.querySelector(".composing-indicator");
+    if (indicator !== null) expect(dock!.contains(indicator)).toBe(true);
   });
 });

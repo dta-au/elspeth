@@ -38,6 +38,7 @@ import {
   INTERPRETATION_AMENDMENT_MAX_BYTES,
   useInterpretationResolver,
 } from "@/hooks/useInterpretationResolver";
+import { preferredScrollBehavior } from "@/utils/motion";
 
 const PROMPT_TEMPLATE_STYLE: CSSProperties = {
   maxHeight: "16rem",
@@ -61,7 +62,7 @@ export function acknowledgementCardDomId(eventId: string): string {
 export function focusAcknowledgementCard(eventId: string): void {
   const element = document.getElementById(acknowledgementCardDomId(eventId));
   if (element === null) return;
-  element.scrollIntoView({ behavior: "smooth", block: "center" });
+  element.scrollIntoView({ behavior: preferredScrollBehavior(), block: "center" });
   element.focus({ preventScroll: true });
 }
 

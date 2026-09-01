@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 import { authedContext, setShowAdvanced, tokenFromStorageState } from "./helpers/api";
 import {
   boxWidth,
+  expectComposerFrameContract,
   expectDesktopWorkspaceGeometry,
   expectDialogGeometry,
   expectIntendedPaneScrollers,
@@ -164,6 +165,12 @@ async function assertScenario(
       break;
     }
   }
+
+  // Every scenario, unconditionally. The frame contract is a property of a
+  // correct build, not of any one scenario — and the defect it guards
+  // (elspeth-ecf973fb9f) surfaced through ordinary composer chrome, so the
+  // scenario that will catch its return is not knowable in advance.
+  await expectComposerFrameContract(page);
 }
 
 /**
