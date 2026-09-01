@@ -126,6 +126,7 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX,
     SOURCE_AUTHORING_KEY,
+    VAGUE_TERM_UNWIRED_PREFIX,
     composition_review_contract_error,
     current_source_data_contract_demand,
     interpretation_sites,
@@ -1652,9 +1653,14 @@ def build_set_pipeline_candidate(
         # via explain_validation_code. A term-matched row whose draft fails
         # marker recognition carries its own code: "add the missing row" is the
         # wrong repair when the row exists and only the draft text is wrong.
+        # An unwired vague_term likewise carries its own code: the repair is
+        # wiring a prompt_template_parts interpretation_ref, not restaging
+        # (session 4c42a794, 2026-09-01).
         review_contract_code = (
             "interpretation_review_draft_malformed"
             if review_contract_error.startswith(RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX)
+            else "vague_term_unwired"
+            if review_contract_error.startswith(VAGUE_TERM_UNWIRED_PREFIX)
             else "interpretation_review_contract_unsatisfied"
         )
         return _failure_result(state, review_contract_error, error_code=review_contract_code)

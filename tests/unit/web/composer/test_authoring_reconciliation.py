@@ -1027,3 +1027,108 @@ def test_review_reconciliation_failure_names_the_underlying_cause() -> None:
     # the id, a pipeline carrying several resolved reviews still leaves the
     # planner guessing which one to re-send.
     assert "model_choice_review:enrich" in result.data["error"], result.data["error"]
+
+
+def _unwired_vague_term_state() -> CompositionState:
+    """The session-4c42a794 shape: pending vague_term, legacy-only placeholder.
+
+    The prompt spells the term as a slug because the legacy placeholder grammar
+    is what the planner actually wrote; the requirement keeps the human phrase.
+    With a matching pending requirement staged, ``vague_term_wiring_count``
+    takes the structured branch and the legacy placeholder no longer counts,
+    so the requirement has no resolvable wiring at all.
+    """
+    return _state(
+        nodes=(
+            _node(
+                node_id="score_lead",
+                options={
+                    "provider": "bedrock",
+                    "model": "bedrock/example.model",
+                    "prompt_template": (
+                        "Rate the lead using this scoring guide: {{interpretation:lead_quality}} Company: {{ row.company }}"
+                    ),
+                    "response_field": "lead_score",
+                    "required_input_fields": ["company"],
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        _requirement(
+                            requirement_id="lead quality:score_lead",
+                            kind=InterpretationKind.VAGUE_TERM,
+                            user_term="lead quality",
+                        )
+                    ],
+                },
+            ),
+        )
+    )
+
+
+def test_set_pipeline_rejects_unwired_pending_vague_term() -> None:
+    """A staged vague_term with no resolvable wiring must fail closed.
+
+    Session 4c42a794 (2026-09-01): ``set_pipeline`` committed a pending
+    vague_term requirement whose only prompt wiring was a legacy
+    ``{{interpretation:...}}`` placeholder — a mixed form
+    ``vague_term_wiring_count`` counts as 0, because the staged requirement
+    disables the legacy fallback and no ``prompt_template_parts``
+    ``interpretation_ref`` exists. The review-staging tool rejects exactly
+    this shape (sessions.py's ``request_interpretation_review`` guard), but
+    ``set_pipeline`` is a second door into the same state and ran no wiring
+    check: the committed requirement was approvable but never resolvable, the
+    execution gate counted it as pending forever, and Run stayed blocked with
+    no card offered.
+    """
+    previous = _unwired_vague_term_state()
+
+    result = _execute_set_pipeline(deep_thaw(_exact_arguments(previous).data), previous, _trained_context())
+
+    assert not result.success
+    assert result.updated_state is previous
+    assert result.data["error_code"] == "vague_term_unwired"
+    # The rejection must name the node and the term so the planner can repair.
+    assert "score_lead" in result.data["error"], result.data["error"]
+    assert "lead quality" in result.data["error"], result.data["error"]
+    # ...and the repair itself: wire a prompt_template_parts interpretation_ref.
+    assert "prompt_template_parts" in result.data["error"], result.data["error"]
+
+
+def test_set_pipeline_accepts_wired_pending_vague_term() -> None:
+    """The guard must not overfire: a parts-wired vague_term composes fine.
+
+    This is the legitimate one-shot authoring shape (wiring count exactly 1):
+    the pending requirement plus a ``prompt_template_parts``
+    ``interpretation_ref`` naming its id. Placeholder spelling is irrelevant
+    on this path — the ref matches on requirement id.
+    """
+    wired = _state(
+        nodes=(
+            _node(
+                node_id="score_lead",
+                options={
+                    "provider": "bedrock",
+                    "model": "bedrock/example.model",
+                    "prompt_template": "Rate the lead. Company: {{ row.company }}",
+                    PROMPT_TEMPLATE_PARTS_KEY: [
+                        {"kind": "text", "text": "Rate the lead using "},
+                        {"kind": "interpretation_ref", "requirement_id": "lead quality:score_lead"},
+                        {"kind": "text", "text": ". Company: {{ row.company }}"},
+                    ],
+                    "response_field": "lead_score",
+                    "required_input_fields": ["company"],
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        _requirement(
+                            requirement_id="lead quality:score_lead",
+                            kind=InterpretationKind.VAGUE_TERM,
+                            user_term="lead quality",
+                        )
+                    ],
+                },
+            ),
+        )
+    )
+
+    result = _execute_set_pipeline(deep_thaw(_exact_arguments(wired).data), wired, _trained_context())
+
+    assert result.success, result.data

@@ -850,6 +850,36 @@ class TestClosedCodeCatalogueInvariants:
         )
         assert any(re.search(pattern, message) for pattern, _e, _f in _VALIDATION_ERROR_PATTERNS)
 
+    def test_vague_term_unwired_is_closed_and_actionable(self) -> None:
+        """The unwired-vague_term rejection must be explainable on both surfaces.
+
+        Session 4c42a794 (2026-09-01): ``set_pipeline`` committed a pending
+        vague_term requirement with no resolvable prompt wiring. The guard
+        that now rejects that shape must not repeat the
+        ``review_reconciliation_failed`` mistake (see the test above): a coded
+        rejection the explainer cannot resolve leaves the planner
+        blind-repeating, so the code is pinned in the closed catalogue and the
+        message is pinned against the pattern table.
+        """
+        code = "vague_term_unwired"
+        assert code in _CLOSED_VALIDATION_ERROR_CODES
+
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        explanation, fix = guidance
+        assert explanation and fix
+        # The repair is wiring, not restaging: the fix must name the
+        # structured wiring mechanism the resolver actually consumes.
+        assert "prompt_template_parts" in (explanation + fix)
+        assert "tutorial" not in (explanation + fix).lower()
+        assert "private" not in (explanation + fix).lower()
+
+        message = (
+            "Pending vague_term review is not wired for resolution on node 'score_lead': "
+            "requirement 'lead quality:score_lead' (user term 'lead quality') has no resolvable prompt wiring."
+        )
+        assert any(re.search(pattern, message) for pattern, _e, _f in _VALIDATION_ERROR_PATTERNS)
+
     def test_codes_are_containment_free(self) -> None:
         """No closed code may be a substring of another.
 

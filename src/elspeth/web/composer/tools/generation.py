@@ -1036,6 +1036,20 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "interpretation_requirements entry you send carries only {kind, user_term, draft}.",
     ),
     (
+        r"vague_term_unwired|Pending vague_term review is not wired for resolution",
+        "The pipeline stages a pending vague_term interpretation requirement that nothing can resolve: no "
+        "prompt_template_parts interpretation_ref references the requirement's id. A legacy "
+        "{{interpretation:...}} placeholder does NOT count once a requirement row is staged — the staged row "
+        "disables the legacy fallback, so the mixed form is unresolvable by construction. Committed, it would "
+        "produce a review the operator can approve but never resolve, and the execution gate would block Run "
+        "on it forever with no card offered.",
+        "Wire the requirement into the node's prompt: author prompt_template_parts as an ordered list of parts "
+        'where exactly one entry is {"kind": "interpretation_ref", "requirement_id": "<the requirement id named '
+        'in the rejection>"} and the surrounding text lives in {"kind": "text", "text": ...} parts. '
+        "Alternatively drop the interpretation_requirements row and keep exactly one legacy "
+        "{{interpretation:<user_term>}} placeholder. Do not restage the review; the repair is wiring.",
+    ),
+    (
         r"interpretation_review_draft_malformed|cleanup review draft is malformed",
         "The cleanup node's interpretation_requirements row IS present and its user_term matches the registered decision kind, but the draft text fails marker recognition — the contract recognizes the draft only when it contains both 'raw html' and 'fingerprint'. Do NOT add another row; the fix is the draft text alone.",
         "On the existing cleanup row, replace ONLY the draft string with the canonical draft, copied verbatim without rephrasing: "
@@ -1365,6 +1379,12 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # 'validation_error' placeholder while the actionable message was redacted.
     "interpretation_review_contract_unsatisfied",
     "interpretation_review_draft_malformed",
+    # ── Unwired vague_term guard (session 4c42a794, 2026-09-01) ────────────
+    # set_pipeline committed a pending vague_term with no resolvable prompt
+    # wiring; the review was approvable but never resolvable and the execution
+    # gate blocked Run forever. The staging tool's guard now also runs at the
+    # node-authoring doors, and its rejection carries this code.
+    "vague_term_unwired",
     # ── Authoritative review reconciliation (session f33fa7c3, 2026-09-01) ─
     # Ten invariants inside reconcile_authoritative_reviews shared one opaque
     # message and no code, so explain_validation_error fell through to its
