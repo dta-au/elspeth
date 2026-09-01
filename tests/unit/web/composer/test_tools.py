@@ -8123,6 +8123,138 @@ class TestPatchSourceOptions:
         assert opts["path"] == "/canon/abc123_x.csv"
         assert opts["blob_ref"] == "abc123"
 
+    def _acknowledged_blob_backed_state(self) -> CompositionState:
+        """Post-acknowledge shape: uploaded source carrying the user's stamp.
+
+        Built from dataclass primitives because the authoring tools
+        (correctly) refuse to write this stamp — only the
+        source_data_contract resolve arm produces it.
+        """
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="t1",
+                options={
+                    "blob_ref": "abc123",
+                    "path": "/canon/abc123_x.csv",
+                    "schema": {"mode": "observed", "guaranteed_fields": ["colour"]},
+                },
+                on_validation_failure="quarantine",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def test_patch_source_options_rejects_planner_guarantee_stamp_on_uploaded_source(self) -> None:
+        """The evidence-class ruling (2026-08-27): an uploaded source's header
+        is a sample; its observed-mode ``guaranteed_fields`` stamp is the
+        user's own recorded promise, written server-side when the
+        source_data_contract review is acknowledged. A planner patch writing
+        it directly silently extinguishes the ask-the-user demand
+        (elspeth-1dddcfee3a) — and landing after
+        ``request_interpretation_review`` it kills the review site under a
+        persisted pending card (elspeth-d73139155a)."""
+        state = self._blob_backed_state()
+        catalog = _mock_catalog()
+        result = execute_tool(
+            "patch_source_options",
+            {"patch": {"schema": {"mode": "observed", "guaranteed_fields": ["colour", "extra"]}}},
+            state,
+            catalog,
+        )
+        assert result.success is False
+        assert "guaranteed_fields" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert _default_source(result.updated_state) is not None
+        opts = deep_thaw(_default_source(result.updated_state).options)
+        assert "guaranteed_fields" not in opts["schema"]
+
+    def test_patch_source_options_rejects_planner_guarantee_stamp_on_plain_source(self) -> None:
+        """A plain path-bound source is rebindable content — same sample
+        evidence class as an upload, same rejection."""
+        state = self._state_with_source({"path": "/a.csv"})
+        catalog = _mock_catalog()
+        result = execute_tool(
+            "patch_source_options",
+            {"patch": {"schema": {"guaranteed_fields": ["colour"]}}},
+            state,
+            catalog,
+        )
+        assert result.success is False
+        assert "guaranteed_fields" in result.data["error"]
+
+    def test_patch_source_options_allows_echoed_guarantee_stamp(self) -> None:
+        """A patch echoing the stored stamp verbatim asserts nothing new
+        (read-modify-write over serialized state) and must pass."""
+        state = self._acknowledged_blob_backed_state()
+        catalog = _mock_catalog()
+        result = execute_tool(
+            "patch_source_options",
+            {"patch": {"schema": {"mode": "observed", "guaranteed_fields": ["colour"]}, "encoding": "utf-8"}},
+            state,
+            catalog,
+        )
+        assert result.success is True
+        opts = deep_thaw(_default_source(result.updated_state).options)
+        assert opts["schema"]["guaranteed_fields"] == ["colour"]
+        assert opts["encoding"] == "utf-8"
+
+    def test_patch_source_options_rejects_changed_guarantee_stamp_over_stored(self) -> None:
+        """Widening the user's acknowledged stamp is authoring, not an echo."""
+        state = self._acknowledged_blob_backed_state()
+        catalog = _mock_catalog()
+        result = execute_tool(
+            "patch_source_options",
+            {"patch": {"schema": {"guaranteed_fields": ["colour", "extra"]}}},
+            state,
+            catalog,
+        )
+        assert result.success is False
+        assert "guaranteed_fields" in result.data["error"]
+        opts = deep_thaw(_default_source(result.updated_state).options)
+        assert opts["schema"]["guaranteed_fields"] == ["colour"]
+
+    def test_patch_source_options_allows_guarantee_stamp_on_llm_authored_source(self) -> None:
+        """An LLM-authored blob's bytes are content-hash-bound: the author's
+        schema claim stands (the same lane ``_options_with_derived_guarantees``
+        serves), so the guard must not over-reach."""
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="t1",
+                options={
+                    "blob_ref": "abc123",
+                    "path": "/canon/abc123_x.csv",
+                    "schema": {"mode": "observed"},
+                    "source_authoring": {
+                        "modality": "llm_generated",
+                        "content_hash": "0" * 64,
+                        "review_event_id": None,
+                        "resolved_kind": None,
+                    },
+                },
+                on_validation_failure="quarantine",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        catalog = _mock_catalog()
+        result = execute_tool(
+            "patch_source_options",
+            {"patch": {"schema": {"mode": "observed", "guaranteed_fields": ["colour"]}}},
+            state,
+            catalog,
+        )
+        assert result.success is True
+        opts = deep_thaw(_default_source(result.updated_state).options)
+        assert opts["schema"]["guaranteed_fields"] == ["colour"]
+
 
 # ---------------------------------------------------------------------------
 # patch_node_options tool tests
@@ -11332,7 +11464,7 @@ class TestSetPipeline:
                 "on_success": "source_out",
                 "options": {
                     "column": "text",
-                    "schema": {"mode": "observed", "guaranteed_fields": ["text"]},
+                    "schema": {"mode": "flexible", "fields": ["text: str"], "guaranteed_fields": ["text"]},
                 },
                 "inline_blob": {
                     "filename": "input.txt",

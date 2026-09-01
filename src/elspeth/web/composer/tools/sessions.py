@@ -19,6 +19,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationKind,
     InterpretationSource,
 )
+from elspeth.contracts.enums import is_llm_authored_creation_modality
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
@@ -127,6 +128,7 @@ from elspeth.web.composer.tools.sources import (
     _header_only_inline_csv_conflict,
     _options_with_derived_guarantees,
     _options_with_source_blob_review,
+    _planner_guarantee_stamp_error,
     _reject_manual_source_authoring,
     _reject_manual_source_blob_ref,
     _reject_manual_source_blobs,
@@ -902,6 +904,17 @@ def build_set_pipeline_candidate(
         single_source_on_vf = src_on_vf
         if source_blob_id is not None and inline_blob is not None:
             return _failure_result(state, "set_pipeline source must use either an existing blob_id or inline_blob, not both.")
+        if source_blob_id is None and inline_blob is None:
+            # Plain-path source: the blob branches below run this same guard
+            # with the bound blob's real creation modality.
+            guarantee_stamp_error = _planner_guarantee_stamp_error(
+                legacy_src_options,
+                stored_options=stored_legacy_options,
+                llm_authored=stored_legacy_options is not None and SOURCE_AUTHORING_KEY in stored_legacy_options,
+                tool_name="set_pipeline",
+            )
+            if guarantee_stamp_error is not None:
+                return _failure_result(state, guarantee_stamp_error)
         if source_blob_id is not None:
             resolved = _resolve_source_blob(
                 blob_id=source_blob_id,
@@ -961,6 +974,17 @@ def build_set_pipeline_candidate(
             )
             if header_conflict is not None:
                 return _failure_result(state, header_conflict)
+            # A user-verbatim inline blob (paste-through) is sample evidence
+            # like an upload; only an LLM-authored one is hash-bound to its
+            # author's schema claim.
+            guarantee_stamp_error = _planner_guarantee_stamp_error(
+                legacy_src_options,
+                stored_options=stored_legacy_options,
+                llm_authored=is_llm_authored_creation_modality(prepared_inline_blob.creation_modality),
+                tool_name="set_pipeline",
+            )
+            if guarantee_stamp_error is not None:
+                return _failure_result(state, guarantee_stamp_error)
 
             # ``prepared_inline_blob.mime_type`` was validated by
             # ``_prepare_blob_create`` against ``_ALLOWED_BLOB_MIME_TYPES``,
@@ -1176,6 +1200,19 @@ def build_set_pipeline_candidate(
             manual_authoring_error = None if reviewed_source else _reject_manual_source_authoring(src_options, tool_name="set_pipeline")
             if manual_authoring_error is not None:
                 _record_component_rejection(_failure_result(state, f"Source '{source_name}': {manual_authoring_error}"))
+                continue
+            guarantee_stamp_error = (
+                None
+                if reviewed_source
+                else _planner_guarantee_stamp_error(
+                    src_options,
+                    stored_options=stored_source_options,
+                    llm_authored=stored_source_options is not None and SOURCE_AUTHORING_KEY in stored_source_options,
+                    tool_name="set_pipeline",
+                )
+            )
+            if guarantee_stamp_error is not None:
+                _record_component_rejection(_failure_result(state, f"Source '{source_name}': {guarantee_stamp_error}"))
                 continue
             manual_blobs_error = None if reviewed_source else _reject_manual_source_blobs(src_options, tool_name="set_pipeline")
             if manual_blobs_error is not None:

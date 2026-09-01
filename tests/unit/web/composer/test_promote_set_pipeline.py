@@ -358,7 +358,7 @@ class TestPromoteSetPipelineArgErrorRouting:
                 "on_success": "rows",
                 "options": {
                     "column": "text",
-                    "schema": {"mode": "observed", "guaranteed_fields": ["text"]},
+                    "schema": {"mode": "flexible", "fields": ["text: str"], "guaranteed_fields": ["text"]},
                 },
                 "inline_blob": {
                     "filename": "input.txt",
@@ -413,7 +413,7 @@ class TestPromoteSetPipelineArgErrorRouting:
                 "on_success": "rows",
                 "options": {
                     "column": "text",
-                    "schema": {"mode": "observed", "guaranteed_fields": ["text"]},
+                    "schema": {"mode": "flexible", "fields": ["text: str"], "guaranteed_fields": ["text"]},
                 },
                 "inline_blob": {
                     "filename": "input.txt",
@@ -458,7 +458,7 @@ class TestPromoteSetPipelineArgErrorRouting:
                 "on_success": "rows",
                 "options": {
                     "column": "text",
-                    "schema": {"mode": "observed", "guaranteed_fields": ["text"]},
+                    "schema": {"mode": "flexible", "fields": ["text: str"], "guaranteed_fields": ["text"]},
                 },
                 "inline_blob": {
                     "filename": "input.txt",

@@ -594,6 +594,150 @@ def _drop_echoed_source_authoring(
     return {key: value for key, value in options.items() if key != SOURCE_AUTHORING_KEY}, True
 
 
+_GUARANTEE_SCHEMA_OPTION_KEYS: Final[tuple[str, str]] = ("schema", "schema_config")
+
+
+def _supplied_guarantee_fields(options: Mapping[str, Any], schema_key: str) -> tuple[bool, Any]:
+    """Return (present, value) for ``options[schema_key]["guaranteed_fields"]``."""
+    raw_schema = _schema_block(options, schema_key)
+    if raw_schema is None or "guaranteed_fields" not in raw_schema:
+        return False, None
+    return True, raw_schema["guaranteed_fields"]
+
+
+def _effective_schema_entry(
+    key: str,
+    supplied_schema: Mapping[str, Any],
+    stored_schema: Mapping[str, Any] | None,
+) -> Any:
+    """Merge-patch view of one schema entry: supplied wins, ``None`` deletes."""
+    if key in supplied_schema:
+        return supplied_schema[key]
+    if stored_schema is not None and key in stored_schema:
+        return stored_schema[key]
+    return None
+
+
+@observation_boundary(
+    tier=3,
+    source="a source options mapping (planner-supplied, or persisted composer state re-read verbatim) whose schema block shape is unproven",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="returns the mapping-shaped schema block or None for every absent or malformed shape; never raises",
+)
+def _schema_block(options: Mapping[str, Any] | None, schema_key: str) -> Mapping[str, Any] | None:
+    """Return ``options[schema_key]`` when it is a mapping, else ``None``."""
+    if options is None or schema_key not in options:
+        return None
+    raw_schema = options[schema_key]
+    return raw_schema if isinstance(raw_schema, Mapping) else None
+
+
+@observation_boundary(
+    tier=3,
+    source="LLM-supplied source options/patch mapping (Tier-3) merged over stored composer state",
+    source_param="supplied_options",
+    suppresses=("R5",),
+    invariant="pure shape classification: returns False for every malformed or explicit-contract shape; never raises",
+)
+def _guarantee_stamp_is_card_owned(
+    supplied_options: Mapping[str, Any],
+    *,
+    stored_options: Mapping[str, Any] | None,
+    schema_key: str,
+) -> bool:
+    """Whether the ask-the-user data-contract flow owns this guarantee stamp.
+
+    The dual of the card-eligibility shape rules
+    (:func:`_schema_options_with_guarantees` / ``backtraced_source_demand``):
+    only an OBSERVED-mode schema with no declared ``fields`` — on options
+    without ``columns``/``field_mapping`` — can carry the user-promise stamp
+    a data-contract card writes, so only that shape is planner-forbidden.
+    An explicit schema contract (``fields`` declared, or a non-observed
+    mode) is a different evidence class: the runtime enforces it per row,
+    the demand backtrace never asks a card for it, and Stage-1 validation
+    owns its honesty — the sanctioned authoring lane the guided emitters
+    prefill and the exemplars teach. Judged on the MERGE-PATCH RESULT
+    (supplied wins, explicit ``None`` deletes), so a patch cannot dodge the
+    guard by omitting context the stored options already carry.
+    """
+    for structural_key in ("columns", "field_mapping"):
+        if structural_key in supplied_options:
+            if supplied_options[structural_key] is not None:
+                return False
+        elif stored_options is not None and structural_key in stored_options:
+            return False
+    supplied_schema = _schema_block(supplied_options, schema_key)
+    if supplied_schema is None:
+        return False
+    stored_schema = _schema_block(stored_options, schema_key)
+    if _effective_schema_entry("fields", supplied_schema, stored_schema) is not None:
+        return False
+    effective_mode = _effective_schema_entry("mode", supplied_schema, stored_schema)
+    return effective_mode is None or effective_mode == "observed"
+
+
+def _planner_guarantee_stamp_error(
+    supplied_options: Mapping[str, Any],
+    *,
+    stored_options: Mapping[str, Any] | None,
+    llm_authored: bool,
+    tool_name: str,
+) -> str | None:
+    """Reject a planner-authored OBSERVED-mode guarantee stamp on non-hash-bound content.
+
+    Evidence class decides who may declare ``schema.guaranteed_fields``
+    (John's ruling, 2026-08-27 — :func:`_options_with_derived_guarantees`,
+    and the three-lane model ``guided/emitters.py`` encodes):
+
+    * LLM-authored content — exact bytes are content-hash-bound; the
+      author's schema claim stands (``llm_authored=True`` exempts).
+    * An explicit schema contract (``fields`` declared / non-observed
+      mode) — runtime-enforced per row, card-ineligible; validation owns
+      it, the guard abstains (:func:`_guarantee_stamp_is_card_owned`).
+    * An OBSERVED-mode stamp on uploaded or path-bound content — the
+      header is a SAMPLE and the stamp is the USER'S recorded promise,
+      written server-side when the source_data_contract review is
+      acknowledged — never by the planner. A planner-authored stamp here
+      silently extinguishes the ask-the-user demand (elspeth-1dddcfee3a):
+      landing after ``request_interpretation_review`` it kills the review
+      site under a persisted pending card (elspeth-d73139155a); landing
+      before it, no card is ever minted and the user acknowledges nothing.
+
+    Echo tolerance (the elspeth-c67fbbbd83 posture): a supplied value that
+    ``stable_hash``-matches the STORED stamp under the same schema key
+    asserts nothing new — a planner doing read-modify-write over serialized
+    state echoes the acknowledged stamp verbatim — and passes. Any other
+    supplied value (a deletion via explicit ``None`` included) rejects.
+    """
+    if llm_authored:
+        return None
+    for schema_key in _GUARANTEE_SCHEMA_OPTION_KEYS:
+        present, supplied_value = _supplied_guarantee_fields(supplied_options, schema_key)
+        if not present:
+            continue
+        if not _guarantee_stamp_is_card_owned(
+            supplied_options,
+            stored_options=stored_options,
+            schema_key=schema_key,
+        ):
+            continue
+        if stored_options is not None:
+            stored_present, stored_value = _supplied_guarantee_fields(stored_options, schema_key)
+            if stored_present and stable_hash(deep_thaw(supplied_value)) == stable_hash(deep_thaw(stored_value)):
+                continue
+        return (
+            f"{tool_name} must not author '{schema_key}.guaranteed_fields' on this source: its content is "
+            "not LLM-authored (uploaded or path-bound), so its header is a sample and the observed-mode "
+            "guarantee stamp is the user's own recorded promise. Either request the data-contract review "
+            "with request_interpretation_review (kind=source_data_contract) and let the user acknowledge "
+            "it (the stamp is written server-side on acknowledgement), or declare an explicit runtime "
+            "contract instead (schema mode 'flexible'/'fixed' with 'fields'), which validation enforces "
+            "per row."
+        )
+    return None
+
+
 def _reject_manual_source_blobs(
     options: Mapping[str, Any],
     *,
@@ -722,6 +866,14 @@ def _resolve_source_blob(
         plugin, mime_extra = _MIME_TO_SOURCE[blob["mime_type"]]
 
     creation_modality = CreationModality(blob["creation_modality"])
+    guarantee_stamp_error = _planner_guarantee_stamp_error(
+        caller_options,
+        stored_options=existing_options,
+        llm_authored=is_llm_authored_creation_modality(creation_modality),
+        tool_name=tool_name,
+    )
+    if guarantee_stamp_error is not None:
+        return _failure_result(state, guarantee_stamp_error)
     merged_options: Mapping[str, Any] = {
         **caller_options,
         **mime_extra,
@@ -937,6 +1089,14 @@ def _execute_set_source(
     manual_blobs_error = _reject_manual_source_blobs(options, tool_name="set_source")
     if manual_blobs_error is not None:
         return _failure_result(state, manual_blobs_error)
+    guarantee_stamp_error = _planner_guarantee_stamp_error(
+        options,
+        stored_options=stored_source_options,
+        llm_authored=stored_source_options is not None and SOURCE_AUTHORING_KEY in stored_source_options,
+        tool_name="set_source",
+    )
+    if guarantee_stamp_error is not None:
+        return _failure_result(state, guarantee_stamp_error)
     credential_error = _credential_wiring_contract_failure(
         state,
         component_id=_source_component_id(source_name),
@@ -1286,6 +1446,18 @@ def _execute_set_source_from_blobs(
         source=True,
         existing_options=stored_source_options,
     )
+    # The plural path serves the authenticated upload/paste flow only
+    # (LLM-authored blobs are rejected below), so a caller-declared
+    # guarantee stamp is never the author's own hash-bound claim; the
+    # server derives the plugin-contract blob_rows guarantee itself.
+    guarantee_stamp_error = _planner_guarantee_stamp_error(
+        caller_options,
+        stored_options=stored_source_options,
+        llm_authored=False,
+        tool_name="set_source_from_blobs",
+    )
+    if guarantee_stamp_error is not None:
+        return _failure_result(state, guarantee_stamp_error)
     on_vf = canonicalize_source_validation_failure(validated.on_validation_failure)
     resolved = _resolve_source_blobs(
         blob_ids=validated.blob_ids,
@@ -1712,6 +1884,17 @@ def _execute_patch_source_options(
     manual_blobs_error = _reject_manual_source_blobs(patch, tool_name="patch_source_options")
     if manual_blobs_error is not None:
         return _failure_result(state, manual_blobs_error)
+    # Checked on the PATCH delta like the forged-requirement gate below: an
+    # echoed stamp asserts nothing new; a new or changed one is the silent
+    # stamp the evidence-class ruling forbids (elspeth-1dddcfee3a).
+    guarantee_stamp_error = _planner_guarantee_stamp_error(
+        patch,
+        stored_options=current_source.options,
+        llm_authored=SOURCE_AUTHORING_KEY in current_source.options,
+        tool_name="patch_source_options",
+    )
+    if guarantee_stamp_error is not None:
+        return _failure_result(state, guarantee_stamp_error)
     # Check the LLM-supplied PATCH delta (not the merged result): a patch that
     # carries a forged "resolved" INVENTED_SOURCE requirement is the live review
     # bypass vector. Checking the delta — mirroring patch_node_options — leaves a

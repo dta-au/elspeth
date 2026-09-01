@@ -568,7 +568,15 @@ def test_resolved_source_contract_survives_unrelated_source_patch() -> None:
     assert carried["accepted_artifact_hash"] == source_data_contract_artifact_hash(["colour"])
 
 
-def test_planner_guarantee_addition_preserves_acknowledged_subset_authority() -> None:
+def test_planner_widening_of_acknowledged_guarantee_is_rejected() -> None:
+    """John's ruling 2026-09-01 (elspeth-1dddcfee3a; supersedes the widening
+    tolerance pinned earlier the same day in 915001735): even a SUPERSET over
+    an acknowledged review is a planner-authored observed-mode stamp — one
+    acknowledgement must not license later widening with no re-ask. The
+    sanctioned paths are growing ``required_input_fields`` and re-requesting
+    the review (the user acknowledges the v2 field set), or declaring an
+    explicit runtime ``fields`` contract. An exact echo of the acknowledged
+    stamp still passes (see the exact-round-trip test below)."""
     previous = _resolved_source_contract_state(required_fields=["colour"])
     exact = _exact_arguments(previous)
     proposal = deep_thaw(exact.data)
@@ -577,13 +585,9 @@ def test_planner_guarantee_addition_preserves_acknowledged_subset_authority() ->
 
     result = _execute_set_pipeline(proposal, previous, _trained_context())
 
-    assert result.success, result.data
-    source = result.updated_state.sources["source"]
-    carried = source.options[INTERPRETATION_REQUIREMENTS_KEY][0]
-    assert carried["status"] == "resolved"
-    assert carried["accepted_artifact_hash"] == source_data_contract_artifact_hash(["colour"])
-    assert source.options["schema"]["guaranteed_fields"] == ("colour", "size")
-    assert isinstance(materialize_state_for_execution(result.updated_state), CompositionState)
+    assert result.success is False
+    assert "guaranteed_fields" in result.data["error"]
+    assert "request_interpretation_review" in result.data["error"]
 
 
 def test_deleting_resolved_source_contract_guarantee_reopens_review() -> None:
