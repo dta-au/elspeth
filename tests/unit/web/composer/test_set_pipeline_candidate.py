@@ -1657,6 +1657,14 @@ def _aggregation_args(tmp_path: Path) -> dict[str, Any]:
 
 def _structured_llm_args(tmp_path: Path) -> dict[str, Any]:
     args = _linear_args(tmp_path)
+    # The llm node's prompt_template reads ``row.text``, so its
+    # required_input_fields names ``text`` and the source must guarantee it.
+    # Same shape as ``_secret_bearing_structured_fork_coalesce_args``.
+    args["source"]["options"]["schema"] = {
+        "mode": "flexible",
+        "fields": ["text: str"],
+        "guaranteed_fields": ["text"],
+    }
     args["nodes"] = [
         {
             "id": "classify",
@@ -1671,6 +1679,7 @@ def _structured_llm_args(tmp_path: Path) -> dict[str, Any]:
                 "endpoint": "https://candidate-test.openai.azure.com",
                 "api_key": {"secret_ref": "AZURE_OPENAI_API_KEY"},
                 "prompt_template": "Classify {{ row.text }}",
+                "required_input_fields": ["text"],
                 # Multi-query execution must use the pooled path so capacity
                 # retries are bounded by the configured pool controller.
                 "pool_size": 2,
@@ -1794,7 +1803,7 @@ _EXPECTED_STATE_HASHES = {
     "fork_coalesce": "21fef020c5ef5d8c9d9b5319446795a57c257ef366d6ddb1c63cfee24d5a4315",
     "gate": "c0380bca12a88112057ce36547ab39547eb691c03a8751e27f2371593b5abb9e",
     "aggregation": "427cde0492596be8a65cf854e3183de0c868f31fb7a24884d4bd86963fbb22cd",
-    "structured_llm": "80d31be6e69ef6937144e9ba5305aa90eaa1f1f8046040c3bb5e17567322f964",
+    "structured_llm": "c324e56c54db6abba0c1eac06fd720ef3cbbd84502b389c0285b32371ecbf31f",
     "multi_output": "a8e0698429a06efa22423ebc37033b585f1b6cdc225eb2501b4d69ee6b67ad8a",
 }
 
