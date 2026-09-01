@@ -45,12 +45,12 @@ def test_blob_inline_resolutions_table_exists_with_expected_columns(engine) -> N
     }
 
 
-def test_blob_inline_resolutions_schema_epoch_is_48(engine) -> None:
-    # 48: interpretation_events.choice gains 'superseded' (elspeth-dbc39dd367 /
-    # elspeth-d73139155a state-commit supersession sweep).
-    assert SESSION_SCHEMA_EPOCH == 48
+def test_blob_inline_resolutions_schema_epoch_is_49(engine) -> None:
+    # 49: composition_rejection_events table added (elspeth-3e28029d2f
+    # durable rejection reasons; operator ruling 2026-09-02).
+    assert SESSION_SCHEMA_EPOCH == 49
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 48
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 49
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:

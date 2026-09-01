@@ -11712,6 +11712,11 @@ class TestExplainValidationError:
         repair feedback, not a message or code — and got a generic non-answer
         mid-repair. The fallback now teaches usage: name the closed codes and
         say to pass the exact ``error_code`` string.
+
+        The catalogue rides ONLY inside ``suggested_fix``: a ``known_codes``
+        array (117 entries) exceeded the 64-wide persisted-projection cap and
+        collapsed the whole audit row to a ``response_projection_limit`` stub
+        (elspeth-3e28029d2f), so the array is gone — pinned absent here.
         """
         state = _empty_state()
         catalog = _mock_catalog()
@@ -11727,7 +11732,8 @@ class TestExplainValidationError:
             assert "error_code" in result.data["suggested_fix"]
             # The catalogue itself rides along so the model can route next turn.
             assert "unknown_node_type" in result.data["suggested_fix"]
-            assert "coalesce_missing_branches" in result.data["known_codes"]
+            assert "coalesce_missing_branches" in result.data["suggested_fix"]
+            assert "known_codes" not in result.data
 
     def test_fuzzy_routes_closed_code_embedded_in_noise(self) -> None:
         """A closed code buried in noise (any case) resolves to its guidance."""

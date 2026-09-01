@@ -55,7 +55,7 @@ security and recovery fixes. The notes below intentionally cover only major
 changes and critical correctness or security fixes.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
-to 48. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
+to 49. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
 completed guided-plan decline contract, epoch 38 adds the decline result
 message locator that pins the exact assistant message a decline replays, and
 epoch 39 adds the `policy_blocked` guided-operation failure code so a
@@ -85,7 +85,10 @@ trust-mode recheck leaves a durable audit record instead of silently falling
 back to the review path. Epoch 48 adds the `superseded` interpretation-event
 choice so a composition-state commit that extinguishes a reviewed site
 terminally retires the persisted pending review in the same transaction
-instead of leaving a zombie card that gates Run forever.
+instead of leaving a zombie card that gates Run forever. Epoch 49 adds the
+`composition_rejection_events` table so a composer mutation-tool rejection's
+reason — the exact payload the planner saw — persists durably as session
+data instead of reaching the operator nowhere (elspeth-3e28029d2f).
 Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 36. Epoch 30 adds durable
 row-union barrier attribution, epoch 31 closes scheduler status over the public
 six-state vocabulary, epoch 32 atomically records aggregation results and their

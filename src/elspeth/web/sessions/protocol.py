@@ -3507,6 +3507,7 @@ class SessionServiceProtocol(Protocol):
         raw_content: str | None = None,
         redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
         redacted_tool_rows: tuple[Any, ...],
+        rejection_records: tuple[Any, ...] = (),
         parent_composition_state_id: str | None,
         expected_current_state_id: str | None,
         writer_principal: ChatMessageWriterPrincipal,

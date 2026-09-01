@@ -1683,7 +1683,11 @@ def _execute_explain_validation_error(
                 },
             )
     # No match at all — teach usage instead of an unhelpful generic. The codes
-    # are a public static catalogue, so listing them leaks nothing.
+    # are a public static catalogue, so listing them leaks nothing — but ONLY
+    # inside ``suggested_fix``: a ``known_codes`` array here (117 entries)
+    # exceeds RESPONSE_PROJECTION_MAX_CONTAINER_WIDTH (64) and collapses the
+    # whole persisted audit row to a ``response_projection_limit`` stub
+    # (elspeth-3e28029d2f). The planner reads the same codes from the string.
     return ToolResult(
         success=True,
         updated_state=state,
@@ -1697,7 +1701,6 @@ def _execute_explain_validation_error(
                 "feedback's validation.errors[].error_code. Closed codes: " + ", ".join(_CLOSED_VALIDATION_ERROR_CODES) + ".",
                 error_text,
             ),
-            "known_codes": list(_CLOSED_VALIDATION_ERROR_CODES),
         },
     )
 

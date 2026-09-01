@@ -246,7 +246,13 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        SQLite cannot ALTER a CHECK constraint in place, so pre-release
 #        policy remains delete-and-recreate for stale session databases
 #        (sessions.db only — auth.db is never touched).
-SESSION_SCHEMA_EPOCH = 48
+#   49 -> ``composition_rejection_events`` table added (elspeth-3e28029d2f):
+#        durable session-side record of composer mutation-tool rejections —
+#        the unredacted reason the planner saw, keyed to session + the
+#        composition state current at rejection. Operator ruling 2026-09-02:
+#        session data, not Landscape data. New table ships by DB recreation
+#        (sessions.db only — auth.db is never touched).
+SESSION_SCHEMA_EPOCH = 49
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -1286,6 +1292,61 @@ Index(
 Index(
     "ix_interpretation_events_composition_state",
     interpretation_events_table.c.composition_state_id,
+)
+
+# ``composition_rejection_events_table`` (elspeth-3e28029d2f — durable
+# rejection reasons).
+#
+# One row per composer mutation-tool REJECTION within a compose turn. The
+# persisted ``tool`` chat row collapses every free-text diagnostic under the
+# closed redaction allowlist, so before this table the reason a payload was
+# refused reached the planner in full and the operator NOWHERE. Operator
+# ruling 2026-09-02: the reason lives in the SESSION as session data — it is
+# authoring-session history, not Landscape data (Landscape relates to the
+# pipeline and the data traversing it).
+#
+# ``planner_payload`` is the EXACT serialized tool response the planner saw —
+# text and reasoning, unredacted. That is deliberate and mirrors
+# ``chat_messages.raw_content`` (B2): the session store is the private
+# audit-attribution surface; redaction governs the public projections, not
+# this table. ``error_code`` / ``message`` are extracted columns for
+# queryability (first coded validation entry, else the failure class).
+#
+# ``composition_state_id`` is the state that was CURRENT when the tool was
+# refused — a rejection commits no state of its own, so the linkage names the
+# version the operator would inspect to reproduce. NULL when the session had
+# no committed state yet. Written only by ``persist_compose_turn`` inside the
+# same transaction as the turn's chat rows.
+composition_rejection_events_table = Table(
+    "composition_rejection_events",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    # Same-session ownership, mirroring interpretation_events: a rejection in
+    # session B cannot reference a composition state owned by session A.
+    Column("composition_state_id", String, nullable=True),
+    Column("tool_call_id", String, nullable=False),
+    Column("tool_name", String, nullable=False),
+    Column("error_code", String, nullable=True),
+    Column("message", Text, nullable=False),
+    Column("planner_payload", Text, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(
+        ["composition_state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_composition_rejection_events_state_session",
+    ),
+)
+Index(
+    "ix_composition_rejection_events_session_created",
+    composition_rejection_events_table.c.session_id,
+    composition_rejection_events_table.c.created_at,
 )
 
 # ``composer_completion_events_table`` (Phase 6A — completion gestures).
