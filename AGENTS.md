@@ -14,6 +14,22 @@ maintainer's own agent toolchain (issue tracker, code map, delegation
 conventions) is described in [docs/maintainer/toolchain.md](docs/maintainer/toolchain.md);
 none of it is required to contribute.
 
+## Working Directory Discipline
+
+- The Bash tool persists its working directory across calls. Begin any script,
+  test, or build invocation with an explicit `cd <repo-root> &&` rather than
+  assuming the current directory.
+- When operating in a worktree, state the worktree path in the command; never
+  rely on an earlier `cd`.
+
+## Claims Must Be Measured
+
+- Counts, inventories, and parity checks must come from the live source of
+  truth (registry, DB query, API), never from a regex over source files.
+- After any status claim ("fix landed", "ticket closed", "branch merged"),
+  re-verify against the current HEAD before writing it into a checkpoint or
+  handoff doc.
+
 ## Quick reference
 
 ```bash
@@ -110,6 +126,33 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 - Directory-scoped guides exist where the details live:
   `examples/AGENTS.md` (how to run every example) and
   `src/elspeth/plugins/transforms/AGENTS.md` (row data vs audit provenance).
+
+## Test Verification Policy
+
+- Never report test results based on `grep`, `tail`, or piped output. A pipe
+  masks the exit code and buffering hides in-progress failures.
+- Always run suites writing to a file, then check the exit code explicitly
+  (`addopts` already carries `-n 12`, so the bare command is the parallel run):
+  `pytest tests/ > "$log" 2>&1; echo "exit=$?"; tail -50 "$log"` — use a
+  unique, lane-private log path, not a shared generic filename.
+- Do not claim "zero failures", "suite green", or "passes in isolation" until
+  the process has exited and you have read its exit code.
+
+## Editing Rules
+
+- Do not use `sed`, `awk`, or scripted line-number rewrites to resolve merge
+  conflicts or perform multi-line edits. Use the Edit tool or regenerate the
+  file.
+- Never add `# noqa`, `# type: ignore`, or lint suppressions to make a gate
+  pass; fix the underlying issue or report it as blocked.
+
+## Commit Hygiene
+
+- Before every commit, run `git status --short` and confirm the staged set.
+  Never stage `.claude/lanes/`, dry-run artifacts, scratch logs, or build
+  output.
+- Run the lint gate (ruff) locally before pushing; do not rely on CI to
+  surface unused imports or formatting.
 
 ## Project delivery posture
 
