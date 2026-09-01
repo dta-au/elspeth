@@ -329,6 +329,20 @@ _WRAPPED_TEMPLATE_ROUND_TRIP_CASES = [
         {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
         id="_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_WITH_DETAIL",
     ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_WITH_DETAIL,
+        no_tool_policy._PREFLIGHT_NOTICE_HEADER,
+        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER,
+        {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
+        id="_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_WITH_DETAIL",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_WITH_DETAIL,
+        no_tool_policy._PREFLIGHT_NOTICE_HEADER,
+        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER,
+        {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
+        id="_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_WITH_DETAIL",
+    ),
 ]
 
 
@@ -434,6 +448,16 @@ _BARE_SUFFIX_ROUND_TRIP_CASES = [
         id="_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE",
     ),
     pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE,
+        f"{no_tool_policy._PREFLIGHT_NOTICE_HEADER}\n\n{no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER}",
+        id="_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE,
+        f"{no_tool_policy._PREFLIGHT_NOTICE_HEADER}\n\n{no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER}",
+        id="_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE",
+    ),
+    pytest.param(
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX,
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
         id="_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX",
@@ -497,6 +521,53 @@ class TestBareTrustedSuffixCompleteness:
 
         assert declared_suffixes, "AST scan found no _bare_trusted_suffix assignments — the scan itself is broken"
         assert declared_suffixes == covered
+
+
+# elspeth-b61894d93d follow-up (F7 sign-off M13): ``_red_diagnostic_suffix``
+# turned each red composer's (template, bare_suffix) pairing into parameters,
+# so a mismatched pair — the flagged composer handed the unrendered class's
+# bare fallback — became a latent self-contradiction (could-not-be-obtained
+# framing for a review that DID flag) reachable whenever a red result yields
+# no extractable objection. This pin holds each composer to its own
+# reason-class bare fallback, and is the bare-fallback path's first test on
+# all three red composers.
+_RED_COMPOSER_BARE_FALLBACK_CASES = [
+    pytest.param(
+        no_tool_policy.compose_advisor_signoff_unrepairable_red_message,
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE,
+        id="unrepairable",
+    ),
+    pytest.param(
+        no_tool_policy.compose_advisor_signoff_flagged_red_message,
+        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE,
+        id="flagged",
+    ),
+    pytest.param(
+        no_tool_policy.compose_advisor_signoff_unrendered_red_message,
+        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE,
+        id="unrendered",
+    ),
+]
+
+
+class TestRedComposerBareFallbackPairing:
+    @pytest.mark.parametrize(("composer", "expected_bare_suffix"), _RED_COMPOSER_BARE_FALLBACK_CASES)
+    def test_detail_less_red_result_falls_back_to_the_composers_own_class_framing(self, composer, expected_bare_suffix: str) -> None:
+        detail_less_red = ValidationResult(
+            is_valid=False,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(
+                authoring_valid=False,
+                execution_ready=False,
+                completion_ready=False,
+                blockers=[],
+            ),
+        )
+
+        message = composer("model prose", runtime_result=detail_less_red)
+
+        assert message == "model prose" + expected_bare_suffix
 
 
 class TestInterpretationReviewHandoffSegments:

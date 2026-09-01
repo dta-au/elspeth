@@ -88,6 +88,8 @@ class TestWithheldProseDisclosure:
             no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_NOTICE,
             no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_NOTICE,
             no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER,
+            no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER,
+            no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER,
             no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
             no_tool_policy.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE,
             no_tool_policy.ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE,
@@ -101,6 +103,8 @@ class TestWithheldProseDisclosure:
             "signoff_unrepairable_unverified_notice",
             "signoff_unrepairable_handoff_notice",
             "signoff_unrepairable_red_footer",
+            "signoff_flagged_red_footer",
+            "signoff_unrendered_red_footer",
             "pending_handoff_notice",
             "repair_success",
             "repair_review",
@@ -205,14 +209,27 @@ def _blocked_terminal(
     from elspeth.web.composer.service import AdvisorCheckpointVerdict
     from elspeth.web.composer.tool_batch import BufferingRecorder
 
-    return service._advisor_blocked_result(
-        reason=reason,
-        verdict=AdvisorCheckpointVerdict(
+    # The verdict shape must match the reason the way the gate produces it:
+    # unavailable/malformed are ok=False failure classes (the red chat arm
+    # branches on ``verdict.ok``, elspeth-b61894d93d); every flagged reason
+    # is ok=True, blocking=True.
+    if reason in {"unavailable", "malformed"}:
+        verdict = AdvisorCheckpointVerdict(
+            ok=False,
+            blocking=False,
+            findings_text="advisor verdict could not be obtained",
+            failure_class=reason,  # type: ignore[arg-type]
+        )
+    else:
+        verdict = AdvisorCheckpointVerdict(
             ok=True,
             blocking=True,
             findings_text="FLAGGED: still wrong",
             findings_backend_authored=findings_backend_authored,
-        ),
+        )
+    return service._advisor_blocked_result(
+        reason=reason,
+        verdict=verdict,
         state=_empty_state(),
         assistant_message=None,
         recorder=BufferingRecorder(),
@@ -541,6 +558,9 @@ class TestEmptyRawProducersPublishCanonicalShapes:
             # product is now pinned.
             ("flagged_unrepairable", "handoff"),
             ("flagged_unrepairable", "red"),
+            # elspeth-b61894d93d: the unrendered-verdict red shapes.
+            ("unavailable", "red"),
+            ("malformed", "red"),
         ],
         ids=[
             "absent",
@@ -551,6 +571,8 @@ class TestEmptyRawProducersPublishCanonicalShapes:
             "unrepairable_green",
             "unrepairable_handoff",
             "unrepairable_red",
+            "unavailable_red",
+            "malformed_red",
         ],
     )
     def test_blocked_terminal_site(self, publication_spy: _RecordingPublicationTelemetry, reason: str, preflight: str | None) -> None:

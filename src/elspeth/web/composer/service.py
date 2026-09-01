@@ -392,6 +392,8 @@ _compose_advisor_signoff_unrepairable_message = _no_tool_policy.compose_advisor_
 _compose_advisor_signoff_unrepairable_unverified_message = _no_tool_policy.compose_advisor_signoff_unrepairable_unverified_message
 _compose_advisor_signoff_unrepairable_handoff_message = _no_tool_policy.compose_advisor_signoff_unrepairable_handoff_message
 _compose_advisor_signoff_unrepairable_red_message = _no_tool_policy.compose_advisor_signoff_unrepairable_red_message
+_compose_advisor_signoff_flagged_red_message = _no_tool_policy.compose_advisor_signoff_flagged_red_message
+_compose_advisor_signoff_unrendered_red_message = _no_tool_policy.compose_advisor_signoff_unrendered_red_message
 _ADVISOR_SIGNOFF_UNVERIFIED_NOTICE = _no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_NOTICE
 _compose_advisor_pending_handoff_message = _no_tool_policy.compose_advisor_pending_handoff_message
 _compose_interpretation_review_handoff_message = _no_tool_policy.compose_interpretation_review_handoff_message
@@ -7863,7 +7865,20 @@ class ComposerServiceImpl:
                 findings=verdict.findings_text,
                 findings_backend_authored=verdict.findings_backend_authored,
             )
-            augmented = _compose_preflight_failure_message("", runtime_result=runtime_result)
+            # elspeth-b61894d93d: the chat copy is composed from the turn's
+            # ACTUAL red preflight, never from the synthesized
+            # advisor-signoff validation above — the synthesized errors carry
+            # the advisor wording, so routing them through the preflight
+            # wrapper put advisor copy in the ``Cause:`` interior and the
+            # validator's leading objection on no published surface. The
+            # footer framing follows the verdict class: a rendered FLAG keeps
+            # did-not-clear, an unrendered verdict (unavailable/malformed)
+            # keeps could-not-be-obtained. (A flagged_unrepairable reason is
+            # re-composed by the shape-aware override below.)
+            if verdict.ok:
+                augmented = _compose_advisor_signoff_flagged_red_message("", runtime_result=runtime_preflight)
+            else:
+                augmented = _compose_advisor_signoff_unrendered_red_message("", runtime_result=runtime_preflight)
         if reason == "flagged_unrepairable":
             # elspeth-25f7b757e7 (A1, fix round 1 N1): the block's cause is
             # the user's own chat message, so every variant names the reword

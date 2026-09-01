@@ -208,6 +208,43 @@ _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE = _bare_trusted_suffix(
     _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER + "\n\n" + _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER
 )
 
+# elspeth-b61894d93d: the advisor-blocked RED terminals for the OTHER three
+# reasons (flagged_final_pass/flagged_no_repair, unavailable, malformed) used
+# to compose their chat copy from the SYNTHESIZED advisor-signoff validation,
+# so the ``Cause:`` interior carried the advisor wording and the validator's
+# leading objection appeared on no published surface — the user with a
+# genuinely broken pipeline was told only that the review did not clear.
+# Same treatment as the unrepairable red shape: the truthful preflight header
+# stays (it is the pre-existing R2-F14-scoped claim, and it is true), the
+# validator's objection rides the untrusted ``Cause:`` interior, and the
+# advisory situation rides a per-reason-class footer — the flagged footer
+# keeps the did-not-clear framing, the unrendered footer keeps the
+# could-not-be-obtained framing, because each is true only for its class.
+_ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER: Final = (
+    "The completion advisory review also did not clear after the available attempts, so composer "
+    "completion is withheld. Fix the validation failure above; validation and the advisory review run "
+    "again on your next message. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+)
+_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
+    _PREFLIGHT_NOTICE_HEADER,
+    _ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER,
+    diagnostic_slots="{detail}{suggestion_block}",
+)
+_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE = _bare_trusted_suffix(_PREFLIGHT_NOTICE_HEADER + "\n\n" + _ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER)
+_ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER: Final = (
+    "The evidence-scoped completion advisory review could also not be obtained, so the Composer cannot "
+    "mark this turn complete. Fix the validation failure above; validation and the advisory review run "
+    "again on your next message. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+)
+_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
+    _PREFLIGHT_NOTICE_HEADER,
+    _ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER,
+    diagnostic_slots="{detail}{suggestion_block}",
+)
+_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE = _bare_trusted_suffix(
+    _PREFLIGHT_NOTICE_HEADER + "\n\n" + _ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER
+)
+
 # elspeth-66717f0c99: the third preflight shape the END advisor gate can hold —
 # a resolvable pending-interpretation handoff. It is neither green (so
 # ``_ADVISOR_SIGNOFF_PENDING_NOTICE`` is wrong: completion is NOT withheld
@@ -649,6 +686,24 @@ def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegme
     )
     if unrepairable_red_with_detail is not None:
         return unrepairable_red_with_detail
+    if suffix == _ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE:
+        return (TrustedSystemNoticeSegment(f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER}"),)
+    flagged_red_with_detail = _split_wrapped_diagnostic(
+        suffix,
+        header=_PREFLIGHT_NOTICE_HEADER,
+        footer=_ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER,
+    )
+    if flagged_red_with_detail is not None:
+        return flagged_red_with_detail
+    if suffix == _ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE:
+        return (TrustedSystemNoticeSegment(f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER}"),)
+    unrendered_red_with_detail = _split_wrapped_diagnostic(
+        suffix,
+        header=_PREFLIGHT_NOTICE_HEADER,
+        footer=_ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER,
+    )
+    if unrendered_red_with_detail is not None:
+        return unrendered_red_with_detail
     if suffix == _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE),)
     handoff_with_findings = _split_wrapped_diagnostic(
@@ -757,8 +812,14 @@ def first_validation_objection(runtime_result: ValidationResult) -> str | None:
     return None
 
 
-def compose_preflight_failure_message(content: str, *, runtime_result: ValidationResult) -> str:
-    """Build the user-facing message for the non-empty-state preflight-invalid path."""
+def _red_diagnostic_suffix(runtime_result: ValidationResult, *, with_detail_template: str, bare_suffix: str) -> str:
+    """One extraction of a red result's leading objection into a wrapped shape.
+
+    Shared by every composer that renders a red validation result: the
+    leading error's message and suggestion (or the first failed check's
+    detail) fill the untrusted diagnostic slots; a result with nothing
+    extractable falls back to the fixed bare shape.
+    """
     detail: str | None = None
     suggestion: str | None = None
     if runtime_result.errors:
@@ -769,14 +830,54 @@ def compose_preflight_failure_message(content: str, *, runtime_result: Validatio
         failed_checks = [check for check in runtime_result.checks if not check.passed]
         if failed_checks:
             detail = failed_checks[0].detail
-    if detail:
-        suggestion_block = f"\n\nSuggested fix: {suggestion}" if suggestion else ""
-        suffix = _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL.format(
-            detail=detail,
-            suggestion_block=suggestion_block,
-        )
-    else:
-        suffix = _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE
+    if not detail:
+        return bare_suffix
+    suggestion_block = f"\n\nSuggested fix: {suggestion}" if suggestion else ""
+    return with_detail_template.format(detail=detail, suggestion_block=suggestion_block)
+
+
+def compose_preflight_failure_message(content: str, *, runtime_result: ValidationResult) -> str:
+    """Build the user-facing message for the non-empty-state preflight-invalid path."""
+    suffix = _red_diagnostic_suffix(
+        runtime_result,
+        with_detail_template=_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL,
+        bare_suffix=_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE,
+    )
+    if not content:
+        return suffix.lstrip("\n").lstrip("-").lstrip()
+    return content + suffix
+
+
+def compose_advisor_signoff_flagged_red_message(content: str, *, runtime_result: ValidationResult) -> str:
+    """RED preflight + a FLAGGED advisory verdict (elspeth-b61894d93d).
+
+    ``runtime_result`` is the turn's ACTUAL red preflight — never the
+    synthesized advisor-signoff validation, whose errors carry the advisor
+    wording rather than the validator's objection. The footer keeps the
+    did-not-clear framing, which is true only for this reason class.
+    """
+    suffix = _red_diagnostic_suffix(
+        runtime_result,
+        with_detail_template=_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_WITH_DETAIL,
+        bare_suffix=_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE,
+    )
+    if not content:
+        return suffix.lstrip("\n").lstrip("-").lstrip()
+    return content + suffix
+
+
+def compose_advisor_signoff_unrendered_red_message(content: str, *, runtime_result: ValidationResult) -> str:
+    """RED preflight + an UNRENDERED advisory verdict (elspeth-b61894d93d).
+
+    Same shape as the flagged variant, but the footer keeps the
+    could-not-be-obtained framing — true only when the advisor rendered no
+    verdict (unavailable/malformed), never for a FLAG.
+    """
+    suffix = _red_diagnostic_suffix(
+        runtime_result,
+        with_detail_template=_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_WITH_DETAIL,
+        bare_suffix=_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE,
+    )
     if not content:
         return suffix.lstrip("\n").lstrip("-").lstrip()
     return content + suffix
@@ -856,28 +957,13 @@ def compose_advisor_signoff_unrepairable_red_message(content: str, *, runtime_re
     ``runtime_result`` is the turn's ACTUAL red preflight (never the
     synthesized advisor-signoff validation): its leading objection rides the
     untrusted ``Cause:`` region so the user with a broken pipeline is not
-    told there is nothing to fix. Extraction mirrors
-    :func:`compose_preflight_failure_message`; a result with no extractable
-    objection falls back to the bare fixed shape.
+    told there is nothing to fix.
     """
-    detail: str | None = None
-    suggestion: str | None = None
-    if runtime_result.errors:
-        first_error = runtime_result.errors[0]
-        detail = first_error.message
-        suggestion = first_error.suggestion
-    else:
-        failed_checks = [check for check in runtime_result.checks if not check.passed]
-        if failed_checks:
-            detail = failed_checks[0].detail
-    if detail:
-        suggestion_block = f"\n\nSuggested fix: {suggestion}" if suggestion else ""
-        suffix = _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_WITH_DETAIL.format(
-            detail=detail,
-            suggestion_block=suggestion_block,
-        )
-    else:
-        suffix = _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE
+    suffix = _red_diagnostic_suffix(
+        runtime_result,
+        with_detail_template=_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_WITH_DETAIL,
+        bare_suffix=_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE,
+    )
     if not content:
         return suffix.lstrip("\n").lstrip("-").lstrip()
     return content + suffix

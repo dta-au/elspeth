@@ -3035,11 +3035,11 @@ async def test_published_notice_never_contradicts_the_preflight_shape(make_servi
     - an affirmative pipeline-health claim ("no pipeline change is needed")
       is permitted ONLY on a preflight that ran and passed (green);
     - the absent shape must not claim a preflight failed (facet B);
-    - the red shape must surface a failure signal — the preflight header or
-      the validator's leading objection — and for the unrepairable reason
-      specifically must name the validator's leading objection (rewording a
-      chat message cannot fix a broken pipeline, so hiding the objection
-      tells the user with a broken pipeline there is nothing to fix);
+    - the red shape must name the validator's leading objection on EVERY
+      reason (elspeth-b61894d93d widened this from flagged_unrepairable to
+      the full vocabulary): whatever the advisory review's own outcome, the
+      user with a broken pipeline must be told what is actually wrong with
+      the pipeline, not only that the review did not clear;
     - the handoff shape must name the still-pending interpretation review
       (it is never true that rewording or advisory clearance is the only
       remaining step — the ac85b0ab0e class).
@@ -3063,9 +3063,7 @@ async def test_published_notice_never_contradicts_the_preflight_shape(make_servi
     if shape == "absent":
         assert _PREFLIGHT_NOTICE_HEADER not in message
     if shape == "red":
-        assert _PREFLIGHT_NOTICE_HEADER in message or _HONESTY_GATE_RED_OBJECTION in message
-        if reason == "flagged_unrepairable":
-            assert _HONESTY_GATE_RED_OBJECTION in message
+        assert _HONESTY_GATE_RED_OBJECTION in message
     if shape == "handoff":
         assert "interpretation review" in message.lower()
 
