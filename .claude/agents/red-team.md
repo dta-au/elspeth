@@ -82,6 +82,10 @@ f. **Mutation survivors in the changed lines.** For each changed guard,
 
 ## Output contract
 
+If your brief names a report file, append the same fenced ```json block to
+the end of that file as well — reply channels can truncate, the file is
+the durable copy.
+
 End your reply with exactly one fenced ```json block:
 
 ```json
