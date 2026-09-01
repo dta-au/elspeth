@@ -718,7 +718,9 @@ promises are `preserves_input_values` (transform) and `observed_value_type`
   `PYTHONPATH=<worktree>/src:<worktree>/elspeth-lints/src <venv>/bin/python -m pytest ...`
   and verify both `elspeth.__file__` and `elspeth_lints.__file__` before
   trusting a result; `elspeth_lints` lives in a separate source root.
-- `git stash` is blocked by a hook; use worktrees or commits.
+- Do not use `git stash`; use a worktree or a commit. This is a convention, not
+  an enforced gate — nothing blocks it. (The old `.git/hooks/pre-stash` never
+  ran: git has no `pre-stash` hook. Removed 2026-09-02.)
 - `.claude/skills/**/*.py` is production code to every whole-tree test gate
   but is not under the `--root src/elspeth` tier gate; ruff `T20` is ignored
   there, as under `scripts/`.

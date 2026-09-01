@@ -8,6 +8,23 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-09-02 — `git stash` was never blocked: `pre-stash` is not a git hook, and the "blocked by a hook" rule was false for six months**
+  `AGENTS.md` and `CONTRIBUTING.md` both stated `git stash` was blocked by a hook. It was not, and never had been.
+  `.git/hooks/pre-stash` (created 2026-03-06) was broken three independent ways: (1) **git has no `pre-stash` hook** —
+  `githooks(5)` on git 2.43.0 lists no such name, so git never invoked the file at all; (2) it was not executable
+  (`-rw-rw-r--`, the only hook in the directory without an `x` bit, on both the old and new host — so this was not a
+  migration artefact); and (3) its shebang was the literal `#\!/bin/sh`, the fingerprint of authoring inside a
+  double-quoted heredoc where `\!` escaped history expansion. Evidence it was inert: `git fsck --connectivity-only`
+  found 1,076 dangling commits, **650 of them stash-shaped** (`WIP on <branch>: …`, two parents), spanning
+  2026-02 to 2026-09. Do not mistake these for pre-commit's autostash — that path is separately and deliberately
+  disabled by the `.git/hooks/pre-commit` dispatcher, which passes `--files <staged>` to keep `stash=False` and feeds a
+  sentinel path (a child of `.git/index`, which cannot exist) when nothing is staged, because `--files` with zero values
+  re-enables the stash path. The dead hook was removed and both documents now state the plain convention: do not use
+  `git stash`; use a worktree or a commit. Enforcing it would require a `reference-transaction` hook rejecting
+  `refs/stash`; that is deliberately **not** installed, because it fires on every ref update in a repo with five
+  worktrees and concurrent agent sessions.
+  See [CONTRIBUTING: Convention: repository and process hygiene](../../CONTRIBUTING.md#convention-repository-and-process-hygiene).
+
 - **2026-09-01 — secret wiring is deny-by-default at three seams, and collectors use the transform policy vocabulary** (elspeth-f3c1aafd25; 9da1b39b8, c163b6366)
   `WebSettings.secret_wiring_allowlist` authorizes only an exact
   `(secret, component_type, plugin, option_key)` match; an empty policy denies every wiring. The policy vocabulary is

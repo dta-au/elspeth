@@ -116,7 +116,12 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 - The pre-commit secret scanner rescans every line of a touched file, so old
   lines can fire on unrelated edits. Append `# secret-scan: allow-this-line`
   to a false positive; do not bypass the hook with `--no-verify`.
-- `git stash` is blocked by a hook — use worktrees or commits instead.
+- Do not use `git stash` — use a worktree or a commit instead. This is a
+  convention, not an enforced gate: nothing blocks it. (A `.git/hooks/pre-stash`
+  once claimed to, but git has no such hook, so it never ran; it was removed
+  2026-09-02 along with the claim that it worked. Blocking a stash would need a
+  `reference-transaction` hook rejecting `refs/stash`, which is deliberately not
+  installed — that hook fires on every ref update in the repo.)
 - Never commit a `/home/<user>` or `/Users/<user>` path in a tracked file:
   hooks bind to `${CLAUDE_PROJECT_DIR}`, skills resolve the checkout with
   `git rev-parse --show-toplevel`, and tests pin both.
