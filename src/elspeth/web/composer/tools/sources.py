@@ -74,6 +74,7 @@ from elspeth.web.composer.tools._common import (
     _validate_source_path,
     _vf_destination_note,
     canonicalize_source_validation_failure,
+    review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools.blobs import (
     BlobToolRecord,
@@ -1812,10 +1813,10 @@ def _execute_patch_source_options(
     # PENDING and silently downgrade an already-resolved review.
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError) as exc:
         return _failure_result(
             state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
         )
     data = None

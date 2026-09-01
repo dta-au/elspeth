@@ -182,6 +182,15 @@ _RAW_HTML_CLEANUP_DRAFT_MARKERS: Final[tuple[str, ...]] = ("raw html", "fingerpr
 # 18b4cee7, 2026-07-22).
 RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX: Final[str] = "Raw-html cleanup review draft is malformed"
 
+# A pending vague_term requirement with no resolvable prompt wiring stages a
+# review the operator can approve but never resolve: the resolver dead-ends
+# (or silent-drops) and the execution gate counts the requirement as pending
+# forever, blocking Run with no card offered. The review-staging tool rejects
+# this shape at its own boundary; ``set_pipeline`` and the other node-authoring
+# tools are second doors into the same state and enforce it via
+# :func:`composition_review_contract_error` (session 4c42a794, 2026-09-01).
+VAGUE_TERM_UNWIRED_PREFIX: Final[str] = "Pending vague_term review is not wired for resolution"
+
 # Honest-provenance sentinel prefix for interpretation event rows written by a
 # BACKEND surfacer (finalization PT auto-surface, kind-general settlement
 # surfacer, YAML-import surfacer) rather than an LLM tool call. Consumers use
@@ -537,11 +546,74 @@ def composition_review_contract_error(state: CompositionState) -> str | None:
     recommendation is advisory, not blocking (see
     :func:`prompt_shield_recommendation_warning_pairs`): an unshielded
     LLM-over-untrusted-content composition surfaces a warning rather than
-    failing the contract. Composition is therefore gated solely on the
-    raw-HTML-cleanup review contract here.
+    failing the contract. Composition is therefore gated on the
+    raw-HTML-cleanup review contract and on every staged pending
+    ``vague_term`` review being resolvable.
     """
 
-    return raw_html_cleanup_review_contract_error(state)
+    error = raw_html_cleanup_review_contract_error(state)
+    if error is not None:
+        return error
+    return unwired_vague_term_error(state)
+
+
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options['interpretation_requirements'] rows, untyped Mapping[str, Any] entries "
+    "persisted on composer state and round-tripped through sessions.db storage",
+    source_param="state",
+    suppresses=("R5",),
+    invariant="a malformed row is skipped (unconditional invariant B rejects it downstream) rather than "
+    "raised on; the only outputs are None or an error string naming a well-formed unwired row, so the "
+    "lenient reads can only under-report, never admit an unresolvable requirement",
+    non_raising=True,
+)
+def unwired_vague_term_error(state: CompositionState) -> str | None:
+    """Return the first pending ``vague_term`` review that nothing can resolve.
+
+    ``vague_term_wiring_count`` is the single resolvability contract: a
+    pending requirement is resolvable only when exactly one wiring exists for
+    its ``user_term`` (a ``prompt_template_parts`` ``interpretation_ref``
+    naming its id, or — with no requirement rows staged — exactly one legacy
+    placeholder). The review-staging tool already refuses to stage an unwired
+    requirement; this enforces the same invariant at the node-authoring doors
+    (``set_pipeline`` / ``upsert_node`` / ``splice_transform`` /
+    ``patch_node_options``), which session 4c42a794 (2026-09-01) proved could
+    commit the unresolvable shape directly: the requirement stayed pending
+    forever, the execution gate blocked Run on it, and no resolver card
+    existed. Reads are lenient (Tier-3 staging idiom, mirroring
+    ``vague_term_wiring_count``): a malformed row is invariant B's to reject,
+    not this contract's.
+    """
+
+    for node in state.nodes:
+        if INTERPRETATION_REQUIREMENTS_KEY not in node.options:
+            continue
+        requirements = node.options[INTERPRETATION_REQUIREMENTS_KEY]
+        if not isinstance(requirements, (list, tuple)):
+            continue
+        for requirement in requirements:
+            if not isinstance(requirement, Mapping):
+                continue
+            if "kind" not in requirement or requirement["kind"] != InterpretationKind.VAGUE_TERM.value:
+                continue
+            if "status" not in requirement or requirement["status"] != "pending":
+                continue
+            if "user_term" not in requirement or not isinstance(requirement["user_term"], str):
+                continue
+            user_term = requirement["user_term"]
+            if vague_term_wiring_count(node.options, user_term=user_term) == 1:
+                continue
+            requirement_id = requirement["id"] if "id" in requirement and isinstance(requirement["id"], str) else user_term
+            return (
+                f"{VAGUE_TERM_UNWIRED_PREFIX} on node {node.id!r}: requirement {requirement_id!r} "
+                f"(user term {user_term!r}) has no resolvable prompt wiring. Wire exactly one "
+                f'prompt_template_parts entry {{"kind": "interpretation_ref", "requirement_id": '
+                f"{requirement_id!r}}} into the node's prompt, or drop the requirement row. An "
+                "unwired requirement stages a review the operator can approve but never resolve, "
+                "and the execution gate blocks Run on it forever."
+            )
+    return None
 
 
 def prompt_shield_recommendation_warning_pairs(

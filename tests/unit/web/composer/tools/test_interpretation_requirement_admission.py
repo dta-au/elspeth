@@ -34,6 +34,7 @@ from elspeth.web.composer.tools._common import (
 )
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_TEMPLATE_PARTS_KEY,
     ServerStagedRequiredControlUserTerm,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -1479,6 +1480,15 @@ def test_canonical_id_projection_normalizes_user_term_once() -> None:
             }
         ],
         catalog=catalog,
+        # A staged pending vague_term must be wired or the review contract
+        # rejects the mutation; the ref names the canonical id this test pins
+        # (trimmed user_term + ":" + node id).
+        extra_options={
+            PROMPT_TEMPLATE_PARTS_KEY: [
+                {"kind": "text", "text": "Classify as "},
+                {"kind": "interpretation_ref", "requirement_id": "alpha:candidate"},
+            ],
+        },
     )
 
     assert result.success is True, result.to_dict()

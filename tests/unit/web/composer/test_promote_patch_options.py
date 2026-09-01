@@ -45,7 +45,7 @@ from elspeth.web.composer.tools import (
     _execute_patch_source_options,
 )
 from elspeth.web.composer.tools._common import ToolContext
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 # ---------------------------------------------------------------------------
@@ -411,6 +411,15 @@ class TestPromotePatchNodeOptionsArgErrorRouting:
                 "prompt_template": "Old {{ row.text }}.",
                 "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
+                # The pre-existing vague_term must be WIRED (an unwired pending
+                # vague_term is rejected by the review contract): the parts ref
+                # survives the prompt_template patch, so the copied-forward row
+                # stays resolvable in the patched state.
+                PROMPT_TEMPLATE_PARTS_KEY: [
+                    {"kind": "text", "text": "Old "},
+                    {"kind": "interpretation_ref", "requirement_id": "vague"},
+                    {"kind": "text", "text": " {{ row.text }}."},
+                ],
                 INTERPRETATION_REQUIREMENTS_KEY: [
                     {
                         "id": "vague",

@@ -18,7 +18,8 @@ none of it is required to contribute.
 
 ```bash
 source .venv/bin/activate      # uv-managed venv (Python 3.12+)
-pytest tests/                  # full suite; the plain default selection IS the CI-equivalent run
+pytest tests/                  # full suite (~20 min); the plain default selection IS the CI-equivalent run
+pytest tests/path::test -n 0   # ONE test: -n 0 disables the default 12 workers (needed for pdb / -s)
 ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
   elspeth-lints check --rules all --root src/elspeth   # static-analysis / trust-tier lint gate
 elspeth run --settings examples/<name>/settings.yaml --execute
@@ -34,7 +35,19 @@ elspeth run --settings examples/<name>/settings.yaml --execute
   every sibling (this has happened — 7201beeb7). Dated incident log:
   [docs/agents/recent-code-hints.md](docs/agents/recent-code-hints.md).
 - Scoped test runs miss cross-cutting gates — run the full `pytest tests/`
-  before merging.
+  before merging. `addopts` carries `-n 12`, so the bare command IS the
+  parallel run: serial it is ~17 hours against 44,399 tests, which is why the
+  default is parallel rather than a flag you have to remember. Pass `-n 0` for
+  a single test or a debugger (`pdb` and `-s` do not work through xdist), and
+  note that xdist auto-disables `pytest-benchmark` — the `performance` marker
+  is deselected by default anyway.
+- A handful of process-death / peer-lease / resume tests are FLAKY under
+  parallelism (elspeth-0077cb7789): two runs of identical code produced
+  DISJOINT failure sets, all passing serially. Before blaming your change for
+  a red in `e2e/recovery`, `integration/pipeline`, or
+  `unit/engine/orchestrator`, re-run the named test with `-n 0`; if it passes,
+  diff your failure set against the same run on your base commit rather than
+  assuming either result.
 - `elspeth-lints check` requires an explicit `--rules` selection and exits 2
   without one (until 2026-08-07 the bare command ran zero rules and exited 0 —
   a green that certified any tree); scope `--root src/elspeth` so whole-repo

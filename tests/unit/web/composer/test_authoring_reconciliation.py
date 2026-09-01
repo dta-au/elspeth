@@ -1150,3 +1150,176 @@ def test_unknown_pipeline_decision_user_term_fails_closed() -> None:
     assert result.updated_state.version == previous.version
     assert result.data["error_code"] == "interpretation_requirements_invalid"
     assert "unknown-decision" not in result.data["error"]
+
+
+def _reconciler_stale_hash_state() -> CompositionState:
+    """A committed llm node whose resolved model-choice hash no longer matches.
+
+    Reaching ``reconcile_authoritative_reviews`` at all requires options that
+    survive plugin prevalidation (``_prevalidate_transform_for_context`` runs
+    first and rejects an llm node missing ``prompt_template`` / ``provider`` /
+    ``required_input_fields`` long before reconciliation), so this fixture
+    carries a fully valid node and corrupts only the stored review hash.
+    """
+    model = "bedrock/example.model"
+    stale = _requirement(
+        requirement_id="model_choice_review:enrich",
+        kind=InterpretationKind.LLM_MODEL_CHOICE,
+        user_term="llm_model_choice:enrich",
+        status="resolved",
+        draft=model,
+        accepted_value=model,
+        resolved_prompt_template_hash="stale-hash",
+    )
+    return _state(
+        nodes=(
+            _node(
+                node_id="enrich",
+                options={
+                    "provider": "bedrock",
+                    "model": model,
+                    "prompt_template": "Extract the industry from {{ row.company }}",
+                    "response_field": "industry",
+                    "required_input_fields": ["company"],
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [stale],
+                },
+            ),
+        )
+    )
+
+
+def test_review_reconciliation_failure_names_the_underlying_cause() -> None:
+    """A reconciliation rejection must say WHICH invariant failed.
+
+    Session f33fa7c3 (2026-09-01) wedged because every raise inside
+    ``reconcile_authoritative_reviews`` — ten distinct causes — collapsed into
+    one identical "re-inspect the payload and retry" sentence at the
+    ``set_pipeline`` boundary. The planner resubmitted a byte-identical
+    payload twice and failed identically: a rejection that cannot name its
+    own cause is unrepairable by construction, the same REPAIR_BLIND_REPEAT
+    shape as the 2026-08-19 withdrawal.
+    """
+    previous = _reconciler_stale_hash_state()
+
+    result = _execute_set_pipeline(deep_thaw(_exact_arguments(previous).data), previous, _trained_context())
+
+    assert not result.success
+    assert result.updated_state is previous
+    assert result.updated_state.version == previous.version
+    assert result.data["error_code"] == "review_reconciliation_failed"
+    # The specific invariant, not just the generic retry instruction.
+    assert "hash drifted" in result.data["error"], result.data["error"]
+    # ...and WHICH requirement drifted. This asserts a server-owned requirement
+    # id reaching the planner, which is deliberate and redaction-safe: the id is
+    # a pipeline identifier derived from kind + node id, not row content, and
+    # the same boundary already returns rejected option KEYS and VALUES from
+    # plugin prevalidation (see plugin_identities_in_option_failure). Without
+    # the id, a pipeline carrying several resolved reviews still leaves the
+    # planner guessing which one to re-send.
+    assert "model_choice_review:enrich" in result.data["error"], result.data["error"]
+
+
+def _unwired_vague_term_state() -> CompositionState:
+    """The session-4c42a794 shape: pending vague_term, legacy-only placeholder.
+
+    The prompt spells the term as a slug because the legacy placeholder grammar
+    is what the planner actually wrote; the requirement keeps the human phrase.
+    With a matching pending requirement staged, ``vague_term_wiring_count``
+    takes the structured branch and the legacy placeholder no longer counts,
+    so the requirement has no resolvable wiring at all.
+    """
+    return _state(
+        nodes=(
+            _node(
+                node_id="score_lead",
+                options={
+                    "provider": "bedrock",
+                    "model": "bedrock/example.model",
+                    "prompt_template": (
+                        "Rate the lead using this scoring guide: {{interpretation:lead_quality}} Company: {{ row.company }}"
+                    ),
+                    "response_field": "lead_score",
+                    "required_input_fields": ["company"],
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        _requirement(
+                            requirement_id="lead quality:score_lead",
+                            kind=InterpretationKind.VAGUE_TERM,
+                            user_term="lead quality",
+                        )
+                    ],
+                },
+            ),
+        )
+    )
+
+
+def test_set_pipeline_rejects_unwired_pending_vague_term() -> None:
+    """A staged vague_term with no resolvable wiring must fail closed.
+
+    Session 4c42a794 (2026-09-01): ``set_pipeline`` committed a pending
+    vague_term requirement whose only prompt wiring was a legacy
+    ``{{interpretation:...}}`` placeholder — a mixed form
+    ``vague_term_wiring_count`` counts as 0, because the staged requirement
+    disables the legacy fallback and no ``prompt_template_parts``
+    ``interpretation_ref`` exists. The review-staging tool rejects exactly
+    this shape (sessions.py's ``request_interpretation_review`` guard), but
+    ``set_pipeline`` is a second door into the same state and ran no wiring
+    check: the committed requirement was approvable but never resolvable, the
+    execution gate counted it as pending forever, and Run stayed blocked with
+    no card offered.
+    """
+    previous = _unwired_vague_term_state()
+
+    result = _execute_set_pipeline(deep_thaw(_exact_arguments(previous).data), previous, _trained_context())
+
+    assert not result.success
+    assert result.updated_state is previous
+    assert result.data["error_code"] == "vague_term_unwired"
+    # The rejection must name the node and the term so the planner can repair.
+    assert "score_lead" in result.data["error"], result.data["error"]
+    assert "lead quality" in result.data["error"], result.data["error"]
+    # ...and the repair itself: wire a prompt_template_parts interpretation_ref.
+    assert "prompt_template_parts" in result.data["error"], result.data["error"]
+
+
+def test_set_pipeline_accepts_wired_pending_vague_term() -> None:
+    """The guard must not overfire: a parts-wired vague_term composes fine.
+
+    This is the legitimate one-shot authoring shape (wiring count exactly 1):
+    the pending requirement plus a ``prompt_template_parts``
+    ``interpretation_ref`` naming its id. Placeholder spelling is irrelevant
+    on this path — the ref matches on requirement id.
+    """
+    wired = _state(
+        nodes=(
+            _node(
+                node_id="score_lead",
+                options={
+                    "provider": "bedrock",
+                    "model": "bedrock/example.model",
+                    "prompt_template": "Rate the lead. Company: {{ row.company }}",
+                    PROMPT_TEMPLATE_PARTS_KEY: [
+                        {"kind": "text", "text": "Rate the lead using "},
+                        {"kind": "interpretation_ref", "requirement_id": "lead quality:score_lead"},
+                        {"kind": "text", "text": ". Company: {{ row.company }}"},
+                    ],
+                    "response_field": "lead_score",
+                    "required_input_fields": ["company"],
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        _requirement(
+                            requirement_id="lead quality:score_lead",
+                            kind=InterpretationKind.VAGUE_TERM,
+                            user_term="lead quality",
+                        )
+                    ],
+                },
+            ),
+        )
+    )
+
+    result = _execute_set_pipeline(deep_thaw(_exact_arguments(wired).data), wired, _trained_context())
+
+    assert result.success, result.data

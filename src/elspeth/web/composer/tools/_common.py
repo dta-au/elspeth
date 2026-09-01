@@ -1210,6 +1210,38 @@ def _failure_result(
     )
 
 
+REVIEW_RECONCILIATION_FAILURE_PREFIX: Final[str] = "Authoritative interpretation-review reconciliation failed"
+
+
+def review_reconciliation_failure_message(exc: BaseException, *, retry_hint: str) -> str:
+    """Name the invariant that failed inside ``reconcile_authoritative_reviews``.
+
+    Ten distinct invariants raise out of that call — duplicate review
+    identity, missing ``event_id`` / ``accepted_value``, a drifted artifact
+    hash, an ``invented_source`` review on a transform node, a vague-term
+    review that cannot round-trip without ``prompt_template_parts``, and the
+    rest. Every ``set_pipeline`` / ``upsert_node`` / ``splice_transform`` /
+    ``patch_node_options`` / ``patch_source_options`` boundary used to
+    discard the exception and answer with one identical "re-inspect and
+    retry" sentence, which names no repair. Session f33fa7c3 (2026-09-01)
+    wedged on exactly that: the planner resubmitted a byte-identical payload
+    twice and was rejected identically, the REPAIR_BLIND_REPEAT shape of the
+    2026-08-19 withdrawal.
+
+    Interpolating is redaction-safe. ``reconcile_authoritative_reviews``
+    reads only the composition's own options — the raise sites quote pipeline
+    identifiers (node ids, server-owned requirement ids), closed
+    ``InterpretationKind`` values, and planner-authored user terms. None of
+    them can reach row content, and the surrounding boundary already quotes
+    rejected option keys and VALUES from plugin prevalidation
+    (see ``plugin_identities_in_option_failure``).
+    """
+    reason = str(exc).strip().rstrip(".")
+    if not reason:
+        return f"{REVIEW_RECONCILIATION_FAILURE_PREFIX}. {retry_hint}"
+    return f"{REVIEW_RECONCILIATION_FAILURE_PREFIX}: {reason}. {retry_hint}"
+
+
 # Regex matching the option-shape failure messages emitted by
 # ``_prevalidate_plugin_options`` (see ``_prevalidate_source`` /
 # ``_prevalidate_transform`` / ``_prevalidate_sink``). The kind token is

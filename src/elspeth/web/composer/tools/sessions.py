@@ -105,6 +105,7 @@ from elspeth.web.composer.tools._common import (
     _vf_destination_note,
     canonicalize_source_validation_failure,
     normalize_tool_result_validation,
+    review_reconciliation_failure_message,
     validate_composer_file_sink_collision_policy,
 )
 from elspeth.web.composer.tools.blobs import (
@@ -139,6 +140,7 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX,
     SOURCE_AUTHORING_KEY,
+    VAGUE_TERM_UNWIRED_PREFIX,
     composition_review_contract_error,
     current_source_data_contract_demand,
     interpretation_sites,
@@ -1644,18 +1646,18 @@ def build_set_pipeline_candidate(
         return _failure_result(state, message, error_code=error_code)
     try:
         new_state = reconcile_authoritative_reviews(state, new_state)
-    except TypeError as exc:
-        if str(exc) == "interpretation_requirements must be a list":
+    except (KeyError, TypeError, ValueError) as exc:
+        # The list-shape TypeError keeps its own bare message: it names the
+        # payload key the planner must fix and carries no error_code, so the
+        # generic reconciliation code would misroute the repair.
+        if type(exc) is TypeError and str(exc) == "interpretation_requirements must be a list":
             return _failure_result(state, "interpretation_requirements must be a list.")
         return _failure_result(
             state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the exact set_pipeline_arguments payload and retry.",
-            error_code="review_reconciliation_failed",
-        )
-    except (KeyError, ValueError):
-        return _failure_result(
-            state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the exact set_pipeline_arguments payload and retry.",
+            review_reconciliation_failure_message(
+                exc,
+                retry_hint="Re-inspect the exact set_pipeline_arguments payload and retry.",
+            ),
             error_code="review_reconciliation_failed",
         )
     canonical_error = _composition_canonical_interpretation_requirement_error(
@@ -1677,9 +1679,14 @@ def build_set_pipeline_candidate(
         # via explain_validation_code. A term-matched row whose draft fails
         # marker recognition carries its own code: "add the missing row" is the
         # wrong repair when the row exists and only the draft text is wrong.
+        # An unwired vague_term likewise carries its own code: the repair is
+        # wiring a prompt_template_parts interpretation_ref, not restaging
+        # (session 4c42a794, 2026-09-01).
         review_contract_code = (
             "interpretation_review_draft_malformed"
             if review_contract_error.startswith(RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX)
+            else "vague_term_unwired"
+            if review_contract_error.startswith(VAGUE_TERM_UNWIRED_PREFIX)
             else "interpretation_review_contract_unsatisfied"
         )
         return _failure_result(state, review_contract_error, error_code=review_contract_code)
