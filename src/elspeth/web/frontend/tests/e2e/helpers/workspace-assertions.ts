@@ -2,6 +2,42 @@ import { expect, type Locator, type Page } from "@playwright/test";
 
 import type { ComposerPage } from "../page-objects/composer-page";
 
+/**
+ * The declared scroll-owner registry for the composer workspace.
+ *
+ * Scrolling inside this workspace is a capability that is GRANTED AND NAMED,
+ * never an ambient property a box picks up. Every entry below is a box that is
+ * allowed to scroll, and the assertions cap each at one visible owner. A
+ * scroller that is not on this list is a defect by construction — that is the
+ * whole point, and it is what "unexpected" means.
+ *
+ * Adding an entry is a deliberate act: give it its own key rather than folding
+ * it into an existing one, so the one-owner-per-key cap keeps meaning what it
+ * says. `.chat-panel-dock` and `.ack-stack` both live inside the authoring
+ * pane alongside the transcript, so the pane legitimately has three named
+ * owners; collapsing them under "authoring" would trip the cap the first time
+ * two of them scrolled at once, which is a state the layout permits.
+ */
+const SCROLL_OWNER_SELECTORS = {
+  // The conversation transcript — freeform, and the guided authoring column.
+  authoring: ".chat-panel-messages, .guided-authoring-scroll",
+  // Docked chrome between transcript and composer (elspeth-ecf973fb9f). It is
+  // a scroll container BY DESIGN: that is what zeroes its automatic minimum
+  // size so it, rather than the composer, absorbs a vertical deficit. Deleting
+  // its overflow-y to quiet this gate reinstates the defect it was added to
+  // fix — the composer was measured 944px below the panel's bottom edge,
+  // clipped away entirely.
+  "authoring-dock": ".chat-panel-dock",
+  // Pinned acknowledgement stack, capped at 45vh with its own internal scroll
+  // (chat.css). Pre-existing and previously unregistered — the gate and the
+  // stylesheet had quietly diverged.
+  "authoring-ack": ".ack-stack",
+  artifact: ".artifact-workspace-panel:not([hidden])",
+  inspector: ".workspace-inspector-body",
+} as const;
+
+type ScrollOwner = keyof typeof SCROLL_OWNER_SELECTORS | "unexpected";
+
 interface ScrollCandidate {
   selector: string;
   className: string;
@@ -11,7 +47,7 @@ interface ScrollCandidate {
   clientWidth: number;
   scrollHeight: number;
   clientHeight: number;
-  owner: "authoring" | "artifact" | "inspector" | "unexpected";
+  owner: ScrollOwner;
   vertical: boolean;
   horizontal: boolean;
 }
@@ -164,7 +200,10 @@ export async function expectIntendedPaneScrollers(
   } = {},
 ): Promise<void> {
   const report = await page.getByTestId("composer-workspace").evaluate(
-    (workspace): { candidates: ScrollCandidate[]; outerOverflow: ScrollCandidate[] } => {
+    (
+      workspace,
+      registry: typeof SCROLL_OWNER_SELECTORS,
+    ): { candidates: ScrollCandidate[]; outerOverflow: ScrollCandidate[] } => {
       const result: ScrollCandidate[] = [];
       const describe = (
         element: HTMLElement,
@@ -172,16 +211,21 @@ export async function expectIntendedPaneScrollers(
         horizontal: boolean,
       ): ScrollCandidate => {
         const style = getComputedStyle(element);
-        const owner = element.matches(
-          ".chat-panel-messages, .guided-authoring-scroll",
+        const owner: ScrollCandidate["owner"] = element.matches(
+          registry.authoring,
         )
           ? "authoring"
-          : element.matches(".artifact-workspace-panel:not([hidden])")
-            ? "artifact"
-            : element.matches(".workspace-inspector-body") &&
-                element.closest<HTMLElement>(".workspace-inspector")?.hidden === false
-              ? "inspector"
-              : "unexpected";
+          : element.matches(registry["authoring-dock"])
+            ? "authoring-dock"
+            : element.matches(registry["authoring-ack"])
+              ? "authoring-ack"
+              : element.matches(registry.artifact)
+                ? "artifact"
+                : element.matches(registry.inspector) &&
+                    element.closest<HTMLElement>(".workspace-inspector")?.hidden ===
+                      false
+                  ? "inspector"
+                  : "unexpected";
         return {
           selector:
             element.getAttribute("aria-label") ??
@@ -244,6 +288,7 @@ export async function expectIntendedPaneScrollers(
       });
       return { candidates: result, outerOverflow };
     },
+    SCROLL_OWNER_SELECTORS,
   );
   const { candidates, outerOverflow } = report;
   expect(
@@ -260,7 +305,9 @@ export async function expectIntendedPaneScrollers(
     unexpectedHorizontal,
     `only the active artifact body may scroll horizontally: ${JSON.stringify(unexpectedHorizontal)}`,
   ).toEqual([]);
-  for (const owner of ["authoring", "artifact", "inspector"] as const) {
+  for (const owner of Object.keys(SCROLL_OWNER_SELECTORS) as Array<
+    keyof typeof SCROLL_OWNER_SELECTORS
+  >) {
     const verticalOwners = candidates.filter(
       (candidate) => candidate.owner === owner && candidate.vertical,
     );
@@ -283,6 +330,84 @@ export async function expectIntendedPaneScrollers(
         candidate.className.split(/\s+/).includes("workspace-inspector-body"),
       ),
     ).toBe(true);
+  }
+}
+
+/**
+ * The composer frame contract.
+ *
+ * Written from the INVARIANT, not from any defect: the chat panel's chrome is
+ * fixed to its own frame, and no box in the workspace outside the declared
+ * scroll-owner registry ever holds a scroll offset. Both statements are true
+ * of a correct build regardless of how a future regression is spelled, which
+ * is what a criterion has to be to outlive the bug that prompted it — a gate
+ * asserting "nobody calls scrollIntoView" dies the day someone scrolls a box
+ * by a different wrong mechanism; "the composer is at the panel's bottom edge"
+ * does not.
+ *
+ * This exists because the same defect was reported three times and fixed
+ * wrongly twice (elspeth-ecf973fb9f). `overflow: hidden` leaves a box
+ * programmatically scrollable, so an ancestor-walking scroll — scrollIntoView,
+ * focus(), find-in-page, an AT caret — could give .chat-panel an offset that
+ * no re-render cleared: the header rode off the top edge and the composer was
+ * stranded above a void until reload. Nothing in the system carried that fact
+ * to a human. expectIntendedPaneScrollers could not see it either, because it
+ * only ever enumerated boxes whose overflow is auto or scroll.
+ */
+export async function expectComposerFrameContract(page: Page): Promise<void> {
+  const frame = await page.getByTestId("composer-workspace").evaluate(
+    (workspace, registry: typeof SCROLL_OWNER_SELECTORS) => {
+      const owned = Object.values(registry).join(", ");
+      const latched: { className: string; scrollTop: number; scrollLeft: number }[] = [];
+      for (const element of workspace.querySelectorAll<HTMLElement>("*")) {
+        if (element.matches(owned)) continue;
+        if (element.scrollTop === 0 && element.scrollLeft === 0) continue;
+        latched.push({
+          className: element.className,
+          scrollTop: element.scrollTop,
+          scrollLeft: element.scrollLeft,
+        });
+      }
+      const panel = workspace.querySelector<HTMLElement>("#chat-main");
+      if (panel === null || panel.hidden) return { latched, edges: null };
+      const header = panel.querySelector<HTMLElement>(".chat-panel-header");
+      const input = panel.querySelector<HTMLElement>(".chat-input");
+      const panelBox = panel.getBoundingClientRect();
+      return {
+        latched,
+        edges: {
+          headerOffset:
+            header === null
+              ? null
+              : header.getBoundingClientRect().top - panelBox.top,
+          inputOffset:
+            input === null
+              ? null
+              : panelBox.bottom - input.getBoundingClientRect().bottom,
+        },
+      };
+    },
+    SCROLL_OWNER_SELECTORS,
+  );
+
+  expect(
+    frame.latched,
+    `no workspace box outside the scroll-owner registry may hold a scroll offset: ${JSON.stringify(frame.latched)}`,
+  ).toEqual([]);
+
+  if (frame.edges === null) return;
+  // Sub-pixel layout rounding is real; a latch is tens of pixels.
+  if (frame.edges.headerOffset !== null) {
+    expect(
+      Math.abs(frame.edges.headerOffset),
+      "the chat panel header must sit on the panel's top edge",
+    ).toBeLessThanOrEqual(1);
+  }
+  if (frame.edges.inputOffset !== null) {
+    expect(
+      Math.abs(frame.edges.inputOffset),
+      "the composer must sit on the panel's bottom edge",
+    ).toBeLessThanOrEqual(1);
   }
 }
 

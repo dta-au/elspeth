@@ -8417,26 +8417,68 @@ describe("ChatPanel jump-to-latest pill (elspeth-4ad68a3769)", () => {
       join(process.cwd(), "src/components/chat/chat.css"),
       "utf8",
     ).replace(/\/\*[\s\S]*?\*\//g, "");
-    const ruleBody = (selector: string): string =>
-      new RegExp(`${selector}\\s*\\{([^}]*)\\}`, "s").exec(css)?.[1] ?? "";
+    // EVERY body for the selector, not the first. A regex that stops at the
+    // first match would miss a later override — inside an @media block, say —
+    // which is precisely the regression these assertions exist to catch.
+    const ruleBodies = (selector: string): string[] => {
+      const bodies: string[] = [];
+      const pattern = new RegExp(`(^|[\\s,}])${selector}\\s*\\{([^{}]*)\\}`, "gm");
+      for (const match of css.matchAll(pattern)) bodies.push(match[2]);
+      return bodies;
+    };
+    const declaration = (bodies: string[], property: string): string | null => {
+      // The LAST declaration across all matching rules is the one that wins,
+      // which also lets a `hidden`-then-`clip` progressive-enhancement pair be
+      // written correctly in future without failing this test.
+      // The value class must admit functional notation — `min(160px, 30%)`
+      // is a value this stylesheet actually ships, and a narrower class
+      // silently skips it and reports an EARLIER declaration as the winner.
+      const pattern = new RegExp(`(?:^|[;{\\s])${property}:\\s*([^;{}]+?);`, "g");
+      let winner: string | null = null;
+      for (const body of bodies) {
+        for (const match of body.matchAll(pattern)) winner = match[1].trim();
+      }
+      return winner;
+    };
 
     // `clip` is load-bearing, not a synonym for `hidden`: a clip box is not a
     // scroll container, so no ancestor walk — scrollIntoView, focus(),
     // find-in-page, an AT caret — can give this panel a scroll offset at all.
     // Reverting this one word restores the defect even with the call sites
     // fixed, because the panel becomes scrollable again.
-    const panelRule = ruleBody("\\.chat-panel");
-    expect(panelRule).toMatch(/overflow:\s*clip/);
-    expect(panelRule).not.toMatch(/overflow:\s*hidden/);
+    const panelRules = ruleBodies("\\.chat-panel");
+    expect(panelRules.length).toBeGreaterThan(0);
+    expect(declaration(panelRules, "overflow")).toBe("clip");
 
-    // The dock absorbs the deficit so .chat-input never does. min-height:0 is
-    // what permits the shrink — without it the automatic minimum floors the
-    // dock at min-content and the composer is pushed through the panel's
-    // bottom edge again (measured 130px below it, clipped away entirely).
-    const dock = ruleBody("\\.chat-panel-dock");
-    expect(dock).toMatch(/flex:\s*0\s+1\s+auto/);
-    expect(dock).toMatch(/min-height:\s*0/);
-    expect(dock).toMatch(/overflow-y:\s*auto/);
+    // The dock absorbs the deficit so .chat-input never does. overflow-y:auto
+    // is the mechanism — it zeroes the dock's automatic minimum size AND
+    // keeps every docked surface reachable while the box is squeezed. Drop it
+    // and the composer is pushed through the panel's bottom edge again
+    // (measured 944px below it at a short panel, clipped away entirely).
+    const dock = ruleBodies("\\.chat-panel-dock");
+    expect(declaration(dock, "flex")).toBe("0 1 auto");
+    expect(declaration(dock, "overflow-y")).toBe("auto");
+    // Scroll chaining out of the dock into the transcript, same treatment as
+    // .chat-panel > .ack-stack.
+    expect(declaration(dock, "overscroll-behavior")).toBe("contain");
+
+    // The composer never yields — DECLARED. Without this, .chat-input is
+    // shrinkable (flex-shrink defaults to 1) and survives only on
+    // min-height:auto freezing it at its content minimum. Adding this
+    // codebase's own `min-height: 0` idiom to that rule collapsed it from
+    // 169px to 54px with every other test still green.
+    expect(declaration(ruleBodies("\\.chat-input"), "flex-shrink")).toBe("0");
+
+    // The transcript never reaches zero. `flex: 1` carries a zero basis, so
+    // this region contributes NOTHING to shrinking and is driven to 0 before
+    // the dock yields a pixel — leaving the operator approving a pipeline
+    // mutation with no visible conversation. The min() clamp is load-bearing:
+    // a bare 160px floor overflowed the panel at 367px.
+    const regionFloor = declaration(
+      ruleBodies("\\.chat-panel-messages-region"),
+      "min-height",
+    );
+    expect(regionFloor).toMatch(/^min\(/);
   });
 
   it("docks every optional surface, and never the composer, inside the dock", () => {
@@ -8452,10 +8494,15 @@ describe("ChatPanel jump-to-latest pill (elspeth-4ad68a3769)", () => {
 
     const input = screen.getByTestId("chat-input");
     expect(dock!.contains(input)).toBe(false);
-    // …and it renders BELOW the dock, so the dock is what the panel squeezes
-    // when space runs out. Document order rather than lastElementChild: the
-    // ChatInput mock in this file returns a fragment, so the panel's last
-    // element child is an artefact of the mock's shape, not of the layout.
+    // …and it renders BELOW the dock. Document order rather than
+    // lastElementChild: the ChatInput mock in this file returns a fragment, so
+    // the panel's last element child is an artefact of the mock's shape.
+    //
+    // Order is NOT why the dock is what gets squeezed — flex shrinkage is
+    // simultaneous and proportional to flex-shrink x flex-basis, then
+    // redistributed as items freeze at their clamps. The dock yields because
+    // its floor is 0 (it is a scroll container) while .chat-input's is
+    // declared flex-shrink: 0. Both facts are asserted in the stylesheet test.
     expect(
       dock!.compareDocumentPosition(input) &
         Node.DOCUMENT_POSITION_FOLLOWING,

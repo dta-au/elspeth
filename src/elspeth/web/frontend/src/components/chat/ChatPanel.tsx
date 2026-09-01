@@ -3246,7 +3246,13 @@ export function ChatPanel({
 
           Grouping is layout-only: each child keeps the DOM position, order and
           live-region semantics it had as a direct panel child. */}
-      <div className="chat-panel-dock">
+      {/* tabIndex=0 (WCAG 2.1.1): the dock is a scroll container whose hidden
+          content need not contain anything focusable — measured 67px below
+          the last focusable control, reachable by wheel or drag alone. Same
+          ruling and same idiom as the transcript scroller above. The cost is
+          one extra tab stop on the transcript-to-composer path; it is the
+          smaller loss. Focus ring in chat.css (.chat-panel-dock:focus-visible). */}
+      <div className="chat-panel-dock" tabIndex={0}>
         {/* Composing indicator — deliberately a SIBLING of the role="log"
             messages container, not a child (elspeth-76a0cc485e, WCAG 4.1.3):
             its role="status" is itself a polite live region, and nesting it
