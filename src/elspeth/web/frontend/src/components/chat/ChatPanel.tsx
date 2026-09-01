@@ -37,7 +37,11 @@ import { FreeformIntroduction } from "./FreeformIntroduction";
 import { BlobManager } from "@/components/blobs/BlobManager";
 import { CompletionSummary } from "./guided/CompletionSummary";
 import { ModeSwitchButton } from "./guided/ModeSwitchButton";
-import { PendingProposalsBanner } from "./PendingProposalsBanner";
+import {
+  PendingProposalsBanner,
+  PendingProposalsLiveRegion,
+  actionableProposals,
+} from "./PendingProposalsBanner";
 import { GuidedChatHistory } from "./guided/GuidedChatHistory";
 import { GuidedPendingStrip } from "./guided/GuidedPendingStrip";
 import { GUIDED_EXPLAIN_MESSAGE } from "./guided/explainPrompt";
@@ -1019,6 +1023,9 @@ export function ChatPanel({
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const guidedLogRef = useRef<HTMLDivElement>(null);
+  // The docked chrome's scroll container (.chat-panel-dock) — named so the
+  // proposal-arrival effect below can scroll IT, and only it.
+  const dockRef = useRef<HTMLDivElement>(null);
   // Guided-chat pending focus contract (elspeth-6a9673ecd3, placement pass
   // 2026-07-23). The input stays MOUNTED (disabled) while /guided/chat is in
   // flight — the old unmount swap is retired — so into pending there is no
@@ -1914,6 +1921,40 @@ export function ChatPanel({
       compositionProposals.filter((p) => !disambiguationProposalIds.has(p.id)),
     [compositionProposals, disambiguationProposalIds],
   );
+
+  // A newly-actionable proposal must be SEEN (elspeth-2d1cf8908c). The dock
+  // is a scroll container by design (elspeth-ecf973fb9f), so a banner that
+  // mounts below its fold — an open blob drawer or a tall composing card is
+  // enough — leaves the Accept control invisible with no signal a decision
+  // is waiting. When an actionable proposal id appears that the previous
+  // render did not have, scroll the dock BY NAME to the banner. Never
+  // scrollIntoView: its ancestor walk scrolls every scrollable box it finds
+  // and is the exact mechanism behind the elspeth-ecf973fb9f defect. Keyed
+  // to arrivals by VALUE (set membership, not array identity — the derived
+  // proposal arrays rebuild on unrelated store writes) so it repositions
+  // once per arrival and never fights the operator's own dock scrolling.
+  const actionableBannerProposalIds = useMemo(
+    () => actionableProposals(bannerProposals, staleProposalIds).map((p) => p.id),
+    [bannerProposals, staleProposalIds],
+  );
+  const seenActionableBannerIdsRef = useRef<ReadonlySet<string>>(new Set());
+  useEffect(() => {
+    const dock = dockRef.current;
+    // No dock on the guided surfaces: leave the seen-set unconsumed so the
+    // arrival still counts as new if the ids change again once the freeform
+    // body (and its dock) is mounted.
+    if (dock === null) return;
+    const seen = seenActionableBannerIdsRef.current;
+    seenActionableBannerIdsRef.current = new Set(actionableBannerProposalIds);
+    if (!actionableBannerProposalIds.some((id) => !seen.has(id))) return;
+    const banner = dock.querySelector<HTMLElement>(".pending-proposals-banner");
+    if (banner === null) return;
+    const bannerTop =
+      banner.getBoundingClientRect().top -
+      dock.getBoundingClientRect().top +
+      dock.scrollTop;
+    dock.scrollTo({ top: bannerTop, behavior: "smooth" });
+  }, [actionableBannerProposalIds]);
 
   // ── Disambiguation action handlers ─────────────────────────────────────────
   //
@@ -3252,7 +3293,7 @@ export function ChatPanel({
           ruling and same idiom as the transcript scroller above. The cost is
           one extra tab stop on the transcript-to-composer path; it is the
           smaller loss. Focus ring in chat.css (.chat-panel-dock:focus-visible). */}
-      <div className="chat-panel-dock" tabIndex={0}>
+      <div className="chat-panel-dock" tabIndex={0} ref={dockRef}>
         {/* Composing indicator — deliberately a SIBLING of the role="log"
             messages container, not a child (elspeth-76a0cc485e, WCAG 4.1.3):
             its role="status" is itself a polite live region, and nesting it
@@ -3282,6 +3323,15 @@ export function ChatPanel({
             surfaces. The widget handlers ultimately funnel through
             acceptProposal / rejectProposal so the audit chain is
             identical regardless of which surface lands the action. */}
+        {/* Persistent announcer for banner arrivals (elspeth-2d1cf8908c):
+            the banner returns null when empty, so a live-region role on the
+            banner itself would mount WITH its content — the unreliable
+            pattern AcknowledgementLiveRegion documents. This node pre-exists
+            the content; only its text mutates. */}
+        <PendingProposalsLiveRegion
+          proposals={bannerProposals}
+          staleProposalIds={staleProposalIds}
+        />
         <PendingProposalsBanner
           proposals={bannerProposals}
           staleProposalIds={staleProposalIds}

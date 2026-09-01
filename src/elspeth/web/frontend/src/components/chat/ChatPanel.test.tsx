@@ -741,6 +741,120 @@ describe("ChatPanel", () => {
     expect(screen.getByText("Replace the pipeline.")).toBeInTheDocument();
     expect(screen.getByText("Stale proposal")).toBeInTheDocument();
   });
+
+  // ── Dock arrival mechanics (elspeth-2d1cf8908c) ──────────────────────────
+  //
+  // The dock is a scroll container by design (elspeth-ecf973fb9f), so a
+  // PendingProposalsBanner mounting below its fold is silent: no live-region
+  // announcement (the banner returns null when empty, so a role on the banner
+  // itself would mount WITH its content — the unreliable pattern) and nothing
+  // scrolling the dock to the new approval control. These pin both halves:
+  // the persistent announcer and the scroll-the-dock-BY-NAME arrival scroll
+  // (never scrollIntoView — its ancestor walk is the elspeth-ecf973fb9f bug).
+  function makeArrivalProposal(id: string): CompositionProposal {
+    return {
+      id,
+      session_id: "session-1",
+      tool_call_id: `call-${id}`,
+      tool_name: "set_pipeline",
+      status: "pending",
+      summary: "Replace the pipeline.",
+      rationale: "Requested by the current composer turn.",
+      affects: ["graph"],
+      arguments_redacted_json: {},
+      base_state_id: null,
+      committed_state_id: null,
+      audit_event_id: `event-${id}`,
+      created_at: "2026-05-14T00:00:00Z",
+      updated_at: "2026-05-14T00:00:00Z",
+    };
+  }
+
+  function renderIdleFreeformPanel() {
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(),
+      retryMessage: vi.fn(),
+      cancelComposition: vi.fn(),
+      isComposing: false,
+      compositionState: null,
+      error: null,
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      messages: [],
+    });
+    const { container } = render(<ChatPanel />);
+    const dock = container.querySelector<HTMLElement>(".chat-panel-dock");
+    expect(dock).not.toBeNull();
+    return dock as HTMLElement;
+  }
+
+  it("scrolls the dock by name when a new actionable proposal arrives", async () => {
+    const dock = renderIdleFreeformPanel();
+    const scrollSpy = vi.spyOn(dock, "scrollTo");
+
+    act(() => {
+      useSessionStore.setState({
+        compositionProposals: [makeArrivalProposal("proposal-1")],
+      });
+    });
+
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalledTimes(1));
+    // The banner must be the scroll target's reason — and the mechanism must
+    // be the named dock, never an ancestor-walking scrollIntoView.
+    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
+
+    // Arrival-keyed, not identity-keyed: an unrelated store change re-renders
+    // the panel (and rebuilds the derived proposal arrays) but must not
+    // re-scroll a banner the operator may have scrolled away from.
+    act(() => {
+      useSessionStore.setState({
+        messages: [
+          {
+            id: "msg-1",
+            session_id: "session-1",
+            role: "user",
+            content: "hello",
+            tool_calls: null,
+            created_at: "2026-05-14T00:00:02Z",
+          },
+        ],
+      });
+    });
+    expect(scrollSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not scroll the dock when the arriving proposal is stale", () => {
+    const dock = renderIdleFreeformPanel();
+    const scrollSpy = vi.spyOn(dock, "scrollTo");
+
+    act(() => {
+      useSessionStore.setState({
+        compositionProposals: [makeArrivalProposal("proposal-1")],
+        staleProposalIds: ["proposal-1"],
+      });
+    });
+
+    expect(scrollSpy).not.toHaveBeenCalled();
+  });
+
+  it("announces a proposal arrival through the persistent live region", () => {
+    renderIdleFreeformPanel();
+
+    // The region pre-exists its content — that is the property that makes the
+    // 0→1 announcement reliable.
+    const region = screen.getByTestId("pending-proposals-live-region");
+    expect(region).toHaveAttribute("role", "status");
+    expect(region).toHaveTextContent("");
+
+    act(() => {
+      useSessionStore.setState({
+        compositionProposals: [makeArrivalProposal("proposal-1")],
+      });
+    });
+
+    expect(region).toHaveTextContent("1 pending change needs your approval");
+  });
 });
 
 // ── Mode discriminator tests (Task 8.1) ─────────────────────────────────────────
