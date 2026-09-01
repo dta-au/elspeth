@@ -263,3 +263,20 @@ Two rules `--help` will not tell you:
 2. On `SCHEMA_MISMATCH` the installed filigree is older than the project
    database. Surface it to the user; do not retry.
 <!-- /filigree:instructions -->
+
+<!-- loomweave:instructions:v1.6.0:39edbf6d -->
+<!-- loomweave:last-writer:loomweave install -->
+## Loomweave (code structure + SEI identity)
+
+Loomweave pre-extracts this repo into a queryable map — entities, their
+call/reference/import/relation edges, and subsystems — each carrying a Stable
+Entity Identity (SEI). Ask its `mcp__loomweave__*` tools, not grep, for "what
+calls X", "what subclasses X", "where is X defined", "find the thing that
+does Y".
+
+- Never hand-construct an entity id: take it from `entity_find` / `entity_at` /
+  `entity_resolve`, and bind cross-tool records on the `sei`, not the `id`.
+- If `project_status_get` reports stale, re-index before answering.
+
+Full reference: `loomweave-workflow` skill, `loomweave --help`, MCP schemas.
+<!-- /loomweave:instructions -->
