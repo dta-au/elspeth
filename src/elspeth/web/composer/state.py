@@ -2441,7 +2441,23 @@ def _node_topology_cycle(nodes: tuple[NodeSpec, ...]) -> tuple[str, ...] | None:
     return None
 
 
-def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, Any]]:
+class SinkTargetingBranchDict(TypedDict):
+    """The sink-publishing hop that lures one unreachable coalesce branch."""
+
+    node_id: str
+    on_success_sink: str
+    expected_connection: str
+
+
+class CoalesceReachabilityFactDict(TypedDict):
+    """Redaction-safe repair facts for one coalesce's unreachable branches."""
+
+    unreachable_branches: dict[str, str]
+    produced_connections: list[str]
+    sink_targeting_branches: NotRequired[list[SinkTargetingBranchDict]]
+
+
+def coalesce_reachability_facts(state: CompositionState) -> dict[str, CoalesceReachabilityFactDict]:
     """Redaction-safe wiring facts for coalesce branch-reachability rejections.
 
     Maps each coalesce node id whose ``branches`` values name connections no
@@ -2491,12 +2507,12 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, 
             connection = consumer.on_success
         return None
 
-    facts: dict[str, dict[str, Any]] = {}
+    facts: dict[str, CoalesceReachabilityFactDict] = {}
     for node in state.nodes:
         if node.node_type != "coalesce" or node.branches is None:
             continue
         unreachable: dict[str, str] = {}
-        sink_targeting: list[dict[str, str]] = []
+        sink_targeting: list[SinkTargetingBranchDict] = []
         for branch_name, branch_connection in zip(
             _coalesce_branch_names(node.branches),
             _coalesce_branch_connections(node.branches),
@@ -2510,7 +2526,7 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, 
                 sink_targeting.append({"node_id": lure[0], "on_success_sink": lure[1], "expected_connection": branch_connection})
         if not unreachable:
             continue
-        entry: dict[str, Any] = {
+        entry: CoalesceReachabilityFactDict = {
             "unreachable_branches": unreachable,
             # _FORK_ROUTE_TARGET is the reserved route keyword ("go to
             # fork_to"), not a connection — it rides the membership set but

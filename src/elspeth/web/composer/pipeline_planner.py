@@ -109,6 +109,7 @@ from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
 from elspeth.web.composer.state import (
     COMPOSER_NODE_TYPES,
+    CoalesceReachabilityFactDict,
     CompositionState,
     RouteDestinationFactDict,
     ValidationEntry,
@@ -2408,7 +2409,7 @@ def _allowlisted_candidate_feedback(
     """
     validation = result.validation
     errors: list[dict[str, Any]] = []
-    reachability_facts: dict[str, dict[str, Any]] | None = None
+    reachability_facts: dict[str, CoalesceReachabilityFactDict] | None = None
     destination_facts: dict[str, RouteDestinationFactDict] | None = None
     any_facts_withheld = False
     for entry in _rejection_entries(result):
