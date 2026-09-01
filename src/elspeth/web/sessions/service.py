@@ -5803,10 +5803,6 @@ class SessionServiceImpl:
                     f"{record.tool_call_id!r} which is not among this turn's "
                     f"tool rows {sorted(tool_row_ids)!r}"
                 )
-        rejections_by_tool_call_id: dict[str, list[RejectionRecord]] = {}
-        for record in rejection_records:
-            rejections_by_tool_call_id.setdefault(record.tool_call_id, []).append(record)
-
         now = self._now()
         # IntegrityError disposition (spec §4.5): the catch is
         # OUTSIDE ``with self._engine.begin()`` deliberately. Order is
@@ -5914,7 +5910,9 @@ class SessionServiceImpl:
                         # row, linked to the state CURRENT at rejection —
                         # ``current_state_id`` at this iteration, since a
                         # rejection commits no state of its own.
-                        for record in rejections_by_tool_call_id.get(tool_row.tool_call_id, ()):
+                        for record in rejection_records:
+                            if record.tool_call_id != tool_row.tool_call_id:
+                                continue
                             conn.execute(
                                 composition_rejection_events_table.insert().values(
                                     id=str(uuid.uuid4()),
