@@ -672,12 +672,20 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "A coalesce branches mapping names an incoming connection that no runtime routing field produces. The usual cause is "
         "the WIRING AROUND the coalesce, not the coalesce itself: a branch transform's on_success routes past the coalesce "
         "(e.g. straight to a sink), so nothing arrives under the connection name the branches value claims. The rejection's "
-        "connectivity facts list each unreachable branches value and every connection the pipeline actually produces.",
+        "connectivity facts, when present, carry 'unreachable_branches' — one record per broken branch, each naming the "
+        "branch ('branch'), the connection it consumes that nothing produces ('consumed_connection'), and, when that "
+        "branch's transform chain ends by publishing to a sink, the node that did it ('sink_lure', carrying 'node_id' and "
+        "'publishes_to_sink') — plus 'produced_connections', the connections the reachability check accepts, with sink "
+        "names, the coalesce's own id and the fork keyword removed because they pass that check but are never a correct "
+        "branch value. Membership in 'produced_connections' does NOT make a value correct for a given branch: the right "
+        "value is whatever THAT branch's own transform publishes.",
         "Wire each fork branch end-to-end: the gate fork_to name is the branch transform's input; that transform's on_success "
         "must be a unique connection name (NOT a sink); the coalesce branches VALUE for that branch is exactly that connection. "
         "A branch with no transforms uses its fork branch name as the value. If a branches value names a connection nothing "
         "produces, repair that branch's transform — point its on_success at the branches value — rather than merely swapping "
-        "the branches value for one of the produced_connections.",
+        "the branches value for one of the produced_connections. Where a branch record carries 'sink_lure', that node_id IS "
+        "the transform to repair: set its on_success to that record's 'consumed_connection' instead of the sink it currently "
+        "publishes to.",
     ),
     (
         r"node_input_not_reachable|input '(.+)' is not reachable",

@@ -1023,14 +1023,25 @@ class TestPlannerFeedbackCarriesStructuralFacts:
         monkeypatch.setattr(
             planner_module,
             "coalesce_reachability_facts",
-            lambda _state: {"merge": {"produced_connections": ["left", "right"]}},
+            # A realistic fact value: the real function never emits an entry
+            # without unreachable_branches, so a double that omits it could
+            # not catch the projection dropping a field.
+            lambda _state: {
+                "merge": {
+                    "unreachable_branches": [{"branch": "left", "consumed_connection": "left_done"}],
+                    "produced_connections": ["left", "right"],
+                }
+            },
         )
         feedback = _allowlisted_candidate_feedback(result)
         assert [entry["error_code"] for entry in feedback["validation"]["errors"]] == [
             "coalesce_branch_unreachable",
             "node_input_not_reachable",
         ]
-        assert feedback["validation"]["errors"][0]["connectivity"] == {"produced_connections": ["left", "right"]}
+        assert feedback["validation"]["errors"][0]["connectivity"] == {
+            "unreachable_branches": [{"branch": "left", "consumed_connection": "left_done"}],
+            "produced_connections": ["left", "right"],
+        }
         assert _candidate_rejection_codes(result) == ("coalesce_branch_unreachable", "node_input_not_reachable")
 
     def test_rejection_trail_codes_never_empty_when_entries_exist(self) -> None:
@@ -1200,20 +1211,28 @@ class TestCoalesceReachabilityFacts:
         facts = coalesce_reachability_facts(state)
         assert facts == {
             "merge": {
-                "unreachable_branches": {"branch_a": "a_done", "branch_b": "b_done"},
+                # One record per broken branch, each carrying its own lure:
+                # the repair reads "this branch is broken AND this node broke
+                # it" as one fact, with no join back by connection name
+                # (guided attempt 14, session 04200b45 — the model wired
+                # branch transforms to the reviewed sink 3x with the bare
+                # facts live).
+                "unreachable_branches": [
+                    {
+                        "branch": "branch_a",
+                        "consumed_connection": "a_done",
+                        "sink_lure": {"node_id": "t_a", "publishes_to_sink": "main"},
+                    },
+                    {
+                        "branch": "branch_b",
+                        "consumed_connection": "b_done",
+                        "sink_lure": {"node_id": "t_b", "publishes_to_sink": "main"},
+                    },
+                ],
                 # Sink names and the coalesce's own published id are excluded:
                 # both pass the membership walk today but are not connections a
                 # branch value should be steered toward.
                 "produced_connections": ["branch_a", "branch_b", "rows"],
-                # The lure, named: each unreachable branch whose branch-side
-                # transform publishes to a SINK instead of the expected
-                # connection (guided attempt 14, session 04200b45 — the model
-                # wired branch transforms to the reviewed sink 3x with the
-                # bare facts live).
-                "sink_targeting_branches": [
-                    {"node_id": "t_a", "on_success_sink": "main", "expected_connection": "a_done"},
-                    {"node_id": "t_b", "on_success_sink": "main", "expected_connection": "b_done"},
-                ],
             }
         }
 
@@ -1222,15 +1241,67 @@ class TestCoalesceReachabilityFacts:
 
         state = _orphaned_coalesce_state(("a_done", "b_done"))
         facts = coalesce_reachability_facts(state)
-        # List-form branch keys are the arriving connection names themselves —
-        # nothing consumes them as an input, so no branch-side transform chain
-        # exists to attribute a sink lure to.
+        # List-form branch keys are the arriving connection names themselves,
+        # so they are identity branches and never carry a lure — see
+        # test_identity_branch_never_carries_a_sink_lure for the case where a
+        # transform DOES consume the name. The record states branch and
+        # connection as the same string outright; the old mapping form encoded
+        # this as {"a_done": "a_done"}, which reads like an alias->connection
+        # pair carrying information it does not have.
         assert facts == {
             "merge": {
-                "unreachable_branches": {"a_done": "a_done", "b_done": "b_done"},
+                "unreachable_branches": [
+                    {"branch": "a_done", "consumed_connection": "a_done"},
+                    {"branch": "b_done", "consumed_connection": "b_done"},
+                ],
                 "produced_connections": ["branch_a", "branch_b", "rows"],
             }
         }
+
+    def test_identity_branch_never_carries_a_sink_lure(self) -> None:
+        """An identity branch must not name a lure — the walk finds a CONSUMER.
+
+        ``_sink_lure`` walks from the branch NAME. For a mapped branch that
+        name is the fork alias, so the transform consuming it is the branch's
+        producer and re-pointing its on_success is the correct repair. For an
+        identity branch the name IS the consumed connection, so the walk finds
+        a node competing for the connection the coalesce awaits. Naming it
+        would make the planner set that node's on_success to its own input —
+        a self-loop rejected as ``pipeline_cycle``, burning a repair turn in
+        the payload that exists to stop exactly that.
+
+        Here ``t_a`` consumes ``a_done`` (the identity branch name) and
+        publishes to the sink, so the pre-guard code DID attribute a lure.
+        """
+        from elspeth.web.composer.state import coalesce_reachability_facts
+
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(_make_gate("fan_out", "rows", ("branch_a", "branch_b")))
+        state = state.with_node(_make_transform("t_a", "a_done", "main"))
+        state = state.with_node(_make_coalesce("merge", ("a_done", "b_done")))
+        state = state.with_node(_make_transform("tidy", "merge", "main"))
+        state = state.with_output(_make_output())
+        facts = coalesce_reachability_facts(state)
+        assert facts["merge"]["unreachable_branches"] == [
+            {"branch": "a_done", "consumed_connection": "a_done"},
+            {"branch": "b_done", "consumed_connection": "b_done"},
+        ]
+
+    def test_unreachable_branches_follow_authored_order_not_sorted_order(self) -> None:
+        """Order is the order the planner authored, never sorted.
+
+        Pinned because the list form makes order observable where the old
+        mapping's was incidental: a reader matching record N against its own
+        emitted branches must see them in the order it wrote them. The branch
+        names here sort into the opposite order, so a ``sorted()`` slipped
+        into the emitter fails this and passes a same-order fixture.
+        """
+        from elspeth.web.composer.state import coalesce_reachability_facts
+
+        state = _orphaned_coalesce_state({"branch_b": "b_done", "branch_a": "a_done"})
+        facts = coalesce_reachability_facts(state)
+        assert [record["branch"] for record in facts["merge"]["unreachable_branches"]] == ["branch_b", "branch_a"]
 
     def test_sink_lure_attribution_follows_transform_chains_and_skips_non_sink_dangles(self) -> None:
         """The lure walk follows a branch's transform CHAIN to the sink hop.
@@ -1252,8 +1323,15 @@ class TestCoalesceReachabilityFacts:
         state = state.with_node(_make_transform("tidy", "merge", "main"))
         state = state.with_output(_make_output())
         facts = coalesce_reachability_facts(state)
-        assert facts["merge"]["sink_targeting_branches"] == [
-            {"node_id": "t_mid", "on_success_sink": "main", "expected_connection": "a_done"},
+        assert facts["merge"]["unreachable_branches"] == [
+            {
+                "branch": "branch_a",
+                "consumed_connection": "a_done",
+                "sink_lure": {"node_id": "t_mid", "publishes_to_sink": "main"},
+            },
+            # branch_b is unreachable but carries NO sink_lure: t_b dangles to
+            # a non-sink name, so there is no sink-publishing hop to name.
+            {"branch": "branch_b", "consumed_connection": "b_done"},
         ]
 
     def test_reachability_facts_empty_for_correctly_wired_coalesce(self) -> None:
@@ -1285,13 +1363,24 @@ class TestCoalesceReachabilityFacts:
         projected = feedback["validation"]["errors"][0]
         assert projected["error_code"] == "coalesce_branch_unreachable"
         assert "message" not in projected
+        # The one PROJECTION-level assertion for this payload: it proves the
+        # facts cross _allowlisted_candidate_feedback unmodified. The other
+        # sites call coalesce_reachability_facts directly, so only this one
+        # would catch the projection dropping or reshaping a field.
         assert projected["connectivity"] == {
-            "unreachable_branches": {"branch_a": "a_done", "branch_b": "b_done"},
-            "produced_connections": ["branch_a", "branch_b", "rows"],
-            "sink_targeting_branches": [
-                {"node_id": "t_a", "on_success_sink": "main", "expected_connection": "a_done"},
-                {"node_id": "t_b", "on_success_sink": "main", "expected_connection": "b_done"},
+            "unreachable_branches": [
+                {
+                    "branch": "branch_a",
+                    "consumed_connection": "a_done",
+                    "sink_lure": {"node_id": "t_a", "publishes_to_sink": "main"},
+                },
+                {
+                    "branch": "branch_b",
+                    "consumed_connection": "b_done",
+                    "sink_lure": {"node_id": "t_b", "publishes_to_sink": "main"},
+                },
             ],
+            "produced_connections": ["branch_a", "branch_b", "rows"],
         }
 
     def test_allowlisted_feedback_omits_connectivity_for_other_codes(self) -> None:

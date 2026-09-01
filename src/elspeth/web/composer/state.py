@@ -2441,20 +2441,36 @@ def _node_topology_cycle(nodes: tuple[NodeSpec, ...]) -> tuple[str, ...] | None:
     return None
 
 
-class SinkTargetingBranchDict(TypedDict):
+class SinkLureDict(TypedDict):
     """The sink-publishing hop that lures one unreachable coalesce branch."""
 
     node_id: str
-    on_success_sink: str
-    expected_connection: str
+    publishes_to_sink: str
+
+
+class UnreachableBranchDict(TypedDict):
+    """One coalesce branch whose consumed connection nothing produces.
+
+    Carries its own ``sink_lure`` rather than exposing a parallel list keyed
+    by connection name: the repair needs "this branch is broken AND this is
+    the node that broke it" as one fact, not two the reader must join on a
+    string.
+
+    ``branch`` matches the identity key of the sibling per-member record
+    ``RowUnionBranchSchemaDetailDict`` — one envelope should not name one
+    concept three ways.
+    """
+
+    branch: str
+    consumed_connection: str
+    sink_lure: NotRequired[SinkLureDict]
 
 
 class CoalesceReachabilityFactDict(TypedDict):
     """Redaction-safe repair facts for one coalesce's unreachable branches."""
 
-    unreachable_branches: dict[str, str]
+    unreachable_branches: list[UnreachableBranchDict]
     produced_connections: list[str]
-    sink_targeting_branches: NotRequired[list[SinkTargetingBranchDict]]
 
 
 def coalesce_reachability_facts(state: CompositionState) -> dict[str, CoalesceReachabilityFactDict]:
@@ -2462,12 +2478,14 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, CoalesceRe
 
     Maps each coalesce node id whose ``branches`` values name connections no
     runtime routing field produces to the facts a repair needs:
-    ``unreachable_branches`` (branch key -> consumed connection value, exactly
-    as authored — list-form branches key by the entry itself) and
-    ``produced_connections`` (the membership set ``validate()``'s
-    ``coalesce_branch_unreachable`` check tests, minus sink names and the
-    coalesce's own published id — both pass the walk but are never a correct
-    branch value, so the facts must not steer a repair toward them).
+    ``unreachable_branches`` (one record per broken branch, naming the branch
+    and the connection it consumes exactly as authored — for list-form
+    branches the two are the same string, which the record states plainly
+    rather than encoding as a self-mapping) and ``produced_connections`` (the
+    membership set ``validate()``'s ``coalesce_branch_unreachable`` check
+    tests, minus sink names and the coalesce's own published id — both pass
+    the walk but are never a correct branch value, so the facts must not
+    steer a repair toward them).
 
     Guided session 277fb6c4 (2026-07-22) exhausted its repair budget on four
     identical ``coalesce_branch_unreachable`` rejections: the observed
@@ -2478,13 +2496,25 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, CoalesceRe
     ``SchemaContractDetail`` — so forwarding it through the message-stripped
     repair feedback does not re-open the redaction boundary.
 
-    ``sink_targeting_branches`` names the lure explicitly: for each
-    unreachable branch whose branch-side transform CHAIN terminates in a
-    sink-publishing hop, the entry carries that transform's id, the sink it
-    publishes to, and the connection the coalesce expects instead. Guided
-    attempt 14 (session 04200b45) re-wired branch transforms to the
-    reviewed sink three times WITH the bare facts live — the repair needs
-    the exact miswired node named.
+    A MAPPED branch whose branch-side transform CHAIN terminates in a
+    sink-publishing hop carries ``sink_lure``: that transform's id and the
+    sink it publishes to. Guided attempt 14 (session 04200b45) re-wired
+    branch transforms to the reviewed sink three times WITH the bare facts
+    live — the repair needs the exact miswired node named. The lure rides
+    on the branch record it explains, so nothing has to be joined back by
+    connection name; the connection the coalesce expects is that record's
+    own ``consumed_connection``.
+
+    An IDENTITY branch (list form, or a mapping entry whose value equals
+    its key) never carries a lure: the walk starts from the branch name,
+    which for such a branch is the consumed connection itself, so it finds
+    a competing consumer rather than a producer. See the guard at the
+    append site.
+
+    Every field here is taught to the planner per-key in
+    ``tools/generation.py``'s ``coalesce_branch_unreachable`` guidance. A
+    fact the model is never told how to read cannot repair anything, so a
+    new field is a change to BOTH surfaces.
     """
     targets = _runtime_connection_targets(state.sources, state.nodes)
     sink_names = {output.name for output in state.outputs}
@@ -2493,7 +2523,7 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, CoalesceRe
         if node.node_type == "transform" and node.input not in transform_by_input:
             transform_by_input[node.input] = node
 
-    def _sink_lure(branch_key: str) -> tuple[str, str] | None:
+    def _sink_lure(branch_key: str) -> SinkLureDict | None:
         """Follow the transform chain consuming ``branch_key`` to a sink hop."""
         connection = branch_key
         for _ in range(len(state.nodes)):
@@ -2503,7 +2533,7 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, CoalesceRe
             if consumer.on_success is None:
                 return None
             if consumer.on_success in sink_names:
-                return consumer.id, consumer.on_success
+                return {"node_id": consumer.id, "publishes_to_sink": consumer.on_success}
             connection = consumer.on_success
         return None
 
@@ -2511,8 +2541,7 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, CoalesceRe
     for node in state.nodes:
         if node.node_type != "coalesce" or node.branches is None:
             continue
-        unreachable: dict[str, str] = {}
-        sink_targeting: list[SinkTargetingBranchDict] = []
+        unreachable: list[UnreachableBranchDict] = []
         for branch_name, branch_connection in zip(
             _coalesce_branch_names(node.branches),
             _coalesce_branch_connections(node.branches),
@@ -2520,22 +2549,32 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, CoalesceRe
         ):
             if branch_connection in targets:
                 continue
-            unreachable[str(branch_name)] = branch_connection
-            lure = _sink_lure(str(branch_name))
-            if lure is not None:
-                sink_targeting.append({"node_id": lure[0], "on_success_sink": lure[1], "expected_connection": branch_connection})
+            record: UnreachableBranchDict = {"branch": branch_name, "consumed_connection": branch_connection}
+            # Only a MAPPED branch can carry a lure. _sink_lure walks from the
+            # branch NAME, which for a mapped branch is the fork alias — so the
+            # transform consuming it is that branch's producer, and re-pointing
+            # its on_success at the consumed connection is the correct repair.
+            # For an identity branch (list form, or a mapping entry whose value
+            # equals its key) the name IS the consumed connection, so that walk
+            # finds a competing CONSUMER of the connection the coalesce awaits.
+            # Naming it would tell the planner to set that node's on_success to
+            # its own input — a self-loop, rejected as pipeline_cycle, spending
+            # a repair turn in the one payload that exists to stop repair
+            # budgets burning on coalesce_branch_unreachable.
+            if branch_name != branch_connection:
+                lure = _sink_lure(branch_name)
+                if lure is not None:
+                    record["sink_lure"] = lure
+            unreachable.append(record)
         if not unreachable:
             continue
-        entry: CoalesceReachabilityFactDict = {
+        facts[node.id] = {
             "unreachable_branches": unreachable,
             # _FORK_ROUTE_TARGET is the reserved route keyword ("go to
             # fork_to"), not a connection — it rides the membership set but
             # must not be advertised as a wirable name.
             "produced_connections": sorted(targets - sink_names - {node.id, _FORK_ROUTE_TARGET}),
         }
-        if sink_targeting:
-            entry["sink_targeting_branches"] = sink_targeting
-        facts[node.id] = entry
     return facts
 
 
