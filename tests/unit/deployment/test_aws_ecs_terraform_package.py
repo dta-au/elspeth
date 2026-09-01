@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NoReturn, get_args
 
@@ -33,6 +34,35 @@ def _require_terraform(reason: str) -> None:
     if os.environ.get("GITHUB_ACTIONS"):
         pytest.fail(f"terraform binary is missing in CI: {reason}")
     pytest.skip(f"terraform is not installed, so {reason}")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _terraform_plugin_cache() -> Iterator[None]:
+    """Install each provider once per worker instead of once per Terraform root.
+
+    Every ``terraform init`` in this module runs in a throwaway directory, so
+    with no plugin cache each one re-extracts the ~830 MB AWS provider.
+    ``initialized_terraform_package`` pays that FOUR times (bootstrap plus the
+    three scenarios), which is where this module's wall time went: measured
+    116 s -> 58 s cold and 43 s warm, fixture setup 96 s -> 17 s. Nothing about
+    what any test asserts changes; only where the provider binary comes from.
+
+    Per WORKER, not shared: Terraform does not promise the plugin cache is safe
+    against concurrent writers, and pytest-xdist can schedule this module onto
+    several workers at once. An operator-supplied TF_PLUGIN_CACHE_DIR always
+    wins — CI may point at a warmed, checksum-pinned cache.
+    """
+    if os.environ.get("TF_PLUGIN_CACHE_DIR"):
+        yield
+        return
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    cache = Path.home() / ".cache" / "elspeth" / "terraform-plugins" / worker
+    cache.mkdir(parents=True, exist_ok=True)
+    os.environ["TF_PLUGIN_CACHE_DIR"] = str(cache)
+    try:
+        yield
+    finally:
+        os.environ.pop("TF_PLUGIN_CACHE_DIR", None)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -256,6 +286,7 @@ def test_all_ecr_repository_inputs_enforce_the_same_aws_contract() -> None:
         pytest.param("elspeth-App", False, id="uppercase"),
     ],
 )
+@pytest.mark.terraform
 def test_ecr_repository_validation_matches_aws_name_contract(tmp_path: Path, repository: str, accepted: bool) -> None:
     _require_terraform("the ECR repository validator must execute")
     variables = _text("bootstrap/variables.tf")
@@ -292,6 +323,7 @@ def test_ecr_repository_validation_matches_aws_name_contract(tmp_path: Path, rep
         pytest.param("elspeth-state--table-s3", False, id="table-bucket-suffix"),
     ],
 )
+@pytest.mark.terraform
 def test_backend_state_bucket_validation_enforces_s3_length_limit(tmp_path: Path, bucket: str, accepted: bool) -> None:
     _require_terraform("the backend state bucket validator must execute")
     variables = _text("bootstrap/variables.tf")
@@ -373,6 +405,7 @@ _ALB_INGRESS_CASES: tuple[tuple[str, bool], ...] = (
 )
 
 
+@pytest.mark.terraform
 def test_alb_ingress_guard_rejects_every_spelling_of_a_world_open_cidr(tmp_path: Path) -> None:
     """The `/0` guard must test the PARSED prefix, not the raw string suffix.
 
@@ -2768,6 +2801,7 @@ def initialized_terraform_package(tmp_path_factory: pytest.TempPathFactory) -> P
     return isolated
 
 
+@pytest.mark.terraform
 def test_scenario_a_native_mock_plans_use_only_documented_minimal_inputs(initialized_terraform_package: Path) -> None:
     scenario_a = initialized_terraform_package / "scenario-a"
     codeblind_test = scenario_a / "codeblind.tftest.hcl"
@@ -2803,6 +2837,7 @@ def test_scenario_a_native_mock_plans_use_only_documented_minimal_inputs(initial
     assert "Success!" in result.stdout
 
 
+@pytest.mark.terraform
 def test_iam_role_contract_drift_replaces_roles_and_dependent_policies(
     initialized_terraform_package: Path,
 ) -> None:
@@ -2874,6 +2909,7 @@ def test_iam_role_replacement_trigger_binds_the_complete_role_contract() -> None
         assert "create_before_destroy" not in body
 
 
+@pytest.mark.terraform
 def test_scenario_c_native_mock_plans_enforce_the_gateway_contract(initialized_terraform_package: Path) -> None:
     scenario_c = initialized_terraform_package / "scenario-c"
     gateway_test = scenario_c / "gateway_contract.tftest.hcl"

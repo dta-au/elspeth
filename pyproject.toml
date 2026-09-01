@@ -468,6 +468,7 @@ markers = [
     "live_azure: marks protected tests that cross a real Azure service boundary",
     "live_dataverse: marks protected tests that cross a real Dataverse boundary",
     "live_chroma: marks protected tests that cross a real Chroma service boundary",
+    "terraform: marks tests that shell out to the terraform binary (deselect with '-m \"not terraform\"')",
 ]
 # Load .env file for integration tests (API keys)
 env_files = [".env"]
