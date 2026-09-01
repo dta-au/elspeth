@@ -92,6 +92,7 @@ from elspeth.web.composer.tools._common import (
     _vf_destination_note,
     canonicalize_source_validation_failure,
     normalize_tool_result_validation,
+    review_reconciliation_failure_message,
     validate_composer_file_sink_collision_policy,
 )
 from elspeth.web.composer.tools.blobs import (
@@ -1618,18 +1619,18 @@ def build_set_pipeline_candidate(
         return _failure_result(state, message, error_code=error_code)
     try:
         new_state = reconcile_authoritative_reviews(state, new_state)
-    except TypeError as exc:
-        if str(exc) == "interpretation_requirements must be a list":
+    except (KeyError, TypeError, ValueError) as exc:
+        # The list-shape TypeError keeps its own bare message: it names the
+        # payload key the planner must fix and carries no error_code, so the
+        # generic reconciliation code would misroute the repair.
+        if type(exc) is TypeError and str(exc) == "interpretation_requirements must be a list":
             return _failure_result(state, "interpretation_requirements must be a list.")
         return _failure_result(
             state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the exact set_pipeline_arguments payload and retry.",
-            error_code="review_reconciliation_failed",
-        )
-    except (KeyError, ValueError):
-        return _failure_result(
-            state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the exact set_pipeline_arguments payload and retry.",
+            review_reconciliation_failure_message(
+                exc,
+                retry_hint="Re-inspect the exact set_pipeline_arguments payload and retry.",
+            ),
             error_code="review_reconciliation_failed",
         )
     canonical_error = _composition_canonical_interpretation_requirement_error(

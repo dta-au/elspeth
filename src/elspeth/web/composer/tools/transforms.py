@@ -60,6 +60,7 @@ from elspeth.web.composer.tools._common import (
     _validate_plugin_name,
     _validate_transform_provider_config_path,
     _validate_transform_provider_config_policy,
+    review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
@@ -747,10 +748,10 @@ def _execute_upsert_node(
         return _failure_result(state, message, error_code=error_code)
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError) as exc:
         return _failure_result(
             state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
         )
     review_contract_error = composition_review_contract_error(new_state)
@@ -1210,10 +1211,10 @@ def _execute_splice_transform(
         )
     try:
         reconciled = reconcile_authoritative_reviews(state, proposed)
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError) as exc:
         return _failure_result(
             state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
         )
     canonical_error = _composition_canonical_interpretation_requirement_error(
@@ -1558,10 +1559,10 @@ def _execute_patch_node_options(
         return _failure_result(state, message, error_code=error_code)
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError) as exc:
         return _failure_result(
             state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
         )
     review_contract_error = composition_review_contract_error(new_state)

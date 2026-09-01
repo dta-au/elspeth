@@ -959,3 +959,71 @@ def test_unknown_pipeline_decision_user_term_fails_closed() -> None:
     assert result.updated_state.version == previous.version
     assert result.data["error_code"] == "interpretation_requirements_invalid"
     assert "unknown-decision" not in result.data["error"]
+
+
+def _reconciler_stale_hash_state() -> CompositionState:
+    """A committed llm node whose resolved model-choice hash no longer matches.
+
+    Reaching ``reconcile_authoritative_reviews`` at all requires options that
+    survive plugin prevalidation (``_prevalidate_transform_for_context`` runs
+    first and rejects an llm node missing ``prompt_template`` / ``provider`` /
+    ``required_input_fields`` long before reconciliation), so this fixture
+    carries a fully valid node and corrupts only the stored review hash.
+    """
+    model = "bedrock/example.model"
+    stale = _requirement(
+        requirement_id="model_choice_review:enrich",
+        kind=InterpretationKind.LLM_MODEL_CHOICE,
+        user_term="llm_model_choice:enrich",
+        status="resolved",
+        draft=model,
+        accepted_value=model,
+        resolved_prompt_template_hash="stale-hash",
+    )
+    return _state(
+        nodes=(
+            _node(
+                node_id="enrich",
+                options={
+                    "provider": "bedrock",
+                    "model": model,
+                    "prompt_template": "Extract the industry from {{ row.company }}",
+                    "response_field": "industry",
+                    "required_input_fields": ["company"],
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [stale],
+                },
+            ),
+        )
+    )
+
+
+def test_review_reconciliation_failure_names_the_underlying_cause() -> None:
+    """A reconciliation rejection must say WHICH invariant failed.
+
+    Session f33fa7c3 (2026-09-01) wedged because every raise inside
+    ``reconcile_authoritative_reviews`` — ten distinct causes — collapsed into
+    one identical "re-inspect the payload and retry" sentence at the
+    ``set_pipeline`` boundary. The planner resubmitted a byte-identical
+    payload twice and failed identically: a rejection that cannot name its
+    own cause is unrepairable by construction, the same REPAIR_BLIND_REPEAT
+    shape as the 2026-08-19 withdrawal.
+    """
+    previous = _reconciler_stale_hash_state()
+
+    result = _execute_set_pipeline(deep_thaw(_exact_arguments(previous).data), previous, _trained_context())
+
+    assert not result.success
+    assert result.updated_state is previous
+    assert result.updated_state.version == previous.version
+    assert result.data["error_code"] == "review_reconciliation_failed"
+    # The specific invariant, not just the generic retry instruction.
+    assert "hash drifted" in result.data["error"], result.data["error"]
+    # ...and WHICH requirement drifted. This asserts a server-owned requirement
+    # id reaching the planner, which is deliberate and redaction-safe: the id is
+    # a pipeline identifier derived from kind + node id, not row content, and
+    # the same boundary already returns rejected option KEYS and VALUES from
+    # plugin prevalidation (see plugin_identities_in_option_failure). Without
+    # the id, a pipeline carrying several resolved reviews still leaves the
+    # planner guessing which one to re-send.
+    assert "model_choice_review:enrich" in result.data["error"], result.data["error"]

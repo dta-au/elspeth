@@ -1022,6 +1022,20 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Apply the requested change under revision_authority: preserve existing nodes and use only insertion rewiring in amend mode, or perform the explicitly requested replacement in replace mode, then re-emit the complete pipeline.",
     ),
     (
+        r"review_reconciliation_failed|Authoritative interpretation-review reconciliation failed",
+        "An interpretation review on this pipeline was already APPROVED, and the submitted payload does not reconcile "
+        "with the server's authoritative record of it. The specific invariant is named in the rejection message after "
+        "the colon — read it: it identifies the requirement or node at fault (a drifted artifact hash, a duplicate "
+        "review identity, a resolved row missing its event_id or accepted_value, or a vague-term review that cannot "
+        "round-trip without prompt_template_parts). The reviewed material itself is server-owned; a rebuilt-from-memory "
+        "payload that drops or re-words it will not reconcile.",
+        "Do NOT resubmit the same payload — it will be rejected identically. Call get_pipeline_state with "
+        'component="set_pipeline_arguments" to obtain the exact round-trippable payload for the CURRENT state, apply '
+        "only the change you intend to that payload, and re-emit it as the full set_pipeline call. Never author the "
+        "server-owned review fields (id, status, event_id, accepted_value, resolved_prompt_template_hash); each "
+        "interpretation_requirements entry you send carries only {kind, user_term, draft}.",
+    ),
+    (
         r"interpretation_review_draft_malformed|cleanup review draft is malformed",
         "The cleanup node's interpretation_requirements row IS present and its user_term matches the registered decision kind, but the draft text fails marker recognition — the contract recognizes the draft only when it contains both 'raw html' and 'fingerprint'. Do NOT add another row; the fix is the draft text alone.",
         "On the existing cleanup row, replace ONLY the draft string with the canonical draft, copied verbatim without rephrasing: "
@@ -1351,6 +1365,11 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # 'validation_error' placeholder while the actionable message was redacted.
     "interpretation_review_contract_unsatisfied",
     "interpretation_review_draft_malformed",
+    # ── Authoritative review reconciliation (session f33fa7c3, 2026-09-01) ─
+    # Ten invariants inside reconcile_authoritative_reviews shared one opaque
+    # message and no code, so explain_validation_error fell through to its
+    # no-match branch and the planner blind-repeated an identical payload.
+    "review_reconciliation_failed",
     "file_sink_write_policy_invalid",
     # ── Nodeless-revision guard (same closure; proposal 3cb6532e) ──────────
     # A revision candidate netting zero transform nodes drew one coded nudge

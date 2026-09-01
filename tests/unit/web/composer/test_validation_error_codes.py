@@ -26,6 +26,7 @@ These tests pin the closure:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -50,6 +51,7 @@ from elspeth.web.composer.tools._common import _PLUGIN_UNAVAILABLE_EXPLANATIONS
 from elspeth.web.composer.tools.generation import (
     _CLOSED_VALIDATION_ERROR_CODES,
     _PLUGIN_UNAVAILABLE_FIXES,
+    _VALIDATION_ERROR_PATTERNS,
     explain_validation_code,
 )
 from elspeth.web.plugin_policy.models import PluginUnavailableReason
@@ -813,6 +815,40 @@ class TestClosedCodeCatalogueInvariants:
         assert "reviewed output form" in fix
         assert "tutorial" not in (explanation + fix).lower()
         assert "private" not in (explanation + fix).lower()
+
+    def test_review_reconciliation_failed_is_closed_and_actionable(self) -> None:
+        """The reconciliation rejection must be explainable on BOTH surfaces.
+
+        Session f33fa7c3 (2026-09-01): ``set_pipeline`` rejected with
+        ``review_reconciliation_failed``, the planner called
+        ``explain_validation_error`` with the verbatim message, and the code
+        was in neither ``_VALIDATION_ERROR_PATTERNS`` nor the closed
+        catalogue — so the tool fell through to its no-match branch and
+        answered "does not match any known validation message or closed
+        error_code". The planner had nothing new and resubmitted an identical
+        payload. Both lookup paths are pinned here: the freeform tool matches
+        the MESSAGE, and the one-shot planner feedback
+        (``_allowlisted_candidate_feedback``) strips the message and can only
+        resolve the bare CODE.
+        """
+        code = "review_reconciliation_failed"
+        assert code in _CLOSED_VALIDATION_ERROR_CODES
+
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        explanation, fix = guidance
+        assert explanation and fix
+        assert "tutorial" not in (explanation + fix).lower()
+        assert "private" not in (explanation + fix).lower()
+
+        # The freeform tool's primary pass matches the raw rejection message,
+        # which now carries the interpolated cause after the colon.
+        message = (
+            "Authoritative interpretation-review reconciliation failed: resolved interpretation "
+            "requirement 'model_choice_review:enrich' hash drifted. Re-inspect the exact "
+            "set_pipeline_arguments payload and retry."
+        )
+        assert any(re.search(pattern, message) for pattern, _e, _f in _VALIDATION_ERROR_PATTERNS)
 
     def test_codes_are_containment_free(self) -> None:
         """No closed code may be a substring of another.
