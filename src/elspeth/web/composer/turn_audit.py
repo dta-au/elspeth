@@ -24,11 +24,60 @@ from elspeth.web.composer._compose_loop_carriers import (
     _ToolOutcome,
 )
 from elspeth.web.composer.bounded_json import bounded_json_loads
+from elspeth.web.composer.discovery_cache import serialize_tool_result
 from elspeth.web.composer.tool_error_payloads import (
     INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
     unknown_tool_arguments_redaction,
 )
-from elspeth.web.sessions._persist_payload import RedactedToolRow
+from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.sessions._persist_payload import RedactedToolRow, RejectionRecord
+
+
+def build_rejection_records(tool_outcomes: tuple[_ToolOutcome, ...]) -> tuple[RejectionRecord, ...]:
+    """Extract one durable rejection record per refused mutation
+    (elspeth-3e28029d2f).
+
+    The chat ``tool`` row persists REDACTED; this record carries the exact
+    payload the planner saw — the text and the reasoning — for the session
+    store (operator ruling 2026-09-02: session data, not Landscape data).
+
+    Three outcome shapes (see ``_ToolOutcome``): failure envelopes with
+    ``error_class`` set (argument errors, plugin crashes); ``ToolResult``
+    with ``success=False`` (validation rejections); everything else —
+    successes and advisor mapping envelopes — records nothing.
+    """
+    records: list[RejectionRecord] = []
+    for outcome in tool_outcomes:
+        tool_name = outcome.call.function.name
+        if outcome.error_class is not None:
+            records.append(
+                RejectionRecord(
+                    tool_call_id=outcome.call.id,
+                    tool_name=tool_name,
+                    error_code=outcome.error_class,
+                    message=outcome.error_message or "",
+                    planner_payload=json.dumps(
+                        {
+                            "error_class": outcome.error_class,
+                            "error_message": outcome.error_message,
+                        }
+                    ),
+                )
+            )
+        elif isinstance(outcome.response, ToolResult) and not outcome.response.success:
+            errors = outcome.response.validation.errors
+            primary = next((entry for entry in errors if entry.error_code), errors[0] if errors else None)
+            records.append(
+                RejectionRecord(
+                    tool_call_id=outcome.call.id,
+                    tool_name=tool_name,
+                    error_code=primary.error_code if primary is not None else None,
+                    message=primary.message if primary is not None else "",
+                    planner_payload=serialize_tool_result(outcome.response),
+                )
+            )
+    return tuple(records)
+
 
 if TYPE_CHECKING:
     from elspeth.web.composer.service import ComposerServiceImpl
@@ -220,6 +269,7 @@ async def persist_turn_audit(
                 raw_content=raw_assistant_content,
                 redacted_assistant_tool_calls=redacted_assistant_tool_calls,
                 redacted_tool_rows=redacted_tool_rows,
+                rejection_records=build_rejection_records(tool_outcomes),
                 parent_composition_state_id=current_state_id,
                 expected_current_state_id=current_state_id,
                 writer_principal="compose_loop",

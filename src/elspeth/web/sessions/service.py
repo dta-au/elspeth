@@ -109,7 +109,7 @@ from elspeth.web.interpretation_state import (
     source_name_from_component_id,
     validate_pipeline_decision_node_semantics,
 )
-from elspeth.web.sessions._persist_payload import AuditMessageDraft, AuditOutcome, RedactedToolRow, StatePayload
+from elspeth.web.sessions._persist_payload import AuditMessageDraft, AuditOutcome, RedactedToolRow, RejectionRecord, StatePayload
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.guided_audit import (
     bind_guided_failure_audit_rows,
@@ -140,6 +140,7 @@ from elspeth.web.sessions.models import (
     chat_messages_table,
     composer_completion_events_table,
     composition_proposals_table,
+    composition_rejection_events_table,
     composition_states_table,
     guided_operation_admission_blocks_table,
     guided_operation_events_table,
@@ -5725,6 +5726,7 @@ class SessionServiceImpl:
         raw_content: str | None = None,
         redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
         redacted_tool_rows: tuple[RedactedToolRow, ...],
+        rejection_records: tuple[RejectionRecord, ...] = (),
         parent_composition_state_id: str | None,
         expected_current_state_id: str | None,
         writer_principal: ChatMessageWriterPrincipal,
@@ -5789,6 +5791,21 @@ class SessionServiceImpl:
             redacted_assistant_tool_calls=redacted_assistant_tool_calls,
             redacted_tool_rows=redacted_tool_rows,
         )
+
+        # Rejection records are caller-supplied context for tool rows in THIS
+        # turn: an id naming no persisted tool row would orphan the reason.
+        # Same pre-transaction posture as the transcript validation above.
+        tool_row_ids = {row.tool_call_id for row in redacted_tool_rows}
+        for record in rejection_records:
+            if record.tool_call_id not in tool_row_ids:
+                raise ValueError(
+                    "persist_compose_turn: rejection record names tool_call_id "
+                    f"{record.tool_call_id!r} which is not among this turn's "
+                    f"tool rows {sorted(tool_row_ids)!r}"
+                )
+        rejections_by_tool_call_id: dict[str, list[RejectionRecord]] = {}
+        for record in rejection_records:
+            rejections_by_tool_call_id.setdefault(record.tool_call_id, []).append(record)
 
         now = self._now()
         # IntegrityError disposition (spec §4.5): the catch is
@@ -5892,6 +5909,25 @@ class SessionServiceImpl:
                             parent_assistant_id=assistant_id,
                             created_at=now,
                         )
+                        # elspeth-3e28029d2f: a refused mutation's reason
+                        # persists unredacted alongside its (redacted) tool
+                        # row, linked to the state CURRENT at rejection —
+                        # ``current_state_id`` at this iteration, since a
+                        # rejection commits no state of its own.
+                        for record in rejections_by_tool_call_id.get(tool_row.tool_call_id, ()):
+                            conn.execute(
+                                composition_rejection_events_table.insert().values(
+                                    id=str(uuid.uuid4()),
+                                    session_id=session_id,
+                                    composition_state_id=current_state_id,
+                                    tool_call_id=record.tool_call_id,
+                                    tool_name=record.tool_name,
+                                    error_code=record.error_code,
+                                    message=record.message,
+                                    planner_payload=record.planner_payload,
+                                    created_at=now,
+                                )
+                            )
 
                 return AuditOutcome(
                     assistant_id=assistant_id,
@@ -6032,6 +6068,7 @@ class SessionServiceImpl:
         raw_content: str | None = None,
         redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
         redacted_tool_rows: tuple[RedactedToolRow, ...],
+        rejection_records: tuple[RejectionRecord, ...] = (),
         parent_composition_state_id: str | None,
         expected_current_state_id: str | None,
         writer_principal: ChatMessageWriterPrincipal,
@@ -6076,6 +6113,7 @@ class SessionServiceImpl:
                 raw_content=raw_content,
                 redacted_assistant_tool_calls=redacted_assistant_tool_calls,
                 redacted_tool_rows=redacted_tool_rows,
+                rejection_records=rejection_records,
                 parent_composition_state_id=parent_composition_state_id,
                 expected_current_state_id=expected_current_state_id,
                 writer_principal=writer_principal,

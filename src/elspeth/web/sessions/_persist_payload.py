@@ -139,6 +139,25 @@ class RedactedToolRow:
 
 
 @dataclass(frozen=True, slots=True)
+class RejectionRecord:
+    """One refused mutation's durable reason (elspeth-3e28029d2f).
+
+    UNREDACTED by design — operator ruling 2026-09-02: the reason a composer
+    mutation tool refused a payload persists as session data (the private
+    audit-attribution surface, like ``chat_messages.raw_content``), while the
+    public ``tool`` chat row stays redacted. ``planner_payload`` is the exact
+    serialized response the planner saw — the text and the reasoning.
+    ``tool_call_id`` must name one of the turn's persisted tool rows.
+    """
+
+    tool_call_id: str
+    tool_name: str
+    error_code: str | None  # first coded validation entry, else failure class
+    message: str  # extracted human-readable reason
+    planner_payload: str  # JSON-serialised unredacted response
+
+
+@dataclass(frozen=True, slots=True)
 class AuditOutcome:
     """Disposition returned by SessionServiceImpl.persist_compose_turn (§5.2.2).
 

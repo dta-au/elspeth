@@ -196,7 +196,7 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_48() -> None:
+def test_current_session_schema_epoch_is_49() -> None:
     """Tripwire, not a truth check — this test deliberately restates the constant.
 
     Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
@@ -210,10 +210,11 @@ def test_current_session_schema_epoch_is_48() -> None:
     bumping; do not replace this with a derived check unless it stays a
     forced second touch.
     """
-    # 48: interpretation_events.choice gains 'superseded' — the state-commit
-    # sweep retires dead-site pending reviews (elspeth-dbc39dd367 /
-    # elspeth-d73139155a).
-    assert SESSION_SCHEMA_EPOCH == 48
+    # 49: composition_rejection_events table added — durable session-side
+    # record of composer mutation-tool rejections, the unredacted reason the
+    # planner saw (elspeth-3e28029d2f; operator ruling 2026-09-02: session
+    # data, not Landscape data).
+    assert SESSION_SCHEMA_EPOCH == 49
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

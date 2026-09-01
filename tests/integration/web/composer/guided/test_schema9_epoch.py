@@ -23,7 +23,10 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # with no defaulting branch — a genuine table-shape change, not a
     # same-shape widening, so it gets its own epoch rather than folding into
     # 35 (see schema.py's epoch comment for the full arch-M1 rationale).
-    assert SESSION_SCHEMA_EPOCH == 48
+    # Session epoch 49 (elspeth-3e28029d2f): composition_rejection_events
+    # table added — durable session-side rejection reasons (operator ruling
+    # 2026-09-02: session data, not Landscape data).
+    assert SESSION_SCHEMA_EPOCH == 49
     assert SQLITE_SCHEMA_EPOCH == 36
 
 
@@ -35,7 +38,10 @@ def test_epoch_40_session_store_fails_before_schema_use(tmp_path: Path) -> None:
         connection.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 40 WHERE store_kind = 'session'"))
         connection.execute(text("PRAGMA user_version = 40"))
 
-    with pytest.raises(SessionSchemaError, match=r"SESSION_SCHEMA_EPOCH=48.*Delete the session DB file and restart"):
+    # The pin lives in test_current_schema_epoch_pair_is_deliberately_pinned;
+    # here the regex tracks the constant so the behavior under test (stale DB
+    # fails before schema use) survives deliberate epoch bumps.
+    with pytest.raises(SessionSchemaError, match=rf"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*Delete the session DB file and restart"):
         initialize_session_schema(engine)
 
 
@@ -47,5 +53,5 @@ def test_epoch_35_session_store_fails_before_schema_use(tmp_path: Path) -> None:
         connection.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 35 WHERE store_kind = 'session'"))
         connection.execute(text("PRAGMA user_version = 35"))
 
-    with pytest.raises(SessionSchemaError, match=r"SESSION_SCHEMA_EPOCH=48.*Delete the session DB file and restart"):
+    with pytest.raises(SessionSchemaError, match=rf"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*Delete the session DB file and restart"):
         initialize_session_schema(engine)
