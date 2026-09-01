@@ -287,7 +287,7 @@ async def test_model_choice_changed_identity_supersedes_old_event(tmp_path, sess
     events = await sessions_service.list_interpretation_events(session_id, status="all")
     model_events = [event for event in events if event.kind is InterpretationKind.LLM_MODEL_CHOICE]
     assert [(event.llm_draft, event.choice) for event in model_events] == [
-        (old_model, InterpretationChoice.ABANDONED),
+        (old_model, InterpretationChoice.SUPERSEDED),
         (new_model, InterpretationChoice.PENDING),
     ]
 
@@ -611,6 +611,6 @@ async def test_pipeline_decision_changed_identity_supersedes_old_event(tmp_path,
     events = await sessions_service.list_interpretation_events(session_id, status="all")
     decision_events = [event for event in events if event.kind is InterpretationKind.PIPELINE_DECISION]
     assert [(event.llm_draft, event.choice) for event in decision_events] == [
-        (old_draft, InterpretationChoice.ABANDONED),
+        (old_draft, InterpretationChoice.SUPERSEDED),
         (new_draft, InterpretationChoice.PENDING),
     ]

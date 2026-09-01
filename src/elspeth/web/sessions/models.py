@@ -236,7 +236,17 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        CHECK constraint in place, so pre-release policy remains delete-
 #        and-recreate for stale session databases (sessions.db only —
 #        auth.db is never touched).
-SESSION_SCHEMA_EPOCH = 47
+#   48 -> ``interpretation_events.choice`` closed enum gains ``superseded``
+#        (elspeth-dbc39dd367, un-deferred by elspeth-d73139155a): a
+#        composition-state commit that extinguishes a reviewed site now
+#        terminally retires the persisted PENDING row in the same
+#        transaction instead of leaving a zombie card that gates Run
+#        forever. ABANDONED was adjudicated semantically wrong for
+#        supersession (the session continues; the review was obsoleted).
+#        SQLite cannot ALTER a CHECK constraint in place, so pre-release
+#        policy remains delete-and-recreate for stale session databases
+#        (sessions.db only — auth.db is never touched).
+SESSION_SCHEMA_EPOCH = 48
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -1164,7 +1174,7 @@ interpretation_events_table = Table(
     # (c) updating the closed-enum tests, and (d) a writer-path audit.
     # NO SILENT EXTENSION. See composition_states governance block above.
     CheckConstraint(
-        "choice IN ('pending', 'accepted_as_drafted', 'amended', 'opted_out', 'abandoned')",
+        "choice IN ('pending', 'accepted_as_drafted', 'amended', 'opted_out', 'abandoned', 'superseded')",
         name="ck_interpretation_events_choice",
     ),
     # Closed enum on interpretation_source. Adding a value requires the same

@@ -5616,7 +5616,106 @@ class SessionServiceImpl:
                 created_at=created_at if created_at is not None else datetime.now(UTC),
             )
         )
+        self._supersede_dead_site_pending_interpretation_events(
+            conn,
+            session_id=session_id,
+            state_id=allocated_state_id,
+        )
         return allocated_state_id
+
+    def _supersede_dead_site_pending_interpretation_events(
+        self,
+        conn: Connection,
+        *,
+        session_id: str,
+        state_id: str,
+    ) -> None:
+        """Terminally retire pending reviews whose site the new head extinguished.
+
+        The locked session head owns supersession authority (see
+        ``create_pending_interpretation_event``). Every composition-state
+        writer calls this under the same session write lock and transaction
+        as its INSERT, so the head advance and the retirement are atomic.
+
+        The predicate is deliberately "identity derivation RAISES", never
+        "identity differs": a differing identity means the site still exists
+        and the surfacing dedup path owns reconciliation (abandon + fresh
+        card), while a raising derivation means no future surfacing can
+        occur — the tool boundary refuses review requests for a site the
+        live state no longer carries, so nothing downstream would ever
+        retire the row. Left pending, such a row is a zombie card: resolve
+        raises drift forever and the Run gate blocks on it
+        (elspeth-d73139155a). ``SUPERSEDED`` records the retirement honestly;
+        ``ABANDONED`` is adjudicated wrong for supersession — the session
+        continues (elspeth-dbc39dd367).
+        """
+        pending_rows = conn.execute(
+            select(interpretation_events_table)
+            .where(interpretation_events_table.c.session_id == session_id)
+            .where(interpretation_events_table.c.choice == InterpretationChoice.PENDING.value)
+            .where(interpretation_events_table.c.interpretation_source == InterpretationSource.USER_APPROVED.value)
+        ).all()
+        if not pending_rows:
+            return
+        state_row = conn.execute(
+            select(composition_states_table)
+            .where(composition_states_table.c.id == state_id)
+            .where(composition_states_table.c.session_id == session_id)
+        ).one_or_none()
+        if state_row is None:  # pragma: no cover - caller inserted this row in this transaction
+            raise AuditIntegrityError(
+                f"_supersede_dead_site_pending_interpretation_events: state {state_id!r} missing in session {session_id!r}"
+            )
+        state_record = self._row_to_state_record(state_row)
+
+        def _extinguished_site_error(kind: InterpretationKind, affected_node_id: str, user_term: str) -> str | None:
+            """Return the derivation error when the new head extinguished the site, else None."""
+            try:
+                _reviewed_content_identity(
+                    state_record,
+                    kind=kind,
+                    affected_node_id=affected_node_id,
+                    user_term=user_term,
+                    context="_supersede_dead_site_pending_interpretation_events",
+                )
+            except InterpretationResolveError as exc:
+                return str(exc)
+            return None
+
+        dead_row_ids: list[str] = []
+        for pending_row in pending_rows:
+            kind_value = pending_row.kind
+            user_term = pending_row.user_term
+            affected_node_id = pending_row.affected_node_id
+            if type(kind_value) is not str or type(user_term) is not str or type(affected_node_id) is not str:
+                raise AuditIntegrityError(
+                    "_supersede_dead_site_pending_interpretation_events: pending user_approved row "
+                    f"{pending_row.id!r} violates the row-shape contract"
+                )
+            extinguished_reason = _extinguished_site_error(InterpretationKind(kind_value), affected_node_id, user_term)
+            if extinguished_reason is None:
+                continue
+            dead_row_ids.append(pending_row.id)
+            self._log.info(
+                "interpretation_event_superseded_dead_site",
+                session_id=session_id,
+                event_id=pending_row.id,
+                kind=kind_value,
+                affected_node_id=affected_node_id,
+                reason=extinguished_reason,
+            )
+        if not dead_row_ids:
+            return
+        conn.execute(
+            update(interpretation_events_table)
+            .where(interpretation_events_table.c.id.in_(dead_row_ids))
+            .where(interpretation_events_table.c.session_id == session_id)
+            .where(interpretation_events_table.c.choice == InterpretationChoice.PENDING.value)
+            .values(
+                choice=InterpretationChoice.SUPERSEDED.value,
+                resolved_at=self._now(),
+            )
+        )
 
     def persist_compose_turn(
         self,
@@ -7663,7 +7762,7 @@ class SessionServiceImpl:
                 # composition_state_id on each pending row lets us reconstruct
                 # exactly what that card reviewed without adding a mutable hash
                 # column. Unrelated state versions compare equal; a changed
-                # reviewed projection terminally abandons the old card.
+                # reviewed projection terminally supersedes the old card.
                 pending_site_rows = conn.execute(
                     select(interpretation_events_table)
                     .where(interpretation_events_table.c.session_id == sid)
@@ -7689,34 +7788,56 @@ class SessionServiceImpl:
                     # site. Return that terminal row so post-persist advisory
                     # surfacers finish without converting a successful state
                     # commit into an error response.
-                    stale_rows_to_abandon = [
+                    stale_rows_to_supersede = [
                         pending_row.id
                         for pending_row in pending_site_rows
                         if type(pending_row.user_term) is str and pending_row.user_term.strip() == user_term.strip()
                     ]
-                    if not stale_rows_to_abandon:
+                    if not stale_rows_to_supersede:
+                        # The state-commit supersession sweep
+                        # (_supersede_dead_site_pending_interpretation_events)
+                        # may have already retired this site's card in the
+                        # commit that extinguished it. Return that terminal
+                        # row for the same reason the supersede path below
+                        # returns one — a successful state commit's advisory
+                        # surfacer must not turn into an error response.
+                        superseded_site_rows = conn.execute(
+                            select(interpretation_events_table)
+                            .where(interpretation_events_table.c.session_id == sid)
+                            .where(interpretation_events_table.c.affected_node_id == affected_node_id)
+                            .where(interpretation_events_table.c.kind == kind_value)
+                            .where(interpretation_events_table.c.choice == InterpretationChoice.SUPERSEDED.value)
+                            .where(interpretation_events_table.c.interpretation_source == InterpretationSource.USER_APPROVED.value)
+                            .order_by(desc(interpretation_events_table.c.created_at), desc(interpretation_events_table.c.id))
+                        ).all()
+                        for superseded_row in superseded_site_rows:
+                            if type(superseded_row.user_term) is str and superseded_row.user_term.strip() == user_term.strip():
+                                return _interpretation_event_record_from_row(superseded_row)
                         raise
                     conn.execute(
                         update(interpretation_events_table)
-                        .where(interpretation_events_table.c.id.in_(stale_rows_to_abandon))
+                        .where(interpretation_events_table.c.id.in_(stale_rows_to_supersede))
                         .where(interpretation_events_table.c.session_id == sid)
                         .where(interpretation_events_table.c.choice == InterpretationChoice.PENDING.value)
                         .values(
-                            choice=InterpretationChoice.ABANDONED.value,
+                            # SUPERSEDED, not ABANDONED: the session continues;
+                            # a newer durable state obsoleted this specific
+                            # review (elspeth-dbc39dd367 adjudication).
+                            choice=InterpretationChoice.SUPERSEDED.value,
                             resolved_at=now,
                         )
                     )
-                    abandoned_row = conn.execute(
-                        select(interpretation_events_table).where(interpretation_events_table.c.id == stale_rows_to_abandon[0])
+                    superseded_terminal_row = conn.execute(
+                        select(interpretation_events_table).where(interpretation_events_table.c.id == stale_rows_to_supersede[0])
                     ).one()
-                    return _interpretation_event_record_from_row(abandoned_row)
+                    return _interpretation_event_record_from_row(superseded_terminal_row)
                 session_row = conn.execute(
                     select(sessions_table.c.interpretation_review_disabled).where(sessions_table.c.id == sid)
                 ).one_or_none()
                 review_disabled = session_row is not None and bool(session_row.interpretation_review_disabled)
 
                 matching_pending_row = None
-                rows_to_abandon: list[str] = []
+                rows_to_supersede: list[str] = []
                 for pending_row in pending_site_rows:
                     pending_user_term = pending_row.user_term
                     if type(pending_user_term) is not str or pending_user_term.strip() != user_term.strip():
@@ -7761,30 +7882,35 @@ class SessionServiceImpl:
                             )
                         if legacy_fields is not None:
                             # V1 showed a materially different consequence.
-                            # Preserve it as abandoned audit history and mint a
+                            # Preserve it as superseded audit history and mint a
                             # v2 card; field equality cannot reuse old copy as
                             # current user authority.
-                            rows_to_abandon.append(pending_row.id)
+                            rows_to_supersede.append(pending_row.id)
                             continue
                     if not review_disabled and matching_pending_row is None and pending_review_identity == current_review_identity:
                         matching_pending_row = pending_row
                     else:
-                        rows_to_abandon.append(pending_row.id)
+                        rows_to_supersede.append(pending_row.id)
                 # A matching live card is safe to reuse. Without one, a stale
-                # surfacing projection must not abandon rows or mint a card that
+                # surfacing projection must not supersede rows or mint a card that
                 # the live-state resolution gate can never settle.
                 if matching_pending_row is None and surfacing_review_identity != current_review_identity:
                     raise InterpretationPlaceholderConsumedError(
                         "create_pending_interpretation_event: reviewed content no longer matches the current composition state"
                     )
-                if rows_to_abandon:
+                if rows_to_supersede:
                     conn.execute(
                         update(interpretation_events_table)
-                        .where(interpretation_events_table.c.id.in_(rows_to_abandon))
+                        .where(interpretation_events_table.c.id.in_(rows_to_supersede))
                         .where(interpretation_events_table.c.session_id == sid)
                         .where(interpretation_events_table.c.choice == InterpretationChoice.PENDING.value)
                         .values(
-                            choice=InterpretationChoice.ABANDONED.value,
+                            # SUPERSEDED, not ABANDONED: a fresh surfacing of
+                            # the same site (changed identity, v1->v2 copy, or
+                            # opt-out auto-interpretation) obsoletes the old
+                            # card while the session continues
+                            # (elspeth-dbc39dd367 adjudication).
+                            choice=InterpretationChoice.SUPERSEDED.value,
                             resolved_at=now,
                         )
                     )
@@ -9454,6 +9580,11 @@ class SessionServiceImpl:
                             created_at=now,
                         )
                     )
+                    self._supersede_dead_site_pending_interpretation_events(
+                        conn,
+                        session_id=sid,
+                        state_id=str(state_id),
+                    )
                 return version
 
         version = await self._run_sync(_sync)
@@ -10179,6 +10310,11 @@ class SessionServiceImpl:
                             provenance="session_seed",
                             created_at=now,
                         )
+                    )
+                    self._supersede_dead_site_pending_interpretation_events(
+                        conn,
+                        session_id=sid,
+                        state_id=str(new_state_id),
                     )
                 return prior_row, new_version
 

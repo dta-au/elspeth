@@ -753,7 +753,7 @@ async def test_only_event_for_exact_current_draft_can_settle(
     )
     all_rows = await service.list_interpretation_events(session_id, status="all")
     by_id = {row.id: row for row in all_rows}
-    assert by_id[old_event.id].choice is InterpretationChoice.ABANDONED
+    assert by_id[old_event.id].choice is InterpretationChoice.SUPERSEDED
     assert by_id[old_event.id].resolved_at is not None
     assert by_id[current_event.id].choice is InterpretationChoice.PENDING
     resolved_event, resolved_state = await service.resolve_interpretation_event(
@@ -880,10 +880,16 @@ async def test_delayed_older_surface_without_current_card_fails_closed(
 
 
 @pytest.mark.asyncio
-async def test_delayed_surface_after_review_site_removal_abandons_the_previous_card(
+async def test_delayed_surface_after_review_site_removal_receives_the_superseded_card(
     service: SessionServiceImpl,
 ) -> None:
-    """A post-commit stale surfacer must not leave an impossible card pending."""
+    """A post-commit stale surfacer must not leave an impossible card pending.
+
+    The commit that removes the review site now retires the card itself
+    (the state-commit supersession sweep, elspeth-d73139155a), so the
+    delayed surfacer finds no pending row and is handed the SUPERSEDED
+    terminal row instead of erroring — the same successful-commit contract
+    the old abandon fallback provided."""
     kind = InterpretationKind.VAGUE_TERM
     old_state, affected_node_id, user_term = _event_liveness_state(
         kind,
@@ -923,8 +929,9 @@ async def test_delayed_surface_after_review_site_removal_abandons_the_previous_c
 
     rows = await service.list_interpretation_events(session_id, status="all")
     assert reconciled.id == previous_event.id
+    assert reconciled.choice is InterpretationChoice.SUPERSEDED
     assert [(row.id, row.choice) for row in rows] == [
-        (previous_event.id, InterpretationChoice.ABANDONED),
+        (previous_event.id, InterpretationChoice.SUPERSEDED),
     ]
 
 
@@ -1001,7 +1008,7 @@ async def test_review_event_identity_supersedes_same_text_changed_artifact(
     assert event_b.id != event_a.id
     rows_after_supersession = await service.list_interpretation_events(session_id, status="all")
     by_id = {row.id: row for row in rows_after_supersession}
-    assert by_id[event_a.id].choice is InterpretationChoice.ABANDONED
+    assert by_id[event_a.id].choice is InterpretationChoice.SUPERSEDED
     assert by_id[event_a.id].resolved_at is not None
     assert by_id[event_b.id].choice is InterpretationChoice.PENDING
 
@@ -1098,7 +1105,7 @@ async def test_structured_vague_term_identity_tracks_prompt_parts_structure(
     assert event_b.id != event_a.id
     all_rows = await service.list_interpretation_events(session_id, status="all")
     by_id = {row.id: row for row in all_rows}
-    assert by_id[event_a.id].choice is InterpretationChoice.ABANDONED
+    assert by_id[event_a.id].choice is InterpretationChoice.SUPERSEDED
     assert by_id[event_b.id].choice is InterpretationChoice.PENDING
 
     event_b_again = await service.create_pending_interpretation_event(

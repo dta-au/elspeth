@@ -2354,7 +2354,7 @@ async def test_auto_surface_re_surfaces_after_prompt_edit_not_bricked(
     assert pt_b[0].llm_draft == prompt_b
     all_events = await sessions_service.list_interpretation_events(session_id, status="all")
     by_id = {event.id: event for event in all_events}
-    assert by_id[pt_a[0].id].choice is InterpretationChoice.ABANDONED
+    assert by_id[pt_a[0].id].choice is InterpretationChoice.SUPERSEDED
 
 
 @pytest.mark.asyncio
@@ -2445,7 +2445,7 @@ async def test_prompt_auto_surfacer_delegates_same_text_changed_skeleton_to_writ
 
     all_events = await sessions_service.list_interpretation_events(session_id, status="all")
     by_id = {event.id: event for event in all_events}
-    assert by_id[event_a.id].choice is InterpretationChoice.ABANDONED
+    assert by_id[event_a.id].choice is InterpretationChoice.SUPERSEDED
     pending = [event for event in all_events if event.choice is InterpretationChoice.PENDING]
     assert len(pending) == 1
     assert pending[0].id != event_a.id
@@ -2538,7 +2538,7 @@ async def test_kind_general_auto_surfacer_delegates_same_text_changed_artifact_t
 
     all_events = await sessions_service.list_interpretation_events(session_id, status="all")
     by_id = {event.id: event for event in all_events}
-    assert by_id[event_a.id].choice is InterpretationChoice.ABANDONED
+    assert by_id[event_a.id].choice is InterpretationChoice.SUPERSEDED
     pending = [event for event in all_events if event.choice is InterpretationChoice.PENDING]
     assert len(pending) == 1
     assert pending[0].id != event_a.id

@@ -55,13 +55,17 @@ export const BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX = "backend_auto_surface:";
  *  - opted_out            — user clicked "stop asking" for this session.
  *  - abandoned            — session ended without resolution (page close,
  *                           timeout).  Phase 11 orphan-cleanup writes this.
+ *  - superseded           — a later composition-state commit extinguished
+ *                           the reviewed site; the state-commit sweep
+ *                           retired the card (never a user action).
  */
 export type InterpretationChoice =
   | "pending"
   | "accepted_as_drafted"
   | "amended"
   | "opted_out"
-  | "abandoned";
+  | "abandoned"
+  | "superseded";
 
 /**
  * Structural source of an interpretation event row.

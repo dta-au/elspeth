@@ -429,8 +429,8 @@ async def test_settlement_surfacer_supersedes_a_pending_legacy_v1_card(
         if event.kind is InterpretationKind.SOURCE_DATA_CONTRACT
     ]
     assert sorted(event.choice for event in events) == [
-        InterpretationChoice.ABANDONED,
         InterpretationChoice.PENDING,
+        InterpretationChoice.SUPERSEDED,
     ]
     pending = next(event for event in events if event.choice is InterpretationChoice.PENDING)
     assert json.loads(pending.llm_draft or "")["contract_version"] == 2
@@ -468,6 +468,124 @@ async def test_settlement_surfacer_skips_card_ineligible_sources(service, tmp_pa
 
     no_demand_state = CompositionState.from_dict(_uploaded_state_dict(str(csv_path), required=[]))
     assert _backend_surface_args_for_site(no_demand_state, site) is None
+
+
+def _stamped_state_dict(csv_path: str, *, required: list[str], guaranteed: list[str]) -> dict[str, Any]:
+    """The planner-stamp shape from the elspeth-d73139155a repro: the source
+    carries an observed-mode guarantee covering the whole demand, so
+    ``backtraced_source_demand`` collapses to ``()`` and the review site dies."""
+    state_dict = _uploaded_state_dict(csv_path, required=required)
+    source_options = dict(state_dict["sources"]["source"]["options"])
+    source_options["schema"] = {"mode": "observed", "guaranteed_fields": guaranteed}
+    state_dict["sources"]["source"]["options"] = source_options
+    return state_dict
+
+
+@pytest.mark.asyncio
+async def test_state_commit_supersedes_pending_card_when_demand_collapses(service, tmp_path: Path) -> None:
+    """The zombie-card lifecycle fix (elspeth-d73139155a): a commit that
+    extinguishes the review site terminally retires the persisted PENDING
+    row as SUPERSEDED in the same transaction — the card leaves the pending
+    list (ungating Run) instead of rejecting Acknowledge with an
+    unactionable drift error forever."""
+    csv_path = tmp_path / "upload.csv"
+    csv_path.write_text("colour,extra\nred,1\n", encoding="utf-8")
+    sid = uuid4()
+    state = await _seed_state(service, session_id=sid, csv_path=str(csv_path), required=["colour"])
+    draft = _server_draft(("colour", "extra"), ["colour"])
+    event = await _create_contract_event(service, session_id=sid, state=state, llm_draft=draft)
+    assert event.choice is InterpretationChoice.PENDING
+
+    stamped = _stamped_state_dict(str(csv_path), required=["colour"], guaranteed=["colour"])
+    await service.save_composition_state(
+        sid,
+        CompositionStateData(
+            sources=stamped["sources"],
+            nodes=stamped["nodes"],
+            metadata_={"name": "Data contract test", "description": ""},
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+
+    events = [
+        row for row in await service.list_interpretation_events(sid, status="all") if row.kind is InterpretationKind.SOURCE_DATA_CONTRACT
+    ]
+    assert [row.choice for row in events] == [InterpretationChoice.SUPERSEDED]
+    assert events[0].resolved_at is not None
+    assert events[0].accepted_value is None
+    pending = await service.list_interpretation_events(sid, status="pending")
+    assert pending == []
+    # A racing Acknowledge degrades to the ordinary already-resolved
+    # refusal, not the eternal drift error.
+    with pytest.raises(InterpretationResolveError):
+        await service.resolve_interpretation_event(
+            session_id=sid,
+            event_id=event.id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="alice",
+        )
+
+
+@pytest.mark.asyncio
+async def test_state_commit_keeps_pending_card_when_demand_changes_but_survives(service, tmp_path: Path) -> None:
+    """The sweep predicate is site DEATH, never site drift: a demand that
+    changes but still exists leaves the card pending — the surfacing dedup
+    path owns that reconciliation (abandon + fresh card)."""
+    csv_path = tmp_path / "upload.csv"
+    csv_path.write_text("colour,size\nred,10\n", encoding="utf-8")
+    sid = uuid4()
+    state = await _seed_state(service, session_id=sid, csv_path=str(csv_path), required=["colour"])
+    draft = _server_draft(("colour", "size"), ["colour"])
+    event = await _create_contract_event(service, session_id=sid, state=state, llm_draft=draft)
+
+    grown = _uploaded_state_dict(str(csv_path), required=["colour", "size"])
+    await service.save_composition_state(
+        sid,
+        CompositionStateData(
+            sources=grown["sources"],
+            nodes=grown["nodes"],
+            metadata_={"name": "Data contract test", "description": ""},
+            is_valid=False,
+        ),
+        provenance="tool_call",
+    )
+
+    pending = await service.list_interpretation_events(sid, status="pending")
+    assert [row.id for row in pending] == [event.id]
+    assert pending[0].choice is InterpretationChoice.PENDING
+
+
+@pytest.mark.asyncio
+async def test_stale_surfacer_returns_superseded_row_after_sweep(service, tmp_path: Path) -> None:
+    """A delayed surfacer holding a pre-collapse projection must not turn a
+    successful state commit into an error once the sweep has already retired
+    the site's card — it receives the terminal row, mirroring the abandon
+    fallback for the un-swept race."""
+    csv_path = tmp_path / "upload.csv"
+    csv_path.write_text("colour,extra\nred,1\n", encoding="utf-8")
+    sid = uuid4()
+    state = await _seed_state(service, session_id=sid, csv_path=str(csv_path), required=["colour"])
+    draft = _server_draft(("colour", "extra"), ["colour"])
+    await _create_contract_event(service, session_id=sid, state=state, llm_draft=draft)
+
+    stamped = _stamped_state_dict(str(csv_path), required=["colour"], guaranteed=["colour"])
+    await service.save_composition_state(
+        sid,
+        CompositionStateData(
+            sources=stamped["sources"],
+            nodes=stamped["nodes"],
+            metadata_={"name": "Data contract test", "description": ""},
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+
+    stale_result = await _create_contract_event(service, session_id=sid, state=state, llm_draft=draft)
+    assert stale_result.choice is InterpretationChoice.SUPERSEDED
+    pending = await service.list_interpretation_events(sid, status="pending")
+    assert pending == []
 
 
 @pytest.mark.asyncio

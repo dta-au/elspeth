@@ -532,6 +532,31 @@ async def _create_prompt_template_interpretation_event(
 
 
 @pytest.mark.asyncio
+async def test_state_commit_supersedes_pending_card_when_node_is_removed(service) -> None:
+    """The supersession sweep is kind-general: a prompt-template card whose
+    affected node a later commit deletes has a dead site (no surfacing path
+    remains to reconcile it), so the commit retires it as SUPERSEDED in the
+    same transaction (elspeth-d73139155a / elspeth-dbc39dd367)."""
+    sid, _state, event = await _create_prompt_template_interpretation_event(service)
+    assert event.choice is InterpretationChoice.PENDING
+
+    await service.save_composition_state(
+        sid,
+        CompositionStateData(
+            nodes=[],
+            metadata_={"name": "Phase 5b Test", "description": ""},
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+
+    events = await service.list_interpretation_events(sid, status="all")
+    assert [row.choice for row in events] == [InterpretationChoice.SUPERSEDED]
+    assert events[0].resolved_at is not None
+    assert await service.list_interpretation_events(sid, status="pending") == []
+
+
+@pytest.mark.asyncio
 async def test_01_create_pending_interpretation_event_inserts_row(service) -> None:
     """Spec test 1: pending row inserted with all required fields."""
     session_id = uuid4()

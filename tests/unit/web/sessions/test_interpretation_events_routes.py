@@ -535,8 +535,6 @@ async def test_08b_resolve_existing_event_with_consumed_placeholder_returns_422(
     [
         pytest.param(["colour"], ["colour", "size"], False, "[colour, size]", id="demand-grows"),
         pytest.param(["colour", "size"], ["colour"], False, "[colour]", id="demand-shrinks"),
-        pytest.param(["colour"], [], False, "no active demanded fields", id="demand-disappears"),
-        pytest.param(["colour"], ["colour"], True, "no active demanded fields", id="source-removed"),
     ],
 )
 @pytest.mark.asyncio
@@ -609,6 +607,82 @@ async def test_resolve_source_data_contract_drift_names_source_and_field_change(
     assert "LLM" not in detail["message"]
     assert "prompt" not in detail["message"].lower()
     assert "node" not in detail["message"].lower()
+
+
+@pytest.mark.parametrize(
+    ("current_fields", "remove_source"),
+    [
+        pytest.param([], False, id="demand-disappears"),
+        pytest.param(["colour"], True, id="source-removed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_resolve_after_site_death_is_already_resolved_not_eternal_drift(
+    test_client: TestClient,
+    tmp_path: Path,
+    current_fields: list[str],
+    remove_source: bool,
+) -> None:
+    """A commit that EXTINGUISHES the review site (demand collapses, or the
+    source is removed) supersedes the pending card in the same transaction
+    (elspeth-d73139155a), so a late Acknowledge gets the ordinary 409
+    already-resolved refusal — never the old unactionable drift alert whose
+    'reload and review' instruction re-rendered the same dead card."""
+    csv_path = tmp_path / "upload.csv"
+    csv_path.write_text("colour,size\nred,10\n", encoding="utf-8")
+    session_id = uuid4()
+    service: SessionServiceImpl = test_client.app.state.session_service
+    with test_client.app.state.phase3_engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id), user_id="alice")
+
+    surfaced = _uploaded_source_contract_state(str(csv_path), required_fields=["colour"])
+    surfaced_state = await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            sources=surfaced["sources"],
+            nodes=surfaced["nodes"],
+            metadata_={"name": "Data contract route test", "description": ""},
+            is_valid=False,
+        ),
+        provenance="tool_call",
+    )
+    event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=surfaced_state.id,
+        affected_node_id="source",
+        tool_call_id="call_data_contract",
+        user_term=SOURCE_DATA_CONTRACT_USER_TERM,
+        kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+        llm_draft=build_source_data_contract_draft(["colour"], ("colour", "size")),
+        model_identifier="anthropic/test-model",
+        model_version="1",
+        provider="anthropic",
+        composer_skill_hash="0" * 64,
+    )
+
+    killed = _uploaded_source_contract_state(str(csv_path), required_fields=current_fields)
+    await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            sources={} if remove_source else killed["sources"],
+            nodes=killed["nodes"],
+            metadata_={"name": "Data contract route test", "description": ""},
+            is_valid=False,
+        ),
+        provenance="tool_call",
+    )
+
+    events = await service.list_interpretation_events(session_id, status="all")
+    assert [row.choice for row in events] == [InterpretationChoice.SUPERSEDED]
+    assert await service.list_interpretation_events(session_id, status="pending") == []
+
+    response = await _post(
+        test_client,
+        f"/api/sessions/{session_id}/interpretations/{event.id}/resolve",
+        json={"choice": "accepted_as_drafted"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "interpretation_already_resolved"
 
 
 @pytest.mark.asyncio

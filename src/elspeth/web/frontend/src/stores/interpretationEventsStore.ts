@@ -236,6 +236,13 @@ function incrementResolvedCount(
       throw new Error(
         "incrementResolvedCount: 'abandoned' is not produced by user action",
       );
+    case "superseded":
+      // Superseded is written by the backend state-commit sweep when a
+      // later commit extinguishes the reviewed site — never by a user
+      // resolve action; if we ever see it here, the call site is wrong.
+      throw new Error(
+        "incrementResolvedCount: 'superseded' is not produced by user action",
+      );
     default: {
       // Exhaustiveness check: a future widening of InterpretationChoice
       // turns this into a compile error.
@@ -293,8 +300,9 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
         ) {
           resolvedList.push(event);
         }
-        // 'abandoned' rows are not counted in this store; the audit-readiness
-        // panel surfaces them via a separate code path if needed.
+        // 'abandoned' and 'superseded' rows are not counted in this store;
+        // the audit-readiness panel surfaces them via a separate code path
+        // if needed.
       }
       set((state) => {
         // The resolved slice is write-MONOTONIC (elspeth-292505e1c3):

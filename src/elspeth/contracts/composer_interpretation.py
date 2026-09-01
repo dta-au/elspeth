@@ -49,6 +49,16 @@ class InterpretationChoice(StrEnum):
     ABANDONED             — session ended without resolution (page close,
                             timeout). The audit trail records the absence
                             of decision; it is not a synonym for ``pending``.
+    SUPERSEDED            — a later composition-state commit extinguished
+                            the reviewed site (the identity the card
+                            reviewed can no longer be derived from the
+                            live state), so no resolution is possible and
+                            no fresh surfacing will ever retire the row.
+                            Written only by the state-commit supersession
+                            sweep, never by user action. Distinct from
+                            ABANDONED: the session continues; the specific
+                            review was obsoleted (elspeth-dbc39dd367,
+                            elspeth-d73139155a).
     """
 
     PENDING = "pending"
@@ -56,6 +66,7 @@ class InterpretationChoice(StrEnum):
     AMENDED = "amended"
     OPTED_OUT = "opted_out"
     ABANDONED = "abandoned"
+    SUPERSEDED = "superseded"
 
 
 class InterpretationSource(StrEnum):
