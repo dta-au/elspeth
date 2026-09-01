@@ -19,6 +19,8 @@ import structlog
 from sqlalchemy import delete, event, func, insert, select, update
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.blobs import BlobRecord
+from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.blobs.protocol import BlobForkWriteFence, BlobInProgressForkError, fork_blob_id
 from elspeth.web.blobs.service import BlobServiceImpl
@@ -38,7 +40,11 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.routes.sessions import _rewrite_fork_state_blob_custody
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl, _fork_blob_plan_from_content
+from elspeth.web.sessions.service import (
+    SessionServiceImpl,
+    _fork_blob_plan_from_content,
+    _value_references_parent_blob,
+)
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 
@@ -1308,3 +1314,212 @@ async def test_current_fence_and_concurrent_takeover_reuse_one_hidden_child(dura
             assert operation.result_session_id == str(initial.session.id)
     finally:
         _cleanup_race_user(durable_engine, user_id)
+
+
+# ---------------------------------------------------------------------------
+# elspeth-f478b01787 / elspeth-d178282593 — fork blob custody over the OPEN
+# ``composer_meta`` envelope.
+#
+# ``composer_meta`` is a contractually open JSON envelope: ``merge_composer_meta_updates``
+# is required to carry forward keys owned by other subsystems, and no schema
+# constrains its key set. The settlement verifier
+# (``_verify_fork_settlement_blob_custody``) walks that envelope EXHAUSTIVELY,
+# while the fork rewriter enumerates named fields — so the rewriter is
+# structurally guaranteed to go stale as new keys appear.
+#
+# These tests pin the three-way split the rewriter must honour:
+#   derived keys  -> RE-DERIVED from the already-rewritten child state
+#   owned keys    -> targeted rewrite (already covered above)
+#   unknown keys  -> cannot be rewritten safely; fork must FAIL AT THE
+#                    REWRITE BOUNDARY naming the key, rather than passing the
+#                    leak through to a cryptic settlement abort that strands an
+#                    archived orphan child.
+# ---------------------------------------------------------------------------
+
+
+def _child_blob_record(*, blob_id: UUID, session_id: UUID, storage_path: str) -> BlobRecord:
+    """A minimal ready child-copy blob row, as the fork blob plan produces."""
+    return BlobRecord(
+        id=blob_id,
+        session_id=session_id,
+        filename="orders.csv",
+        mime_type="text/csv",
+        size_bytes=3,
+        content_hash="c" * 64,
+        storage_path=storage_path,
+        created_at=datetime(2026, 9, 2, tzinfo=UTC),
+        created_by="user",
+        source_description=None,
+        status="ready",
+        creation_modality=CreationModality.VERBATIM,
+        created_from_message_id=None,
+        creating_model_identifier=None,
+        creating_model_version=None,
+        creating_provider=None,
+        creating_composer_skill_hash=None,
+        creating_arguments_hash=None,
+    )
+
+
+async def _state_for_custody_rewrite(service, *, composer_meta, sources):
+    """Persist a parent state carrying ``composer_meta``, ready to be forked.
+
+    ``metadata_`` is populated because a persisted row without it is corruption
+    by the codebase's own rule (``converters.state_from_record`` crashes on
+    ``None``), so a state lacking it could not represent a forkable session.
+    """
+    parent = await service.create_session("alice", "Parent", "local")
+    state = await service.save_composition_state(
+        parent.id,
+        CompositionStateData(
+            sources=sources,
+            metadata_={"name": "Parent pipeline", "description": None},
+            composer_meta=composer_meta,
+        ),
+        provenance="session_seed",
+    )
+    return parent, state
+
+
+@pytest.mark.asyncio
+async def test_fork_rederives_implicit_decisions_rather_than_copying_the_parent_report(service, tmp_path) -> None:
+    """elspeth-f478b01787: ``implicit_decisions`` is a pure PROJECTION of the
+    composition state (``build_implicit_decisions_report(state)``), regenerated
+    unconditionally on every save. The fork mints a NEW state row, so copying
+    the parent's report onto it violates the atomicity contract those saves
+    declare — and strands parent blob ids the settlement verifier then rejects.
+
+    Fails before the fix because nothing in the fork path touches
+    ``composer_meta.implicit_decisions``: the bare and ``blob:``-prefixed parent
+    ids survive verbatim into the child.
+    """
+    parent_blob_id = uuid4()
+    child_blob_id = uuid4()
+    child_session_id = uuid4()
+    parent_storage_path = f"/var/lib/elspeth/blobs/{uuid4()}/{parent_blob_id}.csv"
+    child_storage_path = f"/var/lib/elspeth/blobs/{child_session_id}/{child_blob_id}.csv"
+
+    parent, state = await _state_for_custody_rewrite(
+        service,
+        # Full SourceSpec shape, as ``CompositionState.to_dict`` persists it: the
+        # re-derivation reconstructs through the same authority that every normal
+        # state read uses (``converters.state_from_record``), so a minimal stub
+        # would not represent a state the composer can actually have written.
+        sources={
+            "orders": {
+                "plugin": "csv",
+                "on_success": "rows",
+                "options": {"blob_ref": str(parent_blob_id), "path": parent_storage_path},
+                "on_validation_failure": "quarantine",
+            }
+        },
+        composer_meta={
+            "implicit_decisions": {
+                "schema_version": 1,
+                "entries": [
+                    {"path": "source.orders.blob_ref", "value": str(parent_blob_id), "category": "blob"},
+                    {"path": "source.orders.sentinel", "value": f"blob:{parent_blob_id}", "category": "blob"},
+                    {"path": "source.orders.path", "value": parent_storage_path, "category": "blob"},
+                ],
+                "normalization_events": [],
+            }
+        },
+    )
+    child = _child_blob_record(blob_id=child_blob_id, session_id=child_session_id, storage_path=child_storage_path)
+
+    rewritten = _rewrite_fork_state_blob_custody(
+        state,
+        {parent_blob_id: child},
+        {parent_storage_path: child},
+        data_dir=tmp_path,
+        parent_session_id=parent.id,
+        child_session_id=child_session_id,
+    )
+
+    assert rewritten is not None
+    assert rewritten.composer_meta is not None
+    # Asserted through the production authority, so this test cannot drift from
+    # the guard it protects.
+    forbidden = frozenset({str(parent_blob_id), parent_storage_path})
+    assert not _value_references_parent_blob(rewritten.composer_meta, forbidden)
+    # Deleting the key would also satisfy the line above, so pin that the report
+    # SURVIVES and names the child's own blob: the contract is re-derivation,
+    # not suppression.
+    report = rewritten.composer_meta["implicit_decisions"]
+    assert report["entries"], "implicit_decisions must be re-derived, not dropped"
+    assert _value_references_parent_blob(report, frozenset({str(child_blob_id)}))
+
+
+@pytest.mark.asyncio
+async def test_fork_rewrites_parent_blob_path_nested_inside_source_options(service, tmp_path) -> None:
+    """elspeth-f478b01787 (custody-surface sweep): ``_rewrite_source_blob_options``
+    iterates ``("path", "file")`` over the TOP LEVEL of a source's options only,
+    with no recursion — so a blob path carried by a NESTED option mapping (the
+    shape S3-style sources use) is never rebased and leaks parent custody.
+
+    Fails before the fix: ``options.dataset.path`` still names the parent blob.
+    """
+    parent_blob_id = uuid4()
+    child_blob_id = uuid4()
+    child_session_id = uuid4()
+    parent_storage_path = f"/var/lib/elspeth/blobs/{uuid4()}/{parent_blob_id}.csv"
+    child_storage_path = f"/var/lib/elspeth/blobs/{child_session_id}/{child_blob_id}.csv"
+
+    parent, state = await _state_for_custody_rewrite(
+        service,
+        sources={"orders": {"plugin": "csv", "options": {"dataset": {"path": parent_storage_path}}}},
+        composer_meta=None,
+    )
+    child = _child_blob_record(blob_id=child_blob_id, session_id=child_session_id, storage_path=child_storage_path)
+
+    rewritten = _rewrite_fork_state_blob_custody(
+        state,
+        {parent_blob_id: child},
+        {parent_storage_path: child},
+        data_dir=tmp_path,
+        parent_session_id=parent.id,
+        child_session_id=child_session_id,
+    )
+
+    # ``None`` means "nothing needed rebasing" and makes the caller keep the
+    # PARENT state — so a None here is the leak itself, not a neutral result.
+    assert rewritten is not None, "nested blob path went unrecognised, so the parent state is carried into the child"
+    assert not _value_references_parent_blob(rewritten.sources, frozenset({parent_storage_path}))
+
+
+@pytest.mark.asyncio
+async def test_fork_aborts_naming_an_unrecognised_composer_meta_key_that_retains_parent_custody(service, tmp_path) -> None:
+    """``composer_meta`` is contractually OPEN — another subsystem may own a key
+    the rewriter has never heard of, and the merge contract requires carrying it
+    forward. Such a key cannot be rewritten safely (we do not own its meaning),
+    so the fork must fail AT THE REWRITE BOUNDARY and NAME the key.
+
+    Before the fix the unknown key sails through untouched and the leak surfaces
+    only at settlement — after staging has committed, leaving an archived orphan
+    child and an error that names nothing.
+    """
+    parent_blob_id = uuid4()
+    child_blob_id = uuid4()
+    child_session_id = uuid4()
+    parent_storage_path = f"/var/lib/elspeth/blobs/{uuid4()}/{parent_blob_id}.csv"
+
+    parent, state = await _state_for_custody_rewrite(
+        service,
+        sources={"orders": {"plugin": "csv", "options": {"blob_ref": str(parent_blob_id)}}},
+        composer_meta={"some_future_subsystem": {"remembered_blob": str(parent_blob_id)}},
+    )
+    child = _child_blob_record(
+        blob_id=child_blob_id,
+        session_id=child_session_id,
+        storage_path=f"/var/lib/elspeth/blobs/{child_session_id}/{child_blob_id}.csv",
+    )
+
+    with pytest.raises(AuditIntegrityError, match="some_future_subsystem"):
+        _rewrite_fork_state_blob_custody(
+            state,
+            {parent_blob_id: child},
+            {parent_storage_path: child},
+            data_dir=tmp_path,
+            parent_session_id=parent.id,
+            child_session_id=child_session_id,
+        )
