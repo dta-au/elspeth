@@ -1026,6 +1026,8 @@
    from chaining into the transcript above — the same treatment, for the same
    reason, as .chat-panel > .ack-stack. */
 .chat-panel-dock {
+  --scroll-owner: authoring-dock;
+
   display: flex;
   flex-direction: column;
   flex: 0 1 auto;
@@ -1356,6 +1358,8 @@
 }
 
 .chat-panel-messages {
+  --scroll-owner: authoring;
+
   flex: 1;
   overflow-y: auto;
   padding: var(--space-lg) 0;
@@ -2639,6 +2643,8 @@
 /* In freeform mode the stack sits above the scrolling message list; pin it so
    pending decisions stay visible while the operator scrolls the conversation. */
 .chat-panel > .ack-stack {
+  --scroll-owner: authoring-ack;
+
   position: sticky;
   top: 0;
   z-index: 2;

@@ -238,6 +238,8 @@
    Transcript, acknowledgement cards, current decision, and pending reply
    share one bounded scroller; the composer remains docked beneath it. */
 .guided-authoring-scroll {
+  --scroll-owner: authoring;
+
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
