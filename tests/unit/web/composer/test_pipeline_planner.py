@@ -141,8 +141,15 @@ _TEST_SESSION_ID = "11111111-1111-4111-8111-111111111111"
 # paid for by reference_join + the two blob expanders (+911 B net). Re-set
 # 2026-08-31 (John): 100 -> 102 KiB, paid for by the provider set-pipeline
 # envelope plus state-aware, surface-scoped source-rebuild guidance (current
-# fixed scaffold: 103,596 B).
-_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = 102 * 1024
+# fixed scaffold: 103,596 B). Re-set 2026-09-01 (John): 102 -> 106 KiB,
+# paid for by the runtime-owned option-field advertisement and
+# option-ownership parity work (+2,339 B palette) and the source-contract /
+# review teaching text (+1,485 B skills) landed on interim-merge-target;
+# current fixed scaffold: 107,420 B. The ceiling is not derived from any
+# provider or transport limit — it is a tripwire that makes scaffolding
+# growth a thing someone looks at, so it is set to leave working room rather
+# than to sit one edit away from tripping on noise.
+_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = 106 * 1024
 
 
 @dataclass
