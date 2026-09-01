@@ -211,6 +211,14 @@ Both rules are absolute in the composer's authoring path. They do not prohibit
 server-side *validation*, *rejection*, or *redaction* of what the planner
 produces, nor the required-control admission gates that protect runtime data.
 
+Standing review trigger (operator ruling 2026-09-02): any latency or cost
+optimization touching the rootless or tutorial entry path gets per-TRANSITION
+provider-call scrutiny before it lands — both prior invariant violations
+(`b073d248e`, `9700470e2`) were latency fixes on exactly this chokepoint, and
+the first evaded detection for 26 days because the gate counted calls per
+walk. If the trivial case feels too slow, that is a planner-brief defect to
+fix (see elspeth-63cf3803e6), never a reason to route around the provider.
+
 The interim guided collector guard is LIFTED (WS6, ruling 7878 on
 elspeth-88bb77953c): the guided lane authors and projects collectors like any
 other node kind, `guided_collector_not_authorable` is retired, and every
