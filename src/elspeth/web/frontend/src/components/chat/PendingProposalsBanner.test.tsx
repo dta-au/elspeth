@@ -68,6 +68,28 @@ describe("PendingProposalsLiveRegion", () => {
     expect(region).toHaveTextContent("");
   });
 
+  it("keeps the announcement out of the region's mounting commit", () => {
+    // A live region born WITH content is the unreliable announce pattern —
+    // AT may say nothing. When the region mounts while a proposal is already
+    // actionable (e.g. the freeform surface returning from guided mode), the
+    // text must land as its own mutation inside the already-inserted node.
+    const observer = new MutationObserver(() => {});
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    render(
+      <PendingProposalsLiveRegion
+        proposals={[makeProposal("p-1")]}
+        staleProposalIds={[]}
+      />,
+    );
+
+    const records = observer.takeRecords();
+    observer.disconnect();
+    const region = screen.getByTestId("pending-proposals-live-region");
+    expect(region).toHaveTextContent("1 pending change needs your approval");
+    expect(records.some((r) => r.target === region)).toBe(true);
+  });
+
   it("announces only the actionable count", () => {
     render(
       <PendingProposalsLiveRegion

@@ -867,10 +867,64 @@ describe("ChatPanel", () => {
     }
   });
 
-  // TEMP-SKIP: failing-first test for the guided→freeform reveal; the
-  // implementation edit to ChatPanel.tsx is queued behind a sibling
-  // session's in-flight elspeth-5b42a9ae1e work in the same region.
-  // Unskipped in the same commit that lands the implementation.
+  it("reveals a pending proposal when the freeform surface returns from guided mode", () => {
+    // A proposal already pending while the GUIDED surface is up: the dock is
+    // not mounted there, so the arrival was never surfaced. Returning to
+    // freeform mounts the dock — a fresh scroll container with no operator
+    // scroll state to respect — and must reveal the waiting decision.
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(),
+      retryMessage: vi.fn(),
+      cancelComposition: vi.fn(),
+      isComposing: false,
+      compositionState: null,
+      error: null,
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      messages: [],
+      compositionProposals: [makeArrivalProposal("proposal-1")],
+      guidedSession: {
+        step: "step_1_source",
+        history: [],
+        terminal: null,
+        chat_history: [],
+        chat_turn_seq: 0,
+        profile: null,
+      },
+      guidedNextTurn: {
+        type: "single_select",
+        step_index: 0,
+        turn_token: "a".repeat(64),
+        payload: {
+          question: "Which source plugin should we use?",
+          options: [{ id: "csv", label: "CSV", hint: null }],
+          allow_custom: false,
+          source_blob_compatible_option_ids: ["csv"],
+        },
+      },
+    });
+    const { container } = render(<ChatPanel />);
+    expect(container.querySelector(".chat-panel-dock")).toBeNull();
+
+    // The dock element does not exist until the switch commit, so the scroll
+    // must be observed at the prototype and attributed by receiver.
+    const protoScrollSpy = vi.spyOn(Element.prototype, "scrollTo");
+    try {
+      act(() => {
+        useSessionStore.setState({ guidedSession: null, guidedNextTurn: null });
+      });
+
+      const dock = container.querySelector<HTMLElement>(".chat-panel-dock");
+      expect(dock).not.toBeNull();
+      expect(protoScrollSpy.mock.contexts).toContain(dock);
+      expect(
+        screen.getByTestId("pending-proposals-live-region"),
+      ).toHaveTextContent("1 pending change needs your approval");
+    } finally {
+      protoScrollSpy.mockRestore();
+    }
+  });
 
   it("announces a proposal arrival through the persistent live region", () => {
     renderIdleFreeformPanel();

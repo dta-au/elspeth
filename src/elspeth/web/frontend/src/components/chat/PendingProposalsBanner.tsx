@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import type { CompositionProposal } from "@/types/api";
 import { Button } from "@/components/ui";
@@ -58,15 +58,27 @@ export function PendingProposalsLiveRegion({
   proposals,
   staleProposalIds,
 }: PendingProposalsLiveRegionProps) {
+  const announceText = pendingProposalsAnnounceText(
+    actionableProposals(proposals, staleProposalIds).length,
+  );
+  // Mount silent, land the text one commit later. ChatPanel mounts this node
+  // per surface branch, so a guided→freeform switch (or a reload) with a
+  // proposal already pending would otherwise mount the region WITH its
+  // content — the same unreliable pattern the always-mounted companion
+  // exists to avoid. Deferring the initial text to a passive effect makes
+  // every announcement — the mounting surface included — a content mutation
+  // inside an already-inserted node.
+  const [renderedText, setRenderedText] = useState("");
+  useEffect(() => {
+    setRenderedText(announceText);
+  }, [announceText]);
   return (
     <div
       role="status"
       className="visually-hidden"
       data-testid="pending-proposals-live-region"
     >
-      {pendingProposalsAnnounceText(
-        actionableProposals(proposals, staleProposalIds).length,
-      )}
+      {renderedText}
     </div>
   );
 }

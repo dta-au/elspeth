@@ -1025,8 +1025,9 @@ export function ChatPanel({
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const guidedLogRef = useRef<HTMLDivElement>(null);
   // The docked chrome's scroll container (.chat-panel-dock) — named so the
-  // proposal-arrival effect below can scroll IT, and only it.
-  const dockRef = useRef<HTMLDivElement>(null);
+  // proposal-arrival reveal can scroll IT, and only it. Mutable (| null)
+  // because attachDock assigns it from a callback ref.
+  const dockRef = useRef<HTMLDivElement | null>(null);
   // Guided-chat pending focus contract (elspeth-6a9673ecd3, placement pass
   // 2026-07-23). The input stays MOUNTED (disabled) while /guided/chat is in
   // flight — the old unmount swap is retired — so into pending there is no
@@ -1939,28 +1940,56 @@ export function ChatPanel({
   // to arrivals by VALUE (set membership, not array identity — the derived
   // proposal arrays rebuild on unrelated store writes) so it repositions
   // once per arrival and never fights the operator's own dock scrolling.
+  // Second trigger: a freshly-MOUNTED dock (first freeform render, or the
+  // return from a guided surface with a proposal already pending) reveals
+  // any waiting decision via attachDock — a fresh mount has no operator
+  // scroll state to fight.
   const actionableBannerProposalIds = useMemo(
     () => actionableProposals(bannerProposals, staleProposalIds).map((p) => p.id),
     [bannerProposals, staleProposalIds],
   );
   const seenActionableBannerIdsRef = useRef<ReadonlySet<string>>(new Set());
+  const revealActionableProposals = useCallback(
+    (revealAlreadySeen: boolean) => {
+      const dock = dockRef.current;
+      // No dock on the guided surfaces: leave the seen-set unconsumed so the
+      // arrival still counts as new once the freeform body (and its dock)
+      // is mounted.
+      if (dock === null) return;
+      const seen = seenActionableBannerIdsRef.current;
+      seenActionableBannerIdsRef.current = new Set(actionableBannerProposalIds);
+      const shouldReveal = revealAlreadySeen
+        ? actionableBannerProposalIds.length > 0
+        : actionableBannerProposalIds.some((id) => !seen.has(id));
+      if (!shouldReveal) return;
+      const banner = dock.querySelector<HTMLElement>(".pending-proposals-banner");
+      if (banner === null) return;
+      const bannerTop =
+        banner.getBoundingClientRect().top -
+        dock.getBoundingClientRect().top +
+        dock.scrollTop;
+      dock.scrollTo({ top: bannerTop, behavior: preferredScrollBehavior() });
+    },
+    [actionableBannerProposalIds],
+  );
   useEffect(() => {
-    const dock = dockRef.current;
-    // No dock on the guided surfaces: leave the seen-set unconsumed so the
-    // arrival still counts as new if the ids change again once the freeform
-    // body (and its dock) is mounted.
-    if (dock === null) return;
-    const seen = seenActionableBannerIdsRef.current;
-    seenActionableBannerIdsRef.current = new Set(actionableBannerProposalIds);
-    if (!actionableBannerProposalIds.some((id) => !seen.has(id))) return;
-    const banner = dock.querySelector<HTMLElement>(".pending-proposals-banner");
-    if (banner === null) return;
-    const bannerTop =
-      banner.getBoundingClientRect().top -
-      dock.getBoundingClientRect().top +
-      dock.scrollTop;
-    dock.scrollTo({ top: bannerTop, behavior: preferredScrollBehavior() });
-  }, [actionableBannerProposalIds]);
+    revealActionableProposals(false);
+  }, [revealActionableProposals]);
+  // Latest-reveal ref so the dock's attach callback below stays
+  // identity-stable: a callback ref that changed per proposal-set change
+  // would detach/reattach on every arrival. Render-time ref assignment is
+  // the house idiom (guidedUploadContextRef above).
+  const revealActionableProposalsRef = useRef(revealActionableProposals);
+  revealActionableProposalsRef.current = revealActionableProposals;
+  const attachDock = useCallback((node: HTMLDivElement | null) => {
+    dockRef.current = node;
+    if (node === null) return;
+    // A freshly-mounted dock — the first freeform render, or the return
+    // from a guided surface with a proposal already pending — has no
+    // operator scroll state to respect: reveal ANY waiting decision, seen
+    // before or not. The change-effect above stays arrival-keyed.
+    revealActionableProposalsRef.current(true);
+  }, []);
 
   // ── Disambiguation action handlers ─────────────────────────────────────────
   //
@@ -3302,7 +3331,7 @@ export function ChatPanel({
           ruling and same idiom as the transcript scroller above. The cost is
           one extra tab stop on the transcript-to-composer path; it is the
           smaller loss. Focus ring in chat.css (.chat-panel-dock:focus-visible). */}
-      <div className="chat-panel-dock" tabIndex={0} ref={dockRef}>
+      <div className="chat-panel-dock" tabIndex={0} ref={attachDock}>
         {/* Composing indicator — deliberately a SIBLING of the role="log"
             messages container, not a child (elspeth-76a0cc485e, WCAG 4.1.3):
             its role="status" is itself a polite live region, and nesting it
