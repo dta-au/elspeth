@@ -7661,6 +7661,158 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
       { choice: "accepted_as_drafted" },
     );
   });
+
+  // ── elspeth-51ed4fd8d5: anchoring and survival ────────────────────────────
+  //
+  // The confirmation used to be ChatPanel-local state appended to a list and
+  // rendered after the whole turn stream. Append order WAS the position, so
+  // the bubble was permanently last: resolve a card, send another message, and
+  // "Got it" sat below that message reading as a reply to it, with several
+  // resolutions piling up as a block at the tail. It was also never hydrated,
+  // so a reload erased the operator's approvals from the transcript entirely.
+  //
+  // Both tests below fail against that implementation, and neither is
+  // satisfied by "a confirmation is somewhere on screen" — the two assertions
+  // the old tests made.
+
+  function messagesRaisingToolCall(toolCallId: string): ChatMessage[] {
+    const mk = (
+      overrides: Partial<ChatMessage> & {
+        id: string;
+        role: ChatMessage["role"];
+      },
+    ): ChatMessage =>
+      ({
+        session_id: sessionFixture.id,
+        content: "",
+        tool_calls: null,
+        created_at: "2026-05-18T10:00:00Z",
+        ...overrides,
+      }) as ChatMessage;
+    return [
+      mk({ id: "u1", role: "user", content: "make me a leads csv" }),
+      mk({
+        id: "a1",
+        role: "assistant",
+        tool_calls: [
+          {
+            id: toolCallId,
+            type: "function",
+            function: { name: "set_pipeline", arguments: "{}" },
+          },
+        ],
+      }),
+      mk({ id: "a2", role: "assistant", content: "Pipeline update ready." }),
+      mk({ id: "u2", role: "user", content: "now rate each lead" }),
+    ];
+  }
+
+  it("anchors the confirmation to the turn that raised the term, not the tail", () => {
+    // The resolved row arrives the way refreshAll delivers it on load.
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              session_id: sessionFixture.id,
+              tool_call_id: "call-set-pipeline",
+              user_term: "inline_source_data",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:05:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingToolCall("call-set-pipeline"),
+    });
+
+    render(<ChatPanel />);
+
+    const confirmation = screen.getByTestId(
+      "interpretation-review-confirmation",
+    );
+    expect(confirmation.textContent).toMatch(/inline_source_data/);
+
+    // Document order is the assertion — MessageBubble is mocked in this file,
+    // so its wrapper classes are not available to anchor on and would be a
+    // mock artefact if they were.
+    //
+    // The reported defect exactly: the confirmation must come BEFORE the user
+    // turn that was sent afterwards, or it reads as a reply to that turn.
+    const laterUserTurn = screen.getByText("now rate each lead");
+    expect(
+      confirmation.compareDocumentPosition(laterUserTurn) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // …and AFTER the turn that raised it, so it reads as that turn's closure
+    // rather than as a preamble to it.
+    const agentTurn = screen.getByText("Pipeline update ready.");
+    expect(
+      agentTurn.compareDocumentPosition(confirmation) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("rebuilds confirmations from the store, so a reload does not erase them", () => {
+    // No interaction at all — this is a fresh mount reading what refreshAll
+    // fetched, i.e. the state after a page reload. The old implementation
+    // rendered nothing here: its list was seeded [] and only ever appended to
+    // by an onResolved callback that a reload never fires.
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-1",
+              session_id: sessionFixture.id,
+              tool_call_id: "call-set-pipeline",
+              user_term: "quality",
+              choice: "accepted_as_drafted",
+            }),
+            makeInterpretationEvent({
+              id: "evt-2",
+              session_id: sessionFixture.id,
+              // No anchor available: still shown, after the stream, rather
+              // than dropped — an approval the operator gave is not discarded
+              // for want of a place to put it.
+              tool_call_id: null,
+              user_term: "rate_lead_quality",
+              choice: "amended",
+            }),
+            makeInterpretationEvent({
+              id: "evt-3",
+              session_id: sessionFixture.id,
+              // Opt-out rows carry no term and must stay silent — the opt-out
+              // flow has its own confirm dialog.
+              tool_call_id: null,
+              user_term: null,
+              choice: "opted_out",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingToolCall("call-set-pipeline"),
+    });
+
+    render(<ChatPanel />);
+
+    const confirmations = screen.getAllByTestId(
+      "interpretation-review-confirmation",
+    );
+    expect(confirmations).toHaveLength(2);
+    expect(confirmations.map((node) => node.textContent).join(" ")).toMatch(
+      /quality[\s\S]*rate_lead_quality/,
+    );
+  });
 });
 
 describe("ChatPanel chat presentation (ux-review-2026-07-02)", () => {

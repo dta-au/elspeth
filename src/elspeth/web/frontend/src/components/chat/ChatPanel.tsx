@@ -1,5 +1,6 @@
 // src/components/chat/ChatPanel.tsx
 import {
+  Fragment,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -11,6 +12,7 @@ import {
 import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import type { InterpretationEvent } from "@/types/interpretation";
 import { useBlobStore } from "@/stores/blobStore";
 import {
   deriveInlineSourceRowCount,
@@ -117,6 +119,41 @@ function isEmptyRedactedOptions(value: unknown): boolean {
 }
 
 const DEFAULT_PIPELINE_METADATA_NAME = "Untitled Pipeline";
+
+// Stable empty slice for the resolved-interpretations selector. A selector
+// that returns a fresh `[]` on every call compares unequal to itself under
+// zustand's referential check and re-renders ChatPanel on every store write,
+// so the miss path has to hand back ONE array.
+const NO_RESOLVED_INTERPRETATIONS: readonly InterpretationEvent[] = [];
+
+/**
+ * "Got it — using your interpretation of <term>." — the human-readable echo
+ * of an interpretation the operator approved.
+ *
+ * The canonical record is the interpretation_event row in the audit trail;
+ * this is the nudge that tells the operator, in the conversation, which
+ * assumption they just signed off. One component because it now renders from
+ * TWO places — anchored beside the turn that raised the term, and after the
+ * stream for rows that carry no usable anchor — and the two must stay the
+ * same bubble.
+ */
+function InterpretationConfirmation({ userTerm }: { userTerm: string }) {
+  return (
+    <div
+      className="message-row message-row--assistant interpretation-review-confirmation"
+      data-testid="interpretation-review-confirmation"
+      role="status"
+    >
+      <div className="bubble bubble-assistant message-bubble-content">
+        Got it — using your interpretation of{" "}
+        <em className="interpretation-review-confirmation-user-term">
+          {userTerm}
+        </em>
+        .
+      </div>
+    </div>
+  );
+}
 
 const TUTORIAL_STEP_2_COMPOSING_SUBSTEPS = [
   "Read output request",
@@ -1622,42 +1659,89 @@ export function ChatPanel({
   // confirmations are still visible. Confirmations persist for the
   // lifetime of the ChatPanel mount; switching sessions or reloading clears
   // them, which matches the "ephemeral UI nudge" intent.
-  interface ResolveConfirmation {
-    id: string;
-    userTerm: string;
-  }
-  const [resolveConfirmations, setResolveConfirmations] = useState<
-    ReadonlyArray<ResolveConfirmation>
-  >([]);
-  // Monotonic counter for confirmation ids — useId is per-component and
-  // would collide across appended entries; crypto.randomUUID is overkill
-  // for ephemeral UI state. A ref-backed counter is identity-stable across
-  // renders and produces predictable, debuggable ids in DevTools.
-  const confirmationIdCounterRef = useRef(0);
-
-  const handleInterpretationResolved = useCallback(
-    (resolvedEvent: { user_term: string | null }) => {
-      // Skip the confirmation when user_term is null — this is the case
-      // for opt-out and auto-interpretation rows, which do not have a
-      // user term to echo. The opt-out flow has its own confirm dialog
-      // ("Stop reviewing interpretations"); a chat-stream
-      // echo would be redundant noise.
-      const userTerm = resolvedEvent.user_term;
-      if (userTerm === null || userTerm === "") return;
-      confirmationIdCounterRef.current += 1;
-      const id = `resolve-confirmation-${confirmationIdCounterRef.current}`;
-      setResolveConfirmations((prev) => [...prev, { id, userTerm }]);
-    },
-    [],
+  // Confirmations are DERIVED from the resolved interpretation events, not
+  // accumulated in component state (elspeth-51ed4fd8d5). They used to be a
+  // local useState list appended on each resolve and rendered after the whole
+  // turn stream, which produced two defects at once:
+  //
+  //   Position — append order IS the position, so a confirmation was
+  //   permanently last. Resolve a card, send another message, and the "Got
+  //   it" sat below that message reading as a reply to it; three resolutions
+  //   piled up as a block at the tail no matter which turns raised them.
+  //
+  //   Persistence — the list was seeded [] and reset on session switch, never
+  //   hydrated, so a reload erased every confirmation. In an audit-first
+  //   product the transcript then shows the assumptions being surfaced and
+  //   never shows the operator approving them.
+  //
+  // interpretationEventsStore.resolvedBySession fixes both: refreshAll
+  // populates it from the wire on session load and resolveEvent appends to it
+  // live, so one source serves both paths, and every row carries the
+  // tool_call_id that anchors it to the turn that raised the term.
+  const resolvedInterpretations = useInterpretationEventsStore((state) =>
+    activeSessionId === null
+      ? NO_RESOLVED_INTERPRETATIONS
+      : (state.resolvedBySession[activeSessionId] ??
+        NO_RESOLVED_INTERPRETATIONS),
   );
 
-  // Reset confirmations on session switch — the confirmations are
-  // per-session UI state and showing previous-session confirmations in a
-  // new session's chat would be confusing.
-  useEffect(() => {
-    setResolveConfirmations([]);
-    confirmationIdCounterRef.current = 0;
-  }, [activeSessionId]);
+  // toolCallId -> the terms resolved against that call, in resolution order.
+  //
+  // Rows with no user_term are skipped exactly as before: opt-out and
+  // auto-interpreted rows have nothing to echo, and the opt-out flow carries
+  // its own confirm dialog. Rows with a term but no tool_call_id cannot be
+  // anchored and fall through to `unanchoredConfirmations` below rather than
+  // being dropped — an approval the operator gave is not something to discard
+  // because we cannot place it.
+  const confirmationsByToolCallId = useMemo(() => {
+    const byToolCall = new Map<string, string[]>();
+    for (const event of resolvedInterpretations) {
+      const userTerm = event.user_term;
+      if (userTerm === null || userTerm === "") continue;
+      const toolCallId = event.tool_call_id;
+      if (toolCallId === null) continue;
+      const terms = byToolCall.get(toolCallId);
+      if (terms === undefined) byToolCall.set(toolCallId, [userTerm]);
+      else terms.push(userTerm);
+    }
+    return byToolCall;
+  }, [resolvedInterpretations]);
+
+  // The turns that actually reach the DOM. Hoisted out of the JSX because the
+  // confirmation anchoring has to know which tool calls are on screen: the
+  // atomic-reveal gate hides a mid-flight tail turn, and a confirmation whose
+  // anchor is hidden must fall to the tail rather than silently vanish.
+  const renderedTurns = useMemo(
+    () =>
+      chatTurns.filter(
+        (turn: ChatTurn, index: number) =>
+          turn.isComplete || !isComposing || index < chatTurns.length - 1,
+      ),
+    [chatTurns, isComposing],
+  );
+
+  // Confirmations that cannot be anchored: no tool_call_id on the row, or its
+  // call belongs to a turn that is not on screen (hidden by the atomic-reveal
+  // gate, or raised during a guided phase whose turns replay through
+  // GuidedChatHistory rather than as chatTurns). They render after the stream,
+  // which is where ALL of them used to render — the fallback is the old
+  // behaviour, kept deliberately so an approval is never dropped for want of
+  // a place to put it.
+  const tailConfirmations = useMemo(() => {
+    const onScreen = new Set<string>();
+    for (const turn of renderedTurns) {
+      for (const call of turn.aggregatedToolCalls) onScreen.add(call.id);
+    }
+    const tail: { id: string; userTerm: string }[] = [];
+    for (const event of resolvedInterpretations) {
+      const userTerm = event.user_term;
+      if (userTerm === null || userTerm === "") continue;
+      const toolCallId = event.tool_call_id;
+      if (toolCallId !== null && onScreen.has(toolCallId)) continue;
+      tail.push({ id: event.id, userTerm });
+    }
+    return tail;
+  }, [resolvedInterpretations, renderedTurns]);
 
   // Disambiguation re-fire guards (F-10 / F-11). Subscribed via the
   // store so the widget surface updates when a guard flips — without
@@ -2950,11 +3034,15 @@ export function ChatPanel({
           <AcknowledgementLiveRegion sessionId={activeSessionId} />
           <AcknowledgementStack
             sessionId={activeSessionId}
-            onResolved={(newState, event) => {
+            onResolved={(newState) => {
+              // The confirmation bubble is NOT pushed from here any more
+              // (elspeth-51ed4fd8d5). useInterpretationResolver already lands
+              // the resolved row in interpretationEventsStore.resolvedBySession,
+              // and the transcript derives every confirmation from that slice —
+              // so the same code path serves a live resolve and a page reload,
+              // and the row's tool_call_id anchors the echo to the turn that
+              // raised the term instead of appending it to the tail.
               applyResolvedInterpretation(newState);
-              if (event !== null) {
-                handleInterpretationResolved(event);
-              }
             }}
           />
         </>
@@ -3024,12 +3112,7 @@ export function ChatPanel({
             // composition is running. Those historical turns must still render
             // so their tool calls stay visible; only the current tail turn stays
             // behind the atomic-reveal gate.
-            chatTurns
-              .filter(
-                (turn: ChatTurn, index: number) =>
-                  turn.isComplete || !isComposing || index < chatTurns.length - 1,
-              )
-              .map((turn: ChatTurn) => {
+            renderedTurns.map((turn: ChatTurn) => {
                 const repr = turnRepresentativeMessage(turn);
                 // Attach the inline-source summary to the most recent complete
                 // agent turn — that's the turn whose audit narrative includes
@@ -3044,22 +3127,38 @@ export function ChatPanel({
                   inlineSourceSummary && turn.id === inlineSourceTargetTurnId
                     ? [inlineSourceSummary]
                     : undefined;
+                // Interpretation confirmations raised BY this turn, emitted
+                // straight after its bubble (elspeth-51ed4fd8d5). The anchor
+                // is the tool call that surfaced the term, so the echo stays
+                // beside the exchange it belongs to however long the operator
+                // takes to resolve the card, and however many turns land in
+                // between.
+                const confirmedTerms = turn.aggregatedToolCalls.flatMap(
+                  (call) => confirmationsByToolCallId.get(call.id) ?? [],
+                );
                 return (
-                  <MessageBubble
-                    key={turn.id}
-                    message={repr}
-                    isComposing={isComposing}
-                    onRetry={turn.kind === "user" ? retryMessage : undefined}
-                    onFork={turn.kind === "user" ? handleFork : undefined}
-                    proposalsByToolCallId={proposalsByToolCallId}
-                    compositionState={compositionState}
-                    staleProposalIds={staleProposalIds}
-                    proposalActionPendingIds={proposalActionPendingIds}
-                    onAcceptProposal={acceptProposal}
-                    onRejectProposal={rejectProposal}
-                    sourcesCreated={sourcesForThisTurn}
-                    onEditInlineSource={handleEditInlineSource}
-                  />
+                  <Fragment key={turn.id}>
+                    <MessageBubble
+                      message={repr}
+                      isComposing={isComposing}
+                      onRetry={turn.kind === "user" ? retryMessage : undefined}
+                      onFork={turn.kind === "user" ? handleFork : undefined}
+                      proposalsByToolCallId={proposalsByToolCallId}
+                      compositionState={compositionState}
+                      staleProposalIds={staleProposalIds}
+                      proposalActionPendingIds={proposalActionPendingIds}
+                      onAcceptProposal={acceptProposal}
+                      onRejectProposal={rejectProposal}
+                      sourcesCreated={sourcesForThisTurn}
+                      onEditInlineSource={handleEditInlineSource}
+                    />
+                    {confirmedTerms.map((userTerm) => (
+                      <InterpretationConfirmation
+                        key={`${turn.id}:${userTerm}`}
+                        userTerm={userTerm}
+                      />
+                    ))}
+                  </Fragment>
                 );
               })
           )}
@@ -3076,36 +3175,23 @@ export function ChatPanel({
             />
           )}
           {/*
-            Resolve-success confirmation bubbles (Phase 5b.18b.8).
+            Unanchorable resolve confirmations (Phase 5b.18b.8).
 
-            One assistant-styled bubble per resolved interpretation. Rendered
-            inside the role="log" region so the new bubble is announced to
-            AT users on append (aria-live="polite" on the parent). The
-            bubbles compose the same message-row--assistant +
-            bubble-assistant classes as ordinary assistant turns
-            (MessageBubble.tsx) so the confirmation visually flows with the
-            conversation — the previous chat-message* tokens here were
-            defined by no stylesheet, so these rendered as bare unstyled
-            text (elspeth-729872658a). These are NOT persisted to
-            sessionStore.messages and do NOT round-trip to the server — see
-            the handleInterpretationResolved comment above for the
-            rationale.
+            The anchored ones render beside the turn that raised them, up in
+            the turn map. These are the residue: rows carrying no tool_call_id,
+            or whose call is not on screen. Rendering them here — after the
+            stream, which is where every confirmation used to go — keeps an
+            approval visible rather than dropping it for want of an anchor.
+
+            role="status" inside the role="log" region so an arriving bubble is
+            announced (aria-live="polite" on the parent). The row composes the
+            same message-row--assistant + bubble-assistant classes as an
+            ordinary assistant turn so it flows with the conversation; the
+            chat-message* tokens this once used were defined by no stylesheet
+            and rendered as bare unstyled text (elspeth-729872658a).
           */}
-          {resolveConfirmations.map((conf) => (
-            <div
-              key={conf.id}
-              className="message-row message-row--assistant interpretation-review-confirmation"
-              data-testid="interpretation-review-confirmation"
-              role="status"
-            >
-              <div className="bubble bubble-assistant message-bubble-content">
-                Got it — using your interpretation of{" "}
-                <em className="interpretation-review-confirmation-user-term">
-                  {conf.userTerm}
-                </em>
-                .
-              </div>
-            </div>
+          {tailConfirmations.map((conf) => (
+            <InterpretationConfirmation key={conf.id} userTerm={conf.userTerm} />
           ))}
           {/*
             Inline-source disambiguation widgets (Phase 5a Task 4).
