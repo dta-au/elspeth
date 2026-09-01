@@ -144,8 +144,22 @@ const NO_RESOLVED_INTERPRETATIONS: readonly InterpretationEvent[] = [];
  * TWO places — anchored beside the turn that raised the term, and after the
  * stream for rows that carry no usable anchor — and the two must stay the
  * same bubble.
+ *
+ * The node clause is what keeps two approvals of the SAME term apart
+ * (elspeth-52be5924d7): the staging dedup is per (kind, user_term,
+ * affected_node_id), and pipeline_decision terms are fixed constants
+ * ('drop_raw_html_fields' on every raw-HTML cleanup), so one turn can
+ * legitimately raise the same term against two nodes. Without the node the
+ * two echoes are pixel-identical and the operator cannot tell which
+ * approval bound to which review.
  */
-function InterpretationConfirmation({ userTerm }: { userTerm: string }) {
+function InterpretationConfirmation({
+  userTerm,
+  affectedNodeId,
+}: {
+  userTerm: string;
+  affectedNodeId: string | null;
+}) {
   return (
     <div
       className="message-row message-row--assistant interpretation-review-confirmation"
@@ -157,6 +171,15 @@ function InterpretationConfirmation({ userTerm }: { userTerm: string }) {
         <em className="interpretation-review-confirmation-user-term">
           {userTerm}
         </em>
+        {affectedNodeId !== null && (
+          <>
+            {" "}
+            for{" "}
+            <em className="interpretation-review-confirmation-node">
+              {affectedNodeId}
+            </em>
+          </>
+        )}
         .
       </div>
     </div>
@@ -1752,7 +1775,14 @@ export function ChatPanel({
     [resolvedInterpretations],
   );
 
-  // toolCallId -> the terms approved against that call, in resolution order.
+  // toolCallId -> the approvals resolved against that call, in resolution
+  // order. Each entry keeps the event id and affected node
+  // (elspeth-52be5924d7): the same user_term can be approved twice under one
+  // turn (per-node staging dedup + fixed pipeline_decision constants), and
+  // the backend's pending-uniqueness index puts those approvals on distinct
+  // tool_call_ids — so the term alone can neither key the bubbles nor tell
+  // them apart. The event id is the render key; the node is the visible
+  // differentiator.
   //
   // Approved rows always carry a user_term (the backend CHECK on
   // user_approved rows guarantees it); the null/empty guard is wire-type
@@ -1761,15 +1791,23 @@ export function ChatPanel({
   // rather than being dropped — an approval the operator gave is not
   // something to discard because we cannot place it.
   const confirmationsByToolCallId = useMemo(() => {
-    const byToolCall = new Map<string, string[]>();
+    const byToolCall = new Map<
+      string,
+      { id: string; userTerm: string; affectedNodeId: string | null }[]
+    >();
     for (const event of approvedInterpretations) {
       const userTerm = event.user_term;
       if (userTerm === null || userTerm === "") continue;
       const toolCallId = event.tool_call_id;
       if (toolCallId === null) continue;
-      const terms = byToolCall.get(toolCallId);
-      if (terms === undefined) byToolCall.set(toolCallId, [userTerm]);
-      else terms.push(userTerm);
+      const approval = {
+        id: event.id,
+        userTerm,
+        affectedNodeId: event.affected_node_id,
+      };
+      const approvals = byToolCall.get(toolCallId);
+      if (approvals === undefined) byToolCall.set(toolCallId, [approval]);
+      else approvals.push(approval);
     }
     return byToolCall;
   }, [approvedInterpretations]);
@@ -1799,13 +1837,21 @@ export function ChatPanel({
     for (const turn of renderedTurns) {
       for (const call of turn.aggregatedToolCalls) onScreen.add(call.id);
     }
-    const tail: { id: string; userTerm: string }[] = [];
+    const tail: {
+      id: string;
+      userTerm: string;
+      affectedNodeId: string | null;
+    }[] = [];
     for (const event of approvedInterpretations) {
       const userTerm = event.user_term;
       if (userTerm === null || userTerm === "") continue;
       const toolCallId = event.tool_call_id;
       if (toolCallId !== null && onScreen.has(toolCallId)) continue;
-      tail.push({ id: event.id, userTerm });
+      tail.push({
+        id: event.id,
+        userTerm,
+        affectedNodeId: event.affected_node_id,
+      });
     }
     return tail;
   }, [approvedInterpretations, renderedTurns]);
@@ -3265,7 +3311,7 @@ export function ChatPanel({
                 // beside the exchange it belongs to however long the operator
                 // takes to resolve the card, and however many turns land in
                 // between.
-                const confirmedTerms = turn.aggregatedToolCalls.flatMap(
+                const confirmedApprovals = turn.aggregatedToolCalls.flatMap(
                   (call) => confirmationsByToolCallId.get(call.id) ?? [],
                 );
                 return (
@@ -3284,10 +3330,11 @@ export function ChatPanel({
                       sourcesCreated={sourcesForThisTurn}
                       onEditInlineSource={handleEditInlineSource}
                     />
-                    {confirmedTerms.map((userTerm) => (
+                    {confirmedApprovals.map((conf) => (
                       <InterpretationConfirmation
-                        key={`${turn.id}:${userTerm}`}
-                        userTerm={userTerm}
+                        key={conf.id}
+                        userTerm={conf.userTerm}
+                        affectedNodeId={conf.affectedNodeId}
                       />
                     ))}
                   </Fragment>
@@ -3323,7 +3370,11 @@ export function ChatPanel({
             and rendered as bare unstyled text (elspeth-729872658a).
           */}
           {tailConfirmations.map((conf) => (
-            <InterpretationConfirmation key={conf.id} userTerm={conf.userTerm} />
+            <InterpretationConfirmation
+              key={conf.id}
+              userTerm={conf.userTerm}
+              affectedNodeId={conf.affectedNodeId}
+            />
           ))}
           {/*
             Inline-source disambiguation widgets (Phase 5a Task 4).

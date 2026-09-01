@@ -324,6 +324,9 @@ const RULE_LESS_BY_DESIGN: Record<string, string> = {
   "interpretation-review-confirmation-user-term":
     "Semantic <em> supplies the intended emphasis for the quoted user term; " +
     "the class adds no treatment of its own.",
+  "interpretation-review-confirmation-node":
+    "Semantic <em> supplies the intended emphasis for the node the approval " +
+    "bound to (elspeth-52be5924d7); the class adds no treatment of its own.",
   "wire-review-route":
     "Grouping span around the row's primary from→to text, which correctly " +
     "renders in the list's base register; row rhythm comes from the defined " +

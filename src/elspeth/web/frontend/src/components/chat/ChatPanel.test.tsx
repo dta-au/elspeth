@@ -8200,6 +8200,180 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
       confirmations.map((node) => node.textContent).join(" "),
     ).not.toMatch(/engagement/);
   });
+
+  // ── elspeth-52be5924d7: same term approved twice under one turn ───────────
+  //
+  // The backend guarantees this shape arrives on DISTINCT tool_call_ids: the
+  // staging dedup is scoped per (kind, user_term, affected_node_id), so the
+  // same term against two nodes is two pending events, and the
+  // uq_interpretation_events_pending_tool_call index forbids two pendings
+  // sharing a call id. pipeline_decision terms make it deterministic — every
+  // raw-HTML-cleanup review on every field_mapper uses the literal constant
+  // 'drop_raw_html_fields'. The old key `${turn.id}:${userTerm}` discarded
+  // exactly that differentiator.
+
+  function messagesRaisingTwoToolCalls(
+    callIdA: string,
+    callIdB: string,
+  ): ChatMessage[] {
+    const mk = (
+      overrides: Partial<ChatMessage> & {
+        id: string;
+        role: ChatMessage["role"];
+      },
+    ): ChatMessage =>
+      ({
+        session_id: sessionFixture.id,
+        content: "",
+        tool_calls: null,
+        created_at: "2026-05-18T10:00:00Z",
+        ...overrides,
+      }) as ChatMessage;
+    return [
+      mk({ id: "u1", role: "user", content: "clean both scraped sources" }),
+      mk({
+        id: "a1",
+        role: "assistant",
+        tool_calls: [
+          {
+            id: callIdA,
+            type: "function",
+            function: {
+              name: "request_interpretation_review",
+              arguments: "{}",
+            },
+          },
+          {
+            id: callIdB,
+            type: "function",
+            function: {
+              name: "request_interpretation_review",
+              arguments: "{}",
+            },
+          },
+        ],
+      }),
+      mk({ id: "a2", role: "assistant", content: "Both cleanups staged." }),
+    ];
+  }
+
+  function seedSameTermApprovedOnTwoNodes() {
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-clean-main",
+              session_id: sessionFixture.id,
+              tool_call_id: "call-clean-main",
+              affected_node_id: "cleanup_html_main",
+              user_term: "drop_raw_html_fields",
+              kind: "pipeline_decision",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:05:00Z",
+            }),
+            makeInterpretationEvent({
+              id: "evt-clean-comments",
+              session_id: sessionFixture.id,
+              tool_call_id: "call-clean-comments",
+              affected_node_id: "cleanup_html_comments",
+              user_term: "drop_raw_html_fields",
+              kind: "pipeline_decision",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:06:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingTwoToolCalls(
+        "call-clean-main",
+        "call-clean-comments",
+      ),
+    });
+  }
+
+  it("keys same-term approvals under one turn distinctly — no React duplicate-key error", () => {
+    // Fails if the anchored key reverts to `${turn.id}:${userTerm}`: React
+    // logs "Encountered two children with the same key" through
+    // console.error for the two same-term siblings.
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+
+    seedSameTermApprovedOnTwoNodes();
+    render(<ChatPanel />);
+
+    expect(
+      screen.getAllByTestId("interpretation-review-confirmation"),
+    ).toHaveLength(2);
+    const duplicateKeyErrors = consoleError.mock.calls.filter((args) =>
+      args.some(
+        (arg) =>
+          typeof arg === "string" &&
+          arg.includes("two children with the same key"),
+      ),
+    );
+    expect(duplicateKeyErrors).toHaveLength(0);
+  });
+
+  it("labels each anchored confirmation with the node the approval bound to", () => {
+    // Two approvals of the same term are two audit-distinct events; without
+    // the node on the card the operator cannot tell which approval echoed
+    // which review. Fails if InterpretationConfirmation renders only the
+    // term.
+    seedSameTermApprovedOnTwoNodes();
+    render(<ChatPanel />);
+
+    const confirmations = screen.getAllByTestId(
+      "interpretation-review-confirmation",
+    );
+    expect(confirmations).toHaveLength(2);
+    // flatMap order follows the turn's aggregatedToolCalls order.
+    expect(confirmations[0].textContent).toMatch(/cleanup_html_main/);
+    expect(confirmations[0].textContent).not.toMatch(/cleanup_html_comments/);
+    expect(confirmations[1].textContent).toMatch(/cleanup_html_comments/);
+    expect(confirmations[1].textContent).not.toMatch(/cleanup_html_main/);
+  });
+
+  it("labels a tail confirmation with its node", () => {
+    // The tail path always had unique keys but the same missing node
+    // identity. A row with no tool_call_id still carries the node the
+    // approval bound to.
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-tail",
+              session_id: sessionFixture.id,
+              tool_call_id: null,
+              affected_node_id: "rater",
+              user_term: "lead_quality",
+              choice: "amended",
+              resolved_at: "2026-05-18T10:05:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: [],
+    });
+
+    render(<ChatPanel />);
+
+    const confirmation = screen.getByTestId(
+      "interpretation-review-confirmation",
+    );
+    expect(confirmation.textContent).toMatch(/lead_quality/);
+    expect(confirmation.textContent).toMatch(/rater/);
+  });
 });
 
 describe("ChatPanel chat presentation (ux-review-2026-07-02)", () => {
