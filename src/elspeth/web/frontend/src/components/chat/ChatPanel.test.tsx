@@ -8344,16 +8344,104 @@ describe("ChatPanel jump-to-latest pill (elspeth-4ad68a3769)", () => {
   });
 
   it("keeps the pill's jump behaviour through the new structure", () => {
-    renderScrolledUpPanel();
+    const { scroll } = renderScrolledUpPanel();
 
     const pill = screen.getByRole("button", { name: "Scroll to bottom" });
     fireEvent.click(pill);
 
-    expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({
-      behavior: "smooth",
-    });
+    // The transcript lands at its end (the helper stubs scrollHeight 1000).
+    expect(scroll.scrollTop).toBe(1000);
     expect(
       screen.queryByRole("button", { name: "Scroll to bottom" }),
     ).toBeNull();
+  });
+
+  it("scrolls the transcript BY NAME, never by walking ancestors", () => {
+    // This assertion is the whole defect, so it is worth stating plainly:
+    // scrollIntoView scrolls every scrollable ancestor of its target, and
+    // `overflow: hidden` does not make a box unscrollable — it only hides the
+    // scrollbar. All three freeform call sites used to fire it at a sentinel
+    // inside the transcript, and whenever the docked chrome pushed
+    // .chat-panel's content past its own box the call scrolled the PANEL:
+    // measured in Chrome at scrollTop 0 -> 130, .chat-panel-header carried to
+    // -49, the composer left floating above a void that no re-render could
+    // clear because a scroll offset is not React state. Only a reload fixed it.
+    //
+    // Asserting "the transcript ended up at the bottom" would NOT catch that —
+    // the old code satisfied it too, on its way past. The observable that
+    // separates a correct scroll from the defect is the INSTRUMENT: a scroller
+    // named directly cannot move anything above it. So this pins zero
+    // scrollIntoView calls on the freeform path, and it is the assertion that
+    // fails if anyone reaches for the convenient API again.
+    const walkSpy = vi.fn();
+    Element.prototype.scrollIntoView = walkSpy;
+
+    const { scroll } = renderScrolledUpPanel();
+    fireEvent.click(screen.getByRole("button", { name: "Scroll to bottom" }));
+
+    expect(walkSpy).not.toHaveBeenCalled();
+    expect(scroll.scrollTop).toBe(1000);
+  });
+
+  it("pins the panel as a clip box and the dock as the yielding claimant", () => {
+    // jsdom computes no layout, so the two rules that make the fix structural
+    // are unobservable to a DOM test — same stylesheet-reading idiom as the
+    // positioning-contract test above, for the same reason.
+    // Comments are stripped first: both rules below CARRY a comment that
+    // quotes the declaration it replaced, so a naive match reads the prose as
+    // the code and the negative assertion below inverts.
+    const css = readFileSync(
+      join(process.cwd(), "src/components/chat/chat.css"),
+      "utf8",
+    ).replace(/\/\*[\s\S]*?\*\//g, "");
+    const ruleBody = (selector: string): string =>
+      new RegExp(`${selector}\\s*\\{([^}]*)\\}`, "s").exec(css)?.[1] ?? "";
+
+    // `clip` is load-bearing, not a synonym for `hidden`: a clip box is not a
+    // scroll container, so no ancestor walk — scrollIntoView, focus(),
+    // find-in-page, an AT caret — can give this panel a scroll offset at all.
+    // Reverting this one word restores the defect even with the call sites
+    // fixed, because the panel becomes scrollable again.
+    const panelRule = ruleBody("\\.chat-panel");
+    expect(panelRule).toMatch(/overflow:\s*clip/);
+    expect(panelRule).not.toMatch(/overflow:\s*hidden/);
+
+    // The dock absorbs the deficit so .chat-input never does. min-height:0 is
+    // what permits the shrink — without it the automatic minimum floors the
+    // dock at min-content and the composer is pushed through the panel's
+    // bottom edge again (measured 130px below it, clipped away entirely).
+    const dock = ruleBody("\\.chat-panel-dock");
+    expect(dock).toMatch(/flex:\s*0\s+1\s+auto/);
+    expect(dock).toMatch(/min-height:\s*0/);
+    expect(dock).toMatch(/overflow-y:\s*auto/);
+  });
+
+  it("docks every optional surface, and never the composer, inside the dock", () => {
+    // The dock only settles the budget if the composer is OUTSIDE it: a
+    // .chat-input that shrank with the dock would be squeezed away instead of
+    // pushed away — the same operator-facing loss by a different route.
+    const { container } = renderScrolledUpPanel();
+
+    const panel = container.querySelector<HTMLElement>("#chat-main");
+    const dock = container.querySelector<HTMLElement>(".chat-panel-dock");
+    expect(dock).not.toBeNull();
+    expect(dock!.parentElement).toBe(panel);
+
+    const input = screen.getByTestId("chat-input");
+    expect(dock!.contains(input)).toBe(false);
+    // …and it renders BELOW the dock, so the dock is what the panel squeezes
+    // when space runs out. Document order rather than lastElementChild: the
+    // ChatInput mock in this file returns a fragment, so the panel's last
+    // element child is an artefact of the mock's shape, not of the layout.
+    expect(
+      dock!.compareDocumentPosition(input) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // The optional surfaces are inside it. The composer-progress card is the
+    // one that grows without bound (its details default OPEN on a terminal
+    // phase), so it is the load-bearing member of the group.
+    const indicator = panel!.querySelector(".composing-indicator");
+    if (indicator !== null) expect(dock!.contains(indicator)).toBe(true);
   });
 });

@@ -959,8 +959,49 @@
   display: flex;
   flex-direction: column;
   height: 100%;
-  overflow: hidden;
+  /* `clip`, NOT `hidden` (elspeth-ecf973fb9f). Both paint identically; they differ in one property
+     that is invisible until it bites — an `overflow: hidden` box IS a scroll
+     container, it merely has no scrollbar, so anything that scrolls by
+     ancestor walk (scrollIntoView, focus(), find-in-page, an AT caret) can
+     move this panel's content and leave it moved. That is not hypothetical:
+     scrollIntoView on the transcript's end sentinel was measured driving this
+     box to scrollTop 130, carrying .chat-panel-header to -49 and stranding
+     the composer above a void that survived every re-render, because a scroll
+     offset is DOM state React does not own. A `clip` box is not a scroll
+     container at all, so the offset cannot exist to begin with. The panel's
+     one intended scroller is .chat-panel-messages.
+
+     The clip is also why .chat-panel-messages:focus-visible draws its ring
+     inset — see that rule. */
+  overflow: clip;
   position: relative;
+}
+
+/* Docked chrome between the transcript and the composer (elspeth-ecf973fb9f): the composer-progress
+   card, the blob drawer, the proposal banner, the inline-source prompt
+   (ChatPanel's .chat-panel-dock).
+
+   This box exists to make the panel's vertical budget a two-party negotiation.
+   .chat-panel-messages-region is `flex: 1` with a ZERO basis, which makes it
+   greedy for surplus and — because shrinkage is distributed across basis, not
+   height — completely unable to give anything back. So once the dock grew past
+   the surplus, the only claimant left to take space from was .chat-input, and
+   the composer was pushed clean through the panel's bottom edge: measured 130px
+   below it, clipped out of existence, with the transcript at 0 as well. The
+   operator lost the transcript AND the one control that could recover the
+   session.
+
+   The composer never yields; the dock does. `flex: 0 1 auto` gives this box a
+   content-sized basis, so it is the one that absorbs the deficit, and the
+   internal scroller keeps every docked surface reachable while it is squeezed.
+   min-height:0 is what permits the shrink at all (the automatic minimum would
+   otherwise floor it at min-content and reinstate the overflow). */
+.chat-panel-dock {
+  display: flex;
+  flex-direction: column;
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 /* Composing-state cursors. While the agent is thinking, the cursor over the
