@@ -533,6 +533,17 @@ def composition_review_contract_error(state: CompositionState) -> str | None:
     return unwired_vague_term_error(state)
 
 
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options['interpretation_requirements'] rows, untyped Mapping[str, Any] entries "
+    "persisted on composer state and round-tripped through sessions.db storage",
+    source_param="state",
+    suppresses=("R5",),
+    invariant="a malformed row is skipped (unconditional invariant B rejects it downstream) rather than "
+    "raised on; the only outputs are None or an error string naming a well-formed unwired row, so the "
+    "lenient reads can only under-report, never admit an unresolvable requirement",
+    non_raising=True,
+)
 def unwired_vague_term_error(state: CompositionState) -> str | None:
     """Return the first pending ``vague_term`` review that nothing can resolve.
 
