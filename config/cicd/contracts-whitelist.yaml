@@ -991,6 +991,7 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tools/_common.py:_validate_sink_path:options"
   - "src/elspeth/web/composer/tools/_common.py:_prevalidate_plugin_options:options"
   - "src/elspeth/web/composer/tools/_common.py:_prevalidate_plugin_options:injected_fields"
+  - "src/elspeth/web/composer/tools/_common.py:_deferred_value_source_error:options"
   - "src/elspeth/web/composer/tools/_common.py:_prevalidate_sink:options"
 
   # ═══════════════════════════════════════════════════════════════════════════

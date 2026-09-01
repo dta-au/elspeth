@@ -37,6 +37,7 @@ from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import PluginCapability
+from elspeth.contracts.plugin_protocols import PluginConfigProtocol
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.sink import FILE_SINK_PLUGINS, FILE_SINK_REPAIR_EXTENSIONS
 from elspeth.contracts.trust_boundary import observation_boundary
@@ -48,7 +49,7 @@ from elspeth.core.secrets import (
     redact_secret_refs_for_validation,
 )
 from elspeth.engine.orchestrator.preflight import check_config_value_sources
-from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.infrastructure.config_base import PluginConfig, PluginConfigError
 from elspeth.plugins.infrastructure.validation import (
     UnknownPluginTypeError,
     get_sink_config_model,
@@ -2025,6 +2026,66 @@ def _validate_transform_provider_config_policy(options: Mapping[str, Any], *, pl
     return None
 
 
+_DEFERRED_FIELD_SHAPE_PLACEHOLDER: Final[str] = "deferred value withheld from authoring validation"
+
+
+def _value_source_error(config: object, plugin_type: PluginKind, plugin_name: str) -> str | None:
+    """Format the config's ``VALUE_SOURCES`` findings, or None when it declares none/passes."""
+    findings = check_config_value_sources(config, component_id=plugin_name)
+    if not findings:
+        return None
+    return f"Invalid options for {plugin_type} '{plugin_name}': " + "; ".join(f.reason for f in findings)
+
+
+def _deferred_value_source_error(
+    config_cls: type[PluginConfigProtocol],
+    options: dict[str, Any],
+    deferred_keys: set[str],
+    plugin_type: PluginKind,
+    plugin_name: str,
+) -> str | None:
+    """Enforce ``VALUE_SOURCES`` when a deferred value made validated construction impossible.
+
+    A deferred field (``secret_ref`` marker, ``inline_content`` blob) is withheld
+    before construction, so a config model that requires it cannot be built and
+    the caller's normal value-source pass is unreachable. Catalog membership does
+    not depend on that field, though: ``check_config_value_sources`` only reads
+    the field names a declaration names. Build a SHAPE-ONLY config with
+    ``model_construct`` — no validators run, so nothing here can invent a verdict
+    about the deferred content — and run the declarations against the authored
+    values.
+
+    ``model_construct`` is deliberate, not a shortcut past validation: the caller
+    has already established that every non-deferred field validates. Filling the
+    deferred keys keeps every attribute present, because ``_read_field`` reads
+    without a default and treats a missing declared field as a plugin contract
+    bug. A finding ON a deferred key is dropped: its real value lives in a blob
+    or a secret store, so its catalog membership is unknowable here and claiming
+    otherwise would reject valid authoring. The shaped config is read by the
+    declarations and discarded — it never reaches CompositionState.
+    """
+    if not issubclass(config_cls, PluginConfig):
+        # ``PluginConfigProtocol`` promises only from_dict/model_json_schema.
+        # Building without validation needs the pydantic model API, which only
+        # ELSPETH's own PluginConfig base guarantees (ADR-032: narrow nominally
+        # against a class we define, never structurally). A config model from
+        # outside that tree cannot be shaped here, so its declarations stay
+        # unknowable while a field is deferred — the same answer this path gave
+        # before, and not a claim that they pass.
+        return None
+
+    shaped_options = dict(options)
+    for key in deferred_keys:
+        shaped_options[key] = _DEFERRED_FIELD_SHAPE_PLACEHOLDER
+    shaped = config_cls.model_construct(**shaped_options)
+    findings = tuple(
+        finding for finding in check_config_value_sources(shaped, component_id=plugin_name) if finding.field_name not in deferred_keys
+    )
+    if not findings:
+        return None
+    return f"Invalid options for {plugin_type} '{plugin_name}': " + "; ".join(f.reason for f in findings)
+
+
 def _prevalidate_plugin_options(
     plugin_type: PluginKind,
     plugin_name: str,
@@ -2146,7 +2207,9 @@ def _prevalidate_plugin_options(
                             error for error in placeholder_cause.errors() if not (error["loc"] and error["loc"][0] in blob_inline_ref_keys)
                         ]
                         if not remaining:
-                            return None
+                            return _deferred_value_source_error(
+                                config_cls, placeholder_options, secret_ref_keys | blob_inline_ref_keys, plugin_type, plugin_name
+                            )
                         lines = "; ".join(f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}" for error in remaining)
                         return f"Invalid options for {plugin_type} '{plugin_name}': {lines}"
                 msg = placeholder_exc.cause if placeholder_exc.cause is not None else str(placeholder_exc)
@@ -2164,7 +2227,7 @@ def _prevalidate_plugin_options(
 
             remaining = [e for e in cause.errors() if not (e["loc"] and e["loc"][0] in blob_inline_ref_keys)]
             if not remaining:
-                return None
+                return _deferred_value_source_error(config_cls, placeholder_options, blob_inline_ref_keys, plugin_type, plugin_name)
 
             # Re-format only the non-deferred errors.
             lines = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in remaining)
@@ -2177,10 +2240,7 @@ def _prevalidate_plugin_options(
     # hallucinated catalog value here, with an actionable ``list_models`` hint,
     # instead of letting it slip through prevalidation. Catalog membership is a
     # value-source concern, deliberately NOT enforced in config construction.
-    value_source_findings = check_config_value_sources(config, component_id=plugin_name)
-    if value_source_findings:
-        return f"Invalid options for {plugin_type} '{plugin_name}': " + "; ".join(f.reason for f in value_source_findings)
-    return None
+    return _value_source_error(config, plugin_type, plugin_name)
 
 
 @observation_boundary(
