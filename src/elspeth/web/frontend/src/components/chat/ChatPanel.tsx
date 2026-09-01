@@ -75,6 +75,7 @@ import { InlineSourceCreatedTurn } from "./InlineSourceCreatedTurn";
 import { InlineSourceDisambiguationTurn } from "./InlineSourceDisambiguationTurn";
 import { InlineSourceFallbackPrompt } from "./InlineSourceFallbackPrompt";
 import { sortedSourceEntries } from "@/utils/compositionState";
+import { preferredScrollBehavior } from "@/utils/motion";
 import type {
   BlobMetadata,
   ChatMessage,
@@ -1202,12 +1203,17 @@ export function ChatPanel({
   // resets it — only a reload did.
   //
   // scrollTop is deliberately not used here: the smooth animation IS the
-  // affordance that tells the reader the transcript moved under them. The
+  // affordance that tells the reader the transcript moved under them — except
+  // under prefers-reduced-motion, where the reader has asked us to drop that
+  // affordance and jump (preferredScrollBehavior owns the choice). The
   // two guided call sites already scroll their container by name this way.
   const scrollTranscriptToEnd = useCallback(() => {
     const container = scrollContainerRef.current;
     if (container === null) return;
-    container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: preferredScrollBehavior(),
+    });
   }, []);
 
   function scrollToBottom() {
@@ -1953,7 +1959,7 @@ export function ChatPanel({
       banner.getBoundingClientRect().top -
       dock.getBoundingClientRect().top +
       dock.scrollTop;
-    dock.scrollTo({ top: bannerTop, behavior: "smooth" });
+    dock.scrollTo({ top: bannerTop, behavior: preferredScrollBehavior() });
   }, [actionableBannerProposalIds]);
 
   // ── Disambiguation action handlers ─────────────────────────────────────────
@@ -2212,7 +2218,7 @@ export function ChatPanel({
         ".guided-chat-bubbles [data-seq]",
       );
       rows[rows.length - 1]?.scrollIntoView({
-        behavior: "smooth",
+        behavior: preferredScrollBehavior(),
         block: "start",
       });
     }
@@ -2251,7 +2257,7 @@ export function ChatPanel({
   useEffect(() => {
     if (!guidedLogRef.current) return;
     guidedLogRef.current.scrollIntoView({
-      behavior: "smooth",
+      behavior: preferredScrollBehavior(),
       block: "nearest",
     });
     const first = guidedLogRef.current.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
@@ -2283,7 +2289,10 @@ export function ChatPanel({
     if (errorDetails == null || errorDetails.length === 0) {
       return;
     }
-    rejectionRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    rejectionRef.current?.scrollIntoView({
+      behavior: preferredScrollBehavior(),
+      block: "nearest",
+    });
   }, [errorDetails]);
 
   const handleSend = useCallback(

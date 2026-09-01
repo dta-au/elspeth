@@ -838,6 +838,40 @@ describe("ChatPanel", () => {
     expect(scrollSpy).not.toHaveBeenCalled();
   });
 
+  it("downgrades the arrival scroll to behavior:'auto' under prefers-reduced-motion (elspeth-5b42a9ae1e)", async () => {
+    // The imperative scrollTo API is NOT auto-downgraded by the OS
+    // preference the way CSS animations behind the media query are — every
+    // JS scroll must consult it via preferredScrollBehavior(). This pins
+    // one representative site; the helper's own spec pins the mechanism.
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+      matches: query === "(prefers-reduced-motion: reduce)",
+      media: query,
+    })) as unknown as typeof window.matchMedia;
+    try {
+      const dock = renderIdleFreeformPanel();
+      const scrollSpy = vi.spyOn(dock, "scrollTo");
+
+      act(() => {
+        useSessionStore.setState({
+          compositionProposals: [makeArrivalProposal("proposal-1")],
+        });
+      });
+
+      await waitFor(() => expect(scrollSpy).toHaveBeenCalledTimes(1));
+      expect(scrollSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ behavior: "auto" }),
+      );
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
+  });
+
+  // TEMP-SKIP: failing-first test for the guided→freeform reveal; the
+  // implementation edit to ChatPanel.tsx is queued behind a sibling
+  // session's in-flight elspeth-5b42a9ae1e work in the same region.
+  // Unskipped in the same commit that lands the implementation.
+
   it("announces a proposal arrival through the persistent live region", () => {
     renderIdleFreeformPanel();
 
