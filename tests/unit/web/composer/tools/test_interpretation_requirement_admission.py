@@ -1026,7 +1026,9 @@ def test_direct_node_writers_preserve_trusted_requirement_id(writer: str) -> Non
 def test_direct_llm_writers_preserve_trusted_auto_staged_requirement_ids(writer: str) -> None:
     catalog = _catalog()
     old_prompt = "Summarise {{ row.text }}."
-    old_model = "openai/gpt-4o-mini"
+    # Must be a real openrouter catalog entry: afe354ee4 stopped short-circuiting
+    # value-source checks for deferred-secret configs, so this value is now verified.
+    old_model = "openai/gpt-4o"
     prompt_id = "trusted-prompt-review-id"
     model_id = "trusted-model-review-id"
     state = _state_with_node(
@@ -1036,6 +1038,7 @@ def test_direct_llm_writers_preserve_trusted_auto_staged_requirement_ids(writer:
             "model": old_model,
             "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
             "prompt_template": old_prompt,
+            "required_input_fields": ["text"],
             INTERPRETATION_REQUIREMENTS_KEY: [
                 _canonical_pending_requirement(
                     requirement_id=prompt_id,
@@ -1065,6 +1068,7 @@ def test_direct_llm_writers_preserve_trusted_auto_staged_requirement_ids(writer:
                 "model": old_model,
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                 "prompt_template": old_prompt,
+                "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
             },
         }
