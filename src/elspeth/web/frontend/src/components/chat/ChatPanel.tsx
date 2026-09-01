@@ -979,7 +979,6 @@ export function ChatPanel({
     errorDetails,
   } = useComposer();
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const guidedLogRef = useRef<HTMLDivElement>(null);
@@ -1028,7 +1027,7 @@ export function ChatPanel({
     }
   }, [guidedChatPending]);
   // Guided authoring conversation column (.guided-authoring-scroll). Its own
-  // ref + at-bottom tracking — NOT freeform's messagesEndRef/scrollContainerRef
+  // ref + at-bottom tracking — NOT freeform's scrollContainerRef
   // machinery, which is keyed to sessionStore.messages and only mounted in the
   // freeform body. Null on every non-guided branch, so the auto-scroll
   // effect below no-ops there. The at-bottom flag is a ref (not state): it is
@@ -1143,8 +1142,32 @@ export function ChatPanel({
       : [];
   }, [chatTurns, isComposing]);
 
+  // Scroll the transcript to its end, touching NOTHING above it.
+  //
+  // This was `messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })`
+  // at all three freeform call sites, and scrollIntoView is the wrong
+  // instrument for a scroller we can name: it walks the ancestor chain and
+  // scrolls EVERY scrollable box it finds. `overflow: hidden` does not make a
+  // box unscrollable — it only removes the scrollbar — so .chat-panel itself
+  // was in that set. Whenever the docked chrome pushed the panel's content
+  // past its own box (a terminal ComposingIndicator with its details open
+  // plus a proposal banner is enough), this call scrolled the PANEL:
+  // measured scrollTop 0 -> 130, carrying .chat-panel-header off the top edge
+  // to -49 and leaving the composer stranded above a void. Nothing put it
+  // back, because a DOM scroll position is not React state and no re-render
+  // resets it — only a reload did.
+  //
+  // scrollTop is deliberately not used here: the smooth animation IS the
+  // affordance that tells the reader the transcript moved under them. The
+  // two guided call sites already scroll their container by name this way.
+  const scrollTranscriptToEnd = useCallback(() => {
+    const container = scrollContainerRef.current;
+    if (container === null) return;
+    container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+  }, []);
+
   function scrollToBottom() {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    scrollTranscriptToEnd();
     setShowScrollButton(false);
   }
 
@@ -1198,9 +1221,9 @@ export function ChatPanel({
   useEffect(() => {
     if (messages.length === 0 && !isComposing) return;
     if (!showScrollButton) {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      scrollTranscriptToEnd();
     }
-  }, [messages, isComposing, showScrollButton]);
+  }, [messages, isComposing, showScrollButton, scrollTranscriptToEnd]);
 
   // Return focus to input when composing ends only if focus stayed in the
   // composer. Do not steal focus from proposal buttons, recovery actions, or
@@ -2144,9 +2167,9 @@ export function ChatPanel({
       // Explicit send means user has returned to live conversation —
       // force-scroll to bottom and resume auto-scroll.
       setShowScrollButton(false);
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      scrollTranscriptToEnd();
     },
-    [sendMessage],
+    [sendMessage, scrollTranscriptToEnd],
   );
 
   const handleFork = useCallback(
@@ -3109,7 +3132,6 @@ export function ChatPanel({
               onNotSourceData={handleDisambiguationNotSourceData}
             />
           ))}
-          <div ref={messagesEndRef} />
         </div>
 
         {/* Scroll-to-bottom button — sibling of the scrolling element, so it
@@ -3125,59 +3147,74 @@ export function ChatPanel({
         )}
       </div>
 
-      {/* Composing indicator — deliberately a SIBLING of the role="log"
-          messages container, not a child (elspeth-76a0cc485e, WCAG 4.1.3):
-          its role="status" is itself a polite live region, and nesting it
-          inside the aria-live log risks double announcements on AT that
-          honours both regions. Docked here it also stays visible while the
-          user scrolls back through history mid-compose. */}
-      {shouldShowComposerProgress && (
-        <ComposingIndicator
-          latestRequest={activeComposerMessage?.content ?? null}
-          compositionState={compositionState}
-          composerProgress={composerProgress}
-          completionOutcome={freeformCompletionOutcome}
-          liveToolCalls={liveToolCalls}
+      {/* Docked chrome: everything that sits between the transcript and the
+          composer. It is ONE box (elspeth-ecf973fb9f) because the panel's
+          vertical budget has to be settled between two claimants, not four:
+          the transcript region above yields to zero (flex:1 with a 0 basis
+          contributes nothing to shrinking), so before this wrapper existed a
+          tall dock had nowhere to take space FROM and pushed .chat-input past
+          the panel's own bottom edge — measured 130px below it, clipped away
+          by the panel's clip, with the whole transcript gone as well. The
+          composer is the panel's primary control and is never the thing that
+          yields; the dock is. See .chat-panel-dock in chat.css.
+
+          Grouping is layout-only: each child keeps the DOM position, order and
+          live-region semantics it had as a direct panel child. */}
+      <div className="chat-panel-dock">
+        {/* Composing indicator — deliberately a SIBLING of the role="log"
+            messages container, not a child (elspeth-76a0cc485e, WCAG 4.1.3):
+            its role="status" is itself a polite live region, and nesting it
+            inside the aria-live log risks double announcements on AT that
+            honours both regions. Docked here it also stays visible while the
+            user scrolls back through history mid-compose. */}
+        {shouldShowComposerProgress && (
+          <ComposingIndicator
+            latestRequest={activeComposerMessage?.content ?? null}
+            compositionState={compositionState}
+            composerProgress={composerProgress}
+            completionOutcome={freeformCompletionOutcome}
+            liveToolCalls={liveToolCalls}
+          />
+        )}
+
+        {/* Blob manager drawer */}
+        {showBlobManager && <BlobManager onUseAsInput={handleUseAsInput} />}
+
+        {/* Pending-proposal banner — surfaces composer proposals that need
+            operator approval, co-located with the input so the user does not
+            have to scroll up to find the Accept button on the originating
+            tool-call message. Component returns null when nothing is pending. */}
+        {/* Phase 5a Task 4: `bannerProposals` excludes any proposal
+            currently surfaced by an InlineSourceDisambiguationTurn
+            widget above so a single proposal does not appear in BOTH
+            surfaces. The widget handlers ultimately funnel through
+            acceptProposal / rejectProposal so the audit chain is
+            identical regardless of which surface lands the action. */}
+        <PendingProposalsBanner
+          proposals={bannerProposals}
+          staleProposalIds={staleProposalIds}
+          proposalActionPendingIds={proposalActionPendingIds}
+          onAccept={acceptProposal}
+          onReject={rejectProposal}
         />
-      )}
 
-      {/* Blob manager drawer */}
-      {showBlobManager && <BlobManager onUseAsInput={handleUseAsInput} />}
+        {/*
+          Inline-source fallback prompt (Phase 5a Task 5).
 
-      {/* Pending-proposal banner — surfaces composer proposals that need
-          operator approval, co-located with the input so the user does not
-          have to scroll up to find the Accept button on the originating
-          tool-call message. Component returns null when nothing is pending. */}
-      {/* Phase 5a Task 4: `bannerProposals` excludes any proposal
-          currently surfaced by an InlineSourceDisambiguationTurn
-          widget above so a single proposal does not appear in BOTH
-          surfaces. The widget handlers ultimately funnel through
-          acceptProposal / rejectProposal so the audit chain is
-          identical regardless of which surface lands the action. */}
-      <PendingProposalsBanner
-        proposals={bannerProposals}
-        staleProposalIds={staleProposalIds}
-        proposalActionPendingIds={proposalActionPendingIds}
-        onAccept={acceptProposal}
-        onReject={rejectProposal}
-      />
-
-      {/*
-        Inline-source fallback prompt (Phase 5a Task 5).
-
-        LLM-skip safety net. Anchored ABOVE the chat input — the user
-        reads the affordance immediately before the surface they would
-        otherwise re-type into. The widget renders nothing when
-        `shouldRenderFallback` is false; mounting unconditionally with
-        the boolean gate keeps the DOM stable across predicate flips
-        (no remount churn for the focus/scroll containers around it).
-      */}
-      <InlineSourceFallbackPrompt
-        shouldRender={shouldRenderFallback}
-        candidateText={fallbackCandidate ?? ""}
-        onAccept={handleFallbackAccept}
-        onDismiss={handleFallbackDismiss}
-      />
+          LLM-skip safety net. Anchored ABOVE the chat input — the user
+          reads the affordance immediately before the surface they would
+          otherwise re-type into. The widget renders nothing when
+          `shouldRenderFallback` is false; mounting unconditionally with
+          the boolean gate keeps the DOM stable across predicate flips
+          (no remount churn for the focus/scroll containers around it).
+        */}
+        <InlineSourceFallbackPrompt
+          shouldRender={shouldRenderFallback}
+          candidateText={fallbackCandidate ?? ""}
+          onAccept={handleFallbackAccept}
+          onDismiss={handleFallbackDismiss}
+        />
+      </div>
 
       {/* Input */}
       <ChatInput
