@@ -29,7 +29,7 @@ import ast
 import json
 import re
 import typing
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import NamedTuple, TypedDict
 
@@ -43,7 +43,10 @@ from elspeth.web.composer.tools import generation
 from elspeth_lints.core.ast_walker import iter_python_files
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-COMPOSER_SRC = REPO_ROOT / "src" / "elspeth" / "web" / "composer"
+# The whole web package, not only the composer: ``ValidationEntry`` is also
+# constructed in web/plugin_policy and web/sessions (detail-free today), and a
+# detail added there would otherwise be outside the walk (final red-team).
+WEB_SRC = REPO_ROOT / "src" / "elspeth" / "web"
 FENCE_PATH = Path(__file__).with_name("planner_teaching_fence.json")
 
 # The three detail payloads a ValidationEntry can carry, by constructor keyword,
@@ -145,7 +148,7 @@ def _enclosing_function(tree: ast.Module, lineno: int) -> str | None:
 
 
 def composer_python_files() -> list[Path]:
-    return list(iter_python_files(COMPOSER_SRC))
+    return list(iter_python_files(WEB_SRC))
 
 
 def _display(path: Path) -> str:
@@ -155,12 +158,52 @@ def _display(path: Path) -> str:
         return str(path)
 
 
+def _module_aliases(tree: ast.Module, names: Iterable[str]) -> dict[str, str]:
+    """Module-level ``alias = Name`` and ``from m import Name as alias`` bindings onto ``names``."""
+    canonical = set(names)
+    aliases: dict[str, str] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Name) and stmt.value.id in canonical:
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    aliases[target.id] = stmt.value.id
+        if isinstance(stmt, ast.ImportFrom):
+            for alias in stmt.names:
+                if alias.name in canonical and alias.asname:
+                    aliases[alias.asname] = alias.name
+    return aliases
+
+
+def _enclosing_class(tree: ast.Module, lineno: int) -> str | None:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.lineno <= lineno <= (node.end_lineno or node.lineno):
+            return node.name
+    return None
+
+
 def _detail_sites(files: Iterable[Path]) -> Iterator[ShippedKey]:
-    """Every typed-detail key a ``ValidationEntry`` / ``_err`` construction can ship, per site."""
+    """Every typed-detail key a ``ValidationEntry`` / ``_err`` construction can ship, per site.
+
+    A site is a call to an entry constructor, to a module-level alias of one,
+    or a ``replace(...)`` carrying a detail keyword. Every call to an owned
+    detail constructor must then sit INSIDE a site: one built anywhere else —
+    a prebuilt variable, a helper, a partial — is refused, because the walker
+    could not attribute it to a code (final red-team, third round). The
+    detail class's own body (``from_dict`` and friends) is exempt.
+    """
+    detail_classes = set(_DETAIL_CONSTRUCTORS.values())
     for path in files:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        entry_aliases = _module_aliases(tree, _ENTRY_CONSTRUCTORS)
+        detail_aliases = _module_aliases(tree, detail_classes)
+        attributed: set[int] = set()
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or _call_name(node) not in _ENTRY_CONSTRUCTORS:
+            if not isinstance(node, ast.Call):
+                continue
+            callee = _call_name(node)
+            carries_detail = any(kw.arg in _DETAIL_PAYLOADS for kw in node.keywords)
+            is_entry = callee in _ENTRY_CONSTRUCTORS or callee in entry_aliases
+            if not is_entry and not (callee == "replace" and carries_detail):
                 continue
             site = f"{_display(path)}:{node.lineno}"
             # Fail CLOSED, as the guided walker does: a ``**spread`` or a detail
@@ -192,11 +235,13 @@ def _detail_sites(files: Iterable[Path]) -> Iterator[ShippedKey]:
                     # nothing" and skip every leaf (final red-team F2).
                     # A helper call hides its keywords entirely (second round):
                     # only the owned constructor, called by keyword, is derivable.
-                    if _call_name(ctor) != _DETAIL_CONSTRUCTORS[name]:
+                    ctor_name = _call_name(ctor)
+                    if detail_aliases.get(ctor_name or "", ctor_name) != _DETAIL_CONSTRUCTORS[name]:
                         raise AssertionError(
-                            f"{site}: detail '{name}' built by '{_call_name(ctor)}', not {_DETAIL_CONSTRUCTORS[name]}; "
+                            f"{site}: detail '{name}' built by '{ctor_name}', not {_DETAIL_CONSTRUCTORS[name]}; "
                             "the gate cannot derive its keys"
                         )
+                    attributed.add(id(ctor))
                     if ctor.args or any(kw.arg is None for kw in ctor.keywords):
                         raise AssertionError(
                             f"{site}: detail '{name}' built positionally or with a **spread; the gate cannot derive its keys"
@@ -209,6 +254,16 @@ def _detail_sites(files: Iterable[Path]) -> Iterator[ShippedKey]:
                     if emitted is not None and top not in emitted:
                         continue
                     yield ShippedKey("freeform", code, key, site)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or id(node) in attributed:
+                continue
+            callee = _call_name(node)
+            canonical = detail_aliases.get(callee or "", callee)
+            if canonical in detail_classes and _enclosing_class(tree, node.lineno) != canonical:
+                raise AssertionError(
+                    f"{_display(path)}:{node.lineno}: {canonical} constructed outside an entry site; "
+                    "the gate cannot attribute its keys to a code"
+                )
 
 
 def _route_destination_shapes() -> dict[frozenset[str], int]:
@@ -437,6 +492,44 @@ def test_gate_derives_a_new_typed_detail_key_from_the_constructor_keywords(tmp_p
     }
 
 
+@pytest.mark.parametrize(
+    "prelude",
+    [
+        "build = ValidationEntry\nDetail = SchemaContractDetail\n",
+        "from elspeth.web.composer.state import ValidationEntry as build, SchemaContractDetail as Detail\n",
+    ],
+    ids=["assignment-alias", "import-alias"],
+)
+def test_gate_derives_a_detail_from_aliased_constructors(tmp_path: Path, prelude: str) -> None:
+    """Module-level aliases of the entry and detail constructors are resolved, so an alias is a site like any other."""
+    module = tmp_path / "alias_probe.py"
+    module.write_text(
+        prelude + "def f():\n    return build('node:x', 'm', 'high', 'sink_locked_extras', contract=Detail(producer='p'))\n",
+        encoding="utf-8",
+    )
+    shipped = {(s.code, s.key) for s in _detail_sites([module])}
+    assert shipped == {("sink_locked_extras", "contract"), ("sink_locked_extras", "contract.producer")}
+
+
+def test_guided_fact_values_have_no_mapping_arm() -> None:
+    """The guided facts value type refuses a nested record however it is built.
+
+    The walker enumerates one level and an AST walk cannot bound a mapping
+    reached through a name or a helper call (final red-team, third round):
+    the TYPE is the close. Pinned from the live signature, not a copy.
+    """
+    hints = typing.get_type_hints(guided_planning._guided_delta_rejection)
+    (mapping, _none) = typing.get_args(hints["facts"])
+    _key, value = typing.get_args(mapping)
+    arms = typing.get_args(value)
+    assert arms, "facts value must be a union of closed label types"
+    for arm in arms:
+        origin = typing.get_origin(arm) or arm
+        assert origin is not dict and not (isinstance(origin, type) and issubclass(origin, Mapping)), arm
+        assert not typing.is_typeddict(arm), arm
+    assert list[str] in arms and str in arms
+
+
 def test_gate_refuses_a_guided_site_it_cannot_derive(tmp_path: Path) -> None:
     module = tmp_path / "opaque_probe.py"
     module.write_text(
@@ -488,6 +581,12 @@ def test_gate_refuses_a_nested_dict_value_at_a_guided_site(tmp_path: Path, value
         ("_err('node:x', 'm', 'high', 'sink_locked_extras', contract=build_contract_detail())", "built by 'build_contract_detail'"),
         ("_err('node:x', 'm', 'high', 'sink_locked_extras', contract=_detail_for(producer='p'))", "built by '_detail_for'"),
         ("ValidationEntry(*parts, contract=SchemaContractDetail(producer='p'))", "built from \\*args"),
+        ("replace(entry, contract=SchemaContractDetail(producer='p'))", "cannot derive error_code"),
+        ("_err('node:x', 'm', 'high', 'sink_locked_extras', contract=prebuilt)", "constructed outside an entry site"),
+        (
+            "functools.partial(ValidationEntry, 'node:x')('m', 'high', 'sink_locked_extras', contract=SchemaContractDetail(producer='p'))",
+            "constructed outside an entry site",
+        ),
     ],
     ids=[
         "entry-spread",
@@ -497,6 +596,9 @@ def test_gate_refuses_a_nested_dict_value_at_a_guided_site(tmp_path: Path, value
         "detail-helper-call",
         "detail-helper-with-keywords",
         "entry-starred",
+        "replace-with-detail",
+        "prebuilt-variable",
+        "partial",
     ],
 )
 def test_gate_refuses_a_typed_detail_site_it_cannot_derive(tmp_path: Path, body: str, reason: str) -> None:
@@ -507,7 +609,10 @@ def test_gate_refuses_a_typed_detail_site_it_cannot_derive(tmp_path: Path, body:
     entry-level rules could be deleted unnoticed (final red-team F2).
     """
     module = tmp_path / "detail_probe.py"
-    module.write_text(f"def f(extra, detail, kw, parts):\n    return {body}\n", encoding="utf-8")
+    module.write_text(
+        f"prebuilt = SchemaContractDetail(producer='p')\ndef f(extra, detail, kw, parts, entry):\n    return {body}\n",
+        encoding="utf-8",
+    )
     with pytest.raises(AssertionError, match=reason):
         list(_detail_sites([module]))
 

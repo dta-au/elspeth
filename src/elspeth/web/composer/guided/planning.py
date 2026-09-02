@@ -1379,6 +1379,14 @@ def guided_unproducible_output_field_names(guided: GuidedSession) -> tuple[str, 
     return tuple(sorted(names))
 
 
+# A guided rejection fact is a closed structural label or a list of them —
+# never a nested record. The teaching gate enumerates one level of keys, and an
+# AST walk cannot bound a mapping reached through a name or a helper call, so
+# the TYPE is what refuses a nested record however it is built (final red-team,
+# elspeth-68721c71d7). Adding a mapping arm here is a change to the gate too.
+GuidedFactValue = str | int | bool | None | list[str]
+
+
 class GuidedCandidateBindingRejected(AuditIntegrityError):
     """Typed repairable candidate-shape rejection from the reviewed-component binder.
 
@@ -1392,16 +1400,16 @@ class GuidedCandidateBindingRejected(AuditIntegrityError):
     this type still classifies it as repairable, never a terminal 500.
     """
 
-    def __init__(self, message: str, *, error_code: str, connectivity: Mapping[str, JsonValue]) -> None:
+    def __init__(self, message: str, *, error_code: str, connectivity: Mapping[str, GuidedFactValue]) -> None:
         super().__init__(message)
         self.error_code = error_code
-        self.connectivity: dict[str, JsonValue] = dict(connectivity)
+        self.connectivity: dict[str, GuidedFactValue] = dict(connectivity)
 
 
 def _guided_delta_rejection(
     error_code: str,
     *,
-    facts: Mapping[str, JsonValue] | None = None,
+    facts: Mapping[str, GuidedFactValue] | None = None,
 ) -> GuidedCandidateBindingRejected:
     return GuidedCandidateBindingRejected(
         "guided planner candidate delta violates reviewed mutation authority",
@@ -1657,7 +1665,7 @@ def _exact_delta_members(value: object, *, allowed: set[str], subject: str) -> M
             "guided_delta_authority_violation",
             facts={
                 "delta_member": subject,
-                "allowed_keys": cast(JsonValue, sorted(allowed)),
+                "allowed_keys": sorted(allowed),
             },
         )
     unexpected = set(value) - allowed
@@ -1666,8 +1674,8 @@ def _exact_delta_members(value: object, *, allowed: set[str], subject: str) -> M
             "guided_delta_authority_violation",
             facts={
                 "delta_member": subject,
-                "unexpected_keys": cast(JsonValue, sorted(unexpected)),
-                "allowed_keys": cast(JsonValue, sorted(allowed)),
+                "unexpected_keys": sorted(unexpected),
+                "allowed_keys": sorted(allowed),
             },
         )
     return cast(dict[str, Any], deep_thaw(value))
@@ -1694,8 +1702,8 @@ def _stable_delta_entries(
                 "guided_delta_unknown_stable_id",
                 facts={
                     "delta_member": subject,
-                    "stable_id": cast(JsonValue, stable_id if type(stable_id) is str else "invalid"),
-                    "known_stable_ids": cast(JsonValue, sorted(known_ids)),
+                    "stable_id": stable_id if type(stable_id) is str else "invalid",
+                    "known_stable_ids": sorted(known_ids),
                 },
             )
         if stable_id in entries:
@@ -1721,7 +1729,7 @@ def _require_reviewed_failure_routes(guided: GuidedSession) -> None:
     if unresolved:
         raise _guided_delta_rejection(
             "guided_delta_reviewed_failure_route_required",
-            facts={"routes": cast(JsonValue, sorted(unresolved))},
+            facts={"routes": sorted(unresolved)},
         )
 
 
@@ -1746,7 +1754,7 @@ def _incident_edges(
         if type(edge_id) is not str:
             raise _guided_delta_rejection(
                 "guided_delta_authority_violation",
-                facts={"delta_member": "edges", "required_keys": cast(JsonValue, ["id"])},
+                facts={"delta_member": "edges", "required_keys": ["id"]},
             )
         if edge_id in ids:
             raise _guided_delta_rejection(
@@ -1763,13 +1771,13 @@ def _incident_edges(
                 facts={
                     "delta_member": "edges",
                     "edge_id": edge_id,
-                    "required_keys": cast(JsonValue, ["edge_type", "from_node", "to_node"]),
+                    "required_keys": ["edge_type", "from_node", "to_node"],
                 },
             )
         if origin not in owners and destination not in owners:
             raise _guided_delta_rejection(
                 "guided_delta_nonincident_route",
-                facts={"edge_id": edge_id, "incident_owners": cast(JsonValue, sorted(owners))},
+                facts={"edge_id": edge_id, "incident_owners": sorted(owners)},
             )
         edges.append(
             _IncidentEdge(
@@ -1912,7 +1920,7 @@ def _merge_incident_edge_patches(
             # and lets the prose teach them apart (elspeth-68721c71d7, final red-team).
             raise _guided_delta_rejection(
                 "guided_delta_nonincident_route",
-                facts={"reused_edge_id": edge_id, "incident_owners": cast(JsonValue, sorted(owners))},
+                facts={"reused_edge_id": edge_id, "incident_owners": sorted(owners)},
             )
         pipeline.edges[positions[edge_id]] = cast(dict[str, Any], deep_thaw(patch.members))
 
@@ -2004,7 +2012,7 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_authority_violation",
                 facts={
                     "delta_member": "delta",
-                    "missing_keys": cast(JsonValue, sorted(required_members - admitted.keys())),
+                    "missing_keys": sorted(required_members - admitted.keys()),
                 },
             )
         routes = _stable_delta_entries(
@@ -2024,8 +2032,8 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_authority_violation",
                 facts={
                     "delta_member": "source_routes/output_targets",
-                    "missing_source_stable_ids": cast(JsonValue, sorted(source_ids - set(routes))),
-                    "missing_output_stable_ids": cast(JsonValue, sorted(output_ids - set(targets))),
+                    "missing_source_stable_ids": sorted(source_ids - set(routes)),
+                    "missing_output_stable_ids": sorted(output_ids - set(targets)),
                 },
             )
         for array_member in ("nodes", "edges"):
@@ -2067,7 +2075,7 @@ def materialize_guided_authorized_candidate(
         if set(admitted) != {"edge_patch"}:
             raise _guided_delta_rejection(
                 "guided_delta_authority_violation",
-                facts={"delta_member": "delta", "missing_keys": cast(JsonValue, ["edge_patch"])},
+                facts={"delta_member": "delta", "missing_keys": ["edge_patch"]},
             )
         edge_patch = _exact_delta_members(admitted["edge_patch"], allowed={"stable_id", "to_node"}, subject="edge_patch")
         stable_id = edge_patch["stable_id"] if "stable_id" in edge_patch else None
@@ -2075,12 +2083,12 @@ def materialize_guided_authorized_candidate(
         if stable_id != authority.requested.stable_id:
             raise _guided_delta_rejection(
                 "guided_delta_unknown_stable_id",
-                facts={"stable_id": cast(JsonValue, stable_id if type(stable_id) is str else "invalid")},
+                facts={"stable_id": stable_id if type(stable_id) is str else "invalid"},
             )
         if type(destination) is not str:
             raise _guided_delta_rejection(
                 "guided_delta_authority_violation",
-                facts={"delta_member": "edge_patch", "required_keys": cast(JsonValue, ["to_node"])},
+                facts={"delta_member": "edge_patch", "required_keys": ["to_node"]},
             )
         _apply_selected_edge_route_patch(
             predecessor,
@@ -2105,7 +2113,7 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_authority_violation",
                 facts={
                     "delta_member": "delta",
-                    "missing_keys": cast(JsonValue, sorted({"source_routes", "nodes", "edges"} - set(admitted))),
+                    "missing_keys": sorted({"source_routes", "nodes", "edges"} - set(admitted)),
                 },
             )
         stable_ids = frozenset(
@@ -2122,7 +2130,7 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_authority_violation",
                 facts={
                     "delta_member": "source_routes",
-                    "missing_source_stable_ids": cast(JsonValue, sorted(stable_ids - set(routes))),
+                    "missing_source_stable_ids": sorted(stable_ids - set(routes)),
                 },
             )
         if type(admitted["nodes"]) is not list:
@@ -2139,7 +2147,7 @@ def materialize_guided_authorized_candidate(
         if type(route) is not str:
             raise _guided_delta_rejection(
                 "guided_delta_authority_violation",
-                facts={"delta_member": "source_routes", "required_keys": cast(JsonValue, ["on_success"])},
+                facts={"delta_member": "source_routes", "required_keys": ["on_success"]},
             )
         raw_sources[authority.owner_key]["on_success"] = route
         existing_ids = {node["id"] for node in raw_nodes}
@@ -2158,7 +2166,7 @@ def materialize_guided_authorized_candidate(
             if type(node_id) is not str:
                 raise _guided_delta_rejection(
                     "guided_delta_authority_violation",
-                    facts={"delta_member": "nodes", "required_keys": cast(JsonValue, ["id"])},
+                    facts={"delta_member": "nodes", "required_keys": ["id"]},
                 )
             if node_id in existing_ids or node_id in addition_ids:
                 raise _guided_delta_rejection(
@@ -2184,7 +2192,7 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_authority_violation",
                 facts={
                     "delta_member": "delta",
-                    "missing_keys": cast(JsonValue, sorted({"node_patch", "edges"} - set(admitted))),
+                    "missing_keys": sorted({"node_patch", "edges"} - set(admitted)),
                 },
             )
         canonical_nodes = cast(dict[str, Any], _canonical_schema_properties()["nodes"])
@@ -2199,8 +2207,8 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_unknown_stable_id",
                 facts={
                     "delta_member": "node_patch",
-                    "stable_id": cast(JsonValue, patched_stable_id if type(patched_stable_id) is str else "invalid"),
-                    "known_stable_ids": cast(JsonValue, [authority.requested.stable_id]),
+                    "stable_id": patched_stable_id if type(patched_stable_id) is str else "invalid",
+                    "known_stable_ids": [authority.requested.stable_id],
                 },
             )
         raw_nodes = predecessor.nodes
@@ -2232,8 +2240,8 @@ def materialize_guided_authorized_candidate(
                     "guided_delta_authority_violation",
                     facts={
                         "delta_member": "node_patch.options",
-                        "unexpected_keys": cast(JsonValue, sorted(unexpected_option_keys)),
-                        "allowed_keys": cast(JsonValue, sorted(allowed_option_keys)),
+                        "unexpected_keys": sorted(unexpected_option_keys),
+                        "allowed_keys": sorted(allowed_option_keys),
                     },
                 )
             private_options = cast(dict[str, Any], private_node["options"])
@@ -2254,7 +2262,7 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_authority_violation",
                 facts={
                     "delta_member": "delta",
-                    "missing_keys": cast(JsonValue, sorted({"output_targets", "edges"} - set(admitted))),
+                    "missing_keys": sorted({"output_targets", "edges"} - set(admitted)),
                 },
             )
         stable_ids = frozenset(
@@ -2271,7 +2279,7 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_authority_violation",
                 facts={
                     "delta_member": "output_targets",
-                    "missing_output_stable_ids": cast(JsonValue, sorted(stable_ids - set(targets))),
+                    "missing_output_stable_ids": sorted(stable_ids - set(targets)),
                 },
             )
         edges = _incident_edges(admitted["edges"], owners=frozenset({authority.owner_key}))
@@ -2645,7 +2653,7 @@ def bind_guided_reviewed_components(
                 error_code="guided_delta_authority_violation",
                 connectivity={
                     "component_kind": "sources",
-                    "reviewed_source_names": cast(JsonValue, list(reviewed_source_names)),
+                    "reviewed_source_names": list(reviewed_source_names),
                 },
             )
         source_id = guided.source_order[0]
@@ -2657,8 +2665,8 @@ def bind_guided_reviewed_components(
                 error_code="guided_delta_authority_violation",
                 connectivity={
                     "component_kind": "sources",
-                    "candidate_source_names": cast(JsonValue, [candidate_source_name] if type(candidate_source_name) is str else []),
-                    "reviewed_source_names": cast(JsonValue, list(reviewed_source_names)),
+                    "candidate_source_names": [candidate_source_name] if type(candidate_source_name) is str else [],
+                    "reviewed_source_names": list(reviewed_source_names),
                 },
             )
         raw_sources = {source.name: singular}
@@ -2670,8 +2678,8 @@ def bind_guided_reviewed_components(
             error_code="guided_delta_authority_violation",
             connectivity={
                 "component_kind": "sources",
-                "candidate_source_names": cast(JsonValue, [name for name in raw_sources if type(name) is str]),
-                "reviewed_source_names": cast(JsonValue, list(reviewed_source_names)),
+                "candidate_source_names": [name for name in raw_sources if type(name) is str],
+                "reviewed_source_names": list(reviewed_source_names),
             },
         )
     rebound_sources: dict[str, GuidedBoundSource] = {}
@@ -2685,7 +2693,7 @@ def bind_guided_reviewed_components(
                 connectivity={
                     "component_kind": "sources",
                     "source_name": reviewed.name,
-                    "required_keys": cast(JsonValue, ["on_success"]),
+                    "required_keys": ["on_success"],
                 },
             )
         rebound_sources[reviewed.name] = {
@@ -2707,7 +2715,7 @@ def bind_guided_reviewed_components(
             error_code="guided_delta_authority_violation",
             connectivity={
                 "component_kind": "outputs",
-                "reviewed_output_names": cast(JsonValue, list(reviewed_output_names)),
+                "reviewed_output_names": list(reviewed_output_names),
             },
         )
     expected_output_names = [guided.reviewed_outputs[stable_id].name for stable_id in guided.output_order]
@@ -2728,7 +2736,7 @@ def bind_guided_reviewed_components(
             connectivity={
                 "component_kind": "outputs",
                 "candidate_output_count": len(raw_outputs),
-                "reviewed_output_names": cast(JsonValue, list(reviewed_output_names)),
+                "reviewed_output_names": list(reviewed_output_names),
             },
         )
     node_ids, connection_names, branch_connection_names = _candidate_topology_reference_names(bound)
@@ -2760,7 +2768,7 @@ def bind_guided_reviewed_components(
         raise GuidedCandidateBindingRejected(
             "guided planner candidate output aliases collide with sibling outputs or topology names",
             error_code="guided_output_alias_collision",
-            connectivity={"colliding_aliases": cast(JsonValue, sorted(colliding_aliases))},
+            connectivity={"colliding_aliases": sorted(colliding_aliases)},
         )
     # The reverse direction: reviewed sink NAMES are provider-visible, but nothing
     # stops the planner authoring a node id / connection / branch value equal to one.
@@ -2780,7 +2788,7 @@ def bind_guided_reviewed_components(
         raise GuidedCandidateBindingRejected(
             "guided planner candidate topology names shadow reviewed sink names",
             error_code="guided_reviewed_name_shadowed",
-            connectivity={"shadowed_reviewed_names": cast(JsonValue, shadowed_reviewed_names)},
+            connectivity={"shadowed_reviewed_names": shadowed_reviewed_names},
         )
     output_rename: dict[str, str] = {}
     rebound_outputs: list[GuidedBoundOutput] = []
@@ -2857,7 +2865,7 @@ def bind_guided_reviewed_components(
                 error_code="guided_delta_authority_violation",
                 connectivity={
                     "component_kind": "nodes",
-                    "predecessor_node_ids": cast(JsonValue, list(predecessor_node_ids)),
+                    "predecessor_node_ids": list(predecessor_node_ids),
                 },
             )
         selected_node_id = correction_target.owner_key if correction_target.owner_kind == "node" else None
@@ -2879,7 +2887,7 @@ def bind_guided_reviewed_components(
                         "node_id": private_node_id,
                         "node_occurrences": len(positions),
                         "selected_node": selected,
-                        "predecessor_node_ids": cast(JsonValue, list(predecessor_node_ids)),
+                        "predecessor_node_ids": list(predecessor_node_ids),
                     },
                 )
             position = positions[0]
@@ -2928,7 +2936,7 @@ def bind_guided_reviewed_components(
         raise GuidedCandidateBindingRejected(
             "guided planner candidate exact projection omits reviewed output fields",
             error_code=projection_conflict.error_code,
-            connectivity={"missing_fields": cast(JsonValue, list(projection_conflict.missing_fields))},
+            connectivity={"missing_fields": list(projection_conflict.missing_fields)},
         )
     # Residual dangling sink references. Observed planner slip: the outputs
     # and edges use the reviewed name correctly, but one stale invented name
@@ -3015,9 +3023,9 @@ def bind_guided_reviewed_components(
             "guided planner candidate routing references unknown destinations",
             error_code="guided_route_target_unknown",
             connectivity={
-                "dangling_references": cast(JsonValue, sorted(dangling_references)),
-                "declared_sinks": cast(JsonValue, sorted(expected_output_names)),
-                "consumable_connections": cast(JsonValue, sorted(candidate_consumable_connections)),
+                "dangling_references": sorted(dangling_references),
+                "declared_sinks": sorted(expected_output_names),
+                "consumable_connections": sorted(candidate_consumable_connections),
             },
         )
     # scope_opener is a planner-authored NODE reference (not a connection), so
@@ -3048,8 +3056,8 @@ def bind_guided_reviewed_components(
             # the routing facts above.
             connectivity={
                 "component_kind": "nodes",
-                "dangling_scope_openers": cast(JsonValue, sorted(dangling_scope_openers)),
-                "candidate_node_ids": cast(JsonValue, sorted(node_ids)),
+                "dangling_scope_openers": sorted(dangling_scope_openers),
+                "candidate_node_ids": sorted(node_ids),
             },
         )
     return cast(GuidedBoundPipeline, bound)
@@ -3130,7 +3138,7 @@ def bind_guided_prose_revision_candidate(
             error_code="guided_delta_authority_violation",
             connectivity={
                 "component_kind": "nodes",
-                "predecessor_node_ids": cast(JsonValue, [node["id"] for node in predecessor_nodes]),
+                "predecessor_node_ids": [node["id"] for node in predecessor_nodes],
             },
         )
 
@@ -3201,8 +3209,8 @@ def bind_guided_prose_revision_candidate(
     if candidate_existing_order != predecessor_order:
         _record(
             "existing_node_order_changed",
-            candidate_order=cast(JsonValue, list(candidate_existing_order)),
-            predecessor_order=cast(JsonValue, list(predecessor_order)),
+            candidate_order=list(candidate_existing_order),
+            predecessor_order=list(predecessor_order),
         )
     rebuilt_by_id: dict[str, dict[str, Any]] = {}
     for private_node in predecessor_nodes:
