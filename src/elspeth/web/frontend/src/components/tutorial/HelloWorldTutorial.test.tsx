@@ -720,10 +720,13 @@ describe("HelloWorldTutorial — exit to freeform (elspeth-61591e64bb)", () => {
     expect(api.cancelTutorialRun).toHaveBeenCalledWith("sess-exit-mid-run");
   });
 
-  it("Exit tutorial from the pre-run card cancels nothing — no run has started", async () => {
-    // Before the Run click there is no request to abort and no backend run
-    // to cancel; firing the server-side cancel here would be a lie about
-    // what the learner did (and a stray POST against a session with no run).
+  it("Exit tutorial from the pre-run card starts no run and still sends the idempotent cancel", async () => {
+    // Before the Run click there is no request to abort, but the in-page
+    // state cannot tell a fresh pre-run card from a reload that interrupted
+    // a run still executing server-side (the persisted stage carries no run
+    // identity until the result lands). The cancel endpoint is idempotent,
+    // so Exit always sends it from the run stage: a no-op here, and the only
+    // thing that stops a leaked run after a reload (red-team F3, 2026-09-02).
     const api = await import("@/api/client");
     stubGuidedSessionId = "sess-exit-pre-run";
     const user = userEvent.setup();
@@ -736,7 +739,7 @@ describe("HelloWorldTutorial — exit to freeform (elspeth-61591e64bb)", () => {
     await user.click(screen.getByRole("button", { name: "Exit tutorial" }));
 
     expect(api.runTutorialPipeline).not.toHaveBeenCalled();
-    expect(api.cancelTutorialRun).not.toHaveBeenCalled();
+    expect(api.cancelTutorialRun).toHaveBeenCalledWith("sess-exit-pre-run");
     await waitFor(() =>
       expect(usePreferencesStore.getState().tutorialCompleted).toBe(true),
     );

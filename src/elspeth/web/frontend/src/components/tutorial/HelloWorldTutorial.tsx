@@ -329,16 +329,13 @@ export function HelloWorldTutorial({
     // Exit during an in-flight run: the run turn's effect cleanup
     // deliberately never aborts (StrictMode), and its Cancel button is the
     // only other abort path — without this the backend run (LLM spend, sink
-    // writes) outlives the tutorial. runStarted flips on the learner's Run
-    // click and runId stays null until the run's result lands, so this fires
-    // only while a run is genuinely executing — never for an exit from the
-    // pre-run card, where there is nothing to cancel.
-    if (
-      state.step === "run" &&
-      state.runStarted &&
-      state.runId === null &&
-      state.sessionId !== null
-    ) {
+    // writes) outlives the tutorial. runId stays null until the run's result
+    // lands, so this fires for every exit from the run stage: while a run is
+    // executing, from the pre-run card (nothing to cancel; the endpoint is
+    // idempotent), and after a reload mid-run, where the in-page state
+    // cannot know a server-side run is still going (red-team F3,
+    // 2026-09-02) — which is exactly why this is not gated on a click flag.
+    if (state.step === "run" && state.runId === null && state.sessionId !== null) {
       abandonTutorialRun(state.sessionId);
     }
     void usePreferencesStore
@@ -347,7 +344,7 @@ export function HelloWorldTutorial({
       .catch((err) => {
         console.error("[tutorial] exit opt-out persist failed:", err);
       });
-  }, [state.step, state.runStarted, state.runId, state.sessionId, sessionId]);
+  }, [state.step, state.runId, state.sessionId, sessionId]);
   const stepLabels = TUTORIAL_STEP_LABELS;
   const currentIndex = stepIndex(state.step);
   const totalSteps = stepLabels.length;
@@ -492,7 +489,6 @@ export function HelloWorldTutorial({
           <div className="tutorial-guided-authoring tutorial-run-authoring">
             <TutorialTurn4Run
               sessionId={state.sessionId}
-              onRunStart={() => dispatch({ type: "runStarted" })}
               onResult={(result) => dispatch({ type: "runResultReady", result })}
               onCompleted={(result) => dispatch({ type: "runCompleted", result })}
               onCancelled={() => dispatch({ type: "cancelRun" })}

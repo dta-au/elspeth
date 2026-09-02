@@ -61,13 +61,11 @@ describe("TutorialTurn4Run — explicit Run button (I-1: the run never auto-fire
     expect(api.runTutorialPipeline).not.toHaveBeenCalled();
   });
 
-  it("clicking Run calls the run endpoint exactly once and notifies onRunStart", async () => {
+  it("clicking Run calls the run endpoint exactly once", async () => {
     vi.mocked(api.runTutorialPipeline).mockResolvedValue(okRun("run-click"));
-    const onRunStart = vi.fn();
     render(
       <TutorialTurn4Run
         sessionId="sess-run-click"
-        onRunStart={onRunStart}
         onCompleted={noop}
         onCancelled={noop}
       />,
@@ -75,7 +73,6 @@ describe("TutorialTurn4Run — explicit Run button (I-1: the run never auto-fire
 
     fireEvent.click(screen.getByRole("button", { name: TURN_4_RUN_BUTTON }));
 
-    expect(onRunStart).toHaveBeenCalledTimes(1);
     expect(
       screen.getByRole("heading", { name: /running your pipeline/i }),
     ).toBeInTheDocument();

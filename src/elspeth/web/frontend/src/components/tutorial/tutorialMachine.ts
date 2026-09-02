@@ -71,26 +71,11 @@ export interface TutorialState {
    * LLM spend) — the resumed flow suppresses that Back affordance instead.
    */
   resumed: boolean;
-  /**
-   * True once the learner has clicked Run on the run turn (I-1). Mounting the
-   * run turn is NOT a run: the pipeline executes only on that explicit click,
-   * so the tutorial teaches the same gesture the composer asks for in normal
-   * use. In-memory only — the persisted resume fields carry no such flag, so
-   * a reload lands back on the Run button whether it happened before the
-   * click or mid-run (nothing may execute on the learner's behalf). Cleared
-   * by `reset`; survives `cancelRun` (a cancelled run was still started).
-   */
-  runStarted: boolean;
 }
 
 export type TutorialAction =
   | { type: "start" }
   | { type: "guidedCompleted"; sessionId: string }
-  /**
-   * The learner clicked Run (I-1). Records that the pipeline is now executing
-   * WITHOUT changing step; the run turn owns the request itself.
-   */
-  | { type: "runStarted" }
   /**
    * The run's result arrived (rendered on the run turn, before the user
    * clicks Continue). Records the run identity WITHOUT changing step so
@@ -115,7 +100,6 @@ export const initialTutorialState: TutorialState = {
   skipped: false,
   cancelled: false,
   resumed: false,
-  runStarted: false,
 };
 
 /**
@@ -169,11 +153,6 @@ export function tutorialReducer(
       return { ...state, step: "guided" };
     case "guidedCompleted":
       return { ...state, step: "run", sessionId: action.sessionId };
-    case "runStarted":
-      // The learner's explicit Run click. Stay on `run`; the run turn
-      // renders the progress/result itself. Consumers (the Exit control's
-      // abandon path) use this to know whether there is a run to cancel.
-      return { ...state, runStarted: true };
     case "runResultReady":
       // Result rendered on the run turn; record the run identity so the
       // persisted resume state carries it, but stay on `run` — the user
@@ -249,10 +228,12 @@ export interface PersistedTutorialProgress {
  *    so resume forward at `audit`: zero re-execution.
  *  - `run` without a run identity — the reload happened before Run was
  *    clicked, or interrupted the run itself; the persisted fields cannot tell
- *    the two apart. Resume at `run` with `runStarted=false`: the learner
- *    lands on the Run button and nothing executes until they click it (I-1).
- *    If a pre-reload run is still active server-side, clicking Run surfaces
- *    the one-active-run invariant's friendly still-finishing message.
+ *    the two apart. Resume at `run`: the learner lands on the Run button and
+ *    nothing executes until they click it (I-1). If a pre-reload run is
+ *    still active server-side, clicking Run surfaces the one-active-run
+ *    invariant's friendly still-finishing message, and Exit cancels it (the
+ *    cancel endpoint is idempotent, so Exit from the pre-run card is a
+ *    harmless no-op).
  *  - `audit` — requires the recorded run identity; degrades to `run` when
  *    missing (audit cannot render without it).
  *  - `graduation` — graduation counts as reached once SHOWN; resume there,

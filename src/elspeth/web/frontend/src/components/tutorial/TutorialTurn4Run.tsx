@@ -16,13 +16,6 @@ import type { RunResultRow, TutorialRunResult } from "./tutorialMachine";
 interface TutorialTurn4RunProps {
   sessionId: string;
   /**
-   * Fired when the learner clicks Run (I-1) — the moment the pipeline
-   * request leaves the browser. The parent records `runStarted` so the
-   * Exit control knows there is a run to abandon. Optional — standalone
-   * mounts (tests) may omit it.
-   */
-  onRunStart?: () => void;
-  /**
    * Fired as soon as the run's result arrives (rendered on this turn,
    * before the user clicks Continue). The parent persists the run identity
    * so a reload resumes at the audit step instead of re-executing the
@@ -141,7 +134,6 @@ const TUTORIAL_RUN_STILL_FINISHING_MESSAGE =
 
 export function TutorialTurn4Run({
   sessionId,
-  onRunStart,
   onResult,
   onCompleted,
   onCancelled,
@@ -249,7 +241,6 @@ export function TutorialTurn4Run({
 
   const onRunClick = (): void => {
     setArmed(true);
-    onRunStart?.();
     // The Run button the learner just pressed leaves the DOM; put focus on
     // the heading (now "Running your pipeline.") so keyboard and AT users
     // are not dropped at the document root.

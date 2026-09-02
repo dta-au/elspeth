@@ -25,10 +25,6 @@ describe("nodeOptionDisplay helpers", () => {
     expect(nodeOptionText({ key: "system_prompt", value: "Be terse." })).toBe("System prompt: Be terse.");
     expect(nodeOptionText({ key: "prompt_template", value: "Rate it." })).toBe("Prompt: Rate it.");
     expect(nodeOptionText({ key: "mapping", value: "a → b" })).toBe("Mapping: a → b");
-    // web_scrape's lowered `http` knob carries the backend-rendered identity.
-    expect(nodeOptionText({ key: "http", value: "contact: ops@example.org; reason: catalogue refresh" })).toBe(
-      "Scraping identity: contact: ops@example.org; reason: catalogue refresh",
-    );
     expect(nodeOptionText({ key: "select_only", value: "only the mapped fields are kept" })).toBe(
       "Select only: only the mapped fields are kept",
     );
@@ -130,15 +126,15 @@ describe("NodeOptionsSummary", () => {
     // buttons it opens.
     rerender(<NodeOptionsSummary entries={entries} nodeLabel="node-2" onEdit={onEdit} editDisabled />);
     expect(screen.getByRole("button", { name: "Edit prompt for node-2" })).toBeDisabled();
-    // The scraping identity is a knob line, not a prompt: no Edit grows from it.
+    // A knob line is not a prompt: no Edit grows from it.
     rerender(
       <NodeOptionsSummary
-        entries={[{ key: "http", value: "contact: ops@example.org; reason: catalogue refresh" }]}
+        entries={[{ key: "mapping", value: "a → b" }]}
         nodeLabel="node-3"
         onEdit={onEdit}
       />,
     );
-    expect(screen.getByText("Scraping identity: contact: ops@example.org; reason: catalogue refresh")).toBeInTheDocument();
+    expect(screen.getByText("Mapping: a → b")).toBeInTheDocument();
     expect(screen.queryByRole("button")).toBeNull();
   });
 });

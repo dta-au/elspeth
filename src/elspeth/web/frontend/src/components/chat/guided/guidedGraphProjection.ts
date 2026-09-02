@@ -31,6 +31,7 @@ import type {
   ProposalNodeType,
   ProposalTargetEndpoint,
   ProposePipelinePayload,
+  TerminalState,
   TurnPayload,
   WireStageData,
 } from "@/types/guided";
@@ -286,15 +287,23 @@ function reviewedCaption(reviewed: GuidedReviewedComponents): string {
 
 /**
  * The one graph the pane draws for the current guided state, or null when
- * nothing has been reviewed yet (the pane keeps its empty state). A pending
- * proposal or wire stage always wins over the ledger: it is what the learner
- * is being asked to decide on.
+ * nothing has been reviewed yet (the pane keeps its empty state) or the
+ * guided build is over. A pending proposal or wire stage always wins over
+ * the ledger: it is what the learner is being asked to decide on.
+ *
+ * `terminal` is the guided session's terminal state. Once it is set
+ * (completed, exited to freeform, abandoned) there is no guided build to
+ * draw: the committed composition is the truth for a completed session and
+ * a freeform session has no reviewed-components ledger at all, so the
+ * ledger the store still holds must not be drawn (red-team F2, 2026-09-02).
  */
 export function projectGuidedGraph(input: {
   nextTurn: TurnPayload | null;
   reviewed: GuidedReviewedComponents;
+  terminal?: TerminalState | null;
 }): GuidedGraphProjection | null {
-  const { nextTurn, reviewed } = input;
+  const { nextTurn, reviewed, terminal = null } = input;
+  if (terminal !== null) return null;
   if (nextTurn !== null && nextTurn.type === "propose_pipeline") {
     const graph = projectProposalGraph(nextTurn.payload);
     return {

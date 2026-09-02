@@ -847,13 +847,15 @@ export function GraphView() {
   const guidedReviewedComponents = useSessionStore(
     (s) => s.guidedReviewedComponents,
   );
+  const guidedTerminal = useSessionStore((s) => s.guidedTerminal);
   const guidedProjection = useMemo(
     () =>
       projectGuidedGraph({
         nextTurn: guidedNextTurn,
         reviewed: guidedReviewedComponents,
+        terminal: guidedTerminal,
       }),
-    [guidedNextTurn, guidedReviewedComponents],
+    [guidedNextTurn, guidedReviewedComponents, guidedTerminal],
   );
   const { resolvedTheme } = useTheme();
 

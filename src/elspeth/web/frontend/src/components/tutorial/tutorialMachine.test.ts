@@ -138,53 +138,21 @@ describe("isAbandonOnPageHide", () => {
   });
 });
 
-describe("tutorialReducer runStarted (I-1: the run never auto-fires)", () => {
-  it("starts with no run started — mounting the run turn is not a run", () => {
+describe("tutorialReducer run stage (I-1: the run never auto-fires)", () => {
+  it("guidedCompleted lands on the run stage with no run identity", () => {
     const run = tutorialReducer(
       { ...initialTutorialState, step: "guided" },
       { type: "guidedCompleted", sessionId: "sess-123" },
     );
     expect(run.step).toBe("run");
-    expect(run.runStarted).toBe(false);
+    expect(run.runId).toBeNull();
   });
 
-  it("runStarted records the learner's Run click without changing step", () => {
-    const run: TutorialState = {
-      ...initialTutorialState,
-      step: "run",
-      sessionId: "sess-123",
-    };
-    const next = tutorialReducer(run, { type: "runStarted" });
-    expect(next.step).toBe("run");
-    expect(next.runStarted).toBe(true);
-    expect(next.runId).toBeNull();
-  });
-
-  it("cancelRun keeps runStarted (a cancelled run was still started)", () => {
-    const started: TutorialState = {
-      ...initialTutorialState,
-      step: "run",
-      sessionId: "sess-123",
-      runStarted: true,
-    };
-    expect(tutorialReducer(started, { type: "cancelRun" }).runStarted).toBe(true);
-  });
-
-  it("reset clears runStarted", () => {
-    const started: TutorialState = {
-      ...initialTutorialState,
-      step: "run",
-      sessionId: "sess-123",
-      runStarted: true,
-    };
-    expect(tutorialReducer(started, { type: "reset" }).runStarted).toBe(false);
-  });
-
-  it("a resumed run stage never counts as started — the reload lands on the Run button", () => {
+  it("a resumed run stage without a run identity lands on the run stage", () => {
     // Whether the reload happened before Run was clicked or mid-run, the
     // persisted fields cannot tell the two apart (no run identity yet), and
-    // nothing may execute on the learner's behalf: the resumed state waits
-    // for an explicit Run click.
+    // nothing may execute on the learner's behalf: the run turn waits for an
+    // explicit Run click, and Exit still cancels whatever may be running.
     const state = resumeTutorialState({
       stage: "run",
       sessionId: "sess-1",
@@ -192,7 +160,7 @@ describe("tutorialReducer runStarted (I-1: the run never auto-fires)", () => {
       sourceDataHash: null,
     });
     expect(state.step).toBe("run");
-    expect(state.runStarted).toBe(false);
+    expect(state.runId).toBeNull();
   });
 });
 

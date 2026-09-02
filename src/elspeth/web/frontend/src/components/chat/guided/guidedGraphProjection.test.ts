@@ -303,6 +303,40 @@ describe("projectGuidedGraph", () => {
     ).toBeNull();
   });
 
+  it("returns null once the guided session is terminal, whatever the ledger holds", () => {
+    // Exit to freeform leaves the store's ledger in place (the fold is
+    // identity on a null turn); a freeform session must not keep drawing the
+    // guided "Reviewed so far" nodes (red-team F2, 2026-09-02). A completed
+    // session draws its committed composition instead.
+    const reviewed = {
+      sources: [
+        {
+          stable_id: "src-1",
+          name: "orders",
+          plugin: "csv",
+          summary: "orders.csv",
+        } as never,
+      ],
+      outputs: [],
+    };
+    expect(
+      projectGuidedGraph({
+        nextTurn: null,
+        reviewed,
+        terminal: { kind: "exited_to_freeform", reason: null } as never,
+      }),
+    ).toBeNull();
+    expect(
+      projectGuidedGraph({
+        nextTurn: null,
+        reviewed,
+        terminal: { kind: "completed", reason: null, pipeline_yaml: "" },
+      }),
+    ).toBeNull();
+    // The same ledger with no terminal still draws.
+    expect(projectGuidedGraph({ nextTurn: null, reviewed, terminal: null })?.stage).toBe("reviewed");
+  });
+
   it("draws the reviewed source alone after step 1 and source plus output after step 2", () => {
     const sinkSelect = turn({
       type: "single_select",

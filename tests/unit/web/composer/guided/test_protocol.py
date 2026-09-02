@@ -9,7 +9,6 @@ from uuid import UUID
 import pytest
 from annotated_types import MaxLen
 
-from elspeth.contracts.freeze import deep_freeze
 from elspeth.web.composer.guided.protocol import (
     _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE,
     _MAX_NODE_OPTION_SUMMARY_VALUE,
@@ -1024,11 +1023,17 @@ def test_llm_prompt_summary_reuses_the_approval_card_bound() -> None:
     assert _node_options_summary_error(summary, "p", plugin="llm") is None
 
 
-def test_web_scrape_summary_publishes_only_the_scraping_identity() -> None:
-    """The responsible-scraping declarations are the material of the post-commit
-    ``web_scrape_http_identity`` review, so they reach the card before commit
-    (I-2). The lowered knob is the whole ``http`` object; only the contact and
-    reason are rendered — the SSRF allowlist, timeout and body cap stay private."""
+def test_web_scrape_has_no_public_option_keys() -> None:
+    """web_scrape's ``http`` object is NOT on the option allowlist.
+
+    The allowlist is also the correction authority
+    (``public_node_option_keys``): whatever it lists, a node-scoped correction
+    may overwrite wholesale. ``http`` carries the SSRF host allowlist, timeout
+    and body cap beside the two identity fields a card could show, so listing
+    it made the SSRF policy planner-writable with the card text unchanged
+    (Phase 1 red-team finding F1, 2026-09-02). Until a display-only key exists
+    that the correction authority does not return, web_scrape publishes
+    nothing and a correction cannot touch its options."""
     options = {
         "url_field": "url",
         "http": {
@@ -1039,30 +1044,10 @@ def test_web_scrape_summary_publishes_only_the_scraping_identity() -> None:
             "max_body_bytes": 1024,
         },
     }
-    summary = node_options_summary("web_scrape", options)
 
-    assert summary == [{"key": "http", "value": "contact: ops@example.org; reason: catalogue refresh", "tier": "common"}]
-    rendered = str(summary)
-    for private in ("10.0.0.0", "1024", "url_field", "allowed"):
-        assert private not in rendered
-    assert _node_options_summary_error(summary, "p", plugin="web_scrape") is None
-    assert public_node_option_keys("web_scrape") == frozenset({"http"})
-
-    # A missing, empty or non-string member is omitted, never defaulted; both
-    # missing renders to no pair at all; a non-mapping http renders nothing.
-    assert node_options_summary("web_scrape", {"http": {"abuse_contact": "ops@example.org", "scraping_reason": 7}}) == [
-        {"key": "http", "value": "contact: ops@example.org", "tier": "common"}
-    ]
-    assert node_options_summary("web_scrape", {"http": {"abuse_contact": "  ", "allowed_hosts": "public_only"}}) == []
-    assert node_options_summary("web_scrape", {"http": "ops@example.org"}) == []
-    assert node_options_summary("web_scrape", {}) == []
-    # The replay path hands the projection a deep-frozen proposal: the http
-    # object arrives as a MappingProxyType and renders identically.
-    assert node_options_summary("web_scrape", deep_freeze(options)) == summary
-    # Bounded like every short text.
-    long_reason = "r" * 400
-    value = node_options_summary("web_scrape", {"http": {"scraping_reason": long_reason}})[0]["value"]
-    assert len(value) == _MAX_NODE_OPTION_SUMMARY_VALUE and value.endswith("…")
+    assert public_node_option_keys("web_scrape") == frozenset()
+    assert node_options_summary("web_scrape", options) == []
+    assert "web_scrape" not in _NODE_OPTION_SUMMARY_ALLOWLIST
 
 
 def test_node_options_summary_error_bounds_each_key_at_its_own_limit() -> None:
