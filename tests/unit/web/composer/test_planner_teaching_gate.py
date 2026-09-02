@@ -31,7 +31,7 @@ import re
 import typing
 from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, TypedDict
 
 import pytest
 
@@ -60,6 +60,18 @@ _GUIDED_CONSTRUCTORS = frozenset({"GuidedCandidateBindingRejected", "_guided_del
 _ERROR_CODE_POSITION = 3
 
 
+# Synthetic payloads for the typed-walker self-test; module level because the
+# file's postponed annotations resolve names through the module namespace.
+class _ProbeInner(TypedDict):
+    leaf: str
+
+
+class _ProbeOuter(TypedDict):
+    record: _ProbeInner
+    records: list[_ProbeInner]
+    flat: int
+
+
 class ShippedKey(NamedTuple):
     surface: str  # "freeform" | "guided"
     code: str
@@ -83,14 +95,16 @@ def _typed_keys(payload: type, prefix: str) -> list[str]:
     for name, hint in typing.get_type_hints(payload, include_extras=False).items():
         path = f"{prefix}{name}"
         keys.append(path)
-        inner = hint
-        for arg in typing.get_args(hint) or ():
-            if typing.is_typeddict(arg):
-                inner = arg
-        if typing.is_typeddict(inner):
-            keys.extend(_typed_keys(inner, path + "."))
-        elif typing.get_origin(inner) is list and typing.is_typeddict(typing.get_args(inner)[0]):
-            keys.extend(_typed_keys(typing.get_args(inner)[0], path + "[]."))
+        args = typing.get_args(hint)
+        if typing.is_typeddict(hint):
+            keys.extend(_typed_keys(hint, path + "."))
+        elif typing.get_origin(hint) is list and args and typing.is_typeddict(args[0]):
+            keys.extend(_typed_keys(args[0], path + "[]."))
+        else:
+            # ``X | None`` around a record: recurse through the record member.
+            for arg in args:
+                if typing.is_typeddict(arg):
+                    keys.extend(_typed_keys(arg, path + "."))
     return keys
 
 
@@ -155,7 +169,16 @@ def _detail_sites(files: Iterable[Path]) -> Iterator[ShippedKey]:
                 )
             for name in details:
                 ctor = keywords[name]
-                emitted = {kw.arg for kw in ctor.keywords if kw.arg} if isinstance(ctor, ast.Call) else None
+                emitted: set[str] | None = None
+                if isinstance(ctor, ast.Call):
+                    # Same fail-closed rule one level down: a detail built
+                    # positionally or from a **spread would read as "passes
+                    # nothing" and skip every leaf (final red-team F2).
+                    if ctor.args or any(kw.arg is None for kw in ctor.keywords):
+                        raise AssertionError(
+                            f"{site}: detail '{name}' built positionally or with a **spread; the gate cannot derive its keys"
+                        )
+                    emitted = {kw.arg for kw in ctor.keywords if kw.arg}
                 # The envelope key itself is a fact the model must be able to find.
                 yield ShippedKey("freeform", code, name, site)
                 for key in _typed_keys(_DETAIL_PAYLOADS[name], name + "."):
@@ -236,10 +259,16 @@ def _guided_sites(files: Iterable[Path]) -> Iterator[ShippedKey]:
                 # ``_binding_rejection_feedback`` attaches the dict only when non-empty, so an empty
                 # literal ships no envelope either.
                 yield ShippedKey("guided", code, "connectivity", site)
-            for key_node in facts.keys:
+            for key_node, value_node in zip(facts.keys, facts.values, strict=True):
                 key = _literal_str(key_node)
                 if key is None:
                     raise AssertionError(f"{site}: non-literal connectivity key {ast.unparse(key_node) if key_node else '**'}")
+                if isinstance(value_node, ast.Dict | ast.DictComp):
+                    # A nested record ships its inner keys just as the envelope
+                    # does, and this walker enumerates one level. Refuse rather
+                    # than under-report (final red-team F1): ship a typed record
+                    # the freeform walker recurses through, or flatten the facts.
+                    raise AssertionError(f"{site}: connectivity['{key}'] is a nested dict; the gate cannot derive its inner keys")
                 yield ShippedKey("guided", code, f"connectivity.{key}", site)
 
 
@@ -393,6 +422,43 @@ def test_gate_refuses_a_guided_site_it_cannot_derive(tmp_path: Path) -> None:
         list(_guided_sites([module]))
 
 
+def test_gate_refuses_a_nested_dict_value_at_a_guided_site(tmp_path: Path) -> None:
+    """Inner keys of a dict-literal value would ship untaught and unenumerated; the walker refuses them (final red-team F1)."""
+    module = tmp_path / "nested_probe.py"
+    module.write_text(
+        "def f():\n    raise _guided_delta_rejection('guided_delta_authority_violation', facts={'extra': {'inner_untaught': 1}})\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="nested dict"):
+        list(_guided_sites([module]))
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        ("_err('node:x', 'm', 'high', 'sink_locked_extras', **extra)", "built with a \\*\\*spread"),
+        ("_err('node:x', 'm', 'high', 'sink_locked_extras', detail)", "passes a detail positionally"),
+        (
+            "_err('node:x', 'm', 'high', 'sink_locked_extras', contract=SchemaContractDetail('p', 'c', ('a',)))",
+            "built positionally",
+        ),
+        ("_err('node:x', 'm', 'high', 'sink_locked_extras', contract=SchemaContractDetail(**kw))", "built positionally"),
+    ],
+    ids=["entry-spread", "entry-positional-detail", "detail-positional", "detail-spread"],
+)
+def test_gate_refuses_a_typed_detail_site_it_cannot_derive(tmp_path: Path, body: str, reason: str) -> None:
+    """Every under-derivable entry shape is refused, at the entry AND at the detail constructor.
+
+    Without the detail-level rule a positional or **-built detail read as
+    "passes nothing" and silently skipped every leaf; without these probes the
+    entry-level rules could be deleted unnoticed (final red-team F2).
+    """
+    module = tmp_path / "detail_probe.py"
+    module.write_text(f"def f(extra, detail, kw):\n    return {body}\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match=reason):
+        list(_detail_sites([module]))
+
+
 def test_gate_catches_prose_that_stops_naming_a_taught_key() -> None:
     """Deleting a key's name from its guidance turns the gate red — the taught side is derived, not listed."""
     target = ("freeform", "source_on_success_dangling", "connectivity.dangling_on_success")
@@ -405,6 +471,24 @@ def test_gate_catches_prose_that_stops_naming_a_taught_key() -> None:
         return tuple(part.replace("dangling_on_success", "the offending value") for part in guidance)  # type: ignore[return-value]
 
     assert target in untaught_keys(explain=explain_without_the_key)
+
+
+def test_typed_keys_recurse_through_nested_and_list_of_typed_dicts() -> None:
+    """The typed walker's recursion is pinned by a synthetic payload, not only by today's real ones.
+
+    Dropping the recursion left every gate test green because no self-test
+    exercised it directly (final red-team P15): a nested record's inner keys
+    ship to the planner exactly as the envelope does.
+    """
+    assert _typed_keys(_ProbeOuter, "c.") == ["c.record", "c.record.leaf", "c.records", "c.records[].leaf", "c.flat"]
+
+
+def test_connectivity_sites_enumerate_every_coalesce_reachability_key() -> None:
+    """The freeform coalesce facts are enumerated in full, derived from their TypedDict (final red-team P17)."""
+    coalesce = {s.key for s in _connectivity_sites() if s.code == "coalesce_branch_unreachable"}
+    expected = {"connectivity", *_typed_keys(state.CoalesceReachabilityFactDict, "connectivity.")}
+    assert coalesce == expected
+    assert len(expected) > 2, "the coalesce payload has nested keys; an envelope-only set means the walker regressed"
 
 
 def test_every_guided_site_is_derivable() -> None:

@@ -1906,9 +1906,13 @@ def _merge_incident_edge_patches(
             continue
         previous = pipeline.edges[positions[edge_id]]
         if previous["from_node"] not in owners and previous["to_node"] not in owners:
+            # A different fault from the endpoints check above, under one code:
+            # the emitted edge's own endpoints are fine, its ID is what collides.
+            # Its own key keeps the two shapes apart in the repeat fingerprint
+            # and lets the prose teach them apart (elspeth-68721c71d7, final red-team).
             raise _guided_delta_rejection(
                 "guided_delta_nonincident_route",
-                facts={"edge_id": edge_id, "incident_owners": cast(JsonValue, sorted(owners))},
+                facts={"reused_edge_id": edge_id, "incident_owners": cast(JsonValue, sorted(owners))},
             )
         pipeline.edges[positions[edge_id]] = cast(dict[str, Any], deep_thaw(patch.members))
 

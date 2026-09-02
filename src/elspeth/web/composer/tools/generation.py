@@ -707,7 +707,8 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         r"coalesce_branch_alias_unreachable",
         "A coalesce branches KEY — the branch alias; for list-form branches, the entry itself — is not a fork_to name on any "
         "gate. Arrival at a coalesce is tracked by fork branch name, so a key no gate forks can never be satisfied whatever "
-        "its value names. The message lists the offending keys.",
+        "its value names. No 'connectivity' facts accompany this code: compare every coalesce branches key against "
+        "every gate's fork_to names yourself.",
         "Use the upstream gate's fork_to branch names, spelled exactly, as the coalesce branches keys (or list entries); do "
         "not invent an alias. Add a name to the gate's fork_to only when that fork genuinely lacks the branch. When "
         "'coalesce_branch_unreachable' fires for the same branch, fix the alias first — its record carries no 'sink_lure' "
@@ -1042,20 +1043,20 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"guided_delta_nonincident_route",
         "A correction delta changes routing that is not incident to the selected component. The rejection's "
-        "'connectivity' facts name the offending edge as 'edge_id'. When 'incident_owners' is present, it lists the ids "
-        "an emitted edge must carry as its from_node or to_node — the selected component plus any node this delta adds — "
-        "and one of two things is wrong: the named edge's own from_node and to_node are both outside that list, or (node "
-        "corrections only) the edge's own endpoints are fine but its id reuses an existing pipeline edge that touches "
-        "none of them; inspect the edge you emitted to tell which. When correcting an output, touching is not enough: "
-        "every edge must END at the selected output, and an edge that reaches it only as from_node is rejected with "
-        "'edge_id' alone and no 'incident_owners'.",
+        "'connectivity' facts name the offending edge under exactly one of two keys. 'edge_id' with 'incident_owners': "
+        "that list holds the ids an emitted edge must carry as its from_node or to_node — the selected component plus "
+        "any node this delta adds — and the named edge's own from_node and to_node are both outside it. "
+        "'reused_edge_id' with 'incident_owners' (node corrections only): the emitted edge's endpoints are fine, but "
+        "its id reuses an existing pipeline edge that touches none of those ids. When correcting an output, touching "
+        "is not enough: every edge must END at the selected output, and an edge that reaches it only as from_node is "
+        "rejected with 'edge_id' alone and no 'incident_owners'.",
         "Keep every unrelated route unchanged and emit only edges that touch the selected owner or newly added topology "
-        "named by this correction. If neither endpoint of the edge 'edge_id' names is in 'incident_owners', re-point it "
-        "so one is — for an output correction, set its to_node to the selected output — or remove it; if one endpoint "
-        "already is, give the edge a fresh id rather than reusing an existing edge's id. When 'incident_owners' is "
-        "absent, the edge already has the selected output as its from_node: reverse it — set from_node to the producer "
-        "(the source name or node id that feeds the output) and to_node to the selected output — or remove it; setting "
-        "only to_node leaves an output-to-output edge that fails the next turn. Change nothing else.",
+        "named by this correction. For 'edge_id' with 'incident_owners': re-point the edge so one endpoint is in that "
+        "list — for an output correction, set its to_node to the selected output — or remove it. For 'reused_edge_id': "
+        "keep the edge's endpoints and give it a fresh id that no existing pipeline edge uses. When 'incident_owners' "
+        "is absent, the edge already has the selected output as its from_node: reverse it — set from_node to the "
+        "producer (the source name or node id that feeds the output) and to_node to the selected output — or remove "
+        "it; setting only to_node leaves an output-to-output edge that fails the next turn. Change nothing else.",
     ),
     (
         r"guided_delta_unknown_reference",

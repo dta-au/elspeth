@@ -2583,6 +2583,42 @@ def test_source_correction_admits_every_node_key_the_advertised_schema_admits() 
     assert rejected_for_unexpected_keys == []
 
 
+def test_source_correction_refuses_a_node_key_the_advertised_schema_does_not_admit() -> None:
+    """The derived allowlist is pinned from BOTH sides: nothing non-canonical is admitted.
+
+    The sibling test proves every canonical key binds; without this one a
+    widened derivation (``canonical | {"stable_id"}``) survives every test
+    (final red-team F4). The canonical pre-check masks this in production, so
+    the binder check is defense-in-depth — but it is the check this branch
+    changed, and the change must be pinned exactly.
+    """
+    canonical_node_keys = set(guided_planning._canonical_schema_properties()["nodes"]["items"]["properties"])
+    assert "not_a_canonical_node_key" not in canonical_node_keys
+    node: dict[str, object] = {
+        "id": "screen_rows",
+        "node_type": "transform",
+        "plugin": "passthrough",
+        "input": "screen_input",
+        "on_success": "amount_gate",
+        "on_error": "discard",
+        "options": {"schema": {"mode": "observed"}},
+        "not_a_canonical_node_key": None,
+    }
+    with pytest.raises(guided_planning.GuidedCandidateBindingRejected) as excinfo:
+        materialize_guided_authorized_candidate(
+            {
+                "source_routes": [{"stable_id": SOURCE_ID, "on_success": "screen_input"}],
+                "nodes": [node],
+                "edges": [{"id": "source_to_screen", "from_node": "source", "to_node": "screen_rows", "edge_type": "on_success"}],
+            },
+            authority=_source_correction_target(),
+            guided=_guided(),
+            current_state=_correction_predecessor(),
+        )
+    assert excinfo.value.error_code == "guided_delta_authority_violation"
+    assert excinfo.value.connectivity["unexpected_keys"] == ["not_a_canonical_node_key"]
+
+
 def test_source_correction_binds_a_collector_with_its_scope_keys() -> None:
     """The motivating case for the derived allowlist: a real collector on a source-correction turn.
 

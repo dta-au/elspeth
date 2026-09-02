@@ -5196,6 +5196,18 @@ def test_binding_rejection_fingerprint_discriminates_on_the_fact_key_set() -> No
     other_member = rejection(delta_member="node_patch", owner_kind="node")
     assert _binding_rejection_fingerprint(other_member) != _binding_rejection_fingerprint(owner)
 
+    # ``guided_delta_nonincident_route`` fires for two faults the prose teaches
+    # apart — endpoints outside the owners vs an id reusing an existing edge —
+    # so they ship under different keys and fingerprint apart (final red-team F3).
+    def nonincident(**facts: Any) -> GuidedCandidateBindingRejected:
+        return GuidedCandidateBindingRejected(
+            "guided planner candidate delta", error_code="guided_delta_nonincident_route", connectivity=facts
+        )
+
+    endpoints = nonincident(edge_id="e1", incident_owners=["n1"])
+    id_reuse = nonincident(reused_edge_id="e1", incident_owners=["n1"])
+    assert _binding_rejection_fingerprint(endpoints) != _binding_rejection_fingerprint(id_reuse)
+
 
 @pytest.mark.asyncio
 async def test_candidate_policy_rejection_gets_closed_bounded_repair(
