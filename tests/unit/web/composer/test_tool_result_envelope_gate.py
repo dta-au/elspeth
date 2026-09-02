@@ -980,6 +980,48 @@ def test_every_result_constructor_site_is_attributed() -> None:
     list(_tool_data_sites())
 
 
+# The APPROVAL_REQUIRED proposal payload, in the order run_tool_batch authors it. ``success`` is
+# deliberately absent: the envelope's own ``success`` already says it and ``status`` is the
+# discriminator a reader keys on (F1 on elspeth-e405ad7cd2).
+_PROPOSAL_PAYLOAD_KEYS: tuple[str, ...] = ("status", "proposal_id", "tool_name", "summary", "message")
+
+
+def test_approval_required_proposal_payload_ships_exactly_its_keys() -> None:
+    """Exact-key pin on the proposal payload (red-team R5, mutation RM5).
+
+    The teaching gate cannot catch ``"success": True`` creeping back into this
+    payload: the leaf ``success`` is quoted everywhere the envelope is taught,
+    so ``data.success`` would count as taught. Only an exact pin on the literal
+    the walker reads can refuse it. The pin also refuses a second assignment or
+    a later ``proposal_payload[...] =`` store, so the literal is the whole shape,
+    and checks that the census actually reads this site (the
+    ``_FAILURE_DATA_HELPERS`` row for it), so the pin and the matrix cannot drift
+    apart.
+    """
+    tree = _parse(TOOL_BATCH)
+    constants = _module_str_constants(tree, TOOL_BATCH)
+    fn = _function(tree, "run_tool_batch")
+    site = f"{_display(TOOL_BATCH)}:{fn.lineno}"
+    assignments = list(_assignments_to(fn, "proposal_payload"))
+    assert len(assignments) == 1, f"{site}: proposal_payload must be assigned exactly once, got {len(assignments)}"
+    literal, index, _annotation = assignments[0]
+    assert index is None and isinstance(literal, ast.Dict), f"{site}: proposal_payload is not a plain dict literal"
+    keys = list(_dict_literal_keys(literal, "", f"{site}:{literal.lineno}", constants))
+    assert tuple(keys) == _PROPOSAL_PAYLOAD_KEYS
+    assert "success" not in keys
+    assert list(_subscript_assign_keys(fn, "proposal_payload", site, constants)) == []
+    carried = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and _call_name(node) == "ToolResult"
+        and any(kw.arg == "data" and isinstance(kw.value, ast.Name) and kw.value.id == "proposal_payload" for kw in node.keywords)
+    ]
+    assert len(carried) == 1, f"{site}: expected exactly one ToolResult(data=proposal_payload), got {len(carried)}"
+    census = [row.key for row in _failure_data_sites() if row.site == f"{_display(TOOL_BATCH)}:{literal.lineno}"]
+    assert census == [f"data.{key}" for key in _PROPOSAL_PAYLOAD_KEYS]
+
+
 def test_is_taught_requires_the_quoted_form() -> None:
     assert not is_quoted_leaf("affected_nodes", "the affected nodes are listed")
     assert is_quoted_leaf("affected_nodes", "read `affected_nodes` first")
