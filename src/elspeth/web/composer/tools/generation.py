@@ -297,14 +297,18 @@ def _handle_get_expression_grammar(
     context: ToolContext,
 ) -> ToolResult:
     del context  # unused; signature uniformity with the other handlers.
-    return _discovery_result(state, get_expression_grammar())
+    # A closed one-key payload, not the bare reference string: ``ToolResult``
+    # admits only mapping / sequence / model payloads (elspeth-e405ad7cd2,
+    # D2), and a scalar was the one discovery shape that slipped past the
+    # scoped gate runs until the planner suite constructed this result.
+    return _discovery_result(state, {"grammar": get_expression_grammar()})
 
 
 _GET_EXPRESSION_GRAMMAR_DECLARATION = ToolDeclaration(
     name="get_expression_grammar",
     handler=_handle_get_expression_grammar,
     kind=ToolKind.DISCOVERY,
-    description="Get the gate expression syntax reference.",
+    description="Get the gate expression syntax reference. The result carries the full reference text under `grammar`.",
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
 )

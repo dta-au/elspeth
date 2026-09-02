@@ -385,7 +385,7 @@ class TestStep3DiscoveryTierMigration:
     def test_get_expression_grammar(self) -> None:
         assert self._get("get_expression_grammar") == {
             "name": "get_expression_grammar",
-            "description": "Get the gate expression syntax reference.",
+            "description": "Get the gate expression syntax reference. The result carries the full reference text under `grammar`.",
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 

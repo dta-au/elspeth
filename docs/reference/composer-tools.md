@@ -119,7 +119,7 @@ Get the gate expression syntax reference.
 
 **Parameters:** None
 
-**Returns:** Text reference for valid expression constructs in gate conditions.
+**Returns:** `grammar` — the text reference for valid expression constructs in gate conditions.
 
 **When to use:** Before writing any gate `condition` expression. Expressions are security-validated — only a restricted subset of Python is allowed.
 
