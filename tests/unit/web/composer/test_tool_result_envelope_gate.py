@@ -1012,3 +1012,8 @@ def test_operator_reference_names_every_registry_key() -> None:
         if f"`{key}`" not in section
     ]
     assert missing == [], f"operator reference does not name: {missing}"
+
+
+def test_applied_component_echo_typed_dict_keys_equal_the_registry() -> None:
+    """The echo's TypedDict, the registry, and the ``echo[...] =`` sites are one vocabulary (mutation M8)."""
+    assert tuple(typing.get_type_hints(common.AppliedComponentEcho)) == env.APPLIED_COMPONENT_KEYS
