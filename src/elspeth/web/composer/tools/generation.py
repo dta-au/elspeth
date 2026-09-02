@@ -270,7 +270,13 @@ _GET_PLUGIN_SCHEMA_DECLARATION = ToolDeclaration(
     name="get_plugin_schema",
     handler=_handle_get_plugin_schema,
     kind=ToolKind.DISCOVERY,
-    description="Get the full configuration schema for a plugin.",
+    description=(
+        "Get the full configuration schema for a plugin. Result `data` carries `name`, `plugin_type`, "
+        "`description`, `json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, and "
+        "`web_config_authority` (`user_configurable` — author raw `options` directly; "
+        "`user_configurable_with_policy` — the same, subject to policy checks; `operator_profiled` — do not "
+        "author raw options, author `options.profile` instead)."
+    ),
     json_schema={
         "type": "object",
         "properties": {
@@ -1866,7 +1872,9 @@ _EXPLAIN_VALIDATION_ERROR_DECLARATION = ToolDeclaration(
     handler=_execute_explain_validation_error,
     kind=ToolKind.DISCOVERY,
     description="Get a human-readable explanation of a validation error "
-    "with suggested fixes. Pass the exact error text from a validation result.",
+    "with suggested fixes. Pass the exact error text from a validation result. "
+    "Returns the `error_text` echoed, an `explanation`, a `suggested_fix`, and "
+    "— when the text matched a closed code — the `error_code`.",
     json_schema={
         "type": "object",
         "properties": {
@@ -1996,12 +2004,13 @@ _GET_PLUGIN_ASSISTANCE_DECLARATION = ToolDeclaration(
         "Retrieve plugin-owned guidance for a source, transform, or sink. "
         "Two modes by ``issue_code``:\n"
         "  * Omit ``issue_code`` (or pass null) to get discovery-time guidance "
-        "    — a summary of the plugin and composer_hints. (The same hints "
+        "    — a `summary` of the plugin and its `composer_hints`. (The same hints "
         "    are also carried on list_sources / list_transforms / list_sinks / "
         "    get_plugin_schema responses; this tool is the explicit path.)\n"
         "  * Pass an ``issue_code`` (validators emit these as requirement_code "
         "    on semantic_contracts entries) to get failure-time guidance — "
-        "    summary, suggested_fixes, and example before/after configurations."
+        "    `summary`, `suggested_fixes`, and `examples` (before/after configurations).\n"
+        "Every result names the `plugin_name` and `plugin_type` it describes."
     ),
     json_schema={
         "type": "object",
@@ -2089,8 +2098,10 @@ _GET_AUDIT_INFO_DECLARATION = ToolDeclaration(
         "Landscape, or 'how do I record what the pipeline did'. Audit is "
         "mandatory and operator-managed; the composer cannot configure the "
         "backend (security boundary — see yaml_generator.py:179, fix S1). "
-        "Returns enabled status, composer_modifiable flag, and a canonical "
-        "summary to paraphrase. Does NOT return the audit URL/path/DSN — "
+        "Returns `enabled`, the `composer_modifiable` flag, a canonical "
+        "`summary` to paraphrase, and `audit_export_summary` (the optional "
+        "operator-configured export feature, also not composer-controllable). "
+        "Does NOT return the audit URL/path/DSN — "
         "that is operator-internal and intentionally not surfaced to the LLM."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
@@ -2205,7 +2216,10 @@ _LIST_MODELS_DECLARATION = ToolDeclaration(
     "returns matching model IDs (capped at limit). For provider='openrouter/' "
     "the returned slugs are normalised to OpenRouter's HTTP API form "
     "(without the litellm-internal 'openrouter/' routing prefix) — these "
-    "are the values to put directly in `model:`.",
+    "are the values to put directly in `model:`. Result `data` carries "
+    "`providers` (provider name → model count) with `total_models` and a "
+    "`hint` on narrowing the query when no filter is given, or `models` "
+    "(with `truncated` true when the limit cut the list) with a filter.",
     json_schema={
         "type": "object",
         "properties": {
@@ -3917,7 +3931,15 @@ _PREVIEW_PIPELINE_DECLARATION = ToolDeclaration(
     description="Preview the current pipeline configuration — returns "
     "validation status, source summary, and node/output overview "
     "without executing. Use this to confirm the pipeline is set up "
-    "correctly before running.",
+    "correctly before running. Result `data` carries the authoring check "
+    "(`is_valid`, `errors`, `warnings`, `suggestions`, "
+    "`graph_repair_suggestions`, `semantic_contracts` — the same shapes as "
+    "the top-level `validation` — plus `authoring_validation`, the Stage-1 "
+    "report on its own) and a read-only overview (`sources`, `nodes`, "
+    "`outputs`, `node_count`, `output_count`, `edge_contracts`, "
+    "`structural_preview`, `proof_diagnostics`). When a runtime check ran, "
+    "`runtime_preflight` is the envelope's own top-level field, not a key "
+    "under `data`.",
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=False,
 )
@@ -3966,8 +3988,12 @@ _DIFF_PIPELINE_DECLARATION = ToolDeclaration(
     handler=_execute_diff_pipeline,
     kind=ToolKind.DISCOVERY,
     description="Show what changed since the session was loaded or created. "
-    "Returns added, removed, and modified nodes/edges/outputs, "
-    "plus warnings introduced or resolved.",
+    "On success `data` carries `from_version`, `to_version`, `sources_changed`, "
+    "`metadata_changed`, `total_changes`, `warnings_introduced`, "
+    "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
+    "lists under `nodes`, `edges`, `outputs`, and `sources`. Without a "
+    "baseline (no session loaded or created yet) it fails with `error` and "
+    "`error_code` only.",
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=False,
 )

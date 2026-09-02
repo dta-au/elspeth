@@ -1809,9 +1809,11 @@ _INSPECT_SOURCE_DECLARATION = ToolDeclaration(
     handler=_execute_inspect_source,
     kind=ToolKind.BLOB_DISCOVERY,
     description=(
-        "Return bounded structural facts about a blob-backed source: source kind, observed "
-        "headers, sample row count, inferred scalar types per column, URL candidates, and "
-        "warnings. Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
+        "Return bounded structural facts about a blob-backed source: `source_kind`, "
+        "`observed_headers`, `sample_row_count`, inferred scalar types per column, "
+        "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
+        "was read) and `redacted_identity` (the blob's filename and hash prefix, nothing "
+        "secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
         "before declaring a fixed CSV/JSON schema — observed headers and inferred types "
         "tell you which fields the source actually contains and what numeric coercion is "
         "needed before any gate or value_transform numeric op. Never returns raw row "

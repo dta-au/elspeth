@@ -51,7 +51,9 @@ _EXPECTED_CREATE_BLOB_DEFINITION: dict[str, object] = {
     "description": (
         "Create a new file (blob) from inline content. "
         "Use this to create seed input files (URLs, JSON, CSV snippets) "
-        "mid-conversation without requiring manual upload."
+        "mid-conversation without requiring manual upload. Returns the new blob's `blob_id`, "
+        "`content_hash`, `size_bytes`, and `originated_in` (`this_tool_call`: the blob was authored by "
+        "this call, not uploaded)."
     ),
     "parameters": {
         "type": "object",
@@ -82,7 +84,10 @@ _EXPECTED_CREATE_BLOB_DEFINITION: dict[str, object] = {
 
 _EXPECTED_UPDATE_BLOB_DEFINITION: dict[str, object] = {
     "name": "update_blob",
-    "description": "Update the content of an existing blob (file). Overwrites the file content while preserving metadata.",
+    "description": (
+        "Update the content of an existing blob (file). Overwrites the file content while preserving metadata. "
+        "Returns the new `content_hash` and `size_bytes`."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -103,7 +108,7 @@ _EXPECTED_UPDATE_BLOB_DEFINITION: dict[str, object] = {
 
 _EXPECTED_DELETE_BLOB_DEFINITION: dict[str, object] = {
     "name": "delete_blob",
-    "description": "Delete a blob (file) and its storage.",
+    "description": "Delete a blob (file) and its storage. Returns `deleted`: true.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -363,7 +368,13 @@ class TestStep3DiscoveryTierMigration:
     def test_get_plugin_schema(self) -> None:
         assert self._get("get_plugin_schema") == {
             "name": "get_plugin_schema",
-            "description": "Get the full configuration schema for a plugin.",
+            "description": (
+                "Get the full configuration schema for a plugin. Result `data` carries `name`, `plugin_type`, "
+                "`description`, `json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, and "
+                "`web_config_authority` (`user_configurable` — author raw `options` directly; "
+                "`user_configurable_with_policy` — the same, subject to policy checks; `operator_profiled` — do not "
+                "author raw options, author `options.profile` instead)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -393,7 +404,9 @@ class TestStep3DiscoveryTierMigration:
         assert self._get("explain_validation_error") == {
             "name": "explain_validation_error",
             "description": "Get a human-readable explanation of a validation error "
-            "with suggested fixes. Pass the exact error text from a validation result.",
+            "with suggested fixes. Pass the exact error text from a validation result. "
+            "Returns the `error_text` echoed, an `explanation`, a `suggested_fix`, and "
+            "— when the text matched a closed code — the `error_code`.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -414,12 +427,13 @@ class TestStep3DiscoveryTierMigration:
                 "Retrieve plugin-owned guidance for a source, transform, or sink. "
                 "Two modes by ``issue_code``:\n"
                 "  * Omit ``issue_code`` (or pass null) to get discovery-time guidance "
-                "    — a summary of the plugin and composer_hints. (The same hints "
+                "    — a `summary` of the plugin and its `composer_hints`. (The same hints "
                 "    are also carried on list_sources / list_transforms / list_sinks / "
                 "    get_plugin_schema responses; this tool is the explicit path.)\n"
                 "  * Pass an ``issue_code`` (validators emit these as requirement_code "
                 "    on semantic_contracts entries) to get failure-time guidance — "
-                "    summary, suggested_fixes, and example before/after configurations."
+                "    `summary`, `suggested_fixes`, and `examples` (before/after configurations).\n"
+                "Every result names the `plugin_name` and `plugin_type` it describes."
             ),
             "parameters": {
                 "type": "object",
@@ -455,7 +469,10 @@ class TestStep3DiscoveryTierMigration:
             "returns matching model IDs (capped at limit). For provider='openrouter/' "
             "the returned slugs are normalised to OpenRouter's HTTP API form "
             "(without the litellm-internal 'openrouter/' routing prefix) — these "
-            "are the values to put directly in `model:`.",
+            "are the values to put directly in `model:`. Result `data` carries "
+            "`providers` (provider name → model count) with `total_models` and a "
+            "`hint` on narrowing the query when no filter is given, or `models` "
+            "(with `truncated` true when the limit cut the list) with a filter.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -484,8 +501,10 @@ class TestStep3DiscoveryTierMigration:
                 "Landscape, or 'how do I record what the pipeline did'. Audit is "
                 "mandatory and operator-managed; the composer cannot configure the "
                 "backend (security boundary — see yaml_generator.py:179, fix S1). "
-                "Returns enabled status, composer_modifiable flag, and a canonical "
-                "summary to paraphrase. Does NOT return the audit URL/path/DSN — "
+                "Returns `enabled`, the `composer_modifiable` flag, a canonical "
+                "`summary` to paraphrase, and `audit_export_summary` (the optional "
+                "operator-configured export feature, also not composer-controllable). "
+                "Does NOT return the audit URL/path/DSN — "
                 "that is operator-internal and intentionally not surfaced to the LLM."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
@@ -499,7 +518,12 @@ class TestStep3DiscoveryTierMigration:
             "an applied_component field, that field is already the post-change state "
             "of everything that mutation touched — read it there, and call this tool "
             "for what it does not cover: a component the change did not touch, or "
-            "the whole document.",
+            "the whole document. A single-component request returns that component "
+            "under `node` or `output` (a source under its own key) with `version`, "
+            "plus an `inspection` block: `requested_component` (what you asked for), "
+            "`resolved_component` (what was returned — they differ when the request "
+            "matched a full-state alias), and `accepted_full_state_aliases` (the "
+            "exact strings that resolve to the whole document).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -524,7 +548,15 @@ class TestStep3DiscoveryTierMigration:
             "description": "Preview the current pipeline configuration — returns "
             "validation status, source summary, and node/output overview "
             "without executing. Use this to confirm the pipeline is set up "
-            "correctly before running.",
+            "correctly before running. Result `data` carries the authoring check "
+            "(`is_valid`, `errors`, `warnings`, `suggestions`, "
+            "`graph_repair_suggestions`, `semantic_contracts` — the same shapes as "
+            "the top-level `validation` — plus `authoring_validation`, the Stage-1 "
+            "report on its own) and a read-only overview (`sources`, `nodes`, "
+            "`outputs`, `node_count`, `output_count`, `edge_contracts`, "
+            "`structural_preview`, `proof_diagnostics`). When a runtime check ran, "
+            "`runtime_preflight` is the envelope's own top-level field, not a key "
+            "under `data`.",
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 
@@ -532,8 +564,12 @@ class TestStep3DiscoveryTierMigration:
         assert self._get("diff_pipeline") == {
             "name": "diff_pipeline",
             "description": "Show what changed since the session was loaded or created. "
-            "Returns added, removed, and modified nodes/edges/outputs, "
-            "plus warnings introduced or resolved.",
+            "On success `data` carries `from_version`, `to_version`, `sources_changed`, "
+            "`metadata_changed`, `total_changes`, `warnings_introduced`, "
+            "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
+            "lists under `nodes`, `edges`, `outputs`, and `sources`. Without a "
+            "baseline (no session loaded or created yet) it fails with `error` and "
+            "`error_code` only.",
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 
@@ -842,7 +878,10 @@ class TestStep3BlobDiscoveryTierMigration:
     def test_list_blobs(self) -> None:
         assert self._get("list_blobs") == {
             "name": "list_blobs",
-            "description": "List uploaded/created files (blobs) in this session with metadata.",
+            "description": (
+                "List uploaded/created files (blobs) in this session with metadata: each entry carries the blob id, "
+                "filename, `size_bytes`, `created_by`, and `creation_modality`."
+            ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 
@@ -851,7 +890,8 @@ class TestStep3BlobDiscoveryTierMigration:
             "name": "list_composer_blobs",
             "description": (
                 "List ready blobs available for audited inline-content authoring. "
-                "Returns only blob_id, mime_type, size_bytes, content_hash, and filename; never content bytes."
+                "Returns a `blobs` list whose entries carry only `blob_id`, `mime_type`, `size_bytes`, `content_hash`, "
+                "and `filename`; never content bytes."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -862,7 +902,7 @@ class TestStep3BlobDiscoveryTierMigration:
     def test_get_blob_metadata(self) -> None:
         assert self._get("get_blob_metadata") == {
             "name": "get_blob_metadata",
-            "description": "Get metadata for a specific blob (file) by ID.",
+            "description": "Get metadata for a specific blob (file) by ID: filename, mime type, `content_hash`, and `size_bytes`.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -877,9 +917,10 @@ class TestStep3BlobDiscoveryTierMigration:
         assert self._get("get_blob_content") == {
             "name": "get_blob_content",
             "description": (
-                "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters. "
-                "The result also carries the blob's recorded origin — created_by (user, assistant, or pipeline) and "
-                "creation_modality — so content the assistant generated earlier is not mistaken for a discovered file."
+                "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters "
+                "(`truncated` is true when so; `size_bytes` is the full size). "
+                "The result also carries the blob's recorded origin — `created_by` (user, assistant, or pipeline) and "
+                "`creation_modality` — so content the assistant generated earlier is not mistaken for a discovered file."
             ),
             "parameters": {
                 "type": "object",
@@ -898,9 +939,11 @@ class TestStep3BlobDiscoveryTierMigration:
         assert self._get("inspect_source") == {
             "name": "inspect_source",
             "description": (
-                "Return bounded structural facts about a blob-backed source: source kind, observed "
-                "headers, sample row count, inferred scalar types per column, URL candidates, and "
-                "warnings. Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
+                "Return bounded structural facts about a blob-backed source: `source_kind`, "
+                "`observed_headers`, `sample_row_count`, inferred scalar types per column, "
+                "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
+                "was read) and `redacted_identity` (the blob's filename and hash prefix, nothing "
+                "secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
                 "before declaring a fixed CSV/JSON schema — observed headers and inferred types "
                 "tell you which fields the source actually contains and what numeric coercion is "
                 "needed before any gate or value_transform numeric op. Never returns raw row "
@@ -932,7 +975,8 @@ class TestStep3BlobDiscoveryTierMigration:
             "name": "wire_blob_inline_ref",
             "description": (
                 "Author a widened blob_ref inline_content marker at a canonical field_path. "
-                "Composer pins sha256 from blob metadata; callers must not pass content bytes."
+                "Composer pins sha256 from blob metadata; callers must not pass content bytes. "
+                "Returns the `field_path` that was wired."
             ),
             "parameters": {
                 "type": "object",
@@ -976,14 +1020,20 @@ class TestStep3SecretTierMigration:
     def test_list_secret_refs(self) -> None:
         assert self._get("list_secret_refs") == {
             "name": "list_secret_refs",
-            "description": "List available secret references (API keys, credentials). Shows names and scopes, never values.",
+            "description": (
+                "List available secret references (API keys, credentials). Each entry carries the reference name, its "
+                "`scope`, and `source_kind`; never values."
+            ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 
     def test_validate_secret_ref(self) -> None:
         assert self._get("validate_secret_ref") == {
             "name": "validate_secret_ref",
-            "description": "Check if a secret reference exists and is accessible to the current user.",
+            "description": (
+                "Check if a secret reference exists and is accessible to the current user. Returns whether it resolves, "
+                "with its `scope` and `source_kind`."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {

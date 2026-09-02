@@ -233,7 +233,16 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
             "prompt-template review is not a substitute for an authored "
             "rubric/definition review. "
             "Do not call this for terms the user already defined in the "
-            "conversation."
+            "conversation. The result's `_kind` tells you what happened: "
+            "`interpretation_review_pending` means the card is staged — wait "
+            "for the user; `interpretation_review_suppressed_by_opt_out` means "
+            "no card will appear because this session opted out "
+            "(`interpretation_review_disabled` is true and "
+            "`interpretation_source` names the automatic interpretation that "
+            "stood in) — proceed without waiting; "
+            "`interpretation_review_pending_idempotent` means an identical "
+            "request was already staged — treat it as pending. `message` "
+            "restates the outcome in prose."
         ),
         "parameters": {
             "type": "object",

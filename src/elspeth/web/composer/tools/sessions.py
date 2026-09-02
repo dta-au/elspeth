@@ -2198,7 +2198,12 @@ _GET_PIPELINE_STATE_DECLARATION = ToolDeclaration(
     "an applied_component field, that field is already the post-change state "
     "of everything that mutation touched — read it there, and call this tool "
     "for what it does not cover: a component the change did not touch, or "
-    "the whole document.",
+    "the whole document. A single-component request returns that component "
+    "under `node` or `output` (a source under its own key) with `version`, "
+    "plus an `inspection` block: `requested_component` (what you asked for), "
+    "`resolved_component` (what was returned — they differ when the request "
+    "matched a full-state alias), and `accepted_full_state_aliases` (the "
+    "exact strings that resolve to the whole document).",
     json_schema={
         "type": "object",
         "properties": {

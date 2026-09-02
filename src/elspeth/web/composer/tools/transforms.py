@@ -1787,7 +1787,10 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
     kind=ToolKind.MUTATION,
     description=(
         "Insert one transform between a predecessor and successor on an existing direct linear on_success path. "
-        "Use this for insert/between/before/after edits; the server derives input, on_success, connection, and edge IDs."
+        "Use this for insert/between/before/after edits; the server derives input, on_success, connection, and edge IDs. "
+        "Returns `inserted_node_id`, `predecessor_id`, `successor_id`, `derived_connection` (the on_success carried "
+        "over), `replaced_edge_id`, and `new_edge_id`; repeating an identical splice returns `already_applied`: true "
+        "instead of failing."
     ),
     json_schema={
         "type": "object",
