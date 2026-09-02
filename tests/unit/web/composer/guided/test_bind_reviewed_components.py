@@ -2541,6 +2541,48 @@ def test_source_correction_changes_only_selected_route_and_may_add_topology() ->
     assert bound["nodes"][-1]["id"] == "screen_rows"
 
 
+def test_source_correction_admits_every_node_key_the_advertised_schema_admits() -> None:
+    """The binder's ``nodes`` allowlist must derive from the canonical node schema.
+
+    A hand-written literal lagged the schema by four keys (``description``,
+    ``scope_name``, ``scope_opener``, ``scope_policy``): a collector node on a
+    source-correction turn passed the Draft 2020-12 pre-check and then died in
+    the binder with ``unexpected_keys`` — the WS6 parity sweep missed this
+    ``node_type`` dispatch site (elspeth-68721c71d7, workflow finding).
+    Probing every canonical key individually keeps the test derived: a key
+    the schema adds later is covered without editing this test.
+    """
+    canonical_node_keys = sorted(guided_planning._canonical_schema_properties()["nodes"]["items"]["properties"])
+    assert "scope_policy" in canonical_node_keys  # the motivating collector key is part of the probe
+    rejected_for_unexpected_keys: list[str] = []
+    for key in canonical_node_keys:
+        node: dict[str, object] = {
+            "id": "screen_rows",
+            "node_type": "transform",
+            "plugin": "passthrough",
+            "input": "screen_input",
+            "on_success": "amount_gate",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}},
+        }
+        node.setdefault(key, None)
+        try:
+            materialize_guided_authorized_candidate(
+                {
+                    "source_routes": [{"stable_id": SOURCE_ID, "on_success": "screen_input"}],
+                    "nodes": [node],
+                    "edges": [{"id": "source_to_screen", "from_node": "source", "to_node": "screen_rows", "edge_type": "on_success"}],
+                },
+                authority=_source_correction_target(),
+                guided=_guided(),
+                current_state=_correction_predecessor(),
+            )
+        except guided_planning.GuidedCandidateBindingRejected as exc:
+            if "unexpected_keys" in exc.connectivity:
+                rejected_for_unexpected_keys.append(key)
+    assert rejected_for_unexpected_keys == []
+
+
 def test_node_correction_materializer_preserves_every_unselected_node_byte() -> None:
     predecessor = _correction_predecessor()
     candidate = _planner_correction_candidate()

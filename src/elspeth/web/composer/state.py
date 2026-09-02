@@ -1747,9 +1747,11 @@ _SOURCE_CONFIG_ERROR_PREFIX = "Invalid configuration for source "
 # on how it had learned of the error and could not converge. Neither surface's
 # text was pinned by any test, which is why the drift landed green.
 _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION: Final[str] = (
-    "A field_mapper with select_only: true produced contradictory internal contract metadata: a required output "
-    "field was absent from the mapping's computed guarantees. Since d4ae04b374 the mapping itself is the required-read "
-    "authority; every configured target must therefore be present on every successful row."
+    "A field_mapper with select_only: true produced contradictory internal contract metadata: a required output field "
+    "was absent from the mapping's computed guarantees. Since d4ae04b374 the mapping itself is the required-read "
+    "authority; every configured target must therefore be present on every successful row. The rejection's 'contract' "
+    "facts carry 'producer' and 'consumer' both set to that field_mapper's own node id — the contradiction is "
+    "internal to one node, not an edge — and 'missing_fields', those absent fields."
 )
 _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX: Final[str] = (
     "Do not mutate the pipeline to work around this error. Preserve the authored mapping and report the node and "
@@ -1759,13 +1761,17 @@ _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX: Final[str] = (
 )
 _TRANSFORM_OUTPUT_COLLISION_EXPLANATION: Final[str] = (
     "A transform declares an output field that already arrives on its input row. The engine rejects a transform that "
-    "would overwrite an existing input field, so the run fails on the first row. The rejection's contract facts name "
-    "the node and the colliding field names."
+    "would overwrite an existing input field, so the run fails on the first row. The rejection's 'contract' facts "
+    "name the collision: 'producer' and 'consumer' both carry this same transform's own node id — not an upstream "
+    "edge, because the colliding field can arrive from several upstream arms at once, so no single upstream producer "
+    "is named — and 'extra_fields' lists the declared output field names that already definitely arrive on the input "
+    "row (a lower bound: more names may collide than are listed)."
 )
 _TRANSFORM_OUTPUT_COLLISION_FIX: Final[str] = (
-    "Change ONLY that node's output name, or the field upstream of it: rename this transform's output to a name the "
-    "row does not already carry (for an llm transform that is `response_field`), OR rename/drop the incoming field "
-    "upstream with a field_mapper before this node."
+    "Change ONLY this node's output name, or the field(s) upstream of it: rename this transform's output to a name "
+    "the row does not already carry — for an llm transform, change whichever option produced the colliding name: "
+    "`response_field`, or the output_fields entry that equals it — OR rename or drop each name in 'extra_fields' "
+    "upstream with a field_mapper before this node; resolve every listed name, not just one."
 )
 _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION: Final[str] = (
     "A single-prompt llm node's prompt_template reads row fields its own options.required_input_fields does not "

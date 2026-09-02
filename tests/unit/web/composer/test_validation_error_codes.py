@@ -527,6 +527,7 @@ class TestClosedCodeCatalogueInvariants:
             "no_sinks_configured",
             "aggregation_missing_on_error",
             "coalesce_branch_unreachable",
+            "coalesce_branch_alias_unreachable",
             "coalesce_schema_mode_mixed",
             "row_union_config_invalid",
             "row_union_name_invalid",
@@ -1235,6 +1236,32 @@ class TestCoalesceReachabilityFacts:
                 "produced_connections": ["branch_a", "branch_b", "rows"],
             }
         }
+
+    def test_produced_connections_are_sorted_on_a_fixture_authored_out_of_order(self) -> None:
+        """The sort pin must not depend on the hash seed.
+
+        The three-element fixtures elsewhere in this class pin
+        ``produced_connections`` sortedness only on seeds whose set iteration
+        happens to be alphabetical (an unsorted emitter survived at
+        PYTHONHASHSEED=5 under red-team mutation M6). Six connections authored
+        in non-alphabetical order make accidental agreement 1-in-720.
+        """
+        from elspeth.web.composer.state import coalesce_reachability_facts
+
+        aliases = ("zeta", "eta", "beta", "alpha", "gamma")
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(_make_gate("fan_out", "rows", aliases))
+        for alias in aliases:
+            state = state.with_node(_make_transform(f"t_{alias}", alias, "main"))
+        state = state.with_node(_make_coalesce("merge", {alias: f"{alias}_done" for alias in aliases}))
+        state = state.with_node(_make_transform("tidy", "merge", "main"))
+        state = state.with_output(_make_output())
+
+        facts = coalesce_reachability_facts(state)
+        produced = facts["merge"]["produced_connections"]
+        assert produced == ["alpha", "beta", "eta", "gamma", "rows", "zeta"]
+        assert [record["branch"] for record in facts["merge"]["unreachable_branches"]] == list(aliases)
 
     def test_reachability_facts_handle_list_form_branches(self) -> None:
         from elspeth.web.composer.state import coalesce_reachability_facts

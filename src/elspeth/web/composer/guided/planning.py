@@ -2141,30 +2141,15 @@ def materialize_guided_authorized_candidate(
         existing_ids = {node["id"] for node in raw_nodes}
         addition_ids: set[str] = set()
         additions: list[_AdmittedNode] = []
+        # The admitted key set is the advertised canonical node schema's,
+        # exactly as node_patch derives its own below. A hand-written literal
+        # here lagged that schema by four keys (description and the collector's
+        # scope_*), so a collector passed the Draft 2020-12 pre-check and died
+        # in this binder with unexpected_keys (elspeth-68721c71d7).
+        canonical_addition_item = cast(dict[str, Any], cast(dict[str, Any], _canonical_schema_properties()["nodes"])["items"])
+        addition_properties = cast(dict[str, Any], canonical_addition_item["properties"])
         for raw_node in admitted["nodes"]:
-            node = _exact_delta_members(
-                raw_node,
-                allowed={
-                    "id",
-                    "node_type",
-                    "plugin",
-                    "input",
-                    "on_success",
-                    "on_error",
-                    "options",
-                    "condition",
-                    "routes",
-                    "fork_to",
-                    "branches",
-                    "policy",
-                    "merge",
-                    "trigger",
-                    "output_mode",
-                    "expected_output_count",
-                    "timeout_seconds",
-                },
-                subject="nodes",
-            )
+            node = _exact_delta_members(raw_node, allowed=set(addition_properties), subject="nodes")
             node_id = node["id"] if "id" in node else None
             if type(node_id) is not str:
                 raise _guided_delta_rejection(

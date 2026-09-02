@@ -2656,10 +2656,20 @@ def _binding_rejection_fingerprint(rejection: GuidedCandidateBindingRejected) ->
     the model to keep every other part byte-identical. That is false, and it
     can steer a planner into reverting a genuine fix. The rejection's own
     connectivity facts carry the discriminators: which collection the
-    complaint is about, and which delta member the binder was reading. Both
-    are closed structural labels the binder authors, never candidate values,
-    so a genuine repeat — same code, same facts — still fingerprints the same
-    and still draws the notice.
+    complaint is about, which delta member the binder was reading, and the
+    SET of fact keys — the shape of the complaint. All three are closed
+    structural labels the binder authors, never candidate values, so a
+    genuine repeat — same code, same shape — still fingerprints the same and
+    still draws the notice.
+
+    The key set matters because one member can fail several ways under one
+    code: ``edge_patch`` alone raises ``guided_delta_authority_violation``
+    for not-a-dict, ``unexpected_keys``, a missing ``to_node`` and
+    ``owner_kind``, and ``node_patch`` raises ``guided_delta_unknown_stable_id``
+    for a bad ``stable_id`` and for ``node_occurrences``. A candidate that
+    correctly repaired the first shape and then tripped the next drew the
+    repeat notice — "keep every other part byte-identical and re-emit" —
+    beside a taught fix that says the opposite (elspeth-68721c71d7).
     """
     facts = rejection.connectivity
     discriminators: list[tuple[str, str]] = []
@@ -2669,6 +2679,7 @@ def _binding_rejection_fingerprint(rejection: GuidedCandidateBindingRejected) ->
         fact = facts[key]
         if type(fact) is str:
             discriminators.append((key, fact))
+    discriminators.append(("fact_keys", ",".join(sorted(facts))))
     return (("pipeline", rejection.error_code), *discriminators)
 
 

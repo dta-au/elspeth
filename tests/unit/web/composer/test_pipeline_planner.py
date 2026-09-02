@@ -5084,6 +5084,42 @@ async def test_repeated_typed_binding_rejection_draws_the_repeat_notice(
     assert second == {**_binding_rejection_expected_feedback(), "repeat_notice": _REPEAT_NOTICE}
 
 
+def test_binding_rejection_fingerprint_discriminates_on_the_fact_key_set() -> None:
+    """Same code + same delta member but a different fact SHAPE is a different rejection.
+
+    ``guided_delta_authority_violation`` fires from four edge_patch shapes
+    (not-a-dict, unexpected_keys, missing to_node, owner_kind) and
+    ``guided_delta_unknown_stable_id`` from two node_patch shapes (bad
+    stable_id, node_occurrences). Discriminating on ``delta_member`` alone
+    fingerprinted them identically, so a candidate that CORRECTLY repaired
+    the first shape and then tripped the second drew the repeat notice —
+    "keep every other part byte-identical and re-emit" — beside a taught fix
+    saying the opposite (elspeth-68721c71d7, workflow finding). The key SET is
+    a structural label the binder authors, never a candidate value, so a
+    genuine repeat (same shape) still fingerprints the same.
+    """
+    from elspeth.web.composer.pipeline_planner import _binding_rejection_fingerprint
+
+    def rejection(**facts: Any) -> GuidedCandidateBindingRejected:
+        return GuidedCandidateBindingRejected(
+            "guided planner candidate delta", error_code="guided_delta_authority_violation", connectivity=facts
+        )
+
+    unexpected = rejection(delta_member="edge_patch", unexpected_keys=["target"], allowed_keys=["stable_id", "to_node"])
+    owner = rejection(delta_member="edge_patch", owner_kind="node")
+    not_a_dict = rejection(delta_member="edge_patch", allowed_keys=["stable_id", "to_node"])
+    assert len({_binding_rejection_fingerprint(r) for r in (unexpected, owner, not_a_dict)}) == 3
+
+    # The same shape with different VALUES is still the same rejection: values
+    # are candidate content and must never enter the fingerprint.
+    again = rejection(delta_member="edge_patch", unexpected_keys=["label"], allowed_keys=["stable_id", "to_node"])
+    assert _binding_rejection_fingerprint(again) == _binding_rejection_fingerprint(unexpected)
+
+    # Existing discriminators keep their meaning.
+    other_member = rejection(delta_member="node_patch", owner_kind="node")
+    assert _binding_rejection_fingerprint(other_member) != _binding_rejection_fingerprint(owner)
+
+
 @pytest.mark.asyncio
 async def test_candidate_policy_rejection_gets_closed_bounded_repair(
     tmp_path: Path,
