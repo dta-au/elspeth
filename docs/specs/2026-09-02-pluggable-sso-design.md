@@ -1,7 +1,7 @@
 # Pluggable SSO and identity substrate — backend-for-frontend login for Entra, VANguard, Google, and generic OIDC
 
 Date: 2026-09-02. Status: design, revision 2.4, implementation plan = tracker milestone elspeth-07cd19ba73.
-Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**.
+Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**.
 Branch: `release/0.8.0`.
 Revision 2 incorporates six independent reviews (security architecture,
 solution design, reality check against the tree, systems risk, functional
@@ -12,8 +12,8 @@ Sprint: this spec is the identity half of the "Identity and workflow
 management" milestone in the tracker. Operator ruling (2026-09-02): build
 90% of the final solution now and tweak on the fly, rather than a perfect
 interim system that never gets permission to be replaced. So the workflow
-half (approval, review attestation, shared library, per-day quota, the
-approver's audit view, delegated administration) is BUILT in the same sprint, and its tables
+half (approval, review attestation, shared library, per-day token quota,
+per-person disk quota, the approver's audit view, delegated administration) is BUILT in the same sprint, and its tables
 ride the same epoch pass (phase 1 step 0 fixes their shapes as a
 §Workflow tables addendum to this document before the epoch lands). The
 seams in §Future seams are the starting point for that addendum.
@@ -62,6 +62,7 @@ The tech-debt-free window is weeks, not months.
 | D15 **[rev2.3]** | Quota numbers | `quota_default_tokens_per_day` is a **required container setting** (`WebSettings`, required unless `local`). Activation writes a `quota_policies` row with that number; an admin may override it per identity afterwards. `quota_container_tokens_per_day` is an optional ceiling. No applicable policy ⇒ refuse (only reachable through corruption, since every activated identity gets a row). |
 | D16 **[rev2.3]** | Role and edge names | `approver` (was `manager`) and `reviewer`. Role `approver` may decide approvals and hold `approver` edges; the tree edge type is `approver` ("A is B's default approver"). Role `reviewer` may attest. "Manager" and "lead" appear nowhere in schema, API, or UI. |
 | D17 **[rev2.3]** | IdP groups | Dropped. `groups_json` is removed; the Entra profile no longer extracts `groups`/`roles` and the group-overage check is gone with them; `UserProfile.groups` is always empty for SSO. |
+| D18 **[rev2.5]** | Disk quota for uploaded blobs | Per person, a **level** not a rate: `SUM(blobs.size_bytes)` over the live blob rows of every session the identity owns (fork copies bytes, so each session's rows are real disk). `quota_default_storage_bytes` is a required container setting written into the identity's `quota_policies` row at activation, overridable per identity by an admin; `quota_container_storage_bytes` is an optional ceiling. Enforced at both upload routes under the existing per-session blob lock, before bytes are written; the existing `max_blob_storage_per_session_bytes` stays as the inner per-session bound. Over quota refuses and writes `quota_exceeded` with `dimension=storage`; accounting unavailable refuses (R13). |
 
 ## Architecture
 
@@ -426,7 +427,9 @@ test keeps pinning that none of these boundaries widens to `str`.
   `identity_enabled`, `role_granted`, `role_revoked`,
   `relationship_asserted`, `relationship_revoked`, `approval_requested`,
   `approval_decided`, `review_attested`, `library_published`,
-  `library_recalled`, `quota_set`, `quota_exceeded`.
+  `library_recalled`, `quota_set`, `quota_exceeded`. `quota_set` and
+  `quota_exceeded` carry `dimension` (`tokens` or `storage`), the cap, the
+  ceiling in force, and the measured usage in `metadata_json` [rev2.5].
 - `calls` gains nullable `prompt_tokens`, `completion_tokens`,
   `cached_prompt_tokens`, `reasoning_tokens` written from the provider's
   `TokenUsage` at call-record time **[rev2.1]**. Measured 2026-09-02: the
@@ -464,6 +467,9 @@ test keeps pinning that none of these boundaries widens to `str`.
 | add | `sso_admin_subjects: tuple[str, ...]` | bootstrap only; seeds the first `admin` role row |
 | add | `quota_default_tokens_per_day: int` | **required unless local** (D15); every activation writes a `quota_policies` row with this value, overridable per identity by an admin |
 | add | `quota_container_tokens_per_day: int \| None` | optional container ceiling row (D15) |
+| add | `quota_default_storage_bytes: int` | **required unless local** (D18); written into the same `quota_policies` row at activation |
+| add | `quota_container_storage_bytes: int \| None` | optional container disk ceiling (D18) |
+| keep | `max_upload_bytes`, `max_blob_storage_per_session_bytes` | per-file and per-session inner bounds; the identity quota is the outer bound |
 | add | `compartment_id: str` | required unless local; the marking stamped into exports, library rows, and audit metadata |
 | add | `identity_dormancy_days: int` | R9 window; default 90 |
 | keep | `entra_tenant_id` | required for `entra` only |
@@ -591,6 +597,12 @@ waits for a registered client.
   one human can then hold many identities and every ≠ CHECK is defeatable.
 - **R12.** [rev2.2] Refuse to resolve a shareable review token for a
   requesting identity that is not `active`.
+- **R13.** [rev2.5] Refuse an upload (multipart or inline) whose bytes
+  would take the identity's live blob total over its `storage_bytes` or the
+  container ceiling, before any byte reaches disk; write `quota_exceeded`
+  with `dimension=storage`. Refuse when the accounting query fails. The
+  response names the cap and the current usage so the user can delete
+  blobs to recover; the existing per-session error keeps its shape.
 
 ## Frontend [rev2]
 
@@ -601,7 +613,12 @@ waits for a registered client.
   existing banner.
 - `types/index.ts`: five-value union; `AuthConfig` loses the OIDC fields.
 - Minimal admin UI: identities list with disable/enable, roles grant/revoke,
-  relationships editor (the org chart), all behind the admin role.
+  relationships editor (the org chart), all behind the admin role. The
+  identity row shows both quotas (tokens per day, storage bytes) with
+  current usage, and one editor sets either [rev2.5].
+- Upload surfaces render the storage refusal with cap and usage, and the
+  blob list shows the identity's total so deletion is discoverable
+  [rev2.5].
 
 ## Testing [rev2]
 
@@ -679,6 +696,8 @@ waits for a registered client.
   top of `identity_roles` and `identity_relationships`; route-layer only.
 - **Per-day token quota:** sum of LLM usage over `run_attributions` by
   `identity_id` per day; enforcement at execute. Subject scope is D11.
+- **Disk quota:** `SUM(blobs.size_bytes)` per identity, enforced at upload
+  (D18, R13).
 - **Approver's audit view:** `identity_relationships` × `run_attributions`
   × `auth_events`, scoped to the caller's active `approver` edges.
 - **Preview row trace:** elspeth-8310d6030c, independent.
@@ -697,7 +716,7 @@ deliberate epoch bump.
 | approval_decisions | decision_id PK; approval_id FK; decided_by_identity_id FK; decided_at; decision CHECK `('approved','rejected')`; note NULL | [rev2.2] One row per deciding identity, so `required_count > 1` is a count over rows, not a schema change. Dual control: nullable `quota_policies.dual_control_above_tokens` and a per-container list of secret names / plugins whose wiring raises `required_count` to 2 (reserved, not enforced). |
 | review_attestations | attestation_id PK; session_id FK; state_id; payload_digest; reviewer_identity_id FK; attested_at; verdict CHECK `('signed_off','changes_requested','withdrawn')` [rev2.2]; note NULL | Append-only. Reviewer ≠ author (CHECK); the reviewer must hold an active `reviewer` role [rev2.3]. **Named "reviewer attestations" everywhere — schema, API, UI [rev2.2].** It is a ledger, not a control: nothing refuses on it. The phrase "two-person rule" is reserved for something that refuses; a UI must never say "two-person rule satisfied" over an unenforced count. |
 | library_entries | entry_id PK; published_from_session_id FK; payload_digest; compartment_id; title; version int; published_by_identity_id FK; curated_by_identity_id NULL FK; published_at; accepted_at NULL; rejected_at NULL; rejection_note NULL; deprecated_at NULL; recalled_at NULL; note NULL | Frozen, content-addressed. **A library entry is the public projection (`generate_public_yaml` shape), never a session reference, and it is config-only [rev2.2]:** publishing a pipeline that reads an uploaded blob is refused with a named `error_type` ("publish a profile-bound source instead"), because blob custody proves same-principal on fork and a cross-user fork of a blob-backed source cannot copy the blob without becoming an intra-container exfiltration path. Forking a library entry instantiates the projection into the forker's own staging session; `forked_from_session_id` points at that staging session and the entry's `payload_digest` carries provenance. Visible deployment-wide once `accepted_at` is set by a `curator`. Curator ≠ publisher (CHECK). Recall flags, never deletes. `library_published` audit rows carry `payload_digest` and `compartment_id` so the same artifact appearing in two containers is detectable later. |
-| quota_policies | policy_id PK; identity_id NULL FK; tokens_per_day int; dual_control_above_tokens NULL int; set_by_identity_id FK; set_at; revoked_at NULL | Per person (D11) **plus the container ceiling row (`identity_id` NULL) shipped now [rev2.2]**, because activation otherwise grants unbounded spend on the container's shared LLM credential. Two partial uniques, both dialects: active per identity, and active `WHERE identity_id IS NULL` (NULLs are distinct for uniqueness in Postgres, so one predicate does not cover both). Activation writes the per-identity row from `quota_default_tokens_per_day` (D15), so no applicable policy is reachable only through corruption and refuses. Every `quota_set` / `quota_exceeded` event records the cap and the ceiling in force. |
+| quota_policies | policy_id PK; identity_id NULL FK; tokens_per_day int; storage_bytes int [rev2.5, D18]; dual_control_above_tokens NULL int; set_by_identity_id FK; set_at; revoked_at NULL | Per person (D11) **plus the container ceiling row (`identity_id` NULL) shipped now [rev2.2]**, because activation otherwise grants unbounded spend on the container's shared LLM credential. Two partial uniques, both dialects: active per identity, and active `WHERE identity_id IS NULL` (NULLs are distinct for uniqueness in Postgres, so one predicate does not cover both). Activation writes the per-identity row from `quota_default_tokens_per_day` (D15), so no applicable policy is reachable only through corruption and refuses. Every `quota_set` / `quota_exceeded` event records the cap and the ceiling in force. **Storage [rev2.5]:** `storage_bytes` is a standing level, not a daily rate; usage is `SUM(blobs.size_bytes)` joined through `sessions.identity_id` over live rows (deleted blobs leave no row), evaluated inside the upload's existing session blob lock so two concurrent uploads cannot both pass. Blobs created by the system on the identity's behalf (inline custody, fork copies) count against the identity; the `system` exemption applies to tokens only. Admin set/revoke is one route for both dimensions. |
 | token_usage_ledger | entry_id PK; identity_id NULL FK; source CHECK `('composer','run','auto_title','system')` [rev2.2]; session_id NULL FK; run_id NULL; model; prompt_tokens; completion_tokens; cached_prompt_tokens NULL; reasoning_tokens NULL; recorded_at | Operational accounting index, not audit truth (Landscape `calls` is). Composer writes one row per LLM call from `ComposerLLMCall.usage` (today persisted only inside JSON audit payloads, not queryable). Auto-titling (a paid background call per first message, which its own docstring flags as bypassing rate limits) writes `auto_title`; the boot probe writes `system` with `identity_id` NULL. Runs write one row per run at finalisation from the new `calls` token columns. Quota check = `SUM` over the ledger for the identity in the current UTC day, evaluated at execute and at composer turn start only; post-response spend lands in the next window. Over quota refuses and writes `quota_exceeded`. Accounting unavailable ⇒ refuse (fail closed); the `system` arm is exempt from the check. |
 
 ## Terminology
