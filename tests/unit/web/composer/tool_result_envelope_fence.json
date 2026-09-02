@@ -1,0 +1,4 @@
+{
+ "_doc": "Tool-result envelope keys deliberately left untaught, each with a checkable reason. Read by tests/unit/web/composer/test_tool_result_envelope_gate.py, which fails on any 'pending' reason: every entry is an adjudicated decision (elspeth-e405ad7cd2). A fence must not outlive what it fences — the gate also fails when a fenced key becomes taught or stops shipping.",
+ "fenced": []
+}
