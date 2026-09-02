@@ -592,9 +592,9 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         r"guided_collector_opener_unresolved",
         "A collector's scope_opener names a node id that does not exist in your candidate, so no "
         "expansion opens the group the collector would close.",
-        "Re-emit with scope_opener set to one of the connectivity facts' candidate_node_ids — the exact "
+        "Re-emit with scope_opener set to one of the 'connectivity' facts' 'candidate_node_ids' — the exact "
         "id of the multi-row transform whose expanded rows this collector reassembles. The "
-        "dangling_scope_openers facts are the values that matched nothing.",
+        "'dangling_scope_openers' facts are the values that matched nothing.",
     ),
     (
         r"scope_opener_unknown|scope_opener '(.+)' does not name a transform",
@@ -685,7 +685,7 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "A coalesce branches mapping names an incoming connection that no runtime routing field produces. The usual cause is "
         "the WIRING AROUND the coalesce, not the coalesce itself: a branch transform's on_success routes past the coalesce "
         "(e.g. straight to a sink), so nothing arrives under the connection name the branches value claims. The rejection's "
-        "connectivity facts, when present, carry 'unreachable_branches' — one record per broken branch, each naming the "
+        "'connectivity' facts, when present, carry 'unreachable_branches' — one record per broken branch, each naming the "
         "branch ('branch'), the connection it consumes that nothing produces ('consumed_connection'), and — only for a "
         "MAPPED branch, whose key differs from its value — when that branch's transform chain ends by publishing to a sink, "
         "the node that did it ('sink_lure', carrying 'node_id' and 'publishes_to_sink'). An identity branch (a list-form "
@@ -803,7 +803,8 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"semantic_contract_violation|Semantic contract violation:|Semantic contract:",
         "A consumer requires a field to satisfy a semantic contract (content kind, framing, or value type) that its upstream "
-        "producer does not declare or actively conflicts with. The rejection's contract facts name the producer and consumer.",
+        "producer does not declare or actively conflicts with. The rejection's 'contract' facts, when present, name that "
+        "edge: 'producer' ('source', 'source:<name>', or a node id) and 'consumer' (the requiring node's id).",
         "Call get_plugin_assistance for the consumer plugin to see which producers satisfy its semantic requirements, then "
         "change ONLY that edge: swap the producer, or route through a transform that produces the required content kind.",
     ),
@@ -831,8 +832,9 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "when undeclared, and a field_mapper adds a target as 'any' only when neither the target nor, for a rename, the "
         "renamed source is declared (a rename inherits the source's type when the source is declared). So the named field "
         "may appear in neither branch's authored schema. The rejection's 'coalesce_union_type' facts name the conflict, "
-        "when present: 'branch_a' and 'branch_b' are the two branch names as declared on branches, and 'type_a'/'type_b' "
-        "are the type (str, int, float, bool, or any) each branch's producer carries for the field.",
+        "when present: 'field' is the shared field name; 'branch_a' and 'branch_b' are the two branch names as declared "
+        "on branches, and 'type_a'/'type_b' are the type (str, int, float, bool, or any) each branch's producer carries "
+        "for it.",
         "Read the field and branch names off the rejection's facts, not your schemas. Resolve each branch name to its "
         "connection (its branches entry), then to the producer publishing it: on_success, on_error, a routes value, a "
         "fork_to entry, or, for an aggregation with no on_success, its own node id; if that producer is a gate (it has no "

@@ -2583,6 +2583,58 @@ def test_source_correction_admits_every_node_key_the_advertised_schema_admits() 
     assert rejected_for_unexpected_keys == []
 
 
+def test_source_correction_binds_a_collector_with_its_scope_keys() -> None:
+    """The motivating case for the derived allowlist: a real collector on a source-correction turn.
+
+    The key-probe test above proves no canonical key is rejected as unexpected;
+    this one proves the collector's scope keys bind through to a candidate the
+    canonical model accepts, so the derived allowlist admits nothing the
+    downstream binder then mishandles (red-team finding on bc8b9e237).
+    """
+    from elspeth.web.composer.pipeline_planner import SetPipelineArgumentsModel
+
+    bound = materialize_guided_authorized_candidate(
+        {
+            "source_routes": [{"stable_id": SOURCE_ID, "on_success": "screen_input"}],
+            "nodes": [
+                {
+                    "id": "explode",
+                    "node_type": "transform",
+                    "plugin": "line_explode",
+                    "input": "screen_input",
+                    "on_success": "lines",
+                    "on_error": "discard",
+                    "options": {"field": "color_name", "schema": {"mode": "observed"}},
+                    "description": "split lines",
+                },
+                {
+                    "id": "regroup",
+                    "node_type": "collector",
+                    "plugin": "join_lines",
+                    "input": "lines",
+                    "on_success": "amount_gate",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}},
+                    "scope_name": "lines_group",
+                    "scope_opener": "explode",
+                    "scope_policy": "require_all",
+                },
+            ],
+            "edges": [
+                {"id": "source_to_explode", "from_node": "source", "to_node": "explode", "edge_type": "on_success"},
+                {"id": "explode_to_regroup", "from_node": "explode", "to_node": "regroup", "edge_type": "on_success"},
+            ],
+        },
+        authority=_source_correction_target(),
+        guided=_guided(),
+        current_state=_correction_predecessor(),
+    )
+    collector = next(node for node in bound["nodes"] if node["id"] == "regroup")
+    assert (collector["scope_name"], collector["scope_opener"], collector["scope_policy"]) == ("lines_group", "explode", "require_all")
+    validated = SetPipelineArgumentsModel.model_validate(bound).model_dump()
+    assert any(node["id"] == "regroup" and node["node_type"] == "collector" for node in validated["nodes"])
+
+
 def test_node_correction_materializer_preserves_every_unselected_node_byte() -> None:
     predecessor = _correction_predecessor()
     candidate = _planner_correction_candidate()

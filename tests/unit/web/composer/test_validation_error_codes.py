@@ -46,6 +46,7 @@ from elspeth.web.composer.state import (
     SourceSpec,
     ValidationEntry,
     ValidationSummary,
+    route_destination_facts,
 )
 from elspeth.web.composer.tools._common import _PLUGIN_UNAVAILABLE_EXPLANATIONS
 from elspeth.web.composer.tools.generation import (
@@ -1409,6 +1410,59 @@ class TestCoalesceReachabilityFacts:
             ],
             "produced_connections": ["branch_a", "branch_b", "rows"],
         }
+
+    def test_route_destination_entries_ship_only_their_own_fields_keys(self) -> None:
+        """A component whose on_success AND on_error both dangle gets two entries, each with its own field's keys.
+
+        ``route_destination_facts`` merges both findings into one dict per
+        component; attaching that dict to every entry shipped
+        ``dangling_on_success`` / ``consumable_connections`` under the on_error
+        code and ``dangling_on_error`` under the on_success code — keys the
+        code's guidance never names and the teaching gate never enumerated
+        (red-team finding on bc8b9e237). The consumer now projects each entry
+        to ``route_destination_fact_keys(code)``; this pins that projection on
+        the doubly-dangling fixture the finding used.
+        """
+        from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback, route_destination_fact_keys
+        from elspeth.web.composer.tools import ToolResult
+
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="t1",
+                node_type="transform",
+                plugin="value_transform",
+                input="rows",
+                on_success="nowhere",
+                on_error="ghost_sink",
+                options={"schema": {"mode": "observed"}, "operations": [{"target": "_placeholder", "expression": "row['text']"}]},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_output(_make_output())
+        validation = state.validate()
+        codes = {entry.error_code for entry in validation.errors}
+        assert {"transform_on_success_dangling", "transform_on_error_unknown_sink"} <= codes
+        # The producer really does merge: both fields' keys live in one dict.
+        assert set(route_destination_facts(state)["node:t1"]) == {
+            "dangling_on_success",
+            "declared_sinks",
+            "consumable_connections",
+            "dangling_on_error",
+        }
+
+        feedback = _allowlisted_candidate_feedback(ToolResult(success=False, updated_state=state, validation=validation, affected_nodes=()))
+        shipped = {entry["error_code"]: set(entry["connectivity"]) for entry in feedback["validation"]["errors"] if "connectivity" in entry}
+        assert shipped["transform_on_success_dangling"] == route_destination_fact_keys("transform_on_success_dangling")
+        assert shipped["transform_on_error_unknown_sink"] == route_destination_fact_keys("transform_on_error_unknown_sink")
+        assert "dangling_on_success" not in shipped["transform_on_error_unknown_sink"]
+        assert "dangling_on_error" not in shipped["transform_on_success_dangling"]
 
     def test_allowlisted_feedback_omits_connectivity_for_other_codes(self) -> None:
         from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback

@@ -2117,6 +2117,32 @@ _ROUTE_DESTINATION_FACT_CODES: Final[frozenset[str]] = frozenset(
     }
 )
 
+_ROUTE_DESTINATION_ON_SUCCESS_KEYS: Final[frozenset[str]] = frozenset({"dangling_on_success", "declared_sinks", "consumable_connections"})
+_ROUTE_DESTINATION_ON_ERROR_KEYS: Final[frozenset[str]] = frozenset({"dangling_on_error", "declared_sinks"})
+_ROUTE_DESTINATION_COALESCE_KEYS: Final[frozenset[str]] = frozenset({"dangling_on_success", "declared_sinks"})
+
+
+def route_destination_fact_keys(code: str) -> frozenset[str]:
+    """The ``RouteDestinationFactDict`` keys one route-destination code may ship.
+
+    ``route_destination_facts`` keys its facts by COMPONENT and merges the
+    on_success and on_error findings for one component into a single dict,
+    while the closed code names ONE routing field. Attaching the merged dict
+    to every entry for that component shipped ``dangling_on_success`` and
+    ``consumable_connections`` under an on_error code (and the reverse) —
+    keys the code's guidance never names and the teaching gate never
+    enumerated (elspeth-68721c71d7, red-team finding). Each entry is
+    projected to its own field's keys here, and the gate imports this map
+    so what it checks is what the consumer ships.
+    """
+    if code not in _ROUTE_DESTINATION_FACT_CODES:
+        raise ValueError(f"{code!r} is not a route-destination fact code")
+    if "on_error" in code:
+        return _ROUTE_DESTINATION_ON_ERROR_KEYS
+    if code.startswith("coalesce_"):
+        return _ROUTE_DESTINATION_COALESCE_KEYS
+    return _ROUTE_DESTINATION_ON_SUCCESS_KEYS
+
 
 def _rejection_fingerprint(result: ToolResult) -> tuple[tuple[str, str], ...]:
     """Identity of one candidate rejection: sorted (component, code) pairs.
@@ -2492,7 +2518,10 @@ def _allowlisted_candidate_feedback(
             # repair budget on exactly that blindness (elspeth-5904b1683a).
             if destination_facts is None:
                 destination_facts = route_destination_facts(result.updated_state)
-            projected["connectivity"] = destination_facts[entry.component]
+            # The facts are keyed by component and merge both routing fields;
+            # this entry is about ONE field, so ship only that field's keys.
+            allowed_keys = route_destination_fact_keys(code)
+            projected["connectivity"] = {key: value for key, value in destination_facts[entry.component].items() if key in allowed_keys}
         if code == "coalesce_branch_unreachable" and not withholding.connectivity:
             # Instance wiring facts derived from the REJECTED state the result
             # carries — same redaction class as the contract facts below (node

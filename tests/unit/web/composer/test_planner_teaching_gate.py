@@ -37,6 +37,7 @@ import pytest
 
 from elspeth.web.composer import pipeline_planner, state
 from elspeth.web.composer.guided import planning as guided_planning
+from elspeth.web.composer.pipeline_planner import route_destination_fact_keys
 from elspeth.web.composer.reviewed_output_projection import ReviewedOutputProjectionConflict
 from elspeth.web.composer.tools import generation
 from elspeth_lints.core.ast_walker import iter_python_files
@@ -133,6 +134,13 @@ def _detail_sites(files: Iterable[Path]) -> Iterator[ShippedKey]:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or _call_name(node) not in _ENTRY_CONSTRUCTORS:
                 continue
+            site = f"{_display(path)}:{node.lineno}"
+            # Fail CLOSED, as the guided walker does: a ``**spread`` or a detail
+            # passed positionally could carry a payload this walker cannot see.
+            if any(kw.arg is None for kw in node.keywords):
+                raise AssertionError(f"{site}: entry built with a **spread; the gate cannot derive its detail keys")
+            if len(node.args) > _ERROR_CODE_POSITION + 1:
+                raise AssertionError(f"{site}: entry passes a detail positionally; the gate cannot derive its keys")
             keywords = {kw.arg: kw.value for kw in node.keywords if kw.arg}
             details = [name for name in _DETAIL_PAYLOADS if name in keywords]
             if not details:
@@ -141,7 +149,6 @@ def _detail_sites(files: Iterable[Path]) -> Iterator[ShippedKey]:
             if code_node is None and len(node.args) > _ERROR_CODE_POSITION:
                 code_node = node.args[_ERROR_CODE_POSITION]
             code = _literal_str(code_node)
-            site = f"{_display(path)}:{node.lineno}"
             if code is None:
                 raise AssertionError(
                     f"{site}: cannot derive error_code for a typed-detail entry (non-literal); the gate needs a literal code"
@@ -172,31 +179,13 @@ def _route_destination_shapes() -> dict[frozenset[str], int]:
     return shapes
 
 
-_ON_SUCCESS_SHAPE = frozenset({"dangling_on_success", "declared_sinks", "consumable_connections"})
-_ON_ERROR_SHAPE = frozenset({"dangling_on_error", "declared_sinks"})
-_COALESCE_ON_SUCCESS_SHAPE = frozenset({"dangling_on_success", "declared_sinks"})
-
-
-def route_destination_keys_for(code: str) -> frozenset[str]:
-    """Which ``RouteDestinationFactDict`` keys a route-destination code can carry.
-
-    ``route_destination_facts`` keys its dict by COMPONENT, and the code is
-    chosen by ``_validate_runtime_route_destinations`` per routing field; the
-    two agree by construction on: on_error codes → the on_error shape, coalesce
-    on_success → no consumable connections, every other on_success → all three.
-    ``test_route_destination_facts_emit_exactly_the_three_pinned_shapes`` pins
-    the producer side of that agreement.
-    """
-    if "on_error" in code:
-        return _ON_ERROR_SHAPE
-    if code.startswith("coalesce_"):
-        return _COALESCE_ON_SUCCESS_SHAPE
-    return _ON_SUCCESS_SHAPE
-
-
 def _connectivity_sites() -> Iterator[ShippedKey]:
+    # Per-code shape comes from the CONSUMER's own projection map
+    # (``pipeline_planner.route_destination_fact_keys``): the producer merges
+    # both routing fields per component, so the entry's key set is decided at
+    # the consumer, and that is the authority this gate derives from.
     for code in sorted(pipeline_planner._ROUTE_DESTINATION_FACT_CODES):
-        allowed = route_destination_keys_for(code)
+        allowed = route_destination_fact_keys(code)
         yield ShippedKey("freeform", code, "connectivity", "state.py:route_destination_facts")
         for key in _typed_keys(state.RouteDestinationFactDict, "connectivity."):
             if key.split(".")[1] in allowed:
@@ -260,13 +249,19 @@ def shipped_keys(files: Iterable[Path] | None = None) -> list[ShippedKey]:
 
 
 def is_taught(code: str, key: str, explain=generation.explain_validation_code) -> bool:
-    """The key's leaf name appears verbatim in the guidance the code resolves to."""
+    """The key's leaf name appears in the house-style quoted form in the guidance the code resolves to.
+
+    Quoted (``'key'``) or backticked only: a bare-word match let ordinary prose
+    ("the consumer node", "a field carried by") count as teaching ``consumer``
+    or ``field``, so deleting the deliberate teaching of a common-word key left
+    the gate green (red-team finding on bc8b9e237).
+    """
     guidance = explain(code)
     if guidance is None:
         return False
     leaf = key.split(".")[-1].replace("[]", "")
     text = " ".join(guidance)
-    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(leaf)}(?![A-Za-z0-9_])", text) is not None
+    return re.search(rf"['`]{re.escape(leaf)}['`]", text) is not None
 
 
 def untaught_keys(files: Iterable[Path] | None = None, explain=generation.explain_validation_code) -> dict[tuple[str, str, str], list[str]]:
@@ -315,7 +310,8 @@ def test_fence_entries_are_live_untaught_keys() -> None:
 
 def test_fence_entries_carry_a_checkable_reason() -> None:
     """A fence is an adjudicated decision, not a parking spot (elspeth-68721c71d7)."""
-    pending = [e for e in load_fence() if not e.reason.strip() or e.reason.lower().startswith("pending")]
+    placeholder = re.compile(r"^\s*(pending|todo|tbd|fixme|wip)\b", re.IGNORECASE)
+    pending = [e for e in load_fence() if len(e.reason.split()) < 12 or placeholder.match(e.reason)]
     assert not pending, f"{len(pending)} fence entr{'y' if len(pending) == 1 else 'ies'} await adjudication:\n" + "\n".join(
         f"{e.surface} {e.code} {e.key}: {e.reason!r}" for e in pending
     )
@@ -330,9 +326,27 @@ def test_fence_fixture_has_no_duplicates() -> None:
 
 
 def test_route_destination_facts_emit_exactly_the_three_pinned_shapes() -> None:
-    """Pins the producer half of ``route_destination_keys_for``'s code→shape agreement."""
+    """The producer's dict literals are exactly the three shapes the consumer projects to.
+
+    The producer MERGES shapes per component (a transform whose on_success and
+    on_error both dangle carries all four keys), so this pins the building
+    blocks; the per-entry projection is pinned in test_validation_error_codes.
+    """
     shapes = _route_destination_shapes()
-    assert set(shapes) == {_ON_SUCCESS_SHAPE, _ON_ERROR_SHAPE, _COALESCE_ON_SUCCESS_SHAPE}, shapes
+    assert set(shapes) == {route_destination_fact_keys(code) for code in pipeline_planner._ROUTE_DESTINATION_FACT_CODES}, shapes
+
+
+def test_is_taught_requires_the_quoted_form_not_a_bare_or_super_string() -> None:
+    """A key counts as taught only when named in the house style, and only as itself."""
+
+    def explain(_code: str) -> tuple[str, str]:
+        return ("the consumer node's input; 'branches' holds records; each 'field_type' is set", "use `producer` here")
+
+    assert is_taught("x", "contract.producer", explain)  # backticked
+    assert is_taught("x", "row_union_schema.branches", explain)  # quoted
+    assert not is_taught("x", "contract.consumer", explain)  # bare word in ordinary prose
+    assert not is_taught("x", "row_union_schema.branches[].branch", explain)  # 'branches' is not 'branch'
+    assert not is_taught("x", "row_union_schema.branches[].fields[].name", explain)  # 'field_type' is not 'name'
 
 
 def test_gate_derives_a_new_guided_key_from_the_ast(tmp_path: Path) -> None:

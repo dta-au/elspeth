@@ -5111,8 +5111,9 @@ def test_binding_rejection_fingerprint_discriminates_on_the_fact_key_set() -> No
     assert len({_binding_rejection_fingerprint(r) for r in (unexpected, owner, not_a_dict)}) == 3
 
     # The same shape with different VALUES is still the same rejection: values
-    # are candidate content and must never enter the fingerprint.
-    again = rejection(delta_member="edge_patch", unexpected_keys=["label"], allowed_keys=["stable_id", "to_node"])
+    # are candidate content and must never enter the fingerprint. The keys are
+    # given in a different ORDER too: the shape is a set, not a sequence.
+    again = rejection(allowed_keys=["stable_id", "to_node"], unexpected_keys=["label"], delta_member="edge_patch")
     assert _binding_rejection_fingerprint(again) == _binding_rejection_fingerprint(unexpected)
 
     # Existing discriminators keep their meaning.
