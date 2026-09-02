@@ -63,7 +63,6 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.composer.tool_result_envelope import ValidationCodeGuidance, ValidationGuidance
 from elspeth.web.composer.tools._common import (
-    _DATA_ERROR_KEY,
     _PLUGIN_UNAVAILABLE_EXPLANATIONS,
     ToolContext,
     ToolResult,
@@ -353,6 +352,11 @@ _PLUGIN_UNAVAILABLE_FIXES: Final[dict[PluginUnavailableReason, str]] = {
 
 
 _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
+    (
+        r"diff_baseline_unavailable|No baseline available",
+        "diff_pipeline has nothing to compare against: the session was created without a loaded baseline state.",
+        "Do not retry diff_pipeline in this session. Use get_pipeline_state to read the current state instead.",
+    ),
     (
         r"No source configured",
         "The pipeline has no data source. Every pipeline needs exactly one source to read input data from.",
@@ -1683,6 +1687,14 @@ def explain_validation_code(code: str) -> tuple[str, str] | None:
 # tool envelope (tools._dispatch). Two copies would drift, and the parity
 # suite pins the string.
 EXPLAIN_VALIDATION_ERROR_GUIDANCE: Final[str] = "To expand any code, call explain_validation_error with the exact code string."
+"""Planner-surface pointer: there the catalogue text rides inline on each entry, so no container is named."""
+
+EXPLAIN_TOOL_GUIDANCE: Final[str] = (
+    "An error_code with no entry under 'validation_guidance.codes' can be expanded by calling "
+    "explain_validation_error with the exact code string."
+)
+"""Freeform-envelope pointer (``validation_guidance.explain_tool``): names the container the codes live in,
+so the model knows which codes the call can still add something for (elspeth-e405ad7cd2)."""
 
 
 def build_validation_guidance(codes: Iterable[str | None]) -> ValidationGuidance | None:
@@ -1738,7 +1750,7 @@ def build_validation_guidance(codes: Iterable[str | None]) -> ValidationGuidance
         return None
     payload = ValidationGuidance(codes=resolved)
     if any_unresolved:
-        payload["explain_tool"] = EXPLAIN_VALIDATION_ERROR_GUIDANCE
+        payload["explain_tool"] = EXPLAIN_TOOL_GUIDANCE
     return payload
 
 
@@ -3923,12 +3935,13 @@ def _execute_diff_pipeline(
     baseline = context.baseline
     current_validation = context.current_validation
     if baseline is None:
-        return _discovery_result(
+        # A failure, not a success carrying an ``error`` key: ``error`` is a
+        # failure-only key on every surface (elspeth-e405ad7cd2 D5). The
+        # current version already rides the envelope's ``version``.
+        return _failure_result(
             state,
-            {
-                _DATA_ERROR_KEY: "No baseline available. Load or create a session first.",
-                "current_version": state.version,
-            },
+            "No baseline available. Load or create a session first.",
+            error_code="diff_baseline_unavailable",
         )
 
     baseline_validation = context.catalog.validate_composition_state(baseline).validation

@@ -661,12 +661,16 @@ class TestDiffStates:
 
 
 class TestDiffPipelineTool:
-    def test_returns_error_without_baseline(self) -> None:
+    def test_fails_closed_without_baseline(self) -> None:
+        """A missing baseline is a failure with a closed code, not a success carrying ``error`` (D5, elspeth-e405ad7cd2)."""
         state = _empty_state()
         catalog = _mock_catalog()
         result = execute_tool("diff_pipeline", {}, state, catalog)
-        assert result.success is True
+        assert result.success is False
         assert "No baseline" in result.data["error"]
+        assert result.data["error_code"] == "diff_baseline_unavailable"
+        assert "current_version" not in result.data
+        assert result.validation.errors[0].error_code == "diff_baseline_unavailable"
 
     def test_returns_changes_with_baseline(self) -> None:
         s1 = _empty_state()

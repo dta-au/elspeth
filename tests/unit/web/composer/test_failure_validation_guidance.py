@@ -34,7 +34,7 @@ from elspeth.web.composer.tools import execute_tool as _strict_execute_tool
 from elspeth.web.composer.tools._common import ToolContext, ToolResult
 from elspeth.web.composer.tools._dispatch import finalize_tool_result
 from elspeth.web.composer.tools.generation import (
-    EXPLAIN_VALIDATION_ERROR_GUIDANCE,
+    EXPLAIN_TOOL_GUIDANCE,
     build_validation_guidance,
     explain_validation_code,
 )
@@ -143,14 +143,14 @@ class TestValidationGuidanceBuilder:
 
         assert guidance is not None
         assert set(guidance["codes"]) == {"no_source_configured"}
-        assert guidance["explain_tool"] == EXPLAIN_VALIDATION_ERROR_GUIDANCE
+        assert guidance["explain_tool"] == EXPLAIN_TOOL_GUIDANCE
 
     def test_entries_without_a_code_earn_the_pointer(self) -> None:
         guidance = build_validation_guidance([None])
 
         assert guidance is not None
         assert guidance["codes"] == {}
-        assert guidance["explain_tool"] == EXPLAIN_VALIDATION_ERROR_GUIDANCE
+        assert guidance["explain_tool"] == EXPLAIN_TOOL_GUIDANCE
 
     def test_no_entries_yields_no_payload(self) -> None:
         assert build_validation_guidance([]) is None
@@ -253,7 +253,7 @@ class TestValidationGuidanceSeesTheNormalizedErrorSet:
         )
         assert build_validation_guidance(entry.error_code for entry in handler_result.validation.errors) == {
             "codes": {},
-            "explain_tool": EXPLAIN_VALIDATION_ERROR_GUIDANCE,
+            "explain_tool": EXPLAIN_TOOL_GUIDANCE,
         }, "precondition: the pre-normalization set resolves to nothing"
 
         finalized = finalize_tool_result(
