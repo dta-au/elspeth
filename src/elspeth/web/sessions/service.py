@@ -47,6 +47,7 @@ from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex, stabl
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer.authority_hashing import composer_authority_hash, project_composer_authority_payload
+from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_custody import (
     InlineCustodyPublication,
@@ -1591,9 +1592,13 @@ def _settlement_fork_blob_plan(
 )
 def _value_references_parent_blob(value: Any, forbidden: frozenset[str]) -> bool:
     if type(value) is str:
-        return value in forbidden or (value.startswith("blob:") and value.removeprefix("blob:") in forbidden)
+        return value in forbidden or (value.startswith(BLOB_REF_PATH_PREFIX) and value.removeprefix(BLOB_REF_PATH_PREFIX) in forbidden)
     if isinstance(value, Mapping):
-        return any(_value_references_parent_blob(item, forbidden) for item in value.values())
+        # Keys are custody carriers too: a mapping keyed by a parent blob id or
+        # storage path names the parent exactly as a value does.
+        return any(_value_references_parent_blob(key, forbidden) for key in value) or any(
+            _value_references_parent_blob(item, forbidden) for item in value.values()
+        )
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return any(_value_references_parent_blob(item, forbidden) for item in value)
     return False
@@ -12179,7 +12184,7 @@ class SessionServiceImpl:
         if type(command) is not GuidedPipelineProposalBackEditCommand:
             raise TypeError("command must be an exact GuidedPipelineProposalBackEditCommand")
 
-        from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX, GuidedStep, Turn, TurnType, validate_current_turn
+        from elspeth.web.composer.guided.protocol import GuidedStep, Turn, TurnType, validate_current_turn
         from elspeth.web.composer.guided.state_machine import GuidedSession, TurnRecord
 
         payloads_by_purpose = {payload.purpose: payload for payload in command.payloads}
