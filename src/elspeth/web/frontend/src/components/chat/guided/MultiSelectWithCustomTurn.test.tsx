@@ -1,20 +1,27 @@
 // ============================================================================
 // MultiSelectWithCustomTurn — wire-response contract regression coverage.
 //
-// Pins THREE contracts:
-//   1. Chip-toggle wire shape on Continue:
+// Pins THREE contracts (the pin action is the button labelled "Pin these
+// fields"; it was "Continue" until design review 2026-09-02 I-3 made
+// pass-through the primary gesture):
+//   1. Chip-toggle wire shape on Pin:
 //        chosen=[<sorted selected ids>], custom_inputs=null,
 //        all four other fields explicitly null.
-//   2. Custom-only wire shape on Continue:
+//   2. Custom-only wire shape on Pin:
 //        custom_inputs reflects added strings in addition order and
 //        chosen=null when no known option is selected.
-//   3. Mixed wire shape on Continue:
+//   3. Mixed wire shape on Pin:
 //        chosen and custom_inputs are both non-empty when the user selects
 //        known options and adds custom values in the same response.
 //
-// Continue is disabled when both chosen and customs are empty (the widget's
+// Pin is disabled when both chosen and customs are empty (the widget's
 // only way to surface "the user has asserted nothing" — preventing an empty
 // submit that would crash the backend's required-field reads).
+//
+// Primary gesture (I-3): the pass-through escape is rendered FIRST in the
+// actions row and is the visually primary control; Pin is the secondary.
+// A one-line explanation under the question says why, in every mode — the
+// tutorial gets no special rendering (ADR-031).
 //
 // Custom-add discipline:
 //   - Empty / whitespace-only input → Add disabled.
@@ -39,7 +46,7 @@
 //
 // The GuidedRespondRequest shape is the unit under test; these tests will
 // catch any future refactor that silently drops a null field, swaps chosen
-// and custom_inputs, or relaxes the disabled-on-empty Continue invariant.
+// and custom_inputs, or relaxes the disabled-on-empty Pin invariant.
 // ============================================================================
 
 import { describe, it, expect, vi } from "vitest";
@@ -53,6 +60,11 @@ import type {
 } from "@/types/guided";
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
+
+// The one-line explanation rendered under the question in every mode (I-3).
+const PASS_THROUGH_EXPLANATION =
+  "Transforms come next, so any fields they add are not listed yet. Pass " +
+  "everything through unless the output must carry specific fields on every row.";
 
 const PAYLOAD_THREE_OPTIONS_TWO_DEFAULT: MultiSelectWithCustomPayload = {
   question: "Which fields must appear in the output?",
@@ -97,7 +109,7 @@ describe("MultiSelectWithCustomTurn — initial render", () => {
     ).toBeTruthy();
   });
 
-  it("explains that multiple selections require Continue", () => {
+  it("explains under the question why pass-through is the default answer", () => {
     render(
       <MultiSelectWithCustomTurn
         payload={PAYLOAD_THREE_OPTIONS_TWO_DEFAULT}
@@ -105,9 +117,7 @@ describe("MultiSelectWithCustomTurn — initial render", () => {
       />,
     );
 
-    expect(
-      screen.getByText("Select all that apply, then press Continue."),
-    ).toBeInTheDocument();
+    expect(screen.getByText(PASS_THROUGH_EXPLANATION)).toBeInTheDocument();
   });
 
   it("renders one toggle button per option", () => {
@@ -195,8 +205,8 @@ describe("MultiSelectWithCustomTurn — chip toggle behaviour", () => {
   });
 });
 
-describe("MultiSelectWithCustomTurn — Continue submit (chip-only)", () => {
-  it("Continue with default selection submits chosen=[<defaults sorted>], custom_inputs=null", async () => {
+describe("MultiSelectWithCustomTurn — Pin submit (chip-only)", () => {
+  it("Pin with default selection submits chosen=[<defaults sorted>], custom_inputs=null", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn();
     render(
@@ -205,7 +215,7 @@ describe("MultiSelectWithCustomTurn — Continue submit (chip-only)", () => {
         onSubmit={onSubmit}
       />,
     );
-    await user.click(screen.getByRole("button", { name: /continue/i }));
+    await user.click(screen.getByRole("button", { name: /pin these fields/i }));
 
     expect(onSubmit).toHaveBeenCalledTimes(1);
     const body: GuidedRespondAction = onSubmit.mock.calls[0][0];
@@ -216,7 +226,7 @@ describe("MultiSelectWithCustomTurn — Continue submit (chip-only)", () => {
     });
   });
 
-  it("toggle adds and removes are reflected in chosen on Continue (stable sort over option order)", async () => {
+  it("toggle adds and removes are reflected in chosen on Pin (stable sort over option order)", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn();
     render(
@@ -230,7 +240,7 @@ describe("MultiSelectWithCustomTurn — Continue submit (chip-only)", () => {
     // chosen = ["price", "qty"] in option order.
     await user.click(screen.getByRole("button", { name: "name" }));
     await user.click(screen.getByRole("button", { name: "qty" }));
-    await user.click(screen.getByRole("button", { name: /continue/i }));
+    await user.click(screen.getByRole("button", { name: /pin these fields/i }));
 
     const body: GuidedRespondAction = onSubmit.mock.calls[0][0];
     expect(body).toEqual<GuidedRespondAction>({
@@ -331,8 +341,8 @@ describe("MultiSelectWithCustomTurn — custom-add", () => {
   });
 });
 
-describe("MultiSelectWithCustomTurn — Continue submit (with customs)", () => {
-  it("Continue submits custom_inputs in addition order alongside chosen", async () => {
+describe("MultiSelectWithCustomTurn — Pin submit (with customs)", () => {
+  it("Pin submits custom_inputs in addition order alongside chosen", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn();
     render(
@@ -348,7 +358,7 @@ describe("MultiSelectWithCustomTurn — Continue submit (with customs)", () => {
     await user.type(input, "second_extra");
     await user.click(screen.getByRole("button", { name: /^add$/i }));
 
-    await user.click(screen.getByRole("button", { name: /continue/i }));
+    await user.click(screen.getByRole("button", { name: /pin these fields/i }));
 
     const body: GuidedRespondAction = onSubmit.mock.calls[0][0];
     expect(body).toEqual<GuidedRespondAction>({
@@ -358,7 +368,7 @@ describe("MultiSelectWithCustomTurn — Continue submit (with customs)", () => {
     });
   });
 
-  it("Continue submits with chosen=null when only customs are provided", async () => {
+  it("Pin submits with chosen=null when only customs are provided", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn();
     render(
@@ -371,7 +381,7 @@ describe("MultiSelectWithCustomTurn — Continue submit (with customs)", () => {
     const input = screen.getByRole("textbox", { name: /custom field/i });
     await user.type(input, "only_custom");
     await user.click(screen.getByRole("button", { name: /^add$/i }));
-    await user.click(screen.getByRole("button", { name: /continue/i }));
+    await user.click(screen.getByRole("button", { name: /pin these fields/i }));
 
     const body: GuidedRespondAction = onSubmit.mock.calls[0][0];
     expect(body).toEqual<GuidedRespondAction>({
@@ -382,19 +392,19 @@ describe("MultiSelectWithCustomTurn — Continue submit (with customs)", () => {
   });
 });
 
-describe("MultiSelectWithCustomTurn — Continue disabled on empty assertion", () => {
-  it("Continue is disabled when both chosen and customs are empty", () => {
+describe("MultiSelectWithCustomTurn — Pin disabled on empty assertion", () => {
+  it("Pin is disabled when both chosen and customs are empty", () => {
     render(
       <MultiSelectWithCustomTurn
         payload={PAYLOAD_NO_DEFAULT_NO_ESCAPE}
         onSubmit={vi.fn()}
       />,
     );
-    const continueBtn = screen.getByRole("button", { name: /continue/i });
-    expect(continueBtn).toHaveProperty("disabled", true);
+    const pinBtn = screen.getByRole("button", { name: /pin these fields/i });
+    expect(pinBtn).toHaveProperty("disabled", true);
   });
 
-  it("clicking the disabled Continue button does NOT fire onSubmit", async () => {
+  it("clicking the disabled Pin button does NOT fire onSubmit", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn();
     render(
@@ -403,11 +413,11 @@ describe("MultiSelectWithCustomTurn — Continue disabled on empty assertion", (
         onSubmit={onSubmit}
       />,
     );
-    await user.click(screen.getByRole("button", { name: /continue/i }));
+    await user.click(screen.getByRole("button", { name: /pin these fields/i }));
     expect(onSubmit).not.toHaveBeenCalled();
   });
 
-  it("Continue becomes enabled once a chip is toggled on", async () => {
+  it("Pin becomes enabled once a chip is toggled on", async () => {
     const user = userEvent.setup();
     render(
       <MultiSelectWithCustomTurn
@@ -415,13 +425,13 @@ describe("MultiSelectWithCustomTurn — Continue disabled on empty assertion", (
         onSubmit={vi.fn()}
       />,
     );
-    const continueBtn = screen.getByRole("button", { name: /continue/i });
-    expect(continueBtn).toHaveProperty("disabled", true);
+    const pinBtn = screen.getByRole("button", { name: /pin these fields/i });
+    expect(pinBtn).toHaveProperty("disabled", true);
     await user.click(screen.getByRole("button", { name: "alpha" }));
-    expect(continueBtn).toHaveProperty("disabled", false);
+    expect(pinBtn).toHaveProperty("disabled", false);
   });
 
-  it("Continue becomes enabled once a custom is added", async () => {
+  it("Pin becomes enabled once a custom is added", async () => {
     const user = userEvent.setup();
     render(
       <MultiSelectWithCustomTurn
@@ -429,12 +439,12 @@ describe("MultiSelectWithCustomTurn — Continue disabled on empty assertion", (
         onSubmit={vi.fn()}
       />,
     );
-    const continueBtn = screen.getByRole("button", { name: /continue/i });
-    expect(continueBtn).toHaveProperty("disabled", true);
+    const pinBtn = screen.getByRole("button", { name: /pin these fields/i });
+    expect(pinBtn).toHaveProperty("disabled", true);
     const input = screen.getByRole("textbox", { name: /custom field/i });
     await user.type(input, "extra");
     await user.click(screen.getByRole("button", { name: /^add$/i }));
-    expect(continueBtn).toHaveProperty("disabled", false);
+    expect(pinBtn).toHaveProperty("disabled", false);
   });
 });
 
@@ -473,12 +483,12 @@ describe("MultiSelectWithCustomTurn — escape_label", () => {
     });
   });
 
-  it("escape button is enabled even with nothing selected — NOT gated by Continue's empty-state disable", () => {
-    // The live bug (C-3a): Continue was disabled for the empty state AND the
+  it("escape button is enabled even with nothing selected — NOT gated by Pin's empty-state disable", () => {
+    // The live bug (C-3a): Pin (then labelled Continue) was disabled for the empty state AND the
     // backend 400'd the escape hatch's bare empty submit — the offered
     // "let source decide" action could not succeed from either side. This
     // pins that the escape button's own disabled state never depends on
-    // continueDisabled (only on the `disabled` prop, i.e. an in-flight
+    // pinDisabled (only on the `disabled` prop, i.e. an in-flight
     // request) — the wire-shape fix above closes the backend side.
     render(
       <MultiSelectWithCustomTurn
@@ -650,8 +660,43 @@ describe("MultiSelectWithCustomTurn — focus restoration on custom-chip removal
   });
 });
 
-describe("MultiSelectWithCustomTurn — tutorial passive mode", () => {
-  it("suppresses the 'Select all that apply' subtext but keeps the chips", () => {
+describe("MultiSelectWithCustomTurn — pass-through is the primary gesture (I-3)", () => {
+  // Design review 2026-09-02 I-3: the learner answers this turn by hand, in
+  // the tutorial as everywhere else, and the designed answer before any
+  // transform exists is pass-through. The escape therefore leads the actions
+  // row as the primary control, Pin follows as the secondary, and the
+  // explanation renders in every mode — no tutorial-only branch (ADR-031).
+
+  it("renders the pass-through escape before the Pin action in the actions row", () => {
+    const { container } = render(
+      <MultiSelectWithCustomTurn
+        payload={PAYLOAD_WITH_ESCAPE_LABEL}
+        onSubmit={vi.fn()}
+      />,
+    );
+    const actions = container.querySelector(".guided-multi-actions");
+    expect(actions).not.toBeNull();
+    const buttons = Array.from(actions!.querySelectorAll("button"));
+    expect(buttons.map((button) => button.textContent)).toEqual([
+      "Let source decide",
+      "Pin these fields",
+    ]);
+    expect(buttons[0]).toHaveClass("guided-multi-escape-btn");
+    expect(buttons[1]).toHaveClass("guided-multi-pin-btn");
+  });
+
+  it("with nothing pre-selected, the escape is enabled and Pin is disabled", () => {
+    render(
+      <MultiSelectWithCustomTurn
+        payload={PAYLOAD_WITH_ESCAPE_LABEL}
+        onSubmit={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /let source decide/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /pin these fields/i })).toBeDisabled();
+  });
+
+  it("renders the explanation in tutorial mode too — the prop changes nothing here", () => {
     render(
       <MultiSelectWithCustomTurn
         payload={PAYLOAD_THREE_OPTIONS_TWO_DEFAULT}
@@ -659,22 +704,20 @@ describe("MultiSelectWithCustomTurn — tutorial passive mode", () => {
         isTutorial
       />,
     );
-    expect(
-      screen.queryByText("Select all that apply, then press Continue."),
-    ).toBeNull();
-    // The option chips remain interactive (mirrors the SingleSelectTurn gate).
+    expect(screen.getByText(PASS_THROUGH_EXPLANATION)).toBeInTheDocument();
+    expect(screen.queryByText(/press Continue/i)).toBeNull();
+    // The option chips remain interactive.
     expect(screen.getByRole("button", { name: "qty" })).toBeInTheDocument();
   });
 
-  it("shows the subtext in normal (non-tutorial) mode", () => {
+  it("names the Pin action 'Pin these fields' — there is no Continue on this turn", () => {
     render(
       <MultiSelectWithCustomTurn
         payload={PAYLOAD_THREE_OPTIONS_TWO_DEFAULT}
         onSubmit={vi.fn()}
       />,
     );
-    expect(
-      screen.getByText("Select all that apply, then press Continue."),
-    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^continue$/i })).toBeNull();
+    expect(screen.getByRole("button", { name: "Pin these fields" })).toBeInTheDocument();
   });
 });

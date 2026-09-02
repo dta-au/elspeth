@@ -312,14 +312,19 @@ class ProposePipelinePayload(TypedDict):
     """Redacted display/audit projection of a durable pipeline proposal.
 
     This projection is deliberately non-executable: it contains only
-    catalog-authoritative plugin identities, never component names, prompts,
-    paths, inline content, secret references, or model-authored rationale.
-    Exact canonical arguments remain in private proposal custody. The sole
-    authored values it publishes are the ones a human must see to accept the
-    proposal at all, each drawn from a closed server-owned allowlist: gate
-    behavior (the predicate and its trigger thresholds) and, per
+    catalog-authoritative plugin identities, never component names, paths,
+    inline content, secret references, or model-authored rationale. Exact
+    canonical arguments remain in private proposal custody. The sole authored
+    values it publishes are the ones a human must see to accept the proposal
+    at all, each drawn from a closed server-owned allowlist: gate behavior
+    (the predicate and its trigger thresholds) and, per
     ``_NODE_OPTION_SUMMARY_ALLOWLIST``, a node's key options rendered as
-    display text. Everything outside those allowlists stays private.
+    display text — including an llm node's model and prompts, which are the
+    decision the user is approving (I-2). Everything outside those allowlists
+    stays private. The same allowlist is the correction authority
+    (``public_node_option_keys``), so a key is listed only when the card
+    renders its whole value: a partially rendered option would be
+    planner-writable on a correction with the card text unchanged.
     Human copy is selected from exact server-owned template ids; structural
     labels are deterministic ordinals rather than canonical route, branch, or
     component names. Task 4 must validate catalog and private-proposal
@@ -861,9 +866,46 @@ def proposal_structural_label(kind: Literal["route", "branch"], index: int) -> s
 # entry to the lowering.
 _NODE_OPTION_SUMMARY_ALLOWLIST: Mapping[str, Mapping[str, FieldTier]] = {
     "field_mapper": {"mapping": "common", "select_only": "common"},
+    # The llm node's decision inputs (design review 2026-09-02, I-2): what
+    # the model is asked to do was invisible until the post-commit approval
+    # card, so the learner approved a pipeline whose most consequential
+    # authored value they had never seen. Model, system prompt and prompt
+    # template are planner-authored text, not row data; the adjacent
+    # credentials, endpoints, ``*_source`` file paths and sampling knobs stay
+    # private. Order is display order: model first, then the prompts.
+    "llm": {"model": "common", "system_prompt": "common", "prompt_template": "common"},
+    # NOT listed: web_scrape's ``http`` object. Its abuse contact and scraping
+    # reason would belong on the card, but the lowered knob is one object
+    # that also carries the SSRF host allowlist, timeout and body cap, and
+    # every key here is also what ``public_node_option_keys`` lets a
+    # node-scoped correction overwrite (planning.py replaces the object
+    # wholesale and drops it when a full candidate omits it). A key whose
+    # value the card renders only in part is therefore planner-writable
+    # unseen (Phase 1 red-team finding F1, 2026-09-02). Publishing the
+    # identity needs a display-only key the correction authority does not
+    # return; until that exists, web_scrape has no public option keys.
 }
 _MAX_NODE_OPTION_SUMMARY_PAIRS = 20
 _MAX_NODE_OPTION_SUMMARY_VALUE = 240
+# The prompt keys reach the card under the SAME bound the post-commit approval
+# card already publishes the prompt at — ``InterpretationEventResponse.llm_draft``
+# (sessions/schemas.py, max_length=8192) — so the projection reuses that
+# boundary rather than adding a second one; the parity is pinned by
+# tests/unit/web/composer/guided/test_protocol.py.
+_MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE = 8_192
+# Room reserved at the tail of a cut prompt for the honest "… (N more
+# characters not shown)" marker: the text is what the user is approving, so
+# it is never cut silently.
+_NODE_OPTION_SUMMARY_PROMPT_MARKER_RESERVE = 64
+_NODE_OPTION_SUMMARY_PROMPT_KEYS = frozenset({"prompt_template", "system_prompt"})
+
+
+def _node_option_summary_value_bound(key: str) -> int:
+    """The rendered-length bound for one allowlisted option key."""
+
+    return _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE if key in _NODE_OPTION_SUMMARY_PROMPT_KEYS else _MAX_NODE_OPTION_SUMMARY_VALUE
+
+
 # The two accepted projected-pair shapes: fresh projections always carry
 # ``tier``, durable turns written before it landed do not.
 _NODE_OPTION_SUMMARY_PAIR_KEYS = frozenset({"key", "value"})
@@ -917,9 +959,38 @@ def _rendered_select_only(value: object) -> str:
     return ""
 
 
+def _rendered_short_text(value: object) -> str:
+    """Render an exact-string scalar (the llm ``model``) verbatim, bounded."""
+
+    if type(value) is not str or not value.strip():
+        return ""
+    if len(value) > _MAX_NODE_OPTION_SUMMARY_VALUE:
+        return value[: _MAX_NODE_OPTION_SUMMARY_VALUE - 1] + "…"
+    return value
+
+
+def _rendered_prompt_text(value: object) -> str:
+    """Render a prompt verbatim up to the approval card's bound.
+
+    Past the bound the text is cut with an explicit remaining-character count:
+    the prompt is the thing the user is approving, so a silent cut would show
+    them a different instruction than the one the pipeline will run.
+    """
+
+    if type(value) is not str or not value.strip():
+        return ""
+    if len(value) <= _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE:
+        return value
+    shown = value[: _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE - _NODE_OPTION_SUMMARY_PROMPT_MARKER_RESERVE]
+    return f"{shown}… ({len(value) - len(shown)} more characters not shown)"
+
+
 _NODE_OPTION_SUMMARY_RENDERERS: Mapping[str, Callable[[object], str]] = {
     "mapping": _rendered_mapping,
     "select_only": _rendered_select_only,
+    "model": _rendered_short_text,
+    "system_prompt": _rendered_prompt_text,
+    "prompt_template": _rendered_prompt_text,
 }
 
 
@@ -1004,7 +1075,7 @@ def _node_options_summary_error(value: object, path: str, *, plugin: str | None)
         seen.add(pair["key"])
         if (error := _current_text_error(pair["value"], f"{item_path}.value", nonempty=True)) is not None:
             return error
-        if len(cast(str, pair["value"])) > _MAX_NODE_OPTION_SUMMARY_VALUE:
+        if len(cast(str, pair["value"])) > _node_option_summary_value_bound(cast(str, pair["key"])):
             return f"{item_path}.value exceeds the bounded option summary length"
     return None
 

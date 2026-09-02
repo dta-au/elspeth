@@ -484,9 +484,19 @@ def build_step_2_multi_select_turn(
     """Build a ``multi_select_with_custom`` Turn for declaring required fields.
 
     Emitted after the user fills in sink options (Step 2 ``schema_form``).
-    The options are pre-populated from Step 1's observed columns; the user
-    ticks which fields must appear in the output, adds custom fields, or
-    clicks the escape label to let the source decide.
+    The options are Step 1's observed columns; the user ticks which fields
+    must be present on every output row, adds custom fields, or clicks the
+    escape label to let the source decide.
+
+    Nothing is pre-pinned (``default_chosen`` is empty; design review
+    2026-09-02 I-3). This turn runs before any transform exists, so the
+    fields the pipeline is about to produce are never among its options, and
+    a pre-ticked source column made the one-click answer assert a per-row
+    presence contract derived from a bounded inspection sample — the
+    "validation theatre" elspeth-1318049ffe rejects. Pass-through is the
+    designed default; pinning is a deliberate tick. What "keep" means once a
+    field is pinned is adjudicated in
+    docs/plans/2026-08-19-invert-guided-sink-field-keep.md and unchanged here.
 
     ``escape_label`` wire contract (elspeth-948eb9c0b8 C-3(a)): clicking the
     escape action MUST submit ``control_signal: "passthrough"`` (see
@@ -512,7 +522,7 @@ def build_step_2_multi_select_turn(
     payload: MultiSelectWithCustomPayload = {
         "question": "Which fields must appear in the output?",
         "options": options,
-        "default_chosen": list(observed_columns),
+        "default_chosen": [],
         "escape_label": "Let source decide (pass all fields through)",
     }
     return Turn(

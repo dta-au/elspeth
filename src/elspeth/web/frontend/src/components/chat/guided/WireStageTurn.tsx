@@ -1,11 +1,12 @@
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 
 import { Button } from "@/components/ui";
-import type { GuidedEditTarget, NodeOptionSummary, ProposalFlow, ProposalNodeBehavior, WireRowCardinality, WireStageData } from "@/types/guided";
+import type { GuidedEditTarget, ProposalFlow, ProposalNodeBehavior, WireRowCardinality, WireStageData } from "@/types/guided";
 import { useShowAdvanced } from "@/stores/preferencesStore";
 import { focusAcknowledgementCard } from "../AcknowledgementCard";
 import { stepLabelForPlugin } from "../interpretationStepLabel";
 import { behaviorSummary, humanToken } from "./behaviorSummary";
+import { NodeOptionsSummary, nodeOptionText } from "./nodeOptionDisplay";
 import { optionTier } from "./optionTiers";
 import { WireReviewList } from "./WireReviewList";
 
@@ -241,13 +242,6 @@ function behaviorDetails(
   }
 }
 
-/** "Mapping: a → b" — the server-owned option key as a sentence-case label
- *  beside the value the backend already rendered (R2-F3). */
-export function nodeOptionText(entry: NodeOptionSummary): string {
-  const label = humanToken(entry.key);
-  return `${label.charAt(0).toUpperCase()}${label.slice(1)}: ${entry.value}`;
-}
-
 /** The verbatim engineer-grade row, preserved behind the Technical details
  *  expander for operators (same idiom as the validation summary's raw dump). */
 function rawEdgeRow(edge: WireEdge, routeKeys: ReadonlyMap<string, string>): string {
@@ -330,6 +324,14 @@ export function WireStageTurn({
   ];
   const [correctionTarget, setCorrectionTarget] = useState(correctionTargets[0]?.target.stable_id ?? "");
   const [correctionFeedback, setCorrectionFeedback] = useState("");
+  const correctionFeedbackRef = useRef<HTMLTextAreaElement | null>(null);
+  // "Edit prompt" on an llm row (I-2): the change goes back through the
+  // planner as a node-scoped correction — pre-select that node in the
+  // existing form and hand focus to the feedback field. No local editor.
+  const beginNodeCorrection = (stableId: string): void => {
+    setCorrectionTarget(stableId);
+    correctionFeedbackRef.current?.focus();
+  };
   const selectedCorrectionKind = correctionTargets.find(
     (item) => item.target.stable_id === correctionTarget,
   )?.target.kind;
@@ -459,11 +461,15 @@ export function WireStageTurn({
                       : behaviorSummary(node.behavior, (stableId) =>
                           data.nodes.find((candidate) => candidate.stable_id === stableId)?.label ?? null)}
                   </p>
-                  {node.node_options_summary
-                    .filter((entry) => optionTier(entry) !== "advanced")
-                    .map((entry) => (
-                      <p key={entry.key}>{nodeOptionText(entry)}</p>
-                    ))}
+                  {/* Common-tier pairs inline, including an llm node's
+                      model and prompts (I-2) — a decision input, never
+                      behind the Technical details disclosure. Edit is
+                      offered only when a correction path exists. */}
+                  <NodeOptionsSummary
+                    entries={node.node_options_summary.filter((entry) => optionTier(entry) !== "advanced")}
+                    nodeLabel={node.label}
+                    onEdit={onCorrect === undefined ? undefined : () => beginNodeCorrection(node.stable_id)}
+                  />
                   <details className="wire-stage__row-technical" open={showAdvanced}>
                     <summary>Technical details</summary>
                     <p>{cardinalityText(node.row_cardinality)}</p>
@@ -609,6 +615,7 @@ export function WireStageTurn({
             </label>
             <textarea
               id={correctionFeedbackId}
+              ref={correctionFeedbackRef}
               className="wire-stage__correction-input"
               rows={2}
               value={correctionFeedback}

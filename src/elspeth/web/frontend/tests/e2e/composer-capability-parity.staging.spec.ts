@@ -168,10 +168,15 @@ test.describe("composer capability parity — guided_staged live acceptance (sta
       await expect(proposal.getByRole("heading", { name: "Review pipeline proposal" })).toBeVisible({
         timeout: 5 * 60_000,
       });
-      // The whole-DAG canvas and the two independent LLM assessment nodes. The
-      // planner names the two branches for blue and red; both must surface in
-      // the reviewed proposal (Components section / graph).
-      await expect(proposal.getByRole("img", { name: /pipeline proposal graph/i })).toBeVisible();
+      // The whole-DAG canvas is drawn in the Pipeline pane's Graph tab from
+      // the same proposal payload (elspeth-9f0873426a, IA-1/V-1) — the card
+      // itself only points at it. The two independent LLM assessment nodes:
+      // the planner names the two branches for blue and red; both must
+      // surface in the reviewed proposal (Components section).
+      await expect(proposal.getByRole("button", { name: "Show graph" })).toBeVisible();
+      await expect(
+        page.getByRole("tabpanel").getByRole("img", { name: /pipeline proposal graph/i }),
+      ).toBeVisible();
       await expect(proposal.getByText(/blue/i).first()).toBeVisible();
       await expect(proposal.getByText(/red/i).first()).toBeVisible();
       // A require-all coalesce shows a fan-in join over both branches.

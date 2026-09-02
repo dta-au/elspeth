@@ -1588,7 +1588,10 @@
   margin-top: var(--space-md);
 }
 
-.guided-multi-continue-btn {
+/* The pass-through escape is the PRIMARY action on the required-fields turn
+   (design review 2026-09-02 I-3): filled accent. "Pin these fields" is the
+   outlined secondary. */
+.guided-multi-escape-btn {
   padding: var(--space-sm) var(--space-lg);
   background-color: var(--color-accent);
   color: var(--color-text-inverse);
@@ -1601,7 +1604,7 @@
   transition: background-color var(--transition-fast);
 }
 
-.guided-multi-escape-btn {
+.guided-multi-pin-btn {
   padding: var(--space-sm) var(--space-lg);
   background-color: transparent;
   color: var(--color-text);
@@ -1614,32 +1617,32 @@
   transition: background-color var(--transition-fast), border-color var(--transition-fast);
 }
 
-.guided-multi-escape-btn:hover:not(:disabled) {
+.guided-multi-pin-btn:hover:not(:disabled) {
   background-color: var(--color-surface-hover);
   border-color: var(--color-accent);
 }
 
-.guided-multi-escape-btn:disabled {
+.guided-multi-pin-btn:disabled {
   color: var(--color-text-muted);
   cursor: not-allowed;
 }
 
-.guided-multi-escape-btn:focus-visible {
+.guided-multi-pin-btn:focus-visible {
   outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
 }
 
-.guided-multi-continue-btn:hover:not(:disabled) {
+.guided-multi-escape-btn:hover:not(:disabled) {
   background-color: var(--color-btn-primary-bg-hover);
 }
 
-.guided-multi-continue-btn:disabled {
+.guided-multi-escape-btn:disabled {
   background-color: var(--color-surface-elevated);
   color: var(--color-text-muted);
   cursor: not-allowed;
 }
 
-.guided-multi-continue-btn:focus-visible {
+.guided-multi-escape-btn:focus-visible {
   outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
 }
@@ -2254,6 +2257,21 @@
   font-weight: 600;
 }
 
+/* Pointer that replaced the in-card mini graph (elspeth-9f0873426a,
+   IA-1/V-1): one muted sentence plus the compact Show-graph control that
+   opens the Pipeline pane's Graph tab. Inline-flex keeps the button on the
+   sentence's baseline row and lets it wrap under the text in the narrow
+   column instead of overflowing it. */
+.guided-proposal__graph-pointer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
 .guided-proposal__status,
 .guided-proposal__tutorial-note {
   margin: 0;
@@ -2292,6 +2310,59 @@
 .guided-wire-review li {
   margin-bottom: var(--space-xs);
   overflow-wrap: anywhere;
+}
+
+/* ── Node option summary (nodeOptionDisplay.tsx, I-2) ────────────────────────
+   One rendering shared by the proposal card's component rows and the
+   wire-stage rows. Knob pairs stay plain lines. An llm node's prompts are the
+   instruction the user is approving: pre-wrapped (line structure is part of
+   what is approved), quoted with a rule, first lines visible behind a compact
+   expand control, and ONE compact Edit that opens the existing revise /
+   correction form pre-targeted at the node. */
+.guided-node-options {
+  display: grid;
+  gap: var(--space-xs);
+  min-width: 0;
+  margin-top: var(--space-xs);
+}
+
+.guided-node-options > p,
+.guided-node-options__actions {
+  margin: 0;
+}
+
+.guided-node-prompt {
+  display: grid;
+  gap: var(--space-xs);
+  min-width: 0;
+}
+
+.guided-node-prompt__text {
+  margin: 0;
+  padding: var(--space-sm) var(--space-md);
+  border-left: 3px solid var(--color-border-strong);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  background-color: var(--color-surface-elevated);
+  color: var(--color-text);
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.guided-node-prompt__label {
+  font-weight: 600;
+}
+
+.guided-node-prompt__toggle,
+.guided-node-options__edit {
+  justify-self: start;
+}
+
+.guided-node-options__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
 }
 
 .guided-readonly-graph {
@@ -2437,7 +2508,7 @@
   .guided-inspect-apply-btn,
   .guided-multi-custom-remove-btn,
   .guided-multi-escape-btn,
-  .guided-multi-continue-btn,
+  .guided-multi-pin-btn,
   .guided-schema-input,
   .guided-schema-select,
   .guided-schema-textarea,

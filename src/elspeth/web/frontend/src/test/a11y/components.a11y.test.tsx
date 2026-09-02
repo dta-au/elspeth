@@ -19,7 +19,7 @@
 // ============================================================================
 
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, type ReactNode } from "react";
 
@@ -566,6 +566,43 @@ describe("WireStageTurn", () => {
     );
     expect(await axe(container)).toHaveNoViolations();
   });
+
+  it("has no axe violations with an llm node's prompt summary and its Edit routed to the correction form", async () => {
+    // I-2: prompt block + expand toggle + Edit pre-selecting the node.
+    const longPrompt = Array.from({ length: 12 }, (_, i) => `Step ${i + 1}: read the passage.`).join("\n");
+    const nodeId = "00000000-0000-4000-8000-000000000015";
+    const { container } = render(
+      <WireStageTurn
+        data={{
+          ...wireBase,
+          nodes: [{
+            stable_id: nodeId,
+            label: "summarise",
+            node_type: "transform",
+            plugin: "llm",
+            behavior: { kind: "transform" },
+            required_fields: ["body"],
+            guaranteed_fields: ["summary"],
+            row_cardinality: { input: "one", output: "one", expected_output_count: null },
+            structured_output_fields: [],
+            node_options_summary: [
+              { key: "model", value: "anthropic/claude-sonnet-4", tier: "common" },
+              { key: "prompt_template", value: longPrompt, tier: "common" },
+            ],
+          }],
+        }}
+        onConfirm={() => {}}
+        confirmDisabled={false}
+        onCorrect={() => {}}
+      />,
+    );
+    screen.getByText("Model: anthropic/claude-sonnet-4");
+    expect(await axe(container)).toHaveNoViolations();
+    await userEvent.click(screen.getByRole("button", { name: "Show full prompt for summarise" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit prompt for summarise" }));
+    expect(screen.getByLabelText("Component")).toHaveValue(nodeId);
+    expect(await axe(container)).toHaveNoViolations();
+  });
 });
 
 describe("SchemaFormTurn", () => {
@@ -1042,11 +1079,47 @@ describe("ProposePipelineTurn", () => {
     const { container } = render(
       <ProposePipelineTurn payload={proposalPayload()} reviewState={reviewState} onSubmit={() => {}} />,
     );
-    // Non-vacuous: the labelled graph, the accessible heading, and the enabled
-    // primary control must all be real.
-    screen.getByRole("img", { name: /pipeline proposal graph/i });
+    // Non-vacuous: the Graph-pane pointer (the DAG itself moved to the
+    // Pipeline pane — elspeth-9f0873426a), the accessible heading, and the
+    // enabled primary control must all be real.
+    screen.getByRole("button", { name: "Show graph" });
     screen.getByRole("heading", { name: "Review pipeline proposal" });
     expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  it("has no axe violations with the llm prompt summary collapsed, expanded, and its Edit opened", async () => {
+    // I-2: the prompt block (label, pre-wrapped text, expand toggle) and the
+    // Edit that pre-targets the node revise are new default-view controls.
+    const longPrompt = Array.from({ length: 12 }, (_, i) => `Step ${i + 1}: read the passage.`).join("\n");
+    const reviewState: GuidedProposalReviewState = {
+      status: "active",
+      proposal_id: PROPOSAL_ID,
+      draft_hash: DRAFT_HASH,
+    };
+    const base = proposalPayload();
+    const { container } = render(
+      <ProposePipelineTurn
+        payload={{
+          ...base,
+          nodes: [{
+            ...base.nodes[0],
+            node_options_summary: [
+              { key: "model", value: "anthropic/claude-sonnet-4", tier: "common" },
+              { key: "system_prompt", value: "You are a careful reviewer.", tier: "common" },
+              { key: "prompt_template", value: longPrompt, tier: "common" },
+            ],
+          }],
+        }}
+        reviewState={reviewState}
+        onSubmit={() => {}}
+      />,
+    );
+    screen.getByText("Model: anthropic/claude-sonnet-4");
+    expect(await axe(container)).toHaveNoViolations();
+    await userEvent.click(screen.getByRole("button", { name: "Show full prompt for summarise" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit prompt for summarise" }));
+    expect(screen.getByRole("textbox", { name: "What should change?" })).toHaveFocus();
     expect(await axe(container)).toHaveNoViolations();
   });
 
@@ -1404,7 +1477,21 @@ describe("ChatPanelTutorialWorkspace", () => {
 
 describe("TutorialTurn4Run", () => {
   // The module-level run cache is keyed by sessionId — each test uses a
-  // distinct id so a cached promise never leaks across tests.
+  // distinct id so a cached promise never leaks across tests. The run never
+  // auto-fires (I-1): the executing/results states are reached by clicking
+  // the Run button on the pre-run card.
+  it("has no axe violations on the pre-run card", async () => {
+    const { container } = render(
+      <TutorialTurn4Run
+        sessionId="sess-a11y-run-ready"
+        onCompleted={() => {}}
+        onCancelled={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Run" })).toBeInTheDocument();
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
   it("has no axe violations while the run is executing", async () => {
     vi.mocked(apiClient.runTutorialPipeline).mockReturnValue(
       new Promise<never>(() => {}),
@@ -1416,6 +1503,8 @@ describe("TutorialTurn4Run", () => {
         onCancelled={() => {}}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    expect(screen.getByRole("status", { busy: true })).toBeInTheDocument();
     expect(await axe(container)).toHaveNoViolations();
   });
 
@@ -1443,6 +1532,7 @@ describe("TutorialTurn4Run", () => {
         onBack={() => {}}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
     await screen.findByText(/rows returned/);
     expect(await axe(container)).toHaveNoViolations();
   });

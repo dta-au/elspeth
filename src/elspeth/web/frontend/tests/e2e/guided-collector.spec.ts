@@ -670,8 +670,9 @@ test.describe("guided collector authoring (mocked wire-contract canary)", () => 
 
     // ── Confirm → completed (turn sequencing pin) ───────────────────────────
     await page.getByRole("button", { name: "Confirm wiring", exact: true }).click();
+    // The run turn mounts on its pre-run card (I-1); no run fires here.
     await expect(
-      page.getByRole("heading", { name: /Running your pipeline/i }),
+      page.getByRole("heading", { name: /Ready to run/i }),
     ).toBeVisible();
 
     expect(state.requestLog).toEqual([
