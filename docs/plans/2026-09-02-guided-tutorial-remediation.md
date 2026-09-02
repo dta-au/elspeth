@@ -52,6 +52,37 @@ on the tutorial's own scenario:
 0.1 gates only 1.5, 2.4 and 2.5. Everything else proceeds. 0.2 closes the
 granularity gap in `elspeth-515096e18c` and is the "before" for Phase 5.
 
+### Phase 0 baseline (measured 2026-09-02, harness batch `phase0-baseline-r2`)
+
+Recorded by the per-transition ledger in
+`tests/e2e/tutorial-reliability.staging.spec.ts` against the dev deployment
+running the pre-remediation bundle (`HARNESS_LEGACY_AUTO_RUN=1`, since that
+bundle auto-fires the run). Provider and planner calls are attributed from the
+backend's durable call records, not client timing. Full table and the Phase 5
+invocation: comment 9180 on `elspeth-f191ba494a`.
+
+| # | Transition | Gesture | Provider calls | Planner calls (runs) | Model time |
+|---|---|---|---|---|---|
+| 1 | guided/start | Let's go | 0 | 0 | 0.0 s |
+| 2 | guided/chat (source) | Send | 1 | 0 | 7.6 s |
+| 3–5 | source: Continue, Looks right, Finish sources | 3 | 0 | 0 | 0.0 s |
+| 6 | guided/chat (output) | Send | 2 | 0 | 18.4 s |
+| 7–8 | output: Continue, Let source decide | 2 | 0 | 0 | 0.0 s |
+| 9 | **step-2 finish → propose_pipeline (the empty starting sketch)** | Finish outputs | 2 | 2 (1) | 19.9 s |
+| 10 | transforms → propose_pipeline | Send | 3 | 3 (1) | 58.9 s |
+| 11–12 | Review wiring, Confirm wiring | 2 | 0 | 0 | 0.0 s |
+| 13 | tutorial/run (auto-fired on the last Acknowledge) | 4 | 0 | 0 | — |
+
+Totals: 13 transitions · **15 gestures to run** · 8 provider calls ·
+**2 planner runs** (5 planner calls) · model time 104.8 s · guided wall clock
+108.2 s · first build gesture → run 147.6 s. The walk graduated and then
+failed the harness's existing per-walk planner-efficiency ceiling (2 semantic
+cohorts vs 1 allowed; 5 planner calls vs 2; 2 repair turns vs 0) — that
+failure is the measurement, not a harness fault. Phase 5 passes when the same
+invocation (without the legacy switch) shows transition 9 with no planner run,
+`gestures_to_run` ≤ 7, `planner_runs` = 1, and the run transition's gesture is
+"Run".
+
 ## Phase 1 — Critical fixes, independent of the shape decision (`elspeth-e32b397f37`)
 
 | Step | Finding | Ticket | Notes |
