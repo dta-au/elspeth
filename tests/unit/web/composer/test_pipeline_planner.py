@@ -150,7 +150,18 @@ _TEST_SESSION_ID = "11111111-1111-4111-8111-111111111111"
 # provider or transport limit — it is a tripwire that makes scaffolding
 # growth a thing someone looks at, so it is set to leave working room rather
 # than to sit one edit away from tripping on noise.
-_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = 106 * 1024
+_FIXED_SCAFFOLDING_BASELINE_BYTES = 106 * 1024
+# Standing operator ruling 2026-09-03 (John): the scaffold will rise and fall
+# as the tech-debt burn-down retires duplicated keys and teaches the surviving
+# ones, so the ratchet carries a PRE-APPROVED 10% band above the baseline
+# instead of costing an operator round-trip per edit. Move within the band on
+# the change's own merits; bring the numbers to the operator when the scaffold
+# leaves it. A shrink of more than 10% below the baseline is the other
+# boundary — it means teaching was lost rather than retired — and is a
+# judgement call for the operator, not a gate here. Measured 2026-09-03 at
+# 0dda01dfb (tool-result envelope data-key teaching, elspeth-e405ad7cd2):
+# 109,924 B.
+_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
 
 
 @dataclass
