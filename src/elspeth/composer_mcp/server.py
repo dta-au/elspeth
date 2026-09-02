@@ -50,7 +50,7 @@ from elspeth.web.composer.audit import build_canonicalization_sentinel
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import redact_source_storage_path
-from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.composer.state import CompositionState, EdgeContractDict, PipelineMetadata, ValidationEntryDict
 from elspeth.web.composer.tools import (
     _DISCOVERY_TOOLS,
     _MUTATION_TOOLS,
@@ -80,25 +80,6 @@ __all__ = ["create_server", "main"]
 logger = logging.getLogger(__name__)
 
 
-class _ValidationEntryPayload(TypedDict):
-    component: str
-    message: str
-    severity: str
-
-
-_EdgeContractPayload = TypedDict(
-    "_EdgeContractPayload",
-    {
-        "from": str,
-        "to": str,
-        "producer_guarantees": list[str],
-        "consumer_requires": list[str],
-        "missing_fields": list[str],
-        "satisfied": bool,
-    },
-)
-
-
 class _SemanticEdgeContractPayload(TypedDict):
     from_id: str
     to_id: str
@@ -111,11 +92,21 @@ class _SemanticEdgeContractPayload(TypedDict):
 
 
 class _ValidationPayload(TypedDict):
+    """The MCP session-tool error payload's validation block.
+
+    Entries and edge contracts are the composer state module's own wire
+    dicts (``ValidationEntry.to_dict()`` / ``EdgeContract.to_dict()``), not
+    mirrors of them (elspeth-e405ad7cd2, systems ledger #41/#42). This block
+    is deliberately NARROWER than ``ToolResult.to_dict()["validation"]``: it
+    carries no ``graph_repair_suggestions``, which are computed from the
+    envelope's own validation at serialization time (#43).
+    """
+
     is_valid: bool
-    errors: list[_ValidationEntryPayload]
-    warnings: list[_ValidationEntryPayload]
-    suggestions: list[_ValidationEntryPayload]
-    edge_contracts: list[_EdgeContractPayload]
+    errors: list[ValidationEntryDict]
+    warnings: list[ValidationEntryDict]
+    suggestions: list[ValidationEntryDict]
+    edge_contracts: list[EdgeContractDict]
     semantic_contracts: list[_SemanticEdgeContractPayload]
 
 
@@ -412,7 +403,7 @@ def _dispatch_tool(
     }
 
 
-def _edge_contract_to_payload(contract: Any) -> _EdgeContractPayload:
+def _edge_contract_to_payload(contract: Any) -> EdgeContractDict:
     """Serialize an edge contract without leaking a dict[str, Any] return."""
     payload = contract.to_dict()
     return {

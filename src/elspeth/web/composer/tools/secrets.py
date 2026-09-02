@@ -132,7 +132,8 @@ _LIST_SECRET_REFS_DECLARATION = ToolDeclaration(
     kind=ToolKind.SECRET_DISCOVERY,
     description=(
         "List available secret references (API keys, credentials). Each entry carries the reference name, its "
-        "`scope`, and `source_kind`; never values."
+        "`scope`, `source_kind`, `available` (true when it resolves for you), and `reason` (why not, when it "
+        "does not); never values."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
@@ -174,8 +175,8 @@ _VALIDATE_SECRET_REF_DECLARATION = ToolDeclaration(
     handler=_handle_validate_secret_ref,
     kind=ToolKind.SECRET_DISCOVERY,
     description=(
-        "Check if a secret reference exists and is accessible to the current user. Returns whether it resolves, "
-        "with its `scope` and `source_kind`."
+        "Check if a secret reference exists and is accessible to the current user. Returns `available` (true when "
+        "it resolves for you) with its `scope` and `source_kind`, or `reason` when it does not."
     ),
     json_schema={
         "type": "object",

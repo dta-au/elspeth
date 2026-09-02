@@ -4702,7 +4702,9 @@ class TestGetPipelineState:
         assert len(data["edges"]) == 1
         assert data["edges"][0]["id"] == "e1"
         assert "metadata" in data
-        assert "version" in data
+        # The envelope's own ``version`` is the only carrier; the payload no
+        # longer twins it (elspeth-e405ad7cd2, systems ledger #39).
+        assert "version" not in data
 
     def test_full_state_alias_full_returns_all_components(self) -> None:
         """component='full' is accepted as an explicit full-state alias."""

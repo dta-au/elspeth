@@ -37,6 +37,13 @@ allowed_external_types:
   # Composition state types - shared between web composer and composer MCP server
   - "web/composer/state:CompositionState"
   - "web/composer/state:PipelineMetadata"
+  # The wire dict ValidationEntry.to_dict() emits. The composer MCP server
+  # serializes the same objects and used to hand-copy this shape (a 3-key
+  # mirror of an 8-key dict — elspeth-e405ad7cd2, systems ledger #41);
+  # importing the producer's own TypedDict is the honest form. (EdgeContractDict
+  # is shared the same way but is a functional-form TypedDict the checker
+  # does not index, so it needs no entry.)
+  - "web/composer/state:ValidationEntryDict"
   # Runtime preflight coordination types - shared between web execution and composer MCP
   - "web/execution/runtime_preflight:RuntimePreflightKey"
   - "web/execution/runtime_preflight:RuntimePreflightFailure"

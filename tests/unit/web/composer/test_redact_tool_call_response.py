@@ -374,7 +374,6 @@ def test_existing_response_models_scrub_free_form_failure_and_diagnostic_text() 
         "data": {
             "_kind": "interpretation_review_pending",
             "event_id": _EXTERNAL_SCALAR_CANARY,
-            "affected_node_id": _EXTERNAL_SCALAR_CANARY,
             "kind": "vague_term",
             "interpretation_source": _EXTERNAL_SCALAR_CANARY,
             "message": _EXTERNAL_SCALAR_CANARY,

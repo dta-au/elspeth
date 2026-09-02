@@ -3222,7 +3222,6 @@ class _RequestInterpretationReviewPendingDataModel(BaseModel):
 
     kind_marker: Literal["interpretation_review_pending", "interpretation_review_pending_idempotent"] = Field(alias="_kind")
     event_id: str
-    affected_node_id: str
     kind: InterpretationKind
     interpretation_source: str
     message: str
@@ -3241,7 +3240,6 @@ class _RequestInterpretationReviewPendingTextDataModel(BaseModel):
 
     kind_marker: Literal["interpretation_review_pending", "interpretation_review_pending_idempotent"] = Field(alias="_kind")
     event_id: str
-    affected_node_id: str
     kind: InterpretationKind
     user_term: Annotated[str, Sensitive(summarizer=_summarize_interpretation_term)]
     llm_draft: Annotated[str, Sensitive(summarizer=_summarize_interpretation_term)]

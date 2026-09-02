@@ -372,7 +372,7 @@ class TestStep3DiscoveryTierMigration:
                 "Get the full configuration schema for a plugin. Result `data` carries `name`, `plugin_type`, "
                 "`description`, `json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, and "
                 "`web_config_authority` (`user_configurable` — author raw `options` directly; "
-                "`user_configurable_with_policy` — the same, subject to policy checks; `operator_profiled` — do not "
+                "`user_configurable_with_policy` — author raw `options` the same way; `operator_profiled` — do not "
                 "author raw options, author `options.profile` instead)."
             ),
             "parameters": {
@@ -404,9 +404,9 @@ class TestStep3DiscoveryTierMigration:
         assert self._get("explain_validation_error") == {
             "name": "explain_validation_error",
             "description": "Get a human-readable explanation of a validation error "
-            "with suggested fixes. Pass the exact error text from a validation result. "
-            "Returns the `error_text` echoed, an `explanation`, a `suggested_fix`, and "
-            "— when the text matched a closed code — the `error_code`.",
+            "with suggested fixes. Pass the entry's `message`, or its `error_code` when "
+            "that is all you have. Returns the `error_text` echoed, an `explanation`, a "
+            "`suggested_fix`, and — when the text matched a closed code — the `error_code`.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -433,7 +433,8 @@ class TestStep3DiscoveryTierMigration:
                 "  * Pass an ``issue_code`` (validators emit these as requirement_code "
                 "    on semantic_contracts entries) to get failure-time guidance — "
                 "    `summary`, `suggested_fixes`, and `examples` (before/after configurations).\n"
-                "Every result names the `plugin_name` and `plugin_type` it describes."
+                "Every result names the `plugin_name` and `plugin_type` it describes; a plugin with no published "
+                "guidance returns `summary` null and empty lists."
             ),
             "parameters": {
                 "type": "object",
@@ -471,8 +472,9 @@ class TestStep3DiscoveryTierMigration:
             "(without the litellm-internal 'openrouter/' routing prefix) — these "
             "are the values to put directly in `model:`. Result `data` carries "
             "`providers` (provider name → model count) with `total_models` and a "
-            "`hint` on narrowing the query when no filter is given, or `models` "
-            "(with `truncated` true when the limit cut the list) with a filter.",
+            "`hint` on narrowing the query when no filter is given, or `models` with "
+            "`count` (matches found) and `truncated` (true when the limit cut the "
+            "list) with a filter.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -518,12 +520,14 @@ class TestStep3DiscoveryTierMigration:
             "an applied_component field, that field is already the post-change state "
             "of everything that mutation touched — read it there, and call this tool "
             "for what it does not cover: a component the change did not touch, or "
-            "the whole document. A single-component request returns that component "
-            "under `node` or `output` (a source under its own key) with `version`, "
-            "plus an `inspection` block: `requested_component` (what you asked for), "
-            "`resolved_component` (what was returned — they differ when the request "
-            "matched a full-state alias), and `accepted_full_state_aliases` (the "
-            "exact strings that resolve to the whole document).",
+            "the whole document. A node or output request returns just `node` or "
+            '`output`; `component="source"` returns the `sources` map; '
+            "`set_pipeline_arguments` returns the exact round-trip arguments. A "
+            "full-state read (no component, or an alias) returns the whole document "
+            "with an `inspection` block: `requested_component` (what you asked for), "
+            "`resolved_component` (always `full` here — the request matched a "
+            "full-state alias), and `accepted_full_state_aliases` (the exact strings "
+            "that do).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -567,7 +571,7 @@ class TestStep3DiscoveryTierMigration:
             "On success `data` carries `from_version`, `to_version`, `sources_changed`, "
             "`metadata_changed`, `total_changes`, `warnings_introduced`, "
             "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
-            "lists under `nodes`, `edges`, `outputs`, and `sources`. Without a "
+            "lists under `nodes`, `edges`, `outputs`, and — only when `sources_changed` — `sources`. Without a "
             "baseline (no session loaded or created yet) it fails with `error` and "
             "`error_code` only.",
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
@@ -879,8 +883,8 @@ class TestStep3BlobDiscoveryTierMigration:
         assert self._get("list_blobs") == {
             "name": "list_blobs",
             "description": (
-                "List uploaded/created files (blobs) in this session with metadata: each entry carries the blob id, "
-                "filename, `size_bytes`, `created_by`, and `creation_modality`."
+                "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, filename, "
+                "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -902,7 +906,7 @@ class TestStep3BlobDiscoveryTierMigration:
     def test_get_blob_metadata(self) -> None:
         assert self._get("get_blob_metadata") == {
             "name": "get_blob_metadata",
-            "description": "Get metadata for a specific blob (file) by ID: filename, mime type, `content_hash`, and `size_bytes`.",
+            "description": "Get metadata for a specific blob (file) by ID: `id`, filename, `mime_type`, `size_bytes`, `content_hash`, and `status`.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -942,8 +946,8 @@ class TestStep3BlobDiscoveryTierMigration:
                 "Return bounded structural facts about a blob-backed source: `source_kind`, "
                 "`observed_headers`, `sample_row_count`, inferred scalar types per column, "
                 "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
-                "was read) and `redacted_identity` (the blob's filename and hash prefix, nothing "
-                "secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
+                "was read) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
+                "`content_hash_prefix` — nothing secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
                 "before declaring a fixed CSV/JSON schema — observed headers and inferred types "
                 "tell you which fields the source actually contains and what numeric coercion is "
                 "needed before any gate or value_transform numeric op. Never returns raw row "
@@ -1022,7 +1026,8 @@ class TestStep3SecretTierMigration:
             "name": "list_secret_refs",
             "description": (
                 "List available secret references (API keys, credentials). Each entry carries the reference name, its "
-                "`scope`, and `source_kind`; never values."
+                "`scope`, `source_kind`, `available` (true when it resolves for you), and `reason` (why not, when it "
+                "does not); never values."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -1031,8 +1036,8 @@ class TestStep3SecretTierMigration:
         assert self._get("validate_secret_ref") == {
             "name": "validate_secret_ref",
             "description": (
-                "Check if a secret reference exists and is accessible to the current user. Returns whether it resolves, "
-                "with its `scope` and `source_kind`."
+                "Check if a secret reference exists and is accessible to the current user. Returns `available` (true when "
+                "it resolves for you) with its `scope` and `source_kind`, or `reason` when it does not."
             ),
             "parameters": {
                 "type": "object",

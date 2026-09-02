@@ -141,7 +141,10 @@ _REQUEST_ADVISOR_HINT_DEFINITION: Final[Mapping[str, Any]] = _validate_and_freez
             "in each response. Do NOT call this tool in a loop, do NOT use it "
             "as a substitute for reading validator output. Availability is "
             "operator-configured; the mandatory END sign-off checkpoint runs "
-            "independently of this on-demand escape."
+            "independently of this on-demand escape. Each reply carries `status` "
+            "(`SUCCESS`, `BUDGET_EXHAUSTED`, `COMPOSE_TIMEOUT`, `DEADLINE_TOO_CLOSE`, "
+            "or `ADVISOR_ERROR`), the `guidance` text, `budget_remaining`, and a "
+            "`note` restating that the guidance is advice, not configuration."
         ),
         "parameters": {
             "type": "object",

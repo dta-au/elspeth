@@ -603,7 +603,6 @@ class _FullPipelineStatePayload(TypedDict):
     outputs: list[dict[str, Any]]
     edges: list[dict[str, Any]]
     metadata: _FullPipelineStateMetadataPayload
-    version: int
     inspection: _FullPipelineStateInspectionPayload
 
 
@@ -746,11 +745,7 @@ def _duplicate_consumer_repair_suggestions(
     validation: ValidationSummary,
 ) -> list[_GraphRepairSuggestion]:
     """Build copyable repair skeletons for duplicate-consumer validation failures."""
-    duplicate_error_components = {
-        error.component
-        for error in validation.errors
-        if error.component.startswith("connection:") and error.message.startswith("Duplicate consumer for connection ")
-    }
+    duplicate_error_components = {error.component for error in validation.errors if error.error_code == "duplicate_connection_consumer"}
     if not duplicate_error_components:
         return []
 
@@ -1752,7 +1747,6 @@ def _serialize_full_pipeline_state(state: CompositionState, *, requested_compone
         "outputs": [_serialize_output(o) for o in state.outputs],
         "edges": [_serialize_edge(e) for e in state.edges],
         "metadata": {"name": state.metadata.name, "description": state.metadata.description},
-        "version": state.version,
         "inspection": {
             "requested_component": requested_component,
             "resolved_component": "full",

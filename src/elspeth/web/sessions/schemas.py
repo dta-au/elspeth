@@ -208,9 +208,14 @@ class MessageWithStateResponse(_StrictResponse):
 
 
 class ValidationEntryResponse(_StrictResponse):
-    """Structured validation entry preserving component attribution.
+    """A four-key projection of ``ValidationEntry.to_dict()`` for the HTTP surface.
 
-    Mirrors ``ValidationEntry.to_dict()`` from the composer state module.
+    Carries ``component`` / ``message`` / ``severity`` / ``error_code`` only;
+    the detail payloads (``contract``, ``row_union_schema``,
+    ``coalesce_union_type``) and ``rejected_component`` are deliberately not
+    on this surface. Constructed field by field in ``routes/_helpers``, so a
+    new ``to_dict`` key never reaches it by accident — and never widens it
+    either (elspeth-e405ad7cd2, systems ledger #44).
     """
 
     component: str

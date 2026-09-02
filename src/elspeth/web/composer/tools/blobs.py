@@ -378,8 +378,8 @@ _LIST_BLOBS_DECLARATION = ToolDeclaration(
     handler=_handle_list_blobs,
     kind=ToolKind.BLOB_DISCOVERY,
     description=(
-        "List uploaded/created files (blobs) in this session with metadata: each entry carries the blob id, "
-        "filename, `size_bytes`, `created_by`, and `creation_modality`."
+        "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, filename, "
+        "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
@@ -447,7 +447,7 @@ _GET_BLOB_METADATA_DECLARATION = ToolDeclaration(
     name="get_blob_metadata",
     handler=_handle_get_blob_metadata,
     kind=ToolKind.BLOB_DISCOVERY,
-    description="Get metadata for a specific blob (file) by ID: filename, mime type, `content_hash`, and `size_bytes`.",
+    description="Get metadata for a specific blob (file) by ID: `id`, filename, `mime_type`, `size_bytes`, `content_hash`, and `status`.",
     json_schema={
         "type": "object",
         "properties": {

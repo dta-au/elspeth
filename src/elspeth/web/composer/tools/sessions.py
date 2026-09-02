@@ -2209,12 +2209,14 @@ _GET_PIPELINE_STATE_DECLARATION = ToolDeclaration(
     "an applied_component field, that field is already the post-change state "
     "of everything that mutation touched — read it there, and call this tool "
     "for what it does not cover: a component the change did not touch, or "
-    "the whole document. A single-component request returns that component "
-    "under `node` or `output` (a source under its own key) with `version`, "
-    "plus an `inspection` block: `requested_component` (what you asked for), "
-    "`resolved_component` (what was returned — they differ when the request "
-    "matched a full-state alias), and `accepted_full_state_aliases` (the "
-    "exact strings that resolve to the whole document).",
+    "the whole document. A node or output request returns just `node` or "
+    '`output`; `component="source"` returns the `sources` map; '
+    "`set_pipeline_arguments` returns the exact round-trip arguments. A "
+    "full-state read (no component, or an alias) returns the whole document "
+    "with an `inspection` block: `requested_component` (what you asked for), "
+    "`resolved_component` (always `full` here — the request matched a "
+    "full-state alias), and `accepted_full_state_aliases` (the exact strings "
+    "that do).",
     json_schema={
         "type": "object",
         "properties": {
@@ -2721,7 +2723,6 @@ async def _check_duplicate_interpretation(
             data={
                 "_kind": "interpretation_review_pending_idempotent",
                 "event_id": str(original.id),
-                "affected_node_id": affected_node_id,
                 "kind": kind.value,
                 "interpretation_source": original.interpretation_source.value,
                 "message": "Interpretation review is already pending; reusing the existing event.",
@@ -3023,7 +3024,6 @@ async def _handle_request_interpretation_review(
         data={
             "_kind": "interpretation_review_pending",
             "event_id": str(event.id),
-            "affected_node_id": parsed.affected_node_id,
             "kind": parsed.kind.value,
             "interpretation_source": event.interpretation_source.value,
             "message": (

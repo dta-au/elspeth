@@ -274,7 +274,7 @@ _GET_PLUGIN_SCHEMA_DECLARATION = ToolDeclaration(
         "Get the full configuration schema for a plugin. Result `data` carries `name`, `plugin_type`, "
         "`description`, `json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, and "
         "`web_config_authority` (`user_configurable` — author raw `options` directly; "
-        "`user_configurable_with_policy` — the same, subject to policy checks; `operator_profiled` — do not "
+        "`user_configurable_with_policy` — author raw `options` the same way; `operator_profiled` — do not "
         "author raw options, author `options.profile` instead)."
     ),
     json_schema={
@@ -1700,8 +1700,9 @@ EXPLAIN_VALIDATION_ERROR_GUIDANCE: Final[str] = "To expand any code, call explai
 """Planner-surface pointer: there the catalogue text rides inline on each entry, so no container is named."""
 
 EXPLAIN_TOOL_GUIDANCE: Final[str] = (
-    "An error_code with no entry under 'validation_guidance.codes' can be expanded by calling "
-    "explain_validation_error with the exact code string."
+    "An entry whose error_code has no entry under 'validation_guidance.codes' — or that has no error_code "
+    "at all — can be expanded by calling explain_validation_error with the entry's error_code, or with its "
+    "full message when it has none."
 )
 """Freeform-envelope pointer (``validation_guidance.explain_tool``): names the container the codes live in,
 so the model knows which codes the call can still add something for (elspeth-e405ad7cd2)."""
@@ -1872,9 +1873,9 @@ _EXPLAIN_VALIDATION_ERROR_DECLARATION = ToolDeclaration(
     handler=_execute_explain_validation_error,
     kind=ToolKind.DISCOVERY,
     description="Get a human-readable explanation of a validation error "
-    "with suggested fixes. Pass the exact error text from a validation result. "
-    "Returns the `error_text` echoed, an `explanation`, a `suggested_fix`, and "
-    "— when the text matched a closed code — the `error_code`.",
+    "with suggested fixes. Pass the entry's `message`, or its `error_code` when "
+    "that is all you have. Returns the `error_text` echoed, an `explanation`, a "
+    "`suggested_fix`, and — when the text matched a closed code — the `error_code`.",
     json_schema={
         "type": "object",
         "properties": {
@@ -2010,7 +2011,8 @@ _GET_PLUGIN_ASSISTANCE_DECLARATION = ToolDeclaration(
         "  * Pass an ``issue_code`` (validators emit these as requirement_code "
         "    on semantic_contracts entries) to get failure-time guidance — "
         "    `summary`, `suggested_fixes`, and `examples` (before/after configurations).\n"
-        "Every result names the `plugin_name` and `plugin_type` it describes."
+        "Every result names the `plugin_name` and `plugin_type` it describes; a plugin with no published "
+        "guidance returns `summary` null and empty lists."
     ),
     json_schema={
         "type": "object",
@@ -2218,8 +2220,9 @@ _LIST_MODELS_DECLARATION = ToolDeclaration(
     "(without the litellm-internal 'openrouter/' routing prefix) — these "
     "are the values to put directly in `model:`. Result `data` carries "
     "`providers` (provider name → model count) with `total_models` and a "
-    "`hint` on narrowing the query when no filter is given, or `models` "
-    "(with `truncated` true when the limit cut the list) with a filter.",
+    "`hint` on narrowing the query when no filter is given, or `models` with "
+    "`count` (matches found) and `truncated` (true when the limit cut the "
+    "list) with a filter.",
     json_schema={
         "type": "object",
         "properties": {
@@ -3991,7 +3994,7 @@ _DIFF_PIPELINE_DECLARATION = ToolDeclaration(
     "On success `data` carries `from_version`, `to_version`, `sources_changed`, "
     "`metadata_changed`, `total_changes`, `warnings_introduced`, "
     "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
-    "lists under `nodes`, `edges`, `outputs`, and `sources`. Without a "
+    "lists under `nodes`, `edges`, `outputs`, and — only when `sources_changed` — `sources`. Without a "
     "baseline (no session loaded or created yet) it fails with `error` and "
     "`error_code` only.",
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
