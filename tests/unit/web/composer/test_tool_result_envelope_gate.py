@@ -32,9 +32,11 @@ import re
 import typing
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
+from types import ModuleType
 from typing import NamedTuple, NotRequired, TypedDict
 
 import pytest
+from pydantic import BaseModel
 
 from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer import pipeline_planner, redaction, state
@@ -117,7 +119,7 @@ _PASSTHROUGH_HELPERS = frozenset({"redact_source_storage_path"})
 # (file name, enclosing function, local name) -> payload type, ONLY for a local the resolver
 # cannot follow (it follows assignments, subscript stores, .update, if/else, ``or``, and tuple
 # unpacking from a _Literal helper on its own).
-_LOCAL_DATA_PAYLOADS: dict[tuple[str, str | None, str], type | None] = {}
+_LOCAL_DATA_PAYLOADS: dict[tuple[str, str, str], type | None] = {}
 # ``{**<name>, ...}`` inside a ``data=`` literal: the keys the splatted local carries when the
 # splat is not a result's own ``.data``.
 _SPLAT_KEYS: dict[str, tuple[str, ...]] = {}
@@ -145,7 +147,9 @@ def _module_str_constants(tree: ast.Module, path: Path | None = None) -> dict[st
             if isinstance(stmt, ast.ImportFrom):
                 for alias in stmt.names:
                     bound = alias.asname or alias.name
-                    value = getattr(module, bound, None)
+                    # The module namespace is a dict; the name comes from the import
+                    # statement just parsed, so this is a lookup, not a presence probe.
+                    value = vars(module).get(bound)
                     if type(value) is str:
                         out[bound] = value
     for stmt in tree.body:
@@ -270,9 +274,17 @@ def _payload_keys(payload: type | None, prefix: str) -> list[str]:
         return []
     if typing.is_typeddict(payload):
         return _typed_keys(payload, prefix)
-    fields = getattr(payload, "model_fields", None)
-    assert fields is not None, f"{payload!r} is neither a TypedDict nor a pydantic model"
-    return [f"{prefix}{name}" for name in fields]
+    assert issubclass(payload, BaseModel), f"{payload!r} is neither a TypedDict nor a pydantic model"
+    return [f"{prefix}{name}" for name in payload.model_fields]
+
+
+def _owned_payload_type(value: object) -> type | None:
+    """``value`` when it is one of the two owned payload shapes ``_payload_keys`` reads — a
+    TypedDict class or a pydantic model class — else None. Nominal (ADR-032): a class is a
+    payload type by what it IS, never by whether it happens to carry ``model_fields``."""
+    if isinstance(value, type) and (typing.is_typeddict(value) or issubclass(value, BaseModel)):
+        return value
+    return None
 
 
 def _parse(path: Path) -> ast.Module:
@@ -538,7 +550,7 @@ def _data_expr(node: ast.Call) -> ast.AST | None:
     return None
 
 
-def _module_of(path: Path) -> object:
+def _module_of(path: Path) -> ModuleType:
     return importlib.import_module(".".join(path.relative_to(REPO_ROOT / "src").with_suffix("").parts))
 
 
@@ -568,13 +580,13 @@ def _assignments_to(fn: ast.AST, name: str) -> Iterator[tuple[ast.AST, int | Non
 def _expr_keys(
     expr: ast.AST,
     *,
-    fn: ast.AST,
+    fn: ast.FunctionDef | ast.AsyncFunctionDef,
     tree: ast.Module,
     path: Path,
     prefix: str,
     site: str,
     depth: int = 0,
-    visiting: frozenset[tuple[str | None, str]] = frozenset(),
+    visiting: frozenset[tuple[str, str]] = frozenset(),
 ) -> Iterator[str]:
     """Dotted keys the expression ships, following the code rather than a hand-list.
 
@@ -626,7 +638,7 @@ def _expr_keys(
             yield from _payload_keys(attribution, prefix)
         return
     if isinstance(expr, ast.Name):
-        fn_name = getattr(fn, "name", None)
+        fn_name = fn.name
         ident = (path.name, fn_name, expr.id)
         if ident in _LOCAL_DATA_PAYLOADS:
             yield from _payload_keys(_LOCAL_DATA_PAYLOADS[ident], prefix)
@@ -639,8 +651,8 @@ def _expr_keys(
         for rhs, index, annotation in _assignments_to(fn, expr.id):
             seen = True
             if isinstance(annotation, ast.Name):
-                typed = getattr(_module_of(path), annotation.id, None)
-                if typed is not None and (typing.is_typeddict(typed) or hasattr(typed, "model_fields")):
+                typed = _owned_payload_type(vars(_module_of(path)).get(annotation.id))
+                if typed is not None:
                     yield from _payload_keys(typed, prefix)
                     continue
             if index is not None:
@@ -666,7 +678,7 @@ def _helper_return_keys(
     site: str,
     depth: int,
     index: int | None = None,
-    visiting: frozenset[tuple[str | None, str]] = frozenset(),
+    visiting: frozenset[tuple[str, str]] = frozenset(),
 ) -> Iterator[str]:
     del visiting  # a helper's locals are its own namespace; the guard restarts inside it
     tree = _parse(lit.path)
