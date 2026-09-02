@@ -479,12 +479,25 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"row_union_schema_incompatible",
-        "The row_union branch declarations cannot safely feed one long-format output stream. Fixed schemas must have "
-        "the same complete declared shape; flexible schemas may add branch-only fields but shared fields cannot "
-        "declare conflicting types.",
-        "Use the row_union_schema facts: align the complete declared field sets and types for fixed branches; for "
-        "flexible branches, change only the listed conflicting shared fields to compatible types. Keep disjoint "
-        "flexible-only fields; they do not need to be deleted.",
+        "Row_union branch schemas cannot feed one long-format stream: fixed schemas must share the same complete declared "
+        "shape; flexible schemas may add branch-only fields but not conflicting types on shared fields. "
+        "'row_union_schema' facts, when present, describe the first incompatible pair. 'branches' holds exactly two "
+        "records, distinct from the row_union's branches option; each record's 'branch' is the node's branch label. "
+        "'mode' ('fixed' or 'flexible') and complete 'fields' come from the schema resolved for that branch's connection "
+        "— declared, or computed from a transform's or aggregation's options, never from the row_union itself. Each "
+        "'fields' entry carries 'name', 'field_type' (str, int, float, bool or any), 'required' and 'nullable'. "
+        "'conflicting_fields' names the fields to fix: for fixed pairs, every field on only one branch plus every field "
+        "whose 'field_type', 'required' or 'nullable' differ; for flexible pairs, only shared fields with differing "
+        "'field_type' ('any' never conflicts).",
+        "Use the row_union_schema facts; the branches option only names inputs. Resolve each 'branch' to its connection "
+        "(list entry, or mapping value), then to its publisher: on_success, on_error, a routes value, a fork_to entry, "
+        "or, for an aggregation that omits on_success, its own node id. From a gate, walk upstream from its input to that "
+        "producer and edit its schema — declared, or a transform's/aggregation's output computed from options. Both "
+        "'mode' 'fixed': for 'conflicting_fields' names missing from one branch's 'fields', add or remove; for names in "
+        "both, make 'field_type', 'required' and 'nullable' identical. Either 'mode' 'flexible': change only 'field_type' "
+        "of those names to agree, or use 'any'; disjoint flexible-only fields stay. Only the first pair is reported — "
+        "repeat per branch. Only without 'row_union_schema' facts: call preview_pipeline where it is offered — its errors "
+        "on the saved state carry the same facts — else apply these rules to each producer's schema in your candidate.",
     ),
     (
         r"fork_branch_multiple_barriers",
@@ -579,9 +592,9 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         r"guided_collector_opener_unresolved",
         "A collector's scope_opener names a node id that does not exist in your candidate, so no "
         "expansion opens the group the collector would close.",
-        "Re-emit with scope_opener set to one of the connectivity facts' candidate_node_ids — the exact "
+        "Re-emit with scope_opener set to one of the 'connectivity' facts' 'candidate_node_ids' — the exact "
         "id of the multi-row transform whose expanded rows this collector reassembles. The "
-        "dangling_scope_openers facts are the values that matched nothing.",
+        "'dangling_scope_openers' facts are the values that matched nothing.",
     ),
     (
         r"scope_opener_unknown|scope_opener '(.+)' does not name a transform",
@@ -672,12 +685,34 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "A coalesce branches mapping names an incoming connection that no runtime routing field produces. The usual cause is "
         "the WIRING AROUND the coalesce, not the coalesce itself: a branch transform's on_success routes past the coalesce "
         "(e.g. straight to a sink), so nothing arrives under the connection name the branches value claims. The rejection's "
-        "connectivity facts list each unreachable branches value and every connection the pipeline actually produces.",
+        "'connectivity' facts, when present, carry 'unreachable_branches' — one record per broken branch, each naming the "
+        "branch ('branch'), the connection it consumes that nothing produces ('consumed_connection'), and — only for a "
+        "MAPPED branch, whose key differs from its value — when that branch's transform chain ends by publishing to a sink, "
+        "the node that did it ('sink_lure', carrying 'node_id' and 'publishes_to_sink'). An identity branch (a list-form "
+        "entry, or a key equal to its value) never carries 'sink_lure', so its absence there says nothing about the wiring; "
+        "such a branch is unreachable only when its name is not a gate fork_to name, and 'coalesce_branch_alias_unreachable' "
+        "fires alongside. Also carried: 'produced_connections', the connections the reachability check accepts, with sink "
+        "names, the coalesce's own id and the fork keyword removed because they pass that check but are never a correct "
+        "branch value. Membership in 'produced_connections' does NOT make a value correct for a given branch: the right "
+        "value is whatever THAT branch's own transform publishes.",
         "Wire each fork branch end-to-end: the gate fork_to name is the branch transform's input; that transform's on_success "
         "must be a unique connection name (NOT a sink); the coalesce branches VALUE for that branch is exactly that connection. "
         "A branch with no transforms uses its fork branch name as the value. If a branches value names a connection nothing "
         "produces, repair that branch's transform — point its on_success at the branches value — rather than merely swapping "
-        "the branches value for one of the produced_connections.",
+        "the branches value for one of the produced_connections. Where a branch record carries 'sink_lure', that node_id IS "
+        "the transform to repair: set its on_success to that record's 'consumed_connection' instead of the sink it currently "
+        "publishes to.",
+    ),
+    (
+        r"coalesce_branch_alias_unreachable",
+        "A coalesce branches KEY — the branch alias; for list-form branches, the entry itself — is not a fork_to name on any "
+        "gate. Arrival at a coalesce is tracked by fork branch name, so a key no gate forks can never be satisfied whatever "
+        "its value names. No 'connectivity' facts accompany this code: compare every coalesce branches key against "
+        "every gate's fork_to names yourself.",
+        "Use the upstream gate's fork_to branch names, spelled exactly, as the coalesce branches keys (or list entries); do "
+        "not invent an alias. Add a name to the gate's fork_to only when that fork genuinely lacks the branch. When "
+        "'coalesce_branch_unreachable' fires for the same branch, fix the alias first — its record carries no 'sink_lure' "
+        "for an identity branch.",
     ),
     (
         r"node_input_not_reachable|input '(.+)' is not reachable",
@@ -725,16 +760,26 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"sink_locked_extras|Extra fields rejected by sink input contract",
         "The sink schema is locked (mode: fixed) and the upstream producer emits extra fields the sink does not accept. "
-        "The rejection's contract facts name the producer, the sink, and the extra field names.",
-        "Change ONLY that edge: relax the sink schema (mode: flexible), add the extra field names to the sink schema fields, "
-        "or insert a field_mapper with select_only: true before the sink to drop them.",
+        "The rejection's 'contract' facts, when present, name that edge in YOUR rejected candidate: 'producer' ('source', "
+        "'source:<name>', or a node id) is the emitting end, 'consumer' is the sink written as 'output:<sink name>' (the "
+        "sink's own name is the part after 'output:'), and 'extra_fields' are the field names the producer emits that the "
+        "sink schema does not declare.",
+        "Change ONLY that edge: relax the sink schema (mode: flexible), add every name in 'extra_fields' to the sink "
+        "schema fields, or insert a field_mapper with select_only: true before the sink to drop them.",
     ),
     (
         r"locked_input_extras|Extra fields rejected by consumer input contract",
-        "The consumer node's input schema is locked (mode: fixed) and the upstream producer emits extra fields it does not accept. "
-        "The rejection's contract facts name the producer, the consumer, and the extra field names.",
-        "Change ONLY that edge: relax the consumer schema (mode: flexible), add the extra field names to the consumer schema fields, "
-        "or insert a field_mapper with select_only: true upstream to drop them.",
+        "The consumer node's input schema is locked (mode: fixed) and the upstream producer emits fields it does not "
+        "declare. The rejection's 'contract' facts, when present, name the edge in YOUR rejected candidate: 'consumer' is "
+        "the locked node's id; 'producer' is 'source', 'source:<name>' (a named source) or a node id; 'extra_fields' are "
+        "the field names the producer emits that the consumer schema does not declare.",
+        "Change ONLY that edge: relax the consumer schema (mode: flexible), add every name in 'extra_fields' to the "
+        "consumer schema's fields, or insert a field_mapper with select_only: true upstream to drop them — except when "
+        "'consumer' is itself a field_mapper, where a second field_mapper is redundant: adjust upstream config instead so "
+        "the extras are not emitted — patch_source_options when 'producer' is a source (source_name is the part after "
+        "'source:'; bare 'source' is the default), patch_node_options when it is a node id; a row_union producer emits "
+        "what its arms emit, so change the emitting arm, not the row_union. Only without contract facts: set schema.mode: "
+        "flexible on the rejected component with patch_node_options.",
     ),
     # Rule C precedes Rule D: both headlines start "Transform ", and this pass
     # matches in list order (see the order-sensitivity note above). The two rules
@@ -759,7 +804,8 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"semantic_contract_violation|Semantic contract violation:|Semantic contract:",
         "A consumer requires a field to satisfy a semantic contract (content kind, framing, or value type) that its upstream "
-        "producer does not declare or actively conflicts with. The rejection's contract facts name the producer and consumer.",
+        "producer does not declare or actively conflicts with. The rejection's 'contract' facts, when present, name that "
+        "edge: 'producer' ('source', 'source:<name>', or a node id) and 'consumer' (the requiring node's id).",
         "Call get_plugin_assistance for the consumer plugin to see which producers satisfy its semantic requirements, then "
         "change ONLY that edge: swap the producer, or route through a transform that produces the required content kind.",
     ),
@@ -781,39 +827,67 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"coalesce_union_type_incompatible|[Ii]ncompatible types for field",
         "A union coalesce merges its branches into one row, so a field carried by more than one branch must have the same "
-        "type on each. Two branches carry the same field with different types, and there is no merged row shape that "
-        "satisfies both. Two things surprise authors here. 'any' is a distinct type, NOT a wildcard: 'any' against 'int' "
-        "conflicts. And a branch can carry a field it never declared, because a transform contributes its own output fields "
-        "to that branch's schema — a field_mapper or value_transform writing a target adds it as 'any' when the branch "
-        "schema does not declare it. So the named field may appear in neither branch's authored schema.",
-        "Read the conflicting field and both branch names off the rejection rather than searching your authored schemas — "
-        "the field may not appear in either. Then pick the one type the merged field should have and declare it explicitly "
-        "on every branch that carries it, which also pins any type a transform would otherwise contribute as 'any'. If the "
-        "branches genuinely carry different kinds of value, give them different field names instead, or convert the "
-        "diverging branch to the shared type in its transform before the coalesce.",
+        "type on each; here two branches carry the same field with different types. 'any' is a distinct type, NOT a "
+        "wildcard: 'any' against 'int' conflicts. A branch can also carry a field it never declared: a transform "
+        "contributes its own output fields to a branch's schema — a value_transform writing a target adds it as 'any' "
+        "when undeclared, and a field_mapper adds a target as 'any' only when neither the target nor, for a rename, the "
+        "renamed source is declared (a rename inherits the source's type when the source is declared). So the named field "
+        "may appear in neither branch's authored schema. The rejection's 'coalesce_union_type' facts name the conflict, "
+        "when present: 'field' is the shared field name; 'branch_a' and 'branch_b' are the two branch names as declared "
+        "on branches, and 'type_a'/'type_b' are the type (str, int, float, bool, or any) each branch's producer carries "
+        "for it.",
+        "Read the field and branch names off the rejection's facts, not your schemas. Resolve each branch name to its "
+        "connection (its branches entry), then to the producer publishing it: on_success, on_error, a routes value, a "
+        "fork_to entry, or, for an aggregation with no on_success, its own node id; if that producer is a gate (it has no "
+        "schema), repeat from its input. That producer's schema, never the coalesce's branches, is where type_a/type_b "
+        "come from. Declare the merged type in each such producer's schema; this also pins a type a transform would "
+        "otherwise contribute as 'any' — but not one the producer computes itself: retype a type_coerce conversion's "
+        "'to', or for a field_mapper rename declare its SOURCE field. If the branches genuinely carry different kinds of "
+        "value, rename one, or convert the diverging branch's type before the coalesce. Only without "
+        "'coalesce_union_type' facts: call preview_pipeline where it is offered — its errors carry the same facts against "
+        "the current saved state.",
     ),
     (
         r"sink_contract_violation|Schema contract violation: '.*' -> 'output:[^']+'",
-        "A sink schema requires fields that its upstream producer does not guarantee. "
-        "The rejection's contract facts name the producer, the sink, and the missing field names.",
-        "Call preview_pipeline to inspect edge_contracts, then either relax the sink schema with patch_output_options or "
-        "update the upstream schema with patch_source_options or patch_node_options and re-preview until the edge shows "
-        "satisfied=true. Declare a source guarantee ONLY for fields VERIFIED from the source's actual content (its bound "
-        "blob or inspect_source) or confirmed by the user — never the planner's intent alone: "
-        "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': [...]}}) — guaranteed_fields "
-        "is a COMPLETE claim, so list every such field, not only the missing ones.",
+        "A sink schema requires fields that its upstream producer does not guarantee. The rejection's 'contract' facts, "
+        "when present, name that edge: 'producer' ('source', 'source:<name>', or a node id) is the guaranteeing end, "
+        "'consumer' is the sink written as 'output:<sink name>', and 'missing_fields' are the field names the sink "
+        "requires that the producer does not guarantee — required by the sink's schema block or by a sink option that "
+        "names the field it writes from (e.g. a text or document sink's 'field').",
+        "Fix 'consumer' (sink_name = after 'output:') via patch_output_options, resending the full 'schema': remove each "
+        "'missing_fields' name from required_fields and, if declared in fields, append '?' to its type; or make "
+        "'producer' guarantee it via patch_source_options ('source'/'source:<name>'; source_name is the part after "
+        "'source:') or, for a transform, aggregation or collector id, patch_node_options. A queue, row_union or "
+        "non-require_all union coalesce guarantees the INTERSECTION of its arms — find them in your own candidate (the "
+        "nodes whose routing publishes into it, or its branches' producers) and patch every one. A nested coalesce "
+        "guarantees its branch NAMES only under require_all — repoint there; else it guarantees nothing: use union merge "
+        "or require_all. Call preview_pipeline until edge_contracts shows satisfied=true. A source guarantee names only "
+        "VERIFIED fields, never intent: "
+        "patch_source_options(patch={'schema':{'mode':'observed','guaranteed_fields':[...]}}), a COMPLETE list. Only "
+        "without 'contract' facts: get_pipeline_state on the sink, then reconcile its required fields upstream.",
     ),
     (
         r"schema_contract_violation|Schema contract violation:",
-        "A downstream node requires fields that its upstream producer does not guarantee. An observed-mode source with no "
-        "guaranteed_fields guarantees NOTHING, and a plugin-free gate/coalesce producer only passes through what its own "
-        "upstream guarantees. The rejection's contract facts name the producer, the consumer, and the missing field names.",
-        "Call preview_pipeline to inspect edge_contracts, then update the upstream schema with patch_source_options or "
-        "patch_node_options and re-preview until the edge shows satisfied=true. Declare a source guarantee ONLY for fields "
-        "VERIFIED from the source's actual content (its bound blob or inspect_source) or confirmed by the user — never "
-        "the planner's intent alone: "
-        "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': [...]}}) — guaranteed_fields is a "
-        "COMPLETE claim, so list every such field, not only the missing ones.",
+        "A downstream node requires fields that its upstream producer does not guarantee. An observed-mode source "
+        "guarantees only its declared guaranteed_fields (text and llm sources add their own output fields); a plugin-free "
+        "gate only passes through what its upstream guarantees. The rejection's 'contract' facts, when present, name the "
+        "edge in YOUR rejected candidate: 'producer' ('source', 'source:<name>', or a node id — transform, aggregation, "
+        "collector, queue, row_union, or coalesce), 'consumer' (the requiring node's id), and 'missing_fields' — the "
+        "names the consumer requires (explicitly, via a fixed/flexible schema's non-optional fields, or via an option "
+        "naming an input column) that the producer does not guarantee. A queue or row_union guarantees only the "
+        "INTERSECTION of its arms; a union coalesce the intersection of its participating branches, or their UNION under "
+        "policy require_all. A nested coalesce guarantees only its branch NAMES, only under require_all, never their "
+        "inner fields.",
+        "Make 'producer' guarantee every 'missing_fields' name (patch_source_options for a source — source_name is the "
+        "part after 'source:', bare 'source' is the default; patch_node_options for a transform, aggregation or "
+        "collector). A queue, row_union, or non-require_all union coalesce is named only by its id: find its arms in your "
+        "candidate and add the field to EVERY arm (one for a require_all union). Nested coalesce with policy require_all: "
+        "repoint the requirement at a branch name; otherwise it guarantees nothing: switch it to merge: union, or set "
+        "policy: require_all AND repoint at a branch name. Where preview_pipeline is offered, re-preview until the error "
+        "is gone. Declare a source guarantee ONLY for fields VERIFIED from its content (bound blob or inspect_source) or "
+        "user-confirmed, not intent, via patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': "
+        "[...]}}), a COMPLETE claim: list every such field. Only without 'contract' facts: take 'from', 'to' and "
+        "'missing_fields' from preview_pipeline's unsatisfied edge_contracts row or errors.",
     ),
     # ── Closed structural node-shape codes ──────────────────────────────────
     # The planner repair feedback strips validation messages; these codes are
@@ -902,33 +976,112 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"guided_delta_unknown_stable_id",
-        "A guided topology delta references a reviewed stable identity that is not part of this request's mutation authority.",
-        "Copy only stable_id values from the current reviewed planner context and re-emit the selected delta without inventing or substituting an identity.",
+        "A guided topology delta references a reviewed stable identity that is not part of this request's mutation "
+        "authority, or the node the correction targets no longer resolves to exactly one node in the current pipeline. "
+        "The rejection's 'connectivity' facts locate it: 'stable_id' is the value the delta carried ('invalid' when the "
+        "entry had no string stable_id); 'delta_member', when present, names the member the binder was reading "
+        "('source_routes', 'output_targets', or 'node_patch') — a bare 'stable_id' with no 'delta_member' means the "
+        "edge_patch names an edge other than the selected one; 'known_stable_ids', when present, lists every identity "
+        "that member may legally name. When 'node_id' and 'node_occurrences' appear instead of 'known_stable_ids', the "
+        "selected node's own id ('node_id') occurs 'node_occurrences' times — never exactly once — in the current "
+        "pipeline; nothing in your delta caused that and no delta content can fix it.",
+        "Copy only stable_id values from the current reviewed planner context and re-emit the selected delta without "
+        "inventing or substituting an identity. When 'known_stable_ids' is present, set the offending entry's stable_id "
+        "to the identity in it that entry was meant to bind; when 'delta_member' is absent, set the edge_patch's "
+        "stable_id to the selected edge's own stable_id. When 'node_occurrences' is present instead, do not re-emit: this "
+        "fault has no delta-side fix — report that the current pipeline holds 'node_id' 'node_occurrences' times and must "
+        "be repaired before this correction can be applied.",
     ),
     (
         r"guided_delta_duplicate_stable_id",
-        "A guided topology delta repeats a reviewed component or authored routing identity, so the server cannot bind it exactly once.",
-        "Emit each reviewed stable_id and each edge/node id exactly once in the selected delta.",
+        "A guided topology delta repeats a reviewed component or authored routing identity, so the server cannot bind it "
+        "exactly once. The rejection's 'connectivity' facts locate it: 'delta_member' names the delta array the binder "
+        "was reading ('source_routes', 'output_targets', 'edges', or 'nodes'), and exactly one of 'stable_id' (a reviewed "
+        "identity listed twice in that array), 'edge_id' (an edges[].id listed twice), or 'node_id' (a nodes[].id listed "
+        "twice, or one that already names a node in the current pipeline) carries the offending value.",
+        "Emit each reviewed stable_id and each edge/node id exactly once in the selected delta. Search the array "
+        "'delta_member' names for the value in 'stable_id', 'edge_id', or 'node_id'; when it is listed twice there, "
+        "remove the extra entry. For 'node_id', also check the current pipeline: when the id already names a node there, "
+        "either drop the entry from nodes[] together with every delta edge LEAVING that id, keeping only the edge(s) into "
+        "it (the existing node's own routing already lives in the pipeline), or give the new node a fresh id and rename "
+        "it in every edge that references it. Change nothing else.",
     ),
     (
         r"guided_delta_authority_violation",
-        "The guided proposal includes a field or component outside the current reviewed mutation authority.",
-        "Re-emit only the fields advertised by the current emit_pipeline_proposal schema; reviewed source/output configuration is installed by the server.",
+        "The guided proposal has a field/component outside the reviewed mutation authority, or its delta ('pipeline' "
+        "argument) doesn't fit the schema. 'connectivity' facts, when present, say which — two disjoint families. "
+        "Delta-reader facts key by 'delta_member', the failing part: 'delta'; object members 'edge_patch'/'node_patch' "
+        "(nested: 'node_patch.options'); array members 'source_routes'/'output_targets'/'nodes'/'edges' (joint: "
+        "'source_routes/output_targets'). Beside it: 'expected_shape' ('array'/'object') on a shape mismatch; "
+        "'missing_keys', top-level members missing from the delta; 'allowed_keys', the only keys that part (or entry, for "
+        "an array member) may carry — alone, it wasn't an object; 'unexpected_keys', keys you wrote outside it; "
+        "'required_keys', keys that entry needs as strings ('edge_id' names it if known, else check every entry); "
+        "'missing_source_stable_ids'/'missing_output_stable_ids', reviewed ids absent once each from "
+        "source_routes/output_targets. 'owner_kind' ('source'/'node'/'output') beside delta_member 'edge_patch' alone: no "
+        "writable routing field — no edge_patch can retarget it. Binder facts key by 'component_kind' "
+        "('sources'/'outputs'/'nodes'), the refused candidate collection. 'sources': 'reviewed_source_names' is the "
+        "required name order; 'candidate_source_names' is what you sent; 'source_name'+'required_keys' flags one "
+        "correctly-keyed source missing a field. 'outputs': 'reviewed_output_names' fixes the entry count; "
+        "'candidate_output_count' is how many you sent. 'nodes': 'predecessor_node_ids' must each appear once; 'node_id' "
+        "with 'node_occurrences' (0=dropped, 2+=duplicated) and 'selected_node' (true = correction target) names which "
+        "and how; 'node_id' with 'candidate_node_type'/'candidate_plugin' means you edited its type or plugin.",
+        "Re-emit only schema-advertised fields; reviewed source/output config is server-owned. Repair only the "
+        "'delta_member' part: match 'expected_shape'; add 'missing_keys' members; drop 'unexpected_keys'. If "
+        "'allowed_keys' arrives alone the part wasn't an object: 'edge_patch' needs exactly {stable_id, to_node}; "
+        "'node_patch' needs 'stable_id' plus only the fields you mean to change — 'allowed_keys' is the menu, not a "
+        "requirement; extras are written through too. Give the entry at fault ('edge_id' if known, else all) "
+        "'required_keys' as strings. Add one entry per id in 'missing_source_stable_ids'/'missing_output_stable_ids'. "
+        "Facts only 'edge_patch'+'owner_kind': no edge_patch succeeds — decline in plain text, using the decline prefix "
+        "when this session taught one. 'sources'+'reviewed_source_names': key by exactly those names, in order — never "
+        "rename/add/drop. 'sources'+'source_name'+'required_keys': fix only that source's missing field. 'outputs': one "
+        "object per 'reviewed_output_names' entry — sink_name is yours, the server remaps it. 'nodes': keep each "
+        "'predecessor_node_ids' id present once; bad 'node_id': re-add if 'node_occurrences'=0, drop extra if 2+; "
+        "'selected_node' true: only that node's edits are yours, others restore server-side; "
+        "'candidate_node_type'/'candidate_plugin': keep type/plugin from current_state, edit only options. Only without "
+        "'connectivity' facts: give the selected node an 'options' object.",
     ),
     (
         r"guided_delta_nonincident_route",
-        "A correction delta changes routing that is not incident to the selected component.",
-        "Keep every unrelated route unchanged and emit only edges that touch the selected owner or newly added topology named by this correction.",
+        "A correction delta changes routing that is not incident to the selected component. The rejection's "
+        "'connectivity' facts name the offending edge under exactly one of two keys. 'edge_id' with 'incident_owners': "
+        "that list holds the ids an emitted edge must carry as its from_node or to_node — the selected component plus "
+        "any node this delta adds — and the named edge's own from_node and to_node are both outside it. "
+        "'reused_edge_id' with 'incident_owners' (node corrections only): the emitted edge's endpoints are fine, but "
+        "its id reuses an existing pipeline edge that touches none of those ids. When correcting an output, touching "
+        "is not enough: every edge must END at the selected output, and an edge that reaches it only as from_node is "
+        "rejected with 'edge_id' alone and no 'incident_owners'.",
+        "Keep every unrelated route unchanged and emit only edges that touch the selected owner or newly added topology "
+        "named by this correction. For 'edge_id' with 'incident_owners': re-point the edge so one endpoint is in that "
+        "list — for an output correction, set its to_node to the selected output — or remove it. For 'reused_edge_id': "
+        "keep the edge's endpoints and give it a fresh id that no existing pipeline edge uses. When 'incident_owners' "
+        "is absent, the edge already has the selected output as its from_node: reverse it — set from_node to the "
+        "producer (the source name or node id that feeds the output) and to_node to the selected output — or remove "
+        "it; setting only to_node leaves an output-to-output edge that fails the next turn. Change nothing else.",
     ),
     (
         r"guided_delta_unknown_reference",
-        "A correction route names an upstream owner or route kind that does not exist in the authoritative predecessor.",
-        "Use an exact existing source or node id from current_state and one of the route fields admitted by the selected correction schema.",
+        "A correction route names an upstream owner or route kind that does not exist in the authoritative predecessor. "
+        "The rejection's 'connectivity' facts echo the rejected edge: 'from_node' is its origin and 'edge_type' its route "
+        "kind. The binder admits only an existing source name with 'edge_type' 'on_success', or a node id that exactly "
+        "one node in the current pipeline carries with 'edge_type' 'on_success' or 'on_error'; the pair is rejected as a "
+        "whole, so either value alone may be the fault.",
+        "Re-emit with 'from_node' set to an exact existing source name or node id from current_state and 'edge_type' set "
+        "to a route kind that origin owns ('on_success' for a source; 'on_success' or 'on_error' for a node); leave "
+        "whichever of the two is already correct unchanged. Change nothing else.",
     ),
     (
         r"guided_delta_reviewed_failure_route_required",
-        "A reviewed source/output failure policy names a destination that is not present in the reviewed output authority. The planner cannot rewrite that reviewed policy.",
-        "Return to the reviewed source/output settings form and add or correct the required failure sink before planning topology again.",
+        "A reviewed source's on_validation_failure or a reviewed output's on_write_failure names a destination that "
+        "matches no reviewed output. The planner cannot rewrite that reviewed policy, and this check runs before your "
+        "delta is read, so no re-emitted topology can clear it. The rejection's 'connectivity' facts carry 'routes': the "
+        "sorted set of those unresolved on_validation_failure / on_write_failure destinations (an unset route or "
+        "'discard' never appears there).",
+        "Do not re-emit: no delta can clear this check, and you have no tool that edits a reviewed failure policy — a "
+        "repeat notice on this code is expected and does not mean try again. Tell the user that each destination in "
+        "'routes' is a reviewed on_validation_failure or on_write_failure setting naming no reviewed output, and that "
+        "they must return to the reviewed source/output settings form to edit that reviewed source or output — pointing "
+        "the route at an existing reviewed output or 'discard', or adding a reviewed output with that name — before "
+        "topology planning can continue.",
     ),
     (
         r"guided_route_target_unknown",
@@ -964,11 +1117,12 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"reviewed_output_projection_conflict",
-        "An exact select-only field_mapper projection would remove one or more fields required by a reviewed output contract. "
-        "For field_mapper, retained output names are the VALUES in options.mapping; the rejection's missing_fields facts list "
-        "the reviewed names absent from those values.",
-        "Add every name in missing_fields as an options.mapping value while preserving the intended projection, or return to "
-        "the reviewed output form and change its required-field contract. Do not silently drop a reviewed field.",
+        "An exact select-only field_mapper projection would remove one or more fields required by a reviewed output "
+        "contract. For field_mapper, retained output names are the VALUES in options.mapping. The rejection's "
+        "'connectivity' facts carry the reviewed names absent from those values as 'missing_fields'.",
+        "Add every name in 'missing_fields' as an options.mapping value while preserving the intended projection, or "
+        "return to the reviewed output form and change its required-field contract. Do not silently drop a reviewed "
+        "field.",
     ),
     (
         r"gate_on_error_unknown_sink",
@@ -1267,6 +1421,10 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "coalesce_config_invalid",
     "coalesce_policy_invalid",
     "coalesce_merge_invalid",
+    # Branch ALIASES must be gate fork_to names — the coalesce twin of
+    # row_union_branch_alias_unreachable, and the code that co-fires whenever
+    # an identity branch is coalesce_branch_unreachable.
+    "coalesce_branch_alias_unreachable",
     "row_union_config_invalid",
     "row_union_name_invalid",
     "row_union_branches_invalid",

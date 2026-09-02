@@ -17,6 +17,8 @@ from elspeth.web.blobs.protocol import (
 )
 from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
 from elspeth.web.composer.guided.state_machine import GuidedSession
+from elspeth.web.composer.implicit_decisions import merge_implicit_decisions_meta
+from elspeth.web.composer.state import CompositionState
 from elspeth.web.sessions.protocol import (
     GuidedForkSettlementCommand,
     GuidedOperationFailureCode,
@@ -31,6 +33,7 @@ from elspeth.web.sessions.routes.guided_operations import (
     raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
+from elspeth.web.sessions.service import _free_text_embeds_parent_blob, _value_references_parent_blob
 from elspeth.web.sessions.titles import mint_default_session_title
 
 from ._helpers import (
@@ -178,7 +181,13 @@ def _rewrite_source_blob_options(
     *,
     field_path: str,
 ) -> tuple[dict[str, Any], bool]:
-    """Strictly rebuild one source options object without touching samples."""
+    """Strictly rebuild one source options object with parent blob custody rebased.
+
+    Top-level id carriers (``blob_ref``, ``blob_id``, ``*_blob_id``) and path
+    carriers (``path``, ``file``) are rewritten by name and re-bind the source's
+    blob; the WHOLE options tree -- inline samples included -- is then walked by
+    ``_rebase_known_parent_refs`` so a nested parent reference is rebased too.
+    """
     if type(options) is not dict:
         raise AuditIntegrityError(f"Tier 1 audit anomaly: {field_path} must be an exact dict")
     rebuilt = deep_thaw(options)
@@ -231,9 +240,19 @@ def _rewrite_source_blob_options(
             rebuilt[carrier] = copied.storage_path
     if len(targets) > 1:
         raise AuditIntegrityError(f"Tier 1 audit anomaly: {field_path} binds more than one source blob")
+    # The carriers handled above are TOP-LEVEL only. A source whose options nest
+    # their blob reference (an S3-shaped ``options.dataset.path``, say) kept the
+    # parent's path and leaked custody into the child. Rebasing the whole tree
+    # is a no-op for the keys already rewritten -- they now name the CHILD, which
+    # matches no parent key -- so this only reaches what the enumeration missed.
+    # It deliberately does not participate in ``targets``/``blob_ref`` stamping:
+    # a nested carrier does not re-bind which blob the source is bound to.
+    rebuilt, nested_rewritten = _rebase_known_parent_refs(rebuilt, blob_map, source_blob_path_map)
+    if type(rebuilt) is not dict:  # pragma: no cover - rebase preserves container type
+        raise AuditIntegrityError(f"Tier 1 audit anomaly: {field_path} nested rebase did not produce a dict")
     target = next(iter(targets.values()), None)
     if target is None:
-        return rebuilt, False
+        return rebuilt, nested_rewritten
     rebuilt["blob_ref"] = str(target.id)
     if ("path" in rebuilt and not str(rebuilt["path"]).startswith(BLOB_REF_PATH_PREFIX)) or (
         "path" not in rebuilt and "file" not in rebuilt
@@ -281,14 +300,68 @@ def _rewrite_session_owned_sink_options(
     return rebuilt, rewritten
 
 
-def _contains_exact_string(value: object, needles: frozenset[str]) -> bool:
+def _rebase_known_parent_refs(
+    value: object,
+    blob_map: dict[UUID, BlobRecord],
+    source_blob_path_map: dict[str, BlobRecord],
+) -> tuple[object, bool]:
+    """Return a copy of ``value`` with every KNOWN parent blob reference rebased
+    onto its child copy, plus whether anything changed. The input is not mutated.
+
+    The exact inverse of ``_value_references_parent_blob``:
+    every shape those walks DETECT is a shape this walk CORRECTS -- a bare parent
+    blob id, a raw parent ``storage_path``, and either of them behind the
+    ``blob:`` sentinel prefix -- whether it appears as a str value or as a
+    mapping KEY. Keeping detection and correction on one shape is what stops
+    them drifting apart (the drift that produced elspeth-f478b01787).
+
+    Deliberately conservative: it substitutes only where the fork plan already
+    proves a parent->child mapping, and never invents structure, so it is safe
+    to run over a nested options tree whose keys we do not model. It is NOT
+    safe to run over ``composer_meta`` keys owned by other subsystems -- those
+    fail closed at the rewrite boundary instead.
+
+    Because this walk corrects and never raises, any residue it leaves inside
+    ``sources`` / ``outputs`` is caught only by the settlement verifier, after
+    staging. That is acceptable today ONLY because a source can bind a parent
+    blob solely while that blob is ``ready`` (every binding tool in
+    ``composer/tools/sources.py`` and ``composer/tools/blobs.py`` checks
+    ``status == "ready"``) and ``ready`` is terminal (every status UPDATE in
+    ``web/blobs/service.py`` requires the row to be ``pending`` first), so every
+    blob a source can name is in the ``status == "ready"`` fork plan and hence
+    in ``blob_map``. A change that re-quarantines a ready blob would silently
+    reopen the after-staging failure class for sources and outputs.
+    """
     if type(value) is str:
-        return value in needles or any(value == f"{BLOB_REF_PATH_PREFIX}{needle}" for needle in needles)
+        for parent_id, copied in blob_map.items():
+            if value == str(parent_id):
+                return str(copied.id), True
+            if value == f"{BLOB_REF_PATH_PREFIX}{parent_id}":
+                return f"{BLOB_REF_PATH_PREFIX}{copied.id}", True
+        if value in source_blob_path_map:
+            return source_blob_path_map[value].storage_path, True
+        if value.startswith(BLOB_REF_PATH_PREFIX) and value.removeprefix(BLOB_REF_PATH_PREFIX) in source_blob_path_map:
+            return f"{BLOB_REF_PATH_PREFIX}{source_blob_path_map[value.removeprefix(BLOB_REF_PATH_PREFIX)].storage_path}", True
+        return value, False
     if type(value) is dict:
-        return any(_contains_exact_string(item, needles) for item in value.values())
+        rebuilt_map: dict[Any, Any] = {}
+        changed = False
+        for key, item in value.items():
+            # Keys are custody carriers too: a str key is rebased by the same
+            # predicate as a str value (any other key type falls through unchanged).
+            rebuilt_key, key_changed = _rebase_known_parent_refs(key, blob_map, source_blob_path_map)
+            rebuilt_map[rebuilt_key], item_changed = _rebase_known_parent_refs(item, blob_map, source_blob_path_map)
+            changed = changed or key_changed or item_changed
+        return rebuilt_map, changed
     if type(value) is list:
-        return any(_contains_exact_string(item, needles) for item in value)
-    return False
+        rebuilt_list: list[Any] = []
+        changed = False
+        for item in value:
+            rebuilt_item, item_changed = _rebase_known_parent_refs(item, blob_map, source_blob_path_map)
+            rebuilt_list.append(rebuilt_item)
+            changed = changed or item_changed
+        return rebuilt_list, changed
+    return value, False
 
 
 def _rewrite_guided_blob_custody(
@@ -371,7 +444,7 @@ def _rewrite_guided_blob_custody(
             rewritten = rewritten or changed
     rebuilt = GuidedSession.from_dict(rebuilt).to_dict()
     source_ids = frozenset(str(blob_id) for blob_id in blob_map)
-    if _contains_exact_string(rebuilt, source_ids):
+    if _value_references_parent_blob(rebuilt, source_ids):
         raise AuditIntegrityError("Tier 1 audit anomaly: forked guided metadata retained a parent blob id")
     result = dict(composer_meta)
     result["guided_session"] = rebuilt
@@ -383,13 +456,30 @@ def _rewrite_fork_state_blob_custody(
     blob_map: dict[UUID, BlobRecord],
     source_blob_path_map: dict[str, BlobRecord],
     *,
+    parent_blob_refs: frozenset[str],
     data_dir: Path,
     parent_session_id: UUID,
     child_session_id: UUID,
 ) -> CompositionStateData | None:
+    """Rebase every parent blob reference in ``state`` onto the child's copies.
+
+    ``blob_map`` / ``source_blob_path_map`` are the frozen fork plan (only
+    ``status == "ready"`` parent blobs have a child copy) and drive CORRECTION.
+    ``parent_blob_refs`` is every parent blob row's id and storage_path, ANY
+    status -- the settlement verifier's own scope -- and drives the fail-closed
+    DETECTION backstop over ``composer_meta``, so a parent blob the plan excluded
+    is still named here instead of surfacing only at settlement.
+    """
     if state is None:
         return None
     sources = deep_thaw(state.sources) if state.sources is not None else None
+    if sources is None and state.source is not None:
+        # Mirror ``sessions/converters.py::state_from_record``: a pre-migration
+        # row carries its single source in the legacy ``source`` column. Promote
+        # it under the converter's key so the rewrite, the re-derivation below,
+        # and the returned CompositionStateData all see the same source -- not
+        # an empty source set with the legacy column silently dropped.
+        sources = {"source": deep_thaw(state.source)}
     nodes = deep_thaw(state.nodes)
     edges = deep_thaw(state.edges)
     outputs = deep_thaw(state.outputs)
@@ -455,6 +545,82 @@ def _rewrite_fork_state_blob_custody(
         child_session_id=child_session_id,
     )
     rewritten = rewritten or guided_rewritten
+    # ``implicit_decisions`` is not authored state: it is a pure PROJECTION of the
+    # composition state, regenerated unconditionally on every save via
+    # ``merge_implicit_decisions_meta``. A fork mints a NEW state row, so carrying
+    # the parent's report onto it violates the atomicity those saves declare --
+    # "the report is generated from the state that is about to be saved ... so the
+    # new version and its disclosure are atomic" -- and strands parent blob ids and
+    # raw parent storage paths the child must not name (elspeth-f478b01787; the
+    # private-path disclosure on an ordinary 200 projection is elspeth-d178282593).
+    # RE-DERIVING from the already-rewritten payload retires every stale class at
+    # once, where a blob-id remap would have retired only the first.
+    if composer_meta is not None and "implicit_decisions" in composer_meta:
+        # Shape and Tier-1 posture both mirror ``sessions/converters.py::state_from_record``,
+        # the canonical persisted-record -> CompositionState reconstruction: a row with
+        # no ``metadata_`` is corruption or a migration gap there, and is corruption
+        # here for the same reason. Such a row already fails every ordinary state read,
+        # so refusing to fork it reports an existing defect rather than creating one --
+        # and fabricating metadata to proceed would hide it.
+        #
+        # ``rederived_state`` is a THROWAWAY used only to compute the projection; the
+        # state returned below keeps this row's own ``metadata_`` untouched.
+        if metadata is None:
+            raise AuditIntegrityError("Tier 1 audit anomaly: forked composition state carries no metadata to re-derive its disclosure from")
+        rederived_state = CompositionState.from_dict(
+            {
+                "version": state.version,
+                "sources": sources,
+                "nodes": nodes if nodes is not None else [],
+                "edges": edges if edges is not None else [],
+                "outputs": outputs if outputs is not None else [],
+                "metadata": metadata,
+            }
+        )
+        composer_meta = merge_implicit_decisions_meta(composer_meta, rederived_state)
+        rewritten = True
+    # Fail-closed backstop over the OPEN ``composer_meta`` envelope. That envelope
+    # has no schema (``Column("composer_meta", JSON)``, ``Mapping[str, Any]``) and
+    # ``merge_composer_meta_updates`` is contractually REQUIRED to carry forward
+    # keys owned by other subsystems -- so a field-targeted rewriter over it can
+    # never be complete, while the settlement verifier walks it exhaustively. Any
+    # residue therefore belongs to a key this function does not model (or to a
+    # field of a modelled key its rewriter does not reach), and we must not
+    # blind-rewrite another subsystem's data to silence it.
+    #
+    # What this buys, precisely: the route has ALREADY committed the staged child
+    # (``service.fork_session``) before this function runs, so a raise here lands
+    # in the same failure arm as a settlement abort and the child is retained
+    # archived like any failed fork. It does NOT prevent that archived child. It
+    # fails BEFORE blob settlement and NAMES the offending key in the error
+    # message, which the route records as a last-resort diagnostic
+    # (``session.fork_rewrite_integrity_error``) -- where a settlement abort
+    # names nothing. Keys OUTSIDE ``FORK_REWRITTEN_COMPOSER_META_KEYS`` are
+    # already refused inside ``fork_session`` before any child row exists
+    # (``_refuse_unrewritable_fork_custody``); what reaches this backstop in
+    # practice is residue in a modelled key after its rewriter ran.
+    #
+    # The needle set is ``parent_blob_refs`` -- every parent blob row, any
+    # status -- and the predicate is the settlement verifier's own
+    # ``_value_references_parent_blob``, applied to the top-level key as well
+    # as its value: one definition of "references a parent blob", so the two
+    # cannot drift. Correction (``_rebase_known_parent_refs``) still runs on
+    # ``blob_map`` alone, because only planned blobs have a child copy to
+    # rebase onto.
+    if composer_meta is not None and parent_blob_refs:
+        for meta_key, meta_value in composer_meta.items():
+            if _value_references_parent_blob(meta_key, parent_blob_refs) or _value_references_parent_blob(meta_value, parent_blob_refs):
+                raise AuditIntegrityError(
+                    f"Tier 1 audit anomaly: forked composer_meta key {meta_key!r} retains parent blob custody "
+                    "the fork rewriter did not rebase -- teach the fork path this key before forking sessions that use it"
+                )
+    # ``validation_errors`` is copied verbatim below and served on GET /state;
+    # it is free text no rewriter can rebase, so parent custody in it is refused.
+    if state.validation_errors and parent_blob_refs and _free_text_embeds_parent_blob(state.validation_errors, parent_blob_refs):
+        raise AuditIntegrityError(
+            "Tier 1 audit anomaly: forked validation_errors retains parent blob custody the fork rewriter did not rebase "
+            "-- clear the validation errors before forking this session"
+        )
     if not rewritten:
         return None
     return CompositionStateData(
@@ -715,10 +881,19 @@ def register_session_routes(router: APIRouter) -> None:
                     checkpoint=_checkpoint,
                 )
                 source_blob_path_map = {source_blobs[source_id].storage_path: copied for source_id, copied in blob_map.items()}
+                # Every parent blob row, ANY status: the settlement verifier's
+                # own ``forbidden`` scope, so the rewrite-boundary backstop names
+                # exactly what settlement would otherwise reject after staging.
+                parent_blob_refs = frozenset(
+                    ref
+                    for parent_blob in await blob_service.list_blobs(session_id, limit=None)
+                    for ref in (str(parent_blob.id), parent_blob.storage_path)
+                )
                 rewritten_state = _rewrite_fork_state_blob_custody(
                     staged.state,
                     blob_map,
                     source_blob_path_map,
+                    parent_blob_refs=parent_blob_refs,
                     data_dir=Path(request.app.state.settings.data_dir),
                     parent_session_id=session_id,
                     child_session_id=staged.session.id,
@@ -750,6 +925,28 @@ def register_session_routes(router: APIRouter) -> None:
                     else "operation_failed"
                 )
                 cleanup_integrity_exc: AuditIntegrityError | BlobContentMissingError | BlobIntegrityError | None = None
+
+                if isinstance(primary_exc, AuditIntegrityError):
+                    # The ONLY carrier of what failed is ``str(primary_exc)``:
+                    # ``fail_guided_operation`` durably records a code, not a
+                    # message, and ``raise_guided_operation_failure`` answers
+                    # with a fixed envelope. For pre-staging custody detection
+                    # (inside ``fork_session``, no child row yet) and for the
+                    # rewrite-boundary backstop, that message NAMES the
+                    # offending composer_meta key -- the whole point of failing
+                    # there rather than at settlement -- so it gets a
+                    # last-resort record; the failed operation (and, after
+                    # staging, the archived child) is the audit evidence, this
+                    # is the diagnostic that says which key.
+                    _log_last_resort_diagnostic(
+                        slog.error,
+                        "session.fork_rewrite_integrity_error",
+                        session_id=str(session_id),
+                        child_session_id=str(staged.session.id) if staged is not None else None,
+                        operation_id=fence.operation_id,
+                        exc_class=type(primary_exc).__name__,
+                        message=str(primary_exc),
+                    )
 
                 if staged is not None:
                     try:
