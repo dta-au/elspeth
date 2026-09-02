@@ -53,6 +53,13 @@ _DETAIL_PAYLOADS: dict[str, type] = {
     "row_union_schema": state.RowUnionSchemaDetailDict,
     "coalesce_union_type": state.CoalesceUnionTypeDetailDict,
 }
+# The owned constructor each detail keyword must be built by, at the site. Any
+# other call (a helper) hides its keywords from the walker and is refused.
+_DETAIL_CONSTRUCTORS: dict[str, str] = {
+    "contract": state.SchemaContractDetail.__name__,
+    "row_union_schema": state.RowUnionSchemaDetail.__name__,
+    "coalesce_union_type": state.CoalesceUnionTypeDetail.__name__,
+}
 _ENTRY_CONSTRUCTORS = frozenset({"ValidationEntry", "_err"})
 _GUIDED_CONSTRUCTORS = frozenset({"GuidedCandidateBindingRejected", "_guided_delta_rejection"})
 # Positional layout shared by ``ValidationEntry(component, message, severity, error_code, ...)``
@@ -108,6 +115,13 @@ def _typed_keys(payload: type, prefix: str) -> list[str]:
     return keys
 
 
+def _is_dict_literal(node: ast.AST) -> bool:
+    """A dict built inline: a literal, a comprehension, or a ``dict(...)`` call."""
+    if isinstance(node, ast.Dict | ast.DictComp):
+        return True
+    return isinstance(node, ast.Call) and _call_name(node) == "dict"
+
+
 def _call_name(node: ast.Call) -> str | None:
     if isinstance(node.func, ast.Name):
         return node.func.id
@@ -153,6 +167,8 @@ def _detail_sites(files: Iterable[Path]) -> Iterator[ShippedKey]:
             # passed positionally could carry a payload this walker cannot see.
             if any(kw.arg is None for kw in node.keywords):
                 raise AssertionError(f"{site}: entry built with a **spread; the gate cannot derive its detail keys")
+            if any(isinstance(arg, ast.Starred) for arg in node.args):
+                raise AssertionError(f"{site}: entry built from *args; the gate cannot derive its detail keys")
             if len(node.args) > _ERROR_CODE_POSITION + 1:
                 raise AssertionError(f"{site}: entry passes a detail positionally; the gate cannot derive its keys")
             keywords = {kw.arg: kw.value for kw in node.keywords if kw.arg}
@@ -174,6 +190,13 @@ def _detail_sites(files: Iterable[Path]) -> Iterator[ShippedKey]:
                     # Same fail-closed rule one level down: a detail built
                     # positionally or from a **spread would read as "passes
                     # nothing" and skip every leaf (final red-team F2).
+                    # A helper call hides its keywords entirely (second round):
+                    # only the owned constructor, called by keyword, is derivable.
+                    if _call_name(ctor) != _DETAIL_CONSTRUCTORS[name]:
+                        raise AssertionError(
+                            f"{site}: detail '{name}' built by '{_call_name(ctor)}', not {_DETAIL_CONSTRUCTORS[name]}; "
+                            "the gate cannot derive its keys"
+                        )
                     if ctor.args or any(kw.arg is None for kw in ctor.keywords):
                         raise AssertionError(
                             f"{site}: detail '{name}' built positionally or with a **spread; the gate cannot derive its keys"
@@ -263,12 +286,14 @@ def _guided_sites(files: Iterable[Path]) -> Iterator[ShippedKey]:
                 key = _literal_str(key_node)
                 if key is None:
                     raise AssertionError(f"{site}: non-literal connectivity key {ast.unparse(key_node) if key_node else '**'}")
-                if isinstance(value_node, ast.Dict | ast.DictComp):
+                if any(_is_dict_literal(inner) for inner in ast.walk(value_node)):
                     # A nested record ships its inner keys just as the envelope
-                    # does, and this walker enumerates one level. Refuse rather
-                    # than under-report (final red-team F1): ship a typed record
-                    # the freeform walker recurses through, or flatten the facts.
-                    raise AssertionError(f"{site}: connectivity['{key}'] is a nested dict; the gate cannot derive its inner keys")
+                    # does, and this walker enumerates one level. Refuse a dict
+                    # ANYWHERE in the value — under ``cast(...)``, in a list or
+                    # tuple, or via ``dict(...)`` — rather than under-report
+                    # (final red-team F1, both rounds): ship a typed record the
+                    # freeform walker recurses through, or flatten the facts.
+                    raise AssertionError(f"{site}: connectivity['{key}'] carries a nested dict; the gate cannot derive its inner keys")
                 yield ShippedKey("guided", code, f"connectivity.{key}", site)
 
 
@@ -422,11 +447,28 @@ def test_gate_refuses_a_guided_site_it_cannot_derive(tmp_path: Path) -> None:
         list(_guided_sites([module]))
 
 
-def test_gate_refuses_a_nested_dict_value_at_a_guided_site(tmp_path: Path) -> None:
-    """Inner keys of a dict-literal value would ship untaught and unenumerated; the walker refuses them (final red-team F1)."""
+@pytest.mark.parametrize(
+    "value",
+    [
+        "{'inner_untaught': 1}",
+        "cast(JsonValue, {'inner_untaught': 1})",
+        "[{'inner_untaught': 1}]",
+        "({'inner_untaught': 1},)",
+        "dict(inner_untaught=1)",
+        "{k: 1 for k in ('inner_untaught',)}",
+    ],
+    ids=["literal", "cast-wrapped", "in-list", "in-tuple", "dict-call", "comprehension"],
+)
+def test_gate_refuses_a_nested_dict_value_at_a_guided_site(tmp_path: Path, value: str) -> None:
+    """Inner keys of a dict value would ship untaught and unenumerated; the walker refuses a dict anywhere in the value.
+
+    The first fix refused only a bare literal; ``cast(JsonValue, {...})`` — the
+    house-style wrapper every real site uses — a list, a tuple and ``dict(...)``
+    all slipped past it (final red-team F1, second round).
+    """
     module = tmp_path / "nested_probe.py"
     module.write_text(
-        "def f():\n    raise _guided_delta_rejection('guided_delta_authority_violation', facts={'extra': {'inner_untaught': 1}})\n",
+        f"def f():\n    raise _guided_delta_rejection('guided_delta_authority_violation', facts={{'extra': {value}}})\n",
         encoding="utf-8",
     )
     with pytest.raises(AssertionError, match="nested dict"):
@@ -443,8 +485,19 @@ def test_gate_refuses_a_nested_dict_value_at_a_guided_site(tmp_path: Path) -> No
             "built positionally",
         ),
         ("_err('node:x', 'm', 'high', 'sink_locked_extras', contract=SchemaContractDetail(**kw))", "built positionally"),
+        ("_err('node:x', 'm', 'high', 'sink_locked_extras', contract=build_contract_detail())", "built by 'build_contract_detail'"),
+        ("_err('node:x', 'm', 'high', 'sink_locked_extras', contract=_detail_for(producer='p'))", "built by '_detail_for'"),
+        ("ValidationEntry(*parts, contract=SchemaContractDetail(producer='p'))", "built from \\*args"),
     ],
-    ids=["entry-spread", "entry-positional-detail", "detail-positional", "detail-spread"],
+    ids=[
+        "entry-spread",
+        "entry-positional-detail",
+        "detail-positional",
+        "detail-spread",
+        "detail-helper-call",
+        "detail-helper-with-keywords",
+        "entry-starred",
+    ],
 )
 def test_gate_refuses_a_typed_detail_site_it_cannot_derive(tmp_path: Path, body: str, reason: str) -> None:
     """Every under-derivable entry shape is refused, at the entry AND at the detail constructor.
@@ -454,7 +507,7 @@ def test_gate_refuses_a_typed_detail_site_it_cannot_derive(tmp_path: Path, body:
     entry-level rules could be deleted unnoticed (final red-team F2).
     """
     module = tmp_path / "detail_probe.py"
-    module.write_text(f"def f(extra, detail, kw):\n    return {body}\n", encoding="utf-8")
+    module.write_text(f"def f(extra, detail, kw, parts):\n    return {body}\n", encoding="utf-8")
     with pytest.raises(AssertionError, match=reason):
         list(_detail_sites([module]))
 
