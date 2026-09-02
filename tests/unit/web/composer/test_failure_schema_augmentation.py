@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import MagicMock
@@ -37,7 +38,10 @@ from elspeth.web.catalog.schemas import (
 )
 from elspeth.web.composer.state import (
     CompositionState,
+    NodeSpec,
+    OutputSpec,
     PipelineMetadata,
+    SourceSpec,
 )
 from elspeth.web.composer.tools import _common as common_tools
 from elspeth.web.composer.tools import _execute_create_blob, _execute_set_source_from_blob
@@ -687,6 +691,139 @@ class TestFailureSchemaAugmentationFailsClosed:
         assert payload["plugin_schemas"] == {"source/csv": _csv_schema().model_dump(mode="json")}
 
 
+def _assert_state_held_plugin_rejected_cleanly(result: Any, state: CompositionState, reason: PluginUnavailableReason) -> None:
+    """A patch on a state-held plugin the request's view does not admit is a policy rejection.
+
+    No raise (the compose loop catches only ``ToolArgumentError``; anything
+    else is a 500), no ``plugin_schemas`` (nothing was resolved, so nothing
+    may be stamped), the closed policy reason on the wire in place of the
+    ``plugin_options_invalid`` code the option-shape sites carry, and the
+    state untouched.
+    """
+    payload = result.to_dict()
+    assert result.success is False, payload
+    assert result.updated_state is state
+    leading = payload["validation"]["errors"][0]
+    assert leading["component"] == "rejected_mutation", leading
+    assert leading["error_code"] == reason.value, leading
+    assert payload["data"]["error_code"] == reason.value, payload["data"]
+    assert "Invalid options for" not in leading["message"], leading
+    assert "plugin_schemas" not in payload, sorted(payload["plugin_schemas"])
+
+
+def _restricted_view(catalog: CatalogService, hidden: PluginId) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """The fake catalog projected through a snapshot that no longer authorizes ``hidden``."""
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="state-held-plugin-restricted",
+        principal_scope="local:state-held-plugin",
+        available=unrestricted.available - {hidden},
+        unavailable=(PluginAvailability(hidden, PluginUnavailableReason.NOT_AUTHORIZED),),
+        selected=unrestricted.selected,
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint="state-held-plugin-generation",
+    )
+    return PolicyCatalogView(catalog, snapshot, MagicMock(spec=OperatorProfileRegistry)), snapshot
+
+
+def _source_state(plugin: str, *, nodes: tuple[NodeSpec, ...] = ()) -> CompositionState:
+    """A state holding ``plugin`` as its source — bypassing the tools, as a persisted row would."""
+    return CompositionState(
+        source=SourceSpec(
+            plugin=plugin,
+            on_success="rows",
+            options={"path": "/data/blobs/test-session/in.csv", "schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+        ),
+        nodes=nodes,
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def _ghost_output_state() -> CompositionState:
+    return replace(
+        _empty_state(),
+        outputs=(OutputSpec(name="out", plugin="ghost", options={"path": "/data/outputs/x.json"}, on_write_failure="discard"),),
+    )
+
+
+def _ghost_node_state() -> CompositionState:
+    return _source_state(
+        "csv",
+        nodes=(
+            NodeSpec(
+                id="n1",
+                node_type="transform",
+                plugin="ghost",
+                input="rows",
+                on_success="out",
+                on_error="discard",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+    )
+
+
+class TestStateHeldPluginIsResolvedThroughThePolicyView:
+    """``patch_*`` resolve the STATE-held plugin before stamping it (elspeth-e405ad7cd2 R8-fix1).
+
+    ``_failure_result``'s contract admits ``plugin_identity`` only for a
+    plugin the request's policy view resolved, and the builder propagates a
+    ``catalog.get_schema`` raise as the Tier-1 anomaly that contract rules
+    out. The three ``patch_*`` sites read the plugin from
+    ``CompositionState`` — persisted, possibly under an earlier deployment
+    or policy — so a plugin the current view does not admit (removed or
+    renamed between deploys; no longer authorized by the snapshot) reached
+    the stamp unresolved and turned the rejection into a ``ValueError``
+    out of ``execute_tool``. Every other producer runs
+    ``_validate_plugin_name`` first; these pins hold the ``patch_*`` sites
+    to the same order. Driven through ``execute_tool`` so the dispatch
+    wrapper that attaches the schemas is on the path.
+    """
+
+    def test_patch_output_options_on_a_state_held_plugin_the_registry_does_not_know(self) -> None:
+        catalog = _make_catalog_with_schemas(source_schemas={"csv": _csv_schema()}, sink_schemas={"json": _json_sink_schema()})
+        state = _ghost_output_state()
+        result = execute_tool("patch_output_options", {"sink_name": "out", "patch": {"encoding": "x"}}, state, catalog)
+        _assert_state_held_plugin_rejected_cleanly(result, state, PluginUnavailableReason.NOT_INSTALLED)
+
+    def test_patch_source_options_on_a_state_held_plugin_the_registry_does_not_know(self) -> None:
+        catalog = _make_catalog_with_schemas(source_schemas={"csv": _csv_schema()}, sink_schemas={"json": _json_sink_schema()})
+        state = _source_state("ghost")
+        result = execute_tool("patch_source_options", {"patch": {"encoding": "x"}}, state, catalog)
+        _assert_state_held_plugin_rejected_cleanly(result, state, PluginUnavailableReason.NOT_INSTALLED)
+
+    def test_patch_node_options_on_a_state_held_plugin_the_registry_does_not_know(self) -> None:
+        catalog = _make_catalog_with_schemas(source_schemas={"csv": _csv_schema()}, sink_schemas={"json": _json_sink_schema()})
+        state = _ghost_node_state()
+        result = execute_tool("patch_node_options", {"node_id": "n1", "patch": {"bogus": 1}}, state, catalog)
+        _assert_state_held_plugin_rejected_cleanly(result, state, PluginUnavailableReason.NOT_INSTALLED)
+
+    def test_a_valid_patch_on_a_state_held_plugin_the_policy_no_longer_authorizes_is_a_policy_rejection(self) -> None:
+        """The installed-but-unauthorized twin: a VALID patch, rejected for policy, never a raise.
+
+        Before the resolution step this raised on the base tree as well
+        (the profile adapter refused the candidate and the message was
+        stamped); resolving first turns it into the same closed
+        ``plugin_not_enabled`` rejection ``set_source`` gives.
+        """
+        catalog = _make_catalog_with_schemas(source_schemas={"csv": _csv_schema()}, sink_schemas={"json": _json_sink_schema()})
+        state = _source_state("csv")
+        view, snapshot = _restricted_view(catalog, PluginId("source", "csv"))
+        result = execute_tool("patch_source_options", {"patch": {"encoding": "utf-8"}}, state, view, plugin_snapshot=snapshot)
+        _assert_state_held_plugin_rejected_cleanly(result, state, PluginUnavailableReason.NOT_AUTHORIZED)
+
+
 def _assert_option_failure_augmented_exactly(
     payload: Mapping[str, Any],
     catalog: CatalogService,
@@ -1101,6 +1238,102 @@ def test_every_prevalidation_rejection_stamps_its_plugin_identity_and_code() -> 
         if not (isinstance(code, ast.Constant) and code.value == "plugin_options_invalid"):
             wrong.append(f"{module}:{call.lineno} rejects on a prevalidation result without error_code='plugin_options_invalid'")
     assert not wrong, "\n".join(wrong)
+
+
+def _stamped_identity(call: ast.Call) -> tuple[str, str] | None:
+    """``(kind literal, name expression)`` of a ``plugin_identity=`` keyword, or ``None``.
+
+    The keyword is a 2-tuple, or a conditional whose truthy arm is one (the
+    ``set_pipeline`` repair hint stamps ``("sink", out_plugin) if ... else None``).
+    """
+    for keyword in call.keywords:
+        if keyword.arg != "plugin_identity":
+            continue
+        value = keyword.value
+        if isinstance(value, ast.IfExp):
+            value = value.body
+        if not (isinstance(value, ast.Tuple) and len(value.elts) == 2):
+            return None
+        kind, name = value.elts
+        if not (isinstance(kind, ast.Constant) and isinstance(kind.value, str)):
+            return None
+        return (kind.value, ast.unparse(name))
+    return None
+
+
+def _resolved_before(function: ast.FunctionDef, lineno: int) -> set[tuple[str, str]]:
+    """Every ``(kind, name expression)`` the function resolves through the policy view above ``lineno``.
+
+    Two resolution idioms exist: ``_validate_plugin_name(context, <kind>,
+    <name>)`` (rejecting on its violation) and the blob binders' guarded
+    ``context.catalog.get_schema(<kind>, <name>)``. Both go through
+    ``ToolContext.catalog`` — the request's ``PolicyCatalogView`` — which is
+    the only authority ``_failure_result``'s contract admits.
+    """
+    resolved: set[tuple[str, str]] = set()
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call) or node.lineno >= lineno:
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id == "_validate_plugin_name" and len(node.args) == 3:
+            kind, name = node.args[1], node.args[2]
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get_schema"
+            and ast.unparse(node.func.value) == "context.catalog"
+            and len(node.args) == 2
+        ):
+            kind, name = node.args
+        else:
+            continue
+        if isinstance(kind, ast.Constant) and isinstance(kind.value, str):
+            resolved.add((kind.value, ast.unparse(name)))
+    return resolved
+
+
+def test_every_stamped_plugin_identity_was_resolved_through_the_policy_view_first() -> None:
+    """A stamp names only a plugin the SAME function already resolved (elspeth-e405ad7cd2 R8-fix1).
+
+    The builder propagates a ``catalog.get_schema`` raise as a Tier-1
+    anomaly on the strength of ``_failure_result``'s contract — pass
+    ``plugin_identity`` only for a plugin resolved through the request's
+    policy view. The three ``patch_*`` sites broke that contract by stamping
+    the plugin read from persisted state, and a plugin the current view did
+    not admit raised ``ValueError("plugin_not_enabled")`` out of
+    ``execute_tool``. This pins the order at the source for every stamped
+    ``_failure_result`` in the tool modules: the enclosing function must
+    call ``_validate_plugin_name(context, <same kind>, <same name expr>)``
+    or ``context.catalog.get_schema(<same kind>, <same name expr>)`` on an
+    earlier line. Textual equality of the name expression is deliberate —
+    resolving ``plugin`` and stamping ``current.plugin`` is the defect.
+    """
+    unresolved: list[str] = []
+    stamped = 0
+    for module in (sources_tools, outputs_tools, transforms_tools, sessions_tools):
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        functions = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
+        for function in functions:
+            for call in ast.walk(function):
+                if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "_failure_result"):
+                    continue
+                identity = _stamped_identity(call)
+                if identity is None:
+                    continue
+                # Innermost enclosing function only: a closure's own body is
+                # walked when ``function`` is the closure, so skip the outer
+                # function's view of the same call.
+                if any(inner is not function and inner.lineno > function.lineno and call in ast.walk(inner) for inner in functions):
+                    continue
+                stamped += 1
+                if identity not in _resolved_before(function, call.lineno):
+                    kind, name = identity
+                    unresolved.append(
+                        f"{module.__name__}:{call.lineno} stamps ({kind!r}, {name}) that {function.name} never resolved above it"
+                    )
+    # Floor is the measured census on the day the pin landed (9 incremental
+    # sites, 4 set_pipeline builder sites, the builder's repair hint); a
+    # walker that suddenly sees fewer is broken, not a cleaner tree.
+    assert stamped >= 14, f"expected every stamped rejection site, found {stamped}"
+    assert not unresolved, "\n".join(unresolved)
 
 
 def test_the_message_parser_is_gone() -> None:

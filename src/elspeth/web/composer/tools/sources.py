@@ -1880,6 +1880,15 @@ def _execute_patch_source_options(
     if source_name not in state.sources:
         return _failure_result(state, f"No source named '{source_name}' configured to patch.")
     current_source = state.sources[source_name]
+    # The plugin comes from persisted state, not from this request: resolve
+    # it through the request's policy view before anything downstream
+    # (prevalidation, the plugin_identity stamp) may assume it resolves. A
+    # plugin removed or renamed between deployments, or no longer authorized
+    # by this snapshot, is a policy rejection — the same one set_source gives
+    # — never a raise out of the schema augmentation (elspeth-e405ad7cd2 R8-fix1).
+    plugin_error = _validate_plugin_name(context, "source", current_source.plugin)
+    if plugin_error is not None:
+        return _plugin_policy_failure(state, plugin_error)
     patch: Mapping[str, Any] = validated.patch
 
     # Echo tolerance (elspeth-c67fbbbd83): a patch echoing the stored

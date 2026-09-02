@@ -1529,6 +1529,12 @@ def _execute_patch_node_options(
         return credential_error
 
     if current.node_type in ("transform", "aggregation", "collector") and current.plugin is not None:
+        # State-held plugin: resolve it through the request's policy view
+        # before prevalidation stamps it (see _execute_patch_source_options).
+        plugin_error = _validate_plugin_name(context, "transform", current.plugin)
+        if plugin_error is not None:
+            return _plugin_policy_failure(state, plugin_error)
+
         prevalidation_error = _prevalidate_transform_for_context(context, current.plugin, new_options)
         if prevalidation_error is not None:
             return _failure_result(
