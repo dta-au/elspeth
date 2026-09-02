@@ -5084,6 +5084,131 @@ async def test_repeated_typed_binding_rejection_draws_the_repeat_notice(
     assert second == {**_binding_rejection_expected_feedback(), "repeat_notice": _REPEAT_NOTICE}
 
 
+def test_repeated_terminal_binding_rejection_never_says_re_emit() -> None:
+    """A repeat of a rejection no delta can clear draws the terminal notice, not "re-emit".
+
+    Two binder shapes are unclearable by resubmission: the reviewed
+    failure-route check runs before any delta is read, and an edge_patch
+    against a correction target with no writable routing field fails whatever
+    the patch says. Their taught fixes say "do not re-emit" / "decline in
+    plain text"; the generic repeat notice appended after them says "keep
+    every other part byte-identical, and re-emit". Same message, opposite
+    imperatives (elspeth-68721c71d7, final LLM review). The terminal notice
+    names the repetition without contradicting the fix.
+    """
+    from elspeth.web.composer.pipeline_planner import _REPEAT_NOTICE_TERMINAL, _binding_rejection_feedback
+
+    def repeated(code: str, **facts: Any) -> Mapping[str, Any]:
+        rejection = GuidedCandidateBindingRejected("guided planner candidate delta", error_code=code, connectivity=facts)
+        return _binding_rejection_feedback(rejection, repeated_fingerprint=True)
+
+    policy = repeated("guided_delta_reviewed_failure_route_required", routes=["quarantine"])
+    unwritable = repeated("guided_delta_authority_violation", delta_member="edge_patch", owner_kind="node")
+    for feedback in (policy, unwritable):
+        assert feedback["repeat_notice"] == _REPEAT_NOTICE_TERMINAL
+        assert "byte-identical" not in feedback["repeat_notice"]
+        assert "re-emit" not in feedback["repeat_notice"]
+
+    # Every other shape under the same code is clearable and keeps the
+    # ordinary notice: the terminal predicate matches the exact fact SHAPE,
+    # not the code, so a widened shape does not silently inherit "terminal".
+    clearable = repeated("guided_delta_authority_violation", delta_member="edge_patch", unexpected_keys=["target"])
+    widened = repeated("guided_delta_authority_violation", delta_member="edge_patch", owner_kind="node", extra="x")
+    assert clearable["repeat_notice"] == _REPEAT_NOTICE
+    assert widened["repeat_notice"] == _REPEAT_NOTICE
+
+    # A first (non-repeated) terminal rejection carries no notice at all.
+    first = _binding_rejection_feedback(
+        GuidedCandidateBindingRejected(
+            "guided planner candidate delta",
+            error_code="guided_delta_reviewed_failure_route_required",
+            connectivity={"routes": ["quarantine"]},
+        ),
+        repeated_fingerprint=False,
+    )
+    assert "repeat_notice" not in first
+
+
+def test_terminal_binding_rejections_are_exactly_the_codes_whose_fix_says_do_not_re_emit() -> None:
+    """The terminal predicate and the taught prose name the same rejections.
+
+    Derived from the catalogue, not a hand list: every registered entry
+    whose ``suggested_fix`` tells the planner not to re-emit must be
+    terminal for a bare rejection under that code, and the one sub-case
+    clause (edge_patch + owner_kind) must still be taught in the
+    ``guided_delta_authority_violation`` fix. Deleting either the prose or
+    the predicate arm turns this red.
+    """
+    from elspeth.web.composer.pipeline_planner import _binding_rejection_is_terminal
+    from elspeth.web.composer.tools.generation import _VALIDATION_ERROR_PATTERNS, explain_validation_code
+
+    do_not_re_emit = {pattern for pattern, _explanation, fix in _VALIDATION_ERROR_PATTERNS if "Do not re-emit" in fix}
+    assert do_not_re_emit == {"guided_delta_reviewed_failure_route_required"}
+    for code in do_not_re_emit:
+        assert code.isidentifier(), code
+        bare = GuidedCandidateBindingRejected("guided planner candidate delta", error_code=code, connectivity={})
+        assert _binding_rejection_is_terminal(bare), code
+
+    guidance = explain_validation_code("guided_delta_authority_violation")
+    assert guidance is not None
+    assert "'edge_patch'+'owner_kind': no edge_patch succeeds" in guidance[1]
+    owner_only = GuidedCandidateBindingRejected(
+        "guided planner candidate delta",
+        error_code="guided_delta_authority_violation",
+        connectivity={"delta_member": "edge_patch", "owner_kind": "node"},
+    )
+    assert _binding_rejection_is_terminal(owner_only)
+
+
+def test_binding_rejection_fingerprint_discriminates_on_the_fact_key_set() -> None:
+    """Same code + same delta member but a different fact SHAPE is a different rejection.
+
+    ``guided_delta_authority_violation`` fires from four edge_patch shapes
+    (not-a-dict, unexpected_keys, missing to_node, owner_kind) and
+    ``guided_delta_unknown_stable_id`` from two node_patch shapes (bad
+    stable_id, node_occurrences). Discriminating on ``delta_member`` alone
+    fingerprinted them identically, so a candidate that CORRECTLY repaired
+    the first shape and then tripped the second drew the repeat notice —
+    "keep every other part byte-identical and re-emit" — beside a taught fix
+    saying the opposite (elspeth-68721c71d7, workflow finding). The key SET is
+    a structural label the binder authors, never a candidate value, so a
+    genuine repeat (same shape) still fingerprints the same.
+    """
+    from elspeth.web.composer.pipeline_planner import _binding_rejection_fingerprint
+
+    def rejection(**facts: Any) -> GuidedCandidateBindingRejected:
+        return GuidedCandidateBindingRejected(
+            "guided planner candidate delta", error_code="guided_delta_authority_violation", connectivity=facts
+        )
+
+    unexpected = rejection(delta_member="edge_patch", unexpected_keys=["target"], allowed_keys=["stable_id", "to_node"])
+    owner = rejection(delta_member="edge_patch", owner_kind="node")
+    not_a_dict = rejection(delta_member="edge_patch", allowed_keys=["stable_id", "to_node"])
+    assert len({_binding_rejection_fingerprint(r) for r in (unexpected, owner, not_a_dict)}) == 3
+
+    # The same shape with different VALUES is still the same rejection: values
+    # are candidate content and must never enter the fingerprint. The keys are
+    # given in a different ORDER too: the shape is a set, not a sequence.
+    again = rejection(allowed_keys=["stable_id", "to_node"], unexpected_keys=["label"], delta_member="edge_patch")
+    assert _binding_rejection_fingerprint(again) == _binding_rejection_fingerprint(unexpected)
+
+    # Existing discriminators keep their meaning.
+    other_member = rejection(delta_member="node_patch", owner_kind="node")
+    assert _binding_rejection_fingerprint(other_member) != _binding_rejection_fingerprint(owner)
+
+    # ``guided_delta_nonincident_route`` fires for two faults the prose teaches
+    # apart — endpoints outside the owners vs an id reusing an existing edge —
+    # so they ship under different keys and fingerprint apart (final red-team F3).
+    def nonincident(**facts: Any) -> GuidedCandidateBindingRejected:
+        return GuidedCandidateBindingRejected(
+            "guided planner candidate delta", error_code="guided_delta_nonincident_route", connectivity=facts
+        )
+
+    endpoints = nonincident(edge_id="e1", incident_owners=["n1"])
+    id_reuse = nonincident(reused_edge_id="e1", incident_owners=["n1"])
+    assert _binding_rejection_fingerprint(endpoints) != _binding_rejection_fingerprint(id_reuse)
+
+
 @pytest.mark.asyncio
 async def test_candidate_policy_rejection_gets_closed_bounded_repair(
     tmp_path: Path,

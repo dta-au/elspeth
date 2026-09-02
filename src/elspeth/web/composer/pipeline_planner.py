@@ -109,6 +109,7 @@ from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
 from elspeth.web.composer.state import (
     COMPOSER_NODE_TYPES,
+    CoalesceReachabilityFactDict,
     CompositionState,
     RouteDestinationFactDict,
     ValidationEntry,
@@ -2116,6 +2117,32 @@ _ROUTE_DESTINATION_FACT_CODES: Final[frozenset[str]] = frozenset(
     }
 )
 
+_ROUTE_DESTINATION_ON_SUCCESS_KEYS: Final[frozenset[str]] = frozenset({"dangling_on_success", "declared_sinks", "consumable_connections"})
+_ROUTE_DESTINATION_ON_ERROR_KEYS: Final[frozenset[str]] = frozenset({"dangling_on_error", "declared_sinks"})
+_ROUTE_DESTINATION_COALESCE_KEYS: Final[frozenset[str]] = frozenset({"dangling_on_success", "declared_sinks"})
+
+
+def route_destination_fact_keys(code: str) -> frozenset[str]:
+    """The ``RouteDestinationFactDict`` keys one route-destination code may ship.
+
+    ``route_destination_facts`` keys its facts by COMPONENT and merges the
+    on_success and on_error findings for one component into a single dict,
+    while the closed code names ONE routing field. Attaching the merged dict
+    to every entry for that component shipped ``dangling_on_success`` and
+    ``consumable_connections`` under an on_error code (and the reverse) —
+    keys the code's guidance never names and the teaching gate never
+    enumerated (elspeth-68721c71d7, red-team finding). Each entry is
+    projected to its own field's keys here, and the gate imports this map
+    so what it checks is what the consumer ships.
+    """
+    if code not in _ROUTE_DESTINATION_FACT_CODES:
+        raise ValueError(f"{code!r} is not a route-destination fact code")
+    if "on_error" in code:
+        return _ROUTE_DESTINATION_ON_ERROR_KEYS
+    if code.startswith("coalesce_"):
+        return _ROUTE_DESTINATION_COALESCE_KEYS
+    return _ROUTE_DESTINATION_ON_SUCCESS_KEYS
+
 
 def _rejection_fingerprint(result: ToolResult) -> tuple[tuple[str, str], ...]:
     """Identity of one candidate rejection: sorted (component, code) pairs.
@@ -2156,6 +2183,18 @@ _REPEAT_NOTICE_WITHHELD = (
     "server-side for this surface and its validator detail is withheld, so re-emitting a "
     "near-identical candidate cannot succeed. Only a structurally different candidate — or an "
     "honest decline — can resolve this."
+)
+
+# Honest variant for a repeat of a rejection that NO re-emitted candidate can
+# clear: the taught fix for these says "do not re-emit" / "decline", and the
+# ordinary notice's "keep every other part byte-identical, and re-emit" would
+# contradict it in the same message (elspeth-68721c71d7). Static text, never
+# per-request data.
+_REPEAT_NOTICE_TERMINAL = (
+    "This candidate failed with EXACTLY the same rejection as an earlier candidate in this "
+    "request. No candidate you can author clears this rejection, so another attempt cannot "
+    "succeed. Follow the suggested_fix above: decline in plain text and tell the user what "
+    "they must change."
 )
 
 # Subject prefix of a ``rejected_mutation`` entry's message. These prefixes are
@@ -2408,7 +2447,7 @@ def _allowlisted_candidate_feedback(
     """
     validation = result.validation
     errors: list[dict[str, Any]] = []
-    reachability_facts: dict[str, dict[str, Any]] | None = None
+    reachability_facts: dict[str, CoalesceReachabilityFactDict] | None = None
     destination_facts: dict[str, RouteDestinationFactDict] | None = None
     any_facts_withheld = False
     for entry in _rejection_entries(result):
@@ -2491,7 +2530,10 @@ def _allowlisted_candidate_feedback(
             # repair budget on exactly that blindness (elspeth-5904b1683a).
             if destination_facts is None:
                 destination_facts = route_destination_facts(result.updated_state)
-            projected["connectivity"] = destination_facts[entry.component]
+            # The facts are keyed by component and merge both routing fields;
+            # this entry is about ONE field, so ship only that field's keys.
+            allowed_keys = route_destination_fact_keys(code)
+            projected["connectivity"] = {key: value for key, value in destination_facts[entry.component].items() if key in allowed_keys}
         if code == "coalesce_branch_unreachable" and not withholding.connectivity:
             # Instance wiring facts derived from the REJECTED state the result
             # carries — same redaction class as the contract facts below (node
@@ -2641,8 +2683,41 @@ def _binding_rejection_feedback(
     if _explain_tool_advertisement_earns_its_turn([entry]):
         feedback["guidance"] = _EXPLAIN_VALIDATION_ERROR_GUIDANCE
     if repeated_fingerprint:
-        feedback["repeat_notice"] = _REPEAT_NOTICE
+        # The terminal notice keeps the fix and the notice saying the same
+        # thing: the two shapes below are unclearable by resubmission and
+        # their taught fix already says so.
+        feedback["repeat_notice"] = _REPEAT_NOTICE_TERMINAL if _binding_rejection_is_terminal(rejection) else _REPEAT_NOTICE
     return feedback
+
+
+# Binder rejections no re-emitted candidate can clear, as (code, exact fact-key
+# shape). ``None`` means every shape under the code. Both are closed
+# structural labels the binder authors: the reviewed failure-route check runs
+# before any delta is read (``_require_reviewed_failure_routes``), and an
+# ``edge_patch`` against a correction target with no writable routing field
+# (``_apply_selected_edge_route_patch``) fails whatever the patch says. The
+# catalogue prose for each says "do not re-emit" / "decline"; a test pins that
+# the prose and this table name the same rejections.
+_TERMINAL_BINDING_REJECTIONS: Final[frozenset[tuple[str, frozenset[str] | None]]] = frozenset(
+    {
+        ("guided_delta_reviewed_failure_route_required", None),
+        ("guided_delta_authority_violation", frozenset({"delta_member", "owner_kind"})),
+    }
+)
+
+
+def _binding_rejection_is_terminal(rejection: GuidedCandidateBindingRejected) -> bool:
+    """True when no re-emitted candidate can clear ``rejection``.
+
+    Matches the exact fact-key SHAPE, not the code alone: ten binder sites
+    share ``guided_delta_authority_violation`` and only the owner_kind shape
+    is terminal, so a widened or different shape keeps the ordinary notice.
+    """
+    shape = frozenset(rejection.connectivity)
+    return any(
+        code == rejection.error_code and (terminal_shape is None or terminal_shape == shape)
+        for code, terminal_shape in _TERMINAL_BINDING_REJECTIONS
+    )
 
 
 def _binding_rejection_fingerprint(rejection: GuidedCandidateBindingRejected) -> tuple[tuple[str, str], ...]:
@@ -2655,10 +2730,20 @@ def _binding_rejection_fingerprint(rejection: GuidedCandidateBindingRejected) ->
     the model to keep every other part byte-identical. That is false, and it
     can steer a planner into reverting a genuine fix. The rejection's own
     connectivity facts carry the discriminators: which collection the
-    complaint is about, and which delta member the binder was reading. Both
-    are closed structural labels the binder authors, never candidate values,
-    so a genuine repeat — same code, same facts — still fingerprints the same
-    and still draws the notice.
+    complaint is about, which delta member the binder was reading, and the
+    SET of fact keys — the shape of the complaint. All three are closed
+    structural labels the binder authors, never candidate values, so a
+    genuine repeat — same code, same shape — still fingerprints the same and
+    still draws the notice.
+
+    The key set matters because one member can fail several ways under one
+    code: ``edge_patch`` alone raises ``guided_delta_authority_violation``
+    for not-a-dict, ``unexpected_keys``, a missing ``to_node`` and
+    ``owner_kind``, and ``node_patch`` raises ``guided_delta_unknown_stable_id``
+    for a bad ``stable_id`` and for ``node_occurrences``. A candidate that
+    correctly repaired the first shape and then tripped the next drew the
+    repeat notice — "keep every other part byte-identical and re-emit" —
+    beside a taught fix that says the opposite (elspeth-68721c71d7).
     """
     facts = rejection.connectivity
     discriminators: list[tuple[str, str]] = []
@@ -2668,6 +2753,7 @@ def _binding_rejection_fingerprint(rejection: GuidedCandidateBindingRejected) ->
         fact = facts[key]
         if type(fact) is str:
             discriminators.append((key, fact))
+    discriminators.append(("fact_keys", ",".join(sorted(facts))))
     return (("pipeline", rejection.error_code), *discriminators)
 
 

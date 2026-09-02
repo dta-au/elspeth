@@ -2541,6 +2541,197 @@ def test_source_correction_changes_only_selected_route_and_may_add_topology() ->
     assert bound["nodes"][-1]["id"] == "screen_rows"
 
 
+def test_source_correction_admits_every_node_key_the_advertised_schema_admits() -> None:
+    """The binder's ``nodes`` allowlist must derive from the canonical node schema.
+
+    A hand-written literal lagged the schema by four keys (``description``,
+    ``scope_name``, ``scope_opener``, ``scope_policy``): a collector node on a
+    source-correction turn passed the Draft 2020-12 pre-check and then died in
+    the binder with ``unexpected_keys`` — the WS6 parity sweep missed this
+    ``node_type`` dispatch site (elspeth-68721c71d7, workflow finding).
+    Probing every canonical key individually keeps the test derived: a key
+    the schema adds later is covered without editing this test.
+    """
+    canonical_node_keys = sorted(guided_planning._canonical_schema_properties()["nodes"]["items"]["properties"])
+    assert "scope_policy" in canonical_node_keys  # the motivating collector key is part of the probe
+    rejected_for_unexpected_keys: list[str] = []
+    for key in canonical_node_keys:
+        node: dict[str, object] = {
+            "id": "screen_rows",
+            "node_type": "transform",
+            "plugin": "passthrough",
+            "input": "screen_input",
+            "on_success": "amount_gate",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}},
+        }
+        node.setdefault(key, None)
+        try:
+            materialize_guided_authorized_candidate(
+                {
+                    "source_routes": [{"stable_id": SOURCE_ID, "on_success": "screen_input"}],
+                    "nodes": [node],
+                    "edges": [{"id": "source_to_screen", "from_node": "source", "to_node": "screen_rows", "edge_type": "on_success"}],
+                },
+                authority=_source_correction_target(),
+                guided=_guided(),
+                current_state=_correction_predecessor(),
+            )
+        except guided_planning.GuidedCandidateBindingRejected as exc:
+            if "unexpected_keys" in exc.connectivity:
+                rejected_for_unexpected_keys.append(key)
+    assert rejected_for_unexpected_keys == []
+
+
+@pytest.mark.parametrize("key", ["not_a_canonical_node_key", "stable_id", "secret_ref"])
+def test_source_correction_refuses_a_node_key_the_advertised_schema_does_not_admit(key: str) -> None:
+    """The derived allowlist is pinned from BOTH sides: nothing non-canonical is admitted.
+
+    The sibling test proves every canonical key binds; without this one a
+    widened derivation (``canonical | {"stable_id", "secret_ref"}``) survives
+    every test (final red-team F4, mutant P6b — hence those two keys are
+    probed by name, not only a made-up one). The canonical pre-check masks
+    this in production, so the binder check is defense-in-depth — but it is
+    the check this branch changed, and the change must be pinned exactly.
+    """
+    canonical_node_keys = set(guided_planning._canonical_schema_properties()["nodes"]["items"]["properties"])
+    assert key not in canonical_node_keys
+    node: dict[str, object] = {
+        "id": "screen_rows",
+        "node_type": "transform",
+        "plugin": "passthrough",
+        "input": "screen_input",
+        "on_success": "amount_gate",
+        "on_error": "discard",
+        "options": {"schema": {"mode": "observed"}},
+        key: None,
+    }
+    with pytest.raises(guided_planning.GuidedCandidateBindingRejected) as excinfo:
+        materialize_guided_authorized_candidate(
+            {
+                "source_routes": [{"stable_id": SOURCE_ID, "on_success": "screen_input"}],
+                "nodes": [node],
+                "edges": [{"id": "source_to_screen", "from_node": "source", "to_node": "screen_rows", "edge_type": "on_success"}],
+            },
+            authority=_source_correction_target(),
+            guided=_guided(),
+            current_state=_correction_predecessor(),
+        )
+    assert excinfo.value.error_code == "guided_delta_authority_violation"
+    assert excinfo.value.connectivity["unexpected_keys"] == [key]
+
+
+class _LabelLookalike(str):
+    """A str subclass: structurally a string, nominally not one."""
+
+
+@pytest.mark.parametrize(
+    "value",
+    [{"inner": 1}, [{"k": 2}], ["a", {"k": 1}], ("a", "b"), _LabelLookalike("x"), [_LabelLookalike("x")], 1.5, {"a"}],
+    ids=["dict", "list-of-dict", "mixed-list", "tuple", "str-subclass", "list-of-str-subclass", "float", "set"],
+)
+def test_guided_rejection_refuses_a_fact_value_that_is_not_a_closed_label(value: object) -> None:
+    """A fact value is admitted nominally at construction, where it is built.
+
+    The ``GuidedFactValue`` annotation does not bind a value typed ``Any`` or
+    laundered through a ``cast``; a nested record built that way would reach
+    the planner with inner keys nothing teaches (final red-team, fourth
+    round). Exact types only (ADR-032): a str subclass is refused too.
+    """
+    with pytest.raises(AuditIntegrityError, match="not a closed label"):
+        GuidedCandidateBindingRejected("m", error_code="guided_delta_authority_violation", connectivity={"extra": value})
+
+
+def test_guided_rejection_admits_every_closed_label_type() -> None:
+    facts = {"s": "x", "i": 3, "b": True, "n": None, "l": ["a", "b"], "e": []}
+    rejection = GuidedCandidateBindingRejected("m", error_code="guided_delta_authority_violation", connectivity=facts)
+    assert rejection.connectivity == facts
+    # The admitted list is our own copy: the caller's object is never aliased in.
+    assert rejection.connectivity["l"] is not facts["l"]
+
+
+def test_node_correction_rejects_an_edge_id_reusing_a_non_incident_edge_under_its_own_key() -> None:
+    """The id-reuse fault ships ``reused_edge_id``, not ``edge_id``, at the production site.
+
+    ``guided_delta_nonincident_route`` covers two faults the prose teaches
+    apart; only a binder-level run pins the key the real site emits (final
+    red-team F3 — the fingerprint test builds its own rejections, so
+    reverting the site's key survived it).
+    """
+    predecessor = replace(
+        _correction_predecessor(),
+        edges=(
+            EdgeSpec(id="gate_to_summarize", from_node="amount_gate", to_node="summarize_standard", edge_type="route_true", label="true"),
+        ),
+    )
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        materialize_guided_authorized_candidate(
+            {
+                "node_patch": {"stable_id": _format_node_correction_target().requested.stable_id},
+                # Endpoints touch the selected node, so the incident check passes;
+                # the id belongs to an existing edge touching no owner.
+                "edges": [{"id": "gate_to_summarize", "from_node": "format_high_value", "to_node": "output", "edge_type": "on_success"}],
+            },
+            authority=_format_node_correction_target(),
+            guided=_guided(),
+            current_state=predecessor,
+        )
+    assert raised.value.error_code == "guided_delta_nonincident_route"
+    assert raised.value.connectivity == {"reused_edge_id": "gate_to_summarize", "incident_owners": ["format_high_value"]}
+
+
+def test_source_correction_binds_a_collector_with_its_scope_keys() -> None:
+    """The motivating case for the derived allowlist: a real collector on a source-correction turn.
+
+    The key-probe test above proves no canonical key is rejected as unexpected;
+    this one proves the collector's scope keys bind through to a candidate the
+    canonical model accepts, so the derived allowlist admits nothing the
+    downstream binder then mishandles (red-team finding on bc8b9e237).
+    """
+    from elspeth.web.composer.pipeline_planner import SetPipelineArgumentsModel
+
+    bound = materialize_guided_authorized_candidate(
+        {
+            "source_routes": [{"stable_id": SOURCE_ID, "on_success": "screen_input"}],
+            "nodes": [
+                {
+                    "id": "explode",
+                    "node_type": "transform",
+                    "plugin": "line_explode",
+                    "input": "screen_input",
+                    "on_success": "lines",
+                    "on_error": "discard",
+                    "options": {"field": "color_name", "schema": {"mode": "observed"}},
+                    "description": "split lines",
+                },
+                {
+                    "id": "regroup",
+                    "node_type": "collector",
+                    "plugin": "join_lines",
+                    "input": "lines",
+                    "on_success": "amount_gate",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}},
+                    "scope_name": "lines_group",
+                    "scope_opener": "explode",
+                    "scope_policy": "require_all",
+                },
+            ],
+            "edges": [
+                {"id": "source_to_explode", "from_node": "source", "to_node": "explode", "edge_type": "on_success"},
+                {"id": "explode_to_regroup", "from_node": "explode", "to_node": "regroup", "edge_type": "on_success"},
+            ],
+        },
+        authority=_source_correction_target(),
+        guided=_guided(),
+        current_state=_correction_predecessor(),
+    )
+    collector = next(node for node in bound["nodes"] if node["id"] == "regroup")
+    assert (collector["scope_name"], collector["scope_opener"], collector["scope_policy"]) == ("lines_group", "explode", "require_all")
+    validated = SetPipelineArgumentsModel.model_validate(bound).model_dump()
+    assert any(node["id"] == "regroup" and node["node_type"] == "collector" for node in validated["nodes"])
+
+
 def test_node_correction_materializer_preserves_every_unselected_node_byte() -> None:
     predecessor = _correction_predecessor()
     candidate = _planner_correction_candidate()

@@ -1747,9 +1747,11 @@ _SOURCE_CONFIG_ERROR_PREFIX = "Invalid configuration for source "
 # on how it had learned of the error and could not converge. Neither surface's
 # text was pinned by any test, which is why the drift landed green.
 _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION: Final[str] = (
-    "A field_mapper with select_only: true produced contradictory internal contract metadata: a required output "
-    "field was absent from the mapping's computed guarantees. Since d4ae04b374 the mapping itself is the required-read "
-    "authority; every configured target must therefore be present on every successful row."
+    "A field_mapper with select_only: true produced contradictory internal contract metadata: a required output field "
+    "was absent from the mapping's computed guarantees. Since d4ae04b374 the mapping itself is the required-read "
+    "authority; every configured target must therefore be present on every successful row. The rejection's 'contract' "
+    "facts carry 'producer' and 'consumer' both set to that field_mapper's own node id — the contradiction is "
+    "internal to one node, not an edge — and 'missing_fields', those absent fields."
 )
 _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX: Final[str] = (
     "Do not mutate the pipeline to work around this error. Preserve the authored mapping and report the node and "
@@ -1759,13 +1761,17 @@ _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX: Final[str] = (
 )
 _TRANSFORM_OUTPUT_COLLISION_EXPLANATION: Final[str] = (
     "A transform declares an output field that already arrives on its input row. The engine rejects a transform that "
-    "would overwrite an existing input field, so the run fails on the first row. The rejection's contract facts name "
-    "the node and the colliding field names."
+    "would overwrite an existing input field, so the run fails on the first row. The rejection's 'contract' facts "
+    "name the collision: 'producer' and 'consumer' both carry this same transform's own node id — not an upstream "
+    "edge, because the colliding field can arrive from several upstream arms at once, so no single upstream producer "
+    "is named — and 'extra_fields' lists the declared output field names that already definitely arrive on the input "
+    "row (a lower bound: more names may collide than are listed)."
 )
 _TRANSFORM_OUTPUT_COLLISION_FIX: Final[str] = (
-    "Change ONLY that node's output name, or the field upstream of it: rename this transform's output to a name the "
-    "row does not already carry (for an llm transform that is `response_field`), OR rename/drop the incoming field "
-    "upstream with a field_mapper before this node."
+    "Change ONLY this node's output name, or the field(s) upstream of it: rename this transform's output to a name "
+    "the row does not already carry — for an llm transform, change whichever option produced the colliding name: "
+    "`response_field`, or the output_fields entry that equals it — OR rename or drop each name in 'extra_fields' "
+    "upstream with a field_mapper before this node; resolve every listed name, not just one."
 )
 _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION: Final[str] = (
     "A single-prompt llm node's prompt_template reads row fields its own options.required_input_fields does not "
@@ -2441,17 +2447,51 @@ def _node_topology_cycle(nodes: tuple[NodeSpec, ...]) -> tuple[str, ...] | None:
     return None
 
 
-def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, Any]]:
+class SinkLureDict(TypedDict):
+    """The sink-publishing hop that lures one unreachable coalesce branch."""
+
+    node_id: str
+    publishes_to_sink: str
+
+
+class UnreachableBranchDict(TypedDict):
+    """One coalesce branch whose consumed connection nothing produces.
+
+    Carries its own ``sink_lure`` rather than exposing a parallel list keyed
+    by connection name: the repair needs "this branch is broken AND this is
+    the node that broke it" as one fact, not two the reader must join on a
+    string.
+
+    ``branch`` matches the identity key of the sibling per-member record
+    ``RowUnionBranchSchemaDetailDict`` — one envelope should not name one
+    concept three ways.
+    """
+
+    branch: str
+    consumed_connection: str
+    sink_lure: NotRequired[SinkLureDict]
+
+
+class CoalesceReachabilityFactDict(TypedDict):
+    """Redaction-safe repair facts for one coalesce's unreachable branches."""
+
+    unreachable_branches: list[UnreachableBranchDict]
+    produced_connections: list[str]
+
+
+def coalesce_reachability_facts(state: CompositionState) -> dict[str, CoalesceReachabilityFactDict]:
     """Redaction-safe wiring facts for coalesce branch-reachability rejections.
 
     Maps each coalesce node id whose ``branches`` values name connections no
     runtime routing field produces to the facts a repair needs:
-    ``unreachable_branches`` (branch key -> consumed connection value, exactly
-    as authored — list-form branches key by the entry itself) and
-    ``produced_connections`` (the membership set ``validate()``'s
-    ``coalesce_branch_unreachable`` check tests, minus sink names and the
-    coalesce's own published id — both pass the walk but are never a correct
-    branch value, so the facts must not steer a repair toward them).
+    ``unreachable_branches`` (one record per broken branch, naming the branch
+    and the connection it consumes exactly as authored — for list-form
+    branches the two are the same string, which the record states plainly
+    rather than encoding as a self-mapping) and ``produced_connections`` (the
+    membership set ``validate()``'s ``coalesce_branch_unreachable`` check
+    tests, minus sink names and the coalesce's own published id — both pass
+    the walk but are never a correct branch value, so the facts must not
+    steer a repair toward them).
 
     Guided session 277fb6c4 (2026-07-22) exhausted its repair budget on four
     identical ``coalesce_branch_unreachable`` rejections: the observed
@@ -2462,13 +2502,25 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, 
     ``SchemaContractDetail`` — so forwarding it through the message-stripped
     repair feedback does not re-open the redaction boundary.
 
-    ``sink_targeting_branches`` names the lure explicitly: for each
-    unreachable branch whose branch-side transform CHAIN terminates in a
-    sink-publishing hop, the entry carries that transform's id, the sink it
-    publishes to, and the connection the coalesce expects instead. Guided
-    attempt 14 (session 04200b45) re-wired branch transforms to the
-    reviewed sink three times WITH the bare facts live — the repair needs
-    the exact miswired node named.
+    A MAPPED branch whose branch-side transform CHAIN terminates in a
+    sink-publishing hop carries ``sink_lure``: that transform's id and the
+    sink it publishes to. Guided attempt 14 (session 04200b45) re-wired
+    branch transforms to the reviewed sink three times WITH the bare facts
+    live — the repair needs the exact miswired node named. The lure rides
+    on the branch record it explains, so nothing has to be joined back by
+    connection name; the connection the coalesce expects is that record's
+    own ``consumed_connection``.
+
+    An IDENTITY branch (list form, or a mapping entry whose value equals
+    its key) never carries a lure: the walk starts from the branch name,
+    which for such a branch is the consumed connection itself, so it finds
+    a competing consumer rather than a producer. See the guard at the
+    append site.
+
+    Every field here is taught to the planner per-key in
+    ``tools/generation.py``'s ``coalesce_branch_unreachable`` guidance. A
+    fact the model is never told how to read cannot repair anything, so a
+    new field is a change to BOTH surfaces.
     """
     targets = _runtime_connection_targets(state.sources, state.nodes)
     sink_names = {output.name for output in state.outputs}
@@ -2477,7 +2529,7 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, 
         if node.node_type == "transform" and node.input not in transform_by_input:
             transform_by_input[node.input] = node
 
-    def _sink_lure(branch_key: str) -> tuple[str, str] | None:
+    def _sink_lure(branch_key: str) -> SinkLureDict | None:
         """Follow the transform chain consuming ``branch_key`` to a sink hop."""
         connection = branch_key
         for _ in range(len(state.nodes)):
@@ -2487,16 +2539,15 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, 
             if consumer.on_success is None:
                 return None
             if consumer.on_success in sink_names:
-                return consumer.id, consumer.on_success
+                return {"node_id": consumer.id, "publishes_to_sink": consumer.on_success}
             connection = consumer.on_success
         return None
 
-    facts: dict[str, dict[str, Any]] = {}
+    facts: dict[str, CoalesceReachabilityFactDict] = {}
     for node in state.nodes:
         if node.node_type != "coalesce" or node.branches is None:
             continue
-        unreachable: dict[str, str] = {}
-        sink_targeting: list[dict[str, str]] = []
+        unreachable: list[UnreachableBranchDict] = []
         for branch_name, branch_connection in zip(
             _coalesce_branch_names(node.branches),
             _coalesce_branch_connections(node.branches),
@@ -2504,22 +2555,32 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, 
         ):
             if branch_connection in targets:
                 continue
-            unreachable[str(branch_name)] = branch_connection
-            lure = _sink_lure(str(branch_name))
-            if lure is not None:
-                sink_targeting.append({"node_id": lure[0], "on_success_sink": lure[1], "expected_connection": branch_connection})
+            record: UnreachableBranchDict = {"branch": branch_name, "consumed_connection": branch_connection}
+            # Only a MAPPED branch can carry a lure. _sink_lure walks from the
+            # branch NAME, which for a mapped branch is the fork alias — so the
+            # transform consuming it is that branch's producer, and re-pointing
+            # its on_success at the consumed connection is the correct repair.
+            # For an identity branch (list form, or a mapping entry whose value
+            # equals its key) the name IS the consumed connection, so that walk
+            # finds a competing CONSUMER of the connection the coalesce awaits.
+            # Naming it would tell the planner to set that node's on_success to
+            # its own input — a self-loop, rejected as pipeline_cycle, spending
+            # a repair turn in the one payload that exists to stop repair
+            # budgets burning on coalesce_branch_unreachable.
+            if branch_name != branch_connection:
+                lure = _sink_lure(branch_name)
+                if lure is not None:
+                    record["sink_lure"] = lure
+            unreachable.append(record)
         if not unreachable:
             continue
-        entry: dict[str, Any] = {
+        facts[node.id] = {
             "unreachable_branches": unreachable,
             # _FORK_ROUTE_TARGET is the reserved route keyword ("go to
             # fork_to"), not a connection — it rides the membership set but
             # must not be advertised as a wirable name.
             "produced_connections": sorted(targets - sink_names - {node.id, _FORK_ROUTE_TARGET}),
         }
-        if sink_targeting:
-            entry["sink_targeting_branches"] = sink_targeting
-        facts[node.id] = entry
     return facts
 
 
