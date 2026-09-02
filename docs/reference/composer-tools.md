@@ -530,7 +530,12 @@ Place a secret reference marker in the pipeline config. The secret is resolved a
 
 ## Tool Result Format
 
-Every tool returns a `ToolResult` with this structure:
+Every tool returns a `ToolResult`. The model receives it serialized verbatim;
+the audit row receives the redaction manifest's projection of the same object.
+The key vocabulary is one registry (`src/elspeth/web/composer/tool_result_envelope.py`)
+that the producer, the redaction manifest, and the planner's closed discovery
+twin all derive from, and this section is pinned to it by
+`tests/unit/web/composer/test_tool_result_envelope_gate.py`.
 
 ```json
 {
@@ -538,24 +543,48 @@ Every tool returns a `ToolResult` with this structure:
   "validation": {
     "is_valid": true,
     "errors": [],
-    "warnings": ["Source schema mode is 'observed' — consider 'fixed' for stricter validation"],
-    "suggestions": []
+    "warnings": [
+      {"component": "source", "message": "Source schema mode is 'observed' — consider 'fixed'", "severity": "low", "error_code": "source_schema_mode_observed"}
+    ],
+    "suggestions": [],
+    "semantic_contracts": [],
+    "graph_repair_suggestions": []
   },
   "affected_nodes": ["classifier", "quality_gate"],
   "version": 3,
-  "data": null
+  "applied_component": {"nodes": [{"id": "classifier", "node_type": "transform", "plugin": "llm_classifier", "input": "source"}]},
+  "validation_delta": {"new_errors": [], "resolved_errors": [], "new_warnings": [], "resolved_warnings": []}
 }
 ```
+
+Always present:
 
 | Field | Description |
 |-------|-------------|
 | `success` | Whether the tool call succeeded |
-| `validation` | Current pipeline validation state after this change |
-| `affected_nodes` | Node IDs that were changed or have changed edges |
+| `validation` | Whole-document validation after this change: `is_valid`, `errors` / `warnings` / `suggestions` (entries with `component`, `message`, `severity`, `error_code` and, when the code carries facts, a `contract`, `row_union_schema`, or `coalesce_union_type` block), `semantic_contracts` (per-edge field checks), `graph_repair_suggestions` (a ready `tool_sequence` for a duplicate-consumer repair) |
+| `affected_nodes` | Component ids the call touched |
 | `version` | Pipeline state version (increments on each mutation) |
-| `data` | Discovery tool payload (plugin lists, schemas, etc.) — null for mutations |
 
-**Validation drives the loop.** After each mutation, check `validation.errors`. If there are errors, fix them before responding to the user. The LLM should not present a pipeline as complete until `is_valid` is `true`.
+Present only when set:
+
+| Field | When | Description |
+|-------|------|-------------|
+| `data` | most tools | The tool-specific payload; each tool's description names its keys. A failure carries `error` and `error_code`; a credential-wiring failure adds `credential_fields`, `components`, and `repair`; a proposal under approval custody carries `status: "APPROVAL_REQUIRED"` with `proposal_id`; a prevalidation rejection carries `status: "PREVALIDATION_REJECTED"` with `applied: false` |
+| `runtime_preflight` | `preview_pipeline` | Runtime readiness check: `is_valid`, `checks`, `readiness`, `errors`, `warnings`, `semantic_contracts` |
+| `validation_delta` | successful mutations | `new_errors`, `resolved_errors`, `new_warnings`, `resolved_warnings` relative to the state before the call |
+| `post_call_hints` | successful mutations whose plugin returns them | Plugin-authored next steps |
+| `plugin_schemas` | failed option-shape mutations | `"<kind>/<plugin>"` → the plugin's schema (`json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, …) |
+| `validation_guidance` | failed mutations | `codes`: each `error_code` → `explanation` and `suggested_fix`; `explain_tool` when a code had no catalogue entry |
+| `applied_component` | successful incremental mutations | The stored `source` / `sources` / `nodes` / `outputs` / `edges` the call touched — the authoritative post-change state, so no confirming read is needed |
+
+`set_pipeline` results additionally carry `pipeline_content_hash_schema` and
+`pipeline_content_hash`, attached after dispatch for recovery.
+
+**Validation drives the loop.** After each mutation, check `validation.errors`
+and `validation_delta`. If there are errors, fix them before responding to the
+user. The LLM should not present a pipeline as complete until `is_valid` is
+`true`.
 
 ---
 

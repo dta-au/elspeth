@@ -989,3 +989,26 @@ def test_gate_derives_a_new_envelope_key_from_the_ast(tmp_path: Path) -> None:
     fn = _function(tree, "to_dict", in_class="ToolResult")
     keys = [k for k, _ in _subscript_assign_keys(fn, "result", "probe", _module_str_constants(tree, COMMON))]
     assert "probe_key" in keys
+
+
+# --- operator reference ----------------------------------------------------------------------------
+
+
+def test_operator_reference_names_every_registry_key() -> None:
+    """docs/reference/composer-tools.md 'Tool Result Format' is regenerated from the registry, not remembered."""
+    text = (REPO_ROOT / "docs" / "reference" / "composer-tools.md").read_text(encoding="utf-8")
+    start = text.index("## Tool Result Format")
+    end = text.index("\n## ", start + 1)
+    section = text[start:end]
+    missing = [
+        key
+        for key in (
+            *env.tool_result_keys(data=True),
+            *env.TOOL_RESULT_POST_DISPATCH_KEYS,
+            *env.VALIDATION_KEYS,
+            *env.VALIDATION_DELTA_KEYS,
+            *env.APPLIED_COMPONENT_KEYS,
+        )
+        if f"`{key}`" not in section
+    ]
+    assert missing == [], f"operator reference does not name: {missing}"
