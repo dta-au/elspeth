@@ -118,6 +118,10 @@ def _typed_keys(payload: type, prefix: str) -> list[str]:
     return keys
 
 
+def _is_cast(node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and _call_name(node) == "cast"
+
+
 def _is_dict_literal(node: ast.AST) -> bool:
     """A dict built inline: a literal, a comprehension, or a ``dict(...)`` call."""
     if isinstance(node, ast.Dict | ast.DictComp):
@@ -341,6 +345,11 @@ def _guided_sites(files: Iterable[Path]) -> Iterator[ShippedKey]:
                 key = _literal_str(key_node)
                 if key is None:
                     raise AssertionError(f"{site}: non-literal connectivity key {ast.unparse(key_node) if key_node else '**'}")
+                if any(_is_cast(inner) for inner in ast.walk(value_node)):
+                    # A cast launders a nested record past the value type; the
+                    # constructor's nominal check is the runtime close, this is
+                    # the review-time tripwire (final red-team, fourth round).
+                    raise AssertionError(f"{site}: connectivity['{key}'] carries a cast; fact values are built, never cast")
                 if any(_is_dict_literal(inner) for inner in ast.walk(value_node)):
                     # A nested record ships its inner keys just as the envelope
                     # does, and this walker enumerates one level. Refuse a dict
@@ -541,18 +550,19 @@ def test_gate_refuses_a_guided_site_it_cannot_derive(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "value",
+    ("value", "reason"),
     [
-        "{'inner_untaught': 1}",
-        "cast(JsonValue, {'inner_untaught': 1})",
-        "[{'inner_untaught': 1}]",
-        "({'inner_untaught': 1},)",
-        "dict(inner_untaught=1)",
-        "{k: 1 for k in ('inner_untaught',)}",
+        ("{'inner_untaught': 1}", "nested dict"),
+        ("cast(JsonValue, {'inner_untaught': 1})", "carries a cast"),
+        ("cast(GuidedFactValue, nested_record)", "carries a cast"),
+        ("[{'inner_untaught': 1}]", "nested dict"),
+        ("({'inner_untaught': 1},)", "nested dict"),
+        ("dict(inner_untaught=1)", "nested dict"),
+        ("{k: 1 for k in ('inner_untaught',)}", "nested dict"),
     ],
-    ids=["literal", "cast-wrapped", "in-list", "in-tuple", "dict-call", "comprehension"],
+    ids=["literal", "cast-wrapped", "cast-of-name", "in-list", "in-tuple", "dict-call", "comprehension"],
 )
-def test_gate_refuses_a_nested_dict_value_at_a_guided_site(tmp_path: Path, value: str) -> None:
+def test_gate_refuses_a_nested_dict_value_at_a_guided_site(tmp_path: Path, value: str, reason: str) -> None:
     """Inner keys of a dict value would ship untaught and unenumerated; the walker refuses a dict anywhere in the value.
 
     The first fix refused only a bare literal; ``cast(JsonValue, {...})`` — the
@@ -564,7 +574,7 @@ def test_gate_refuses_a_nested_dict_value_at_a_guided_site(tmp_path: Path, value
         f"def f():\n    raise _guided_delta_rejection('guided_delta_authority_violation', facts={{'extra': {value}}})\n",
         encoding="utf-8",
     )
-    with pytest.raises(AssertionError, match="nested dict"):
+    with pytest.raises(AssertionError, match=reason):
         list(_guided_sites([module]))
 
 

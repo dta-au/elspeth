@@ -2621,6 +2621,33 @@ def test_source_correction_refuses_a_node_key_the_advertised_schema_does_not_adm
     assert excinfo.value.connectivity["unexpected_keys"] == [key]
 
 
+class _LabelLookalike(str):
+    """A str subclass: structurally a string, nominally not one."""
+
+
+@pytest.mark.parametrize(
+    "value",
+    [{"inner": 1}, [{"k": 2}], ("a", "b"), _LabelLookalike("x"), [_LabelLookalike("x")], 1.5, {"a"}],
+    ids=["dict", "list-of-dict", "tuple", "str-subclass", "list-of-str-subclass", "float", "set"],
+)
+def test_guided_rejection_refuses_a_fact_value_that_is_not_a_closed_label(value: object) -> None:
+    """A fact value is admitted nominally at construction, where it is built.
+
+    The ``GuidedFactValue`` annotation does not bind a value typed ``Any`` or
+    laundered through a ``cast``; a nested record built that way would reach
+    the planner with inner keys nothing teaches (final red-team, fourth
+    round). Exact types only (ADR-032): a str subclass is refused too.
+    """
+    with pytest.raises(AuditIntegrityError, match="not a closed label"):
+        GuidedCandidateBindingRejected("m", error_code="guided_delta_authority_violation", connectivity={"extra": value})
+
+
+def test_guided_rejection_admits_every_closed_label_type() -> None:
+    facts = {"s": "x", "i": 3, "b": True, "n": None, "l": ["a", "b"], "e": []}
+    rejection = GuidedCandidateBindingRejected("m", error_code="guided_delta_authority_violation", connectivity=facts)
+    assert rejection.connectivity == facts
+
+
 def test_node_correction_rejects_an_edge_id_reusing_a_non_incident_edge_under_its_own_key() -> None:
     """The id-reuse fault ships ``reused_edge_id``, not ``edge_id``, at the production site.
 

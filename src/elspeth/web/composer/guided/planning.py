@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Any, Literal, NotRequired, TypedDict, cast
+from typing import Any, Final, Literal, NotRequired, TypedDict, cast
 from uuid import UUID, uuid4
 
 import structlog
@@ -1385,6 +1385,22 @@ def guided_unproducible_output_field_names(guided: GuidedSession) -> tuple[str, 
 # the TYPE is what refuses a nested record however it is built (final red-team,
 # elspeth-68721c71d7). Adding a mapping arm here is a change to the gate too.
 GuidedFactValue = str | int | bool | None | list[str]
+_GUIDED_FACT_SCALARS: Final[tuple[type, ...]] = (str, int, bool, type(None))
+
+
+def _require_guided_fact_value(key: str, value: object) -> GuidedFactValue:
+    """Nominally admit one fact value at construction, where the value is built.
+
+    The annotation alone does not bind a value that arrives as ``Any`` or
+    through a ``cast`` (ADR-032: validate by trust domain — exact types, no
+    subclasses), so a nested record is refused HERE however it was built,
+    before it can reach the planner untaught (final red-team, fourth round).
+    """
+    if type(value) in _GUIDED_FACT_SCALARS:
+        return cast(GuidedFactValue, value)
+    if type(value) is list and all(type(item) is str for item in value):
+        return cast(list[str], value)
+    raise AuditIntegrityError(f"guided rejection fact {key!r} is not a closed label: {type(value).__name__}")
 
 
 class GuidedCandidateBindingRejected(AuditIntegrityError):
@@ -1403,7 +1419,7 @@ class GuidedCandidateBindingRejected(AuditIntegrityError):
     def __init__(self, message: str, *, error_code: str, connectivity: Mapping[str, GuidedFactValue]) -> None:
         super().__init__(message)
         self.error_code = error_code
-        self.connectivity: dict[str, GuidedFactValue] = dict(connectivity)
+        self.connectivity: dict[str, GuidedFactValue] = {key: _require_guided_fact_value(key, value) for key, value in connectivity.items()}
 
 
 def _guided_delta_rejection(
