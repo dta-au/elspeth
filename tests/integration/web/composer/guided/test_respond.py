@@ -2299,6 +2299,98 @@ class TestStep2IntraStep:
         assert len(matching) == 1
         assert str(matching[0].id) == originating_message.message_id
 
+    def test_node_revision_carries_a_changed_prompt_to_the_successor_and_its_card(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """I-2 (design review 2026-09-02) end to end: the proposal card shows an
+        llm node's prompt before any approval; its Edit routes a node-scoped
+        correction; the planner answers with a changed prompt for that node;
+        the bound successor carries the new prompt with every withheld option
+        preserved, and the successor card publishes it. Until I-2 the llm
+        allowlist was empty, so the binder restored the predecessor's prompt
+        and a prompt revise could not land at all."""
+        initial_prompt = "Summarise this row in one short sentence."
+        revised_prompt = "Summarise this row in two sentences, keeping every number."
+        composer_service = composer_test_client.app.state.composer_service
+        monkeypatch.setattr(composer_service, "plan_guided_pipeline", _llm_prompt_template_planner(initial_prompt))
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="node-prompt-edit.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        node_target = next(candidate for candidate in payload["edit_targets"] if candidate["kind"] == "node")
+        card_node = next(node for node in payload["nodes"] if node["plugin"] == {"kind": "transform", "id": "llm"})
+        assert card_node["stable_id"] == node_target["stable_id"]
+        assert {"key": "prompt_template", "value": initial_prompt, "tier": "common"} in card_node["node_options_summary"]
+
+        captured: dict[str, object] = {}
+        replacement = _llm_prompt_template_planner(revised_prompt)
+
+        async def spy_planner(**kwargs: object) -> object:
+            captured.update(kwargs)
+            return await replacement(**kwargs)
+
+        monkeypatch.setattr(composer_service, "plan_guided_pipeline", spy_planner)
+        feedback = "Ask for two sentences and keep every number."
+
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edit_target": node_target,
+                "correction_feedback": feedback,
+            },
+        )
+
+        assert response.status_code == 200, response.json()
+        correction_target = captured["correction_target"]
+        assert correction_target.requested.kind == "node"
+        assert correction_target.requested.stable_id == node_target["stable_id"]
+        assert captured["intent"] == feedback
+        predecessor = cast(CompositionState, captured["current_state"])
+        selected_before = next(node for node in predecessor.nodes if node.id == "summarize_rows")
+        assert selected_before.options["prompt_template"] == initial_prompt
+
+        successor_turn = response.json()["next_turn"]
+        assert successor_turn["type"] == "propose_pipeline"
+        successor_payload = successor_turn["payload"]
+        assert successor_payload["supersedes_draft_hash"] == payload["draft_hash"]
+        # Stable ids are proposal-scoped labels and are reissued on the
+        # successor; the one llm node is found by its plugin.
+        successor_card_node = next(node for node in successor_payload["nodes"] if node["plugin"] == {"kind": "transform", "id": "llm"})
+        assert {"key": "prompt_template", "value": revised_prompt, "tier": "common"} in successor_card_node["node_options_summary"]
+        assert initial_prompt not in str(successor_card_node["node_options_summary"])
+
+        service = composer_test_client.app.state.session_service
+        state_record = asyncio.run(service.get_current_state(UUID(session_id)))
+        assert state_record is not None
+        guided = state_from_record(state_record).guided_session
+        assert guided is not None and guided.active_proposal is not None
+        authority = asyncio.run(
+            service.get_authoritative_pipeline_proposal(
+                session_id=UUID(session_id),
+                proposal_id=guided.active_proposal.proposal_id,
+                reviewed_facts=guided_private_reviewed_facts(guided),
+            )
+        )
+        successor = guided_candidate_state(authority.proposal)
+        selected_after = next(node for node in successor.nodes if node.id == "summarize_rows")
+        assert selected_after.options["prompt_template"] == revised_prompt
+        # Only the published key moved among the authored options; the
+        # withheld profile, response field and schema are the predecessor's,
+        # whatever the candidate carried.
+        for key in ("profile", "response_field", "schema"):
+            assert selected_after.options[key] == selected_before.options[key]
+        # The prompt review requirement follows the live prompt, so the
+        # post-commit review sees the revised instruction, never the stale one.
+        (requirement,) = selected_after.options["interpretation_requirements"]
+        assert requirement["draft"] == revised_prompt
+        assert requirement["status"] == "pending"
+
     def test_substituted_unchanged_planner_cannot_supersede_predecessor(
         self,
         composer_test_client: TestClient,

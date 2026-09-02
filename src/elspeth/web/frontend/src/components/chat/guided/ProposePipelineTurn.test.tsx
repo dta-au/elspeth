@@ -406,6 +406,121 @@ describe("ProposePipelineTurn", () => {
     ).toBeVisible();
   });
 
+  // I-2 (design review 2026-09-02): the llm node's prompt and model — the
+  // decision the user is approving — were invisible until the post-commit
+  // approval card. They render on the proposal card before any approval, and
+  // Edit routes back through the existing node-scoped revise so the planner
+  // stays the author of the change (composer invariant 1).
+  const LONG_PROMPT = Array.from(
+    { length: 12 },
+    (_, index) => `Step ${index + 1}: consider the passage carefully.`,
+  ).join("\n");
+
+  function llmPayload(overrides: Partial<ProposePipelinePayload> = {}): ProposePipelinePayload {
+    const base = payload();
+    return {
+      ...base,
+      component_counts: { sources: 0, nodes: 1, edges: 0, outputs: 0 },
+      graph: { sources: [], edges: [] },
+      nodes: [
+        {
+          stable_id: IDS.aggregation,
+          label: "node-1",
+          node_type: "transform",
+          plugin: { kind: "transform", id: "llm" },
+          behavior: { kind: "transform" },
+          node_options_summary: [
+            { key: "model", value: "anthropic/claude-sonnet-4", tier: "common" },
+            { key: "system_prompt", value: "You are a careful reviewer.", tier: "common" },
+            { key: "prompt_template", value: LONG_PROMPT, tier: "common" },
+          ],
+        },
+      ],
+      outputs: [],
+      edit_targets: [{ kind: "node", stable_id: IDS.aggregation }],
+      ...overrides,
+    };
+  }
+
+  it("shows the llm node's model and prompts before approval, long prompt collapsed to its first lines", async () => {
+    const user = userEvent.setup();
+    render(<ProposePipelineTurn payload={llmPayload()} reviewState={activeReview()} onSubmit={vi.fn()} />);
+
+    expect(screen.getByText("Model: anthropic/claude-sonnet-4")).toBeVisible();
+    expect(screen.getByText(/You are a careful reviewer\./)).toBeVisible();
+    expect(screen.getByText(/Step 1: consider the passage carefully\./)).toBeVisible();
+    // Not detail-level gated: a decision input, not technical detail.
+    expect(screen.getByText(/Step 1: consider/).closest("details")).toBeNull();
+    expect(screen.queryByText(/Step 12: consider/)).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Show full prompt for node-1" }));
+    expect(screen.getByText(/Step 12: consider the passage carefully\./)).toBeVisible();
+  });
+
+  it("Edit on the prompt pre-targets that node in the revise flow and submits a node-scoped revise", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    render(<ProposePipelineTurn payload={llmPayload()} reviewState={activeReview()} onSubmit={onSubmit} />);
+
+    await user.click(screen.getByRole("button", { name: "Edit prompt for node-1" }));
+    const feedback = screen.getByRole("textbox", { name: "What should change?" });
+    expect(feedback).toHaveFocus();
+    expect(screen.getByText("Revision for")).toHaveTextContent("Revision for node-1");
+    await user.type(feedback, "Ask for a two-sentence summary instead of one.");
+    await user.click(screen.getByRole("button", { name: "Send revision request" }));
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit).toHaveBeenCalledWith({
+      chosen: null,
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: IDS.proposal,
+      draft_hash: "d".repeat(64),
+      edit_target: { kind: "node", stable_id: IDS.aggregation },
+      correction_feedback: "Ask for a two-sentence summary instead of one.",
+      control_signal: null,
+    });
+  });
+
+  it("disables Edit while the review controls are locked, like the Revise buttons it opens", () => {
+    render(
+      <ProposePipelineTurn
+        payload={llmPayload()}
+        reviewState={{ ...activeReview(), status: "submitting" }}
+        onSubmit={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Edit prompt for node-1" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Revise node-1" })).toBeDisabled();
+  });
+
+  it("withholds Edit where no node revise target exists or the revise flow is hidden (tutorial)", () => {
+    const { rerender } = render(
+      <ProposePipelineTurn
+        payload={llmPayload({ edit_targets: [] })}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Model: anthropic/claude-sonnet-4")).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Edit prompt/ })).toBeNull();
+
+    // The tutorial hides Reject/Revise today (slice F, step 3.2, will stop
+    // hiding them); the prompt itself is NOT tutorial-special — it still
+    // shows (ADR-031). Only the Edit that would open the hidden flow is
+    // withheld alongside it.
+    rerender(
+      <ProposePipelineTurn
+        payload={llmPayload({ supersedes_draft_hash: "e".repeat(64) })}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+        isTutorial
+      />,
+    );
+    expect(screen.getByText("Model: anthropic/claude-sonnet-4")).toBeVisible();
+    expect(screen.getByText(/Step 1: consider the passage carefully\./)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Edit prompt/ })).toBeNull();
+  });
+
   it("renders row_union as a distinct N-to-N barrier with its own success flow and honest copy", () => {
     const rowUnionPayload = payload();
     rowUnionPayload.nodes[3] = {

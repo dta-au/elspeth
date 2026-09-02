@@ -15,8 +15,8 @@ import type {
 } from "@/types/guided";
 import { behaviorSummary, gateSummary } from "./behaviorSummary";
 import { flowLabel, routeKeysByAlias } from "./guidedGraphProjection";
+import { NodeOptionsSummary } from "./nodeOptionDisplay";
 import { optionTier } from "./optionTiers";
-import { nodeOptionText } from "./WireStageTurn";
 import { WireReviewList, type WireReviewItem } from "./WireReviewList";
 
 interface ProposePipelineTurnProps {
@@ -135,6 +135,20 @@ export function ProposePipelineTurn({
   const [revisionFeedback, setRevisionFeedback] = useState(
     retainedCorrection?.correction_feedback ?? "",
   );
+  // "Edit prompt" on an llm row (I-2) opens the SAME node-scoped revise the
+  // "Revise <node>" button opens — pre-targeted — and hands focus to the
+  // feedback field once it has mounted. The planner re-plans the node from
+  // that feedback; there is no local prompt editor (composer invariant 1).
+  const revisionFeedbackRef = useRef<HTMLTextAreaElement | null>(null);
+  const focusRevisionFeedbackOnMount = useRef(false);
+  useEffect(() => {
+    if (focusRevisionFeedbackOnMount.current && revisionFeedbackRef.current !== null) {
+      focusRevisionFeedbackOnMount.current = false;
+      revisionFeedbackRef.current.focus();
+    }
+  }, [revisionTarget]);
+  const nodeReviseTarget = (stableId: string): GuidedEditTarget | null =>
+    payload.edit_targets.find((target) => target.kind === "node" && target.stable_id === stableId) ?? null;
   const labelById = useMemo(() => {
     const labels = new Map<string, string>();
     for (const source of payload.graph.sources) labels.set(source.stable_id, source.label);
@@ -288,12 +302,32 @@ export function ProposePipelineTurn({
                   options say what this one actually does. Advanced-tier pairs
                   are gated on show_advanced (elspeth-ca456d9d8d) — this list
                   has no per-row disclosure, so a plain gate, not a new
-                  surface, is the honest form of "debug mode expands". */}
-              {node.node_options_summary
-                .filter((entry) => showAdvanced || optionTier(entry) !== "advanced")
-                .map((entry) => (
-                  <p key={entry.key}>{nodeOptionText(entry)}</p>
-                ))}
+                  surface, is the honest form of "debug mode expands". An llm
+                  node's model and prompts are common-tier (I-2): the decision
+                  being approved, never gated. Its Edit opens the node revise
+                  below; withheld with the rest of the revise flow in the
+                  tutorial (step 3.2 un-hides them together). */}
+              {(() => {
+                const reviseTarget = isTutorial ? null : nodeReviseTarget(node.stable_id);
+                return (
+                  <NodeOptionsSummary
+                    entries={node.node_options_summary.filter(
+                      (entry) => showAdvanced || optionTier(entry) !== "advanced",
+                    )}
+                    nodeLabel={node.label}
+                    onEdit={
+                      reviseTarget === null
+                        ? undefined
+                        : () => {
+                            setRevisionTarget(reviseTarget);
+                            setRevisionFeedback("");
+                            focusRevisionFeedbackOnMount.current = true;
+                          }
+                    }
+                    editDisabled={reviseTarget !== null && !revisionTargetEnabled(reviseTarget)}
+                  />
+                );
+              })()}
             </li>
           ))}
           {payload.outputs.map((output) => (
@@ -462,6 +496,7 @@ export function ProposePipelineTurn({
                 </label>
                 <textarea
                   id={revisionFeedbackId}
+                  ref={revisionFeedbackRef}
                   className="wire-stage__correction-input"
                   rows={2}
                   value={revisionFeedback}

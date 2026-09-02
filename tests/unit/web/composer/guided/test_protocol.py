@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from uuid import UUID
 
 import pytest
+from annotated_types import MaxLen
 
+from elspeth.contracts.freeze import deep_freeze
 from elspeth.web.composer.guided.protocol import (
+    _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE,
+    _MAX_NODE_OPTION_SUMMARY_VALUE,
     _NODE_OPTION_SUMMARY_ALLOWLIST,
     _NODE_OPTION_SUMMARY_RENDERERS,
     ComponentReviewPayload,
@@ -23,9 +28,11 @@ from elspeth.web.composer.guided.protocol import (
     TurnType,
     _node_options_summary_error,
     node_options_summary,
+    public_node_option_keys,
     validate_current_turn,
     validate_payload,
 )
+from elspeth.web.sessions.schemas import InterpretationEventResponse
 
 
 def test_every_allowlisted_node_option_has_a_renderer() -> None:
@@ -932,3 +939,141 @@ def test_node_options_summary_error_admits_the_pre_tier_pair_shape() -> None:
     assert _node_options_summary_error(new, "p", plugin="field_mapper") is None
     bad = [{"key": "mapping", "value": "a → b", "tier": "loud"}]
     assert _node_options_summary_error(bad, "p", plugin="field_mapper") is not None
+
+
+# ── I-2: the llm node's prompt and model reach the card before commit ────────
+
+
+_LLM_OPTIONS: dict[str, Any] = {
+    "schema": {"mode": "observed"},
+    "provider": "openrouter",
+    "model": "anthropic/claude-sonnet-4",
+    "system_prompt": "You are a careful reviewer.",
+    "prompt_template": "Summarise {{ row.body }} in one sentence.",
+    "temperature": 0.7,
+    "api_key": "sk-live-SECRET",
+    "base_url": "https://gateway.internal/v1",
+    "prompt_template_source": "/private/prompts/summarise.j2",
+    "system_prompt_source": "/private/prompts/system.txt",
+    # Nothing shaped like row data may reach the summary, whatever key a
+    # caller smuggles it under (reframe epic D1: the verification surface is
+    # the graph, never sample output).
+    "observed": {"samples": [{"body": "ROW-SAMPLE-TEXT"}]},
+    "samples": ["ROW-SAMPLE-TEXT"],
+}
+
+
+def test_llm_summary_publishes_the_model_and_prompts_and_nothing_adjacent() -> None:
+    """The single most consequential decision on a proposal — what the model is
+    asked to do — was invisible until after Confirm wiring (design review
+    2026-09-02, I-2). The llm allowlist carries exactly the decision inputs;
+    credentials, endpoints, file-path sources, sampling knobs and row samples
+    stay private."""
+    summary = node_options_summary("llm", _LLM_OPTIONS)
+
+    assert summary == [
+        {"key": "model", "value": "anthropic/claude-sonnet-4", "tier": "common"},
+        {"key": "system_prompt", "value": "You are a careful reviewer.", "tier": "common"},
+        {"key": "prompt_template", "value": "Summarise {{ row.body }} in one sentence.", "tier": "common"},
+    ]
+    rendered = str(summary)
+    for private in ("sk-live", "gateway.internal", "/private/", "ROW-SAMPLE-TEXT", "0.7", "openrouter"):
+        assert private not in rendered
+    assert _node_options_summary_error(summary, "p", plugin="llm") is None
+    # The same closed key set is the only authority a node-scoped revise may
+    # overlay onto the reviewed node — this is what lets the card's Edit route
+    # the prompt back through the planner instead of a local editor.
+    assert public_node_option_keys("llm") == frozenset({"model", "system_prompt", "prompt_template"})
+
+
+def test_llm_summary_skips_absent_empty_or_non_string_values() -> None:
+    summary = node_options_summary("llm", {"prompt_template": "Rate {{ row.text }}", "model": None, "system_prompt": 7})
+    assert summary == [{"key": "prompt_template", "value": "Rate {{ row.text }}", "tier": "common"}]
+    assert node_options_summary("llm", {"prompt_template": "", "model": "   "}) == []
+    assert node_options_summary("llm", {"temperature": 0.2}) == []
+
+
+def test_llm_prompt_summary_reuses_the_approval_card_bound() -> None:
+    """One redaction boundary, not two: the prompt reaches the proposal card
+    under the bound the post-commit approval card already publishes it at
+    (``InterpretationEventResponse.llm_draft``). Past that bound the text is
+    cut with an explicit count — never silently — because it is the thing the
+    user is approving."""
+    llm_draft_bound = next(
+        constraint.max_length
+        for constraint in InterpretationEventResponse.model_fields["llm_draft"].metadata
+        if isinstance(constraint, MaxLen)
+    )
+    assert llm_draft_bound == _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE
+    assert _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE > _MAX_NODE_OPTION_SUMMARY_VALUE
+
+    exact = "p" * llm_draft_bound
+    summary = node_options_summary("llm", {"prompt_template": exact, "system_prompt": exact})
+    assert [entry["value"] for entry in summary] == [exact, exact]
+    assert _node_options_summary_error(summary, "p", plugin="llm") is None
+
+    over = "".join(chr(ord("a") + (index % 26)) for index in range(llm_draft_bound + 1))
+    summary = node_options_summary("llm", {"prompt_template": over})
+    value = summary[0]["value"]
+    assert len(value) <= llm_draft_bound
+    marker = re.search(r"… \((\d+) more characters not shown\)$", value)
+    assert marker is not None
+    shown = value[: marker.start()]
+    assert over.startswith(shown)
+    assert len(shown) + int(marker.group(1)) == len(over)
+    assert _node_options_summary_error(summary, "p", plugin="llm") is None
+
+
+def test_web_scrape_summary_publishes_only_the_scraping_identity() -> None:
+    """The responsible-scraping declarations are the material of the post-commit
+    ``web_scrape_http_identity`` review, so they reach the card before commit
+    (I-2). The lowered knob is the whole ``http`` object; only the contact and
+    reason are rendered — the SSRF allowlist, timeout and body cap stay private."""
+    options = {
+        "url_field": "url",
+        "http": {
+            "abuse_contact": "ops@example.org",
+            "scraping_reason": "catalogue refresh",
+            "allowed_hosts": ["10.0.0.0/8"],
+            "timeout": 5,
+            "max_body_bytes": 1024,
+        },
+    }
+    summary = node_options_summary("web_scrape", options)
+
+    assert summary == [{"key": "http", "value": "contact: ops@example.org; reason: catalogue refresh", "tier": "common"}]
+    rendered = str(summary)
+    for private in ("10.0.0.0", "1024", "url_field", "allowed"):
+        assert private not in rendered
+    assert _node_options_summary_error(summary, "p", plugin="web_scrape") is None
+    assert public_node_option_keys("web_scrape") == frozenset({"http"})
+
+    # A missing, empty or non-string member is omitted, never defaulted; both
+    # missing renders to no pair at all; a non-mapping http renders nothing.
+    assert node_options_summary("web_scrape", {"http": {"abuse_contact": "ops@example.org", "scraping_reason": 7}}) == [
+        {"key": "http", "value": "contact: ops@example.org", "tier": "common"}
+    ]
+    assert node_options_summary("web_scrape", {"http": {"abuse_contact": "  ", "allowed_hosts": "public_only"}}) == []
+    assert node_options_summary("web_scrape", {"http": "ops@example.org"}) == []
+    assert node_options_summary("web_scrape", {}) == []
+    # The replay path hands the projection a deep-frozen proposal: the http
+    # object arrives as a MappingProxyType and renders identically.
+    assert node_options_summary("web_scrape", deep_freeze(options)) == summary
+    # Bounded like every short text.
+    long_reason = "r" * 400
+    value = node_options_summary("web_scrape", {"http": {"scraping_reason": long_reason}})[0]["value"]
+    assert len(value) == _MAX_NODE_OPTION_SUMMARY_VALUE and value.endswith("…")
+
+
+def test_node_options_summary_error_bounds_each_key_at_its_own_limit() -> None:
+    prompt_bound = _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE
+    short_bound = _MAX_NODE_OPTION_SUMMARY_VALUE
+    # A prompt-sized value is accepted only under a prompt key of the llm plugin.
+    assert _node_options_summary_error([{"key": "prompt_template", "value": "x" * prompt_bound}], "p", plugin="llm") is None
+    assert _node_options_summary_error([{"key": "system_prompt", "value": "x" * prompt_bound}], "p", plugin="llm") is None
+    assert _node_options_summary_error([{"key": "prompt_template", "value": "x" * (prompt_bound + 1)}], "p", plugin="llm") is not None
+    assert _node_options_summary_error([{"key": "model", "value": "x" * (short_bound + 1)}], "p", plugin="llm") is not None
+    assert _node_options_summary_error([{"key": "mapping", "value": "x" * (short_bound + 1)}], "p", plugin="field_mapper") is not None
+    # The llm keys are outside every other plugin's allowlist.
+    assert _node_options_summary_error([{"key": "prompt_template", "value": "x"}], "p", plugin="field_mapper") is not None
+    assert _node_options_summary_error([{"key": "prompt_template", "value": "x"}], "p", plugin=None) is not None

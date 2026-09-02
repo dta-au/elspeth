@@ -9,6 +9,7 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any, Literal, NotRequired, TypedDict, cast
 from uuid import UUID
 
@@ -312,14 +313,16 @@ class ProposePipelinePayload(TypedDict):
     """Redacted display/audit projection of a durable pipeline proposal.
 
     This projection is deliberately non-executable: it contains only
-    catalog-authoritative plugin identities, never component names, prompts,
-    paths, inline content, secret references, or model-authored rationale.
-    Exact canonical arguments remain in private proposal custody. The sole
-    authored values it publishes are the ones a human must see to accept the
-    proposal at all, each drawn from a closed server-owned allowlist: gate
-    behavior (the predicate and its trigger thresholds) and, per
+    catalog-authoritative plugin identities, never component names, paths,
+    inline content, secret references, or model-authored rationale. Exact
+    canonical arguments remain in private proposal custody. The sole authored
+    values it publishes are the ones a human must see to accept the proposal
+    at all, each drawn from a closed server-owned allowlist: gate behavior
+    (the predicate and its trigger thresholds) and, per
     ``_NODE_OPTION_SUMMARY_ALLOWLIST``, a node's key options rendered as
-    display text. Everything outside those allowlists stays private.
+    display text — including an llm node's model and prompts and a web_scrape
+    node's scraping identity, which are the decision the user is approving
+    (I-2). Everything outside those allowlists stays private.
     Human copy is selected from exact server-owned template ids; structural
     labels are deterministic ordinals rather than canonical route, branch, or
     component names. Task 4 must validate catalog and private-proposal
@@ -861,9 +864,43 @@ def proposal_structural_label(kind: Literal["route", "branch"], index: int) -> s
 # entry to the lowering.
 _NODE_OPTION_SUMMARY_ALLOWLIST: Mapping[str, Mapping[str, FieldTier]] = {
     "field_mapper": {"mapping": "common", "select_only": "common"},
+    # The llm node's decision inputs (design review 2026-09-02, I-2): what
+    # the model is asked to do was invisible until the post-commit approval
+    # card, so the learner approved a pipeline whose most consequential
+    # authored value they had never seen. Model, system prompt and prompt
+    # template are planner-authored text, not row data; the adjacent
+    # credentials, endpoints, ``*_source`` file paths and sampling knobs stay
+    # private. Order is display order: model first, then the prompts.
+    "llm": {"model": "common", "system_prompt": "common", "prompt_template": "common"},
+    # web_scrape's responsible-scraping identity (same review, I-2): the
+    # abuse contact and scraping reason are wire-visible headers and the
+    # material of the post-commit ``web_scrape_http_identity`` decision, so
+    # they belong on the card before commit too. The lowered knob is the
+    # ``http`` object; its renderer publishes ONLY those two declarations —
+    # the SSRF host allowlist, timeout and body cap stay private.
+    "web_scrape": {"http": "common"},
 }
 _MAX_NODE_OPTION_SUMMARY_PAIRS = 20
 _MAX_NODE_OPTION_SUMMARY_VALUE = 240
+# The prompt keys reach the card under the SAME bound the post-commit approval
+# card already publishes the prompt at — ``InterpretationEventResponse.llm_draft``
+# (sessions/schemas.py, max_length=8192) — so the projection reuses that
+# boundary rather than adding a second one; the parity is pinned by
+# tests/unit/web/composer/guided/test_protocol.py.
+_MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE = 8_192
+# Room reserved at the tail of a cut prompt for the honest "… (N more
+# characters not shown)" marker: the text is what the user is approving, so
+# it is never cut silently.
+_NODE_OPTION_SUMMARY_PROMPT_MARKER_RESERVE = 64
+_NODE_OPTION_SUMMARY_PROMPT_KEYS = frozenset({"prompt_template", "system_prompt"})
+
+
+def _node_option_summary_value_bound(key: str) -> int:
+    """The rendered-length bound for one allowlisted option key."""
+
+    return _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE if key in _NODE_OPTION_SUMMARY_PROMPT_KEYS else _MAX_NODE_OPTION_SUMMARY_VALUE
+
+
 # The two accepted projected-pair shapes: fresh projections always carry
 # ``tier``, durable turns written before it landed do not.
 _NODE_OPTION_SUMMARY_PAIR_KEYS = frozenset({"key", "value"})
@@ -917,9 +954,62 @@ def _rendered_select_only(value: object) -> str:
     return ""
 
 
+def _rendered_short_text(value: object) -> str:
+    """Render an exact-string scalar (the llm ``model``) verbatim, bounded."""
+
+    if type(value) is not str or not value.strip():
+        return ""
+    if len(value) > _MAX_NODE_OPTION_SUMMARY_VALUE:
+        return value[: _MAX_NODE_OPTION_SUMMARY_VALUE - 1] + "…"
+    return value
+
+
+def _rendered_prompt_text(value: object) -> str:
+    """Render a prompt verbatim up to the approval card's bound.
+
+    Past the bound the text is cut with an explicit remaining-character count:
+    the prompt is the thing the user is approving, so a silent cut would show
+    them a different instruction than the one the pipeline will run.
+    """
+
+    if type(value) is not str or not value.strip():
+        return ""
+    if len(value) <= _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE:
+        return value
+    shown = value[: _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE - _NODE_OPTION_SUMMARY_PROMPT_MARKER_RESERVE]
+    return f"{shown}… ({len(value) - len(shown)} more characters not shown)"
+
+
+def _rendered_scrape_identity(value: object) -> str:
+    """Render web_scrape's ``http`` identity as "contact: …; reason: …".
+
+    Only the two responsible-scraping declarations are published; every other
+    member of the ``http`` mapping (the SSRF host allowlist, timeout, body cap)
+    is private. A member that is absent, empty or not an exact string is
+    omitted rather than defaulted, and both missing renders to nothing.
+    """
+
+    # Exact types, not an ABC test: the value is either the planner's JSON
+    # object (a dict) or the same object deep-frozen for replay
+    # (contracts/freeze.py renders every mapping as MappingProxyType). Those
+    # are the only two producers, so the exact-type idiom IS exact here.
+    if type(value) is not dict and type(value) is not MappingProxyType:
+        return ""
+    parts: list[str] = []
+    for member, label in (("abuse_contact", "contact"), ("scraping_reason", "reason")):
+        text = value[member] if member in value else None
+        if type(text) is str and text.strip():
+            parts.append(f"{label}: {text.strip()}")
+    return _rendered_short_text("; ".join(parts))
+
+
 _NODE_OPTION_SUMMARY_RENDERERS: Mapping[str, Callable[[object], str]] = {
     "mapping": _rendered_mapping,
     "select_only": _rendered_select_only,
+    "model": _rendered_short_text,
+    "system_prompt": _rendered_prompt_text,
+    "prompt_template": _rendered_prompt_text,
+    "http": _rendered_scrape_identity,
 }
 
 
@@ -1004,7 +1094,7 @@ def _node_options_summary_error(value: object, path: str, *, plugin: str | None)
         seen.add(pair["key"])
         if (error := _current_text_error(pair["value"], f"{item_path}.value", nonempty=True)) is not None:
             return error
-        if len(cast(str, pair["value"])) > _MAX_NODE_OPTION_SUMMARY_VALUE:
+        if len(cast(str, pair["value"])) > _node_option_summary_value_bound(cast(str, pair["key"])):
             return f"{item_path}.value exceeds the bounded option summary length"
     return None
 

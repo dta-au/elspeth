@@ -2312,6 +2312,59 @@
   overflow-wrap: anywhere;
 }
 
+/* ── Node option summary (nodeOptionDisplay.tsx, I-2) ────────────────────────
+   One rendering shared by the proposal card's component rows and the
+   wire-stage rows. Knob pairs stay plain lines. An llm node's prompts are the
+   instruction the user is approving: pre-wrapped (line structure is part of
+   what is approved), quoted with a rule, first lines visible behind a compact
+   expand control, and ONE compact Edit that opens the existing revise /
+   correction form pre-targeted at the node. */
+.guided-node-options {
+  display: grid;
+  gap: var(--space-xs);
+  min-width: 0;
+  margin-top: var(--space-xs);
+}
+
+.guided-node-options > p,
+.guided-node-options__actions {
+  margin: 0;
+}
+
+.guided-node-prompt {
+  display: grid;
+  gap: var(--space-xs);
+  min-width: 0;
+}
+
+.guided-node-prompt__text {
+  margin: 0;
+  padding: var(--space-sm) var(--space-md);
+  border-left: 3px solid var(--color-border-strong);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  background-color: var(--color-surface-elevated);
+  color: var(--color-text);
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.guided-node-prompt__label {
+  font-weight: 600;
+}
+
+.guided-node-prompt__toggle,
+.guided-node-options__edit {
+  justify-self: start;
+}
+
+.guided-node-options__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+}
+
 .guided-readonly-graph {
   width: 100%;
   min-width: 0;

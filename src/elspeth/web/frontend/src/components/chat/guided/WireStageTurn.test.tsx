@@ -342,6 +342,58 @@ describe("WireStageTurn", () => {
     expect(screen.getByText("Select only: only the mapped fields are kept")).toBeInTheDocument();
   });
 
+  // I-2 (design review 2026-09-02): the llm node's prompt and model render on
+  // the wire card before Confirm wiring, ungated, and Edit pre-selects that
+  // node in the existing correction form (the planner re-plans it).
+  const LONG_PROMPT = Array.from(
+    { length: 12 },
+    (_, index) => `Step ${index + 1}: consider the passage carefully.`,
+  ).join("\n");
+
+  function llmData(): WireStageData {
+    const base = canonicalData();
+    return {
+      ...base,
+      nodes: [{
+        ...base.nodes[0],
+        plugin: "llm",
+        node_options_summary: [
+          { key: "model", value: "anthropic/claude-sonnet-4", tier: "common" },
+          { key: "system_prompt", value: "You are a careful reviewer.", tier: "common" },
+          { key: "prompt_template", value: LONG_PROMPT, tier: "common" },
+        ],
+      }],
+    };
+  }
+
+  it("shows the llm node's model and prompts before Confirm wiring, outside the Technical details disclosure", async () => {
+    render(<WireStageTurn data={llmData()} onConfirm={vi.fn()} confirmDisabled={false} />);
+
+    expect(screen.getByText("Model: anthropic/claude-sonnet-4").closest("details")).toBeNull();
+    expect(screen.getByText(/You are a careful reviewer\./).closest("details")).toBeNull();
+    expect(screen.getByText(/Step 1: consider the passage carefully\./).closest("details")).toBeNull();
+    expect(screen.queryByText(/Step 12: consider/)).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Show full prompt for node-1" }));
+    expect(screen.getByText(/Step 12: consider the passage carefully\./)).toBeInTheDocument();
+    // No correction path offered → no Edit.
+    expect(screen.queryByRole("button", { name: /Edit prompt/ })).toBeNull();
+  });
+
+  it("Edit on the prompt selects that node in the correction form and the request targets it", async () => {
+    const onCorrect = vi.fn();
+    render(<WireStageTurn data={llmData()} onConfirm={vi.fn()} confirmDisabled={false} onCorrect={onCorrect} />);
+
+    // The form starts on the first target (the source); Edit moves it.
+    expect(screen.getByLabelText("Component")).toHaveValue(SOURCE_ID);
+    await userEvent.click(screen.getByRole("button", { name: "Edit prompt for node-1" }));
+    expect(screen.getByLabelText("Component")).toHaveValue(NODE_ID);
+    const feedback = screen.getByLabelText("What should change?");
+    expect(feedback).toHaveFocus();
+    await userEvent.type(feedback, "Ask for a two-sentence summary.");
+    await userEvent.click(screen.getByRole("button", { name: "Re-plan wiring" }));
+    expect(onCorrect).toHaveBeenCalledWith({ kind: "node", stable_id: NODE_ID }, "Ask for a two-sentence summary.");
+  });
+
   it("reports a missing contract without asserting why it is missing", async () => {
     // A null schema_contract is cause-free on the wire: it can mean nothing was
     // required, but equally an ADR-007 producer abstention, an error-continue

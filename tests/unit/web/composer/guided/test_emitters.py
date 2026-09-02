@@ -683,6 +683,67 @@ class TestStep4WireEmitter:
             {"key": "select_only", "value": "unmapped fields pass through", "tier": "common"},
         ]
 
+    def test_llm_options_summary_carries_model_and_prompts_before_commit(self) -> None:
+        # I-2 (design review 2026-09-02): the wire card must show what the
+        # model is asked to do; the prompt was invisible until the post-commit
+        # approval card. Nothing adjacent — credentials, endpoints, prompt file
+        # paths, sampling knobs — and nothing row-shaped (D1) rides along.
+        turn = _wire_turn(
+            _field_mapper_state(
+                plugin="llm",
+                options={
+                    "schema": {"mode": "observed"},
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-sonnet-4",
+                    "system_prompt": "You are a careful reviewer.",
+                    "prompt_template": "Summarise {{ row.body }} in one sentence.",
+                    "temperature": 0.7,
+                    "api_key": "sk-live-SECRET",
+                    "base_url": "https://gateway.internal/v1",
+                    "prompt_template_source": "/private/prompts/summarise.j2",
+                    "observed": {"samples": [{"body": "ROW-SAMPLE-TEXT"}]},
+                },
+            )
+        )
+
+        node = next(node for node in turn["payload"]["nodes"] if node["plugin"] == "llm")
+        assert node["node_options_summary"] == [
+            {"key": "model", "value": "anthropic/claude-sonnet-4", "tier": "common"},
+            {"key": "system_prompt", "value": "You are a careful reviewer.", "tier": "common"},
+            {"key": "prompt_template", "value": "Summarise {{ row.body }} in one sentence.", "tier": "common"},
+        ]
+        rendered = str(turn)
+        for private in ("sk-live", "gateway.internal", "/private/", "ROW-SAMPLE-TEXT", "0.7"):
+            assert private not in rendered
+        assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
+
+    def test_web_scrape_options_summary_carries_only_the_scraping_identity(self) -> None:
+        # I-2: the abuse contact and scraping reason are the post-commit
+        # identity review's material; they show before commit. The rest of
+        # the http policy (SSRF allowlist, timeout, body cap) stays private.
+        turn = _wire_turn(
+            _field_mapper_state(
+                plugin="web_scrape",
+                options={
+                    "schema": {"mode": "observed"},
+                    "url_field": "url",
+                    "http": {
+                        "abuse_contact": "ops@example.org",
+                        "scraping_reason": "catalogue refresh",
+                        "allowed_hosts": ["10.0.0.0/8"],
+                        "timeout": 5,
+                    },
+                },
+            )
+        )
+
+        node = next(node for node in turn["payload"]["nodes"] if node["plugin"] == "web_scrape")
+        assert node["node_options_summary"] == [
+            {"key": "http", "value": "contact: ops@example.org; reason: catalogue refresh", "tier": "common"},
+        ]
+        assert "10.0.0.0" not in str(turn)
+        assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
+
     def test_options_summary_is_empty_for_a_plugin_outside_the_allowlist(self) -> None:
         turn = _wire_turn(
             _field_mapper_state(
