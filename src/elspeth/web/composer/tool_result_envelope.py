@@ -7,9 +7,15 @@ subset of these. ``tests/unit/web/composer/test_tool_result_envelope_gate.py``
 pins all three against this module from the AST and the live objects, so a key
 added in one place and not the others turns the tree red (elspeth-e405ad7cd2).
 
-This module imports nothing from ``elspeth.web``: both ``redaction`` and
-``tools/_common`` import it, and ``tools/__init__`` imports ``_dispatch``, which
-imports ``redaction`` — so the registry cannot live under ``tools/``.
+This module imports nothing from ``elspeth.web``: its production importers
+include ``redaction`` and ``tools/_common`` (grep for the module name before
+trusting any list of them — a stale enumeration here is the same drift this
+registry exists to close), and ``tools/__init__`` imports ``_dispatch``, which
+imports ``redaction`` — so the registry cannot live under ``tools/``. The gate
+is the ONLY thing making the registry true: a consumer that reads these keys
+but is not walked by the gate is unpinned by construction, and a skip or
+narrowing of the gate reverts every derivation to an unverified "mirrors"
+comment (systems-seat shape ledger, elspeth-e405ad7cd2).
 """
 
 from __future__ import annotations
