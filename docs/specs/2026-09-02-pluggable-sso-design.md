@@ -1,7 +1,7 @@
 # Pluggable SSO and identity substrate — backend-for-frontend login for Entra, VANguard, Google, and generic OIDC
 
-Date: 2026-09-02. Status: design, revision 2.3, implementation plan = tracker milestone elspeth-07cd19ba73.
-Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**.
+Date: 2026-09-02. Status: design, revision 2.4, implementation plan = tracker milestone elspeth-07cd19ba73.
+Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**.
 Branch: `release/0.8.0`.
 Revision 2 incorporates six independent reviews (security architecture,
 solution design, reality check against the tree, systems risk, functional
@@ -95,7 +95,19 @@ One frozen dataclass per IdP. A profile declares:
 Literal (contracts import nothing above them, and a Literal cannot be
 computed). The registry asserts parity at import:
 `frozenset(profile names) | {"local"} == frozenset(get_args(AuthProviderType))`.
-Adding an IdP is a deliberate edit to an L0 contract. `EntraAuthProvider`
+Adding an IdP is a deliberate edit to an L0 contract.
+
+**Operator selection [rev2.4].** `WebSettings.auth_provider` is the only
+selector: it names one registered profile, and every other `sso_*` field is
+that profile's configuration for this container. The build carries no
+credentials; the profile carries no deployment facts. The settings
+validator rejects a value with no registered profile by naming the
+registered profiles in the error, readiness reports the active profile
+name and each missing `required_settings` field by name, and
+`GET /api/auth/config` returns the active `provider`. Switching a container
+from one IdP to another is a config change and a restart, never a build.
+
+`EntraAuthProvider`
 is deleted; its tenant check moves into the Entra profile and is re-declared
 `@trust_boundary` there with its own `test_ref`. Group and role extraction,
 including the group-overage fail-closed, is dropped (D17): IdP groups are
