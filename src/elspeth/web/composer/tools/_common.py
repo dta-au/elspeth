@@ -919,7 +919,7 @@ def _require_validation_guidance(value: object) -> None:
     if value is None:
         return
     mapping = _exact_mapping(value)
-    if mapping is None or _exact_mapping(mapping.get("codes")) is None:
+    if mapping is None or "codes" not in mapping or _exact_mapping(mapping["codes"]) is None:
         raise AuditIntegrityError("ToolResult.validation_guidance must carry a 'codes' mapping")
 
 
