@@ -5,11 +5,6 @@ import {
   respondGuided,
 } from "@/api/client";
 import { ChatPanel } from "@/components/chat/ChatPanel";
-import { PipelineValidationSummary } from "@/components/chat/guided/PipelineValidationSummary";
-import { ArtifactWorkspace } from "@/components/workspace/ArtifactWorkspace";
-import { ComposerWorkspace } from "@/components/workspace/ComposerWorkspace";
-import { WorkspaceActionBar } from "@/components/workspace/WorkspaceActionBar";
-import { WorkspaceInspector } from "@/components/workspace/WorkspaceInspector";
 import {
   EXIT_TO_FREEFORM_ACTION,
   useSessionStore,
@@ -26,6 +21,7 @@ import {
   TUTORIAL_SOURCE_PROMPT,
   TUTORIAL_TRANSFORMS_PROMPT,
 } from "./tutorialMachine";
+import { TutorialWorkspaceFrame } from "./TutorialWorkspaceFrame";
 
 /**
  * The per-stage prelocked prompts the passive learner Sends verbatim, one per
@@ -114,8 +110,8 @@ export function TutorialGuidedShell({
   // event writer boundary validates nodes against the committed state), so a
   // completed session may still carry unresolved reviews. The completion
   // handoff below defers while any remain: handing off immediately would
-  // mount the run turn — which auto-fires POST /tutorial/run — and the run
-  // 409s (tutorial_interpretations_pending) with the guided surface already
+  // mount the run turn, and the learner's Run click would then 409
+  // (tutorial_interpretations_pending) with the guided surface already
   // unmounted, leaving nothing that can resolve the cards. The learner
   // resolves them on the completion surface (the review-before-run teaching
   // moment); draining the last one releases the run.
@@ -260,63 +256,43 @@ export function TutorialGuidedShell({
   const bookends = guidedSession?.profile?.bookends ?? true;
 
   return (
-    <section
-      className="tutorial-guided-shell"
-      aria-label="Guided pipeline composer"
-    >
-      <ComposerWorkspace
-        authoring={
-          <div className="tutorial-guided-authoring">
-            {bookends && (
-              <p className="tutorial-kicker">
-                Let's build your first pipeline one stage at a time.
-              </p>
-            )}
-            <p role="status" className="sr-only">
-              {starting ? "Starting guided composer" : ""}
+    <TutorialWorkspaceFrame ariaLabel="Guided pipeline composer">
+      <div className="tutorial-guided-authoring">
+        {bookends && (
+          <p className="tutorial-kicker">
+            Let's build your first pipeline one stage at a time.
+          </p>
+        )}
+        <p role="status" className="sr-only">
+          {starting ? "Starting guided composer" : ""}
+        </p>
+        {error !== null && (
+          <p role="alert" className="tutorial-error">
+            {error}
+          </p>
+        )}
+        {sampleUrls !== null ? (
+          // Gate the wizard on the resolved URLs: the locked STEP_1 prompt must
+          // carry them so the source driver can parse the runtime-served
+          // addresses. The box is read-only in tutorial mode (ChatPanel's
+          // lockedChatPrompt), so the only learner action — Send — is never
+          // exposed with a URL-less prompt.
+          <ChatPanel
+            isTutorial
+            lockedChatPrompt={buildLockedPrompts(sampleUrls)}
+          />
+        ) : (
+          error === null && (
+            // Plain text, NOT role="status": the sr-only "Starting guided
+            // composer" status above already announces this loading phase;
+            // a second live region would double-announce.
+            <p className="tutorial-sample-loading">
+              Preparing the tutorial's sample pages…
             </p>
-            {error !== null && (
-              <p role="alert" className="tutorial-error">
-                {error}
-              </p>
-            )}
-            {sampleUrls !== null ? (
-              // Gate the wizard on the resolved URLs: the locked STEP_1 prompt must
-              // carry them so the source driver can parse the runtime-served
-              // addresses. The box is read-only in tutorial mode (ChatPanel's
-              // lockedChatPrompt), so the only learner action — Send — is never
-              // exposed with a URL-less prompt.
-              <ChatPanel
-                isTutorial
-                lockedChatPrompt={buildLockedPrompts(sampleUrls)}
-              />
-            ) : (
-              error === null && (
-                // Plain text, NOT role="status": the sr-only "Starting guided
-                // composer" status above already announces this loading phase;
-                // a second live region would double-announce.
-                <p className="tutorial-sample-loading">
-                  Preparing the tutorial's sample pages…
-                </p>
-              )
-            )}
-          </div>
-        }
-        artifact={
-          <ArtifactWorkspace
-            checksValidationContent={<PipelineValidationSummary isTutorial />}
-          />
-        }
-        inspector={<WorkspaceInspector />}
-        actionBar={
-          <WorkspaceActionBar
-            capabilities={{
-              completion: false,
-            }}
-          />
-        }
-      />
-    </section>
+          )
+        )}
+      </div>
+    </TutorialWorkspaceFrame>
   );
 }
 

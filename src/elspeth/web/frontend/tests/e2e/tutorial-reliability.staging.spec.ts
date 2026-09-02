@@ -126,7 +126,9 @@ async function resolveVisibleReviews(page: Page): Promise<number> {
 // harness's purpose (grading the real LLM-backed scenario, dims a/b/c/d).
 async function driveGuidedWalk(page: Page): Promise<void> {
   const guidedPanel = page.getByLabel(/guided composer/i);
-  const runHeading = page.getByRole("heading", { name: /Running your pipeline/i });
+  // The run turn mounts on its PRE-RUN card (I-1): "Ready to run." with an
+  // explicit Run button. Nothing executes until the caller clicks it.
+  const runHeading = page.getByRole("heading", { name: /Ready to run/i });
   const stepChat = page.getByRole("region", { name: "Describe what you want" });
   const stepChatInput = stepChat.getByLabel("Message input");
   const stepChatSend = stepChat.getByRole("button", { name: "Send message" });
@@ -441,7 +443,8 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
     // TutorialGuidedShell). The compose phase is the staged source → sink →
     // recipe/transforms → wire walk over POST /guided/respond, with per-stage
     // interpretation reviews surfaced inline (D12 gate). Drive it to completion;
-    // the run auto-starts when the guided session reaches terminal=completed.
+    // the guided session reaching terminal=completed mounts the run turn's
+    // pre-run card.
     await expect(page.getByLabel(/guided composer/i)).toBeVisible({
       timeout: 60_000,
     });
@@ -449,9 +452,15 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
     await driveGuidedWalk(page);
 
     // On guided terminal=completed, TutorialGuidedShell hands off to the run
-    // turn (which auto-starts the tutorial run). Wait for completion, continue
-    // to the audit story. Headroom for LLM-provider latency over the heavy
-    // 5-source canonical scenario plus the wire-stage advisor sign-off.
+    // turn, which shows the committed graph and an explicit Run button (I-1)
+    // — the run NEVER auto-starts. Assert nothing fired, then click Run as
+    // the learner would.
+    expect(step.run.fired, "the tutorial run must not fire before Run is clicked").toBe(false);
+    await page.getByRole("button", { name: "Run", exact: true }).click();
+
+    // Wait for completion, continue to the audit story. Headroom for
+    // LLM-provider latency over the heavy 5-source canonical scenario plus
+    // the wire-stage advisor sign-off.
     await expect(page.getByRole("button", { name: "Continue" })).toBeVisible({
       timeout: 420_000,
     });

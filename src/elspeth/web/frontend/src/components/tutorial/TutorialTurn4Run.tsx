@@ -8,11 +8,20 @@ import {
   TUTORIAL_SHIELD_OVERRIDE_CAVEAT,
   TUTORIAL_SHIELD_WIRED_NOTE,
   TURN_4_PRIMARY_BUTTON,
+  TURN_4_READY_BODY,
+  TURN_4_RUN_BUTTON,
 } from "./copy";
 import type { RunResultRow, TutorialRunResult } from "./tutorialMachine";
 
 interface TutorialTurn4RunProps {
   sessionId: string;
+  /**
+   * Fired when the learner clicks Run (I-1) — the moment the pipeline
+   * request leaves the browser. The parent records `runStarted` so the
+   * Exit control knows there is a run to abandon. Optional — standalone
+   * mounts (tests) may omit it.
+   */
+  onRunStart?: () => void;
   /**
    * Fired as soon as the run's result arrives (rendered on this turn,
    * before the user clicks Continue). The parent persists the run identity
@@ -132,11 +141,20 @@ const TUTORIAL_RUN_STILL_FINISHING_MESSAGE =
 
 export function TutorialTurn4Run({
   sessionId,
+  onRunStart,
   onResult,
   onCompleted,
   onCancelled,
   onBack,
 }: TutorialTurn4RunProps): JSX.Element {
+  // The run never auto-fires (I-1). `armed` flips true on the learner's Run
+  // click and gates the run effect below. It initialises TRUE only when this
+  // session already has a cached run — the in-page audit → Back → run
+  // remount, where the completed result is re-viewable and offering Run
+  // again would be a second execution. A fresh mount (first arrival, or a
+  // resume after reload — the cache is module-level and dies with the page)
+  // starts disarmed on the pre-run card.
+  const [armed, setArmed] = useState(() => tutorialRunCache.has(sessionId));
   const [result, setResult] = useState<TutorialRunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [phase, setPhase] = useState<RunPhase>("fetch");
@@ -152,6 +170,11 @@ export function TutorialTurn4Run({
   }, []);
 
   useEffect(() => {
+    if (!armed) {
+      // Pre-run card: no request, no phase timers. The learner has not
+      // clicked Run yet.
+      return;
+    }
     let active = true;
     setResult(null);
     setError(null);
@@ -222,7 +245,16 @@ export function TutorialTurn4Run({
     // captured at the most recent effect run, which is fine here: onCancelled
     // is a stable "dispatch a fixed action" callback, not state-dependent.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, retryNonce]);
+  }, [sessionId, retryNonce, armed]);
+
+  const onRunClick = (): void => {
+    setArmed(true);
+    onRunStart?.();
+    // The Run button the learner just pressed leaves the DOM; put focus on
+    // the heading (now "Running your pipeline.") so keyboard and AT users
+    // are not dropped at the document root.
+    headingRef.current?.focus();
+  };
 
   const onCancelClick = (): void => {
     abandonTutorialRun(sessionId);
@@ -288,7 +320,7 @@ export function TutorialTurn4Run({
     <section className="tutorial-turn" aria-labelledby="tutorial-run-title">
       <p className="tutorial-kicker">Run</p>
       <h2 id="tutorial-run-title" ref={headingRef} tabIndex={-1}>
-        Running your pipeline.
+        {armed ? "Running your pipeline." : "Ready to run."}
       </h2>
       <AlertBanner tone="info" className="tutorial-disclosure">
         {TUTORIAL_RUN_PREAMBLE}
@@ -298,7 +330,29 @@ export function TutorialTurn4Run({
           {shieldNote === "wired" ? TUTORIAL_SHIELD_WIRED_NOTE : TUTORIAL_SHIELD_OVERRIDE_CAVEAT}
         </p>
       )}
-      {result === null && error === null && (
+      {!armed && (
+        // Pre-run card (I-1): the committed graph sits in the pipeline pane
+        // beside this card; the run waits for the learner's explicit click.
+        // No role="status" here — nothing is in progress yet.
+        <>
+          <p className="tutorial-run-ready">{TURN_4_READY_BODY}</p>
+          <div className="tutorial-actions">
+            <Button variant="primary" onClick={onRunClick}>
+              {TURN_4_RUN_BUTTON}
+            </Button>
+            {onBack !== undefined && (
+              <Button
+                variant="bare"
+                className="tutorial-link-button"
+                onClick={onBack}
+              >
+                Back
+              </Button>
+            )}
+          </div>
+        </>
+      )}
+      {armed && result === null && error === null && (
         <>
           <div
             role="status"

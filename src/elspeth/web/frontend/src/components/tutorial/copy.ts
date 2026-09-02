@@ -7,6 +7,21 @@ export const TURN_1_PRIMARY_BUTTON = "Let's go";
 // so skip exits the whole tutorial straight to graduation rather than naming a
 // removed step.
 export const TURN_1_SKIP_BUTTON = "Skip the tutorial";
+/**
+ * The explicit Run gesture on the run turn (I-1). The pipeline never executes
+ * on mount: the learner clicks this, exactly as the composer's own Run button
+ * asks in normal use. The graduation lesson "before clicking Run" names this
+ * button.
+ */
+export const TURN_4_RUN_BUTTON = "Run";
+/**
+ * Pre-run framing on the run turn. States two checkable facts: the pipeline
+ * pane shows the graph the learner just confirmed (the workspace frame stays
+ * mounted around the run card), and nothing executes until Run is clicked.
+ */
+export const TURN_4_READY_BODY =
+  "The pipeline pane shows the graph you just confirmed. Look it over — " +
+  "nothing runs until you click Run.";
 export const TURN_4_PRIMARY_BUTTON = "Continue";
 export const TURN_5_PRIMARY_BUTTON = "Continue";
 export const TURN_7_PRIMARY_BUTTON = "Take me to the composer";

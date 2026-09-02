@@ -1404,7 +1404,21 @@ describe("ChatPanelTutorialWorkspace", () => {
 
 describe("TutorialTurn4Run", () => {
   // The module-level run cache is keyed by sessionId — each test uses a
-  // distinct id so a cached promise never leaks across tests.
+  // distinct id so a cached promise never leaks across tests. The run never
+  // auto-fires (I-1): the executing/results states are reached by clicking
+  // the Run button on the pre-run card.
+  it("has no axe violations on the pre-run card", async () => {
+    const { container } = render(
+      <TutorialTurn4Run
+        sessionId="sess-a11y-run-ready"
+        onCompleted={() => {}}
+        onCancelled={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Run" })).toBeInTheDocument();
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
   it("has no axe violations while the run is executing", async () => {
     vi.mocked(apiClient.runTutorialPipeline).mockReturnValue(
       new Promise<never>(() => {}),
@@ -1416,6 +1430,8 @@ describe("TutorialTurn4Run", () => {
         onCancelled={() => {}}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    expect(screen.getByRole("status", { busy: true })).toBeInTheDocument();
     expect(await axe(container)).toHaveNoViolations();
   });
 
@@ -1443,6 +1459,7 @@ describe("TutorialTurn4Run", () => {
         onBack={() => {}}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
     await screen.findByText(/rows returned/);
     expect(await axe(container)).toHaveNoViolations();
   });

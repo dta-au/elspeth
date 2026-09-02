@@ -829,6 +829,13 @@ test.describe("first-run tutorial (staged guided flow)", () => {
     // ── Wire confirm → completed → run turn (no 409 dead-end) ────────────────
     await page.getByRole("button", { name: "Confirm wiring", exact: true }).click();
     // TutorialGuidedShell handed off to the run turn on terminal=completed.
+    // The run turn mounts on its pre-run card (I-1): the committed graph in
+    // the pipeline pane and an explicit Run button; nothing runs until it is
+    // clicked.
+    await expect(
+      page.getByRole("heading", { name: /Ready to run/i }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "Run", exact: true }).click();
     await expect(
       page.getByRole("heading", { name: /Running your pipeline/i }),
     ).toBeVisible();
