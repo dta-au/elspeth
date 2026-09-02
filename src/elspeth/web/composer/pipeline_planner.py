@@ -3104,9 +3104,12 @@ def _serialize_provider_discovery_result(
     on every discovery result. Discovery execution, audit, validation, and
     candidate construction continue to use the authoritative
     ``CompositionState``. Non-state discovery retains its canonical outcome
-    and data; preview fails closed because its data duplicates authoritative
-    validation, runtime preflight, and proof diagnostics. Failed reads retain
-    their canonical outcome and leak-safe error data. Successful state
+    and data; preview fails closed because its data is computed from the
+    authoritative state and this surface has no policy-owned projection of it
+    to disclose instead — ``get_pipeline_state`` is servable here only because
+    the caller supplies exactly that in ``provider_current_state``, which is
+    why the closed code is ``surface_projection_unavailable``. Failed reads
+    retain their canonical outcome and leak-safe error data. Successful state
     component reads follow the authoritative result shape, so node/output
     identifiers that collide with full-state aliases keep dispatch precedence.
     """

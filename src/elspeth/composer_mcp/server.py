@@ -633,9 +633,12 @@ def create_server(
         scratch_dir: Directory for session persistence.
         runtime_preflight: Async callable for runtime-equivalent preflight, or
             an explicit None. Keyword-required and without a default: an
-            omitted preflight degrades preview_pipeline into publishing
-            is_valid on authoring checks alone, so every caller must take a
-            visible position rather than inherit one.
+            omitted preflight makes every preview_pipeline call fail closed —
+            ``data["preview_is_valid"]`` is false however the authoring check
+            came out, and ``data["preview_errors"]`` carries a
+            ``runtime_preflight_not_run`` entry naming the stage that did not
+            run — so every caller must take a visible position rather than
+            inherit one.
 
             Deliberately STRICT-ONLY (elspeth-229e9e8195): the MCP surface
             wires no interpretation-tolerant ``structural_preflight``, so
