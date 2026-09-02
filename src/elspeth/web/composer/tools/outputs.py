@@ -165,7 +165,12 @@ def _execute_set_output(
 
     prevalidation_error = _prevalidate_sink(plugin, sink_options)
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("sink", plugin),
+        )
     collision_error = validate_composer_file_sink_collision_policy(
         plugin,
         sink_options,
@@ -258,7 +263,12 @@ def _execute_patch_output_options(
 
     prevalidation_error = _prevalidate_sink(current.plugin, new_options)
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("sink", current.plugin),
+        )
     collision_error = validate_composer_file_sink_collision_policy(
         current.plugin,
         new_options,

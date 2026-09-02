@@ -1551,6 +1551,13 @@ def build_set_pipeline_candidate(
                             on_write_failure=output.on_write_failure if output.on_write_failure is not None else "discard",
                             validation_error=validation_error,
                         ),
+                        # The repair hint embeds the sink's option-shape
+                        # rejection when that is what empty options failed on;
+                        # the plugin was resolved by ``_validate_plugin_name``
+                        # above, so the schema augmentation carries it. A
+                        # collision-policy failure is not an option-shape
+                        # rejection and carries nothing.
+                        plugin_identity=("sink", out_plugin) if out_prevalidation is not None else None,
                         rejected_component=output_ref,
                     )
                 )

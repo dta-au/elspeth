@@ -526,19 +526,19 @@ def _augment_with_plugin_schemas(
 
     For the mutation tools whose declarations set
     ``augments_on_failure=True`` (derived into
-    ``_registry._AUGMENTS_ON_FAILURE_TOOL_NAMES``), scan
-    ``result.validation.errors``
-    for ``Invalid options for <kind> '<plugin>'`` messages and embed the
-    full ``get_plugin_schema`` payload for every named plugin. Eliminates
-    the second round-trip the LLM would otherwise burn calling
-    ``get_plugin_schema`` after each rejection (see composer session
-    47cfbb5e on staging: 13 tool calls + 18 LLM rounds to converge a
-    4-plugin pipeline because the model never preloaded schemas).
+    ``_registry._AUGMENTS_ON_FAILURE_TOOL_NAMES``), read the structural
+    ``ValidationEntry.plugin_identity`` each producer stamped on its
+    rejection and embed the full ``get_plugin_schema`` payload for every
+    stamped plugin — never an identity parsed from the message
+    (elspeth-f60d638661). Eliminates the second round-trip the LLM would
+    otherwise burn calling ``get_plugin_schema`` after each rejection (see
+    composer session 47cfbb5e on staging: 13 tool calls + 18 LLM rounds to
+    converge a 4-plugin pipeline because the model never preloaded schemas).
 
-    No-op when the mutation succeeded, when no error message matches the
-    option-shape pattern, when the result already carries
-    ``plugin_schemas`` (handler set it directly), or when ``tool_name`` is
-    not one of the augmentation-eligible tools.
+    No-op when the mutation succeeded, when no error entry carries an
+    identity, when the result already carries ``plugin_schemas`` (handler
+    set it directly), or when ``tool_name`` is not one of the
+    augmentation-eligible tools.
     """
     if not should_augment_with_plugin_schemas(tool_name):
         return result

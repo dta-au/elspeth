@@ -953,7 +953,12 @@ def _resolve_source_blob(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("source", plugin),
+        )
 
     return _ResolvedSourceBlob(
         plugin=plugin,
@@ -1131,7 +1136,12 @@ def _execute_set_source(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("source", plugin),
+        )
 
     source = SourceSpec(
         plugin=plugin,
@@ -1392,7 +1402,12 @@ def _resolve_source_blobs(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("source", "blob_rows"),
+        )
     return merged_options, tuple(payloads)
 
 
@@ -1988,7 +2003,12 @@ def _execute_patch_source_options(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("source", current_source.plugin),
+        )
 
     new_source = replace(current_source, options=new_options)
     proposed_state = state.with_named_source(source_name, new_source)

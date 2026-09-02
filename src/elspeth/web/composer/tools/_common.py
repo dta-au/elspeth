@@ -960,10 +960,11 @@ class ToolResult:
             *only when non-empty* so existing tool consumers see no
             schema change.
         plugin_schemas: Inline ``get_plugin_schema`` payloads for every
-            plugin named in a validation error of the form
-            ``Invalid options for <kind> '<plugin>'``. Populated only on
-            failed mutations (``success=False``) for the option-shape
-            tools by ``execute_tool``. Keys are ``"<kind>/<plugin>"``
+            plugin a validation error carries in its structural
+            ``ValidationEntry.plugin_identity`` (stamped by the producer of
+            a plugin-option rejection; never read from the message).
+            Populated only on failed mutations (``success=False``) for the
+            option-shape tools by ``execute_tool``. Keys are ``"<kind>/<plugin>"``
             strings sorted deterministically. ``to_dict`` emits this
             field *only when non-empty*. Eliminates the second
             round-trip the LLM would otherwise burn calling
@@ -1316,49 +1317,13 @@ def review_reconciliation_failure_message(exc: BaseException, *, retry_hint: str
     identifiers (node ids, server-owned requirement ids), closed
     ``InterpretationKind`` values, and planner-authored user terms. None of
     them can reach row content, and the surrounding boundary already quotes
-    rejected option keys and VALUES from plugin prevalidation
-    (see ``plugin_identities_in_option_failure``).
+    rejected option keys and VALUES from plugin prevalidation (the
+    ``_prevalidate_plugin_options`` message family).
     """
     reason = str(exc).strip().rstrip(".")
     if not reason:
         return f"{REVIEW_RECONCILIATION_FAILURE_PREFIX}. {retry_hint}"
     return f"{REVIEW_RECONCILIATION_FAILURE_PREFIX}: {reason}. {retry_hint}"
-
-
-# Regex matching the option-shape failure messages emitted by
-# ``_prevalidate_plugin_options`` (see ``_prevalidate_source`` /
-# ``_prevalidate_transform`` / ``_prevalidate_sink``). The kind token is
-# pinned to the three valid PluginKind values so an unrelated message
-# containing ``Invalid options for ...`` text cannot trigger augmentation.
-# The plugin name group accepts any non-apostrophe characters because
-# plugin names are validated upstream.
-_INVALID_OPTIONS_PLUGIN_RE: Final[re.Pattern[str]] = re.compile(
-    r"Invalid options for (source|transform|sink) '([^']+)'",
-)
-
-
-def plugin_identities_in_option_failure(message: str) -> tuple[tuple[PluginKind, str], ...]:
-    """Return the ``(kind, plugin)`` pairs one option-shape message names.
-
-    Scans the WHOLE message, so it reports identities the validator never
-    resolved. These messages interpolate model-authored text in three places —
-    the details tail quotes rejected option VALUES, the secret_ref-placement
-    head quotes option KEYS, and the ``set_pipeline`` attribution prefix
-    quotes the component NAME, which is unvalidated for exactly the components
-    that fail — and each one is enough to plant a plugin identity here. No
-    reading of the message is trustworthy; that is why the in-process consumer
-    now carries ``ValidationEntry.plugin_identity`` from the producer instead
-    (elspeth-1d8fc3da83).
-
-    The freeform augmentation below is this function's only caller and keeps
-    the whole-message reading, its own pre-existing behaviour: changing it
-    would move the schema bytes it inlines. Its exposure is real and tracked
-    separately.
-
-    Ordering is sorted and duplicates dropped.
-    """
-    identities = {(cast(PluginKind, match.group(1)), match.group(2)) for match in _INVALID_OPTIONS_PLUGIN_RE.finditer(message)}
-    return tuple(sorted(identities))
 
 
 def build_plugin_schemas_for_failure(
@@ -1369,41 +1334,57 @@ def build_plugin_schemas_for_failure(
 ) -> Mapping[str, Mapping[str, JsonValue]] | None:
     """Build the ``plugin_schemas`` augmentation dict for a failed mutation.
 
-    Scans every entry in ``result.validation.errors`` (including both the
-    leading ``rejected_mutation`` entry and any state-level errors that
-    follow). Each entry's ``message`` is regex-matched against
-    ``_INVALID_OPTIONS_PLUGIN_RE``; every distinct ``(kind, plugin)`` pair
-    is resolved through ``catalog.get_schema`` and dumped to a plain dict
-    via ``PluginSchemaInfo.model_dump()`` so the payload is byte-identical
-    to what the LLM would otherwise receive from a discrete
+    Reads ``ValidationEntry.plugin_identity`` from every entry in
+    ``result.validation.errors`` (the leading ``rejected_mutation`` entry and
+    any state-level errors that follow). The identity is a structural fact
+    the PRODUCER stamped at the moment it built the failure, from the plugin
+    it had already resolved through the request's policy view — never
+    recovered from ``message``. Those messages quote model-authored text in
+    three places (rejected option VALUES in the details tail, option KEYS in
+    the secret_ref-placement head, the component NAME in the ``set_pipeline``
+    attribution prefix), and each was enough to plant a plugin identity that
+    no validator had admitted; ``catalog.get_schema`` on such a name raised
+    out of ``execute_tool`` as a model-triggerable 500. Three successive
+    message parsers were each defeated by a different one of those, so the
+    parser is deleted rather than re-anchored (elspeth-f60d638661).
+
+    Fails closed on absence: an entry with ``plugin_identity=None`` attaches
+    nothing, whatever its message says. The model cannot plant an identity
+    through message text because no text is read.
+
+    Every distinct ``(kind, plugin)`` pair is resolved through
+    ``catalog.get_schema`` and dumped to a plain dict via
+    ``PluginSchemaInfo.model_dump()`` so the payload is byte-identical to
+    what the LLM would otherwise receive from a discrete
     ``get_plugin_schema`` tool call. When ``schema_unavailable_message`` is
     supplied, plugins hidden by the same availability gate as
-    ``get_plugin_schema`` are omitted rather than inlining a forbidden schema.
+    ``get_plugin_schema`` are omitted rather than inlining a forbidden
+    schema. Keys are ``"<kind>/<plugin>"``, sorted, deduplicated.
 
-    Returns ``None`` when the result is successful or when no error
-    message matches the option-shape pattern. The caller is responsible
-    for restricting the call to declarations that set
-    ``augments_on_failure=True`` (gated by
+    Returns ``None`` when the result is successful or when no entry carries
+    an identity. The caller is responsible for restricting the call to
+    declarations that set ``augments_on_failure=True`` (gated by
     ``_registry.should_augment_with_plugin_schemas``).
 
-    Trust tier: server-controlled response shaping. A regex match implies
-    the validator already resolved the plugin in the catalog (the unknown
-    -plugin path emits ``"Unknown <kind> plugin '<name>'"`` instead).
-    Therefore ``catalog.get_schema`` returning ``ValueError`` here is a
-    Tier-1 anomaly — propagate, do not silently omit.
+    Trust tier: server-controlled response shaping. A stamped identity was
+    resolved by the producer, so ``catalog.get_schema`` raising here is a
+    Tier-1 anomaly (a producer stamped a name it never resolved) —
+    propagate, do not silently omit.
     """
     if result.success:
         return None
     discovered: dict[tuple[str, str], Mapping[str, Any]] = {}
     for entry in result.validation.errors:
-        for key in plugin_identities_in_option_failure(entry.message):
-            kind, plugin_name = key
-            if key in discovered:
-                continue
-            schema = catalog.get_schema(kind, plugin_name)
-            if schema_unavailable_message is not None and schema_unavailable_message(schema) is not None:
-                continue
-            discovered[key] = schema.model_dump()
+        if entry.plugin_identity is None:
+            continue
+        kind, plugin_name = entry.plugin_identity
+        key = (kind, plugin_name)
+        if key in discovered:
+            continue
+        schema = catalog.get_schema(cast(PluginKind, kind), plugin_name)
+        if schema_unavailable_message is not None and schema_unavailable_message(schema) is not None:
+            continue
+        discovered[key] = schema.model_dump()
     if not discovered:
         return None
     return {f"{kind}/{plugin_name}": payload for (kind, plugin_name), payload in sorted(discovered.items())}
