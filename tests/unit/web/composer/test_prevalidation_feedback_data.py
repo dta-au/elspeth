@@ -83,12 +83,15 @@ def test_the_callers_copy_is_mutable_and_leaves_the_frozen_source_alone() -> Non
     "payload",
     [
         pytest.param(["alpha", "beta"], id="sequence"),
-        pytest.param("candidate rejected", id="string"),
-        pytest.param(7, id="int"),
+        pytest.param(({"a": 1},), id="tuple-of-dicts"),
     ],
 )
 def test_non_mapping_data_falls_back_to_candidate_data(payload: Any) -> None:
-    """Fallback arm: an unexpected shape is carried structurally, not raised."""
+    """Fallback arm: an admitted non-mapping shape is carried structurally, not raised.
+
+    Scalars no longer reach here: ``ToolResult`` refuses them at construction
+    (elspeth-e405ad7cd2 D2), see ``test_scalar_data_is_refused_at_construction``.
+    """
     result = _tool_result(payload)
 
     feedback = dict(_prevalidation_feedback_seed(result.data))
@@ -97,6 +100,15 @@ def test_non_mapping_data_falls_back_to_candidate_data(payload: Any) -> None:
     # Compared against the FROZEN value: deep_freeze rewrites a list to a
     # tuple subclass, so asserting against the pre-freeze literal would fail.
     assert feedback["candidate_data"] == result.data
+
+
+@pytest.mark.parametrize("payload", [pytest.param("candidate rejected", id="string"), pytest.param(7, id="int")])
+def test_scalar_data_is_refused_at_construction(payload: Any) -> None:
+    """A scalar ``data`` is not a closed payload shape; the seed's fallback arm never sees one."""
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    with pytest.raises(AuditIntegrityError, match=r"ToolResult\.data"):
+        _tool_result(payload)
 
 
 def test_absent_data_yields_an_empty_seed() -> None:

@@ -34,6 +34,7 @@ from sqlalchemy import Engine
 
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import PluginCapability
@@ -81,6 +82,7 @@ from elspeth.web.composer.state import (
     _coalesce_branch_names,
     _serialize_branches,
 )
+from elspeth.web.composer.tool_result_envelope import APPLIED_COMPONENT_KEYS, ValidationGuidance
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -873,6 +875,73 @@ def _graph_repair_suggestions(
     return _duplicate_consumer_repair_suggestions(state, validation)
 
 
+ToolResultData = Mapping[str, object] | Sequence[object] | BaseModel
+"""The closed shapes a tool's ``data`` payload may take on the wire: a JSON object, a JSON array, or
+a pydantic model that ``serialize_tool_result`` dumps. Each tool's own TypedDict says which keys."""
+
+_DATA_CONTAINER_TYPES: Final[tuple[type, ...]] = (dict, MappingProxyType, list, tuple)
+_MAPPING_TYPES: Final[tuple[type, ...]] = (dict, MappingProxyType)
+
+
+class AppliedComponentEcho(TypedDict, total=False):
+    """The post-change components a successful incremental mutation echoes (``_applied_component_echo``).
+
+    Every key is optional and present only when non-empty; the key set is the
+    registry's ``APPLIED_COMPONENT_KEYS`` and the constructor refuses any other.
+    """
+
+    source: dict[str, JsonValue]
+    sources: dict[str, dict[str, JsonValue]]
+    nodes: list[_SetPipelineNodePayload]
+    outputs: list[dict[str, JsonValue]]
+    edges: list[dict[str, JsonValue]]
+
+
+def _require_tool_result_data(value: object) -> None:
+    """Nominal admission (ADR-032): exact container types or a pydantic model; a dict subclass is refused."""
+    if value is None or isinstance(value, BaseModel) or type(value) in _DATA_CONTAINER_TYPES:
+        return
+    raise AuditIntegrityError(f"ToolResult.data is not a closed payload shape: {type(value).__name__}")
+
+
+def _exact_mapping(value: object) -> Mapping[str, object] | None:
+    """The value when it is EXACTLY a dict or mappingproxy; a subclass or anything else yields None.
+
+    ``isinstance`` gives mypy the narrowing; the ``type(...) in`` test gives the
+    nominal exactness ADR-032 asks for (a dict subclass is an impostor here).
+    """
+    if isinstance(value, (dict, MappingProxyType)) and type(value) in _MAPPING_TYPES:
+        return value
+    return None
+
+
+def _require_validation_guidance(value: object) -> None:
+    if value is None:
+        return
+    mapping = _exact_mapping(value)
+    if mapping is None or _exact_mapping(mapping.get("codes")) is None:
+        raise AuditIntegrityError("ToolResult.validation_guidance must carry a 'codes' mapping")
+
+
+def _require_applied_component(value: object) -> None:
+    if value is None:
+        return
+    mapping = _exact_mapping(value)
+    if mapping is None:
+        raise AuditIntegrityError(f"ToolResult.applied_component is not a mapping: {type(value).__name__}")
+    extra = sorted(set(mapping) - set(APPLIED_COMPONENT_KEYS))
+    if extra:
+        raise AuditIntegrityError(f"ToolResult.applied_component keys outside the registry: {extra}")
+
+
+def _require_plugin_schemas(value: object) -> None:
+    if value is None:
+        return
+    mapping = _exact_mapping(value)
+    if mapping is None or any(_exact_mapping(schema) is None for schema in mapping.values()):
+        raise AuditIntegrityError("ToolResult.plugin_schemas must map '<kind>/<plugin>' to a schema mapping")
+
+
 @dataclass(frozen=True, slots=True)
 class ToolResult:
     """Result of a tool execution.
@@ -928,13 +997,13 @@ class ToolResult:
     updated_state: CompositionState
     validation: ValidationSummary
     affected_nodes: tuple[str, ...]
-    data: Any = None
+    data: ToolResultData | None = None
     prior_validation: ValidationSummary | None = None
     runtime_preflight: ValidationResult | None = None
     post_call_hints: tuple[str, ...] = ()
-    plugin_schemas: Mapping[str, Mapping[str, Any]] | None = None
-    validation_guidance: Mapping[str, Any] | None = None
-    applied_component: Mapping[str, Any] | None = None
+    plugin_schemas: Mapping[str, Mapping[str, JsonValue]] | None = None
+    validation_guidance: ValidationGuidance | None = None
+    applied_component: AppliedComponentEcho | None = None
     _validation_snapshot_hash: str | None = field(default=None, compare=False, repr=False)
     # True when this failure envelope deliberately withheld the pre-mutation
     # state's validate() entries (full-replacement rejections,
@@ -944,6 +1013,11 @@ class ToolResult:
     _state_validation_withheld: bool = field(default=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
+        # Admission before freezing: a refusal must leave nothing half-frozen behind.
+        _require_tool_result_data(self.data)
+        _require_plugin_schemas(self.plugin_schemas)
+        _require_validation_guidance(self.validation_guidance)
+        _require_applied_component(self.applied_component)
         freeze_fields(self, "affected_nodes", "post_call_hints")
         if self.data is not None:
             freeze_fields(self, "data")
@@ -1283,7 +1357,7 @@ def build_plugin_schemas_for_failure(
     catalog: CatalogService,
     *,
     schema_unavailable_message: Callable[[PluginSchemaInfo], str | None] | None = None,
-) -> Mapping[str, Mapping[str, Any]] | None:
+) -> Mapping[str, Mapping[str, JsonValue]] | None:
     """Build the ``plugin_schemas`` augmentation dict for a failed mutation.
 
     Scans every entry in ``result.validation.errors`` (including both the
@@ -3715,7 +3789,7 @@ _APPLIED_COMPONENT_ECHO_MAX_CANONICAL_BYTES: Final[int] = 16 * 1024
 def _applied_component_echo(
     state: CompositionState,
     affected: tuple[str, ...],
-) -> Mapping[str, Any] | None:
+) -> AppliedComponentEcho | None:
     """Project the components a successful mutation applied, post-finalizer.
 
     The echo is the exact ``set_pipeline`` arguments that
@@ -3750,6 +3824,11 @@ def _applied_component_echo(
         # get_pipeline_state. An echo is never worth a second projection.
         return None
     assert payload is not None
+    # Storage-path redaction runs on the full authoring payload before the echo
+    # is narrowed: same bytes redacted, and the echo is then assembled directly
+    # in its closed shape (AppliedComponentEcho) with no round-trip through an
+    # open dict.
+    payload = redact_source_storage_path(payload)
 
     state_node_ids = {node.id for node in state.nodes}
     state_output_names = {output.name for output in state.outputs}
@@ -3770,7 +3849,7 @@ def _applied_component_echo(
         elif component in state_output_names:
             output_names.add(component)
 
-    echo: dict[str, Any] = {}
+    echo: AppliedComponentEcho = {}
     if "source" in payload and SOURCE_COMPONENT_ID in source_names:
         echo["source"] = payload["source"]
     if "sources" in payload:
@@ -3796,7 +3875,6 @@ def _applied_component_echo(
     if not echo:
         return None
 
-    echo = redact_source_storage_path(echo)
     if len(canonical_json(echo).encode("utf-8")) > _APPLIED_COMPONENT_ECHO_MAX_CANONICAL_BYTES:
         return None
     return echo

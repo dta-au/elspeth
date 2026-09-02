@@ -1210,13 +1210,15 @@ def test_response_walker_emits_manifest_dispatch_for_declarative_entry(
 def test_tool_result_envelope_keys_are_implicitly_known_for_declarative_entries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """{success, validation, version} — the closed, engine-produced ToolResult
-    dispatch envelope — must survive declarative redaction even when the policy
-    does not declare them, so audit rows retain the dispatch outcome. Live
-    forensics regression: every planner discovery invocation row read
-    '<redacted-unknown-response-key>' for all three, leaving the audit trail
-    blind to tool outcomes. ``data`` and any other undeclared key stay
-    fail-closed.
+    """{success, validation, affected_nodes, version} — the closed, engine-produced
+    ToolResult dispatch envelope — must survive declarative redaction even when
+    the policy does not declare them, so audit rows retain the dispatch outcome.
+    Live forensics regression: every planner discovery invocation row read
+    '<redacted-unknown-response-key>' for all of them, leaving the audit trail
+    blind to tool outcomes. ``affected_nodes`` joined the set under
+    elspeth-e405ad7cd2 (D1): while it was missing, every declarative row fired
+    the unknown-key counter on every call. ``data`` and any other undeclared
+    key stay fail-closed.
     """
     tool = "t_envelope"
     entry = _declarative_entry(known_response_keys=("summary",))
@@ -1230,6 +1232,7 @@ def test_tool_result_envelope_keys_are_implicitly_known_for_declarative_entries(
     response = {
         "success": False,
         "validation": validation,
+        "affected_nodes": ["node-a"],
         "version": 3,
         "summary": "s",
         "data": {"content": "SECRET-CONTENT"},
@@ -1238,12 +1241,36 @@ def test_tool_result_envelope_keys_are_implicitly_known_for_declarative_entries(
 
     assert result["success"] is False
     assert result["validation"] == "<redacted-response-mapping>"
+    assert result["affected_nodes"] == ["<redacted-response-text>"]
     assert result["version"] == 3
     assert result["summary"] == "<redacted-response-text>"
     assert "data" not in result
     assert result["_unknown_response"] == REDACTED_UNKNOWN_RESPONSE_KEY
     assert "SECRET-CONTENT" not in str(result)
+    assert "node-a" not in str(result)
     assert len(tel.unknown_response_key_calls) == 1
+
+
+def test_declarative_discovery_row_no_longer_fires_the_unknown_key_counter_on_affected_nodes() -> None:
+    """A real discovery envelope (every required key, nothing else) must not trip the drift counter (D1)."""
+    tel = NoopRedactionTelemetry()
+    response = {
+        "success": True,
+        "validation": {
+            "is_valid": True,
+            "errors": [],
+            "warnings": [],
+            "suggestions": [],
+            "semantic_contracts": [],
+            "graph_repair_suggestions": [],
+        },
+        "affected_nodes": [],
+        "version": 3,
+    }
+    result = redact_tool_call_response("list_sources", response, telemetry=tel)
+    assert tel.unknown_response_key_calls == []
+    assert "_unknown_response" not in result
+    assert result["affected_nodes"] == []
 
 
 def test_declared_sensitive_envelope_key_still_wins_over_implicit_knowledge(

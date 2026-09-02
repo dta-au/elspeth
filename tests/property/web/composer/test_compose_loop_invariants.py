@@ -306,8 +306,14 @@ def _assert_persisted_tool_payloads_match_manifest(harness: _Harness) -> None:
             continue
         payload = json.loads(row.content)
         assert "do-not-persist" not in row.content
-        if "stray_provider_field" in payload:
-            assert payload["stray_provider_field"] == REDACTED_UNKNOWN_RESPONSE_KEY
+        # The declarative walker DROPS an unknown key's name and aggregates the fact under
+        # ``_unknown_response`` (redaction.redact_tool_call_response); the old
+        # ``if "stray_provider_field" in payload`` guard therefore never fired and the
+        # invariant was dead (elspeth-e405ad7cd2 census). A stray key is only ever
+        # observable as the aggregate sentinel.
+        assert "stray_provider_field" not in payload
+        if "_unknown_response" in payload:
+            assert payload["_unknown_response"] == REDACTED_UNKNOWN_RESPONSE_KEY
 
 
 def _tool_call_payload(tool_call: ToolCallSpec, argument_dict: Mapping[str, object]) -> dict[str, Any]:
