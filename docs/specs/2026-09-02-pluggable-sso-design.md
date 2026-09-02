@@ -199,6 +199,7 @@ snapshot and `identity_id` in `metadata_json`. Failures write
 | add | `sso_issuer: str` | required for `oidc` and `vanguard`; forbidden for `entra` and `google` (derived/fixed) |
 | add | `sso_transaction_secret: SecretStr` | encrypts the PKCE cookie; required unless local |
 | add | `google_hosted_domain: str` | required for `google`; forbidden otherwise |
+| add | `sso_admin_subjects: tuple[str, ...]` | IdP subjects granted the admin surface; forbidden for local (which keeps `dev_admin_user`) |
 | keep | `entra_tenant_id` | required for `entra` only |
 | keep | JWKS cache tuning | unchanged |
 | keep | `token_expiry_hours`, refresh chain bound | now apply to SSO sessions |
@@ -225,8 +226,10 @@ enforces the per-provider required/forbidden matrix above. The
 
 `GET /api/auth/me` for SSO users reads the identity record.
 
-`/api/auth/admin/` (existing gate, extended to accept an SSO identity as
-admin as well as `dev_admin_user`; no new authorisation model):
+`/api/auth/admin/` (existing gate, extended: for local the admin is
+`dev_admin_user` as today; for SSO providers the admin is any identity whose
+`subject` is listed in `sso_admin_subjects`. Same gate, one more membership
+check, no new authorisation model):
 
 - `GET identities`, `POST identities/{id}/disable`, `POST identities/{id}/enable`.
 - `GET relationships`, `POST relationships`, `POST relationships/{id}/revoke`.
