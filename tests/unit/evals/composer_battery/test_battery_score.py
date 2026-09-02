@@ -423,7 +423,9 @@ def test_approval_pending_is_flagged() -> None:
     """
     rows = tg.ideal_thread(ARGS)
     rows[-1]["composition_state_id"] = None
-    rows[-1]["content"] = json.dumps({"success": True, "status": "APPROVAL_REQUIRED", "proposal_id": "p1"})
+    # The real envelope nesting: ``success`` on the envelope, the proposal
+    # discriminator under ``data`` (tool_batch proposal payload).
+    rows[-1]["content"] = json.dumps({"success": True, "data": {"status": "APPROVAL_REQUIRED", "proposal_id": "p1"}})
     s = score_run(tg.capture(rows, state=ARGS), SC)
     assert "approval_pending" in _classes(s)
 

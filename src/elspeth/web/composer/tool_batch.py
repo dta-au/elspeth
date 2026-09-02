@@ -1463,8 +1463,10 @@ async def run_tool_batch(
                         tool_arguments_hash=audit.binding_arguments_hash,
                     )
                 proposals_this_turn += 1
+                # No ``success`` inside the payload: the envelope's own
+                # ``success`` already says it, and ``status`` is the
+                # discriminator a reader keys on (elspeth-e405ad7cd2, F1).
                 proposal_payload = {
-                    "success": True,
                     "status": "APPROVAL_REQUIRED",
                     "proposal_id": str(proposal.id),
                     "tool_name": proposal_tool_name,
