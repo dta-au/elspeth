@@ -1,7 +1,7 @@
 # Pluggable SSO and identity substrate — backend-for-frontend login for Entra, VANguard, Google, and generic OIDC
 
-Date: 2026-09-02. Status: design, revision 2.2, implementation plan = tracker milestone elspeth-07cd19ba73.
-Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. Four operator decisions from that round are listed as D14–D17.
+Date: 2026-09-02. Status: design, revision 2.3, implementation plan = tracker milestone elspeth-07cd19ba73.
+Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**.
 Branch: `release/0.8.0`.
 Revision 2 incorporates six independent reviews (security architecture,
 solution design, reality check against the tree, systems risk, functional
@@ -12,8 +12,8 @@ Sprint: this spec is the identity half of the "Identity and workflow
 management" milestone in the tracker. Operator ruling (2026-09-02): build
 90% of the final solution now and tweak on the fly, rather than a perfect
 interim system that never gets permission to be replaced. So the workflow
-half (approval, review attestation, shared library, per-day quota, manager
-view, delegated administration) is BUILT in the same sprint, and its tables
+half (approval, review attestation, shared library, per-day quota, the
+approver's audit view, delegated administration) is BUILT in the same sprint, and its tables
 ride the same epoch pass (phase 1 step 0 fixes their shapes as a
 §Workflow tables addendum to this document before the epoch lands). The
 seams in §Future seams are the starting point for that addendum.
@@ -52,16 +52,16 @@ The tech-debt-free window is weeks, not months.
 | D5 | Delivery scope | Framework + all four profiles + Cognito migration + old path deleted. VANguard and Cognito verified live; Google verified live when a client exists. |
 | D6 **[rev2]** | Session subject and ownership key | `sub` = `identity_id`. `sessions`, `user_secrets`, `user_preferences`, and Landscape `run_attributions` are keyed on `identity_id`. Accepted on reviewer recommendation; reversible until phase 1 lands. |
 | D7 **[rev2]** | Local users | Get an `identities` row on first login (`provider='local'`, `subject=username`). `auth.db` becomes credentials only. Accepted on recommendation. |
-| D8 **[rev2]** | `relationship_type` | Closed CHECK + L0 Literal (`manager` only now), widened per delivery. Accepted on recommendation. |
+| D8 **[rev2]** | `relationship_type` | Closed CHECK + L0 Literal (`approver` only now, per D16), widened per delivery. Accepted on recommendation. |
 | D9 **[rev2]** | Roles | `identity_roles` table ships now (`admin`, `curator`); `sso_admin_subjects` only seeds the first admin. Accepted on recommendation. |
 | D10 **[rev2]** | Principal above identity | No `principals` table. The VANguard spike asks for a stable non-email subject; if none, detection columns plus a refusal (§Refusals R3). Identity merge is an unbuilt admin action. |
-| D11 **[rev2.1]** | Operator facts, now ruled | Quota is **per person**, the aggregate of tokens used in the composer and tokens used in runs. Approval quorum is one (a count column is "for but not with"). The term is **flex teams**, not hybrid teams: anyone in the organisation can log on to any container (deployment) of that organisation, but permissions are federated within that container only. The system takes SSO accounts; a container administrator grants `user` or `manager` permission and wires them into that container's org **tree**. A cross-container permissions manager is a possible later feature and is explicitly not built now. |
+| D11 **[rev2.1]** | Operator facts, now ruled | Quota is **per person**, the aggregate of tokens used in the composer and tokens used in runs. Approval quorum is one (a count column is "for but not with"). The term is **flex teams**, not hybrid teams: anyone in the organisation can log on to any container (deployment) of that organisation, but permissions are federated within that container only. The system takes SSO accounts; a container administrator (a container-operations person, D14) grants `user`, `approver`, or `reviewer` permission and wires them into that container's org **tree**. A cross-container permissions manager is a possible later feature and is explicitly not built now. |
 | D12 **[rev2.1]** | Default access | **No access, even with SSO, until an administrator gives the tick of approval.** A first login creates an identity in `pending`; no session token is issued until an admin activates it. |
 | D13 **[rev2.1]** | Workflow tables | Built "for but not with": basic columns now, fleshed out later, all in the same epoch pass. See §Workflow tables. |
-| D14 **[rev2.2]** | Admin separation of duties | OPEN. (a) an identity holding `admin` may not hold `manager`, `user`, or `curator` in the same container (a container needs an admin who is not the lead); or (b) self-grant refused and every grant or edge made by an admin who also holds a workflow role is written with `sod_conflict=true`. Recommendation: (a). |
-| D15 **[rev2.2]** | Quota numbers | OPEN. Default `tokens_per_day` for a fresh identity and for the container ceiling; rule when no policy applies (recommendation: the container ceiling row is required at setup and readiness checks it; no applicable policy ⇒ refuse). |
-| D16 **[rev2.2]** | Naming of the oversight role and edge | OPEN. Keep `manager` (operator's word) or rename to `lead` so "your manager approved this" is not read as line management. Recommendation: `lead`. |
-| D17 **[rev2.2]** | IdP groups | OPEN. Stop collecting `groups_json` (never used for authorisation under the compartment principle; removes the Entra group-overage login block and shrinks stored PII). Recommendation: drop. |
+| D14 **[rev2.3]** | Admin separation of duties | **(a).** `admin` is *container operations*, held by someone technical (CTO branch or similar), not a workload role. An identity holding `admin` may not hold `approver`, `reviewer`, `user`, or `curator` in the same container, and vice versa (R8). |
+| D15 **[rev2.3]** | Quota numbers | `quota_default_tokens_per_day` is a **required container setting** (`WebSettings`, required unless `local`). Activation writes a `quota_policies` row with that number; an admin may override it per identity afterwards. `quota_container_tokens_per_day` is an optional ceiling. No applicable policy ⇒ refuse (only reachable through corruption, since every activated identity gets a row). |
+| D16 **[rev2.3]** | Role and edge names | `approver` (was `manager`) and `reviewer`. Role `approver` may decide approvals and hold `approver` edges; the tree edge type is `approver` ("A is B's default approver"). Role `reviewer` may attest. "Manager" and "lead" appear nowhere in schema, API, or UI. |
+| D17 **[rev2.3]** | IdP groups | Dropped. `groups_json` is removed; the Entra profile no longer extracts `groups`/`roles` and the group-overage check is gone with them; `UserProfile.groups` is always empty for SSO. |
 
 ## Architecture
 
@@ -96,9 +96,10 @@ Literal (contracts import nothing above them, and a Literal cannot be
 computed). The registry asserts parity at import:
 `frozenset(profile names) | {"local"} == frozenset(get_args(AuthProviderType))`.
 Adding an IdP is a deliberate edit to an L0 contract. `EntraAuthProvider`
-is deleted; its tenant check and group/role extraction (including the
-group-overage fail-closed) move into the Entra profile and are re-declared
-`@trust_boundary` there with their own `test_ref`.
+is deleted; its tenant check moves into the Entra profile and is re-declared
+`@trust_boundary` there with its own `test_ref`. Group and role extraction,
+including the group-overage fail-closed, is dropped (D17): IdP groups are
+organisation facts, never compartment facts.
 
 ### 2. SSO login service — `src/elspeth/web/auth/sso.py`
 
@@ -158,8 +159,8 @@ row plus the identity row, for SSO the identity row.
 
 `SsoAuthProvider` (one class, parameterised by profile) implements
 `AuthProvider`: `authenticate` verifies the session token and confirms the
-identity is enabled; `get_user_info` reads the identity row (including
-`groups_json`). `POST /api/auth/token` is mounted for all providers and
+identity is enabled; `get_user_info` reads the identity row; `groups` is
+always empty for SSO (D17). `POST /api/auth/token` is mounted for all providers and
 re-checks `disabled_at` and `provider` **[rev2]**. `POST /api/auth/logout`
 writes an `auth_events` `logout` row; the client discards the token
 (server-side revocation is a future `jti` denylist) **[rev2]**.
@@ -319,13 +320,12 @@ compatibility-record example.
 |--------|------|-------|
 | identity_id | text PK | surrogate; the key every ownership and future workflow table references |
 | provider | text | CHECK in the five values plus `service` [rev2.2] (`local` included, D7). A `service` identity authenticates by an operator-issued credential, not OIDC; the mechanism is not built now, the CHECK simply does not close against it. |
-| kind | text | CHECK `('human','service')`, default `human` [rev2.2]. Service identities may hold only `admin` or `oversight`, never `manager`, `user`, or `curator`, and may not approve, attest, or publish (CHECKs on the workflow tables). |
+| kind | text | CHECK `('human','service')`, default `human` [rev2.2]. Service identities may hold only `admin` or `oversight`, never `approver`, `reviewer`, `user`, or `curator`, and may not approve, attest, or publish (CHECKs on the workflow tables). |
 | subject | text | IdP `sub`, or local username |
 | username | text | display only, non-blank; changes update the row and write an audit row |
 | display_name | text null | |
 | email | text null | |
 | organisation_id | text null | VANguard ABN; null elsewhere |
-| groups_json | text | IdP groups/roles as a JSON list, refreshed per login; feeds `/me` |
 | raw_claims_json | text null | bounded 16 KiB; declared profile keys plus `iss aud iat exp`; `groups`, `_claim_*`, `picture`, `at_hash`, `nonce` stripped; forensics only, never returned by any API. **Taken at activation, not at first sight [rev2.2]:** a `pending` row holds only provider, subject, and organisation_id, so the container does not accumulate profile PII of people who merely tried. Never-activated `pending` rows are purged by the retention sweep after a container-set window. |
 | subject_email_at_first_seen | text null | D10 detection |
 | rebound_at | datetime null | D10 detection: verified email changed under the same subject |
@@ -349,7 +349,7 @@ record.
 |--------|------|-------|
 | role_id | text PK | |
 | identity_id | text FK | |
-| role | text | CHECK `('admin', 'manager', 'user', 'curator', 'auditor', 'oversight')` [rev2.2]; L0 Literal `IdentityRole`. `user` = may author and run; `manager` = the functional/matrix lead (name per D16): may approve (role-based eligibility, see approvals) and hold `manager` edges; `curator` = library gate; `admin` = identity/roles/org-tree administration; `auditor` = read-only over the audit surfaces, no authoring, no run, all reads through `audit_access_log`; `oversight` = read plus quota-policy write, no activation, no role grant, no disable — the role the organisation console holds, so it never needs `admin` in every container. Activation (D12) grants `user` unless the admin picks `manager`. |
+| role | text | CHECK `('admin', 'approver', 'reviewer', 'user', 'curator', 'auditor', 'oversight')` [rev2.3]; L0 Literal `IdentityRole`. `user` = may author and run; `approver` = the functional/matrix lead: may decide approvals (role-based eligibility, see approvals) and hold `approver` edges; `reviewer` = may attest; `curator` = library gate; `admin` = container operations: identity, roles, and org-tree administration, held by someone technical, never a workload role (D14); `auditor` = read-only over the audit surfaces, no authoring, no run, all reads through `audit_access_log`; `oversight` = read plus quota-policy write, no activation, no role grant, no disable — the role the organisation console holds. Activation (D12) grants `user` unless the admin picks `approver` or `reviewer`; `admin` may never be combined with a workload role (R8). |
 | expires_at | datetime null | [rev2.2] JIT grants. The console's role in a container is granted with an expiry by a *container* admin (the compartment owner reads the console in, not the reverse). |
 | note | text null | [rev2.2] Reason for the grant; activation is the most consequential act in the model and must carry one. |
 | scope | text null | reserved (library id, team id); null = deployment-wide |
@@ -373,10 +373,10 @@ admin-only in this delivery; delegated administration is phase 4.
 | relationship_id | text PK | |
 | from_identity_id | text FK | |
 | to_identity_id | text FK | |
-| relationship_type | text | CHECK `('manager')`; L0 Literal `RelationshipType` (D8) |
+| relationship_type | text | CHECK `('approver')`; L0 Literal `RelationshipType` (D8, D16) |
 | asserted_by_identity_id | text FK | |
 | asserted_at | datetime | |
-| effective_from | datetime null | annotation only [rev2.2]: a partial-index predicate must be immutable, so "active" cannot consult the window and no check reads it. Leave cover is a second `manager` role grant, not an edge. |
+| effective_from | datetime null | annotation only [rev2.2]: a partial-index predicate must be immutable, so "active" cannot consult the window and no check reads it. Leave cover is a second `approver` role grant, not an edge. |
 | effective_until | datetime null | annotation only |
 | revoked_at | datetime null | never deleted |
 | revoked_by_identity_id | text null FK | |
@@ -384,15 +384,15 @@ admin-only in this delivery; delegated administration is phase 4.
 
 CHECK `from_identity_id <> to_identity_id`. **Org tree (D11):** partial
 unique on active `(to_identity_id, relationship_type)` so a person has at
-most one active manager, plus the partial unique on active `(from, to, type)`;
-both with both dialect predicates declared. Cycles are refused at write time
-by a bounded ancestor walk (route layer). `from_identity_id` must hold an
-active `manager` role. Disabling an identity revokes, with the disabling
+most one active default approver, plus the partial unique on active
+`(from, to, type)`; both with both dialect predicates declared. Cycles are
+refused at write time by a bounded ancestor walk (route layer).
+`from_identity_id` must hold an active `approver` role. Disabling an identity revokes, with the disabling
 actor recorded, every active edge **incident to** it in either direction
 [rev2.2], marks its open `approvals` as approver `revoked` and as requester
 `revoked`, refuses any queued-not-started run it owns with an audit row,
 and makes its `user_secrets` unresolvable while not `active`. The tree
-carries one job: who oversees whom, for the manager audit view. Approver
+carries one job: who oversees whom, for the approver's audit view. Approver
 eligibility and leave cover are role questions, not tree questions.
 
 ### `sso_handoffs` (sessions store) [rev2]
@@ -450,6 +450,10 @@ test keeps pinning that none of these boundaries widens to `str`.
 | add | `sso_transaction_secret: SecretStr` | required unless local; `secret_key` strength validators apply |
 | add | `google_hosted_domain: str` | required for `google`; forbidden otherwise |
 | add | `sso_admin_subjects: tuple[str, ...]` | bootstrap only; seeds the first `admin` role row |
+| add | `quota_default_tokens_per_day: int` | **required unless local** (D15); every activation writes a `quota_policies` row with this value, overridable per identity by an admin |
+| add | `quota_container_tokens_per_day: int \| None` | optional container ceiling row (D15) |
+| add | `compartment_id: str` | required unless local; the marking stamped into exports, library rows, and audit metadata |
+| add | `identity_dormancy_days: int` | R9 window; default 90 |
 | keep | `entra_tenant_id` | required for `entra` only |
 | keep | JWKS cache tuning; `token_expiry_hours`; refresh chain bound | the latter two now apply to SSO sessions via the mounted refresh route |
 | change | `public_base_url` | required whenever provider is not local |
@@ -479,7 +483,7 @@ existing dev-admin gate is local-only and structlog-only by design):
 - `GET identities` (paginated, bounded, filter by `access_state`, defaults
   to `pending` first, never returns `raw_claims_json`; for `pending` rows
   returns subject and organisation only [rev2.2]), `POST identities/{id}/
-  activate` (grants `user` or `manager` and takes the profile snapshot in
+  activate` (grants `user`, `approver`, or `reviewer` and takes the profile snapshot in
   the same audited write, with a required `note`; the "tick of approval"),
   `POST identities` (pre-provision by `(provider, subject)`, [rev2.2]),
   `POST identities/{id}/disable` (refused for self and for the last active
@@ -507,7 +511,7 @@ Recovery from total admin lockout is a config change to
 | profile | issuer | expected origins | extra checks | username | userinfo | notes |
 |---------|--------|------------------|--------------|----------|----------|-------|
 | oidc (Cognito) | `sso_issuer` | issuer + `sso_endpoint_origins` | none | `preferred_username` → `cognito:username` → `sub` | no | confidential app client with the ELSPETH callback URL; new client id (Cognito secrets are fixed at creation; operator to confirm) |
-| entra | derived from tenant | `login.microsoftonline.com` | `tid`; group-overage fails closed | `preferred_username` → `sub` | no | groups + `role:` roles into `groups_json` |
+| entra | derived from tenant | `login.microsoftonline.com` | `tid` | `preferred_username` → `sub` | no | groups and roles are not collected (D17); the group-overage check is gone with them |
 | vanguard | `sso_issuer` | same as issuer | none | `sub` (email today) | yes | `given_name`, `family_name`, `abn` → `organisation_id`; display name from name parts |
 | google | `https://accounts.google.com` (the bare `accounts.google.com` form is rejected) | the four Google origins above | `email_verified` true; `hd` = `google_hosted_domain` (absent for non-Workspace accounts, fails closed) | `email` → `sub` | no | refuses to start without a hosted domain |
 
@@ -557,9 +561,11 @@ waits for a registered client.
   any identity whose `access_state` is not `active`; category
   `sso_access_pending` or `sso_identity_disabled`. The login page shows
   "awaiting approval" for pending. The `login` audit row is still written.
-- **R7.** Refuse a `manager` edge whose `from` identity lacks an active
-  `manager` role, and any edge that would create a cycle.
-- **R8.** [rev2.2] Admin separation of duties per D14.
+- **R7.** Refuse an `approver` edge whose `from` identity lacks an active
+  `approver` role, and any edge that would create a cycle.
+- **R8.** [rev2.3] Refuse any grant that would make one identity hold
+  `admin` together with `approver`, `reviewer`, `user`, or `curator` in the
+  same container (D14). Admin is container operations, not a workload role.
 - **R9.** [rev2.2] Refuse a login for an identity dormant longer than the
   container's dormancy window: it drops to `pending` with
   `disable_reason='dormant'`, writes `identity_disabled`, and needs an admin
@@ -656,13 +662,13 @@ waits for a registered client.
   shared-read surface, which must not weaken `verify_session_ownership`.
   Curator role already exists (D9). Personal lists are the existing
   per-identity session list.
-- **Delegated administration:** a manager appointing a curator, or reading
-  their own edges for an approver picker, is a scoped authorization check on
+- **Delegated administration:** an approver appointing a curator, or
+  reading their own edges for an approver picker, is a scoped authorization check on
   top of `identity_roles` and `identity_relationships`; route-layer only.
 - **Per-day token quota:** sum of LLM usage over `run_attributions` by
   `identity_id` per day; enforcement at execute. Subject scope is D11.
-- **Manager audit view:** `identity_relationships` × `run_attributions` ×
-  `auth_events`, needs the `identity_id` column landed here.
+- **Approver's audit view:** `identity_relationships` × `run_attributions`
+  × `auth_events`, scoped to the caller's active `approver` edges.
 - **Preview row trace:** elspeth-8310d6030c, independent.
 - **`auth_events` export and retention:** separate product question.
 
@@ -675,11 +681,11 @@ deliberate epoch bump.
 
 | table | columns | notes |
 |-------|---------|-------|
-| approvals | approval_id PK; session_id FK; state_id; binding_json (`config_hash`, `canonical_version`, `runtime_val_manifest_sha256`, `openrouter_catalog_sha256`, **`binding_generation_fingerprint`, `policy_hash`** [rev2.2]); requested_by_identity_id FK; approver_identity_id FK; requested_at; decided_at NULL; decision NULL CHECK `('approved','rejected','revoked','superseded')` [rev2.2]; required_count int default 1; note NULL | One open request per `(session_id, state_id)`. Author ≠ approver (CHECK). **Approver eligibility is role-based [rev2.2]:** any identity holding an active `manager` role in this container who is not the author may decide; the author's active manager edge only supplies the default suggestion in the picker. This is what gives the lead's own work an approver and gives leave cover without touching the tree. Any new `state_id` marks the open request `superseded`. Execute refuses (409, distinct `error_type`) unless an `approved` row matches the compiled binding (R2, **delivered in this sprint**, phase 4). `binding_generation_fingerprint` is included because `config_hash` records profile aliases, not the buckets or credentials they resolve to; without it an approval survives an operator repointing an alias. `snapshot_hash` is deliberately excluded (it embeds the principal scope and would never match across approver and author). Pinned by a test that fails if a new field enters `WebPluginPolicyEvidence` without a tuple decision. |
+| approvals | approval_id PK; session_id FK; state_id; binding_json (`config_hash`, `canonical_version`, `runtime_val_manifest_sha256`, `openrouter_catalog_sha256`, **`binding_generation_fingerprint`, `policy_hash`** [rev2.2]); requested_by_identity_id FK; approver_identity_id FK; requested_at; decided_at NULL; decision NULL CHECK `('approved','rejected','revoked','superseded')` [rev2.2]; required_count int default 1; note NULL | One open request per `(session_id, state_id)`. Author ≠ approver (CHECK). **Approver eligibility is role-based [rev2.2]:** any identity holding an active `approver` role in this container who is not the author may decide; the author's active `approver` edge only supplies the default suggestion in the picker. This is what gives the lead's own work an approver and gives leave cover without touching the tree. Any new `state_id` marks the open request `superseded`. Execute refuses (409, distinct `error_type`) unless an `approved` row matches the compiled binding (R2, **delivered in this sprint**, phase 4). `binding_generation_fingerprint` is included because `config_hash` records profile aliases, not the buckets or credentials they resolve to; without it an approval survives an operator repointing an alias. `snapshot_hash` is deliberately excluded (it embeds the principal scope and would never match across approver and author). Pinned by a test that fails if a new field enters `WebPluginPolicyEvidence` without a tuple decision. |
 | approval_decisions | decision_id PK; approval_id FK; decided_by_identity_id FK; decided_at; decision CHECK `('approved','rejected')`; note NULL | [rev2.2] One row per deciding identity, so `required_count > 1` is a count over rows, not a schema change. Dual control: nullable `quota_policies.dual_control_above_tokens` and a per-container list of secret names / plugins whose wiring raises `required_count` to 2 (reserved, not enforced). |
-| review_attestations | attestation_id PK; session_id FK; state_id; payload_digest; reviewer_identity_id FK; attested_at; verdict CHECK `('signed_off','changes_requested','withdrawn')` [rev2.2]; note NULL | Append-only. Reviewer ≠ author (CHECK). **Named "reviewer attestations" everywhere — schema, API, UI [rev2.2].** It is a ledger, not a control: nothing refuses on it. The phrase "two-person rule" is reserved for something that refuses; a UI must never say "two-person rule satisfied" over an unenforced count. |
+| review_attestations | attestation_id PK; session_id FK; state_id; payload_digest; reviewer_identity_id FK; attested_at; verdict CHECK `('signed_off','changes_requested','withdrawn')` [rev2.2]; note NULL | Append-only. Reviewer ≠ author (CHECK); the reviewer must hold an active `reviewer` role [rev2.3]. **Named "reviewer attestations" everywhere — schema, API, UI [rev2.2].** It is a ledger, not a control: nothing refuses on it. The phrase "two-person rule" is reserved for something that refuses; a UI must never say "two-person rule satisfied" over an unenforced count. |
 | library_entries | entry_id PK; published_from_session_id FK; payload_digest; compartment_id; title; version int; published_by_identity_id FK; curated_by_identity_id NULL FK; published_at; accepted_at NULL; rejected_at NULL; rejection_note NULL; deprecated_at NULL; recalled_at NULL; note NULL | Frozen, content-addressed. **A library entry is the public projection (`generate_public_yaml` shape), never a session reference, and it is config-only [rev2.2]:** publishing a pipeline that reads an uploaded blob is refused with a named `error_type` ("publish a profile-bound source instead"), because blob custody proves same-principal on fork and a cross-user fork of a blob-backed source cannot copy the blob without becoming an intra-container exfiltration path. Forking a library entry instantiates the projection into the forker's own staging session; `forked_from_session_id` points at that staging session and the entry's `payload_digest` carries provenance. Visible deployment-wide once `accepted_at` is set by a `curator`. Curator ≠ publisher (CHECK). Recall flags, never deletes. `library_published` audit rows carry `payload_digest` and `compartment_id` so the same artifact appearing in two containers is detectable later. |
-| quota_policies | policy_id PK; identity_id NULL FK; tokens_per_day int; dual_control_above_tokens NULL int; set_by_identity_id FK; set_at; revoked_at NULL | Per person (D11) **plus the container ceiling row (`identity_id` NULL) shipped now [rev2.2]**, because activation otherwise grants unbounded spend on the container's shared LLM credential. Two partial uniques, both dialects: active per identity, and active `WHERE identity_id IS NULL` (NULLs are distinct for uniqueness in Postgres, so one predicate does not cover both). Behaviour with no applicable policy is D15. Every `quota_set` / `quota_exceeded` event records the cap and the ceiling in force. |
+| quota_policies | policy_id PK; identity_id NULL FK; tokens_per_day int; dual_control_above_tokens NULL int; set_by_identity_id FK; set_at; revoked_at NULL | Per person (D11) **plus the container ceiling row (`identity_id` NULL) shipped now [rev2.2]**, because activation otherwise grants unbounded spend on the container's shared LLM credential. Two partial uniques, both dialects: active per identity, and active `WHERE identity_id IS NULL` (NULLs are distinct for uniqueness in Postgres, so one predicate does not cover both). Activation writes the per-identity row from `quota_default_tokens_per_day` (D15), so no applicable policy is reachable only through corruption and refuses. Every `quota_set` / `quota_exceeded` event records the cap and the ceiling in force. |
 | token_usage_ledger | entry_id PK; identity_id NULL FK; source CHECK `('composer','run','auto_title','system')` [rev2.2]; session_id NULL FK; run_id NULL; model; prompt_tokens; completion_tokens; cached_prompt_tokens NULL; reasoning_tokens NULL; recorded_at | Operational accounting index, not audit truth (Landscape `calls` is). Composer writes one row per LLM call from `ComposerLLMCall.usage` (today persisted only inside JSON audit payloads, not queryable). Auto-titling (a paid background call per first message, which its own docstring flags as bypassing rate limits) writes `auto_title`; the boot probe writes `system` with `identity_id` NULL. Runs write one row per run at finalisation from the new `calls` token columns. Quota check = `SUM` over the ledger for the identity in the current UTC day, evaluated at execute and at composer turn start only; post-response spend lands in the next window. Over quota refuses and writes `quota_exceeded`. Accounting unavailable ⇒ refuse (fail closed); the `system` arm is exempt from the check. |
 
 ## Terminology
@@ -694,8 +700,9 @@ deliberate epoch bump.
   team. Around nine people cherry-picked from across the organisation who
   work on one problem space, overseen by a **matrix or functional lead**.
   The container's org tree therefore records functional oversight within
-  the problem space, not corporate line management; the `manager` role and
-  the `manager` edge mean "functional lead in this container". The same
+  the problem space, not corporate line management; the `approver` role and
+  the `approver` edge mean "functional lead in this container" (D16: the
+  words manager and lead appear nowhere in schema, API, or UI). The same
   person may hold an identity in several containers, each activated,
   role-assigned, and placed in the tree independently.
 - **Guiding principle — compartments** (operator, 2026-09-02): containers
