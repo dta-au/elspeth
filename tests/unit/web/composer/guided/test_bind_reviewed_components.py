@@ -4041,3 +4041,106 @@ def test_bind_prose_amend_records_unidentifiable_node_entry_as_malformed(malform
     # topology either: it is neither an existing reconstruction nor an
     # admissible added node.
     assert malformed_entry not in result.pipeline["nodes"]
+
+
+# ---------------------------------------------------------------------------
+# Display-only options are never a correction authority (red-team F1, 2026-09-02)
+# ---------------------------------------------------------------------------
+
+_WEB_SCRAPE_STABLE_ID = "88888888-8888-4888-8888-888888888888"
+
+
+def _web_scrape_predecessor() -> CompositionState:
+    """A reviewed web_scrape node whose ``http`` object carries the SSRF policy
+    beside the two identity members the card renders."""
+    http = {
+        "abuse_contact": "ops@example.org",
+        "scraping_reason": "catalogue refresh",
+        "allowed_hosts": "public_only",
+        "timeout": 30,
+        "max_body_bytes": 1_000_000,
+    }
+    return CompositionState(
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="scrape",
+                options={"path": "blob:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="scrape",
+                node_type="transform",
+                plugin="web_scrape",
+                input="scrape",
+                on_success="output",
+                on_error="discard",
+                options={"url_field": "url", "http": http, "schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(OutputSpec(name="output", plugin="json", options={"path": "rows.jsonl"}, on_write_failure="discard"),),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def test_node_patch_cannot_touch_the_display_only_http_object() -> None:
+    """The card shows web_scrape's contact and reason from the ``http`` object,
+    but that object also holds the SSRF host allowlist, timeout and body cap.
+    It lives in the DISPLAY-ONLY table, so the node-patch schema advertises
+    no ``http`` member and a patch naming it is refused as an authority
+    violation — the policy can never be rewritten behind an unchanged card."""
+    predecessor = _web_scrape_predecessor()
+    target = _public_node_correction_target(
+        "scrape",
+        stable_id=_WEB_SCRAPE_STABLE_ID,
+        node_type="transform",
+        plugin="web_scrape",
+        behavior={"kind": "transform"},
+    )
+
+    schema = guided_authorized_pipeline_schema(_guided(), correction_target=target)["properties"]["node_patch"]
+    # No correctable keys at all: the patch schema advertises no options
+    # member for web_scrape, so there is nothing for a provider to name.
+    assert "options" not in schema["properties"]
+
+    hostile_http = {
+        "abuse_contact": "ops@example.org",
+        "scraping_reason": "catalogue refresh",
+        "allowed_hosts": "allow_private",
+        "timeout": 1,
+        "max_body_bytes": 1,
+    }
+    delta = {"node_patch": {"stable_id": _WEB_SCRAPE_STABLE_ID, "options": {"http": hostile_http}}, "edges": []}
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        materialize_guided_authorized_candidate(delta, authority=target, guided=_guided(), current_state=predecessor)
+    assert raised.value.error_code == "guided_delta_authority_violation"
+
+
+def test_full_candidate_correction_that_omits_http_keeps_the_reviewed_block() -> None:
+    """A full-candidate node correction overlays only the correctable keys.
+    ``http`` is display-only, so a candidate that restates the node without
+    it neither deletes nor rewrites the reviewed block: it comes back from
+    the predecessor intact, policy included."""
+    predecessor = _web_scrape_predecessor()
+    candidate = predecessor.to_dict()
+    candidate.pop("version")
+    candidate["nodes"][0]["options"] = {"url_field": "url", "schema": {"mode": "observed"}}
+
+    bound = bind_guided_reviewed_components(
+        candidate,
+        _guided(),
+        predecessor=predecessor,
+        correction_target=_node_correction_target("scrape", stable_id=_WEB_SCRAPE_STABLE_ID),
+    )
+
+    assert bound["nodes"][0]["options"]["http"] == predecessor.to_dict()["nodes"][0]["options"]["http"]
