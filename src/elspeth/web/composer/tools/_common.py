@@ -1242,6 +1242,7 @@ def _failure_result(
     error_code: str | None = None,
     with_state_validation: bool = True,
     plugin_identity: tuple[str, str] | None = None,
+    rejected_component: str | None = None,
 ) -> ToolResult:
     """Build a ToolResult for a failed mutation.
 
@@ -1268,9 +1269,20 @@ def _failure_result(
     be made to. Omitting it costs an enrichment, never correctness.
     """
     if with_state_validation:
-        validation = _prepend_rejection_entry(state.validate(), error_msg, error_code=error_code, plugin_identity=plugin_identity)
+        validation = _prepend_rejection_entry(
+            state.validate(),
+            error_msg,
+            error_code=error_code,
+            plugin_identity=plugin_identity,
+            rejected_component=rejected_component,
+        )
     else:
-        validation = _rejection_only_validation(error_msg, error_code=error_code, plugin_identity=plugin_identity)
+        validation = _rejection_only_validation(
+            error_msg,
+            error_code=error_code,
+            plugin_identity=plugin_identity,
+            rejected_component=rejected_component,
+        )
     data = {_DATA_ERROR_KEY: error_msg}
     if error_code is not None:
         data["error_code"] = error_code
@@ -1400,12 +1412,54 @@ def build_plugin_schemas_for_failure(
     return {f"{kind}/{plugin_name}": payload for (kind, plugin_name), payload in sorted(discovered.items())}
 
 
+def rejected_component_ref(component_type: str, component_id: str) -> str:
+    """The canonical validation-component ref for a component a rejection is about.
+
+    ``source`` ids already carry the canonical form (``source`` /
+    ``source:<name>``, minted by ``source_component_id``); node and output ids
+    are bare and take the ``node:`` / ``output:`` prefix. This is the one
+    place the ``rejected_component`` grammar is minted for rejections, so the
+    prose prefix (:func:`rejected_component_prefix`) and the structural fact
+    cannot disagree (elspeth-e405ad7cd2, F10).
+    """
+    # ``component_type`` arrives in two vocabularies: the component family
+    # (``source`` / ``node`` / ``output``, what the mutation tools pass) and the
+    # plugin kind (``transform`` / ``sink``, what the credential payload's
+    # ``components[].component_type`` historically carried). Both map onto the
+    # same three ref families.
+    if component_type == "source":
+        return component_id
+    if component_type in {"node", "transform"}:
+        return f"node:{component_id}"
+    if component_type in {"output", "sink"}:
+        return f"output:{component_id}"
+    raise AuditIntegrityError(f"unknown component_type {component_type!r} for a rejection subject")
+
+
+def rejected_component_prefix(rejected_component: str) -> str:
+    """The message prefix a set_pipeline rejection about one component carries.
+
+    ``Source '<name>': `` / ``Node '<id>': `` / ``Output '<name>': `` — the
+    same prose the per-component loops used to hand-write beside the stamp.
+    """
+    if rejected_component.startswith("node:"):
+        return f"Node '{rejected_component.removeprefix('node:')}': "
+    if rejected_component.startswith("output:"):
+        return f"Output '{rejected_component.removeprefix('output:')}': "
+    if rejected_component == "source":
+        return "Source 'source': "
+    if rejected_component.startswith("source:"):
+        return f"Source '{rejected_component.removeprefix('source:')}': "
+    raise AuditIntegrityError(f"not a validation-component ref: {rejected_component!r}")
+
+
 def _prepend_rejection_entry(
     base: ValidationSummary,
     error_msg: str,
     *,
     error_code: str | None = None,
     plugin_identity: tuple[str, str] | None = None,
+    rejected_component: str | None = None,
 ) -> ValidationSummary:
     """Return a ValidationSummary with a leading rejected_mutation entry.
 
@@ -1420,6 +1474,7 @@ def _prepend_rejection_entry(
         severity="high",
         error_code=error_code,
         plugin_identity=plugin_identity,
+        rejected_component=rejected_component,
     )
     return ValidationSummary(
         is_valid=False,
@@ -1436,6 +1491,7 @@ def _rejection_only_validation(
     *,
     error_code: str | None = None,
     plugin_identity: tuple[str, str] | None = None,
+    rejected_component: str | None = None,
 ) -> ValidationSummary:
     """Return a ValidationSummary holding only a rejected_mutation entry.
 
@@ -1452,6 +1508,7 @@ def _rejection_only_validation(
         severity="high",
         error_code=error_code,
         plugin_identity=plugin_identity,
+        rejected_component=rejected_component,
     )
     return ValidationSummary(is_valid=False, errors=(rejection,))
 
@@ -1818,10 +1875,15 @@ def _credential_wiring_contract_failure(
     # validation.errors; with_state_validation decides whether the unchanged
     # state's errors follow it (False for full-replacement set_pipeline,
     # elspeth-e89e6bf47a).
+    # The builder already receives the subject structurally (``component_type``
+    # + ``component_id``), so it stamps ``rejected_component`` itself — every
+    # caller, incremental tools included, gets attribution with no edit
+    # (elspeth-e405ad7cd2, F10 round 2).
+    subject = rejected_component_ref(component_type, component_id)
     if with_state_validation:
-        validation = _prepend_rejection_entry(state.validate(), error_msg)
+        validation = _prepend_rejection_entry(state.validate(), error_msg, rejected_component=subject)
     else:
-        validation = _rejection_only_validation(error_msg)
+        validation = _rejection_only_validation(error_msg, rejected_component=subject)
     return ToolResult(
         success=False,
         updated_state=state,
@@ -1989,6 +2051,7 @@ def _plugin_policy_failure(
     *,
     component: str | None = None,
     with_state_validation: bool = True,
+    rejected_component: str | None = None,
 ) -> ToolResult:
     message = violation.message if component is None else f"{component}: {violation.message}"
     return _failure_result(
@@ -1996,6 +2059,7 @@ def _plugin_policy_failure(
         message,
         error_code=violation.error_code.value,
         with_state_validation=with_state_validation,
+        rejected_component=rejected_component,
     )
 
 
@@ -3066,7 +3130,7 @@ def _missing_output_options_repair_error(
         option_list = ", ".join(options)
         field_note = f" Replace {_FIELD_OPTION_PLACEHOLDER} with the actual selected string field." if "field" in options else ""
         return (
-            f"Output '{sink_name}' is missing options. For {plugin_name} file sinks, include "
+            f"Missing options. For {plugin_name} file sinks, include "
             f"an options object with {option_list}. Use this runnable output object and adjust "
             f"the path/schema if needed: {json.dumps(repair_output)}.{field_note}{detail}"
         )
@@ -3079,7 +3143,7 @@ def _missing_output_options_repair_error(
     }
     detail = f" Empty options were rejected: {validation_error}" if validation_error is not None else ""
     return (
-        f"Output '{sink_name}' is missing options. Include the sink plugin's options object. "
+        "Missing options. Include the sink plugin's options object. "
         f"If this sink accepts empty configuration, use: {json.dumps(repair_output)}; otherwise "
         f"call get_plugin_schema for sink '{plugin_name}' and fill the required options.{detail}"
     )

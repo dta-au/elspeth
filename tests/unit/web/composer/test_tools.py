@@ -52,6 +52,7 @@ from elspeth.web.composer.tools import (
 from elspeth.web.composer.tools import (
     execute_tool as _execute_tool,
 )
+from elspeth.web.composer.tools._common import rejected_component_prefix
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import (
@@ -233,12 +234,18 @@ def _assert_aws_s3_endpoint_url_rejected(
     original_state: CompositionState,
     *,
     forbidden_value: str = _AWS_S3_ENDPOINT_SENTINEL,
+    rejected_component: str | None = None,
 ) -> None:
     assert result.success is False
     assert result.updated_state is original_state
     assert result.updated_state.version == original_state.version
     assert result.data is not None
-    assert result.data["error"] == AWS_S3_ENDPOINT_URL_POLICY_ERROR
+    # A set_pipeline component rejection names its subject both structurally
+    # and as the minted message prefix; an incremental tool's rejection is
+    # about the component it was called with and carries neither.
+    expected_prefix = "" if rejected_component is None else rejected_component_prefix(rejected_component)
+    assert result.data["error"] == f"{expected_prefix}{AWS_S3_ENDPOINT_URL_POLICY_ERROR}"
+    assert result.validation.errors[0].rejected_component == rejected_component
     assert forbidden_value not in repr(result.data)
     assert forbidden_value not in repr(result.validation)
 
@@ -1044,7 +1051,7 @@ class TestAwsS3EndpointUrlComposerPolicy:
 
         result = execute_tool("set_pipeline", args, state, _mock_catalog())
 
-        _assert_aws_s3_endpoint_url_rejected(result, state)
+        _assert_aws_s3_endpoint_url_rejected(result, state, rejected_component="source:archive")
 
     def test_aws_s3_set_pipeline_legacy_source_rejects_endpoint_url_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -1054,7 +1061,7 @@ class TestAwsS3EndpointUrlComposerPolicy:
 
         result = execute_tool("set_pipeline", args, state, _mock_catalog())
 
-        _assert_aws_s3_endpoint_url_rejected(result, state)
+        _assert_aws_s3_endpoint_url_rejected(result, state, rejected_component="source")
 
     def test_aws_s3_set_pipeline_output_rejects_endpoint_url_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -1064,7 +1071,7 @@ class TestAwsS3EndpointUrlComposerPolicy:
 
         result = execute_tool("set_pipeline", args, state, _mock_catalog())
 
-        _assert_aws_s3_endpoint_url_rejected(result, state)
+        _assert_aws_s3_endpoint_url_rejected(result, state, rejected_component="output:main")
 
     def test_aws_s3_set_source_from_blob_rejects_raw_endpoint_url_before_lookup(self) -> None:
         state = _empty_state()
@@ -9694,7 +9701,7 @@ class TestSetPipeline:
         assert result.success is False
         assert result.updated_state is state
         error = result.data["error"]
-        assert "Output 'main' is missing options" in error
+        assert error.startswith("Output 'main': Missing options")
         assert '"sink_name": "main"' in error
         assert '"plugin": "json"' in error
         assert '"path": "outputs/main.json"' in error
@@ -10660,7 +10667,7 @@ class TestSetPipeline:
         )
 
         assert result.success is False
-        assert result.data["error"] == "Refusing inline CSV because it exceeds bounded CSV inspection limits."
+        assert result.data["error"] == "Source 'source': Refusing inline CSV because it exceeds bounded CSV inspection limits."
         assert "x" * 32 not in result.data["error"]
 
     @pytest.mark.parametrize(
@@ -10718,7 +10725,7 @@ class TestSetPipeline:
         )
 
         assert result.success is False
-        assert result.data["error"] == "Refusing inline CSV because it exceeds bounded CSV inspection limits."
+        assert result.data["error"] == "Source 'source': Refusing inline CSV because it exceeds bounded CSV inspection limits."
         assert malformed_content not in result.data["error"]
 
     def test_set_pipeline_candidate_csv_parser_error_escalates_as_integrity_failure(self, tmp_path: Path) -> None:
