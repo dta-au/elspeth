@@ -11,7 +11,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Literal, NotRequired, TypedDict, final
+from typing import Any, Final, Literal, TypedDict, final
 from uuid import UUID
 
 from opentelemetry import metrics
@@ -61,6 +61,7 @@ from elspeth.web.composer.state import (
     _source_options_have_schema,
     _validate_gate_expression,
 )
+from elspeth.web.composer.tool_result_envelope import ValidationCodeGuidance, ValidationGuidance
 from elspeth.web.composer.tools._common import (
     _DATA_ERROR_KEY,
     _PLUGIN_UNAVAILABLE_EXPLANATIONS,
@@ -1682,25 +1683,6 @@ def explain_validation_code(code: str) -> tuple[str, str] | None:
 # tool envelope (tools._dispatch). Two copies would drift, and the parity
 # suite pins the string.
 EXPLAIN_VALIDATION_ERROR_GUIDANCE: Final[str] = "To expand any code, call explain_validation_error with the exact code string."
-
-
-class ValidationCodeGuidance(TypedDict):
-    """The catalogue's ``(explanation, suggested_fix)`` for one closed code."""
-
-    explanation: str
-    suggested_fix: str
-
-
-class ValidationGuidance(TypedDict):
-    """Inline repair guidance for one failed mutation envelope.
-
-    ``codes`` is keyed by the closed ``error_code`` so N entries sharing a
-    code cost the text once. ``explain_tool`` rides only when some entry got
-    no inline guidance — see :func:`build_validation_guidance`.
-    """
-
-    codes: dict[str, ValidationCodeGuidance]
-    explain_tool: NotRequired[str]
 
 
 def build_validation_guidance(codes: Iterable[str | None]) -> ValidationGuidance | None:
