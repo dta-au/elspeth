@@ -81,9 +81,6 @@ from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
 )
-from elspeth.web.composer.tools.sessions import (
-    _authoring_validation_payload,
-)
 from elspeth.web.execution.schemas import CHECK_OUTCOME_SKIPPED_AFTER_FAILURE, ValidationResult
 from elspeth.web.interpretation_state import (
     RAW_HTML_CLEANUP_REVIEW_DRAFT,
@@ -3717,8 +3714,8 @@ def _runtime_preflight_not_run_error() -> ValidationEntryDict:
     """Build the marker naming an un-run Stage 2 in a preview's error channel.
 
     A fresh dict per call: the entry is handed to the caller inside
-    ``data["errors"]``, so a shared module constant would let one consumer's
-    mutation leak into every later preview.
+    ``data["preview_errors"]``, so a shared module constant would let one
+    consumer's mutation leak into every later preview.
 
     Deliberately NOT registered in ``_CLOSED_VALIDATION_ERROR_CODES`` — that
     tuple is a claim about the codes the planner's redacted repair feedback
@@ -3730,8 +3727,8 @@ def _runtime_preflight_not_run_error() -> ValidationEntryDict:
         message=(
             "The runtime preflight stage did not run for this preview, so this pipeline has not been "
             "checked against the real engine at all (path allowlist, plugin instantiation, graph "
-            "structure, schema compatibility, secret refs, policy gates). is_valid is false because no "
-            "verdict on those checks exists, not because one of them failed. This is a server wiring "
+            "structure, schema compatibility, secret refs, policy gates). preview_is_valid is false because "
+            "no verdict on those checks exists, not because one of them failed. This is a server wiring "
             "omission, not a defect in the pipeline: do not rewrite the pipeline to try to clear it — "
             "report that preview_pipeline returned runtime_preflight_not_run."
         ),
@@ -3830,22 +3827,32 @@ def _execute_preview_pipeline(
 ) -> ToolResult:
     """Preview pipeline configuration — dry-run validation with source summary.
 
-    Returns ``authoring_validation`` (Stage 1), ``runtime_preflight``
-    (Stage 2 from the caller-supplied callback), and ``proof_diagnostics``
-    (Stage 3 — operator-input-aware proof against the observed source
-    blob). The presence of any blocking ``proof_diagnostics`` entry means
-    ``is_valid=False`` even when authoring + runtime checks pass.
+    Three checks, each on its own surface: the authoring check rides on the
+    envelope's own ``validation``; the runtime preflight (the caller-supplied
+    callback) on the envelope's ``runtime_preflight``; the operator-input-aware
+    proof against the observed source blob under ``data["proof_diagnostics"]``.
+    ``data["preview_is_valid"]`` is their conjunct — any blocking
+    ``proof_diagnostics`` entry makes it false even when authoring + runtime
+    pass.
+
+    ``data`` carries only what the preview stage itself produces: the
+    conjunct, ``preview_errors`` (entries the preview stage mints — never a
+    copy of the authoring errors, which the envelope already carries),
+    ``edge_contracts`` (the one authoring fact the envelope does not carry),
+    the proof diagnostics, and a read-only overview. Hoisting the authoring
+    verdict here again put byte-twins of ``validation`` on the wire under a
+    second name and made ``is_valid`` a homonym (elspeth-e405ad7cd2 R4).
 
     An un-run stage never rides the success side: with no runtime callback
-    wired, ``is_valid`` is false and ``errors`` carries an explicit
-    ``runtime_preflight_not_run`` entry naming the stage that did not run.
+    wired, ``preview_is_valid`` is false and ``preview_errors`` carries an
+    explicit ``runtime_preflight_not_run`` entry naming the stage that did
+    not run.
     """
     validation = context.catalog.validate_composition_state(state).validation
     _AUTHORING_VALIDATION_COUNTER.add(
         1,
         {"outcome": "valid" if validation.is_valid else "invalid"},
     )
-    authoring_payload = _authoring_validation_payload(state, validation)
     runtime_result = context.runtime_preflight(state) if context.runtime_preflight is not None else None
     # Wired only when the caller's strict Stage-2 verdict is handoff-shaped
     # (elspeth-229e9e8195). Additive advisory block: it never joins the
@@ -3862,10 +3869,10 @@ def _execute_preview_pipeline(
     )
     has_blocking_proof = any(d["severity"] == "blocking" for d in proof_diagnostics)
 
-    is_valid = validation.is_valid
-    summary_errors = authoring_payload["errors"]
+    preview_is_valid = validation.is_valid
+    preview_errors: list[ValidationEntryDict] = []
     if runtime_result is not None:
-        is_valid = is_valid and runtime_result.is_valid
+        preview_is_valid = preview_is_valid and runtime_result.is_valid
     else:
         # Three live callers wire Stage 2 for preview: the operator channel
         # precomputes it per call (tool_batch.py), the stdio MCP server wires
@@ -3879,23 +3886,15 @@ def _execute_preview_pipeline(
         # an un-run stage must not ride the success side of the conjunct: fail
         # closed and name the stage, because ``runtime_preflight: null`` alone
         # cannot tell a caller "not computed" apart from "nothing to report".
-        is_valid = False
-        # A fresh list, never an in-place append: this list object IS
-        # ``authoring_payload["errors"]``, which the summary also embeds as
-        # ``authoring_validation`` — Stage 1's own report must stay Stage-1-true.
-        summary_errors = [*summary_errors, _runtime_preflight_not_run_error()]
+        preview_is_valid = False
+        preview_errors.append(_runtime_preflight_not_run_error())
     if has_blocking_proof:
-        is_valid = False
+        preview_is_valid = False
 
     summary: dict[str, Any] = {
-        "is_valid": is_valid,
-        "errors": summary_errors,
-        "warnings": authoring_payload["warnings"],
-        "suggestions": authoring_payload["suggestions"],
-        "edge_contracts": authoring_payload["edge_contracts"],
-        "semantic_contracts": authoring_payload["semantic_contracts"],
-        "graph_repair_suggestions": authoring_payload["graph_repair_suggestions"],
-        "authoring_validation": authoring_payload,
+        "preview_is_valid": preview_is_valid,
+        "preview_errors": preview_errors,
+        "edge_contracts": [ec.to_dict() for ec in validation.edge_contracts],
         # No nested ``runtime_preflight`` copy: the same value rides on the
         # envelope's own ``runtime_preflight`` field (set below), and a
         # byte-identical twin under ``data`` was two keys the model had to be
@@ -3931,18 +3930,15 @@ _PREVIEW_PIPELINE_DECLARATION = ToolDeclaration(
     name="preview_pipeline",
     handler=_execute_preview_pipeline,
     kind=ToolKind.DISCOVERY,
-    description="Preview the current pipeline configuration — returns "
-    "validation status, source summary, and node/output overview "
-    "without executing. Use this to confirm the pipeline is set up "
-    "correctly before running. Result `data` carries the authoring check "
-    "(`is_valid`, `errors`, `warnings`, `suggestions`, "
-    "`graph_repair_suggestions`, `semantic_contracts` — the same shapes as "
-    "the top-level `validation` — plus `authoring_validation`, the Stage-1 "
-    "report on its own) and a read-only overview (`sources`, `nodes`, "
-    "`outputs`, `node_count`, `output_count`, `edge_contracts`, "
-    "`structural_preview`, `proof_diagnostics`). When a runtime check ran, "
-    "`runtime_preflight` is the envelope's own top-level field, not a key "
-    "under `data`.",
+    description="Preview the current pipeline without executing it. The "
+    "envelope's `validation` is the authoring check and `runtime_preflight` "
+    "(top-level, when a runtime check ran) is the dry-run. `data` carries "
+    "`preview_is_valid` (true only when the authoring check, the runtime "
+    "check and the source proof all pass), `preview_errors` (entries only "
+    "the preview stage produces, such as `runtime_preflight_not_run`), "
+    "`edge_contracts`, `proof_diagnostics`, `structural_preview` when "
+    "present, and a read-only overview: `sources`, `nodes`, `outputs`, "
+    "`node_count`, `output_count`.",
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=False,
 )

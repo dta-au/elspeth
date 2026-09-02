@@ -1253,7 +1253,7 @@ class TestStdioServerConstruction:
         preflight = envelope.get("runtime_preflight")
         assert preflight is not None, "stage 2 never ran — the stdio construction dropped the preflight"
         assert preflight["is_valid"] is True
-        assert envelope["data"]["is_valid"] is True
+        assert envelope["data"]["preview_is_valid"] is True
         # The costly checks are asserted present-and-passed rather than
         # inferred from an absence of failures: a stub preflight returning an
         # empty check list would otherwise satisfy every assertion above.
@@ -1307,7 +1307,7 @@ class TestStdioServerConstruction:
         # Stage 1 accepts these paths; only the runtime allowlist rejects them.
         envelope = await self._preview_with_sink_path(tmp_path, data_dir, label, sink_path)
 
-        assert envelope["data"]["authoring_validation"]["is_valid"] is True
+        assert envelope["validation"]["is_valid"] is True
         preflight = envelope.get("runtime_preflight")
         assert preflight is not None
         assert preflight["is_valid"] is False
@@ -1317,7 +1317,7 @@ class TestStdioServerConstruction:
         # so ``outputs/deadbeef1234/x.csv`` validates TRUE. A verdict-only
         # assertion here would pass for the wrong reason.
         assert "path_allowlist" in {check["name"] for check in preflight["checks"] if not check["passed"]}
-        assert envelope["data"]["is_valid"] is False
+        assert envelope["data"]["preview_is_valid"] is False
 
     def test_create_server_requires_an_explicit_runtime_preflight(self, tmp_path: Path) -> None:
         """Re-adding the silent default is itself the mutation being caught."""

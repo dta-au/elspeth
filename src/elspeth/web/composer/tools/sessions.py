@@ -52,7 +52,6 @@ from elspeth.web.composer.state import (
     OutputSpec,
     PipelineMetadata,
     SourceSpec,
-    ValidationSummary,
     _batch_aware_placement_error,
     _batch_aware_required_input_fields_error,
     _validate_gate_expression,
@@ -76,7 +75,6 @@ from elspeth.web.composer.tools._common import (
     _credential_wiring_contract_failure,
     _discovery_result,
     _failure_result,
-    _graph_repair_suggestions,
     _merged_component_rejection_result,
     _missing_output_options_repair_error,
     _mutation_result,
@@ -91,7 +89,6 @@ from elspeth.web.composer.tools._common import (
     _resolver_owned_interpretation_requirement_error,
     _row_union_node_contract_error,
     _runtime_owned_llm_option_error,
-    _semantic_contracts_payload,
     _serialize_full_pipeline_state,
     _serialize_node,
     _serialize_output,
@@ -2235,18 +2232,6 @@ _GET_PIPELINE_STATE_DECLARATION = ToolDeclaration(
     },
     cacheable=False,
 )
-
-
-def _authoring_validation_payload(state: CompositionState, validation: ValidationSummary) -> dict[str, Any]:
-    return {
-        "is_valid": validation.is_valid,
-        "errors": [e.to_dict() for e in validation.errors],
-        "warnings": [e.to_dict() for e in validation.warnings],
-        "suggestions": [e.to_dict() for e in validation.suggestions],
-        "edge_contracts": [ec.to_dict() for ec in validation.edge_contracts],
-        "semantic_contracts": _semantic_contracts_payload(validation.semantic_contracts),
-        "graph_repair_suggestions": _graph_repair_suggestions(state, validation),
-    }
 
 
 def _find_node_or_raise(state: CompositionState, affected_node_id: str) -> NodeSpec:

@@ -145,11 +145,15 @@ Preview the current pipeline configuration — validation status, source summary
 
 **Parameters:** None
 
-**Returns:** Structured summary of the pipeline's current state including:
-- `is_valid`
-- structured validation `errors`, `warnings`, and `suggestions`
+**Returns:** The authoring check rides on the envelope's `validation` and the
+runtime check on its top-level `runtime_preflight`; `data` carries only the
+preview stage's own facts:
+- `preview_is_valid` — true only when the authoring check, the runtime check, and the source proof all pass (false when no runtime check ran)
+- `preview_errors` — entries the preview stage itself produces (`runtime_preflight_not_run` when no runtime check was wired); authoring errors stay on `validation.errors`
 - `edge_contracts` for declared producer/consumer field contracts
-- source, node, and output summary data
+- `proof_diagnostics` — the source proof against the bound blob; a `blocking` entry forces `preview_is_valid` false
+- `structural_preview` when a tolerant structural check ran
+- source, node, and output summary data (`sources`, `nodes`, `outputs`, `node_count`, `output_count`)
 
 Each `edge_contracts` entry reports:
 - `from` / `to`

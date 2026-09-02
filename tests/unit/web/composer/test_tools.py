@@ -156,7 +156,7 @@ def passing_runtime_preflight() -> _SyncCallRecorder:
 
     ``preview_pipeline`` fails closed when no preflight callback is wired
     (an un-run stage may not ride the success side), so a test that wants
-    a preview to publish ``is_valid: True`` must wire one. Deliberately
+    a preview to publish ``preview_is_valid: True`` must wire one. Deliberately
     NOT autouse: a blanket always-passing stub would hide exactly the
     un-run-stage state this guard exists to expose.
     """
@@ -961,18 +961,19 @@ class TestToolResultSemanticContracts:
 
 
 class TestPreviewPipelineSemanticContracts:
-    """_execute_preview_pipeline summary must include semantic_contracts."""
+    """A preview's envelope ``validation`` carries semantic_contracts; ``data`` does not twin them (R4)."""
 
-    def test_summary_includes_semantic_contracts(self) -> None:
+    def test_envelope_validation_includes_semantic_contracts(self) -> None:
         from elspeth.web.composer.tools import _execute_preview_pipeline
         from tests.unit.web.composer.test_semantic_validator import _wardline_state
 
         state = _wardline_state(text_separator=" ")
         result = _execute_preview_pipeline({}, state, _trained_tool_context())
-        assert "semantic_contracts" in result.data
-        assert len(result.data["semantic_contracts"]) == 1
-        assert result.data["semantic_contracts"][0]["outcome"] == "conflict"
-        assert result.data["semantic_contracts"][0]["consumer_plugin"] == "line_explode"
+        contracts = result.to_dict()["validation"]["semantic_contracts"]
+        assert len(contracts) == 1
+        assert contracts[0]["outcome"] == "conflict"
+        assert contracts[0]["consumer_plugin"] == "line_explode"
+        assert "semantic_contracts" not in result.data
 
 
 class TestAwsS3EndpointUrlComposerPolicy:
@@ -12681,7 +12682,7 @@ class TestPreviewPipeline:
         catalog = _mock_catalog()
         result = execute_tool("preview_pipeline", {}, state, catalog)
         assert result.success is True
-        assert result.data["is_valid"] is False
+        assert result.data["preview_is_valid"] is False
         assert _pipeline_state_default_source(result.data) is None
         assert result.data["node_count"] == 0
 
@@ -12786,7 +12787,7 @@ class TestPreviewPipeline:
         assert "text" in source_to_t1["producer_guarantees"]
         assert "text" in source_to_t1["consumer_requires"]
         assert source_to_t1["satisfied"] is True
-        assert result.data["is_valid"] is True
+        assert result.data["preview_is_valid"] is True
 
     def test_reserved_connection_names_covers_every_implicit_self_publisher(self) -> None:
         """A repair branch may not be minted onto a name an implicit publisher owns.
@@ -13001,7 +13002,7 @@ class TestPreviewPipeline:
         )
 
         result = execute_tool("preview_pipeline", {}, state, _mock_catalog())
-        payload = result.to_dict()["data"]
+        payload = result.to_dict()["validation"]
 
         assert result.success is True
         assert any("Duplicate consumer for connection 'classified_rows'" in err["message"] for err in payload["errors"])
@@ -13040,9 +13041,9 @@ class TestPreviewPipeline:
         for step in repair["tool_sequence"][:-1]:
             step_result = execute_tool(step["tool"], step["arguments"], fixed_state, _mock_catalog())
             fixed_state = step_result.updated_state
-        fixed_preview = execute_tool("preview_pipeline", {}, fixed_state, _mock_catalog()).to_dict()["data"]
+        fixed_validation = execute_tool("preview_pipeline", {}, fixed_state, _mock_catalog()).to_dict()["validation"]
 
-        assert not any("Duplicate consumer for connection 'classified_rows'" in err["message"] for err in fixed_preview["errors"])
+        assert not any("Duplicate consumer for connection 'classified_rows'" in err["message"] for err in fixed_validation["errors"])
 
     @pytest.mark.parametrize("duplicate_branch", ["control", "treatment"])
     def test_duplicate_consumer_repair_patches_row_union_branch_and_validates(self, duplicate_branch: str) -> None:
@@ -13189,7 +13190,7 @@ class TestPreviewPipeline:
         )
 
         preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
-        repair = preview.data["graph_repair_suggestions"][0]
+        repair = preview.to_dict()["validation"]["graph_repair_suggestions"][0]
         union_step = next(
             step for step in repair["tool_sequence"] if step["tool"] == "upsert_node" and step["arguments"]["id"] == "variant_union"
         )
@@ -13206,7 +13207,7 @@ class TestPreviewPipeline:
             repaired_state = step_result.updated_state
 
         repaired_preview = execute_tool("preview_pipeline", {}, repaired_state, _mock_catalog())
-        remaining_codes = {entry["error_code"] for entry in repaired_preview.data["errors"]}
+        remaining_codes = {entry.error_code for entry in repaired_preview.validation.errors}
         assert "duplicate_connection_consumer" not in remaining_codes
         assert "row_union_input_mismatch" not in remaining_codes
         assert "fork_branch_no_destination" in remaining_codes
@@ -13254,13 +13255,13 @@ class TestPreviewPipeline:
             )
         )
 
-        preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
-        duplicate_error = next(entry for entry in preview.data["errors"] if entry["error_code"] == "duplicate_connection_consumer")
+        preview_validation = execute_tool("preview_pipeline", {}, state, _mock_catalog()).to_dict()["validation"]
+        duplicate_error = next(entry for entry in preview_validation["errors"] if entry["error_code"] == "duplicate_connection_consumer")
         assert "ordinary_a" in duplicate_error["message"]
         assert "ordinary_b" in duplicate_error["message"]
         assert "variant_union" not in duplicate_error["message"]
 
-        repair = next(entry for entry in preview.data["graph_repair_suggestions"] if entry["connection"] == "control")
+        repair = next(entry for entry in preview_validation["graph_repair_suggestions"] if entry["connection"] == "control")
         assert [consumer["id"] for consumer in repair["affected_consumers"]] == [
             "ordinary_a",
             "ordinary_b",
@@ -13405,9 +13406,9 @@ class TestPreviewPipeline:
             )
         )
 
-        preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
-        assert "duplicate_connection_consumer" in {entry["error_code"] for entry in preview.data["errors"]}
-        repair = next(entry for entry in preview.data["graph_repair_suggestions"] if entry["connection"] == "union_out")
+        preview_validation = execute_tool("preview_pipeline", {}, state, _mock_catalog()).to_dict()["validation"]
+        assert "duplicate_connection_consumer" in {entry["error_code"] for entry in preview_validation["errors"]}
+        repair = next(entry for entry in preview_validation["graph_repair_suggestions"] if entry["connection"] == "union_out")
 
         upsert_ids = [step["arguments"]["id"] for step in repair["tool_sequence"] if step["tool"] == "upsert_node"]
         assert len(upsert_ids) == len(set(upsert_ids)), repair["tool_sequence"]
@@ -13431,7 +13432,7 @@ class TestPreviewPipeline:
             repaired_state = step_result.updated_state
 
         repaired_preview = execute_tool("preview_pipeline", {}, repaired_state, _mock_catalog())
-        remaining_codes = {entry["error_code"] for entry in repaired_preview.data["errors"]}
+        remaining_codes = {entry.error_code for entry in repaired_preview.validation.errors}
         assert "duplicate_connection_consumer" not in remaining_codes
         assert "row_union_input_mismatch" not in remaining_codes
 
@@ -13491,15 +13492,15 @@ class TestPreviewPipeline:
 
         assert result.success is True
         assert result.runtime_preflight is not None
-        assert result.data["authoring_validation"]["is_valid"] is True
+        assert result.validation.is_valid is True
         assert result.runtime_preflight.is_valid is False
-        assert result.data["is_valid"] is False
+        assert result.data["preview_is_valid"] is False
         assert result.runtime_preflight.errors[0].message == "Forbidden name: 'end_of_source'"
         # The preflight rides ONLY on the envelope field; no nested twin.
         assert "runtime_preflight" not in result.data
         runtime_preflight.assert_called_once_with(state)
 
-    def test_preview_pipeline_without_runtime_preflight_preserves_authoring_validation(self) -> None:
+    def test_preview_pipeline_without_runtime_preflight_keeps_the_authoring_verdict_on_the_envelope(self) -> None:
         state = _stage1_valid_preview_state()
 
         result = execute_tool(
@@ -13513,9 +13514,9 @@ class TestPreviewPipeline:
 
         assert result.success is True
         assert result.runtime_preflight is None
-        assert result.data["authoring_validation"]["is_valid"] is True
+        assert result.validation.is_valid is True
         assert "runtime_preflight" not in result.data
-        assert result.data["is_valid"] is False
+        assert result.data["preview_is_valid"] is False
 
     def test_preview_pipeline_absent_runtime_preflight_fails_closed(self) -> None:
         """An un-run Stage 2 may not ride the success side of the conjunct.
@@ -13537,19 +13538,19 @@ class TestPreviewPipeline:
         )
 
         assert result.success is True
-        assert result.data["authoring_validation"]["is_valid"] is True
-        assert result.data["is_valid"] is False
+        assert result.validation.is_valid is True
+        assert result.data["preview_is_valid"] is False
         assert "runtime_preflight" not in result.data
 
-        markers = [entry for entry in result.data["errors"] if entry.get("error_code") == "runtime_preflight_not_run"]
-        assert len(markers) == 1, result.data["errors"]
+        markers = [entry for entry in result.data["preview_errors"] if entry.get("error_code") == "runtime_preflight_not_run"]
+        assert len(markers) == 1, result.data["preview_errors"]
         assert markers[0]["severity"] == "high"
         assert "did not run" in markers[0]["message"]
 
-        # Stage 1's own report stays Stage-1-true: the marker is appended to
-        # the summary's error channel, never into the authoring payload the
-        # summary embeds (the two lists would alias without a fresh copy).
-        authoring_codes = [entry.get("error_code") for entry in result.data["authoring_validation"]["errors"]]
+        # The authoring check's own report stays true to itself: the marker
+        # is a preview-stage entry under ``data``, never an entry on the
+        # envelope's ``validation``.
+        authoring_codes = [entry.error_code for entry in result.validation.errors]
         assert "runtime_preflight_not_run" not in authoring_codes
 
     def test_preview_pipeline_runtime_conjunct_three_directions(
@@ -13609,23 +13610,122 @@ class TestPreviewPipeline:
 
         def marker_codes(envelope: dict[str, Any]) -> list[str]:
             return [
-                entry.get("error_code") for entry in envelope["data"]["errors"] if entry.get("error_code") == "runtime_preflight_not_run"
+                entry.get("error_code")
+                for entry in envelope["data"]["preview_errors"]
+                if entry.get("error_code") == "runtime_preflight_not_run"
             ]
 
         # The preflight is an envelope field, never a nested twin under data.
         assert all("runtime_preflight" not in envelope["data"] for envelope in (wired_pass, wired_fail, absent))
 
-        assert wired_pass["data"]["is_valid"] is True
+        assert wired_pass["data"]["preview_is_valid"] is True
         assert wired_pass["runtime_preflight"]["is_valid"] is True
         assert marker_codes(wired_pass) == []
 
-        assert wired_fail["data"]["is_valid"] is False
+        assert wired_fail["data"]["preview_is_valid"] is False
         assert wired_fail["runtime_preflight"]["is_valid"] is False
         assert marker_codes(wired_fail) == []
 
-        assert absent["data"]["is_valid"] is False
+        assert absent["data"]["preview_is_valid"] is False
         assert "runtime_preflight" not in absent
         assert marker_codes(absent) == ["runtime_preflight_not_run"]
+
+    def test_preview_data_carries_exactly_the_preview_stage_facts(
+        self,
+        passing_runtime_preflight: _SyncCallRecorder,
+    ) -> None:
+        """``data`` is the preview stage's own facts and the overview — nothing the envelope already carries.
+
+        Mutation caught: re-hoisting the authoring verdict under ``data``
+        (``is_valid`` / ``errors`` / ``warnings`` / ``suggestions`` /
+        ``semantic_contracts`` / ``graph_repair_suggestions``, or a nested
+        ``authoring_validation`` copy) puts byte-twins of the envelope's own
+        ``validation`` back on the wire under a second name, and revives the
+        ``is_valid`` homonym (the 3-stage conjunct wearing the authoring
+        verdict's key). The key set is exact so an addition is a deliberate
+        teaching change, not a drift (elspeth-e405ad7cd2 R4).
+        """
+        state = _stage1_valid_preview_state()
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            data_dir="/data",
+            runtime_preflight=passing_runtime_preflight,
+        )
+        assert result.success is True
+        assert frozenset(result.data) == _PREVIEW_DATA_KEYS
+        assert "is_valid" not in result.data
+        assert "authoring_validation" not in result.data
+        assert "errors" not in result.data
+
+        with_structural = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            data_dir="/data",
+            runtime_preflight=passing_runtime_preflight,
+            structural_preflight=_SyncCallRecorder(_tolerant_result(valid=True)),
+        )
+        assert with_structural.success is True
+        assert frozenset(with_structural.data) == _PREVIEW_DATA_KEYS | {"structural_preview"}
+
+    def test_preview_errors_is_only_the_preview_stage(
+        self,
+        passing_runtime_preflight: _SyncCallRecorder,
+    ) -> None:
+        """``preview_errors`` carries entries the preview stage itself mints, never authoring errors.
+
+        Mutation caught: seeding ``preview_errors`` from the authoring
+        errors (the pre-R4 ``summary_errors = authoring errors + marker``
+        shape) makes every authoring error appear twice on the wire —
+        once under ``validation.errors`` and once under ``data`` — and
+        hides which entries the envelope's ``validation`` does NOT know.
+        """
+        # An empty pipeline is authoring-invalid: at least one error rides on
+        # the envelope's own validation, and none of them may leak into data.
+        state = _empty_state()
+
+        absent = execute_tool("preview_pipeline", {}, state, _mock_catalog(), data_dir="/data", runtime_preflight=None)
+        assert absent.success is True
+        assert absent.validation.is_valid is False
+        assert len(absent.validation.errors) >= 1
+        assert [entry["error_code"] for entry in absent.data["preview_errors"]] == ["runtime_preflight_not_run"]
+        assert absent.data["preview_errors"][0]["severity"] == "high"
+        assert "did not run" in absent.data["preview_errors"][0]["message"]
+        authoring_codes = {entry.error_code for entry in absent.validation.errors}
+        assert "runtime_preflight_not_run" not in authoring_codes
+
+        wired = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            data_dir="/data",
+            runtime_preflight=passing_runtime_preflight,
+        )
+        assert wired.success is True
+        assert wired.validation.is_valid is False
+        assert list(wired.data["preview_errors"]) == []
+
+
+_PREVIEW_DATA_KEYS = frozenset(
+    {
+        "preview_is_valid",
+        "preview_errors",
+        "edge_contracts",
+        "proof_diagnostics",
+        "sources",
+        "node_count",
+        "output_count",
+        "nodes",
+        "outputs",
+    }
+)
+"""The exact ``preview_pipeline`` ``data`` key set when a runtime check is wired (``structural_preview`` joins when its callback is)."""
 
 
 def _handoff_strict_preflight() -> _SyncCallRecorder:
@@ -13773,7 +13873,7 @@ class TestPreviewPipelineStructuralPreview:
     def test_no_structural_callback_leaves_block_absent(self) -> None:
         data = self._preview(_stage1_valid_preview_state(), structural_preflight=None)
         assert "structural_preview" not in data
-        assert data["is_valid"] is False  # strict handoff verdict governs
+        assert data["preview_is_valid"] is False  # strict handoff verdict governs
 
     def test_tolerant_green_yields_block_with_empty_findings(self) -> None:
         data = self._preview(
@@ -13788,7 +13888,7 @@ class TestPreviewPipelineStructuralPreview:
         assert block["masking_applied"] is False
         assert block["confidence"] == "equivalent"
         # The strict conjunct is untouched by a green tolerant pass.
-        assert data["is_valid"] is False
+        assert data["preview_is_valid"] is False
 
     def test_tolerant_red_without_masking_is_framed_equivalent(self) -> None:
         data = self._preview(
@@ -13803,7 +13903,7 @@ class TestPreviewPipelineStructuralPreview:
         assert block["errors"][0]["message"] == "consumer requires ['colour'], producer guarantees (none)"
         # The skipped-after-failure stamp is derived noise and must be dropped.
         assert all(check["outcome_code"] != "validation.skipped_after_failure" for check in block["failing_checks"])
-        assert data["is_valid"] is False
+        assert data["preview_is_valid"] is False
 
     def test_tolerant_red_with_masking_is_framed_provisional(self) -> None:
         """The ticket's false-positive shape: a pending prompt-template ref.
@@ -13827,7 +13927,7 @@ class TestPreviewPipelineStructuralPreview:
         assert "placeholder" in block["note"]
         assert "Report" in block["note"]
         assert [check["name"] for check in block["failing_checks"]] == ["plugin_instantiation"]
-        assert data["is_valid"] is False
+        assert data["preview_is_valid"] is False
 
     def test_masking_noop_state_is_framed_equivalent_with_prompt_node(self) -> None:
         """A resolved-parts prompt renders identically → identical state object."""
@@ -16624,7 +16724,7 @@ class TestPreviewProofStep:
                 session_id=self.session_id,
             )
 
-        assert result.data["authoring_validation"]["is_valid"] is True
+        assert result.validation.is_valid is True
         matching = [
             diagnostic
             for diagnostic in result.data["proof_diagnostics"]
@@ -16704,7 +16804,7 @@ class TestPreviewProofStep:
         blocking = [d for d in diagnostics if d["severity"] == "blocking"]
         assert blocking, "expected a blocking diagnostic for omitted observed columns"
         # is_valid is forced False by the blocking proof diagnostic.
-        assert result.data["is_valid"] is False
+        assert result.data["preview_is_valid"] is False
 
     def test_fixed_csv_with_all_columns_does_not_block(self) -> None:
         state = self._state_with_csv_source(
@@ -16794,7 +16894,7 @@ class TestPreviewProofStep:
         assert "text_source_url_without_web_scrape" in codes
         blocking = [d for d in diagnostics if d["severity"] == "blocking"]
         assert blocking
-        assert result.data["is_valid"] is False
+        assert result.data["preview_is_valid"] is False
 
     def test_text_url_with_web_scrape_does_not_block(self) -> None:
         state = self._state_with_text_url_source(fetch_plugin="web_scrape")
@@ -16913,7 +17013,7 @@ class TestPreviewProofStep:
         assert "headerless" in repair
         assert "explicit unique `columns`" in repair
         # is_valid is forced False by the blocking proof diagnostic.
-        assert result.data["is_valid"] is False
+        assert result.data["preview_is_valid"] is False
 
     def test_explicit_unique_columns_clear_duplicate_warning_for_headerless_input(self) -> None:
         self._replace_csv_blob_with_duplicate_headers(headerless=True)
@@ -17023,7 +17123,7 @@ class TestPreviewProofStep:
         assert mismatch[0]["severity"] == "blocking"
         assert mismatch[0]["evidence_locator"]["node_id"] == "price_gate"
         assert mismatch[0]["evidence_locator"]["field"] == "price"
-        assert result.data["is_valid"] is False
+        assert result.data["preview_is_valid"] is False
 
     def test_observed_csv_string_amplification_gate_blocks_without_evaluating(self, monkeypatch) -> None:
         """A Mult over an observed (string-typed) field must be diagnosed
@@ -17075,7 +17175,7 @@ class TestPreviewProofStep:
         assert amplification, diagnostics
         assert amplification[0]["severity"] == "blocking"
         assert amplification[0]["evidence_locator"]["node_id"] == "amp_gate"
-        assert result.data["is_valid"] is False
+        assert result.data["preview_is_valid"] is False
         # The mechanism, not just the symptom: the amplifying condition was
         # never evaluated against sampled rows.
         assert not any("100000" in expr for expr in evaluated_expressions), evaluated_expressions
@@ -17214,7 +17314,7 @@ class TestPreviewProofStep:
         assert mismatch[0]["evidence_locator"]["node_id"] == "summarize"
         assert mismatch[0]["evidence_locator"]["field"] == "financial_barrier"
         assert mismatch[0]["evidence_locator"]["observed_type"] == "str"
-        assert result.data["is_valid"] is False
+        assert result.data["preview_is_valid"] is False
 
     def test_observed_named_csv_batch_stats_string_value_field_blocks_through_transform(self) -> None:
         """Named CSV sources must participate in source-field proof walk-back."""
@@ -17308,7 +17408,7 @@ class TestPreviewProofStep:
         assert mismatch[0]["evidence_locator"]["node_id"] == "summarize"
         assert mismatch[0]["evidence_locator"]["field"] == "financial_barrier"
         assert mismatch[0]["evidence_locator"]["observed_type"] == "str"
-        assert result.data["is_valid"] is False
+        assert result.data["preview_is_valid"] is False
 
     def test_observed_csv_numeric_aggregation_does_not_block_after_field_overwrite(self) -> None:
         """The proof step abstains once an upstream transform overwrites the field."""
@@ -17569,7 +17669,7 @@ class TestPreviewProofStep:
         assert mismatch[0]["evidence_locator"]["field"] == "price"
         assert mismatch[0]["evidence_locator"]["declared_type"] == "float"
         assert mismatch[0]["evidence_locator"]["observed_type"] == "str"
-        assert result.data["is_valid"] is False
+        assert result.data["preview_is_valid"] is False
 
     def test_observed_csv_str_input_declaration_does_not_block(self) -> None:
         """str/any declarations match what an observed CSV actually delivers."""
@@ -17711,7 +17811,7 @@ class TestPreviewProofStep:
         assert mismatch[0]["evidence_locator"]["field"] == "id"
         assert mismatch[0]["evidence_locator"]["declared_type"] == "int"
         assert mismatch[0]["evidence_locator"]["inferred_sample_type"] == "int"
-        assert result.data["is_valid"] is False
+        assert result.data["preview_is_valid"] is False
 
     def test_observed_csv_typed_sink_schema_blocks(self) -> None:
         """The same contradiction one node further on: a fixed sink schema
@@ -17758,7 +17858,7 @@ class TestPreviewProofStep:
         assert mismatch[0]["evidence_locator"]["output_name"] == "typed_out"
         assert mismatch[0]["evidence_locator"]["field"] == "order_id"
         assert mismatch[0]["evidence_locator"]["declared_type"] == "int"
-        assert result.data["is_valid"] is False
+        assert result.data["preview_is_valid"] is False
 
     def test_malformed_node_schema_block_abstains_without_crashing(self) -> None:
         """A node whose schema block cannot be parsed is an abstention, not a
@@ -17851,15 +17951,45 @@ class TestPreviewProofStep:
         )
         codes = [d["code"] for d in result.data["proof_diagnostics"]]
         assert "source_inspection_failed" in codes
-        assert result.data["is_valid"] is False
+        assert result.data["preview_is_valid"] is False
 
-    def test_blocking_proof_overrides_authoring_validation(self) -> None:
-        """Authoring may be valid but blocking proof_diagnostics still flips is_valid."""
+    def test_blocking_proof_overrides_authoring_validation(self, passing_runtime_preflight: _SyncCallRecorder) -> None:
+        """Authoring is valid but a blocking proof diagnostic still flips ``preview_is_valid``.
+
+        The runtime check is held green so the proof stage is the only stage
+        that can move the verdict: with authoring valid on the envelope and
+        the preflight passing, a false ``preview_is_valid`` can only be the
+        blocking diagnostic (pin 3 of elspeth-e405ad7cd2 R4).
+        """
         state = self._state_with_csv_source(
             schema_mode="fixed",
             fields=("order_id: str",),
             on_validation_failure="discard",
         )
+        # Route the source's ``rows`` connection into the sink so the
+        # authoring check is genuinely green; the helper's ``out`` sink leaves
+        # ``rows`` unconsumed, which would make authoring — not the proof
+        # stage — the reason for the verdict below.
+        removed = execute_tool("remove_output", {"sink_name": "out"}, state, _mock_catalog())
+        assert removed.success, removed.data
+        routed = execute_tool(
+            "set_output",
+            {
+                "sink_name": "rows",
+                "plugin": "json",
+                "options": {
+                    "path": "outputs/out.json",
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            },
+            removed.updated_state,
+            _mock_catalog(),
+        )
+        assert routed.success, routed.data
+        state = routed.updated_state
         result = execute_tool(
             "preview_pipeline",
             {},
@@ -17867,15 +17997,14 @@ class TestPreviewProofStep:
             _mock_catalog(),
             session_engine=self.engine,
             session_id=self.session_id,
+            runtime_preflight=passing_runtime_preflight,
         )
-        # Stage 1 might be valid, but proof step blocks → is_valid False.
-        assert result.data["is_valid"] is False
-        # The state-level validation still reflects authoring shape, only
-        # the summary-level is_valid is forced. authoring_validation is
-        # deep-frozen to MappingProxyType by ToolResult.__post_init__.
-        from collections.abc import Mapping as _Mapping
-
-        assert isinstance(result.data["authoring_validation"], _Mapping)
+        assert result.validation.is_valid is True
+        assert result.runtime_preflight is not None
+        assert result.runtime_preflight.is_valid is True
+        assert any(d["severity"] == "blocking" for d in result.data["proof_diagnostics"])
+        assert result.data["preview_is_valid"] is False
+        assert list(result.data["preview_errors"]) == []
 
     # -- Tier-3 persisted-option boundaries: malformed source.options ---------
     # ``source.options`` is composer/operator-authored config re-read from
@@ -18775,7 +18904,7 @@ class TestRowUnionTopologyCodesDoNotBlockUnrelatedMutations:
         state = self._mis_wired_state()
 
         preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
-        assert "row_union_branch_unreachable" in {entry["error_code"] for entry in preview.data["errors"]}
+        assert "row_union_branch_unreachable" in {entry.error_code for entry in preview.validation.errors}
 
         result = execute_tool(
             "upsert_node",

@@ -998,8 +998,8 @@ Before you stop, copy this checklist and confirm each item:
 
 For build/edit/validate turns, end only in one of these states:
 
-1. `preview_pipeline` returned `is_valid: true` and blocking diagnostics are
-   resolved.
+1. `preview_pipeline` returned `preview_is_valid: true` (its `data` verdict,
+   which already folds in the runtime check and the source proof).
 2. All required `request_interpretation_review` calls succeeded, and the only
    remaining blocker is unresolved pending interpretation reviews. Tell the user
    the review cards are waiting; do not call `preview_pipeline` yet. Announce

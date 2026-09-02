@@ -821,7 +821,6 @@ allowed_dict_patterns:
   # LLM tool-use loop. Tool JSON schemas define optional fields.
   # ═══════════════════════════════════════════════════════════════════════════
   - "src/elspeth/web/composer/tools/_common.py:ToolResult.to_dict:return"
-  - "src/elspeth/web/composer/tools/sessions.py:_authoring_validation_payload:return"
   - "src/elspeth/web/composer/tools/_common.py:_secret_ref_placement_error:options"
   - "src/elspeth/web/composer/tools/_dispatch.py:get_tool_definitions:return (list)"
   - "src/elspeth/web/composer/tools/_dispatch.py:execute_tool:arguments"

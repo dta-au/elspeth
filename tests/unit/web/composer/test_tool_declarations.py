@@ -549,18 +549,15 @@ class TestStep3DiscoveryTierMigration:
     def test_preview_pipeline(self) -> None:
         assert self._get("preview_pipeline") == {
             "name": "preview_pipeline",
-            "description": "Preview the current pipeline configuration — returns "
-            "validation status, source summary, and node/output overview "
-            "without executing. Use this to confirm the pipeline is set up "
-            "correctly before running. Result `data` carries the authoring check "
-            "(`is_valid`, `errors`, `warnings`, `suggestions`, "
-            "`graph_repair_suggestions`, `semantic_contracts` — the same shapes as "
-            "the top-level `validation` — plus `authoring_validation`, the Stage-1 "
-            "report on its own) and a read-only overview (`sources`, `nodes`, "
-            "`outputs`, `node_count`, `output_count`, `edge_contracts`, "
-            "`structural_preview`, `proof_diagnostics`). When a runtime check ran, "
-            "`runtime_preflight` is the envelope's own top-level field, not a key "
-            "under `data`.",
+            "description": "Preview the current pipeline without executing it. The "
+            "envelope's `validation` is the authoring check and `runtime_preflight` "
+            "(top-level, when a runtime check ran) is the dry-run. `data` carries "
+            "`preview_is_valid` (true only when the authoring check, the runtime "
+            "check and the source proof all pass), `preview_errors` (entries only "
+            "the preview stage produces, such as `runtime_preflight_not_run`), "
+            "`edge_contracts`, `proof_diagnostics`, `structural_preview` when "
+            "present, and a read-only overview: `sources`, `nodes`, `outputs`, "
+            "`node_count`, `output_count`.",
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 

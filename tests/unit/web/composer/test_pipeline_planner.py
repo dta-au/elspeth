@@ -2989,7 +2989,7 @@ async def test_preview_pipeline_disclosure_fails_closed_when_authoritative_data_
         assert _HIDDEN_CONNECTION_COMPONENT_CANARY in tool_message["content"]
         assert _HIDDEN_EDGE_COMPONENT_CANARY in tool_message["content"]
         if not failed:
-            assert "authoring_validation" in payload["data"]
+            assert "preview_is_valid" in payload["data"]
 
 
 @pytest.mark.parametrize(
