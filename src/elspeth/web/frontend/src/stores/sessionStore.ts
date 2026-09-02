@@ -3069,6 +3069,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           releaseSubmitOwnership();
           set({
             guidedNextTurn: null,
+            // The reviewed-components ledger goes with the turn: this path
+            // tells the user to reload, and a reload re-derives the ledger
+            // from the wire. Leaving it would keep drawing the pre-failure
+            // source/output nodes beside the refresh-required banner.
+            guidedReviewedComponents: EMPTY_GUIDED_REVIEWED_COMPONENTS,
             guidedProposalReview: null,
             guidedResponsePending: false,
             error: GUIDED_RESPONSE_REFRESH_REQUIRED_MESSAGE,

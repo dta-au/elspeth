@@ -1199,6 +1199,13 @@ describe("sessionStore — guided-mode fields and actions", () => {
         guidedNextTurn: sampleNextTurn,
         guidedTerminal: null,
         compositionState: sampleCompositionState,
+        // A reviewed source is in the ledger when the failure lands; the
+        // refresh-required state must drop it with the turn, or the pane keeps
+        // drawing the pre-failure node beside the reload banner.
+        guidedReviewedComponents: {
+          sources: [{ stable_id: "src-stale" } as never],
+          outputs: [],
+        },
       });
       const action: GuidedRespondAction = {
         chosen: ["csv"],
@@ -1216,6 +1223,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
       expect(respondMock).toHaveBeenCalledTimes(1);
       expect(getMock).toHaveBeenCalledWith(RETRY_SESSION_ID);
       expect(useSessionStore.getState().guidedNextTurn).toBeNull();
+      expect(useSessionStore.getState().guidedReviewedComponents).toEqual({ sources: [], outputs: [] });
       expect(useSessionStore.getState().guidedResponsePending).toBe(false);
       expect(useSessionStore.getState().error).toMatch(/accepted.*refresh.*re-enter/i);
       await expect(useSessionStore.getState().respondGuided(action)).resolves.toMatchObject({
