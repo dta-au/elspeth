@@ -25,6 +25,10 @@ describe("nodeOptionDisplay helpers", () => {
     expect(nodeOptionText({ key: "system_prompt", value: "Be terse." })).toBe("System prompt: Be terse.");
     expect(nodeOptionText({ key: "prompt_template", value: "Rate it." })).toBe("Prompt: Rate it.");
     expect(nodeOptionText({ key: "mapping", value: "a → b" })).toBe("Mapping: a → b");
+    // web_scrape's display-only `http` identity carries the backend-rendered text.
+    expect(nodeOptionText({ key: "http", value: "contact: ops@example.org; reason: catalogue refresh" })).toBe(
+      "Scraping identity (confirmed after commit): contact: ops@example.org; reason: catalogue refresh",
+    );
     expect(nodeOptionText({ key: "select_only", value: "only the mapped fields are kept" })).toBe(
       "Select only: only the mapped fields are kept",
     );
@@ -126,15 +130,16 @@ describe("NodeOptionsSummary", () => {
     // buttons it opens.
     rerender(<NodeOptionsSummary entries={entries} nodeLabel="node-2" onEdit={onEdit} editDisabled />);
     expect(screen.getByRole("button", { name: "Edit prompt for node-2" })).toBeDisabled();
-    // A knob line is not a prompt: no Edit grows from it.
+    // A knob line is not a prompt: no Edit grows from it — including the
+    // display-only scraping identity, which a correction can never touch.
     rerender(
       <NodeOptionsSummary
-        entries={[{ key: "mapping", value: "a → b" }]}
+        entries={[{ key: "http", value: "contact: ops@example.org; reason: catalogue refresh" }]}
         nodeLabel="node-3"
         onEdit={onEdit}
       />,
     );
-    expect(screen.getByText("Mapping: a → b")).toBeInTheDocument();
+    expect(screen.getByText("Scraping identity (confirmed after commit): contact: ops@example.org; reason: catalogue refresh")).toBeInTheDocument();
     expect(screen.queryByRole("button")).toBeNull();
   });
 });

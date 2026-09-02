@@ -27,11 +27,17 @@ const PROMPT_OPTION_KEYS: ReadonlySet<string> = new Set(["prompt_template", "sys
 
 /** Labels in the approval card's vocabulary (OptionRows uses the same words
  *  for the llm keys), so the pre-commit card and the post-commit card name
- *  one thing one way. Unlisted keys read as their humanised token. */
+ *  one thing one way. `http` is web_scrape's display-only identity, rendered
+ *  by the backend as "contact: …; reason: …". It is display-only: a revise
+ *  cannot change it (the binder restores the reviewed value), only the
+ *  post-commit identity decision can — so the label says where it is
+ *  confirmed rather than letting a learner ask a revise for it and watch
+ *  nothing happen. Unlisted keys read as their humanised token. */
 const OPTION_LABELS: Readonly<Record<string, string>> = {
   prompt_template: "Prompt",
   system_prompt: "System prompt",
   model: "Model",
+  http: "Scraping identity (confirmed after commit)",
 };
 
 /** A prompt longer than this many lines OR characters starts collapsed. */

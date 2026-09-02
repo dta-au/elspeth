@@ -717,10 +717,12 @@ class TestStep4WireEmitter:
             assert private not in rendered
         assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
 
-    def test_web_scrape_options_summary_is_empty_and_leaks_no_http_policy(self) -> None:
-        # web_scrape's http object is deliberately NOT allowlisted: the
-        # allowlist is also the correction authority, and the object carries
-        # the SSRF policy beside the identity fields (red-team F1, 2026-09-02).
+    def test_web_scrape_options_summary_carries_only_the_scraping_identity(self) -> None:
+        # I-2: the abuse contact and scraping reason are the post-commit
+        # identity review's material; they show before commit through the
+        # DISPLAY-ONLY table (never correctable — red-team F1, 2026-09-02).
+        # The rest of the http policy (SSRF allowlist, timeout, body cap)
+        # stays off the wire.
         turn = _wire_turn(
             _field_mapper_state(
                 plugin="web_scrape",
@@ -738,9 +740,10 @@ class TestStep4WireEmitter:
         )
 
         node = next(node for node in turn["payload"]["nodes"] if node["plugin"] == "web_scrape")
-        assert node["node_options_summary"] == []
+        assert node["node_options_summary"] == [
+            {"key": "http", "value": "contact: ops@example.org; reason: catalogue refresh", "tier": "common"},
+        ]
         assert "10.0.0.0" not in str(turn)
-        assert "ops@example.org" not in str(turn)
         assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
 
     def test_options_summary_is_empty_for_a_plugin_outside_the_allowlist(self) -> None:
