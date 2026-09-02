@@ -39,7 +39,7 @@ import pytest
 from pydantic import BaseModel
 
 from elspeth.web.catalog.schemas import PluginSchemaInfo
-from elspeth.web.composer import pipeline_planner, redaction, state
+from elspeth.web.composer import pipeline_planner, redaction, state, tool_batch
 from elspeth.web.composer import tool_result_envelope as env
 from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.tools import _common as common
@@ -138,8 +138,14 @@ _FUNCTION_TOOL_OVERRIDES: dict[str, str] = {
 
 def _module_str_constants(tree: ast.Module, path: Path | None = None) -> dict[str, str]:
     """Module-level ``NAME = "literal"`` / ``NAME: Final[str] = "literal"`` bindings, plus — when
-    ``path`` is given — every ``from m import NAME`` whose live value in that module is a str
-    (``_DATA_ERROR_KEY`` is imported into the tool modules from ``_common``)."""
+    ``path`` is given — every ``from m import NAME`` whose live value in that module is a str.
+
+    A census file may key a shipped dict on a constant it imports (``generation.py`` keyed a
+    payload on ``_DATA_ERROR_KEY`` from ``_common`` until d20f58783); the import branch reads
+    such a key as the constant's value instead of refusing it. No census file does so today, so
+    the branch is pinned by ``test_walker_resolves_import_bound_str_constants``, not by the
+    census.
+    """
     out: dict[str, str] = {}
     if path is not None:
         module = _module_of(path)
@@ -260,6 +266,70 @@ def _subscript_assign_keys(fn: ast.AST, target: str, site: str, constants: dict[
     yield from sorted(found, key=lambda item: item[1])
 
 
+def _name_bindings(fn: ast.AST) -> Iterator[tuple[list[ast.expr], ast.AST]]:
+    """Every ``a = <rhs>`` / ``a: T = <rhs>`` inside ``fn`` as (targets, rhs)."""
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign):
+            yield node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            yield [node.target], node.value
+
+
+def _aliases_of(fn: ast.AST, name: str) -> frozenset[str]:
+    """``name`` plus every local bound to it by a plain assignment, to a fixpoint: an alias of an
+    alias is still the same dict object, so a store through any of them re-shapes the payload."""
+    names = {name}
+    while True:
+        grown = set(names)
+        for targets, rhs in _name_bindings(fn):
+            if isinstance(rhs, ast.Name) and rhs.id in names:
+                grown.update(target.id for target in targets if isinstance(target, ast.Name))
+        if grown == names:
+            return frozenset(names)
+        names = grown
+
+
+def _results_carrying(fn: ast.AST, payload: str) -> frozenset[str]:
+    """Locals bound to a ``ToolResult(..., data=<payload>)`` call, and their aliases: the result
+    is frozen but ``.data`` is the payload dict itself, so ``result.data[k] = v`` ships ``k``."""
+    bound: set[str] = set()
+    for targets, rhs in _name_bindings(fn):
+        if not (isinstance(rhs, ast.Call) and _call_name(rhs) == "ToolResult"):
+            continue
+        if any(kw.arg == "data" and isinstance(kw.value, ast.Name) and kw.value.id == payload for kw in rhs.keywords):
+            bound.update(target.id for target in targets if isinstance(target, ast.Name))
+    out: set[str] = set()
+    for name in bound:
+        out.update(_aliases_of(fn, name))
+    return frozenset(out)
+
+
+_DICT_MUTATORS = frozenset({"update", "setdefault", "pop", "popitem", "clear", "__setitem__", "__delitem__"})
+
+
+def _dict_mutations(fn: ast.AST, aliases: frozenset[str], results: frozenset[str]) -> list[tuple[int, str]]:
+    """(lineno, form) of every statement that can re-shape the dict behind ``aliases``: a subscript
+    store, augmented store, or ``del`` on an alias or on a result's ``.data``, and any mutator
+    method call (``update``, ``setdefault``, ``pop``, ...) on either. Source order."""
+
+    def refers(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in aliases
+        return isinstance(node, ast.Attribute) and node.attr == "data" and isinstance(node.value, ast.Name) and node.value.id in results
+
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(fn):
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
+            targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Subscript) and refers(target.value):
+                    found.append((node.lineno, f"{type(node).__name__} through {ast.unparse(target.value)}"))
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _DICT_MUTATORS:
+            if refers(node.func.value):
+                found.append((node.lineno, f".{node.func.attr} on {ast.unparse(node.func.value)}"))
+    return sorted(found)
+
+
 def _initial_dict_assign(fn: ast.AST, target: str, site: str) -> ast.Dict:
     for node in ast.walk(fn):
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -344,6 +414,27 @@ def f():
     return {"components": ({"component_id": "x", "fields": ("a",)},), "repair": {"inline_form": {"instruction": "i"}}}
 """
 
+_PROBE_IMPORTED_KEY = """
+def f():
+    return {_DATA_ERROR_KEY: "boom", "other": 1}
+"""
+
+_PROBE_ALIAS_STORES = """
+def f():
+    payload = {"status": "x"}
+    _p = payload
+    _q: dict[str, str] = _p
+    _q["late"] = "y"
+    result = ToolResult(success=True, data=payload)
+    other = result
+    other.data["later"] = 1
+    result.data.update({"z": 1})
+    del _p["status"]
+    unrelated = {"k": 1}
+    unrelated["k"] = 2
+    return result
+"""
+
 
 def test_walker_reads_literal_constant_subscript_and_update_keys_in_emission_order() -> None:
     tree = ast.parse(_PROBE_TO_DICT)
@@ -397,6 +488,52 @@ def test_typed_keys_recurse_through_nested_and_list_of_typed_dicts() -> None:
         "x.nested.code",
         "x.nested.detail",
     ]
+
+
+def test_walker_resolves_import_bound_str_constants() -> None:
+    """The ``from m import NAME`` branch of ``_module_str_constants`` is load-bearing.
+
+    No census file keys a shipped dict on an imported constant today (``generation.py``
+    stopped at d20f58783), so the census cannot notice the branch resolving nothing
+    (GATE-refute1 F1: ``value = None`` survived the whole gate). This probe is its
+    consumer: ``tools/__init__.py`` imports ``_DATA_ERROR_KEY`` from ``_common``; the
+    lookup must resolve it to the literal ``_common`` binds so a dict keyed on it reads
+    as that key, must NOT admit an import whose live value is not a str, and without
+    the branch the same key must be a refusal rather than a silent drop.
+    """
+    path = TOOLS_DIR / "__init__.py"
+    tree = _parse(path)
+    imported = {alias.asname or alias.name for stmt in tree.body if isinstance(stmt, ast.ImportFrom) for alias in stmt.names}
+    assert {"_DATA_ERROR_KEY", "ToolResult"} <= imported, "probe premise: tools/__init__.py imports both names"
+    constants = _module_str_constants(tree, path)
+    assert constants["_DATA_ERROR_KEY"] == common._DATA_ERROR_KEY
+    assert "ToolResult" not in constants
+    fn = _function(ast.parse(_PROBE_IMPORTED_KEY), "f")
+    ret = next(n for n in ast.walk(fn) if isinstance(n, ast.Return))
+    assert ret.value is not None
+    assert list(_dict_literal_keys(ret.value, "data.", "probe", constants)) == [f"data.{common._DATA_ERROR_KEY}", "data.other"]
+    with pytest.raises(AssertionError, match="non-literal key"):
+        list(_dict_literal_keys(ret.value, "data.", "probe", _module_str_constants(tree)))
+
+
+def test_walker_finds_stores_through_local_and_result_aliases() -> None:
+    """Alias stores re-shape the same dict object (GATE-refute1-2 F-1: ``_p = payload;
+    _p["success"] = "true"`` survived the R5 pin). The alias walk follows ``a = payload``
+    chains and the locals bound to ``ToolResult(data=payload)``, and reports every store,
+    ``del`` and mutator call through any of them — and nothing through an unrelated dict."""
+    fn = _function(ast.parse(_PROBE_ALIAS_STORES), "f")
+    aliases = _aliases_of(fn, "payload")
+    results = _results_carrying(fn, "payload")
+    assert aliases == {"payload", "_p", "_q"}
+    assert results == {"result", "other"}
+    assert _dict_mutations(fn, aliases, results) == [
+        (6, "Assign through _q"),
+        (9, "Assign through other.data"),
+        (10, ".update on result.data"),
+        (11, "Delete through _p"),
+    ]
+    # The direct-name walker is blind to every one of them: the reason the alias walk exists.
+    assert list(_subscript_assign_keys(fn, "payload", "probe", {})) == []
 
 
 # --- shipped side: shared surfaces -----------------------------------------------------------------
@@ -496,7 +633,10 @@ def _failure_data_sites() -> Iterator[ShippedKey]:
         found = False
         if owner is not None:
             for node in ast.walk(fn):
-                if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == owner for t in node.targets):
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if any(isinstance(t, ast.Name) and t.id == owner for t in targets):
                     if isinstance(node.value, ast.Dict):
                         found = True
                         for key in _dict_literal_keys(node.value, "data.", f"{site}:{node.lineno}", constants):
@@ -987,16 +1127,23 @@ _PROPOSAL_PAYLOAD_KEYS: tuple[str, ...] = ("status", "proposal_id", "tool_name",
 
 
 def test_approval_required_proposal_payload_ships_exactly_its_keys() -> None:
-    """Exact-key pin on the proposal payload (red-team R5, mutation RM5).
+    """Exact-key pin on the proposal payload (red-team R5, mutation RM5; GATE-refute1-2 F-1).
 
     The teaching gate cannot catch ``"success": True`` creeping back into this
     payload: the leaf ``success`` is quoted everywhere the envelope is taught,
     so ``data.success`` would count as taught. Only an exact pin on the literal
-    the walker reads can refuse it. The pin also refuses a second assignment or
-    a later ``proposal_payload[...] =`` store, so the literal is the whole shape,
-    and checks that the census actually reads this site (the
-    ``_FAILURE_DATA_HELPERS`` row for it), so the pin and the matrix cannot drift
-    apart.
+    the walker reads can refuse it. The shape is closed structurally first: the
+    literal is annotated with the owned ``_ProposalPayload`` TypedDict, whose
+    keys this pin holds equal to the literal's, so mypy refuses an extra key at
+    the literal and any store of an unknown key through the local, an alias, or
+    ``proposal_result.data``. The walker is the backstop for what the type does
+    not police at runtime: exactly one assignment, no store / ``del`` / mutator
+    call through ``proposal_payload``, any local aliased to it, or the ``.data``
+    of any local bound to ``ToolResult(data=proposal_payload)``. A store the
+    walker cannot see — inside a callee — is what the type refuses (a callee
+    that mutates takes ``dict``, which a TypedDict is not). Finally the census
+    rows for this line (the ``_FAILURE_DATA_HELPERS`` row) must equal the pin,
+    so the pin and the matrix cannot drift apart.
     """
     tree = _parse(TOOL_BATCH)
     constants = _module_str_constants(tree, TOOL_BATCH)
@@ -1004,12 +1151,21 @@ def test_approval_required_proposal_payload_ships_exactly_its_keys() -> None:
     site = f"{_display(TOOL_BATCH)}:{fn.lineno}"
     assignments = list(_assignments_to(fn, "proposal_payload"))
     assert len(assignments) == 1, f"{site}: proposal_payload must be assigned exactly once, got {len(assignments)}"
-    literal, index, _annotation = assignments[0]
+    literal, index, annotation = assignments[0]
     assert index is None and isinstance(literal, ast.Dict), f"{site}: proposal_payload is not a plain dict literal"
+    payload_type = tool_batch._ProposalPayload
+    assert typing.is_typeddict(payload_type)
+    assert isinstance(annotation, ast.Name) and annotation.id == payload_type.__name__, (
+        f"{site}: proposal_payload is not annotated {payload_type.__name__}"
+    )
+    assert _typed_keys(payload_type, "") == list(_PROPOSAL_PAYLOAD_KEYS)
     keys = list(_dict_literal_keys(literal, "", f"{site}:{literal.lineno}", constants))
     assert tuple(keys) == _PROPOSAL_PAYLOAD_KEYS
     assert "success" not in keys
-    assert list(_subscript_assign_keys(fn, "proposal_payload", site, constants)) == []
+    aliases = _aliases_of(fn, "proposal_payload")
+    results = _results_carrying(fn, "proposal_payload")
+    assert results, f"{site}: no local is bound to ToolResult(data=proposal_payload)"
+    assert _dict_mutations(fn, aliases, results) == [], f"{site}: the proposal payload is re-shaped after the literal"
     carried = [
         node
         for node in ast.walk(fn)

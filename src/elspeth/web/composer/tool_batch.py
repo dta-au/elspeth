@@ -18,7 +18,7 @@ import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict, cast
 from uuid import UUID
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
@@ -156,6 +156,23 @@ if TYPE_CHECKING:
 
 
 _MAX_PENDING_PROPOSALS_PER_TURN: Final[int] = 10
+
+
+class _ProposalPayload(TypedDict):
+    """The ``data`` payload of an APPROVAL_REQUIRED tool result, in wire order.
+
+    No ``success`` inside the payload: the envelope's own ``success`` already
+    says it, and ``status`` is the discriminator a reader keys on
+    (elspeth-e405ad7cd2, F1). The closed type is what stops a later store —
+    through the local, an alias, or ``result.data`` — from re-shaping the
+    payload after the literal; the envelope gate pins the literal to it.
+    """
+
+    status: Literal["APPROVAL_REQUIRED"]
+    proposal_id: str
+    tool_name: str
+    summary: str
+    message: str
 
 
 _MISSING_TOOL_CALL_FIELD = object()
@@ -1466,7 +1483,7 @@ async def run_tool_batch(
                 # No ``success`` inside the payload: the envelope's own
                 # ``success`` already says it, and ``status`` is the
                 # discriminator a reader keys on (elspeth-e405ad7cd2, F1).
-                proposal_payload = {
+                proposal_payload: _ProposalPayload = {
                     "status": "APPROVAL_REQUIRED",
                     "proposal_id": str(proposal.id),
                     "tool_name": proposal_tool_name,
