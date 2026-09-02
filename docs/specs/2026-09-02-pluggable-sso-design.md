@@ -1,7 +1,7 @@
 # Pluggable SSO and identity substrate — backend-for-frontend login for Entra, VANguard, Google, and generic OIDC
 
 Date: 2026-09-02. Status: design, revision 2.4, implementation plan = tracker milestone elspeth-07cd19ba73.
-Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**.
+Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**.
 Branch: `release/0.8.0`.
 Revision 2 incorporates six independent reviews (security architecture,
 solution design, reality check against the tree, systems risk, functional
@@ -619,6 +619,17 @@ waits for a registered client.
 - Upload surfaces render the storage refusal with cap and usage, and the
   blob list shows the identity's total so deletion is discoverable
   [rev2.5].
+- **Mailbox [rev2.6]:** one surface, two folders, mounted for every
+  active identity. *Inbox*: approvals awaiting my decision (addressed to
+  me first, then any other open request I am eligible to decide, since
+  eligibility is role-based) and review requests addressed to me, each
+  opening the frozen read-only inspect view with the requester's note and
+  approve/reject (or sign off/changes requested) plus a note field.
+  *Sent*: my own requests with their state, the decider, the decision
+  note, and when; opening one sets `decision_seen_at`. A badge on the
+  navigation shows unread counts from one summary endpoint polled on the
+  existing session-list cadence. Notification stops at the badge: there is
+  no email or push transport in this sprint (a seam, see §Future seams).
 
 ## Testing [rev2]
 
@@ -698,6 +709,9 @@ waits for a registered client.
   `identity_id` per day; enforcement at execute. Subject scope is D11.
 - **Disk quota:** `SUM(blobs.size_bytes)` per identity, enforced at upload
   (D18, R13).
+- **Notification transport [rev2.6]:** the mailbox is in-app only. Email
+  or chat delivery is a later adapter over the same summary query; the
+  addresses exist on the identity row already.
 - **Approver's audit view:** `identity_relationships` × `run_attributions`
   × `auth_events`, scoped to the caller's active `approver` edges.
 - **Preview row trace:** elspeth-8310d6030c, independent.
@@ -712,7 +726,7 @@ deliberate epoch bump.
 
 | table | columns | notes |
 |-------|---------|-------|
-| approvals | approval_id PK; session_id FK; state_id; binding_json (`config_hash`, `canonical_version`, `runtime_val_manifest_sha256`, `openrouter_catalog_sha256`, **`binding_generation_fingerprint`, `policy_hash`** [rev2.2]); requested_by_identity_id FK; approver_identity_id FK; requested_at; decided_at NULL; decision NULL CHECK `('approved','rejected','revoked','superseded')` [rev2.2]; required_count int default 1; note NULL | One open request per `(session_id, state_id)`. Author ≠ approver (CHECK). **Approver eligibility is role-based [rev2.2]:** any identity holding an active `approver` role in this container who is not the author may decide; the author's active `approver` edge only supplies the default suggestion in the picker. This is what gives the lead's own work an approver and gives leave cover without touching the tree. Any new `state_id` marks the open request `superseded`. Execute refuses (409, distinct `error_type`) unless an `approved` row matches the compiled binding (R2, **delivered in this sprint**, phase 4). `binding_generation_fingerprint` is included because `config_hash` records profile aliases, not the buckets or credentials they resolve to; without it an approval survives an operator repointing an alias. `snapshot_hash` is deliberately excluded (it embeds the principal scope and would never match across approver and author). Pinned by a test that fails if a new field enters `WebPluginPolicyEvidence` without a tuple decision. |
+| approvals | approval_id PK; session_id FK; state_id; binding_json (`config_hash`, `canonical_version`, `runtime_val_manifest_sha256`, `openrouter_catalog_sha256`, **`binding_generation_fingerprint`, `policy_hash`** [rev2.2]); requested_by_identity_id FK; approver_identity_id FK; requested_at; decided_at NULL; decision NULL CHECK `('approved','rejected','revoked','superseded')` [rev2.2]; required_count int default 1; request_note NULL [rev2.6]; decision_seen_at NULL [rev2.6] | One open request per `(session_id, state_id)`. **Mailbox [rev2.6]:** `request_note` is the requester's message to the approver ("please approve, it's for entirely legitimate business"); the approver's reply travels in `approval_decisions.note`. Both are bounded plain text (4 KiB), rendered as text, never as markup, and both are part of the audit record. `decision_seen_at` is set when the requester opens the decided request, so the badge can clear; it is a UI convenience, never a control. Author ≠ approver (CHECK). **Approver eligibility is role-based [rev2.2]:** any identity holding an active `approver` role in this container who is not the author may decide; the author's active `approver` edge only supplies the default suggestion in the picker. This is what gives the lead's own work an approver and gives leave cover without touching the tree. Any new `state_id` marks the open request `superseded`. Execute refuses (409, distinct `error_type`) unless an `approved` row matches the compiled binding (R2, **delivered in this sprint**, phase 4). `binding_generation_fingerprint` is included because `config_hash` records profile aliases, not the buckets or credentials they resolve to; without it an approval survives an operator repointing an alias. `snapshot_hash` is deliberately excluded (it embeds the principal scope and would never match across approver and author). Pinned by a test that fails if a new field enters `WebPluginPolicyEvidence` without a tuple decision. |
 | approval_decisions | decision_id PK; approval_id FK; decided_by_identity_id FK; decided_at; decision CHECK `('approved','rejected')`; note NULL | [rev2.2] One row per deciding identity, so `required_count > 1` is a count over rows, not a schema change. Dual control: nullable `quota_policies.dual_control_above_tokens` and a per-container list of secret names / plugins whose wiring raises `required_count` to 2 (reserved, not enforced). |
 | review_attestations | attestation_id PK; session_id FK; state_id; payload_digest; reviewer_identity_id FK; attested_at; verdict CHECK `('signed_off','changes_requested','withdrawn')` [rev2.2]; note NULL | Append-only. Reviewer ≠ author (CHECK); the reviewer must hold an active `reviewer` role [rev2.3]. **Named "reviewer attestations" everywhere — schema, API, UI [rev2.2].** It is a ledger, not a control: nothing refuses on it. The phrase "two-person rule" is reserved for something that refuses; a UI must never say "two-person rule satisfied" over an unenforced count. |
 | library_entries | entry_id PK; published_from_session_id FK; payload_digest; compartment_id; title; version int; published_by_identity_id FK; curated_by_identity_id NULL FK; published_at; accepted_at NULL; rejected_at NULL; rejection_note NULL; deprecated_at NULL; recalled_at NULL; note NULL | Frozen, content-addressed. **A library entry is the public projection (`generate_public_yaml` shape), never a session reference, and it is config-only [rev2.2]:** publishing a pipeline that reads an uploaded blob is refused with a named `error_type` ("publish a profile-bound source instead"), because blob custody proves same-principal on fork and a cross-user fork of a blob-backed source cannot copy the blob without becoming an intra-container exfiltration path. Forking a library entry instantiates the projection into the forker's own staging session; `forked_from_session_id` points at that staging session and the entry's `payload_digest` carries provenance. Visible deployment-wide once `accepted_at` is set by a `curator`. Curator ≠ publisher (CHECK). Recall flags, never deletes. `library_published` audit rows carry `payload_digest` and `compartment_id` so the same artifact appearing in two containers is detectable later. |
@@ -798,7 +812,7 @@ deliberate epoch bump.
 ## Out of scope
 
 The organisation console (central management, oversight, and
-organisation-wide policy applied into containers; see §Terminology); deriving relationships from IdP data; approval or review enforcement;
+organisation-wide policy applied into containers; see §Terminology); deriving relationships from IdP data; review enforcement (attestation stays a ledger; approval enforcement R2 IS in scope); email or push notification of mailbox items;
 cookie-based SPA sessions; storing IdP refresh tokens or `offline_access`;
 multiple IdPs in one deployment; identity merge; RP-initiated IdP logout.
 
