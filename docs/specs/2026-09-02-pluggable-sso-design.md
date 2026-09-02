@@ -8,10 +8,14 @@ needs, UX needs). Items marked **[rev2]** changed as a result. The raw reports
 are session artefacts; the reconciled list lives in this document.
 
 Sprint: this spec is the identity half of the "Identity and workflow
-management" milestone in the tracker. The workflow half (approval, review
-attestation, shared library, quota, manager view) is design work tracked as
-sibling phases and is deliberately not specified here beyond the seams in
-§Future seams.
+management" milestone in the tracker. Operator ruling (2026-09-02): build
+90% of the final solution now and tweak on the fly, rather than a perfect
+interim system that never gets permission to be replaced. So the workflow
+half (approval, review attestation, shared library, per-day quota, manager
+view, delegated administration) is BUILT in the same sprint, and its tables
+ride the same epoch pass (phase 1 step 0 fixes their shapes as a
+§Workflow tables addendum to this document before the epoch lands). The
+seams in §Future seams are the starting point for that addendum.
 
 ## Problem
 
