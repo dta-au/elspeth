@@ -2185,6 +2185,18 @@ _REPEAT_NOTICE_WITHHELD = (
     "honest decline — can resolve this."
 )
 
+# Honest variant for a repeat of a rejection that NO re-emitted candidate can
+# clear: the taught fix for these says "do not re-emit" / "decline", and the
+# ordinary notice's "keep every other part byte-identical, and re-emit" would
+# contradict it in the same message (elspeth-68721c71d7). Static text, never
+# per-request data.
+_REPEAT_NOTICE_TERMINAL = (
+    "This candidate failed with EXACTLY the same rejection as an earlier candidate in this "
+    "request. No candidate you can author clears this rejection, so another attempt cannot "
+    "succeed. Follow the suggested_fix above: decline in plain text and tell the user what "
+    "they must change."
+)
+
 # Subject prefix of a ``rejected_mutation`` entry's message. These prefixes are
 # authored by our own ``build_set_pipeline_candidate`` failure sites
 # (``Source '<name>': …`` / ``Node '<id>': …`` / ``Output '<name>': …``), the
@@ -2671,8 +2683,41 @@ def _binding_rejection_feedback(
     if _explain_tool_advertisement_earns_its_turn([entry]):
         feedback["guidance"] = _EXPLAIN_VALIDATION_ERROR_GUIDANCE
     if repeated_fingerprint:
-        feedback["repeat_notice"] = _REPEAT_NOTICE
+        # The terminal notice keeps the fix and the notice saying the same
+        # thing: the two shapes below are unclearable by resubmission and
+        # their taught fix already says so.
+        feedback["repeat_notice"] = _REPEAT_NOTICE_TERMINAL if _binding_rejection_is_terminal(rejection) else _REPEAT_NOTICE
     return feedback
+
+
+# Binder rejections no re-emitted candidate can clear, as (code, exact fact-key
+# shape). ``None`` means every shape under the code. Both are closed
+# structural labels the binder authors: the reviewed failure-route check runs
+# before any delta is read (``_require_reviewed_failure_routes``), and an
+# ``edge_patch`` against a correction target with no writable routing field
+# (``_apply_selected_edge_route_patch``) fails whatever the patch says. The
+# catalogue prose for each says "do not re-emit" / "decline"; a test pins that
+# the prose and this table name the same rejections.
+_TERMINAL_BINDING_REJECTIONS: Final[frozenset[tuple[str, frozenset[str] | None]]] = frozenset(
+    {
+        ("guided_delta_reviewed_failure_route_required", None),
+        ("guided_delta_authority_violation", frozenset({"delta_member", "owner_kind"})),
+    }
+)
+
+
+def _binding_rejection_is_terminal(rejection: GuidedCandidateBindingRejected) -> bool:
+    """True when no re-emitted candidate can clear ``rejection``.
+
+    Matches the exact fact-key SHAPE, not the code alone: ten binder sites
+    share ``guided_delta_authority_violation`` and only the owner_kind shape
+    is terminal, so a widened or different shape keeps the ordinary notice.
+    """
+    shape = frozenset(rejection.connectivity)
+    return any(
+        code == rejection.error_code and (terminal_shape is None or terminal_shape == shape)
+        for code, terminal_shape in _TERMINAL_BINDING_REJECTIONS
+    )
 
 
 def _binding_rejection_fingerprint(rejection: GuidedCandidateBindingRejected) -> tuple[tuple[str, str], ...]:
