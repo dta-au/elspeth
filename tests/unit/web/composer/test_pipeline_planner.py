@@ -68,6 +68,7 @@ from elspeth.web.composer.pipeline_planner import (
     _allowlisted_candidate_feedback,
     _candidate_shape_hash,
     _derive_finalizer_owned_refs,
+    _entry_component_ref,
     _feedback_error_codes,
     _FinalizerOwnedRefs,
     _materialize_terminal_payload,
@@ -9872,6 +9873,7 @@ def test_truncated_component_rejection_feedback_reports_what_was_withheld() -> N
                 message=f"Output 'main{index}': Invalid options for sink 'json': RAW_MESSAGE_CANARY",
                 severity="high",
                 error_code="plugin_options_invalid",
+                rejected_component=f"output:main{index}",
             )
             for index in range(1, 9)
         ),
@@ -10179,22 +10181,23 @@ def test_candidate_rejection_fingerprint_discriminates_disjoint_component_sets()
                 errors=tuple(
                     ValidationEntry(
                         component="rejected_mutation",
-                        message=f"{subject}: Invalid options for plugin 'json': RAW_MESSAGE_CANARY",
+                        message="Invalid options for plugin 'json': RAW_MESSAGE_CANARY",
                         severity="high",
                         error_code="plugin_options_invalid",
+                        rejected_component=subject,
                     )
                     for subject in subjects
                 ),
             )
         )
 
-    disjoint_first = _rejection_fingerprint(cast(Any, rejection("Source 'rows_in'", "Node 'clean'")))
-    disjoint_second = _rejection_fingerprint(cast(Any, rejection("Output 'rows_out'", "Node 'score'")))
+    disjoint_first = _rejection_fingerprint(cast(Any, rejection("source:rows_in", "node:clean")))
+    disjoint_second = _rejection_fingerprint(cast(Any, rejection("output:rows_out", "node:score")))
     assert disjoint_first != disjoint_second
 
     # A genuine repeat — same components, same codes — still fingerprints the
     # same, so the notice it earns still fires.
-    assert _rejection_fingerprint(cast(Any, rejection("Source 'rows_in'", "Node 'clean'"))) == disjoint_first
+    assert _rejection_fingerprint(cast(Any, rejection("source:rows_in", "node:clean"))) == disjoint_first
 
 
 @pytest.mark.asyncio
@@ -10402,3 +10405,49 @@ def test_withheld_component_count_crashes_on_corrupt_first_party_count() -> None
 
     with pytest.raises(AuditIntegrityError, match="must be an int"):
         pipeline_planner._withheld_component_count(_withheld_result({COMPONENTS_WITHHELD_KEY: "3"}))
+
+
+def test_rejection_subject_is_read_structurally_never_parsed_from_the_message() -> None:
+    """``rejected_component`` is the only source of a rejection entry's subject.
+
+    Until elspeth-e405ad7cd2 the planner recovered the subject from the
+    ``Output 'rows': …`` message prefix with a regex — the prose-parsing shape
+    that lost three ``plugin_identity`` parsers. Now an entry that carries the
+    ref is attributed to it and disclosed when the finalizer owns something
+    ELSE; an entry that does not carry it is unattributable and fails closed
+    (masked to ``pipeline``) even though its message still names the subject
+    in exactly the format the regex used to read.
+    """
+    attributed = ValidationEntry(
+        component="rejected_mutation",
+        message="Output 'rows': RAW_MESSAGE_CANARY",
+        severity="high",
+        error_code="plugin_options_invalid",
+        rejected_component="output:rows",
+    )
+    unattributed = ValidationEntry(
+        component="rejected_mutation",
+        message="Output 'rows': RAW_MESSAGE_CANARY",
+        severity="high",
+        error_code="plugin_options_invalid",
+    )
+    assert _entry_component_ref(attributed) == "output:rows"
+    assert _entry_component_ref(unattributed) is None
+
+    owns_something_else = _FinalizerOwnedRefs(config=frozenset({"source"}), routing=frozenset())
+
+    disclosed = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=ValidationSummary(is_valid=False, errors=(attributed,)), updated_state=object())),
+        finalizer_owned=owns_something_else,
+    )
+    (disclosed_entry,) = disclosed["validation"]["errors"]
+    assert disclosed_entry["component"] == "output:rows"
+    assert disclosed_entry["detail"] == "Output 'rows': RAW_MESSAGE_CANARY"
+
+    withheld = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=ValidationSummary(is_valid=False, errors=(unattributed,)), updated_state=object())),
+        finalizer_owned=owns_something_else,
+    )
+    (withheld_entry,) = withheld["validation"]["errors"]
+    assert withheld_entry["component"] == "pipeline"
+    assert "RAW_MESSAGE_CANARY" not in json.dumps(withheld_entry)

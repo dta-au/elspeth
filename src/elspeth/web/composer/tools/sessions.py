@@ -632,8 +632,33 @@ def build_set_pipeline_candidate(
     interpretation_requirements_are_internal = context._interpretation_requirements_are_internal
     prepared_inline_blob: _PreparedBlobCreate | None = None
 
+    # The validation-component ref of the component whose checks are running
+    # RIGHT NOW: the legacy-source helper and each per-component loop below set
+    # it from their subject, and every candidate built while it is set carries
+    # it on its leading rejection entry as ``rejected_component``
+    # (elspeth-e405ad7cd2, F10) — ``_candidate`` is the one choke point every
+    # rejection passes through, whichever helper built the ToolResult. The
+    # unit of rejection is the component — a component that has failed a
+    # check runs nothing further — so the current subject is exactly what any
+    # rejection built inside its body is about. It is reset to None before
+    # the collected rejections are merged, so a merge never stamps a stale
+    # subject onto an unattributable entry. None means "unattributable" and
+    # stamps nothing; consumers fail closed on absence, never parse the
+    # message.
+    rejecting_component: str | None = None
+
+    def _stamp_rejected_component(result: ToolResult) -> ToolResult:
+        errors = result.validation.errors
+        if rejecting_component is None or not errors:
+            return result
+        leading = errors[0]
+        if leading.component != "rejected_mutation" or leading.rejected_component is not None:
+            return result
+        stamped = replace(leading, rejected_component=rejecting_component)
+        return replace(result, validation=replace(result.validation, errors=(stamped, *errors[1:])))
+
     def _candidate(result: ToolResult) -> SetPipelineCandidate:
-        normalized = normalize_tool_result_validation(result, context.catalog)
+        normalized = normalize_tool_result_validation(_stamp_rejected_component(result), context.catalog)
         return SetPipelineCandidate(result=normalized, prepared_inline_blob=prepared_inline_blob)
 
     def _failure_result(
@@ -825,11 +850,12 @@ def build_set_pipeline_candidate(
         call's result) lets the node and output sections still report their
         own defects in the same turn (elspeth-4fad98a453).
         """
-        nonlocal prepared_inline_blob, resolved_source_blob, single_source_on_vf
+        nonlocal prepared_inline_blob, rejecting_component, resolved_source_blob, single_source_on_vf
 
         legacy_source_model = validated.source
         if legacy_source_model is None:
             raise AssertionError("validated.source unexpectedly None after source/sources gate")
+        rejecting_component = "source"
         src_plugin = legacy_source_model.plugin
         legacy_src_options: Mapping[str, Any] = dict(legacy_source_model.options)
 
@@ -1083,6 +1109,7 @@ def build_set_pipeline_candidate(
         )
         return None
 
+    rejecting_component = None
     if validated.sources is not None:
         if not validated.sources:
             return _failure_result(state, "set_pipeline sources must include at least one named source.")
@@ -1091,6 +1118,7 @@ def build_set_pipeline_candidate(
         # canonicalized, so running them after a failure would report a
         # defect the planner cannot act on.
         for source_name, source_model in validated.sources.items():
+            rejecting_component = _source_component_id(source_name) if source_name.strip() else None
             if not source_name.strip():
                 _record_component_rejection(_failure_result(state, "set_pipeline sources keys must be non-empty source names."))
                 continue
@@ -1266,8 +1294,10 @@ def build_set_pipeline_candidate(
     # 2. Validate node plugins and options
     canonical_node_options: dict[int, Mapping[str, Any]] = {}
     current_nodes = {node.id: node for node in state.nodes}
+    rejecting_component = None
     for node_index, node in enumerate(validated.nodes):
         node_id = node.id
+        rejecting_component = f"node:{node_id}"
         node_type = node.node_type
         node_plugin = node.plugin
         node_options: Mapping[str, Any] = node.options
@@ -1457,7 +1487,9 @@ def build_set_pipeline_candidate(
     # remaining checks are skipped outright rather than reading a missing
     # canonical option dict.
     uncanonical_output_indexes: set[int] = set()
+    rejecting_component = None
     for index, output in enumerate(validated.outputs):
+        rejecting_component = f"output:{output.sink_name}"
         try:
             canonical_out_options[index] = dict(canonical_sink_local_paths(output.options))
         except ValueError as exc:
@@ -1479,6 +1511,7 @@ def build_set_pipeline_candidate(
         if index in uncanonical_output_indexes:
             continue
         out_name = output.sink_name
+        rejecting_component = f"output:{out_name}"
         out_plugin = output.plugin
         out_options = canonical_out_options[index]
         endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(out_plugin, out_options)
@@ -1554,6 +1587,7 @@ def build_set_pipeline_candidate(
             )
             continue
 
+    rejecting_component = None
     # Every per-component gate has now run. Spec construction and the
     # whole-state checks below need a COMPLETE component set — a partially
     # validated candidate would either construct specs from options that

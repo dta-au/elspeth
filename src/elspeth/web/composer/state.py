@@ -1420,6 +1420,7 @@ class ValidationEntryDict(TypedDict):
     contract: NotRequired[SchemaContractDetailDict]
     row_union_schema: NotRequired[RowUnionSchemaDetailDict]
     coalesce_union_type: NotRequired[CoalesceUnionTypeDetailDict]
+    rejected_component: NotRequired[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1455,6 +1456,21 @@ class ValidationEntry:
     # projection moves. Keep it that way unless a wire consumer genuinely
     # needs it.
     plugin_identity: tuple[str, str] | None = None
+    # The validation-component ref (``source`` / ``source:<name>`` /
+    # ``node:<id>`` / ``output:<name>``) a ``rejected_mutation`` entry is
+    # ABOUT. ``component`` stays the literal discriminator
+    # ``"rejected_mutation"`` — the merge, dispatch, and planner filters key on
+    # it — so the subject rides here, stamped by the set_pipeline
+    # per-component loops (``build_set_pipeline_candidate``) where the loop
+    # variable IS the subject. Before this the subject lived only in the
+    # message prefix (``Output 'main': ...``) and the planner's withholding
+    # decision parsed it back with a regex; on a two-component rejection the
+    # model had to match prose to learn which component each entry named
+    # (elspeth-e405ad7cd2, F10). Absent means unattributable: consumers fail
+    # closed rather than parse, exactly as for ``plugin_identity``. Unlike
+    # ``plugin_identity`` this IS wire-carried — it exists so the model can
+    # read it.
+    rejected_component: str | None = None
 
     def to_dict(self) -> ValidationEntryDict:
         """Serialize to a plain dict for JSON responses."""
@@ -1467,6 +1483,8 @@ class ValidationEntry:
             result["row_union_schema"] = self.row_union_schema.to_dict()
         if self.coalesce_union_type is not None:
             result["coalesce_union_type"] = self.coalesce_union_type.to_dict()
+        if self.rejected_component is not None:
+            result["rejected_component"] = self.rejected_component
         return result
 
 

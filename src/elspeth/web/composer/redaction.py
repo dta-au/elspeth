@@ -3163,9 +3163,12 @@ class _ValidationEntryShadowModel(BaseModel):
     ``contract`` the structured schema-contract facts, emitted only for the
     schema-contract family, ``row_union_schema`` the branch declarations
     emitted only for row-union incompatibility, and ``coalesce_union_type``
-    the conflicting declaration emitted only for a union-coalesce type clash.
-    The response scalar projection preserves the closed severity value and
-    summarizes all free-form diagnostic text.
+    the conflicting declaration emitted only for a union-coalesce type clash,
+    and ``rejected_component`` the validation-component ref a
+    ``rejected_mutation`` entry is about, emitted only when the set_pipeline
+    component loop stamped it (elspeth-e405ad7cd2). The response scalar
+    projection preserves the closed severity value and summarizes all
+    free-form diagnostic text.
 
     This model is ``extra="forbid"``, so it must carry EVERY optional key
     ``ValidationEntry.to_dict()`` can emit: a missing one is not a silent
@@ -3181,6 +3184,7 @@ class _ValidationEntryShadowModel(BaseModel):
     contract: _SchemaContractDetailShadowModel | None = None
     row_union_schema: _RowUnionSchemaDetailShadowModel | None = None
     coalesce_union_type: _CoalesceUnionTypeDetailShadowModel | None = None
+    rejected_component: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 

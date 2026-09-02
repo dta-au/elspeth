@@ -3195,3 +3195,84 @@ def test_component_rejections_are_bounded_and_report_what_they_withheld(tmp_path
     # Truncation is reported, never silent: eleven components failed, eight
     # are listed, and the remaining three are counted.
     assert candidate.result.data["components_withheld"] == 3
+
+
+# The validation-component ref each semantic-failure case's rejection is
+# about, keyed by case name. Every case's message may or may not carry a
+# ``Node 'x': `` prefix — ``manual_blob_ref`` and ``credential_policy`` do
+# not — and the subject must arrive structurally either way.
+_REJECTED_COMPONENT_BY_CASE: dict[str, str] = {
+    "unknown_plugin": "node:copy",
+    "blocked_plugin": "node:copy",
+    "profile_validation": "node:copy",
+    "invalid_options": "node:copy",
+    "escaping_path": "output:main",
+    "invalid_gate": "node:threshold",
+    "manual_blob_ref": "source",
+    "credential_policy": "node:classify",
+    "resolver_owned_interpretation_review": "node:classify",
+}
+
+
+@pytest.mark.parametrize("case_index", range(9))
+def test_component_rejection_carries_its_subject_structurally(tmp_path: Path, case_index: int) -> None:
+    """A ``rejected_mutation`` entry names WHICH component was rejected in ``rejected_component``.
+
+    ``component`` stays the literal ``rejected_mutation`` discriminator; the
+    subject used to live only in the message prefix, which the planner parsed
+    back with a regex and the model had to match by prose on a
+    multi-component rejection (elspeth-e405ad7cd2, F10). The set_pipeline
+    component loop stamps it from its loop variable, so it is present whether
+    or not the producer prefixed the message — two of these cases do not.
+    """
+    case, args, context, _expected_error, _expected_error_code = _semantic_failure_cases(tmp_path)[case_index]
+
+    result = _execute_set_pipeline(args, _empty_state(), context)
+
+    entry = result.validation.errors[0]
+    assert entry.component == "rejected_mutation"
+    assert entry.rejected_component == _REJECTED_COMPONENT_BY_CASE[case], (case, entry)
+    wire = result.to_dict()["validation"]["errors"][0]
+    assert wire["rejected_component"] == _REJECTED_COMPONENT_BY_CASE[case]
+
+
+def test_two_component_rejection_names_each_subject_structurally(tmp_path: Path) -> None:
+    """One merged rejection envelope, one ``rejected_component`` per defective component.
+
+    Wire sample 12 on elspeth-e405ad7cd2: both entries carried
+    ``component: "rejected_mutation"`` and only the message text (one
+    prefixed, one not) said which component each was about, while
+    ``data.error`` carried only the first. The model repairs by
+    ``rejected_component`` now, never by prose.
+    """
+    args = _linear_args(tmp_path)
+    args["nodes"][0]["options"] = {}
+    args["outputs"][0]["options"]["path"] = "/etc/candidate-escape.json"
+
+    result = _execute_set_pipeline(args, _empty_state(), _trained_context(data_dir=tmp_path))
+
+    assert result.success is False
+    rejections = [entry for entry in result.validation.errors if entry.component == "rejected_mutation"]
+    assert [entry.rejected_component for entry in rejections] == ["node:copy", "output:main"]
+    wire = [entry for entry in result.to_dict()["validation"]["errors"] if entry["component"] == "rejected_mutation"]
+    assert [entry["rejected_component"] for entry in wire] == ["node:copy", "output:main"]
+
+
+def test_rejection_outside_a_component_loop_is_not_stamped(tmp_path: Path) -> None:
+    """A rejection with no component subject carries no ``rejected_component``.
+
+    Fail-closed contract: consumers treat absence as "unattributable" rather
+    than parsing the message, so the stamp must never be invented for a
+    whole-candidate rejection.
+    """
+    args = _linear_args(tmp_path)
+    args["sources"] = {}
+    args.pop("source", None)
+
+    result = _execute_set_pipeline(args, _empty_state(), _trained_context(data_dir=tmp_path))
+
+    assert result.success is False
+    entry = result.validation.errors[0]
+    assert entry.component == "rejected_mutation"
+    assert entry.rejected_component is None
+    assert "rejected_component" not in result.to_dict()["validation"]["errors"][0]
