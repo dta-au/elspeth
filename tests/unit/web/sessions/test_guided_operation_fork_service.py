@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import threading
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -50,7 +51,7 @@ from elspeth.web.sessions.service import (
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
-from tests.unit.web.sessions.test_fork import _make_fork_app
+from tests.unit.web.sessions.test_fork import _complete_guided_start_authority, _make_fork_app
 
 
 @pytest.fixture()
@@ -1849,12 +1850,14 @@ async def test_fork_promotes_a_legacy_single_source_row_before_rewriting_and_red
 
 
 @pytest.mark.asyncio
-async def test_fork_route_records_the_offending_composer_meta_key_when_the_rewrite_backstop_fires(tmp_path) -> None:
-    """The backstop's only observable benefit is the KEY it names: the client body
-    is the same fixed integrity-error envelope a settlement abort produces, and
-    ``fail_guided_operation`` records a code, not a message. So the route must
-    write the named key to the last-resort log, or the name is dropped on the
-    floor (red-team finding B1 on ee1ae108b).
+async def test_fork_route_records_the_offending_composer_meta_key_when_custody_detection_refuses_the_fork(tmp_path) -> None:
+    """Custody detection's only observable benefit is the KEY it names: the client
+    body is the same fixed integrity-error envelope a settlement abort produces,
+    and ``fail_guided_operation`` records a code, not a message. So the route
+    must write the named key to the last-resort log, or the name is dropped on
+    the floor (red-team finding B1 on ee1ae108b). Since pre-staging detection
+    landed, an unknown key is refused inside ``fork_session`` before any child
+    row exists; the record's fields are the same.
     """
     app, service, blob_service = _make_fork_app(tmp_path)
     parent = await service.create_session("alice", "Parent", "local")
@@ -2140,12 +2143,12 @@ async def test_fork_backstop_names_a_key_that_retains_only_a_parent_storage_path
 
 
 @pytest.mark.asyncio
-async def test_fork_route_builds_backstop_needles_from_parent_storage_paths_too(tmp_path) -> None:
-    """Red-team M8 at its post-F1 home: the ROUTE builds ``parent_blob_refs`` from
-    every parent blob's id AND storage_path. Drop the path and a path-only residue
-    in an unknown key passes the backstop and is rejected only at settlement --
-    same 500, but the last-resort record then carries the settlement message
-    instead of the offending key's name. The key name is the assertion.
+async def test_fork_route_refuses_a_path_only_residue_in_an_unknown_key_by_name(tmp_path) -> None:
+    """Red-team M8 at its post-F1 home: the forbidden set is every parent blob's
+    id AND storage_path. Drop the path and a path-only residue in an unknown key
+    passes detection and is rejected only at settlement -- same 500, but the
+    last-resort record then carries the settlement message instead of the
+    offending key's name. The key name is the assertion.
     """
     app, service, blob_service = _make_fork_app(tmp_path)
     parent = await service.create_session("alice", "Parent", "local")
@@ -2177,59 +2180,29 @@ async def test_fork_route_builds_backstop_needles_from_parent_storage_paths_too(
 
 
 @pytest.mark.asyncio
-async def test_fork_route_backstop_names_a_key_that_references_a_parent_blob_outside_the_ready_plan(tmp_path) -> None:
-    """F1 through the real route: the fork plan admits ``status == "ready"`` blobs
-    only, but the settlement verifier forbids EVERY parent blob row. A needle set
-    derived from the plan (``blob_map``) is blind to a non-ready parent blob
-    referenced from an unknown ``composer_meta`` key, so the fork failed only at
-    settlement, unnamed (systems review section 1, red-team S7). The route must
-    build the needles from ``list_blobs(limit=None)`` so this key is named.
-    """
-    app, service, blob_service = _make_fork_app(tmp_path)
-    parent = await service.create_session("alice", "Parent", "local")
-    ready_blob = await blob_service.create_blob(parent.id, "orders.csv", b"id\n1\n", "text/csv")
-    pending_blob = await blob_service.create_blob(parent.id, "later.csv", b"id\n2\n", "text/csv")
-    with service._engine.begin() as conn:
-        conn.execute(update(blobs_table).where(blobs_table.c.id == str(pending_blob.id)).values(status="pending"))
-    state = await service.save_composition_state(
-        parent.id,
-        CompositionStateData(
-            sources={
-                "orders": {
-                    "plugin": "csv",
-                    "on_success": "rows",
-                    "options": {"blob_ref": str(ready_blob.id), "path": ready_blob.storage_path},
-                    "on_validation_failure": "quarantine",
-                }
-            },
-            metadata_={"name": "Parent pipeline", "description": None},
-            composer_meta={"some_future_subsystem": {"remembered_blob": str(pending_blob.id)}},
-        ),
-        provenance="session_seed",
-    )
-
-    response, cap_logs = await _fork_via_route(app, service, parent.id, state.id)
-
-    assert response.status_code == 500
-    assert response.json()["detail"]["failure_code"] == "integrity_error"
-    records = [entry for entry in cap_logs if entry.get("event") == "session.fork_rewrite_integrity_error"]
-    assert len(records) == 1, [entry.get("event") for entry in cap_logs]
-    assert "'some_future_subsystem' retains parent blob custody" in records[0]["message"]
-
-
-@pytest.mark.asyncio
 async def test_fork_route_backstop_needles_span_more_parent_blobs_than_one_list_page(tmp_path) -> None:
-    """Red-team MK9 on the F1 route hunk: ``list_blobs`` defaults to the 50 NEWEST
-    rows, and the route must ask for ``limit=None``. With the default page the
-    OLDEST parent blob -- non-ready, so outside the plan, referenced from an
-    unknown ``composer_meta`` key -- is absent from the needles, the backstop
-    passes it unnamed, and settlement rejects it after staging with the generic
-    text. Every other pin used fewer than 50 parent blobs, so that mutation
-    survived the suite. The parent here carries 54 blob rows and the message in
-    the last-resort record must name the key.
+    """Red-team MK5 on the F1 route hunk, kept alive after pre-staging detection
+    took over the unknown-key class. ``list_blobs`` defaults to the 50 NEWEST
+    rows and the route must ask for ``limit=None``. The residue here sits inside
+    a MODELLED key -- ``guided_session.reviewed_sources[...].options.dataset.path``
+    naming the OLDEST parent blob, non-ready so outside the plan -- which
+    pre-staging detection deliberately skips (the guided rewriter owns that key)
+    and the nested rebase cannot correct (no child copy exists). Only the
+    rewrite-boundary backstop can name it, and only if its needles span every
+    parent row: with the default page the 54th row is absent, the backstop
+    passes it, and settlement rejects it after staging, unnamed. Every other pin
+    uses fewer than 50 parent blobs, so that mutation survived the suite. The
+    fixture depends on pre-staging detection SKIPPING ``guided_session``: if that
+    skip were removed, this test would fail for the wrong reason (refused before
+    staging, no ``'guided_session'`` backstop text).
     """
+    from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
+    from elspeth.web.composer.guided.resolved import SourceResolved
+    from elspeth.web.composer.guided.state_machine import GuidedSession, TurnRecord
+
     app, service, blob_service = _make_fork_app(tmp_path)
     parent = await service.create_session("alice", "Parent", "local")
+    root = await service.add_message(parent.id, "user", "root", writer_principal="route_user_message")
     ready_blob = await blob_service.create_blob(parent.id, "orders.csv", b"id\n1\n", "text/csv")
     oldest_pending_blob = await blob_service.create_blob(parent.id, "oldest.csv", b"id\n2\n", "text/csv")
     with service._engine.begin() as conn:
@@ -2252,22 +2225,51 @@ async def test_fork_route_backstop_needles_span_more_parent_blobs_than_one_list_
     assert len(default_page) == 50
     assert oldest_pending_blob.id not in {blob.id for blob in default_page}
     assert len(await blob_service.list_blobs(parent.id, limit=None)) == 54
-    state = await service.save_composition_state(
-        parent.id,
-        CompositionStateData(
-            sources={
-                "orders": {
-                    "plugin": "csv",
-                    "on_success": "rows",
-                    "options": {"blob_ref": str(ready_blob.id), "path": ready_blob.storage_path},
-                    "on_validation_failure": "quarantine",
-                }
-            },
-            metadata_={"name": "Parent pipeline", "description": None},
-            composer_meta={"some_future_subsystem": {"remembered_blob": str(oldest_pending_blob.id)}},
+    stable_id = str(uuid4())
+    # The reviewed snapshot binds the READY blob (rebased by the plan) and nests
+    # the OLDEST non-ready blob's path where only the walkers can see it.
+    snapshot_options = {
+        "path": ready_blob.storage_path,
+        "blob_ref": str(ready_blob.id),
+        "schema": {"mode": "observed"},
+        "dataset": {"path": oldest_pending_blob.storage_path},
+    }
+    live_options = {"path": ready_blob.storage_path, "schema": {"mode": "observed"}}
+    guided = GuidedSession(
+        step=GuidedStep.STEP_2_SINK,
+        history=(
+            TurnRecord(
+                step=GuidedStep.STEP_2_SINK,
+                turn_type=TurnType.INSPECT_AND_CONFIRM,
+                payload_hash="a" * 64,
+                response_hash=None,
+                emitter="server",
+            ),
         ),
-        provenance="session_seed",
+        source_order=(stable_id,),
+        reviewed_sources={
+            stable_id: SourceResolved(
+                name="orders",
+                plugin="csv",
+                options=snapshot_options,
+                observed_columns=("id",),
+                sample_rows=({"id": 1},),
+                on_validation_failure="discard",
+            )
+        },
+        root_intent_message_id=str(root.id),
     )
+    state_data = CompositionStateData(
+        sources={"orders": {"plugin": "csv", "on_success": "out", "options": dict(live_options), "on_validation_failure": "discard"}},
+        nodes=[],
+        edges=[],
+        outputs=[],
+        metadata_={"name": "Guided", "description": ""},
+        is_valid=True,
+        composer_meta={"guided_session": guided.to_dict()},
+    )
+    state = await service.save_composition_state(parent.id, state_data, provenance="session_seed")
+    await _complete_guided_start_authority(service, session_id=parent.id, root_message=root, state=state, state_data=state_data)
 
     response, cap_logs = await _fork_via_route(app, service, parent.id, state.id)
 
@@ -2275,7 +2277,7 @@ async def test_fork_route_backstop_needles_span_more_parent_blobs_than_one_list_
     assert response.json()["detail"]["failure_code"] == "integrity_error"
     records = [entry for entry in cap_logs if entry.get("event") == "session.fork_rewrite_integrity_error"]
     assert len(records) == 1, [entry.get("event") for entry in cap_logs]
-    assert "'some_future_subsystem' retains parent blob custody" in records[0]["message"]
+    assert "'guided_session' retains parent blob custody" in records[0]["message"]
 
 
 @pytest.mark.asyncio
@@ -2379,3 +2381,205 @@ def test_fork_refuses_to_rederive_a_report_for_a_row_that_carries_no_metadata(tm
             parent_session_id=parent_session_id,
             child_session_id=child_session_id,
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-two pins on d92f70d78 (red-team F1, systems A/C): the backstop tests
+# the TOP-LEVEL composer_meta key itself, walks ``validation_errors``, and
+# shares the settlement verifier's predicate instead of restating it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("key_shape", ["id", "sentinel", "storage_path"])
+@pytest.mark.asyncio
+async def test_fork_backstop_names_a_top_level_composer_meta_key_that_is_itself_a_parent_blob_ref(service, tmp_path, key_shape) -> None:
+    """Round-two red-team F1 on d92f70d78. The backstop iterated
+    ``composer_meta.items()`` and handed only the VALUE to the walker, so a
+    parent blob id, ``blob:`` sentinel or raw storage path used as the top-level
+    key passed unnamed and died at settlement -- the exact class the commit
+    claimed closed. The key must be tested like any nested key, and the error
+    must name it.
+    """
+    parent_blob, child_blob, child_session_id = uuid4(), uuid4(), uuid4()
+    parent_path = f"/var/lib/elspeth/blobs/{uuid4()}/{parent_blob}.csv"
+    children = {
+        parent_blob: _child_blob_record(
+            blob_id=child_blob, session_id=child_session_id, storage_path=f"/var/lib/elspeth/blobs/{child_session_id}/{child_blob}.csv"
+        )
+    }
+    key = {"id": str(parent_blob), "sentinel": f"blob:{parent_blob}", "storage_path": parent_path}[key_shape]
+    parent, state = await _state_for_custody_rewrite(
+        service,
+        sources={
+            "orders": {
+                "plugin": "csv",
+                "on_success": "rows",
+                "options": {"blob_ref": str(parent_blob), "path": parent_path},
+                "on_validation_failure": "quarantine",
+            }
+        },
+        composer_meta={key: {"note": "x"}},
+    )
+
+    with pytest.raises(AuditIntegrityError, match=f"composer_meta key {re.escape(repr(key))} retains parent blob custody"):
+        _rewrite_fork_state_blob_custody(
+            state,
+            children,
+            {parent_path: children[parent_blob]},
+            parent_blob_refs=frozenset({str(parent_blob), parent_path}),
+            data_dir=tmp_path,
+            parent_session_id=parent.id,
+            child_session_id=child_session_id,
+        )
+
+
+@pytest.mark.parametrize("entry_shape", ["exact", "embedded"])
+@pytest.mark.asyncio
+async def test_fork_backstop_names_validation_errors_that_retain_a_parent_storage_path(service, tmp_path, entry_shape) -> None:
+    """Round-two systems finding C: ``validation_errors`` is persisted and served
+    on GET /state, is copied verbatim into the child, and was the only state
+    column outside every custody walker. No rewriter can rebase free text, so
+    the backstop must refuse the fork and NAME the column, exactly as it does
+    for an unmodelled ``composer_meta`` key.
+    """
+    parent_blob, child_blob, child_session_id = uuid4(), uuid4(), uuid4()
+    parent_path = f"/var/lib/elspeth/blobs/{uuid4()}/{parent_blob}.csv"
+    children = {
+        parent_blob: _child_blob_record(
+            blob_id=child_blob, session_id=child_session_id, storage_path=f"/var/lib/elspeth/blobs/{child_session_id}/{child_blob}.csv"
+        )
+    }
+    parent = await service.create_session("alice", "Parent", "local")
+    state = await service.save_composition_state(
+        parent.id,
+        CompositionStateData(
+            sources={
+                "orders": {
+                    "plugin": "csv",
+                    "on_success": "rows",
+                    "options": {"blob_ref": str(parent_blob), "path": parent_path},
+                    "on_validation_failure": "quarantine",
+                }
+            },
+            metadata_={"name": "Parent pipeline", "description": None},
+            is_valid=False,
+            validation_errors=[parent_path if entry_shape == "exact" else f"source file not found: {parent_path}"],
+        ),
+        provenance="session_seed",
+    )
+
+    with pytest.raises(AuditIntegrityError, match="validation_errors retains parent blob custody"):
+        _rewrite_fork_state_blob_custody(
+            state,
+            children,
+            {parent_path: children[parent_blob]},
+            parent_blob_refs=frozenset({str(parent_blob), parent_path}),
+            data_dir=tmp_path,
+            parent_session_id=parent.id,
+            child_session_id=child_session_id,
+        )
+
+
+def test_fork_backstop_shares_the_settlement_verifiers_reference_predicate() -> None:
+    """Tripwire (round-two systems finding A). d92f70d78 made the backstop's
+    needle set equal to the settlement verifier's, which removed the only
+    signal that had revealed drift between the two -- and left two predicates
+    that agreed by comment alone (no test called the route's copy). Drift
+    becomes impossible rather than untested only if there is ONE predicate: the
+    route imports the verifier's. A second definition of "references a parent
+    blob" in the route module fails this test.
+    """
+    import elspeth.web.sessions.routes.sessions as fork_routes
+    from elspeth.web.sessions import service as sessions_service
+
+    assert fork_routes._value_references_parent_blob is sessions_service._value_references_parent_blob
+    assert "_contains_exact_string" not in dir(fork_routes)
+
+
+@pytest.mark.asyncio
+async def test_fork_rewriter_changes_exactly_the_composer_meta_keys_declared_as_rewritten(service, tmp_path) -> None:
+    """Tripwire (round-two systems sign-off, section 2). Pre-staging detection
+    skips the keys in ``FORK_REWRITTEN_COMPOSER_META_KEYS`` because their
+    rewriters run later; the rewriter identifies those same keys by literal in
+    another module. Nothing bound the two, so a key declared without a rewriter
+    would silently regress to the post-staging orphan, and a rewriter added
+    without a declaration would refuse every fork that needs it. This test
+    derives the set from BEHAVIOUR: a parent state whose every key names its
+    blob is rewritten, and the keys whose value changed must equal the declared
+    set exactly -- in both directions.
+    """
+    from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
+    from elspeth.web.composer.guided.resolved import SourceResolved
+    from elspeth.web.composer.guided.state_machine import GuidedSession, TurnRecord
+    from elspeth.web.sessions.service import FORK_REWRITTEN_COMPOSER_META_KEYS
+
+    parent_blob, child_blob, child_session_id = uuid4(), uuid4(), uuid4()
+    parent_path = f"/var/lib/elspeth/blobs/{uuid4()}/{parent_blob}.csv"
+    children = {
+        parent_blob: _child_blob_record(
+            blob_id=child_blob, session_id=child_session_id, storage_path=f"/var/lib/elspeth/blobs/{child_session_id}/{child_blob}.csv"
+        )
+    }
+    stable_id = str(uuid4())
+    guided = GuidedSession(
+        step=GuidedStep.STEP_2_SINK,
+        history=(
+            TurnRecord(
+                step=GuidedStep.STEP_2_SINK,
+                turn_type=TurnType.INSPECT_AND_CONFIRM,
+                payload_hash="a" * 64,
+                response_hash=None,
+                emitter="server",
+            ),
+        ),
+        source_order=(stable_id,),
+        reviewed_sources={
+            stable_id: SourceResolved(
+                name="orders",
+                plugin="csv",
+                options={"path": parent_path, "blob_ref": str(parent_blob), "schema": {"mode": "observed"}},
+                observed_columns=("id",),
+                sample_rows=({"id": 1},),
+                on_validation_failure="discard",
+            )
+        },
+        root_intent_message_id=str(uuid4()),
+    )
+    # Every key present, custody-bearing or inert, so the changed-key set is a
+    # statement about the rewriter and not about which keys happened to exist.
+    composer_meta = {
+        "guided_session": guided.to_dict(),
+        "implicit_decisions": _stale_report([{"path": "source.blob_ref", "value": str(parent_blob), "category": "source"}]),
+        "validation_lane": "strict",
+        "guided_completed_terminal_before_user_exit": False,
+        "completion_gates": {"graph_fingerprint": "f" * 64},
+    }
+    parent, state = await _state_for_custody_rewrite(
+        service,
+        sources={
+            "orders": {
+                "plugin": "csv",
+                "on_success": "rows",
+                "options": {"blob_ref": str(parent_blob), "path": parent_path},
+                "on_validation_failure": "quarantine",
+            }
+        },
+        composer_meta=composer_meta,
+    )
+
+    rewritten = _rewrite_fork_state_blob_custody(
+        state,
+        children,
+        {parent_path: children[parent_blob]},
+        parent_blob_refs=frozenset({str(parent_blob), parent_path}),
+        data_dir=tmp_path,
+        parent_session_id=parent.id,
+        child_session_id=child_session_id,
+    )
+
+    assert rewritten is not None
+    before = deep_thaw(state.composer_meta)
+    after = deep_thaw(rewritten.composer_meta)
+    assert set(before) == set(after) == set(composer_meta), "the rewriter must neither add nor drop composer_meta keys"
+    changed = {key for key in composer_meta if before[key] != after[key]}
+    assert changed == FORK_REWRITTEN_COMPOSER_META_KEYS

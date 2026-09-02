@@ -33,6 +33,7 @@ from elspeth.web.sessions.routes.guided_operations import (
     raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
+from elspeth.web.sessions.service import _free_text_embeds_parent_blob, _value_references_parent_blob
 from elspeth.web.sessions.titles import mint_default_session_title
 
 from ._helpers import (
@@ -299,24 +300,6 @@ def _rewrite_session_owned_sink_options(
     return rebuilt, rewritten
 
 
-def _contains_exact_string(value: object, needles: frozenset[str]) -> bool:
-    """Detect a parent blob reference anywhere in a thawed JSON tree.
-
-    Same shape predicate as ``service.py::_value_references_parent_blob`` (the
-    settlement authority): a bare needle, or ``blob:<needle>``, as a str value
-    OR as a mapping key.
-    """
-    if type(value) is str:
-        return value in needles or any(value == f"{BLOB_REF_PATH_PREFIX}{needle}" for needle in needles)
-    if type(value) is dict:
-        return any(_contains_exact_string(key, needles) for key in value) or any(
-            _contains_exact_string(item, needles) for item in value.values()
-        )
-    if type(value) is list:
-        return any(_contains_exact_string(item, needles) for item in value)
-    return False
-
-
 def _rebase_known_parent_refs(
     value: object,
     blob_map: dict[UUID, BlobRecord],
@@ -325,7 +308,7 @@ def _rebase_known_parent_refs(
     """Return a copy of ``value`` with every KNOWN parent blob reference rebased
     onto its child copy, plus whether anything changed. The input is not mutated.
 
-    The exact inverse of ``_contains_exact_string`` / ``_value_references_parent_blob``:
+    The exact inverse of ``_value_references_parent_blob``:
     every shape those walks DETECT is a shape this walk CORRECTS -- a bare parent
     blob id, a raw parent ``storage_path``, and either of them behind the
     ``blob:`` sentinel prefix -- whether it appears as a str value or as a
@@ -461,7 +444,7 @@ def _rewrite_guided_blob_custody(
             rewritten = rewritten or changed
     rebuilt = GuidedSession.from_dict(rebuilt).to_dict()
     source_ids = frozenset(str(blob_id) for blob_id in blob_map)
-    if _contains_exact_string(rebuilt, source_ids):
+    if _value_references_parent_blob(rebuilt, source_ids):
         raise AuditIntegrityError("Tier 1 audit anomaly: forked guided metadata retained a parent blob id")
     result = dict(composer_meta)
     result["guided_session"] = rebuilt
@@ -612,20 +595,32 @@ def _rewrite_fork_state_blob_custody(
     # fails BEFORE blob settlement and NAMES the offending key in the error
     # message, which the route records as a last-resort diagnostic
     # (``session.fork_rewrite_integrity_error``) -- where a settlement abort
-    # names nothing.
+    # names nothing. Keys OUTSIDE ``FORK_REWRITTEN_COMPOSER_META_KEYS`` are
+    # already refused inside ``fork_session`` before any child row exists
+    # (``_refuse_unrewritable_fork_custody``); what reaches this backstop in
+    # practice is residue in a modelled key after its rewriter ran.
     #
     # The needle set is ``parent_blob_refs`` -- every parent blob row, any
-    # status -- which is exactly the settlement verifier's ``forbidden`` scope,
-    # so nothing the verifier would reject can pass here unnamed. Correction
-    # (``_rebase_known_parent_refs``) still runs on ``blob_map`` alone, because
-    # only planned blobs have a child copy to rebase onto.
+    # status -- and the predicate is the settlement verifier's own
+    # ``_value_references_parent_blob``, applied to the top-level key as well
+    # as its value: one definition of "references a parent blob", so the two
+    # cannot drift. Correction (``_rebase_known_parent_refs``) still runs on
+    # ``blob_map`` alone, because only planned blobs have a child copy to
+    # rebase onto.
     if composer_meta is not None and parent_blob_refs:
         for meta_key, meta_value in composer_meta.items():
-            if _contains_exact_string(meta_value, parent_blob_refs):
+            if _value_references_parent_blob(meta_key, parent_blob_refs) or _value_references_parent_blob(meta_value, parent_blob_refs):
                 raise AuditIntegrityError(
                     f"Tier 1 audit anomaly: forked composer_meta key {meta_key!r} retains parent blob custody "
                     "the fork rewriter did not rebase -- teach the fork path this key before forking sessions that use it"
                 )
+    # ``validation_errors`` is copied verbatim below and served on GET /state;
+    # it is free text no rewriter can rebase, so parent custody in it is refused.
+    if state.validation_errors and parent_blob_refs and _free_text_embeds_parent_blob(state.validation_errors, parent_blob_refs):
+        raise AuditIntegrityError(
+            "Tier 1 audit anomaly: forked validation_errors retains parent blob custody the fork rewriter did not rebase "
+            "-- clear the validation errors before forking this session"
+        )
     if not rewritten:
         return None
     return CompositionStateData(
@@ -935,12 +930,14 @@ def register_session_routes(router: APIRouter) -> None:
                     # The ONLY carrier of what failed is ``str(primary_exc)``:
                     # ``fail_guided_operation`` durably records a code, not a
                     # message, and ``raise_guided_operation_failure`` answers
-                    # with a fixed envelope. For the rewrite-boundary custody
-                    # backstop that message NAMES the offending composer_meta
-                    # key -- the whole point of failing there rather than at
-                    # settlement -- so it gets a last-resort record; the
-                    # archived child and the failed operation are the audit
-                    # evidence, this is the diagnostic that says which key.
+                    # with a fixed envelope. For pre-staging custody detection
+                    # (inside ``fork_session``, no child row yet) and for the
+                    # rewrite-boundary backstop, that message NAMES the
+                    # offending composer_meta key -- the whole point of failing
+                    # there rather than at settlement -- so it gets a
+                    # last-resort record; the failed operation (and, after
+                    # staging, the archived child) is the audit evidence, this
+                    # is the diagnostic that says which key.
                     _log_last_resort_diagnostic(
                         slog.error,
                         "session.fork_rewrite_integrity_error",

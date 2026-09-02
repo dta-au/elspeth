@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.pool import StaticPool
 from structlog.testing import capture_logs
 
@@ -29,7 +29,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.blobs.protocol import BlobForkWriteFence
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table
+from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
 from elspeth.web.sessions.protocol import CompositionStateData, GuidedForkSettlementCommand
 from elspeth.web.sessions.routes.sessions import _rewrite_fork_state_blob_custody
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -38,7 +38,7 @@ from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.sessions.test_fork import _complete_guided_start_authority, _make_fork_app
 from tests.unit.web.sessions.test_guided_operation_fork_service import _claim_fork, _service_for
 
-_REWRITE_BOUNDARY_TEXT = "retains parent blob custody the fork rewriter did not rebase"
+_PRE_STAGING_TEXT = "retains parent blob custody the fork rewriter does not model"
 _SETTLEMENT_TEXT = "Guided fork settlement state retains parent blob custody"
 
 
@@ -394,20 +394,29 @@ async def test_guided_native_fork_child_serves_no_raw_storage_path(tmp_path: Pat
     assert str(child_blobs[0].id) in " ".join(str(value) for value in report_values)
 
 
-# --- T4: a non-ready parent blob fails at the REWRITE boundary, named -----------
+# --- T4: unrewritable parent custody is refused BEFORE any child row exists -----
 
 
+@pytest.mark.parametrize(
+    "carrier",
+    ["unknown_meta_value", "top_level_meta_key", "validation_errors", "validation_errors_embedded", "metadata", "metadata_embedded"],
+)
 @pytest.mark.asyncio
-async def test_non_ready_parent_blob_in_unknown_meta_key_fails_at_rewrite_boundary_not_settlement(tmp_path: Path) -> None:
-    """The fork plan admits only ``status == "ready"`` parent blobs, while the
-    settlement verifier forbids EVERY parent blob row. A non-ready parent blob
-    referenced from a ``composer_meta`` key the rewriter does not model used to
-    pass the rewrite-boundary backstop (its needles came from the plan) and die
-    at settlement with the generic message, after staging. With the backstop
-    needled on ``list_blobs(limit=None)`` the real route must now fail at the
-    rewrite boundary: the last-resort record names the key and carries the
-    rewrite-boundary text, not the settlement text, and settlement is never
-    entered.
+async def test_unrewritable_parent_custody_refuses_the_fork_before_any_child_row_exists(tmp_path: Path, carrier: str) -> None:
+    """Round-two systems finding B. The route commits the staged child inside
+    ``fork_session`` BEFORE the rewriter runs, so the rewrite-boundary backstop
+    could only make the "unknown key retains parent custody" failure observable
+    -- the orphaned, archived child it was invented to prevent was created
+    regardless (ee1ae108b's "no orphan child" claim was false). Custody that no
+    rewriter can rebase -- a ``composer_meta`` key outside the two the rewriter
+    models, whether the reference sits in its VALUE or is the top-level KEY
+    itself (round-two red-team F1), free text in ``validation_errors``, or the
+    ``metadata`` column (name and description, no rewriter either) -- is now
+    detected inside the staging transaction before ``sessions`` is written.
+    The non-ready blob keeps this outside the fork plan, so only the all-rows
+    forbidden set can see it. Driven through the real route: 500, the key named
+    in the last-resort record, settlement never entered, and NO child session
+    row for this parent.
     """
     app, service, blob_service = _make_fork_app(tmp_path)
     parent = await service.create_session("alice", "Parent", "local")
@@ -416,6 +425,29 @@ async def test_non_ready_parent_blob_in_unknown_meta_key_fails_at_rewrite_bounda
     with service._engine.begin() as conn:
         conn.execute(update(blobs_table).where(blobs_table.c.id == str(pending_blob.id)).values(status="pending"))
     assert (await blob_service.get_blob(pending_blob.id)).status == "pending"
+    composer_meta = {
+        "unknown_meta_value": {"some_future_subsystem": {"remembered_blob": str(pending_blob.id)}},
+        "top_level_meta_key": {str(pending_blob.id): {"note": "x"}},
+    }.get(carrier)
+    # The free-text carriers are matched by SUBSTRING (round-two red-team sign-off
+    # S1): a real validator message or description embeds the path in a sentence,
+    # a shape whole-string equality can never see.
+    validation_errors = {
+        "validation_errors": [pending_blob.storage_path],
+        "validation_errors_embedded": [f"source file not found: {pending_blob.storage_path}"],
+    }.get(carrier)
+    description = {
+        "metadata": pending_blob.storage_path,
+        "metadata_embedded": f"built from {pending_blob.storage_path} on Tuesday",
+    }.get(carrier)
+    expected_name = {
+        "unknown_meta_value": "'some_future_subsystem'",
+        "top_level_meta_key": f"'{pending_blob.id}'",
+        "validation_errors": "validation_errors",
+        "validation_errors_embedded": "validation_errors",
+        "metadata": "metadata",
+        "metadata_embedded": "metadata",
+    }[carrier]
     state = await service.save_composition_state(
         parent.id,
         CompositionStateData(
@@ -427,8 +459,10 @@ async def test_non_ready_parent_blob_in_unknown_meta_key_fails_at_rewrite_bounda
                     "on_validation_failure": "quarantine",
                 }
             },
-            metadata_={"name": "Parent pipeline", "description": None},
-            composer_meta={"some_future_subsystem": {"remembered_blob": str(pending_blob.id)}},
+            metadata_={"name": "Parent pipeline", "description": description},
+            is_valid=validation_errors is None,
+            validation_errors=validation_errors,
+            composer_meta=composer_meta,
         ),
         provenance="session_seed",
     )
@@ -455,10 +489,172 @@ async def test_non_ready_parent_blob_in_unknown_meta_key_fails_at_rewrite_bounda
 
     assert response.status_code == 500
     assert response.json()["detail"]["failure_code"] == "integrity_error"
-    assert settle_calls == [], "settlement must not be entered when the rewrite boundary refuses the fork"
+    assert settle_calls == [], "settlement must not be entered when custody detection refuses the fork"
     records = [entry for entry in cap_logs if entry.get("event") == "session.fork_rewrite_integrity_error"]
     assert len(records) == 1, [entry.get("event") for entry in cap_logs]
     message_text = records[0]["message"]
-    assert "some_future_subsystem" in message_text
-    assert _REWRITE_BOUNDARY_TEXT in message_text
+    assert expected_name in message_text
+    assert _PRE_STAGING_TEXT in message_text
     assert _SETTLEMENT_TEXT not in message_text
+    assert records[0]["child_session_id"] is None
+    with service._engine.begin() as conn:
+        child_rows = conn.execute(select(sessions_table.c.id).where(sessions_table.c.forked_from_session_id == str(parent.id))).all()
+    assert child_rows == [], "the refused fork must not leave an archived child session behind"
+
+
+# --- T5: validation_errors is inside the settlement verifier's payload ----------
+
+
+@pytest.mark.parametrize("entry_shape", ["exact", "embedded"])
+@pytest.mark.asyncio
+async def test_settlement_rejects_a_rewritten_state_whose_validation_errors_retain_a_parent_path(
+    engine, tmp_path: Path, entry_shape: str
+) -> None:
+    """Round-two systems finding C. ``validation_errors`` is persisted, copied
+    verbatim into the child and served on GET /state, yet the settlement payload
+    was built from six columns that did not include it -- the only served state
+    column outside every custody walker. The rewriter now refuses this shape
+    itself, so the payload is handed straight to settlement: the verifier must
+    reject it through its own plan and cohort checks.
+    """
+    service = _service_for(engine)
+    blob_service = BlobServiceImpl(engine, tmp_path / "blobs")
+    parent = await service.create_session("alice", "Parent", "local")
+    blob = await blob_service.create_blob(parent.id, "cases.csv", b"a,b\n1,2\n", "text/csv")
+    state = await service.save_composition_state(
+        parent.id,
+        CompositionStateData(
+            sources={
+                "data": {
+                    "plugin": "csv",
+                    "on_success": "rows",
+                    "options": {"blob_ref": str(blob.id), "path": blob.storage_path},
+                    "on_validation_failure": "quarantine",
+                }
+            },
+            metadata_={"name": "P", "description": None},
+        ),
+        provenance="session_seed",
+    )
+    message = await service.add_message(
+        parent.id, "user", "fork here", composition_state_id=state.id, writer_principal="route_user_message"
+    )
+    fence, staged, _blob_map, rewritten = await _stage_copy_rewrite(
+        service, blob_service, parent_id=parent.id, fork_message_id=message.id, data_dir=tmp_path
+    )
+    assert rewritten is not None
+    tainted = CompositionStateData(
+        sources=rewritten.sources,
+        nodes=rewritten.nodes,
+        edges=rewritten.edges,
+        outputs=rewritten.outputs,
+        metadata_=rewritten.metadata_,
+        is_valid=False,
+        validation_errors=[blob.storage_path if entry_shape == "exact" else f"source file not found: {blob.storage_path}"],
+        composer_meta=rewritten.composer_meta,
+    )
+
+    with pytest.raises(AuditIntegrityError, match=_SETTLEMENT_TEXT):
+        await service.settle_guided_fork_operation(_settlement_command(fence, staged, tainted))
+
+
+@pytest.mark.parametrize("entry_shape", ["exact", "embedded"])
+@pytest.mark.asyncio
+async def test_settlement_rejects_a_staged_state_whose_validation_errors_retain_a_parent_path(
+    engine, tmp_path: Path, entry_shape: str
+) -> None:
+    """The second settlement arm: no rewritten state, so the verifier reads the
+    staged row itself. The parent binds no blob (empty plan) but owns a pending
+    one, the child stages clean, and the staged row is then corrupted in place
+    to carry that blob's raw path in ``validation_errors`` -- settlement must
+    still refuse, because the verifier is the whole-payload authority.
+    """
+    service = _service_for(engine)
+    blob_service = BlobServiceImpl(engine, tmp_path / "blobs")
+    parent = await service.create_session("alice", "Parent", "local")
+    pending_blob = await blob_service.create_blob(parent.id, "late.csv", b"a\n1\n", "text/csv")
+    with engine.begin() as conn:
+        conn.execute(update(blobs_table).where(blobs_table.c.id == str(pending_blob.id)).values(status="pending"))
+    state = await service.save_composition_state(
+        parent.id,
+        CompositionStateData(sources={}, metadata_={"name": "P", "description": None}),
+        provenance="session_seed",
+    )
+    message = await service.add_message(
+        parent.id, "user", "fork here", composition_state_id=state.id, writer_principal="route_user_message"
+    )
+    fence = await _claim_fork(service, parent.id, operation_id=str(uuid4()))
+    staged = await service.fork_session(fence, fork_message_id=message.id, new_message_content="edited")
+    assert staged.state is not None and staged.blob_plan == ()
+    with engine.begin() as conn:
+        conn.execute(
+            update(composition_states_table)
+            .where(composition_states_table.c.id == str(staged.state.id))
+            .values(
+                is_valid=False,
+                validation_errors=[
+                    pending_blob.storage_path if entry_shape == "exact" else f"source file not found: {pending_blob.storage_path}"
+                ],
+            )
+        )
+
+    with pytest.raises(AuditIntegrityError, match=_SETTLEMENT_TEXT):
+        await service.settle_guided_fork_operation(_settlement_command(fence, staged, None))
+
+
+# --- T6: the fork plan row never reaches GET /messages ------------------------
+
+
+@pytest.mark.asyncio
+async def test_forked_child_messages_never_serve_the_parent_blob_plan_row(tmp_path: Path) -> None:
+    """Round-two systems finding D. The settlement verifier reads the frozen fork
+    plan from a ``role="audit"`` row in the CHILD's transcript, and that row
+    names the parent's blob ids by design (``_fork_blob_plan_content``). So "no
+    parent identity in the child" is true of ``composition_states`` only, and
+    the transcript projection's unconditional audit-row exclusion is the sole
+    thing between that row and the wire. Nothing pinned it. Every opt-in view
+    of GET /messages on a forked child must omit it.
+    """
+    app, service, blob_service = _make_fork_app(tmp_path)
+    parent = await service.create_session("alice", "Parent", "local")
+    blob = await blob_service.create_blob(parent.id, "orders.csv", b"id\n1\n", "text/csv")
+    state = await service.save_composition_state(
+        parent.id,
+        CompositionStateData(
+            sources={
+                "orders": {
+                    "plugin": "csv",
+                    "on_success": "rows",
+                    "options": {"blob_ref": str(blob.id), "path": blob.storage_path},
+                    "on_validation_failure": "quarantine",
+                }
+            },
+            metadata_={"name": "Parent pipeline", "description": None},
+        ),
+        provenance="session_seed",
+    )
+    fork_message = await service.add_message(
+        parent.id, "user", "fork", composition_state_id=state.id, writer_principal="route_user_message"
+    )
+    client = SyncASGITestClient(app)
+    response = client.post(
+        f"/api/sessions/{parent.id}/fork",
+        json={"operation_id": str(uuid4()), "from_message_id": str(fork_message.id), "new_message_content": "edited"},
+    )
+    assert response.status_code == 201, response.text
+    child_id = UUID(response.json()["session_id"])
+    stored = await service.get_messages(child_id, limit=None)
+    assert any(item.role == "audit" and str(blob.id) in item.content for item in stored), "fixture: the plan row must exist in the child"
+
+    for query in (
+        "",
+        "?include_tool_rows=true",
+        "?include_llm_audit=true",
+        "?include_raw_content=true",
+        "?include_tool_rows=true&include_llm_audit=true",
+    ):
+        served = client.get(f"/api/sessions/{child_id}/messages{query}")
+        assert served.status_code == 200, (query, served.text)
+        assert str(blob.id) not in served.text, query
+        assert blob.storage_path not in served.text, query
+        assert all(item["role"] != "audit" for item in served.json()), query
