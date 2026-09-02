@@ -47,6 +47,7 @@ from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex, stabl
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer.authority_hashing import composer_authority_hash, project_composer_authority_payload
+from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_custody import (
     InlineCustodyPublication,
@@ -1591,12 +1592,93 @@ def _settlement_fork_blob_plan(
 )
 def _value_references_parent_blob(value: Any, forbidden: frozenset[str]) -> bool:
     if type(value) is str:
-        return value in forbidden or (value.startswith("blob:") and value.removeprefix("blob:") in forbidden)
+        return value in forbidden or (value.startswith(BLOB_REF_PATH_PREFIX) and value.removeprefix(BLOB_REF_PATH_PREFIX) in forbidden)
     if isinstance(value, Mapping):
-        return any(_value_references_parent_blob(item, forbidden) for item in value.values())
+        # Keys are custody carriers too: a mapping keyed by a parent blob id or
+        # storage path names the parent exactly as a value does.
+        return any(_value_references_parent_blob(key, forbidden) for key in value) or any(
+            _value_references_parent_blob(item, forbidden) for item in value.values()
+        )
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return any(_value_references_parent_blob(item, forbidden) for item in value)
     return False
+
+
+def _free_text_embeds_parent_blob(value: Any, forbidden: frozenset[str]) -> bool:
+    """Substring form of ``_value_references_parent_blob`` for FREE-TEXT carriers.
+
+    ``validation_errors`` entries and ``metadata`` (pipeline name, description)
+    are prose: a validator writes ``"source file not found: <path>"``, never the
+    bare path, so whole-string equality can never see the parent there
+    (round-two red-team sign-off S1). Blob ids are UUIDs and storage paths are
+    session-scoped absolute paths, so a substring hit is unambiguous. This is
+    deliberately NOT applied to the structured columns, where a key or value IS
+    the reference and equality is the honest predicate. The carriers are tiny
+    JSON columns, so they are thawed to exact ``dict``/``list``/``str`` first
+    and walked by exact type, as the other persisted-JSON walks in this module
+    do.
+    """
+    thawed = deep_thaw(value)
+    if type(thawed) is str:
+        return any(needle in thawed for needle in forbidden)
+    if type(thawed) is dict:
+        return any(_free_text_embeds_parent_blob(item, forbidden) for item in thawed.values())
+    if type(thawed) is list:
+        return any(_free_text_embeds_parent_blob(item, forbidden) for item in thawed)
+    return False
+
+
+# The ``composer_meta`` keys the fork rewriter (``routes/sessions.py::
+# _rewrite_fork_state_blob_custody``) knows how to rebase onto the child:
+# ``guided_session`` is rewritten field by field and ``implicit_decisions`` is
+# re-derived from the rewritten state. Every OTHER key is carried forward
+# verbatim by ``merge_composer_meta_updates``, so parent blob custody under it
+# has no correction path and must refuse the fork BEFORE a child row exists.
+# A key that gains a rewriter is added here in the same change.
+FORK_REWRITTEN_COMPOSER_META_KEYS: frozenset[str] = frozenset({"guided_session", "implicit_decisions"})
+
+
+def _refuse_unrewritable_fork_custody(
+    *,
+    composer_meta: Mapping[str, Any] | None,
+    validation_errors: Sequence[str] | None,
+    metadata: Mapping[str, Any] | None,
+    forbidden: frozenset[str],
+) -> None:
+    """Refuse a fork whose source state carries parent custody nothing can rebase.
+
+    Runs inside ``fork_session``'s staging transaction before ``sessions`` is
+    written, so the refusal leaves NO archived child behind -- unlike the
+    rewrite-boundary backstop in the route, which runs after the child is
+    committed and can only name the key. ``forbidden`` is every parent blob row
+    (id and storage path, any status), the settlement verifier's own scope.
+    Keys in ``FORK_REWRITTEN_COMPOSER_META_KEYS`` are skipped: their rewriters
+    run later and the backstop judges their residue. The key itself is tested as
+    well as its value (a mapping keyed by a parent blob id names the parent).
+    ``validation_errors`` and ``metadata`` (name, description) are free text
+    with no rewriter at all.
+    """
+    if not forbidden:
+        return
+    if composer_meta is not None:
+        for meta_key, meta_value in composer_meta.items():
+            if meta_key in FORK_REWRITTEN_COMPOSER_META_KEYS:
+                continue
+            if _value_references_parent_blob(meta_key, forbidden) or _value_references_parent_blob(meta_value, forbidden):
+                raise AuditIntegrityError(
+                    f"Tier 1 audit anomaly: fork source composer_meta key {meta_key!r} retains parent blob custody "
+                    "the fork rewriter does not model -- teach the fork path this key before forking sessions that use it"
+                )
+    if validation_errors is not None and _free_text_embeds_parent_blob(validation_errors, forbidden):
+        raise AuditIntegrityError(
+            "Tier 1 audit anomaly: fork source validation_errors retains parent blob custody "
+            "the fork rewriter does not model -- clear the validation errors before forking this session"
+        )
+    if metadata is not None and _free_text_embeds_parent_blob(metadata, forbidden):
+        raise AuditIntegrityError(
+            "Tier 1 audit anomaly: fork source metadata retains parent blob custody "
+            "the fork rewriter does not model -- remove the blob reference from the pipeline name or description before forking"
+        )
 
 
 def _verify_fork_settlement_blob_custody(
@@ -1647,6 +1729,11 @@ def _verify_fork_settlement_blob_custody(
     forbidden = frozenset(item for row in parent_rows for item in (row.id, row.storage_path))
     if _value_references_parent_blob(state_payload, forbidden):
         raise AuditIntegrityError("Guided fork settlement state retains parent blob custody")
+    # The two free-text columns are prose; a parent path embedded in a sentence
+    # is custody the equality walk above cannot see.
+    for free_text_column in ("validation_errors", "metadata"):
+        if free_text_column in state_payload and _free_text_embeds_parent_blob(state_payload[free_text_column], forbidden):
+            raise AuditIntegrityError("Guided fork settlement state retains parent blob custody")
 
 
 def _current_adr019_counter_subsets_hold(
@@ -12179,7 +12266,7 @@ class SessionServiceImpl:
         if type(command) is not GuidedPipelineProposalBackEditCommand:
             raise TypeError("command must be an exact GuidedPipelineProposalBackEditCommand")
 
-        from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX, GuidedStep, Turn, TurnType, validate_current_turn
+        from elspeth.web.composer.guided.protocol import GuidedStep, Turn, TurnType, validate_current_turn
         from elspeth.web.composer.guided.state_machine import GuidedSession, TurnRecord
 
         payloads_by_purpose = {payload.purpose: payload for payload in command.payloads}
@@ -13673,6 +13760,18 @@ class SessionServiceImpl:
                                 session_id=parent_session_id_str,
                                 guided=source_guided,
                             )
+                    # Custody no rewriter can rebase is refused HERE, before the
+                    # child session row is inserted, so the failure the
+                    # route's backstop can only name never creates an orphan.
+                    parent_blob_rows = conn.execute(
+                        select(blobs_table.c.id, blobs_table.c.storage_path).where(blobs_table.c.session_id == parent_session_id_str)
+                    ).all()
+                    _refuse_unrewritable_fork_custody(
+                        composer_meta=forked_composer_meta,
+                        validation_errors=locked_source_state.validation_errors,
+                        metadata=locked_source_state.metadata_,
+                        forbidden=frozenset(item for row in parent_blob_rows for item in (row.id, row.storage_path)),
+                    )
 
                 plan = tuple(
                     BlobForkPlanEntry(
@@ -13879,6 +13978,7 @@ class SessionServiceImpl:
                         "edges": deep_thaw(command.rewritten_state.edges),
                         "outputs": deep_thaw(command.rewritten_state.outputs),
                         "metadata": deep_thaw(command.rewritten_state.metadata_),
+                        "validation_errors": deep_thaw(command.rewritten_state.validation_errors),
                         "composer_meta": deep_thaw(command.rewritten_state.composer_meta),
                     }
                 elif current_state_row is not None:
@@ -13889,6 +13989,7 @@ class SessionServiceImpl:
                         "edges": current_state_row.edges,
                         "outputs": current_state_row.outputs,
                         "metadata": current_state_row.metadata_,
+                        "validation_errors": current_state_row.validation_errors,
                         "composer_meta": current_state_row.composer_meta,
                     }
                 else:
