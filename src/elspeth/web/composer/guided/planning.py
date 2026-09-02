@@ -1399,7 +1399,7 @@ def _require_guided_fact_value(key: str, value: object) -> GuidedFactValue:
     if type(value) in _GUIDED_FACT_SCALARS:
         return cast(GuidedFactValue, value)
     if type(value) is list and all(type(item) is str for item in value):
-        return cast(list[str], value)
+        return list(value)  # our own copy: the caller's list is never aliased into the rejection
     raise AuditIntegrityError(f"guided rejection fact {key!r} is not a closed label: {type(value).__name__}")
 
 

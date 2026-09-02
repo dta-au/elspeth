@@ -2627,8 +2627,8 @@ class _LabelLookalike(str):
 
 @pytest.mark.parametrize(
     "value",
-    [{"inner": 1}, [{"k": 2}], ("a", "b"), _LabelLookalike("x"), [_LabelLookalike("x")], 1.5, {"a"}],
-    ids=["dict", "list-of-dict", "tuple", "str-subclass", "list-of-str-subclass", "float", "set"],
+    [{"inner": 1}, [{"k": 2}], ["a", {"k": 1}], ("a", "b"), _LabelLookalike("x"), [_LabelLookalike("x")], 1.5, {"a"}],
+    ids=["dict", "list-of-dict", "mixed-list", "tuple", "str-subclass", "list-of-str-subclass", "float", "set"],
 )
 def test_guided_rejection_refuses_a_fact_value_that_is_not_a_closed_label(value: object) -> None:
     """A fact value is admitted nominally at construction, where it is built.
@@ -2646,6 +2646,8 @@ def test_guided_rejection_admits_every_closed_label_type() -> None:
     facts = {"s": "x", "i": 3, "b": True, "n": None, "l": ["a", "b"], "e": []}
     rejection = GuidedCandidateBindingRejected("m", error_code="guided_delta_authority_violation", connectivity=facts)
     assert rejection.connectivity == facts
+    # The admitted list is our own copy: the caller's object is never aliased in.
+    assert rejection.connectivity["l"] is not facts["l"]
 
 
 def test_node_correction_rejects_an_edge_id_reusing_a_non_incident_edge_under_its_own_key() -> None:
