@@ -193,8 +193,12 @@ async function driveGuidedWalk(page: Page): Promise<void> {
     // Output required-fields turn (multi_select_with_custom): the sink the LLM
     // built is observed-mode (pass-all-through), and the real output fields come
     // from the downstream transforms — so the correct, designed answer here is
-    // the escape, not ticking the source's `url` column. Only renders on this
-    // one turn, so it never preempts another stage's primary.
+    // the escape, not ticking the source's `url` column. Since design review
+    // 2026-09-02 (I-3) the escape IS that turn's primary: nothing is pre-pinned,
+    // the secondary is "Pin these fields" (disabled until a chip is ticked), and
+    // the turn carries no "Continue" — so the "Continue" primary above cannot
+    // preempt this one. Only renders on this one turn, so it never preempts
+    // another stage's primary.
     page.getByRole("button", { name: "Let source decide (pass all fields through)", exact: true }),
   ];
 

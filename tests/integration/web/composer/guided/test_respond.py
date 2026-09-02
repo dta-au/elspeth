@@ -1705,11 +1705,12 @@ class TestStep2IntraStep:
         assert body["next_turn"]["type"] == "multi_select_with_custom"
         payload = body["next_turn"]["payload"]
         assert "options" in payload
-        assert "default_chosen" in payload
-        # Observed columns from step 1 appear as options
+        # Observed columns from step 1 appear as options, none pre-pinned
+        # (I-3, design review 2026-09-02): pinning is a deliberate tick.
         option_ids = [o["id"] for o in payload["options"]]
         assert "text" in option_ids
         assert "category" in option_ids
+        assert payload["default_chosen"] == []
 
     def test_multi_select_response_atomically_stages_step_3_proposal(self, composer_test_client: TestClient) -> None:
         """Reviewed sink facts and the private proposal become durable together."""

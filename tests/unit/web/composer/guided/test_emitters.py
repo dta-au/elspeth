@@ -14,6 +14,7 @@ from elspeth.web.composer.guided.emitters import (
     build_initial_step_1_turn,
     build_step_1_schema_form_turn,
     build_step_1_schema_form_turn_from_resolved,
+    build_step_2_multi_select_turn,
     build_step_2_schema_form_turn,
     build_step_4_wire_turn,
 )
@@ -1205,3 +1206,37 @@ class TestSchemaFormPathMask:
         )
         turn = build_step_1_schema_form_turn_from_resolved(source, _Catalog())
         assert turn["payload"]["prefilled"]["path"] == "data/input.json"
+
+
+class TestStep2FieldsTurnDefaultGesture:
+    """I-3 (design review 2026-09-02): the fields turn pre-pins nothing.
+
+    The turn is asked at Step 2, before any transform exists, so the fields the
+    pipeline is about to produce are never among its options. Pre-selecting the
+    source's columns made the one-click answer pin the sink to the source
+    schema; the designed answer for a transform-bearing pipeline is pass-through
+    (what the staging driver clicks). Pinning must be a deliberate tick, so the
+    emitted default selection is empty and the pass-through escape is always
+    offered. The keep semantics themselves are adjudicated in
+    docs/plans/2026-08-19-invert-guided-sink-field-keep.md and are not changed
+    here — only the default gesture is.
+    """
+
+    def test_no_source_column_is_pre_pinned(self) -> None:
+        turn = build_step_2_multi_select_turn(("url", "title"))
+
+        assert turn["type"] == TurnType.MULTI_SELECT_WITH_CUSTOM.value
+        payload = turn["payload"]
+        assert [option["id"] for option in payload["options"]] == ["url", "title"]
+        assert payload["default_chosen"] == []
+        assert payload["escape_label"] is not None
+        assert validate_payload(TurnType.MULTI_SELECT_WITH_CUSTOM, payload) is None
+
+    def test_pass_through_is_offered_even_with_no_observed_columns(self) -> None:
+        turn = build_step_2_multi_select_turn(())
+
+        payload = turn["payload"]
+        assert payload["options"] == []
+        assert payload["default_chosen"] == []
+        assert payload["escape_label"] is not None
+        assert validate_payload(TurnType.MULTI_SELECT_WITH_CUSTOM, payload) is None

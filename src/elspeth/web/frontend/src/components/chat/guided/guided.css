@@ -1588,7 +1588,10 @@
   margin-top: var(--space-md);
 }
 
-.guided-multi-continue-btn {
+/* The pass-through escape is the PRIMARY action on the required-fields turn
+   (design review 2026-09-02 I-3): filled accent. "Pin these fields" is the
+   outlined secondary. */
+.guided-multi-escape-btn {
   padding: var(--space-sm) var(--space-lg);
   background-color: var(--color-accent);
   color: var(--color-text-inverse);
@@ -1601,7 +1604,7 @@
   transition: background-color var(--transition-fast);
 }
 
-.guided-multi-escape-btn {
+.guided-multi-pin-btn {
   padding: var(--space-sm) var(--space-lg);
   background-color: transparent;
   color: var(--color-text);
@@ -1614,32 +1617,32 @@
   transition: background-color var(--transition-fast), border-color var(--transition-fast);
 }
 
-.guided-multi-escape-btn:hover:not(:disabled) {
+.guided-multi-pin-btn:hover:not(:disabled) {
   background-color: var(--color-surface-hover);
   border-color: var(--color-accent);
 }
 
-.guided-multi-escape-btn:disabled {
+.guided-multi-pin-btn:disabled {
   color: var(--color-text-muted);
   cursor: not-allowed;
 }
 
-.guided-multi-escape-btn:focus-visible {
+.guided-multi-pin-btn:focus-visible {
   outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
 }
 
-.guided-multi-continue-btn:hover:not(:disabled) {
+.guided-multi-escape-btn:hover:not(:disabled) {
   background-color: var(--color-btn-primary-bg-hover);
 }
 
-.guided-multi-continue-btn:disabled {
+.guided-multi-escape-btn:disabled {
   background-color: var(--color-surface-elevated);
   color: var(--color-text-muted);
   cursor: not-allowed;
 }
 
-.guided-multi-continue-btn:focus-visible {
+.guided-multi-escape-btn:focus-visible {
   outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
 }
@@ -2437,7 +2440,7 @@
   .guided-inspect-apply-btn,
   .guided-multi-custom-remove-btn,
   .guided-multi-escape-btn,
-  .guided-multi-continue-btn,
+  .guided-multi-pin-btn,
   .guided-schema-input,
   .guided-schema-select,
   .guided-schema-textarea,
