@@ -2583,17 +2583,19 @@ def test_source_correction_admits_every_node_key_the_advertised_schema_admits() 
     assert rejected_for_unexpected_keys == []
 
 
-def test_source_correction_refuses_a_node_key_the_advertised_schema_does_not_admit() -> None:
+@pytest.mark.parametrize("key", ["not_a_canonical_node_key", "stable_id", "secret_ref"])
+def test_source_correction_refuses_a_node_key_the_advertised_schema_does_not_admit(key: str) -> None:
     """The derived allowlist is pinned from BOTH sides: nothing non-canonical is admitted.
 
     The sibling test proves every canonical key binds; without this one a
-    widened derivation (``canonical | {"stable_id"}``) survives every test
-    (final red-team F4). The canonical pre-check masks this in production, so
-    the binder check is defense-in-depth — but it is the check this branch
-    changed, and the change must be pinned exactly.
+    widened derivation (``canonical | {"stable_id", "secret_ref"}``) survives
+    every test (final red-team F4, mutant P6b — hence those two keys are
+    probed by name, not only a made-up one). The canonical pre-check masks
+    this in production, so the binder check is defense-in-depth — but it is
+    the check this branch changed, and the change must be pinned exactly.
     """
     canonical_node_keys = set(guided_planning._canonical_schema_properties()["nodes"]["items"]["properties"])
-    assert "not_a_canonical_node_key" not in canonical_node_keys
+    assert key not in canonical_node_keys
     node: dict[str, object] = {
         "id": "screen_rows",
         "node_type": "transform",
@@ -2602,7 +2604,7 @@ def test_source_correction_refuses_a_node_key_the_advertised_schema_does_not_adm
         "on_success": "amount_gate",
         "on_error": "discard",
         "options": {"schema": {"mode": "observed"}},
-        "not_a_canonical_node_key": None,
+        key: None,
     }
     with pytest.raises(guided_planning.GuidedCandidateBindingRejected) as excinfo:
         materialize_guided_authorized_candidate(
@@ -2616,7 +2618,37 @@ def test_source_correction_refuses_a_node_key_the_advertised_schema_does_not_adm
             current_state=_correction_predecessor(),
         )
     assert excinfo.value.error_code == "guided_delta_authority_violation"
-    assert excinfo.value.connectivity["unexpected_keys"] == ["not_a_canonical_node_key"]
+    assert excinfo.value.connectivity["unexpected_keys"] == [key]
+
+
+def test_node_correction_rejects_an_edge_id_reusing_a_non_incident_edge_under_its_own_key() -> None:
+    """The id-reuse fault ships ``reused_edge_id``, not ``edge_id``, at the production site.
+
+    ``guided_delta_nonincident_route`` covers two faults the prose teaches
+    apart; only a binder-level run pins the key the real site emits (final
+    red-team F3 — the fingerprint test builds its own rejections, so
+    reverting the site's key survived it).
+    """
+    predecessor = replace(
+        _correction_predecessor(),
+        edges=(
+            EdgeSpec(id="gate_to_summarize", from_node="amount_gate", to_node="summarize_standard", edge_type="route_true", label="true"),
+        ),
+    )
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        materialize_guided_authorized_candidate(
+            {
+                "node_patch": {"stable_id": _format_node_correction_target().requested.stable_id},
+                # Endpoints touch the selected node, so the incident check passes;
+                # the id belongs to an existing edge touching no owner.
+                "edges": [{"id": "gate_to_summarize", "from_node": "format_high_value", "to_node": "output", "edge_type": "on_success"}],
+            },
+            authority=_format_node_correction_target(),
+            guided=_guided(),
+            current_state=predecessor,
+        )
+    assert raised.value.error_code == "guided_delta_nonincident_route"
+    assert raised.value.connectivity == {"reused_edge_id": "gate_to_summarize", "incident_owners": ["format_high_value"]}
 
 
 def test_source_correction_binds_a_collector_with_its_scope_keys() -> None:
