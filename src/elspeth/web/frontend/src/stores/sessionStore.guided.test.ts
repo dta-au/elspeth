@@ -4658,4 +4658,103 @@ describe("sessionStore — guided-mode fields and actions", () => {
       expect(useSessionStore.getState().guidedApprovalNotice).toBeNull();
     });
   });
+
+  // The ledger is the pane's only memory of the reviewed source/output once
+  // the review turn that named them has advanced (elspeth-9f0873426a); it
+  // must fold on every published turn and reset with the guided context.
+  describe("guidedReviewedComponents ledger (elspeth-9f0873426a)", () => {
+    const reviewedSource = {
+      stable_id: "00000000-0000-4000-8000-000000000602",
+      name: "source-1",
+      plugin: "csv",
+      status: "reviewed" as const,
+    };
+    const sourceReviewTurn: TurnPayload = {
+      type: "review_components",
+      step_index: 0,
+      turn_token: "f".repeat(64),
+      payload: {
+        component_kind: "source",
+        items: [reviewedSource],
+        allowed_actions: ["finish"],
+      },
+    };
+
+    it("starts empty and is reset with the rest of the guided context on session switch", async () => {
+      expect(useSessionStore.getState().guidedReviewedComponents).toEqual({
+        sources: [],
+        outputs: [],
+      });
+      const {
+        fetchMessages,
+        fetchCompositionState,
+        fetchCompositionProposals,
+        fetchComposerPreferences,
+      } = await import("@/api/client");
+      (fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+      (fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
+      (fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+      (fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
+      useSessionStore.setState({
+        activeSessionId: "sess-1",
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sourceReviewTurn,
+        guidedReviewedComponents: { sources: [reviewedSource], outputs: [] },
+      });
+
+      await useSessionStore.getState().selectSession("sess-2");
+
+      expect(useSessionStore.getState().guidedReviewedComponents).toEqual({
+        sources: [],
+        outputs: [],
+      });
+    });
+
+    it("respondGuided: folds a review turn into the ledger and keeps it through the next turn", async () => {
+      const { respondGuided } = await import("@/api/client");
+      (respondGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        ...sampleRespondResponse,
+        guided_session: sampleGuidedSession,
+        next_turn: sourceReviewTurn,
+      });
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+
+      await useSessionStore.getState().respondGuided({
+        chosen: ["csv"],
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      });
+      expect(useSessionStore.getState().guidedReviewedComponents).toEqual({
+        sources: [reviewedSource],
+        outputs: [],
+      });
+
+      // The sink single_select turn replaces the review turn on the wire; the
+      // ledger is what still remembers the source.
+      (respondGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(sampleRespondResponse);
+      await useSessionStore.getState().respondGuided({
+        chosen: null,
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+        component_action: { action: "finish", component_kind: "source" },
+      });
+      expect(useSessionStore.getState().guidedNextTurn?.type).toBe("single_select");
+      expect(useSessionStore.getState().guidedReviewedComponents).toEqual({
+        sources: [reviewedSource],
+        outputs: [],
+      });
+    });
+  });
 });

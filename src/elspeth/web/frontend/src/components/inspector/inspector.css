@@ -312,6 +312,36 @@
   margin: 0;
 }
 
+/* Guided pre-commit drawing (elspeth-9f0873426a, IA-1/V-1): GuidedGraphPane
+   replaces the empty state above while a guided build has something reviewed
+   or proposed but nothing committed. Same panel box as the canvas (fills the
+   tabpanel, scrolls its own overflow) with a one-line caption over the
+   read-only SVG. The SVG scales with its viewBox, so left unbounded in the
+   wide pane a three-node drawing would blow up to poster size: the canvas is
+   capped at reading width and centred — roughly twice the width the
+   proposal card used to give it, so the labels V-1 measured at 8px read at
+   body size without the nodes turning into billboards. */
+.graph-view-guided {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  box-sizing: border-box;
+  height: 100%;
+  padding: var(--space-md);
+  overflow: auto;
+}
+
+.graph-view-guided__caption {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.graph-view-guided .guided-readonly-graph {
+  width: min(100%, 44rem);
+  margin-inline: auto;
+}
+
 .graph-view-canvas {
   /* Positioned so the React Flow Controls/MiniMap panels — rendered as
      SIBLINGS of the role="img" diagram (elspeth-37f6f13132) — anchor to the

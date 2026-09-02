@@ -2,7 +2,12 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  REQUEST_ARTIFACT_VIEW_EVENT,
+  type RequestArtifactViewDetail,
+} from "@/lib/composer-events";
 import { usePreferencesStore } from "@/stores/preferencesStore";
+import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
 import type {
   GuidedProposalReviewState,
@@ -12,7 +17,12 @@ import { ProposePipelineTurn } from "./ProposePipelineTurn";
 
 // The components list gates advanced-tier option pairs on show_advanced, so
 // this turn is a preferences-store reader; the store is a module singleton.
-beforeEach(() => resetStore(usePreferencesStore));
+// The Show-graph pointer reads activeSessionId from the session store, so
+// that singleton is reset too.
+beforeEach(() => {
+  resetStore(usePreferencesStore);
+  resetStore(useSessionStore);
+});
 
 const IDS = {
   proposal: "00000000-0000-4000-8000-000000000401",
@@ -223,7 +233,38 @@ function activeReview(): GuidedProposalReviewState {
 }
 
 describe("ProposePipelineTurn", () => {
-  it("renders the full DAG, stable edge identities, virtual discard, routes, queues, aggregations, fan-in, sources, and outputs", () => {
+  // The DAG itself is drawn by the Pipeline pane from the same payload
+  // (guidedGraphProjection → GraphView); the card keeps the textual summary
+  // and controls and points at the pane (elspeth-9f0873426a, IA-1/V-1).
+  it("points at the Graph pane instead of drawing the DAG, and Show graph requests that tab for the active session", async () => {
+    const user = userEvent.setup();
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    const received: RequestArtifactViewDetail[] = [];
+    const listener = (event: Event): void => {
+      received.push((event as CustomEvent<RequestArtifactViewDetail>).detail);
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, listener);
+    try {
+      const { container } = render(
+        <ProposePipelineTurn
+          payload={payload()}
+          reviewState={activeReview()}
+          onSubmit={vi.fn()}
+        />,
+      );
+      expect(container.querySelector(".guided-readonly-graph")).toBeNull();
+      expect(screen.getByText("The proposed structure is drawn in the Graph pane.")).toBeVisible();
+
+      await user.click(screen.getByRole("button", { name: "Show graph" }));
+      expect(received).toEqual([
+        { tab: "graph", focusMode: false, sessionId: "session-1" },
+      ]);
+    } finally {
+      window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, listener);
+    }
+  });
+
+  it("renders the counts, routes, queues, aggregations, fan-in, sources, and outputs textually", () => {
     const { container } = render(
       <ProposePipelineTurn
         payload={payload()}
@@ -232,9 +273,9 @@ describe("ProposePipelineTurn", () => {
       />,
     );
 
-    expect(screen.getByRole("img", { name: /pipeline proposal graph/i })).toBeVisible();
-    expect(container.querySelector(`[data-edge-id="${edgeId(6)}"]`)).not.toBeNull();
-    expect(container.querySelector('[data-node-kind="discard"]')).not.toBeNull();
+    expect(screen.getByText("The proposed structure is drawn in the Graph pane.")).toBeVisible();
+    expect(screen.queryByRole("img", { name: /pipeline proposal graph/i })).toBeNull();
+    expect(container.querySelector(".guided-readonly-graph")).toBeNull();
     expect(screen.getByText("2 sources · 4 nodes · 13 routes · 2 outputs")).toBeVisible();
     // F11: the gate summary carries the authored predicate verbatim plus each
     // author-visible route key resolved to its destination — with the ordinal
@@ -255,7 +296,11 @@ describe("ProposePipelineTurn", () => {
     // the ordinal alias visible.
     expect(screen.getAllByText(/when true \(route-1\) forks to branch-1/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/when false \(route-2\)/i).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/on error → discard/i).length).toBeGreaterThan(0);
+    // The routes list is the card's structural view now that the DAG is drawn
+    // in the pane; each route row carries its stable edge identity.
+    expect(container.querySelector(`[data-edge-id="${edgeId(10)}"]`)).toHaveTextContent(
+      "node-3 → discard — on error",
+    );
     // elspeth-ca456d9d8d: the components list names a plugin by its display
     // label ("JSON", "CSV"), not its raw catalog id.
     expect(screen.getByText("source-2 · JSON")).toBeVisible();
@@ -387,9 +432,6 @@ describe("ProposePipelineTurn", () => {
       />,
     );
 
-    expect(
-      container.querySelector('[data-node-kind="row_union"]'),
-    ).not.toBeNull();
     // The components list names the node type in the reader's register, never
     // the raw union member, with the raw token recoverable from `title` — the
     // same derivation the sibling wire-stage row uses.
@@ -399,18 +441,13 @@ describe("ProposePipelineTurn", () => {
     expect(componentRow).not.toBeNull();
     expect(componentRow!.textContent).toBe("node-4 · Row Union");
     expect(
-      container.querySelector(
-        ".guided-readonly-graph__node--row_union",
-      ),
-    ).not.toBeNull();
-    expect(
       screen.getByText(
         /waits for branch-1, branch-2, then forwards every row without merging records; timeout 12.5s/i,
       ),
     ).toBeVisible();
-    expect(
-      screen.getAllByText(/after row union → output-1/i).length,
-    ).toBeGreaterThan(0);
+    expect(container.querySelector(`[data-edge-id="${edgeId(11)}"]`)).toHaveTextContent(
+      "node-4 → output-1 — after row union",
+    );
   });
 
   it("distinguishes parallel row-union revision controls by gate-fork flow", async () => {
@@ -670,7 +707,11 @@ describe("ProposePipelineTurn", () => {
       );
 
       expect(screen.getByRole("alert")).toHaveTextContent(/response was not received/i);
-      const controls = screen.getAllByRole("button");
+      // Show graph is a navigation pointer, not a proposal action: it stays
+      // enabled in every review state and is excluded from the count.
+      const controls = screen.getAllByRole("button", {
+        name: (name) => name !== "Show graph",
+      });
       expect(controls.filter((control) => !control.hasAttribute("disabled"))).toHaveLength(1);
       expect(screen.getByRole("button", { name: enabledName })).toBeEnabled();
     },
@@ -757,7 +798,8 @@ describe("ProposePipelineTurn", () => {
         isTutorial
       />,
     );
-    expect(screen.getByRole("img", { name: /pipeline proposal graph/i })).toBeVisible();
+    expect(screen.getByText("The proposed structure is drawn in the Graph pane.")).toBeVisible();
+    expect(screen.queryByRole("img", { name: /pipeline proposal graph/i })).toBeNull();
     expect(screen.getByText("source-1 · CSV")).toBeVisible();
     expect(screen.getByText(/press Review wiring to continue/i)).toBeVisible();
     expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
@@ -794,7 +836,8 @@ describe("ProposePipelineTurn", () => {
         isTutorial
       />,
     );
-    expect(screen.getByRole("img", { name: /pipeline proposal graph/i })).toBeVisible();
+    expect(screen.getByText("The proposed structure is drawn in the Graph pane.")).toBeVisible();
+    expect(screen.queryByRole("img", { name: /pipeline proposal graph/i })).toBeNull();
     expect(screen.queryByRole("button", { name: "Review wiring" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
     expect(screen.queryByRole("button", { name: /Revise/ })).toBeNull();

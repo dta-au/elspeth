@@ -38,6 +38,8 @@ import dagre from "@dagrejs/dagre";
 import "@xyflow/react/dist/style.css";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import { projectGuidedGraph } from "@/components/chat/guided/guidedGraphProjection";
+import { GuidedGraphPane } from "./GuidedGraphPane";
 import { useTheme } from "@/hooks/useTheme";
 import {
   hasCompositionContent,
@@ -837,6 +839,22 @@ export function GraphView() {
   );
   const selectedNodeId = useSessionStore((s) => s.selectedNodeId);
   const selectNode = useSessionStore((s) => s.selectNode);
+  // Guided pre-commit projection (elspeth-9f0873426a, IA-1 / V-1): what the
+  // learner has reviewed or is being asked to approve, drawn from the guided
+  // turn payloads already in the store. Both selectors return stable
+  // references (the ledger fold is identity for non-review turns).
+  const guidedNextTurn = useSessionStore((s) => s.guidedNextTurn);
+  const guidedReviewedComponents = useSessionStore(
+    (s) => s.guidedReviewedComponents,
+  );
+  const guidedProjection = useMemo(
+    () =>
+      projectGuidedGraph({
+        nextTurn: guidedNextTurn,
+        reviewed: guidedReviewedComponents,
+      }),
+    [guidedNextTurn, guidedReviewedComponents],
+  );
   const { resolvedTheme } = useTheme();
 
   const validationResult = useExecutionStore((s) => s.validationResult);
@@ -2029,6 +2047,18 @@ export function GraphView() {
   // tabpanel, and the message is a state, not a document section. The
   // explicit {" "} keeps the two sentences one whitespace-normalised string
   // for text-content assertions.
+  //
+  // Guided builds first (elspeth-9f0873426a): a pending proposal or wire
+  // stage is what the learner is deciding on, so it is drawn even over a
+  // committed composition (a re-entered session keeps its old graph until
+  // the new one is confirmed — and the proposal card no longer draws its
+  // own copy). The weaker reviewed-components ledger only fills the void.
+  if (
+    guidedProjection !== null &&
+    (guidedProjection.stage !== "reviewed" || nodes.length === 0)
+  ) {
+    return <GuidedGraphPane projection={guidedProjection} />;
+  }
   if (nodes.length === 0) {
     return (
       <div className="empty-state graph-view-empty">

@@ -19,7 +19,7 @@
 // ============================================================================
 
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, type ReactNode } from "react";
 
@@ -1042,9 +1042,10 @@ describe("ProposePipelineTurn", () => {
     const { container } = render(
       <ProposePipelineTurn payload={proposalPayload()} reviewState={reviewState} onSubmit={() => {}} />,
     );
-    // Non-vacuous: the labelled graph, the accessible heading, and the enabled
-    // primary control must all be real.
-    screen.getByRole("img", { name: /pipeline proposal graph/i });
+    // Non-vacuous: the Graph-pane pointer (the DAG itself moved to the
+    // Pipeline pane — elspeth-9f0873426a), the accessible heading, and the
+    // enabled primary control must all be real.
+    screen.getByRole("button", { name: "Show graph" });
     screen.getByRole("heading", { name: "Review pipeline proposal" });
     expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
     expect(await axe(container)).toHaveNoViolations();

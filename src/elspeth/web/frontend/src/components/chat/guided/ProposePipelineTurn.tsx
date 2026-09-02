@@ -2,22 +2,19 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui";
 import { stepLabelForPlugin } from "@/components/chat/interpretationStepLabel";
+import { dispatchArtifactViewIntent } from "@/lib/composer-events";
 import { useShowAdvanced } from "@/stores/preferencesStore";
+import { useSessionStore } from "@/stores/sessionStore";
 
 import type {
   GuidedEditTarget,
   GuidedProposalReviewState,
   GuidedProposalRetryAction,
   GuidedRespondAction,
-  ProposalFlow,
   ProposePipelinePayload,
 } from "@/types/guided";
-import {
-  ReadOnlyPipelineGraph,
-  type ReadOnlyPipelineGraphEdge,
-  type ReadOnlyPipelineGraphNode,
-} from "./ReadOnlyPipelineGraph";
 import { behaviorSummary, gateSummary } from "./behaviorSummary";
+import { flowLabel, routeKeysByAlias } from "./guidedGraphProjection";
 import { optionTier } from "./optionTiers";
 import { nodeOptionText } from "./WireStageTurn";
 import { WireReviewList, type WireReviewItem } from "./WireReviewList";
@@ -43,8 +40,6 @@ interface ProposePipelineTurnProps {
   disabled?: boolean;
   isTutorial?: boolean;
 }
-
-const DISCARD_NODE_ID = "guided-proposal-discard";
 
 const BLOCKER_COPY: Record<ProposePipelinePayload["blockers"][number]["code"], string> = {
   pipeline_invalid: "The proposed pipeline has validation problems that must be revised.",
@@ -80,43 +75,6 @@ function sameRetryAction(
     retained.edit_target.stable_id === candidate.edit_target.stable_id &&
     (retained.correction_feedback ?? null) === (candidate.correction_feedback ?? null)
   );
-}
-
-/** Human name for one gate route: "when true (route-1)". The ordinal alias
- *  stays visible — it is the revise-target / integrity token — while the
- *  author-visible key says which branch this actually is (F11). */
-function routeName(alias: string, routeKeys: ReadonlyMap<string, string>): string {
-  const key = routeKeys.get(alias);
-  return key === undefined ? alias : `when ${key} (${alias})`;
-}
-
-function flowLabel(flow: ProposalFlow, routeKeys: ReadonlyMap<string, string>): string {
-  switch (flow.kind) {
-    case "source_success":
-      return flow.branch === null ? "on source success" : `on source success in ${flow.branch}`;
-    case "source_validation_failure":
-      return "on validation failure";
-    case "node_success":
-      return flow.branch === null ? "on success" : `on success in ${flow.branch}`;
-    case "node_error":
-      return "on error";
-    case "gate_route": {
-      const label = routeName(flow.route, routeKeys);
-      return flow.branch === null ? label : `${label} in ${flow.branch}`;
-    }
-    case "gate_fork":
-      return `${flow.routes.map((route) => routeName(route, routeKeys)).join(" + ")} forks to ${flow.branch}`;
-    case "queue_continue":
-      return flow.branch === null ? "queue continues" : `queue continues in ${flow.branch}`;
-    case "coalesce_success":
-      return flow.branch === null ? "after join" : `after join in ${flow.branch}`;
-    case "row_union_success":
-      return flow.branch === null
-        ? "after row union"
-        : `after row union in ${flow.branch}`;
-    case "output_write_failure":
-      return "on write failure";
-  }
 }
 
 function reviewStatusCopy(
@@ -155,6 +113,7 @@ export function ProposePipelineTurn({
   isTutorial = false,
 }: ProposePipelineTurnProps): JSX.Element {
   const showAdvanced = useShowAdvanced();
+  const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const statusRef = useRef<HTMLParagraphElement | null>(null);
   const revisionFeedbackId = useId();
   const retainedCorrection =
@@ -183,58 +142,9 @@ export function ProposePipelineTurn({
     for (const output of payload.outputs) labels.set(output.stable_id, output.label);
     return labels;
   }, [payload]);
-  // Alias → author-visible route key, from each gate's behavior bindings
-  // (bijective with route_aliases; aliases are globally unique ordinals, so
-  // one flat map covers every gate).
-  const routeKeyByAlias = useMemo(() => {
-    const keys = new Map<string, string>();
-    for (const node of payload.nodes) {
-      if (node.behavior.kind !== "gate") continue;
-      for (const { alias, key } of node.behavior.routes) keys.set(alias, key);
-    }
-    return keys;
-  }, [payload.nodes]);
-  const hasDiscard = payload.graph.edges.some((edge) => edge.to_endpoint.kind === "discard");
-  const graphNodes = useMemo<ReadOnlyPipelineGraphNode[]>(() => [
-    ...payload.graph.sources.map((source) => ({
-      id: source.stable_id,
-      label: source.label,
-      kind: "source" as const,
-      subtitle: stepLabelForPlugin(source.plugin.id),
-    })),
-    ...payload.nodes.map((node) => ({
-      id: node.stable_id,
-      label: node.label,
-      kind: node.node_type,
-      subtitle: node.plugin === null ? null : stepLabelForPlugin(node.plugin.id),
-    })),
-    ...payload.outputs.map((output) => ({
-      id: output.stable_id,
-      label: output.label,
-      kind: "output" as const,
-      subtitle: stepLabelForPlugin(output.plugin.id),
-    })),
-    ...(hasDiscard
-      ? [{ id: DISCARD_NODE_ID, label: "discard", kind: "discard" as const, subtitle: null }]
-      : []),
-  ], [hasDiscard, payload]);
-  const graphEdges = useMemo<ReadOnlyPipelineGraphEdge[]>(() =>
-    payload.graph.edges.map((edge) => {
-      const targetId = edge.to_endpoint.kind === "discard"
-        ? DISCARD_NODE_ID
-        : edge.to_endpoint.stable_id;
-      const from = labelById.get(edge.from_endpoint.stable_id) ?? edge.from_endpoint.stable_id;
-      const to = edge.to_endpoint.kind === "discard"
-        ? "discard"
-        : (labelById.get(edge.to_endpoint.stable_id) ?? edge.to_endpoint.stable_id);
-      return {
-        id: edge.stable_id,
-        source: edge.from_endpoint.stable_id,
-        target: targetId,
-        label: `${from} ${flowLabel(edge.flow, routeKeyByAlias)} → ${to}`,
-        isError: ["source_validation_failure", "node_error", "output_write_failure"].includes(edge.flow.kind),
-      };
-    }), [labelById, payload.graph.edges, routeKeyByAlias]);
+  // Alias → author-visible route key (guidedGraphProjection owns the rule so
+  // the route list here and the pane's edge labels cannot drift).
+  const routeKeyByAlias = useMemo(() => routeKeysByAlias(payload.nodes), [payload.nodes]);
   const routeItems = useMemo<WireReviewItem[]>(() =>
     payload.graph.edges.map((edge) => ({
       id: edge.stable_id,
@@ -324,11 +234,29 @@ export function ProposePipelineTurn({
         </section>
       ) : null}
 
-      <ReadOnlyPipelineGraph
-        nodes={graphNodes}
-        edges={graphEdges}
-        ariaLabel={`Pipeline proposal graph with ${graphNodes.length} components and ${graphEdges.length} routes`}
-      />
+      {/* The proposal's DAG is drawn in the Pipeline pane's Graph tab
+          (GraphView → GuidedGraphPane, from the same payload via
+          guidedGraphProjection) — not here. The 300px in-card mini graph was
+          the review's IA-1/V-1 defect: a six-node DAG in the narrow column
+          while the wide pane sat empty. This pointer is the card's only
+          anchor to it; the button works on narrow viewports too, where the
+          pane is a tab (ArtifactWorkspace's REQUEST_ARTIFACT_VIEW handler
+          calls showPipeline before selecting the tab). */}
+      <p className="guided-proposal__graph-pointer">
+        The proposed structure is drawn in the Graph pane.{" "}
+        <Button
+          compact
+          onClick={() =>
+            dispatchArtifactViewIntent({
+              tab: "graph",
+              focusMode: false,
+              sessionId: activeSessionId,
+            })
+          }
+        >
+          Show graph
+        </Button>
+      </p>
 
       <section className="guided-proposal__components" aria-labelledby="guided-proposal-components">
         <h4 id="guided-proposal-components">Components</h4>
