@@ -1261,7 +1261,7 @@ def test_runtime_preflight_preview_blocks_scenario_2_invalid_trigger(tmp_path: P
 
     preview_envelope = preview.to_dict()
     assert preview.success is True
-    assert preview_envelope["data"]["is_valid"] is False
+    assert preview_envelope["data"]["preview_is_valid"] is False
     assert "runtime_preflight" not in preview_envelope["data"]
     assert preview_envelope["runtime_preflight"]["is_valid"] is False
     assert "end_of_source" in json.dumps(preview_envelope["runtime_preflight"])

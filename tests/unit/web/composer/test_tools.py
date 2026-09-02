@@ -13711,6 +13711,41 @@ class TestPreviewPipeline:
         assert wired.validation.is_valid is False
         assert list(wired.data["preview_errors"]) == []
 
+    def test_preview_is_valid_keeps_the_authoring_leg_of_the_conjunct(
+        self,
+        passing_runtime_preflight: _SyncCallRecorder,
+    ) -> None:
+        """Authoring INVALID with the runtime stage wired-and-passing and no blocking proof still yields ``preview_is_valid`` false.
+
+        Mutation caught: ``preview_is_valid = True`` in place of
+        ``validation.is_valid`` (dropping the authoring leg of the three-stage
+        conjunct). Every other authoring-invalid pin runs with the runtime
+        callback absent, where the un-run branch forces the conjunct false
+        regardless of the authoring verdict — so only this three-leg state
+        (authoring the sole mover) can see the leg go missing
+        (elspeth-e405ad7cd2 R4-fix1).
+        """
+        state = _empty_state()
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            data_dir="/data",
+            runtime_preflight=passing_runtime_preflight,
+        )
+        assert result.success is True
+        # The two other legs are green: the runtime verdict rode through and
+        # nothing in the source proof blocks.
+        assert result.runtime_preflight is not None
+        assert result.runtime_preflight.is_valid is True
+        assert [d for d in result.data["proof_diagnostics"] if d["severity"] == "blocking"] == []
+        assert list(result.data["preview_errors"]) == []
+        # Authoring is the only red leg, and it alone must fail the conjunct.
+        assert result.validation.is_valid is False
+        assert result.data["preview_is_valid"] is False
+
 
 _PREVIEW_DATA_KEYS = frozenset(
     {

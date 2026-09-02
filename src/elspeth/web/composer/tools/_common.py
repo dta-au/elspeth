@@ -631,9 +631,11 @@ def _semantic_contracts_payload(
 ) -> list[_SemanticEdgeContractPayload]:
     """Serialize a SemanticEdgeContract tuple to JSON-friendly dicts.
 
-    Centralized so ToolResult.to_dict and _execute_preview_pipeline
-    emit identical shapes — and so adding a field updates both
-    surfaces in one place.
+    Centralized so ToolResult.to_dict and the guided stage emitter
+    (guided/emitters.py) emit identical shapes — and so adding a field
+    updates both surfaces in one place. (preview_pipeline no longer
+    co-emits it: its data stopped carrying a copy of the envelope's
+    validation in elspeth-e405ad7cd2 R4.)
 
     SemanticEdgeContract intentionally has no .to_dict() of its own:
     serialization happens at consumption sites so L0 stays free of

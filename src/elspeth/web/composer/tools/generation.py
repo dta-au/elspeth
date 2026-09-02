@@ -3856,8 +3856,9 @@ def _execute_preview_pipeline(
     runtime_result = context.runtime_preflight(state) if context.runtime_preflight is not None else None
     # Wired only when the caller's strict Stage-2 verdict is handoff-shaped
     # (elspeth-229e9e8195). Additive advisory block: it never joins the
-    # ``is_valid`` conjunct below — folding tolerant findings into the strict
-    # verdict would misreport a review-pending state as a validator objection.
+    # ``preview_is_valid`` conjunct below — folding tolerant findings into the
+    # strict verdict would misreport a review-pending state as a validator
+    # objection.
     structural_preview = (
         _structural_preview_block(state, context.structural_preflight(state)) if context.structural_preflight is not None else None
     )
