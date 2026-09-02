@@ -13483,9 +13483,11 @@ class TestPreviewPipeline:
         assert result.success is True
         assert result.runtime_preflight is not None
         assert result.data["authoring_validation"]["is_valid"] is True
-        assert result.data["runtime_preflight"]["is_valid"] is False
+        assert result.runtime_preflight.is_valid is False
         assert result.data["is_valid"] is False
-        assert result.data["runtime_preflight"]["errors"][0]["message"] == "Forbidden name: 'end_of_source'"
+        assert result.runtime_preflight.errors[0].message == "Forbidden name: 'end_of_source'"
+        # The preflight rides ONLY on the envelope field; no nested twin.
+        assert "runtime_preflight" not in result.data
         runtime_preflight.assert_called_once_with(state)
 
     def test_preview_pipeline_without_runtime_preflight_preserves_authoring_validation(self) -> None:
@@ -13503,7 +13505,7 @@ class TestPreviewPipeline:
         assert result.success is True
         assert result.runtime_preflight is None
         assert result.data["authoring_validation"]["is_valid"] is True
-        assert result.data["runtime_preflight"] is None
+        assert "runtime_preflight" not in result.data
         assert result.data["is_valid"] is False
 
     def test_preview_pipeline_absent_runtime_preflight_fails_closed(self) -> None:
@@ -13528,7 +13530,7 @@ class TestPreviewPipeline:
         assert result.success is True
         assert result.data["authoring_validation"]["is_valid"] is True
         assert result.data["is_valid"] is False
-        assert result.data["runtime_preflight"] is None
+        assert "runtime_preflight" not in result.data
 
         markers = [entry for entry in result.data["errors"] if entry.get("error_code") == "runtime_preflight_not_run"]
         assert len(markers) == 1, result.data["errors"]
@@ -13590,27 +13592,30 @@ class TestPreviewPipeline:
                 runtime_preflight=runtime_preflight,
             )
             assert result.success is True
-            return result.data
+            return result.to_dict()
 
         wired_pass = preview(passing_runtime_preflight)
         wired_fail = preview(failing_preflight)
         absent = preview(None)
 
-        def marker_codes(data: dict[str, Any]) -> list[str]:
-            return [entry.get("error_code") for entry in data["errors"] if entry.get("error_code") == "runtime_preflight_not_run"]
+        def marker_codes(envelope: dict[str, Any]) -> list[str]:
+            return [
+                entry.get("error_code") for entry in envelope["data"]["errors"] if entry.get("error_code") == "runtime_preflight_not_run"
+            ]
 
-        assert wired_pass["is_valid"] is True
-        assert wired_pass["runtime_preflight"] is not None
+        # The preflight is an envelope field, never a nested twin under data.
+        assert all("runtime_preflight" not in envelope["data"] for envelope in (wired_pass, wired_fail, absent))
+
+        assert wired_pass["data"]["is_valid"] is True
         assert wired_pass["runtime_preflight"]["is_valid"] is True
         assert marker_codes(wired_pass) == []
 
-        assert wired_fail["is_valid"] is False
-        assert wired_fail["runtime_preflight"] is not None
+        assert wired_fail["data"]["is_valid"] is False
         assert wired_fail["runtime_preflight"]["is_valid"] is False
         assert marker_codes(wired_fail) == []
 
-        assert absent["is_valid"] is False
-        assert absent["runtime_preflight"] is None
+        assert absent["data"]["is_valid"] is False
+        assert "runtime_preflight" not in absent
         assert marker_codes(absent) == ["runtime_preflight_not_run"]
 
 

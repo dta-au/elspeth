@@ -3879,7 +3879,10 @@ def _execute_preview_pipeline(
         "semantic_contracts": authoring_payload["semantic_contracts"],
         "graph_repair_suggestions": authoring_payload["graph_repair_suggestions"],
         "authoring_validation": authoring_payload,
-        "runtime_preflight": runtime_result.model_dump() if runtime_result is not None else None,
+        # No nested ``runtime_preflight`` copy: the same value rides on the
+        # envelope's own ``runtime_preflight`` field (set below), and a
+        # byte-identical twin under ``data`` was two keys the model had to be
+        # taught were one (elspeth-e405ad7cd2, F9).
         "proof_diagnostics": proof_diagnostics,
         "sources": {
             name: {

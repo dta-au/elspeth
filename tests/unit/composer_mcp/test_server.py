@@ -1236,7 +1236,10 @@ class TestStdioServerConstruction:
         preview = await _call_handler(handlers, "preview_pipeline", {})  # type: ignore[misc]
         payload = json.loads(preview.root.content[0].text)
         assert payload["success"] is True
-        return payload["data"]
+        # The whole envelope: ``runtime_preflight`` is an envelope field, not
+        # a key under ``data`` (elspeth-e405ad7cd2, F9).
+        assert "runtime_preflight" not in payload["data"]
+        return payload
 
     @pytest.mark.asyncio
     async def test_stdio_construction_publishes_valid_pipeline_with_runtime_preflight(
@@ -1245,12 +1248,12 @@ class TestStdioServerConstruction:
         data_dir: Path,
     ) -> None:
         """Green control: the stdio data_dir wiring must not reject legitimate pipelines."""
-        data = await self._preview_with_sink_path(tmp_path, data_dir, "green", "outputs/out.csv")
+        envelope = await self._preview_with_sink_path(tmp_path, data_dir, "green", "outputs/out.csv")
 
-        preflight = data["runtime_preflight"]
+        preflight = envelope.get("runtime_preflight")
         assert preflight is not None, "stage 2 never ran — the stdio construction dropped the preflight"
         assert preflight["is_valid"] is True
-        assert data["is_valid"] is True
+        assert envelope["data"]["is_valid"] is True
         # The costly checks are asserted present-and-passed rather than
         # inferred from an absence of failures: a stub preflight returning an
         # empty check list would otherwise satisfy every assertion above.
@@ -1279,10 +1282,10 @@ class TestStdioServerConstruction:
         monkeypatch.setattr(server_module, "run_sync_in_worker", recording_worker)
         monkeypatch.setattr(asyncio, "to_thread", reject_default_executor)
 
-        data = await self._preview_with_sink_path(tmp_path, data_dir, "bounded-worker", "outputs/out.csv")
+        envelope = await self._preview_with_sink_path(tmp_path, data_dir, "bounded-worker", "outputs/out.csv")
 
         assert calls == [server_module.validate_pipeline]
-        assert data["runtime_preflight"]["is_valid"] is True
+        assert envelope["runtime_preflight"]["is_valid"] is True
 
     @pytest.mark.parametrize(
         ("label", "sink_path"),
@@ -1302,10 +1305,10 @@ class TestStdioServerConstruction:
         escape forms have to stay rejected under it.
         """
         # Stage 1 accepts these paths; only the runtime allowlist rejects them.
-        data = await self._preview_with_sink_path(tmp_path, data_dir, label, sink_path)
+        envelope = await self._preview_with_sink_path(tmp_path, data_dir, label, sink_path)
 
-        assert data["authoring_validation"]["is_valid"] is True
-        preflight = data["runtime_preflight"]
+        assert envelope["data"]["authoring_validation"]["is_valid"] is True
+        preflight = envelope.get("runtime_preflight")
         assert preflight is not None
         assert preflight["is_valid"] is False
         # Named, because a sink path resolving outside data_dir is not
@@ -1314,7 +1317,7 @@ class TestStdioServerConstruction:
         # so ``outputs/deadbeef1234/x.csv`` validates TRUE. A verdict-only
         # assertion here would pass for the wrong reason.
         assert "path_allowlist" in {check["name"] for check in preflight["checks"] if not check["passed"]}
-        assert data["is_valid"] is False
+        assert envelope["data"]["is_valid"] is False
 
     def test_create_server_requires_an_explicit_runtime_preflight(self, tmp_path: Path) -> None:
         """Re-adding the silent default is itself the mutation being caught."""
