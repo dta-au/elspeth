@@ -1089,9 +1089,17 @@ Table columns: surface, tool, key, verdict (`teach` / `fence` / `fix-producer` /
 | `diff_pipeline data.error` on success | fix-producer (D5) | contradiction between `success` and `error` |
 | `tool-data` rows | per D3 | per-tool description teaches, or sibling ticket with fences naming it |
 
-- [ ] **Step 2: Walk John through it**
+- [ ] **Step 2: LLM-specialist review of the draft verdicts BEFORE the walkthrough (John's ruling 2026-09-02: the LLM seat is a first-class reviewer in auditing, review, and synthesis, not a final-gate add-on)**
 
-Deliver `$S/verdicts.md` as the walkthrough plus D1–D5. Record John's per-row answers on the ticket (comment from `claude-fable` quoting the ruling with the date). Do not proceed past this step on silence.
+Spawn `yzmir-llm-specialist:llm-diagnostician` with `$S/verdicts.md`, `$S/matrix.md`, the current skill text, and one REAL serialized envelope per shape (a failed `set_pipeline` with `plugin_schemas` + `validation_guidance`, a successful `upsert_node` with `applied_component` + `validation_delta`, a credential-wiring failure, a `preview_pipeline` result) captured from a unit-test run into `$S/wire/`. Charter: for every `teach` row, does the draft sentence let a model act correctly from the wire alone; for every `fence` row, would the model be better off knowing; which rows should change verdict. Its report goes to `$S/review/llm/verdicts-review.md`; every changed verdict carries its reason. The walkthrough John sees is the post-review table.
+
+- [ ] **Step 3: Systems-thinker shape-propagation sweep, in parallel with Step 2 (John's ruling 2026-09-02: the systems seat looks for emerging patterns and gaps in our thinking — "if we find a faulty shape, where else have we used that shape")**
+
+Spawn `yzmir-systems-thinking:pattern-recognizer` with `$S/matrix.md`, the three exploration reports, and the faulty shapes already found: (a) two hand-maintained copies of one vocabulary with no cross-check (`_tool_result_response_keys` vs `_ToolResultResponseModel`); (b) a required producer key absent from an implicit-admit set so a drift counter is always non-zero (`affected_nodes`); (c) a success envelope carrying an `error` key (`diff_pipeline`); (d) a redaction disposition that erases the audit row's ability to reproduce what the model read (the 26 hnsd=True tools); (e) a loose `Mapping[str, Any]` field whose producer is already a TypedDict (`validation_guidance`); (f) `explain_tool` prose that never names its container. Charter: for each shape, search the tree (Loomweave + grep) for every other site with the same shape, and write `$S/review/systems/shape-ledger.md`: shape → sites → closed by this lane / fixed-now follow-up / fenced sibling ticket. Every "elsewhere" site becomes a row in the walkthrough. Nothing is parked as a TODO.
+
+- [ ] **Step 4: Walk John through it**
+
+Deliver `$S/verdicts.md` (post LLM review) and `$S/review/systems/shape-ledger.md` as the walkthrough. D1–D5 were ratified 2026-09-02 (ticket comment 9174): D1 yes, D2 yes, D3 full census, D4 no change (aggregate described in session), D5 yes. Record John's per-row answers on the ticket (comment from `claude-fable` quoting the ruling with the date). Do not proceed past this step on silence.
 
 ---
 
@@ -1393,8 +1401,8 @@ Verify with `git diff --stat` that the tree is clean after every restore. A muta
 
 - [ ] **Step 1: Spawn three reviewers on the branch tip**, each given the ticket, `$S/matrix.md`, `$S/verdicts.md`, `$S/mutations.md`, the diff range `d14dd221f..HEAD`, and told to write their report to `$S/review/<seat>/report.md` (agents that cannot write hand the text back; save it yourself):
   - `red-team` (adversarial): disprove the gate — a way to ship a key it does not see; a fix whose test survives reversion; the admission functions bypassed via `dataclasses.replace`.
-  - `yzmir-llm-specialist:llm-diagnostician` (LLM seat): is the "Reading a tool result" section actionable from the wire alone; does any sentence contradict the existing echo rule at lines 44-49; does teaching `graph_repair_suggestions.tool_sequence` risk the model echoing raw arguments.
-  - `yzmir-systems-thinking:leverage-analyst` (systems seat): second-order effects of the registry (what else should derive from it: MCP server `composer_mcp/server.py:387-401`, `discovery_cache`, `_ClosedProviderDiscoveryPayload`), and the D4 question.
+  - `yzmir-llm-specialist:llm-diagnostician` (LLM seat, first-class: it already reviewed the verdicts in Task 6 and reviews the landed prose here against real wire samples): is the "Reading a tool result" section actionable from the wire alone; does any sentence contradict the existing echo rule at lines 44-49; does teaching `graph_repair_suggestions.tool_sequence` risk the model echoing raw arguments; does the section change the reply register rules at lines 159-168. The LLM seat also writes the synthesis paragraph of the close-out: what the model can now do that it could not before, in its own words, checked against the live-trial transcripts.
+  - `yzmir-systems-thinking:leverage-analyst` (systems seat, first-class: it wrote the shape ledger in Task 6 and now checks the landed code against it): second-order effects of the registry (what else should derive from it: MCP server `composer_mcp/server.py:387-401`, `discovery_cache`, `_ClosedProviderDiscoveryPayload`), whether every "elsewhere" site in the shape ledger was closed or fenced with a named ticket, the D4 question, and what NEW shape this lane introduced that a later lane will have to hold (the registry itself, the admission functions).
 - [ ] **Step 2: Fix rounds** — every finding goes back to its originator for a per-finding sign-off; repeat until a round returns nothing. Save each round's sign-off under `$S/review/<seat>/signoff-<n>.md`.
 - [ ] **Step 3: Ticket comment** naming the commit all three signed off on.
 

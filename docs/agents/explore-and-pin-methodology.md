@@ -142,6 +142,23 @@ Each untaught or stale row gets exactly one verdict:
 - **retire** — taught but never shipped. Delete the prose and the test that
   pinned it.
 
+Before the verdicts go to the operator, the LLM-specialist seat reviews them
+against real wire samples (operator ruling 2026-09-02: the LLM seat is a
+first-class reviewer in auditing, review, and synthesis, not a final-gate
+add-on). Only that seat can say whether a taught sentence lets the model act
+correctly from the bytes it actually receives; the adversarial seat proves the
+gate holds, which is a different question. Changed verdicts carry the seat's
+reason into the walkthrough.
+
+In parallel, the systems-thinker seat runs a shape-propagation sweep (same
+ruling): every faulty shape the census surfaced (a duplicated vocabulary with
+no cross-check, a success envelope carrying an error key, a drift counter that
+is always non-zero, a loose type whose producer is already typed) is searched
+for across the whole tree, and the result is a shape ledger — shape, every
+other site with that shape, and whether this lane closes it, fixes it now as
+a follow-up, or fences it under a named sibling ticket. The ledger rides with
+the walkthrough; nothing in it is parked as a TODO.
+
 Two rules that came out of the first run:
 
 - One prose slot per code. When the same rejection code can ship two fact
@@ -231,12 +248,18 @@ the gate, and each with a distinct charter:
   ship a fact it does not see, a test that passes for the wrong reason, a fix
   whose test survives its reversion. Runs until a round returns nothing. The
   first seam took five rounds and surfaced one major and five minor findings.
-- **LLM reviewer.** Reads the seam from the model's side. Is each teaching
-  entry actionable by a model that sees only the wire, and does the repeat /
-  terminal notice actually stop a loop rather than describe one.
-- **Systems thinker.** Second-order effects: which sibling seams the change
-  touches, what the registry or type introduced becomes the authority for, and
-  what the next seam should be.
+- **LLM reviewer (first-class, present at phases 2, 6, and the close-out).**
+  Reads the seam from the model's side against real serialized samples. Is
+  each teaching entry actionable by a model that sees only the wire, does the
+  repeat / terminal notice actually stop a loop rather than describe one, and
+  at close-out, what can the model now do that it could not before, checked
+  against the live-trial transcripts.
+- **Systems thinker (first-class, present at phases 2, 6, and the close-out).**
+  Emerging patterns and gaps in our thinking: which sibling seams the change
+  touches, whether every site in the phase-2 shape ledger was closed or fenced
+  under a named ticket, what the registry or type introduced becomes the
+  authority for, what new shape this lane created that a later lane must hold,
+  and what the next seam should be.
 
 Rules for the rounds:
 
