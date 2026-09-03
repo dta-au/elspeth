@@ -20,10 +20,17 @@ mechanics (``resolve_issuer``, ``expected_origins``, ``claim_checks``,
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Final, get_args
+from typing import TYPE_CHECKING, Any, Final, get_args
 
 from elspeth.contracts.auth import AuthProviderType
+from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.auth.providers import _mechanics
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only; web.config imports
+    # this module to drive its validation, so a runtime import is circular.
+    from elspeth.web.config import WebSettings
 
 __all__ = ["PROFILE_REGISTRY", "IdPProfile", "get_profile", "registered_provider_names"]
 
@@ -67,11 +74,36 @@ class IdPProfile:
     description: str
     """Operator-facing one-line summary, used in configuration errors."""
 
+    resolve_issuer: Callable[[WebSettings], str]
+    """Where this profile's tokens must claim to come from."""
+
+    expected_origins: Callable[[WebSettings, str], frozenset[str]]
+    """Exact HTTPS origins the discovered endpoints may use.
+
+    Per profile, not global: Google's endpoints are genuinely cross-origin,
+    so a single same-origin rule cannot serve every IdP.
+    """
+
+    claim_checks: Callable[[Mapping[str, Any], WebSettings], None]
+    """Fail-closed checks beyond standard token validation. Raises or returns."""
+
+    map_identity: Callable[[Mapping[str, Any], Mapping[str, Any] | None], IdentityClaims]
+    """Tier-3 boundary: raw claims in, one owned ``IdentityClaims`` out."""
+
     specific_required: tuple[str, ...] = ()
     """Provider-specific settings this profile cannot start without."""
 
     specific_optional: tuple[str, ...] = ()
     """Provider-specific settings this profile accepts but does not demand."""
+
+    scopes: tuple[str, ...] = ("openid", "profile", "email")
+    """Requested at authorization. The same three for all four IdPs."""
+
+    id_token_algorithms: tuple[str, ...] = ("RS256",)
+    """Pinned. The validator never reads the algorithm from the token header."""
+
+    userinfo: bool = False
+    """Whether a userinfo call is part of this profile's login."""
 
     @property
     def required_settings(self) -> tuple[str, ...]:
@@ -92,6 +124,10 @@ class IdPProfile:
 _ENTRA = IdPProfile(
     name="entra",
     description="Microsoft Entra ID; issuer derived from entra_tenant_id",
+    resolve_issuer=_mechanics.issuer_from_entra_tenant,
+    expected_origins=_mechanics.entra_origins,
+    claim_checks=_mechanics.check_entra_tenant,
+    map_identity=_mechanics.map_entra,
     # The issuer is DERIVED from the tenant, so accepting sso_issuer as well
     # would let two sources of truth disagree.
     specific_required=("entra_tenant_id",),
@@ -99,6 +135,10 @@ _ENTRA = IdPProfile(
 _GOOGLE = IdPProfile(
     name="google",
     description="Google Workspace; requires a hosted domain",
+    resolve_issuer=_mechanics.google_issuer,
+    expected_origins=_mechanics.google_origins,
+    claim_checks=_mechanics.check_google_hosted_domain,
+    map_identity=_mechanics.map_google,
     # The issuer is fixed at https://accounts.google.com. Without a hosted
     # domain any Google account in the world is a valid login, so this is
     # required rather than defaulted.
@@ -107,6 +147,10 @@ _GOOGLE = IdPProfile(
 _OIDC = IdPProfile(
     name="oidc",
     description="Generic OIDC provider, including AWS Cognito",
+    resolve_issuer=_mechanics.issuer_from_settings,
+    expected_origins=_mechanics.issuer_origin_plus_operator_origins,
+    claim_checks=_mechanics.no_extra_claim_checks,
+    map_identity=_mechanics.map_generic_oidc,
     specific_required=("sso_issuer",),
     # Cognito's hosted domain differs from the pool issuer, so the generic
     # profile is the one that may widen beyond same-origin. Optional: a
@@ -116,7 +160,14 @@ _OIDC = IdPProfile(
 _VANGUARD = IdPProfile(
     name="vanguard",
     description="VANguard; issuer supplied by the operator",
+    resolve_issuer=_mechanics.issuer_from_settings,
+    expected_origins=_mechanics.same_origin_as_issuer,
+    claim_checks=_mechanics.no_extra_claim_checks,
+    map_identity=_mechanics.map_vanguard,
     specific_required=("sso_issuer",),
+    # The only profile that calls userinfo: given_name, family_name and abn
+    # are not in the ID token.
+    userinfo=True,
 )
 
 PROFILE_REGISTRY: Final[dict[AuthProviderType, IdPProfile]] = {profile.name: profile for profile in (_ENTRA, _GOOGLE, _OIDC, _VANGUARD)}

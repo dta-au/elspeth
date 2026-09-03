@@ -149,12 +149,33 @@ def validate_oidc_browser_origins(origins: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def oidc_browser_endpoint_origin(endpoint: str) -> str:
-    """Return the canonical origin of an already validated browser endpoint."""
-    _value, origin = _parse_browser_endpoint(endpoint, field_name="browser_endpoint")
+def _canonical_origin(origin: _Origin) -> str:
     host = f"[{origin.host}]" if ":" in origin.host else origin.host
     port = "" if origin.port == _HTTPS_DEFAULT_PORT else f":{origin.port}"
     return f"https://{host}{port}"
+
+
+def oidc_browser_endpoint_origin(endpoint: str) -> str:
+    """Return the canonical origin of an already validated browser endpoint."""
+    _value, origin = _parse_browser_endpoint(endpoint, field_name="browser_endpoint")
+    return _canonical_origin(origin)
+
+
+def https_url_origin(value: str, *, field_name: str = "issuer") -> str:
+    """Return the canonical origin of any HTTPS URL, path or no path.
+
+    An ISSUER is not a browser endpoint: ``https://accounts.google.com`` is a
+    perfectly good issuer and has no path, while
+    ``oidc_browser_endpoint_origin`` deliberately refuses a root path because
+    an endpoint with no path is a misconfiguration. Per-profile origin policy
+    needs the origin of the issuer itself, so it needs this instead — running
+    the SAME parse, so the control-character, backslash, percent-encoding,
+    embedded-credential, scheme and host canonicalisation checks all still
+    apply. Extracting the origin with ``urlsplit`` at the call site would
+    have skipped every one of them.
+    """
+    _value, _parsed, origin = _parse_https_url(value, field_name=field_name)
+    return _canonical_origin(origin)
 
 
 def validate_oidc_browser_endpoints(
