@@ -1191,8 +1191,22 @@ class _DataSite(NamedTuple):
     """One ``<result constructor>(..., data=<expr>)`` call in web/composer."""
 
     file: str  # file name, as the classification registries key it
+    module: str  # path relative to web/composer, posix — what the file name alone cannot disambiguate
     function: str  # enclosing function name
     lineno: int
+
+
+def _ambiguous_data_module_names(sites: Iterable[_DataSite]) -> dict[str, list[str]]:
+    """File names that more than one data-shipping module under web/composer answers to.
+
+    The classification registries key on the base name, which only identifies a
+    module while the mapping is injective. ``_all_data_sites`` walks the package
+    recursively, so it is not injective by construction.
+    """
+    modules_by_name: dict[str, set[str]] = {}
+    for site in sites:
+        modules_by_name.setdefault(site.file, set()).add(site.module)
+    return {name: sorted(modules) for name, modules in modules_by_name.items() if len(modules) > 1}
 
 
 def _all_data_sites() -> list[_DataSite]:
@@ -1214,7 +1228,7 @@ def _all_data_sites() -> list[_DataSite]:
                 continue
             fn_name = _enclosing_function(tree, node.lineno)
             assert fn_name is not None, f"{_display(path)}:{node.lineno}: result constructed outside any function"
-            sites.append(_DataSite(path.name, fn_name, node.lineno))
+            sites.append(_DataSite(path.name, path.relative_to(COMPOSER).as_posix(), fn_name, node.lineno))
     return sites
 
 
@@ -1499,6 +1513,23 @@ def test_no_shared_envelope_key_is_unadmitted_on_a_mutation_tool() -> None:
         assert not missing, f"{tool}: can ship {sorted(missing)} but the audit row does not admit them"
 
 
+def test_ambiguous_data_module_names_reports_a_base_name_two_modules_answer_to() -> None:
+    """Witness for ``_ambiguous_data_module_names``, both arms.
+
+    The live tree is injective today, so the guard's positive arm has no
+    consumer among the real sites and a mutant that returned ``{}`` outright
+    would survive the whole gate file. Feed it the shape it exists to refuse —
+    two modules whose base name is one — and the shape it must pass.
+    """
+    shadowed = (
+        _DataSite("sources.py", "tools/sources.py", "_execute_add_source", 1),
+        _DataSite("sources.py", "guided/sources.py", "_execute_shadow", 2),
+        _DataSite("blobs.py", "tools/blobs.py", "_execute_create_blob", 3),
+    )
+    assert _ambiguous_data_module_names(shadowed) == {"sources.py": ["guided/sources.py", "tools/sources.py"]}
+    assert _ambiguous_data_module_names(shadowed[:1] + shadowed[2:]) == {}
+
+
 def test_every_result_constructor_site_is_attributed() -> None:
     """Every ``data=`` result-constructor site in web/composer is walked or classified, and nothing is skipped.
 
@@ -1511,19 +1542,39 @@ def test_every_result_constructor_site_is_attributed() -> None:
 
     The registries are checked in both directions: a stale row (its site gone or
     renamed) fails too, so a classification cannot outlive what it classifies.
+
+    Both the walked set and the registries key on the BASE NAME, while
+    ``_all_data_sites`` walks the package recursively — so the name identifies a
+    module only while the mapping is injective, and nothing made it so. A
+    producer in a subpackage whose file name matches a walked one
+    (``guided/sources.py`` against ``tools/sources.py``) counted itself as
+    walked and shipped an unteachable key past this whole file, 33 passed
+    (systems seat, round-3 sign-off). ``guided/`` already holds three base-name
+    collisions with its parent package (``audit.py``, ``prompts.py``,
+    ``protocol.py``), so this is the tree's live shape and not a hypothetical
+    one. ``_ambiguous_data_module_names`` asserts the injectivity the two keyed
+    sets assume, by name, before either is built; the base-name keying below is
+    correct only because it runs after that refusal.
     """
     list(_tool_data_sites())
 
-    walked = {(name, site.function) for name in _TOOL_DATA_FILES for site in _all_data_sites() if site.file == name}
+    sites = _all_data_sites()
+    ambiguous = _ambiguous_data_module_names(sites)
+    assert not ambiguous, (
+        f"two modules under web/composer ship data= payloads under the same file name: {ambiguous} — "
+        "a registry row keyed on the name alone cannot say which of them it classifies"
+    )
+
+    walked = {(site.file, site.function) for site in sites if site.file in _TOOL_DATA_FILES}
     classified = set(_DATA_SITES_COUNTED_AT_THEIR_PRODUCER) | set(_DATA_SITES_OFF_THE_COMPOSER_TOOL_SURFACE)
     seen: set[tuple[str, str]] = set()
-    for site in _all_data_sites():
+    for site in sites:
         key = (site.file, site.function)
         seen.add(key)
         if key in walked:
             continue
         assert key in classified, (
-            f"{site.file}:{site.lineno}: {site.function} ships a data= payload that no census walks — "
+            f"{site.module}:{site.lineno}: {site.function} ships a data= payload that no census walks — "
             "walk it in _TOOL_DATA_FILES or classify it in one of the two registries"
         )
     stale = classified - seen
