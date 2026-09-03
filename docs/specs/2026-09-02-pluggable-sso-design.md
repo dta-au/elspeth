@@ -1,7 +1,7 @@
 # Pluggable SSO and identity substrate — backend-for-frontend login for Entra, VANguard, Google, and generic OIDC
 
-Date: 2026-09-02. Status: design, revision 2.4, implementation plan = tracker milestone elspeth-07cd19ba73.
-Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**.
+Date: 2026-09-02. Status: design, revision 2.7, implementation plan = tracker milestone elspeth-07cd19ba73.
+Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**.
 Branch: `release/0.8.0`.
 Revision 2 incorporates six independent reviews (security architecture,
 solution design, reality check against the tree, systems risk, functional
@@ -63,6 +63,9 @@ The tech-debt-free window is weeks, not months.
 | D16 **[rev2.3]** | Role and edge names | `approver` (was `manager`) and `reviewer`. Role `approver` may decide approvals and hold `approver` edges; the tree edge type is `approver` ("A is B's default approver"). Role `reviewer` may attest. "Manager" and "lead" appear nowhere in schema, API, or UI. |
 | D17 **[rev2.3]** | IdP groups | Dropped. `groups_json` is removed; the Entra profile no longer extracts `groups`/`roles` and the group-overage check is gone with them; `UserProfile.groups` is always empty for SSO. |
 | D18 **[rev2.5]** | Disk quota for uploaded blobs | Per person, a **level** not a rate: `SUM(blobs.size_bytes)` over the live blob rows of every session the identity owns (fork copies bytes, so each session's rows are real disk). `quota_default_storage_bytes` is a required container setting written into the identity's `quota_policies` row at activation, overridable per identity by an admin; `quota_container_storage_bytes` is an optional ceiling. Enforced at both upload routes under the existing per-session blob lock, before bytes are written; the existing `max_blob_storage_per_session_bytes` stays as the inner per-session bound. Over quota refuses and writes `quota_exceeded` with `dimension=storage`; accounting unavailable refuses (R13). |
+| D19 **[rev2.7]** | `service` in the provider discriminator | Two L0 types. `AuthProviderType` keeps the five login values and governs settings, the registry, session tokens, `sessions`, `user_secrets` and both Landscape CHECKs. `IdentityProviderType = AuthProviderType | Literal["service"]` governs `identities.provider` alone, under its own named CHECK constant. Putting `service` in `AuthProviderType` fails the import-time parity assert and the app does not boot. **Applied on review recommendation; reversible until phase 1 lands.** |
+| D20 **[rev2.7]** | Bootstrap admin | The seed and the operator CLI each write `access_state='active'`, an `admin` role, no workload role, and the audit pair in one transaction; the seed fires only while the container has zero active human admins. Activation accepts `role=none`, which is what an `admin` must be activated with under R8. The contradicting "lockout recovery is a config change" sentence is deleted. **Applied on review recommendation.** |
+| D21 **[rev2.7]** | VM in-place rebuild | Withdrawn. Both deployment paths use the existing reset runbook, because the pre-1.0 gate this spec cites for ECS forbids in-place migration everywhere, and the promised byte-for-byte preservation of `user_secrets` is false across a key-derivation change. Re-admission of the known cohort moves inside the cutover window. **Applied on review recommendation; the fact it rests on is the runbook's own standing rule, not an assumption.** |
 
 ## Architecture
 
@@ -97,6 +100,28 @@ Literal (contracts import nothing above them, and a Literal cannot be
 computed). The registry asserts parity at import:
 `frozenset(profile names) | {"local"} == frozenset(get_args(AuthProviderType))`.
 Adding an IdP is a deliberate edit to an L0 contract.
+
+**`AuthProviderType` is the set of things that can authenticate a browser
+[rev2.7, D19].** `service` is not one of them, so it is not a member: a
+`service` identity holds an operator-issued credential and never completes an
+OIDC walk, there is no `service` profile, and putting it in `AuthProviderType`
+fails the parity assert above **at import**, which is a boot failure rather
+than a test failure. Two L0 types, therefore:
+
+- `AuthProviderType = Literal["local", "oidc", "entra", "vanguard", "google"]`
+  — the login mechanism. Governs `WebSettings.auth_provider`, the profile
+  registry, the session-token `provider` claim, `sessions` and `user_secrets`
+  (a `service` identity never owns either), Landscape
+  `ck_run_attributions_auth_provider_type` and `ck_auth_events_provider`.
+- `IdentityProviderType = AuthProviderType | Literal["service"]` — how an
+  identity row came to exist. Governs `identities.provider` alone, under its
+  own named constant `_IDENTITY_PROVIDER_TYPE_CHECK`, distinct from
+  `_AUTH_PROVIDER_TYPE_CHECK`.
+
+The narrower type is a subset of the wider one, so the `sessions.user_id` →
+`identities.identity_id` FK stays sound: every value `sessions` admits is a
+value `identities` admits. The contract test pins **both** CHECK strings and
+both Literals, and asserts the subset relation.
 
 **Operator selection [rev2.4].** `WebSettings.auth_provider` is the only
 selector: it names one registered profile, and every other `sso_*` field is
@@ -164,9 +189,15 @@ HS256 minting, decoding, and the bounded refresh chain extracted from
 (display only), `provider`, `iss="elspeth"`, `aud=<public_base_url or
 "elspeth-local">`, `jti`, `iat`, `exp`. `authenticate` rejects any token
 whose `provider` differs from `settings.auth_provider`. Keys are derived
-from `secret_key` with HKDF and distinct info strings for JWT signing,
-user-secret encryption, and share-link signing, so the SSO delivery does not
-widen the blast radius of one 32-byte string. Each provider supplies a
+from `secret_key` with HKDF and distinct info strings for JWT signing and
+user-secret encryption, so the SSO delivery does not widen the blast radius of
+one 32-byte string. **Share-link signing is excluded [rev2.7]:
+`shareable_link_signing_key` is its own Secrets Manager binding today, and
+deriving it from `secret_key` would replace an independent secret with a
+dependent one — the opposite of the goal.** Changing the user-secret key
+derivation invalidates every stored secret, so it is bound to the epoch window
+where both stores are recreated (§Two epochs) and is stated in the operator
+notice; it must never ship in a release that keeps an existing store. Each provider supplies a
 `principal_is_active(identity_id)` callback; for local that is the `auth.db`
 row plus the identity row, for SSO the identity row.
 
@@ -275,9 +306,13 @@ Closed set, each an explicit exception class, never a `detail` prefix:
 
 `local | oidc | entra | vanguard | google` in:
 
-1. `contracts/auth.py` `AuthProviderType` (hand-written).
+1. `contracts/auth.py` `AuthProviderType` (hand-written) **and
+   `IdentityProviderType = AuthProviderType | Literal["service"]`
+   [rev2.7, D19]**.
 2. `web/sessions/models.py` `_AUTH_PROVIDER_TYPE_CHECK`, used by BOTH
-   `sessions` and `user_secrets`; `SESSION_SCHEMA_EPOCH` 49 → 50.
+   `sessions` and `user_secrets` and staying at the five login values; **plus
+   the new `_IDENTITY_PROVIDER_TYPE_CHECK` on `identities.provider` alone
+   [rev2.7]**; `SESSION_SCHEMA_EPOCH` 49 → 50.
 3. `core/landscape/schema.py` `ck_run_attributions_auth_provider_type`,
    `ck_auth_events_provider`; `SQLITE_SCHEMA_EPOCH` 36 → 37.
    `core/landscape/database.py` needs no edit (it lists names only).
@@ -290,7 +325,10 @@ Closed set, each an explicit exception class, never a `detail` prefix:
 8. `web/auth/routes.py` provider guards at lines 246 and 405.
 9. `web/frontend/src/types/index.ts` provider union.
 10. `tests/unit/web/auth/test_provider_type_contract.py` pins all of the
-    above plus registry parity and the CHECK strings.
+    above plus registry parity and **both** CHECK strings
+    (`_AUTH_PROVIDER_TYPE_CHECK` and `_IDENTITY_PROVIDER_TYPE_CHECK`), both
+    Literals, and the assertion that `get_args(AuthProviderType)` is a proper
+    subset of `get_args(IdentityProviderType)` [rev2.7].
 
 ### Two epochs, one window [rev2]
 
@@ -308,16 +346,47 @@ Cutover by deployment:
   In-place changes are forbidden by the pre-1.0 gate. All live SSO sessions
   are invalidated at this deploy; users log in again. This is stated in the
   operator notice for the window.
-- **VM / SQLite:** the existing reset runbook, or a documented in-place
-  rebuild that covers `sessions` and `user_secrets` (encrypted values and
-  salts preserved byte-for-byte), backfills `identity_id` from
-  `(provider, subject)` for every existing row, and restamps the
-  `schema_identity` row. Landscape on the VM follows the same
+- **VM / SQLite:** the existing reset runbook
+  ([docs/runbooks/staging-session-db-recreation.md](../runbooks/staging-session-db-recreation.md)),
+  unchanged. **The in-place rebuild offered in rev2 is withdrawn [rev2.7,
+  D21].** It contradicted the same pre-1.0 gate this section cites for ECS —
+  the runbook's standing rule is "uninstall, archive/export when required,
+  recreate, and reinstall; ELSPETH does not migrate either database in place" —
+  and it promised to preserve `user_secrets` "byte-for-byte" across a delivery
+  that changes the key those bytes are encrypted under (see §3), which is not
+  preservation but silent corruption surfacing later as `InvalidToken`. Every
+  deployment therefore lands on a fresh, empty store, and there is **one**
+  cutover story to test rather than two. Users re-enter their secrets, as they
+  do for every pre-1.0 epoch cut. Landscape on the VM follows the same
   archive-drop-recreate.
 - **Both paths** export a `(provider, subject, pre_cutover_user_id,
   identity_id)` mapping as a named cutover artifact retained with the
   archive [rev2.2]: pre-cutover `WebPluginPolicyEvidence` hashes embed the
   old principal scope and are otherwise uninterpretable after the re-key.
+- **Re-admission is part of the window, not the morning after [rev2.7, D21].**
+  A recreated store has no `identities` rows, so without this step every
+  returning user meets D12's `pending` wall and the only person who could
+  clear it is the admin who is themselves locked out (C2 covers that half).
+  Immediately after `--init-schema` the operator runs the bootstrap CLI for
+  the first admin, then pre-provisions the known cohort from the mapping
+  artifact by `(provider, subject)` — each row landing `active` with its
+  chosen role, its `quota_policies` row written from the container defaults
+  exactly as activation writes one (D15, D18), and the same audit pair.
+  Anyone not in the artifact arrives `pending` and is activated normally.
+  The operator notice says re-activation happened, not merely "log in again",
+  and names what users must re-enter: their stored secrets.
+
+**§Data model and §Workflow tables are living text; the epoch step is one-way
+[rev2.7, C3].** Every revision of this spec since the plan was written has
+moved a column, and tracker comments carrying those deltas have landed on
+phase-4 steps that run *after* the epoch. Before implementing the epoch step,
+re-read both sections at the spec's current revision and reconcile them
+against the step's comments; the spec wins. The post-epoch relief valve at
+§Workflow tables — "fleshed out later without a new epoch, by adding nullable
+columns" — does **not** cover a NOT NULL column written at activation
+(`quota_policies.storage_bytes`) or a rename (`approvals.note` →
+`request_note`), both of which are table rewrites and must land in this
+window or cost a second one with `rollback_permitted: false`.
 
 Epoch fan-out checklist (all pinned by tests): `CHANGELOG.md`;
 `tests/unit/website/test_release_site_contract.py`;
@@ -332,7 +401,7 @@ compatibility-record example.
 | column | type | notes |
 |--------|------|-------|
 | identity_id | text PK | surrogate; the key every ownership and future workflow table references |
-| provider | text | CHECK in the five values plus `service` [rev2.2] (`local` included, D7). A `service` identity authenticates by an operator-issued credential, not OIDC; the mechanism is not built now, the CHECK simply does not close against it. |
+| provider | text | CHECK `_IDENTITY_PROVIDER_TYPE_CHECK` = the `IdentityProviderType` values: the five IdP values (`local` included, D7) plus `service` [rev2.7, D19]. A `service` identity authenticates by an operator-issued credential, not OIDC; the mechanism is not built now. This is a **different** constant from the `_AUTH_PROVIDER_TYPE_CHECK` on `sessions`/`user_secrets`, which stays at the five login values — see §1. |
 | kind | text | CHECK `('human','service')`, default `human` [rev2.2]. Service identities may hold only `admin` or `oversight`, never `approver`, `reviewer`, `user`, or `curator`, and may not approve, attest, or publish (CHECKs on the workflow tables). |
 | subject | text | IdP `sub`, or local username |
 | username | text | display only, non-blank; changes update the row and write an audit row |
@@ -362,7 +431,7 @@ record.
 |--------|------|-------|
 | role_id | text PK | |
 | identity_id | text FK | |
-| role | text | CHECK `('admin', 'approver', 'reviewer', 'user', 'curator', 'auditor', 'oversight')` [rev2.3]; L0 Literal `IdentityRole`. `user` = may author and run; `approver` = the functional/matrix lead: may decide approvals (role-based eligibility, see approvals) and hold `approver` edges; `reviewer` = may attest; `curator` = library gate; `admin` = container operations: identity, roles, and org-tree administration, held by someone technical, never a workload role (D14); `auditor` = read-only over the audit surfaces, no authoring, no run, all reads through `audit_access_log`; `oversight` = read plus quota-policy write, no activation, no role grant, no disable — the role the organisation console holds. Activation (D12) grants `user` unless the admin picks `approver` or `reviewer`; `admin` may never be combined with a workload role (R8). |
+| role | text | CHECK `('admin', 'approver', 'reviewer', 'user', 'curator', 'auditor', 'oversight')` [rev2.3]; L0 Literal `IdentityRole`. `user` = may author and run; `approver` = the functional/matrix lead: may decide approvals (role-based eligibility, see approvals) and hold `approver` edges; `reviewer` = may attest; `curator` = library gate; `admin` = container operations: identity, roles, and org-tree administration, held by someone technical, never a workload role (D14); `auditor` = read-only over the audit surfaces, no authoring, no run, all reads through `audit_access_log`; `oversight` = read plus quota-policy write, no activation, no role grant, no disable — the role the organisation console holds. Activation (D12) grants a role chosen from `user`, `approver`, `reviewer` or **`none`** [rev2.7, D20]; `admin` may never be combined with a workload role (R8), so activating an identity that holds `admin` requires `none` and the route refuses any other value. `none` is a request argument, not a stored role: it writes no `identity_roles` row. |
 | expires_at | datetime null | [rev2.2] JIT grants. The console's role in a container is granted with an expiry by a *container* admin (the compartment owner reads the console in, not the reverse). |
 | note | text null | [rev2.2] Reason for the grant; activation is the most consequential act in the model and must carry one. |
 | scope | text null | reserved (library id, team id); null = deployment-wide |
@@ -372,12 +441,28 @@ record.
 
 Partial unique on active `(identity_id, role, scope)` with both
 `sqlite_where` and `postgresql_where` declared (dialect-symmetry contract).
-`sso_admin_subjects` seeds an `admin` row for a listed subject at first login
-only. Lockout recovery is **not** a config edit [rev2.2]: it is an operator
-CLI that writes the role row with actor `operator` and an audit row, so
-config never becomes a silent standing grant. R5 counts only *active human*
-identities with an unexpired, unrevoked `admin` role. Grant and revoke are
-admin-only in this delivery; delegated administration is phase 4.
+**Bootstrap: the first admin activates themselves, once [rev2.7, D20].** A
+role row alone is not access — D12 lands every first login in `pending` and R6
+refuses a token to anything but `active` — so both bootstrap paths write the
+whole state in **one audited transaction**: `access_state='active'`,
+`activated_at`, `activated_by_identity_id = NULL` with actor `operator`, an
+`admin` role row, **no workload role** (R8), and the `identity_activated` +
+`role_granted` audit pair.
+
+- `sso_admin_subjects` seeds a listed subject at first login **only while the
+  container has zero active human admins**. Once one exists the list is inert,
+  so it never becomes a standing grant and the compartment argument holds.
+- The operator CLI does the same thing on demand, for recovery. It is the only
+  path once an admin exists.
+
+Lockout recovery is **not** a config edit [rev2.2]: adding a subject to a
+container that already has an active admin does nothing. R5 counts only
+*active human* identities with an unexpired, unrevoked `admin` role. Grant and
+revoke are admin-only in this delivery; delegated administration is phase 4.
+
+Pinned by an integration test: a fresh `--init-schema` store plus one listed
+subject, walked through `start → callback → complete`, yields a session token
+and a role list of exactly `admin` [rev2.7].
 
 ### `identity_relationships` (sessions store) [rev2]
 
@@ -521,8 +606,13 @@ existing dev-admin gate is local-only and structlog-only by design):
   `POST relationships/{id}/revoke`.
 - Every mutation writes its `auth_events` row before responding.
 
-Recovery from total admin lockout is a config change to
-`sso_admin_subjects` plus restart.
+`POST identities/{id}/activate` takes `role ∈ {user, approver, reviewer,
+none}` and refuses a workload role for an identity holding `admin` (R8)
+[rev2.7, D20].
+
+Recovery from total admin lockout is the operator CLI described under
+§`identity_roles`, never a config edit [rev2.7 corrects rev2.2's contradiction:
+this paragraph previously said the opposite of the paragraph that ruled it].
 
 ## Profiles
 
