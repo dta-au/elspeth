@@ -37,7 +37,10 @@
 import { Button } from "@/components/ui";
 import type { ChatTurn } from "@/types/guided";
 import { MarkdownRenderer } from "../MarkdownRenderer";
-import { GUIDED_STEP_LABELS } from "./stepLabels";
+import {
+  GUIDED_AFTER_CONFIRMATION_LABEL,
+  GUIDED_STEP_LABELS,
+} from "./stepLabels";
 
 interface Props {
   /** Server-authoritative chat history from GuidedSession.chat_history. */
@@ -60,6 +63,28 @@ interface Props {
    * labelled static group and changes nothing else about the rows.
    */
   replay?: boolean;
+  /**
+   * Confirmation hash of a build this transcript was committed under
+   * (elspeth-986801d218) — `afterConfirmationChatToken(session)`, null on a
+   * session that never confirmed one. When set, an "After confirmation"
+   * divider opens at the FIRST user turn carrying it as `turn_token`: every
+   * post-commit question is submitted under that one token, so it is the
+   * transcript's own record of where the build ended and the advisory
+   * conversation began.
+   *
+   * The per-step divider cannot mark this boundary — post-commit turns are
+   * persisted with `step="step_4_wire"`, identical to the pre-commit wire
+   * turns, so `turn.step !== previousStep` never fires there.
+   *
+   * The TRANSCRIPT derivation, deliberately not the channel's
+   * `completedGuidedChatToken`: a fork, a `/guided/reenter` after a content
+   * change, and an exit all keep these turns while ending the completed-chat
+   * channel, and a boundary that vanished with the channel would render the
+   * inherited post-commit conversation as ordinary build turns under a
+   * step_4_wire divider on a session parked at Step 2. Applies in replay mode
+   * too (the freeform transcript replays a terminal session).
+   */
+  afterConfirmationToken?: string | null;
 }
 
 /**
@@ -87,6 +112,7 @@ export function GuidedChatHistory({
   onRetrySyntheticFailure,
   retryDisabled = false,
   replay = false,
+  afterConfirmationToken = null,
 }: Props): React.ReactElement | null {
   if (chatHistory.length === 0) {
     return null;
@@ -103,6 +129,9 @@ export function GuidedChatHistory({
 
   const rows: React.ReactNode[] = [];
   let previousStep: ChatTurn["step"] | null = null;
+  // One-shot latch: every post-commit question carries the SAME confirmation
+  // hash, so without it the divider would repeat before each one.
+  let afterConfirmationOpened = false;
 
   for (const turn of sorted) {
     if (turn.step !== previousStep) {
@@ -125,6 +154,30 @@ export function GuidedChatHistory({
         </div>,
       );
       previousStep = turn.step;
+    }
+
+    // "After confirmation" boundary — same divider markup as the stage
+    // divider (no new class, no new live region: the parent log's
+    // aria-relevant="additions" announces it once when the first
+    // post-commit turn lands). Ordered after the stage divider so a
+    // coincident step change still reads stage-then-boundary.
+    if (
+      !afterConfirmationOpened &&
+      afterConfirmationToken !== null &&
+      turn.role === "user" &&
+      turn.turn_token === afterConfirmationToken
+    ) {
+      afterConfirmationOpened = true;
+      rows.push(
+        <div
+          key={`after-confirmation-${turn.seq}`}
+          className="message-row message-row--system"
+        >
+          <div className="bubble bubble-system bubble-system--stage">
+            {GUIDED_AFTER_CONFIRMATION_LABEL}
+          </div>
+        </div>,
+      );
     }
 
     const isUser = turn.role === "user";

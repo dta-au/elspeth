@@ -62,6 +62,7 @@ from elspeth.web.paths import SINK_LOCAL_PATH_OPTION_KEYS, allowed_sink_director
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.guided_payloads import prepare_guided_json_payload
 from elspeth.web.sessions.guided_replay import (
+    guided_completed_chat_token,
     guided_turn_token,
     load_guided_json_payload,
     parse_guided_response_descriptor,
@@ -300,6 +301,55 @@ def _load_durable_current_turn(
             or turn["payload"]["draft_hash"] != active_proposal.draft_hash
         ):
             raise AuditIntegrityError("Persisted guided proposal turn does not match active proposal authority")
+    return turn, prepared
+
+
+def _load_durable_committed_wire_turn(
+    guided: GuidedSession,
+    *,
+    payload_store: Any,
+) -> tuple[Turn, PreparedGuidedJsonPayload]:
+    """Load the answered wire occurrence a COMPLETED session was built from.
+
+    Sibling of :func:`_load_durable_current_turn` for the terminal case. After
+    ``confirm_wiring`` there is no current *unanswered* turn, so the only
+    durable graph authority a completed session still owns is the frozen
+    CONFIRM_WIRING payload the user reviewed and confirmed.
+    :func:`guided_completed_chat_token` owns admission (completed terminal,
+    every record answered, the last one an answered STEP_4 confirmation);
+    ``load_guided_json_payload`` re-derives the content address, so the loaded
+    bytes are bound to the history record rather than trusted from it.
+
+    The active-proposal cross-check its sibling performs is deliberately
+    inverted here: confirmation nulls ``active_proposal``, so a completed
+    session that still carries one is an audit anomaly, not a binding to
+    verify.
+    """
+
+    guided_completed_chat_token(guided)
+    if guided.active_proposal is not None:
+        raise AuditIntegrityError("Completed guided session retains an active proposal binding")
+    record = guided.history[-1]
+    prepared = load_guided_json_payload(
+        payload_store,
+        payload_id=record.payload_hash,
+        purpose="turn",
+    )
+    step_index = {
+        GuidedStep.STEP_1_SOURCE: 0,
+        GuidedStep.STEP_2_SINK: 1,
+        GuidedStep.STEP_3_TRANSFORMS: 2,
+        GuidedStep.STEP_4_WIRE: 3,
+    }[record.step]
+    turn = Turn(
+        type=record.turn_type.value,
+        step_index=step_index,
+        payload=dict(deep_thaw(prepared.payload)),
+    )
+    try:
+        validate_current_turn(record.step, turn)
+    except ValueError as exc:
+        raise AuditIntegrityError(f"Persisted confirmed-wiring turn is invalid: {exc}") from exc
     return turn, prepared
 
 

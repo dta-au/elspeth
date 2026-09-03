@@ -279,9 +279,25 @@
   outline-offset: -2px;
 }
 
-/* Only the authoring scroller may shrink in a short pane. */
-.chat-panel--guided > .guided-step-chat {
+/* Only the authoring scroller may shrink in a short pane. The completed
+   surface docks the SAME composer under the SAME scroller (the conversation
+   survives Confirm wiring — elspeth-986801d218), so it needs the identical
+   floor; without it a short pane crushes the composer instead of the
+   transcript. */
+.chat-panel--guided > .guided-step-chat,
+.chat-panel--completed > .guided-step-chat {
   flex-shrink: 0;
+}
+
+/* "Explain this pipeline" row on the completed surface. The scroller is a
+   flex COLUMN, so a bare Button child would stretch to the full column width
+   — this row keeps it at its intrinsic size on the same content gutter the
+   cards and bubbles use. (The button token itself is a documented rule-less
+   Button hook; its chrome comes from .btn-compact.) */
+.guided-authoring-scroll > .guided-completed-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-inline: var(--space-lg);
 }
 
 /* Cards inside the scroll region align their left/right edges with the bubble
