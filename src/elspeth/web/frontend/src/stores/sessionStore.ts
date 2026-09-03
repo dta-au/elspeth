@@ -29,7 +29,7 @@ import type {
 import type { GuidedRetryAcquisition, GuidedRetryHandle, GuidedRetryKind } from "./guidedOperationRetry";
 import {
   EMPTY_GUIDED_REVIEWED_COMPONENTS,
-  foldGuidedReviewedComponents,
+  selectGuidedReviewedComponents,
   type GuidedReviewedComponents,
 } from "./guidedReviewedComponents";
 import * as api from "@/api/client";
@@ -333,9 +333,8 @@ async function reconcileOrphanedGuidedRetry(
         guidedNextTurn: resynced.next_turn,
         guidedTerminal: resynced.terminal,
         guidedProposalReview: proposalReviewForTurn(resynced.next_turn),
-        guidedReviewedComponents: foldGuidedReviewedComponents(
-          useSessionStore.getState().guidedReviewedComponents,
-          resynced.next_turn,
+        guidedReviewedComponents: selectGuidedReviewedComponents(
+          resynced.guided_session,
         ),
         compositionState: resynced.composition_state,
       });
@@ -865,9 +864,8 @@ async function resyncAfterAbortedGuidedTurn(
       guidedSession: resynced.guided_session,
       guidedNextTurn: resynced.next_turn,
       guidedProposalReview: proposalReviewForTurn(resynced.next_turn),
-      guidedReviewedComponents: foldGuidedReviewedComponents(
-        s.guidedReviewedComponents,
-        resynced.next_turn,
+      guidedReviewedComponents: selectGuidedReviewedComponents(
+        resynced.guided_session,
       ),
       guidedTerminal: resynced.terminal ?? s.guidedTerminal,
       compositionState: resynced.composition_state ?? s.compositionState,
@@ -1309,12 +1307,19 @@ interface SessionState {
   /** Exact proposal/hash-bound lifecycle for the current proposal controls. */
   guidedProposalReview: GuidedProposalReviewState | null;
   /**
-   * Reviewed source/output ledger (elspeth-9f0873426a): folded from every
-   * published review_components turn so the Pipeline pane can draw the
-   * agreed components before a proposal exists — the wire carries the
-   * current turn only and the pre-commit composition is empty by design.
-   * Written wherever guidedNextTurn is published (the same discipline as
-   * guidedProposalReview) and reset with the rest of the guided context.
+   * Reviewed source/output ledger (elspeth-9f0873426a, server-projected by
+   * elspeth-f2a8550b3d): the settled components, so the Pipeline pane can
+   * draw them before a proposal exists — the pre-commit composition is empty
+   * by design.
+   *
+   * Read straight off the published `guided_session.reviewed_components`
+   * through `selectGuidedReviewedComponents`; it is NOT folded from turns any
+   * more, so a reload mid-build and a completed session (no `next_turn` to
+   * fold) both name what was agreed. Written wherever guidedSession is
+   * published — the same discipline as guidedProposalReview — and reset with
+   * the rest of the guided context. The one deliberate divergence from the
+   * published session is the refresh-required path below, which drops the
+   * ledger because this view has stopped being authoritative.
    */
   guidedReviewedComponents: GuidedReviewedComponents;
   // Per-step chat (Phase A slice 5).  The history itself lives on
@@ -1787,12 +1792,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
               guidedProposalReview: proposalReviewForTurn(
                 restoredGuided.next_turn,
               ),
-              // A resumed session starts the ledger from its current turn:
-              // earlier review turns are not on the wire (see the module
-              // note in guidedReviewedComponents.ts).
-              guidedReviewedComponents: foldGuidedReviewedComponents(
-                EMPTY_GUIDED_REVIEWED_COMPONENTS,
-                restoredGuided.next_turn,
+              // A resumed session gets the SERVER's ledger, not one folded
+              // from its current turn: the whole point of the projected
+              // field is that a reload mid-build (and a completed session,
+              // which has no turn at all) still names what was settled.
+              guidedReviewedComponents: selectGuidedReviewedComponents(
+                restoredGuided.guided_session,
               ),
             }
           : {}),
@@ -2717,9 +2722,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
                 guidedProposalReview: proposalReviewForTurn(
                   forkedGuided.next_turn,
                 ),
-                guidedReviewedComponents: foldGuidedReviewedComponents(
-                  EMPTY_GUIDED_REVIEWED_COMPONENTS,
-                  forkedGuided.next_turn,
+                guidedReviewedComponents: selectGuidedReviewedComponents(
+                  forkedGuided.guided_session,
                 ),
               }
             : {}),
@@ -2834,9 +2838,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         guidedNextTurn: response.next_turn,
         guidedTerminal: response.terminal,
         guidedProposalReview: proposalReviewForTurn(response.next_turn),
-        guidedReviewedComponents: foldGuidedReviewedComponents(
-          get().guidedReviewedComponents,
-          response.next_turn,
+        guidedReviewedComponents: selectGuidedReviewedComponents(
+          response.guided_session,
         ),
         compositionState: response.composition_state,
       });
@@ -2950,9 +2953,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         guidedNextTurn: response.next_turn,
         guidedTerminal: response.terminal,
         guidedProposalReview: proposalReviewForTurn(response.next_turn),
-        guidedReviewedComponents: foldGuidedReviewedComponents(
-          get().guidedReviewedComponents,
-          response.next_turn,
+        guidedReviewedComponents: selectGuidedReviewedComponents(
+          response.guided_session,
         ),
         compositionState: response.composition_state,
         error: null,
@@ -3206,9 +3208,27 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           set({
             guidedNextTurn: null,
             // The reviewed-components ledger goes with the turn: this path
-            // tells the user to reload, and a reload re-derives the ledger
-            // from the wire. Leaving it would keep drawing the pre-failure
+            // tells the user to reload, and a reload re-reads the ledger from
+            // the wire. Leaving it would keep drawing the pre-failure
             // source/output nodes beside the refresh-required banner.
+            //
+            // This is the one place the store's ledger deliberately diverges
+            // from the published `guidedSession.reviewed_components`, which
+            // stays put because the rest of the chat surface still renders
+            // from it — the transcript, and the stepper's settled ticks and
+            // the decision sheets they open (guidedDecisionStages.ts binds to
+            // the SESSION, not to this copy, and ChatPanel.test.tsx pins that
+            // in this exact state: at step_3_transforms the guided surface
+            // still renders with a null turn, so the two are on screen
+            // together). The divergence is about this VIEW's authority, not
+            // about what the server settled: the settlement succeeded, and
+            // only the refresh failed, so the held session is a stale-but-true
+            // snapshot the pane must stop drawing until it is re-fetched.
+            //
+            // The single-authority tidy-up — naming this field for the one
+            // view that reads it, or replacing the blanking with an explicit
+            // "projection suspended" flag — belongs to the graph-pane lane
+            // that owns GraphView.tsx, at rebase time.
             guidedReviewedComponents: EMPTY_GUIDED_REVIEWED_COMPONENTS,
             guidedProposalReview: null,
             guidedResponsePending: false,
@@ -3292,9 +3312,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
               guidedNextTurn: resynced.next_turn,
               guidedTerminal: resynced.terminal,
               guidedProposalReview: proposalReviewForTurn(resynced.next_turn),
-              guidedReviewedComponents: foldGuidedReviewedComponents(
-                get().guidedReviewedComponents,
-                resynced.next_turn,
+              guidedReviewedComponents: selectGuidedReviewedComponents(
+                resynced.guided_session,
               ),
               compositionState: resynced.composition_state,
               guidedResponsePending: false,
@@ -3410,9 +3429,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
             guidedSession: resynced.guided_session,
             guidedNextTurn: resynced.next_turn,
             guidedTerminal: resynced.terminal,
-            guidedReviewedComponents: foldGuidedReviewedComponents(
-              get().guidedReviewedComponents,
-              resynced.next_turn,
+            guidedReviewedComponents: selectGuidedReviewedComponents(
+              resynced.guided_session,
             ),
             guidedProposalReview:
               proposalBinding === null
@@ -3647,9 +3665,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       guidedNextTurn: response.next_turn,
       guidedTerminal: response.terminal,
       guidedProposalReview: proposalReviewForTurn(response.next_turn),
-      guidedReviewedComponents: foldGuidedReviewedComponents(
-        get().guidedReviewedComponents,
-        response.next_turn,
+      guidedReviewedComponents: selectGuidedReviewedComponents(
+        response.guided_session,
       ),
       compositionState: response.composition_state,
       guidedResponsePending: false,
@@ -3686,9 +3703,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         guidedNextTurn: response.next_turn,
         guidedTerminal: response.terminal,
         guidedProposalReview: proposalReviewForTurn(response.next_turn),
-        guidedReviewedComponents: foldGuidedReviewedComponents(
-          get().guidedReviewedComponents,
-          response.next_turn,
+        guidedReviewedComponents: selectGuidedReviewedComponents(
+          response.guided_session,
         ),
         compositionState: response.composition_state,
         error: null,
@@ -3781,9 +3797,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       guidedNextTurn: probe.next_turn,
       guidedTerminal: probe.terminal,
       guidedProposalReview: proposalReviewForTurn(probe.next_turn),
-      guidedReviewedComponents: foldGuidedReviewedComponents(
-        get().guidedReviewedComponents,
-        probe.next_turn,
+      guidedReviewedComponents: selectGuidedReviewedComponents(
+        probe.guided_session,
       ),
       compositionState: probe.composition_state,
       error: null,
@@ -4083,9 +4098,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         guidedNextTurn: response.next_turn,
         guidedTerminal: response.terminal,
         guidedProposalReview: proposalReviewForTurn(response.next_turn),
-        guidedReviewedComponents: foldGuidedReviewedComponents(
-          get().guidedReviewedComponents,
-          response.next_turn,
+        guidedReviewedComponents: selectGuidedReviewedComponents(
+          response.guided_session,
         ),
         compositionState: response.composition_state,
         guidedChatPending: false,
@@ -4110,9 +4124,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
             guidedNextTurn: resynced.next_turn,
             guidedTerminal: resynced.terminal,
             guidedProposalReview: proposalReviewForTurn(resynced.next_turn),
-            guidedReviewedComponents: foldGuidedReviewedComponents(
-              get().guidedReviewedComponents,
-              resynced.next_turn,
+            guidedReviewedComponents: selectGuidedReviewedComponents(
+              resynced.guided_session,
             ),
             compositionState: resynced.composition_state,
             error: apiErr.detail ?? "The guided turn changed. Review the refreshed step and try again.",
@@ -4294,9 +4307,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         guidedNextTurn: guided?.next_turn ?? null,
         guidedTerminal: guided?.terminal ?? null,
         guidedProposalReview: proposalReviewForTurn(guided?.next_turn ?? null),
-        guidedReviewedComponents: foldGuidedReviewedComponents(
-          get().guidedReviewedComponents,
-          guided?.next_turn ?? null,
+        guidedReviewedComponents: selectGuidedReviewedComponents(
+          guided?.guided_session ?? null,
         ),
       });
       // Revert is a state-producing route: restoring an older pending

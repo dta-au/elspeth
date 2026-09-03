@@ -136,6 +136,15 @@ export interface GuidedSession {
   terminal: TerminalState | null;
   chat_history: ChatTurn[];
   chat_turn_seq: number;
+  /**
+   * Server-projected reviewed-component ledger (elspeth-f2a8550b3d): the
+   * components settled so far, in authored order. Present on EVERY guided
+   * response — including a completed session, whose `next_turn` is `null`.
+   * This replaced a client-side fold over `next_turn`, which necessarily saw
+   * an empty ledger after any reload and on every completed session, and
+   * which was reconstructed rather than authoritative.
+   */
+  reviewed_components: GuidedReviewedComponents;
   /** Server-owned WorkflowProfile, or `null` for the empty/live-guided profile. */
   profile: WorkflowProfile | null;
 }
@@ -561,6 +570,23 @@ export interface ComponentReviewPayload {
   component_kind: GuidedComponentKind;
   items: ComponentReviewItem[];
   allowed_actions: ComponentReviewAction[];
+}
+
+/**
+ * Wire: `GuidedSessionResponse.reviewed_components`
+ * (schemas.py `GuidedReviewedComponentsResponse`) — what the server says has
+ * been settled, per kind, in authored order.
+ *
+ * The entries are `ComponentReviewItem`s BY DESIGN, not by coincidence: the
+ * server projects this ledger and the `review_components` card from one
+ * derivation (`state_machine.reviewed_component_ledger`), so the field set is
+ * closed at identity + display. Reviewed option values, inspected columns and
+ * samples, storage paths and content anchors are deliberately absent — they
+ * stay in the schema-8 checkpoint under `composition_state.composer_meta`.
+ */
+export interface GuidedReviewedComponents {
+  readonly sources: readonly ComponentReviewItem[];
+  readonly outputs: readonly ComponentReviewItem[];
 }
 
 /**

@@ -19,7 +19,7 @@
 // ============================================================================
 
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, type ReactNode } from "react";
 
@@ -105,6 +105,11 @@ const AUDITED_COMPONENTS = [
   // either/or has to be audited on its own rather than assumed from the
   // active-branch entry.
   "ChatPanelGoalCard",
+  // Decision sheets (elspeth-f2a8550b3d): the read-only record a settled
+  // stepper tick opens. A disclosure whose panel takes focus, names itself,
+  // and replays a settled transcript — none of which the in-situ ChatPanel
+  // entries can cover for more than one stage at a time.
+  "GuidedDecisionSheet",
 ] as const;
 
 const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
@@ -126,6 +131,7 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "GraphMiniView",
   "GraphModal",
   "GraphView",
+  "GuidedDecisionSheet",
   "HeaderSessionSwitcher",
   "HeaderVersionSelector",
   "HelloWorldTutorial",
@@ -314,6 +320,7 @@ import { ModeSwitchButton } from "@/components/chat/guided/ModeSwitchButton";
 import { PipelineGloss } from "@/components/chat/guided/PipelineGloss";
 import { PipelineValidationSummary } from "@/components/chat/guided/PipelineValidationSummary";
 import { ProposePipelineTurn } from "@/components/chat/guided/ProposePipelineTurn";
+import { GuidedDecisionSheet } from "@/components/chat/guided/GuidedDecisionSheet";
 import { AcknowledgementCard } from "@/components/chat/AcknowledgementCard";
 import { AcknowledgementStack } from "@/components/chat/AcknowledgementStack";
 import { ChatInput } from "@/components/chat/ChatInput";
@@ -1405,6 +1412,7 @@ describe("ChatPanelTutorialWorkspace", () => {
         },
       ],
       chat_turn_seq: 4,
+      reviewed_components: { sources: [], outputs: [] },
       profile: null,
     };
   }
@@ -1507,6 +1515,103 @@ describe("ChatPanelTutorialWorkspace", () => {
 
     expect(await axe(container)).toHaveNoViolations();
   });
+
+  it("has no axe violations with a settled tick expanded into its decision sheet", async () => {
+    // Decision sheets (elspeth-f2a8550b3d): a settled stepper tick becomes a
+    // disclosure BUTTON inside its <li>, and the panel it controls mounts
+    // between the band and the conversation group. That is a new arrangement
+    // inside an already-audited surface — a listitem with an interactive
+    // child, an aria-controls IDREF that must resolve, and a replayed
+    // transcript that must not become a second live region.
+    Element.prototype.scrollIntoView = vi.fn();
+    vi.mocked(apiClient.fetchRuns).mockResolvedValue([]);
+    const session = makeTutorialGuidedSession();
+    session.reviewed_components = {
+      sources: [
+        {
+          stable_id: "00000000-0000-4000-8000-0000000009a1",
+          name: "pages",
+          plugin: "web_scrape",
+          status: "reviewed",
+        },
+      ],
+      outputs: [],
+    };
+    useSessionStore.setState({
+      compositionState: makeFullCompositionState(),
+      compositionProposals: [],
+      guidedSession: session,
+      guidedNextTurn: makeSchemaFormNextTurn(),
+    } as never);
+
+    const { container } = render(
+      <ChatPanel
+        isTutorial
+        lockedChatPrompt={{
+          step_1_source: "Summarise these pages:\nhttps://example.gov.au/page-1",
+          step_2_sink: "Write the results out as JSONL.",
+        }}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /^Source/ }));
+
+    // Non-vacuous: the disclosure is expanded, the panel it names is mounted
+    // and its aria-controls resolves, and the replayed turns are a static
+    // group rather than a second "Step chat history" log.
+    const tick = screen.getByRole("button", { name: "Source, completed" });
+    expect(tick).toHaveAttribute("aria-expanded", "true");
+    const sheet = screen.getByRole("region", { name: "Source — decided" });
+    expect(tick.getAttribute("aria-controls")).toBe(sheet.getAttribute("id"));
+    expect(
+      within(sheet).getByRole("group", { name: "Guided build conversation" }),
+    ).toBeInTheDocument();
+    expect(within(sheet).queryByRole("log")).toBeNull();
+
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("GuidedDecisionSheet", () => {
+  // The read-only record a settled stepper tick opens (elspeth-f2a8550b3d).
+  // Audited as a leaf too, not only in situ: it owns a named region that takes
+  // focus on open, a component list, and a replayed transcript, and the
+  // in-situ case above can only ever mount ONE stage's arrangement.
+  it("has no axe violations with components, a record and replayed turns", async () => {
+    const { container } = render(
+      <GuidedDecisionSheet
+        id="a11y-decision-sheet"
+        stage="step_4_wire"
+        rows={[
+          {
+            key: "00000000-0000-4000-8000-0000000009b1",
+            name: "pages",
+            plugin: "web_scrape",
+          },
+          { key: "fan_out", name: "Fan Out", plugin: null },
+        ]}
+        chatTurns={[
+          {
+            role: "user",
+            content: "does this wiring look right?",
+            seq: 1,
+            step: "step_4_wire",
+            ts_iso: "2026-09-03T00:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+        ]}
+        record="Guided pipeline wiring confirmed."
+        onClose={vi.fn()}
+      />,
+    );
+
+    screen.getByRole("region", { name: "Wire — decided" });
+    screen.getByRole("button", { name: "Close" });
+
+    expect(await axe(container)).toHaveNoViolations();
+  });
 });
 
 describe("ChatPanelCompletedSurface", () => {
@@ -1572,6 +1677,7 @@ describe("ChatPanelCompletedSurface", () => {
           },
         ],
         chat_turn_seq: 4,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedNextTurn: null,
@@ -1612,6 +1718,7 @@ describe("ChatPanelGoalCard", () => {
         terminal: null,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedNextTurn: {

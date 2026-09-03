@@ -164,6 +164,10 @@ function guidedSession(
     terminal: null,
     chat_history: chatHistory,
     chat_turn_seq: chatHistory.length,
+    // Server-projected reviewed ledger (elspeth-f2a8550b3d). Empty here: this
+    // route mock drives the stepper and transcript, not the pre-commit graph,
+    // and the decoder requires the key to be present rather than absent.
+    reviewed_components: { sources: [], outputs: [] },
     // null profile == empty/live; the tutorial seeds via /guided/start. The
     // shell reads profile.bookends but tolerates a null profile (defaults true).
     profile: {

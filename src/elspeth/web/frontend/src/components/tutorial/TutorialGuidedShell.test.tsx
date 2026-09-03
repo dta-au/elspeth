@@ -53,6 +53,7 @@ function guidedSessionPayload(terminalKind: TerminalKind | null): unknown {
     terminal: terminalKind === null ? null : { kind: terminalKind, reason: null },
     chat_history: [],
     chat_turn_seq: 0,
+    reviewed_components: { sources: [], outputs: [] },
     profile: null,
   };
 }
@@ -371,6 +372,7 @@ describe("TutorialGuidedShell", () => {
           terminal: null,
           chat_history: [],
           chat_turn_seq: 0,
+          reviewed_components: { sources: [], outputs: [] },
           profile: null,
         },
         guidedNextTurn: closedProposalTurn,
@@ -734,6 +736,7 @@ describe("TutorialGuidedShell", () => {
         terminal: { kind: "completed", reason: null },
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedNextTurn: null,
