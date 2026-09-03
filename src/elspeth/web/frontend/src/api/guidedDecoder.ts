@@ -2,10 +2,12 @@ import { COALESCE_MERGES, COALESCE_POLICIES } from "@/lib/graphTopology";
 import type { CompositionState } from "@/types/index";
 import type {
   ChatTurn,
+  ComponentReviewItem,
   ComponentReviewPayload,
   GetGuidedResponse,
   GuidedChatResponse,
   GuidedRespondResponse,
+  GuidedReviewedComponents,
   GuidedSession,
   GuidedStartOperationReconciliation,
   GuidedStep,
@@ -1235,6 +1237,64 @@ function decodeSchemaPayload(value: unknown, path: string): SchemaFormPayload {
   };
 }
 
+/**
+ * One reviewed component, decoded to the closed wire shape.
+ *
+ * The single frontend authority for that shape: the `review_components` turn
+ * payload and `guided_session.reviewed_components` both come through here, so
+ * a server that changed one and not the other is rejected rather than half
+ * accepted. `status` is gated to the literal `"reviewed"` — the field exists
+ * on the wire precisely so an unreviewed component can never arrive dressed
+ * as a settled decision.
+ */
+function decodeReviewedComponentEntries(
+  raw: readonly unknown[],
+  path: string,
+): ComponentReviewItem[] {
+  const stableIds = new Set<string>();
+  const names = new Set<string>();
+  return raw.map((value, index) => {
+    const itemPath = `${path}[${index}]`;
+    const item = exactRecord(value, itemPath, ["stable_id", "name", "plugin", "status"]);
+    const stableId = canonicalUuid(item.stable_id, `${itemPath}.stable_id`);
+    const name = stringValue(item.name, `${itemPath}.name`);
+    const plugin = stringValue(item.plugin, `${itemPath}.plugin`);
+    const status = stringValue(item.status, `${itemPath}.status`);
+    if (name.trim() === "") invalid(`${itemPath}.name`, "expected non-empty name");
+    if (plugin.trim() === "") invalid(`${itemPath}.plugin`, "expected non-empty plugin");
+    if (status !== "reviewed") invalid(`${itemPath}.status`, "expected reviewed");
+    if (stableIds.has(stableId)) invalid(path, "duplicate stable id");
+    if (names.has(name)) invalid(path, "duplicate component name");
+    stableIds.add(stableId);
+    names.add(name);
+    return { stable_id: stableId, name, plugin, status: "reviewed" as const };
+  });
+}
+
+function decodeReviewedComponentKind(value: unknown, path: string): ComponentReviewItem[] {
+  const raw = arrayValue(value, path);
+  if (raw.length > MAX_REVIEWED_COMPONENTS_PER_KIND) {
+    invalid(path, "expected at most 256 reviewed components");
+  }
+  return decodeReviewedComponentEntries(raw, path);
+}
+
+/**
+ * `GuidedSessionResponse.reviewed_components` — required, never absent.
+ *
+ * An empty ledger and a MISSING ledger mean different things (nothing settled
+ * yet versus a route that failed to project reviewed custody), and only the
+ * first is admissible: a decision sheet built on a silently-empty ledger would
+ * tell the user they had agreed to nothing.
+ */
+function decodeReviewedComponents(value: unknown, path: string): GuidedReviewedComponents {
+  const ledger = exactRecord(value, path, ["sources", "outputs"]);
+  return {
+    sources: decodeReviewedComponentKind(ledger.sources, `${path}.sources`),
+    outputs: decodeReviewedComponentKind(ledger.outputs, `${path}.outputs`),
+  };
+}
+
 function decodeComponentReviewPayload(
   value: unknown,
   path: string,
@@ -1252,24 +1312,7 @@ function decodeComponentReviewPayload(
   if (rawItems.length === 0 || rawItems.length > MAX_REVIEWED_COMPONENTS_PER_KIND) {
     invalid(`${path}.items`, "expected 1 to 256 reviewed components");
   }
-  const stableIds = new Set<string>();
-  const names = new Set<string>();
-  const items = rawItems.map((value, index) => {
-    const itemPath = `${path}.items[${index}]`;
-    const item = exactRecord(value, itemPath, ["stable_id", "name", "plugin", "status"]);
-    const stableId = canonicalUuid(item.stable_id, `${itemPath}.stable_id`);
-    const name = stringValue(item.name, `${itemPath}.name`);
-    const plugin = stringValue(item.plugin, `${itemPath}.plugin`);
-    const status = stringValue(item.status, `${itemPath}.status`);
-    if (name.trim() === "") invalid(`${itemPath}.name`, "expected non-empty name");
-    if (plugin.trim() === "") invalid(`${itemPath}.plugin`, "expected non-empty plugin");
-    if (status !== "reviewed") invalid(`${itemPath}.status`, "expected reviewed");
-    if (stableIds.has(stableId)) invalid(`${path}.items`, "duplicate stable id");
-    if (names.has(name)) invalid(`${path}.items`, "duplicate component name");
-    stableIds.add(stableId);
-    names.add(name);
-    return { stable_id: stableId, name, plugin, status: "reviewed" as const };
-  });
+  const items = decodeReviewedComponentEntries(rawItems, `${path}.items`);
 
   const actions = stringArray(payload.allowed_actions, `${path}.allowed_actions`).map(
     (action, index): ComponentReviewPayload["allowed_actions"][number] => {
@@ -1933,7 +1976,15 @@ function decodeChatTurn(value: unknown, path: string): ChatTurn {
 }
 
 function decodeSession(value: unknown, path: string): GuidedSession {
-  const session = exactRecord(value, path, ["step", "history", "terminal", "chat_history", "chat_turn_seq", "profile"]);
+  const session = exactRecord(value, path, [
+    "step",
+    "history",
+    "terminal",
+    "chat_history",
+    "chat_turn_seq",
+    "reviewed_components",
+    "profile",
+  ]);
   const step = decodeGuidedStep(session.step, `${path}.step`);
   const history = arrayValue(session.history, `${path}.history`).map((item, index) => {
     const historyPath = `${path}.history[${index}]`;
@@ -1952,6 +2003,10 @@ function decodeSession(value: unknown, path: string): GuidedSession {
     (item, index) => decodeChatTurn(item, `${path}.chat_history[${index}]`),
   );
   const chatTurnSeq = integerValue(session.chat_turn_seq, `${path}.chat_turn_seq`);
+  const reviewedComponents = decodeReviewedComponents(
+    session.reviewed_components,
+    `${path}.reviewed_components`,
+  );
   const profile = session.profile === null
     ? null
     : (() => {
@@ -1967,6 +2022,7 @@ function decodeSession(value: unknown, path: string): GuidedSession {
     terminal,
     chat_history: chatHistory,
     chat_turn_seq: chatTurnSeq,
+    reviewed_components: reviewedComponents,
     profile,
   };
 }

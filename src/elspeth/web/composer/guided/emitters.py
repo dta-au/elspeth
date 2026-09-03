@@ -56,6 +56,7 @@ from elspeth.web.composer.guided.protocol import (
     node_options_summary,
 )
 from elspeth.web.composer.guided.stage_transitions import source_plugin_accepts_blob_inspection
+from elspeth.web.composer.guided.state_machine import reviewed_component_ledger
 from elspeth.web.composer.tools._common import _semantic_contracts_payload
 
 if TYPE_CHECKING:
@@ -365,6 +366,10 @@ def build_component_review_turn(
     if len(order) > 1:
         actions.append("remove")
     actions.extend(("reorder", "finish"))
+    # One derivation for the card and the wire ledger: the same entries this
+    # card publishes are what ``reviewed_components`` carries on every guided
+    # response (guided_replay.project_reviewed_components), so the two
+    # surfaces cannot name different components, orders, or plugins.
     return Turn(
         type=TurnType.REVIEW_COMPONENTS.value,
         step_index=_step_index(expected_step),
@@ -372,12 +377,12 @@ def build_component_review_turn(
             "component_kind": component_kind,
             "items": [
                 {
-                    "stable_id": stable_id,
-                    "name": reviewed[stable_id].name,
-                    "plugin": reviewed[stable_id].plugin,
-                    "status": "reviewed",
+                    "stable_id": entry.stable_id,
+                    "name": entry.name,
+                    "plugin": entry.plugin,
+                    "status": entry.status,
                 }
-                for stable_id in order
+                for entry in reviewed_component_ledger(guided, component_kind)
             ],
             "allowed_actions": actions,
         },

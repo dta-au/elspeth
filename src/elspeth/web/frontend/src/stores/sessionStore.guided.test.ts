@@ -85,6 +85,7 @@ const sampleGuidedSession: GuidedSession = {
   terminal: null,
   chat_history: [],
   chat_turn_seq: 0,
+  reviewed_components: { sources: [], outputs: [] },
   profile: null,
 };
 
@@ -5057,9 +5058,11 @@ describe("sessionStore — guided-mode fields and actions", () => {
     });
   });
 
-  // The ledger is the pane's only memory of the reviewed source/output once
-  // the review turn that named them has advanced (elspeth-9f0873426a); it
-  // must fold on every published turn and reset with the guided context.
+  // The ledger names the reviewed source/output the pane draws
+  // (elspeth-9f0873426a). It is no longer folded from published turns: the
+  // server projects it on `guided_session.reviewed_components`
+  // (elspeth-f2a8550b3d), so the store reads it wherever it publishes a
+  // guided session, and it resets with the guided context.
   describe("guidedReviewedComponents ledger (elspeth-9f0873426a)", () => {
     const reviewedSource = {
       stable_id: "00000000-0000-4000-8000-000000000602",
@@ -5108,11 +5111,15 @@ describe("sessionStore — guided-mode fields and actions", () => {
       });
     });
 
-    it("respondGuided: folds a review turn into the ledger and keeps it through the next turn", async () => {
+    it("respondGuided: publishes the server ledger and keeps it through the next turn", async () => {
+      const reviewedSession: GuidedSession = {
+        ...sampleGuidedSession,
+        reviewed_components: { sources: [reviewedSource], outputs: [] },
+      };
       const { respondGuided } = await import("@/api/client");
       (respondGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
         ...sampleRespondResponse,
-        guided_session: sampleGuidedSession,
+        guided_session: reviewedSession,
         next_turn: sourceReviewTurn,
       });
       useSessionStore.setState({
@@ -5135,9 +5142,13 @@ describe("sessionStore — guided-mode fields and actions", () => {
         outputs: [],
       });
 
-      // The sink single_select turn replaces the review turn on the wire; the
-      // ledger is what still remembers the source.
-      (respondGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(sampleRespondResponse);
+      // The sink single_select turn replaces the review turn on the wire, and
+      // the SERVER's ledger is what still names the source: the reviewed
+      // custody rides on the session, not on the turn that displayed it.
+      (respondGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        ...sampleRespondResponse,
+        guided_session: reviewedSession,
+      });
       await useSessionStore.getState().respondGuided({
         chosen: null,
         edited_values: null,
@@ -5153,6 +5164,53 @@ describe("sessionStore — guided-mode fields and actions", () => {
         sources: [reviewedSource],
         outputs: [],
       });
+    });
+
+    it("respondGuided: a reload-shaped response with no review turn still names the ledger", async () => {
+      // The retired fold's defect, pinned at the store level: the wire's
+      // current turn is a proposal, so there was nothing to fold and the pane
+      // forgot both components. The projection carries them regardless.
+      const midBuildSession: GuidedSession = {
+        ...sampleGuidedSession,
+        step: "step_3_transforms",
+        reviewed_components: {
+          sources: [reviewedSource],
+          outputs: [
+            {
+              stable_id: "00000000-0000-4000-8000-000000000604",
+              name: "output-1",
+              plugin: "json",
+              status: "reviewed" as const,
+            },
+          ],
+        },
+      };
+      const { respondGuided } = await import("@/api/client");
+      (respondGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        ...sampleRespondResponse,
+        guided_session: midBuildSession,
+        next_turn: null,
+      });
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+
+      await useSessionStore.getState().respondGuided({
+        chosen: ["csv"],
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      });
+
+      expect(useSessionStore.getState().guidedNextTurn).toBeNull();
+      expect(useSessionStore.getState().guidedReviewedComponents).toEqual(
+        midBuildSession.reviewed_components,
+      );
     });
   });
 });

@@ -145,6 +145,10 @@ function guidedSession(step: string): Record<string, unknown> {
     terminal: null,
     chat_history: chatHistory,
     chat_turn_seq: chatHistory.length,
+    // Server-projected reviewed ledger (elspeth-f2a8550b3d): required on the
+    // wire, empty in this spec — the collector proposal it drives names its
+    // own components in the turn payload.
+    reviewed_components: { sources: [], outputs: [] },
     profile: { coaching: true, bookends: true },
   };
 }

@@ -170,6 +170,51 @@
   font-weight: var(--font-weight-semibold);
 }
 
+/* Settled tick as a disclosure for its decision sheet (elspeth-f2a8550b3d).
+   The <li> used to apply the indicator-above-label stack DIRECTLY to its
+   children; wrapping them in a button makes the button the sole flex item, so
+   the stack has to move onto it or the pair collapses side by side. It also
+   has to undo the raw UA button chrome in full — base.css declares no button
+   reset, so an unreset <button> here would render four grey OS boxes across a
+   band whose whole visual language is "no container box in any state".
+
+   No min-height literal: the stack is ~38px tall and stretches the full grid
+   cell, comfortably over the 24×24 floor (SC 2.5.8), and pinning a height here
+   would fight --size-workspace-band, which the band and the artifact toolbar
+   share so their bottom seams land on one line. `justify-content: flex-start`
+   keeps the indicator at the top of the cell, where the decorative rail
+   (.guided-workflow-step::before, positioned against the li) expects it. */
+.guided-workflow-step-button {
+  appearance: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  align-self: stretch;
+  gap: var(--space-xs);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: center;
+  cursor: pointer;
+}
+
+/* Hover reads on the LABEL, not the cell: a background wash would reinstate
+   the container box the stepper deliberately dropped. */
+.guided-workflow-step-button:hover .guided-workflow-label {
+  text-decoration: underline;
+}
+
+.guided-workflow-step-button:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
 /* Card radius, not button radius (elspeth-cad0862ed7). This is a top-level
    card in the guided authoring scroller, and its two peers there are both
    --radius-lg: .ack-stack (chat.css) above it and .guided-completion (below in
@@ -220,6 +265,122 @@
   padding-block: 0;
   padding-inline: var(--space-lg);
   border-bottom: 1px solid var(--color-border);
+}
+
+/* Decision sheet — the read-only record a settled tick opens
+   (elspeth-f2a8550b3d). Same card idiom as .guided-current-decision (its
+   sibling one band lower): --radius-lg top-level card on --color-surface.
+
+   flex-shrink: 0 + a bounded height are load-bearing, not polish. The sheet is
+   a SIBLING of .guided-authoring-scroll inside a .chat-panel that clips
+   overflow, so an unbounded sheet on a long stage would push the docked
+   composer out of the panel entirely rather than scrolling. Bounded, it takes
+   its space from the one box designed to shrink and scrolls its own overflow;
+   the section is focusable (tabIndex=-1), so that scroller has a keyboard
+   owner. */
+.guided-decision-sheet {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: var(--space-sm);
+  /* The min() pairing chat.css uses for every panel docked inside this column:
+     the vh term protects a short viewport, the px cap stops a tall one handing
+     the sheet more of the pane than the live conversation. */
+  max-height: min(360px, 45vh);
+  overflow-y: auto;
+  margin: var(--space-md);
+  padding: var(--space-md);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-lg);
+  background-color: var(--color-surface);
+}
+
+/* Focus lands here on open. Drawn INSET because the sheet is its own scroll
+   container and the panel around it clips — the default +2px offset ring
+   would be cropped (the same fix .guided-authoring-scroll carries). */
+.guided-decision-sheet:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: -2px;
+}
+
+.guided-decision-sheet__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+
+.guided-decision-sheet__heading {
+  margin: 0;
+  color: var(--color-text);
+  font-size: var(--font-size-base);
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+/* Bare Button: it emits ONLY this class, so the chrome has to be here. Same
+   quiet outline control as .guided-component-review-btn one card away. */
+.guided-decision-sheet__close {
+  flex-shrink: 0;
+  min-height: var(--size-control-compact);
+  padding: var(--space-xs) var(--space-sm);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  background-color: var(--color-surface);
+  color: var(--color-text);
+  cursor: pointer;
+  font: inherit;
+}
+
+.guided-decision-sheet__close:hover {
+  border-color: var(--color-chip-border);
+  background-color: var(--color-highlight);
+}
+
+.guided-decision-sheet__close:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+.guided-decision-sheet__components {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.guided-decision-sheet__component {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  padding: var(--space-sm);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background-color: var(--color-surface-elevated);
+}
+
+.guided-decision-sheet__component-name {
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+
+.guided-decision-sheet__component-plugin {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.guided-decision-sheet__record,
+.guided-decision-sheet__empty {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.guided-decision-sheet__empty {
+  color: var(--color-text-muted);
 }
 
 /* Loading placeholder shown under the stepper while the guided pipeline
@@ -629,7 +790,7 @@
 }
 
 /* Routes region: one count roll-up line, then per-route rows with a status
-   chip pinned right — never a per-line trailing "— not yet checked" clause. */
+   chip pinned right — never a per-line trailing "— no static check" clause. */
 .wire-stage__routes {
   display: grid;
   gap: var(--space-xs);
@@ -640,6 +801,17 @@
   margin: 0;
   font-size: var(--font-size-sm);
   color: var(--color-text-secondary);
+}
+
+/* What an absent verdict means at run time — the quieter register of the
+   roll-up it follows (it explains the count, it is not a second count).
+   Unlike the Confirm caption below, this one is NOT gated on the confirm
+   being pressable: it is a fact about the routes, true either way. */
+.wire-stage__routes-note {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+  color: var(--color-text-muted);
 }
 
 .wire-stage__edges {
@@ -703,6 +875,23 @@
   color: var(--color-error);
 }
 
+/* No static verdict: deliberately NOT a success or error tone — the route is
+   neither confirmed nor broken, it is unjudged. A firmer border than the base
+   chip separates it from the row background without claiming a status colour. */
+.wire-review-status--unchecked {
+  border-color: var(--color-border-strong);
+  background-color: var(--color-surface);
+  color: var(--color-text-secondary);
+}
+
+/* Discard destination: the quietest chip on the row. It is a normal, fully
+   understood route (a discarded row goes nowhere), so it neither warns nor
+   competes with the routes that carry data. */
+.wire-review-status--discard {
+  border-style: dashed;
+  color: var(--color-text-muted);
+}
+
 /* Correction request as a proper form group (the .guided-proposal__revise
    bordered-region idiom): quiet legend-style heading, labelled select +
    full-width feedback field from the schema-form family, action right. */
@@ -764,6 +953,19 @@
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-sm);
+}
+
+/* Caption directly under Confirm wiring, naming what an ENABLED confirm
+   accepts (routes this card carries no static verdict for). WireStageTurn
+   gates the render on the button being pressable at all, so this never
+   appears above the blockers panel's "The pipeline isn't ready to confirm:".
+   Same quiet register as that panel — this is a statement about the button,
+   not a blocker, so it carries no tint or border of its own. */
+.wire-stage__confirm-note {
+  margin: var(--space-2xs) 0 0;
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+  color: var(--color-text-muted);
 }
 
 /* ── Guided respond rejection (elspeth-3b35abf148 variant 3) ──────────────────

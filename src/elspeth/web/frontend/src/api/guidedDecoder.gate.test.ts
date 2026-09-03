@@ -33,6 +33,7 @@ function proposalResponse(payload: unknown): Record<string, unknown> {
       terminal: null,
       chat_history: [],
       chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] },
       profile: null,
     },
     next_turn: {
@@ -61,6 +62,7 @@ function wireResponse(gateBehavior: unknown): Record<string, unknown> {
       terminal: null,
       chat_history: [],
       chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] },
       profile: null,
     },
     next_turn: {
