@@ -31,6 +31,7 @@ from elspeth.contracts.auth import (
     IdentityRole,
     RelationshipType,
 )
+from elspeth.core.landscape.auth_audit_repository import AUTH_AUDIT_EVENT_TYPES, AuthAuditEventType
 from elspeth.core.landscape.run_lifecycle_repository import _AUTH_PROVIDER_TYPES
 from elspeth.core.landscape.schema import auth_events_table, run_attributions_table
 from elspeth.web.auth.providers import PROFILE_REGISTRY, registered_provider_names
@@ -248,6 +249,52 @@ def test_landscape_checks_admit_exactly_the_login_providers() -> None:
     assert _check_constraint_text(run_attributions_table, "ck_run_attributions_auth_provider_type") == (
         f"auth_provider_type IN ({_sql_in_list(LOGIN_PROVIDERS)})"
     )
+
+
+def test_the_auth_event_vocabulary_is_closed_and_complete() -> None:
+    """A value missing from this CHECK is a self-inflicted outage.
+
+    R4 refuses the mutation whose audit write failed, and the audit write
+    fails on the constraint — so an admin action with no event type does not
+    degrade to "unaudited", it degrades to "impossible". The whole vocabulary
+    therefore lands while the epoch is open, ahead of the features that use
+    it, because adding one afterwards is a table rewrite and a second
+    service-stop window.
+    """
+    declared = get_args(AuthAuditEventType)
+    assert declared == AUTH_AUDIT_EVENT_TYPES, "the write-side guard must derive from the Literal, not restate it"
+    assert _check_constraint_text(auth_events_table, "ck_auth_events_event_type") == (f"event_type IN ({_sql_in_list(declared)})")
+
+    # Every table whose mutations the spec says are audited needs somewhere
+    # to record them. review_requests is the one this project has already
+    # been bitten by in the other direction: the table existed with no event.
+    for required in (
+        "identity_activated",
+        "identity_disabled",
+        "role_granted",
+        "role_revoked",
+        "relationship_asserted",
+        "approval_requested",
+        "approval_decided",
+        "review_requested",
+        "review_attested",
+        "library_published",
+        "library_accepted",
+        "quota_set",
+        "quota_exceeded",
+    ):
+        assert required in declared
+
+
+def test_authorization_denials_are_not_their_own_event_type() -> None:
+    """Deliberate: ``auth_failure`` plus a ``failure_category`` covers it.
+
+    And a business-rule refusal must NOT be filed as an authorization denial.
+    An authorized caller hitting a rule is not an escalation attempt, and
+    conflating the two makes the audit view unreadable exactly when someone
+    is looking for a real one.
+    """
+    assert "authz_denied" not in get_args(AuthAuditEventType)
 
 
 def test_run_attribution_guard_derives_from_the_contract() -> None:

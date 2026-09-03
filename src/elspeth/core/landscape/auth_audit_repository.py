@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Literal
+from typing import Literal, get_args
 
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.errors import AuditIntegrityError
@@ -13,10 +13,58 @@ from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.schema import auth_events_table
 
-AuthAuditEventType = Literal["login", "token_issued", "auth_failure"]
+AuthAuditEventType = Literal[
+    # Authentication.
+    "login",
+    "token_issued",
+    "auth_failure",
+    "logout",
+    # Admission and authority. Every one of these is an admin mutation whose
+    # row is written synchronously, before the response.
+    "identity_activated",
+    "identity_disabled",
+    "identity_enabled",
+    "role_granted",
+    "role_revoked",
+    "relationship_asserted",
+    "relationship_revoked",
+    # Workflow governance.
+    "approval_requested",
+    "approval_decided",
+    "review_requested",
+    "review_request_cancelled",
+    "review_attested",
+    "library_published",
+    "library_accepted",
+    "library_rejected",
+    "library_deprecated",
+    "library_recalled",
+    "quota_set",
+    "quota_exceeded",
+]
+"""Closed vocabulary of auditable authentication and authority events.
+
+The CHECK constraint backing this is closed too, so a MISSING value is a
+self-inflicted outage: R4 refuses the mutation whose audit write failed, and
+the write fails on the constraint. The list therefore has to be right while
+the epoch is open — adding one afterwards is a table rewrite and a second
+service-stop window.
+
+Authorization denials deliberately have no member here. ``auth_failure``
+exists, ``failure_category`` is an unconstrained ``String(64)`` and
+``metadata_json`` is free-form, so ``{route, required_role}`` under
+``failure_category='authz_denied'`` is writable with no schema change. And
+business-rule refusals keep their own categories rather than being filed as
+authorization denials: an authorized caller hitting a rule is not an
+escalation attempt, and conflating the two poisons the audit view.
+"""
+
 AuthAuditOutcome = Literal["success", "failure"]
 
-AUTH_AUDIT_EVENT_TYPES: tuple[AuthAuditEventType, ...] = ("login", "token_issued", "auth_failure")
+# Derived, not restated: a runtime guard that repeats its own contract drifts
+# from it silently, and this one decides whether an audit row is written at
+# all.
+AUTH_AUDIT_EVENT_TYPES: tuple[AuthAuditEventType, ...] = get_args(AuthAuditEventType)
 AUTH_AUDIT_SUCCESS: AuthAuditOutcome = "success"
 AUTH_AUDIT_FAILURE: AuthAuditOutcome = "failure"
 AUTH_AUDIT_OUTCOMES: tuple[AuthAuditOutcome, ...] = (AUTH_AUDIT_SUCCESS, AUTH_AUDIT_FAILURE)

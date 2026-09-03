@@ -521,6 +521,12 @@ _REQUIRED_COLUMNS += tuple(
     (table_name, column.name) for table_name in _EPOCH_32_REQUIRED_TABLES for column in metadata.tables[table_name].columns
 )
 
+# Epoch 37: every auth event carries the identity it concerns. Nullable — a
+# login that fails before an identity is resolved has none — but startup
+# verified, so an epoch-36 store fails HERE, naming the column, instead of
+# raising an opaque SQL error the first time an admin opens the audit view.
+_REQUIRED_COLUMNS += (("auth_events", "identity_id"),)
+
 # Required foreign keys for audit integrity (Tier 1 trust).
 # Format: (table_name, column_name, referenced_table)
 # Use this only for exact single-column contracts. Run-scoped contracts belong in
