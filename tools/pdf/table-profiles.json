@@ -1,4 +1,169 @@
 {
-  "_comment": "Table column-width profiles for the ELSPETH arch-pack PDF pipeline. Each profile matches a table by exact column count + header-cell prefix or substring match, and applies hand-tuned widths summing to 1.0 for A4 layout. Add a profile only when Pandoc's auto-sizing produces a table that demonstrably reads poorly in the rendered PDF.",
-  "profiles": []
+  "_comment": "Table column-width profiles for the ELSPETH PDF pipelines (arch-pack and control-pack). Each profile matches a table by exact column count + header-cell prefix or substring match, and applies hand-tuned widths summing to 1.0 for A4 layout. Add a profile only when Pandoc's auto-sizing produces a table that demonstrably reads poorly in the rendered PDF. Matchers name at least two header cells so a profile cannot capture an unrelated table of the same width.",
+  "profiles": [
+    {
+      "_doc": "control-pack: RAID issues",
+      "cols": 6,
+      "match": {
+        "col_1": "id",
+        "col_2": "issue",
+        "col_3": "exp"
+      },
+      "widths": [
+        0.05,
+        0.44,
+        0.08,
+        0.1,
+        0.22,
+        0.11
+      ]
+    },
+    {
+      "_doc": "control-pack: RAID risks",
+      "cols": 8,
+      "match": {
+        "col_1": "id",
+        "col_2": "risk",
+        "col_6": "trend"
+      },
+      "widths": [
+        0.05,
+        0.4,
+        0.07,
+        0.05,
+        0.09,
+        0.08,
+        0.16,
+        0.1
+      ]
+    },
+    {
+      "_doc": "control-pack: RAID assumptions",
+      "cols": 6,
+      "match": {
+        "col_1": "id",
+        "col_2": "assumption",
+        "col_3": "if false"
+      },
+      "widths": [
+        0.05,
+        0.33,
+        0.2,
+        0.09,
+        0.22,
+        0.11
+      ]
+    },
+    {
+      "_doc": "control-pack: RAID dependencies",
+      "cols": 6,
+      "match": {
+        "col_1": "id",
+        "col_2": "dependency",
+        "col_4": "responsible"
+      },
+      "widths": [
+        0.05,
+        0.4,
+        0.07,
+        0.12,
+        0.24,
+        0.12
+      ]
+    },
+    {
+      "_doc": "control-pack: RAID closes-on-a-decision",
+      "cols": 3,
+      "match": {
+        "col_1": "decision",
+        "col_2": "closes",
+        "col_3": "cost of delay"
+      },
+      "widths": [
+        0.3,
+        0.4,
+        0.3
+      ]
+    },
+    {
+      "_doc": "control-pack: RAID carried deliberately",
+      "cols": 3,
+      "match": {
+        "col_1": "item",
+        "col_2": "why",
+        "col_3": "review"
+      },
+      "widths": [
+        0.25,
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "_doc": "control-pack: RAID watch list",
+      "cols": 2,
+      "match": {
+        "col_1": "indicator",
+        "col_2": "entry"
+      },
+      "widths": [
+        0.7,
+        0.3
+      ]
+    },
+    {
+      "_doc": "control-pack: RAID closed",
+      "cols": 4,
+      "match": {
+        "col_1": "id",
+        "col_2": "entry",
+        "col_4": "evidence"
+      },
+      "widths": [
+        0.06,
+        0.26,
+        0.1,
+        0.58
+      ]
+    },
+    {
+      "_doc": "control-pack: programme corrections table",
+      "cols": 2,
+      "match": {
+        "col_1": "prior framing",
+        "col_2": "measured position"
+      },
+      "widths": [
+        0.35,
+        0.65
+      ]
+    },
+    {
+      "_doc": "control-pack: programme pilot-vs-durable options",
+      "cols": 3,
+      "match": {
+        "col_2_contains": "option a",
+        "col_3_contains": "option b"
+      },
+      "widths": [
+        0.2,
+        0.4,
+        0.4
+      ]
+    },
+    {
+      "_doc": "control-pack: programme terminology",
+      "cols": 3,
+      "match": {
+        "col_1": "informal",
+        "col_2": "term of record",
+        "col_3": "note"
+      },
+      "widths": [
+        0.22,
+        0.25,
+        0.53
+      ]
+    }
+  ]
 }

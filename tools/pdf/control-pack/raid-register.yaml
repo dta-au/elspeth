@@ -1,0 +1,37 @@
+title: "ELSPETH — Implementation RAID Register"
+subtitle: "Risks, assumptions, issues and dependencies for delivery"
+author: "John Morrissey"
+date: "3 September 2026"
+version: "1.0.0"
+status: "DRAFT FOR EXECUTIVE BRIEFING"
+
+# Template variables
+running-title: "Implementation RAID Register"
+doc-id: "ELS-RAID"
+document-category: "Delivery Governance"
+document-type: "RAID register"
+classification: "OFFICIAL"
+
+# Codebase HEAD the entries were measured against.
+commit: "8ef46621b"
+
+scope-blurb: >-
+  This register records the implementation risks, assumptions, issues and
+  dependencies attached to delivering the programme of outstanding work.  It
+  covers the delivery of the product, not the operation of it: operational
+  risk from the running service is a separate register, and individual
+  defects remain in the issue tracker and are referenced here rather than
+  copied.  Entries are held to a single test — would this change what is done
+  next — and instances of the same underlying problem are merged into the
+  response that resolves them.  It is the third of the four project-control
+  artefacts required by ADR-024.
+
+# Organization branding (appears on cover page)
+org-name: "ELSPETH"
+org-tagline: "Auditable LLM and Data Pipelines"
+
+# Revision history (newest first)
+revisions:
+  - version: "1.0.0"
+    date: "3 September 2026"
+    changes: "Initial issue. R-1 closed the same day: all completed work now has a remote copy."
