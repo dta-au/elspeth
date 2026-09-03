@@ -1676,12 +1676,21 @@ def test_prevalidation_rejected_payload_ships_exactly_its_status_keys() -> None:
 
     Closed the same way as the proposal payload: the merge argument is a call to
     an owned TypedDict, so mypy refuses an extra, missing or mistyped key at the
-    constructor, and this pin holds the CALL's keyword order equal to the wire
-    order and to the class's own keys. Unlike the proposal payload the merge
-    result IS bound to a name (it is seeded from the candidate's own ``data``),
-    so the pin also asserts the seed is a bare re-wrap and that no store
-    re-shapes the local afterwards — the walker refusals that make those
-    readable are ``_failure_data_sites``' owner branch and ``_subscript_assign_keys``.
+    constructor — measured, not assumed: ``success=True`` added to that call is
+    ``error: Extra key "success" for TypedDict "_PrevalidationRejectedStatus"
+    [typeddict-unknown-key]``, mypy exit 1. This pin holds the CALL's keyword
+    order equal to the wire order and to the class's own keys. Unlike the
+    proposal payload the merge result IS bound to a name (it is seeded from the
+    candidate's own ``data``), so the pin also asserts the seed is a bare re-wrap
+    and that no store re-shapes the local afterwards — the walker refusals that
+    make those readable are ``_failure_data_sites``' owner branch and
+    ``_subscript_assign_keys``.
+
+    SCOPE: these are the keys the MERGE adds, not everything ``data`` carries.
+    The seed contributes the rejected candidate's own payload (its ``error`` /
+    ``error_code``), which is censused at ITS producer, so a reader must not
+    take this pin as "``data`` has exactly four keys" — it is "the merge adds
+    exactly these four, and never a fifth".
     """
     tree = _parse(TOOL_BATCH)
     fn = _function(tree, "run_tool_batch")
