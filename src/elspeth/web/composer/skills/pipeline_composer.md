@@ -321,9 +321,9 @@ credential fields YOU must wire; empty when there are none — an
 `options`). It holds one entry per distinct plugin the rejected components
 use. On a `set_pipeline` rejection, match each entry to every rejection whose
 `rejected_component` uses that plugin; on a single-component tool there is one
-entry: the plugin of the component you called it on. Read no other entry. A rejection with no schema entry (for example
-`plugin_not_installed`) is still a component to repair, from
-its `message`. `web_config_authority` tells you whether to author raw
+entry: the plugin of the component you called it on. Read no other entry. A
+rejection with no schema entry (for example `plugin_not_installed`) is still a
+component to repair, from its `message`. `web_config_authority` tells you whether to author raw
 `options` (`user_configurable` or `user_configurable_with_policy`) or to
 author `options.profile` instead and leave the plugin's own options alone
 (`operator_profiled`).
