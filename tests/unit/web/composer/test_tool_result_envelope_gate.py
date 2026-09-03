@@ -275,6 +275,32 @@ def _dict_literal_keys(
             yield from _dict_literal_keys(value.elts[0], path + "[].", site, constants)
 
 
+def _merged_mapping_keys(
+    argument: ast.AST,
+    *,
+    form: str,
+    where: str,
+    constants: dict[str, str],
+    path: Path | None,
+) -> Iterator[str]:
+    """Keys a mapping merged into a payload contributes: a dict literal, or a call to an owned TypedDict.
+
+    ``target.update(x)`` and ``target |= x`` are ONE operation (``dict.update``
+    and ``dict.__ior__`` both merge in place), so they read the same shapes and
+    refuse the same ones through this one helper. ``form`` names the syntax in
+    the refusal, because a merge the walker cannot read is a key shipped past
+    the census whichever syntax wrote it.
+    """
+    if isinstance(argument, ast.Dict):
+        yield from _dict_literal_keys(argument, "", where, constants)
+        return
+    if isinstance(argument, ast.Call):
+        assert path is not None, f"{where}: {form} needs the walked file to resolve the payload type"
+        yield from _typed_call_keys(argument, path, "", where)
+        return
+    raise AssertionError(f"{where}: {form} of {type(argument).__name__} is not a shape the walker reads")
+
+
 def _subscript_assign_keys(
     fn: ast.AST,
     target: str,
@@ -283,17 +309,27 @@ def _subscript_assign_keys(
     *,
     path: Path | None = None,
 ) -> Iterator[tuple[str, int]]:
-    """``target["key"] = ...`` and ``target.update(...)`` statements inside ``fn``: (key, lineno), in source order.
+    """``target["key"] = ...``, ``target.update(...)`` and ``target |= ...`` inside ``fn``: (key, lineno), in source order.
 
     ``ast.walk`` is breadth-first, so nested assignments would otherwise come
     out after their later siblings and the emission-order pins would lie.
 
-    The ``.update`` argument is read as a dict literal or as a call to an owned
-    TypedDict (``path`` resolves the class nominally, ADR-032). Every other
-    shape REFUSES: an update the walker cannot read used to be skipped
-    silently whenever it had no positional argument, which is a key shipped
-    past the census (red-team RED-R3-3, the sibling of the ``dict(...)`` arm
-    below).
+    The merged argument — ``.update``'s or ``|=``'s — is read as a dict literal
+    or as a call to an owned TypedDict (``path`` resolves the class nominally,
+    ADR-032). Every other shape REFUSES: an update the walker cannot read used
+    to be skipped silently whenever it had no positional argument, which is a
+    key shipped past the census (red-team RED-R3-3, the sibling of the
+    ``dict(...)`` arm below).
+
+    ``|=`` is read HERE, in the walker every payload path already funnels
+    through, rather than in each of them: this one arm covers ``to_dict``'s
+    envelope (``_envelope_sites``), the applied-component echo, the failure
+    helpers' owner branch and every per-tool ``data=`` local (``_expr_keys``).
+    All four were blind to it — measured, four surviving mutants, one of them
+    an ENVELOPE key added by ``result |= {...}`` that left the census at 341
+    rows (red-team RED2-1, mutants A2d / A1 / C1 and E1). Only ``|=`` merges: a
+    ``+=`` or ``&=`` on a payload name is refused by op, since neither ships
+    keys a reader could act on and ``dict`` has no ``__iadd__`` at all.
     """
     found: list[tuple[str, int]] = []
     for node in ast.walk(fn):
@@ -303,18 +339,23 @@ def _subscript_assign_keys(
                 key = _key_of(tgt.slice, constants, f"{site}:{node.lineno}")
                 assert not _is_cast(node.value), f"{site}:{node.lineno}: cast(...) hides the shape of {key}"
                 found.append((key, node.lineno))
+        if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id == target:
+            where = f"{site}:{node.lineno}"
+            assert isinstance(node.op, ast.BitOr), (
+                f"{where}: {target} is augmented by {type(node.op).__name__}, which is not a mapping merge — only |= merges keys into a dict"
+            )
+            form = f"{target} |= ..."
+            found.extend(
+                (key, node.lineno) for key in _merged_mapping_keys(node.value, form=form, where=where, constants=constants, path=path)
+            )
         is_update = isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "update"
         if is_update and isinstance(node.func.value, ast.Name) and node.func.value.id == target:
             where = f"{site}:{node.lineno}"
             assert len(node.args) == 1 and not node.keywords, f"{where}: {target}.update(...) takes exactly one positional mapping"
-            argument = node.args[0]
-            if isinstance(argument, ast.Dict):
-                found.extend((key, node.lineno) for key in _dict_literal_keys(argument, "", where, constants))
-            elif isinstance(argument, ast.Call):
-                assert path is not None, f"{where}: {target}.update(<call>) needs the walked file to resolve the payload type"
-                found.extend((key, node.lineno) for key in _typed_call_keys(argument, path, "", where))
-            else:
-                raise AssertionError(f"{where}: {target}.update({type(argument).__name__}) is not a shape the walker reads")
+            form = f"{target}.update(...)"
+            found.extend(
+                (key, node.lineno) for key in _merged_mapping_keys(node.args[0], form=form, where=where, constants=constants, path=path)
+            )
     yield from sorted(found, key=lambda item: item[1])
 
 
@@ -369,8 +410,15 @@ _DICT_MUTATORS = frozenset({"update", "setdefault", "pop", "popitem", "clear", "
 
 def _dict_mutations(fn: ast.AST, aliases: frozenset[str], results: frozenset[str]) -> list[tuple[int, str]]:
     """(lineno, form) of every statement that can re-shape the dict behind ``aliases``: a subscript
-    store, augmented store, or ``del`` on an alias or on a result's ``.data``, and any mutator
-    method call (``update``, ``setdefault``, ``pop``, ...) on either. Source order."""
+    store, augmented store, or ``del`` on an alias or on a result's ``.data``, an augmented store on
+    the alias ITSELF (``payload |= {...}`` is ``dict.__ior__``, an in-place merge, not a rebinding),
+    and any mutator method call (``update``, ``setdefault``, ``pop``, ...) on either. Source order.
+
+    The bare-name augmented store is what made the exactness pins reachable
+    past: the census now enumerates such a merge (``_subscript_assign_keys``),
+    but a pin that asserts "this ``.update`` is the ONLY mutation" reads THIS
+    walker, and without the arm ``feedback_data |= {...}`` was not a mutation
+    to it (red-team RED2-1, mutant A1)."""
 
     def referenced(node: ast.AST) -> ast.AST | None:
         """The alias or result ``.data`` a store target names, seeing THROUGH a ``cast(...)``.
@@ -393,7 +441,15 @@ def _dict_mutations(fn: ast.AST, aliases: frozenset[str], results: frozenset[str
         if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
             targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
             for target in targets:
-                store = referenced(target.value) if isinstance(target, ast.Subscript) else None
+                if isinstance(target, ast.Subscript):
+                    store = referenced(target.value)
+                elif isinstance(node, ast.AugAssign):
+                    # ``payload |= {...}`` mutates the SAME object; a plain
+                    # ``payload = {...}`` rebinds the name and is a new payload
+                    # the assignment walkers read instead.
+                    store = referenced(target)
+                else:
+                    store = None
                 if store is not None:
                     found.append((node.lineno, f"{type(node).__name__} through {ast.unparse(store)}"))
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _DICT_MUTATORS:
@@ -546,6 +602,9 @@ def f():
     unrelated = {"k": 1}
     unrelated["k"] = 2
     cast(dict[str, int], unrelated)["k"] = 3
+    _q |= {"merged": "y"}
+    result.data |= {"merged_data": 1}
+    unrelated |= {"k": 4}
     return result
 """
 
@@ -577,11 +636,36 @@ def unreadable_empty():
     payload = {}
     payload.update()
     return payload
+
+
+def merged_literal():
+    payload = {}
+    payload |= {"merged": 1}
+    return payload
+
+
+def merged_typed_call():
+    payload = {}
+    payload |= _FullPipelineStatePayload(sources={}, nodes=[], outputs=[], edges=[], metadata={}, inspection={})
+    return payload
+
+
+def merged_unreadable():
+    payload = {}
+    other = {"success": True}
+    payload |= other
+    return payload
+
+
+def merged_by_the_wrong_operator():
+    payload = {}
+    payload += {"success": True}
+    return payload
 """
 
 
 def test_walker_reads_an_update_of_an_owned_typed_dict_and_refuses_every_other_shape() -> None:
-    """``target.update(...)`` is readable as a dict literal or an owned TypedDict call, and REFUSES otherwise.
+    """A merge into a payload — ``target.update(...)`` or ``target |= ...`` — is readable as a dict literal or an owned TypedDict call, and REFUSES otherwise.
 
     Before this, the arm required ``node.args`` and yielded nothing when the
     argument list was empty, so ``payload.update(other)`` was read as zero keys
@@ -590,6 +674,15 @@ def test_walker_reads_an_update_of_an_owned_typed_dict_and_refuses_every_other_s
     adjudicates (red-team RED-R3-3, the ``dict(...)`` sibling of the same
     shape). The TypedDict arm is what lets a payload be closed by its type at
     the merge site instead of by a walker chasing a dict literal.
+
+    ``|=`` is the same operation written differently (``dict.__ior__``) and was
+    read by nothing: four mutants merging a key into a payload that way left
+    the census at 341 rows and the gate green (red-team RED2-1). It reads the
+    identical shapes through ``_merged_mapping_keys``, so the two syntaxes
+    cannot drift apart, and every OTHER augmented operator on a payload name is
+    refused by op rather than read — ``payload += {...}`` is a runtime
+    ``TypeError`` on a dict, so reading keys from it would report a wire that
+    cannot exist.
     """
     tree = ast.parse(_PROBE_UPDATE_SHAPES)
     keys = [k for k, _ in _subscript_assign_keys(_function(tree, "typed_call"), "payload", "probe", {}, path=COMMON)]
@@ -597,13 +690,17 @@ def test_walker_reads_an_update_of_an_owned_typed_dict_and_refuses_every_other_s
     assert keys == list(typing.get_type_hints(common._FullPipelineStatePayload)), (
         "the CALL orders the wire; the pin holds it equal to the class's declaration order"
     )
+    assert [k for k, _ in _subscript_assign_keys(_function(tree, "merged_literal"), "payload", "probe", {}, path=COMMON)] == ["merged"]
+    assert [k for k, _ in _subscript_assign_keys(_function(tree, "merged_typed_call"), "payload", "probe", {}, path=COMMON)] == keys
 
     for fn_name, expected in (
         ("unreadable_name", "is not a shape the walker reads"),
         ("unreadable_kwargs", "takes exactly one positional mapping"),
         ("unreadable_empty", "takes exactly one positional mapping"),
+        ("merged_unreadable", "is not a shape the walker reads"),
+        ("merged_by_the_wrong_operator", "only |= merges keys into a dict"),
     ):
-        with pytest.raises(AssertionError, match=expected):
+        with pytest.raises(AssertionError, match=re.escape(expected)):
             list(_subscript_assign_keys(_function(tree, fn_name), "payload", "probe", {}, path=COMMON))
 
 
@@ -637,30 +734,19 @@ def owner_from_a_call():
 
 
 def _probe_owner_keys(fn_name: str) -> list[str]:
-    """Run ``_failure_data_sites``' owner branch over one probe function.
+    """Run ``_failure_data_sites``' owner branch — the SAME function, not a copy — over one probe function.
 
-    The branch is inlined here rather than reached through ``_FAILURE_DATA_HELPERS``
-    because that tuple names LIVE helpers; a parked probe row would be a curated
-    input a reviewer cannot check (the reason c1f1d4622 gave for monkeypatching
-    instead of parking).
+    The branch is reached through ``_owner_assignment_keys`` rather than through
+    ``_FAILURE_DATA_HELPERS`` because that tuple names LIVE helpers; a parked
+    probe row would be a curated input a reviewer cannot check (the reason
+    c1f1d4622 gave for monkeypatching instead of parking).
+
+    It used to re-implement the branch here instead, which is a pin passing on
+    its own copy: deleting either ``dict(...)`` refusal from the walker left the
+    whole gate file green, 34 passed exit 0 (seat-fix-r4, mutants P1/P2).
     """
     fn = _function(ast.parse(_PROBE_OWNER_SHAPES), fn_name)
-    keys: list[str] = []
-    for node in ast.walk(fn):
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        if not any(isinstance(t, ast.Name) and t.id == "data" for t in targets):
-            continue
-        where = f"probe:{node.lineno}"
-        if isinstance(node.value, ast.Dict):
-            keys.extend(_dict_literal_keys(node.value, "data.", where, {}))
-        elif isinstance(node.value, ast.Call) and _call_name(node.value) == "dict":
-            assert not node.value.keywords, f"{where}: dict(..., **kwargs) adds keys the census cannot see"
-            assert len(node.value.args) == 1, f"{where}: dict(...) re-wraps exactly one seed"
-        else:
-            raise AssertionError(f"{where}: data = {type(node.value).__name__} is not a shape the walker reads")
-    return keys
+    return [key for key, _ in _owner_assignment_keys(fn, "data", "probe", {}, prefix="data.").keys]
 
 
 def test_failure_owner_assignment_refuses_every_rhs_it_cannot_read() -> None:
@@ -768,9 +854,15 @@ def test_walker_finds_stores_through_local_and_result_aliases() -> None:
     """Alias stores re-shape the same dict object (GATE-refute1-2 F-1: ``_p = payload;
     _p["success"] = "true"`` survived the R5 pin). The alias walk follows ``a = payload``
     chains and the locals bound to the ``ToolResult(data=payload)`` call, and reports every
-    store, ``del`` and mutator call through any of them — including one hidden behind a
-    ``cast(...)`` widening (verify-gate VG-F1, mutant P5) — and nothing through an unrelated
-    dict, cast or not."""
+    store, ``del``, mutator call and augmented merge through any of them — including one
+    hidden behind a ``cast(...)`` widening (verify-gate VG-F1, mutant P5) — and nothing
+    through an unrelated dict, cast or merge.
+
+    ``_q |= {...}`` and ``result.data |= {...}`` are the arm red-team RED2-1
+    (mutant A1) measured missing: ``dict.__ior__`` re-shapes the payload in
+    place, but the walker only looked at SUBSCRIPT targets, so the exactness
+    pins that read it — "this ``.update`` is the only mutation of the rejection
+    payload" — held while a fifth key was merged in one line below."""
     fn = _function(ast.parse(_PROBE_ALIAS_STORES), "f")
     call = next(node for node in ast.walk(fn) if isinstance(node, ast.Call) and _call_name(node) == "ToolResult")
     payload = next(kw.value for kw in call.keywords if kw.arg == "data")
@@ -785,6 +877,8 @@ def test_walker_finds_stores_through_local_and_result_aliases() -> None:
         (11, "Delete through _p"),
         (12, "Assign through _p"),
         (13, "Assign through result.data"),
+        (17, "AugAssign through _q"),
+        (18, "AugAssign through result.data"),
     ]
     # The direct-name walker is blind to every one of them: the reason the alias walk exists.
     assert list(_subscript_assign_keys(fn, "payload", "probe", {})) == []
@@ -960,6 +1054,55 @@ def _typed_call_keys(call: ast.Call, path: Path, prefix: str, site: str) -> Iter
         yield f"{prefix}{kw.arg}"
 
 
+class _OwnerAssignments(NamedTuple):
+    """What the statements BINDING a payload local ship: their (key, lineno) pairs, and how many bindings were read.
+
+    A bare ``dict(<seed>)`` re-wrap ships no key of its own, so ``bindings`` —
+    never the key list — is what says the walker found the payload rather than
+    walking a name that has moved.
+    """
+
+    keys: list[tuple[str, int]]
+    bindings: int
+
+
+def _owner_assignment_keys(fn: ast.AST, owner: str, site: str, constants: dict[str, str], *, prefix: str) -> _OwnerAssignments:
+    """Keys the assignments binding ``owner`` inside ``fn`` ship, in source order.
+
+    Two readable shapes: a dict literal, and a bare ``dict(<seed>)`` re-wrap
+    whose seed is a result's own data (counted at ITS producer, so the re-wrap
+    adds nothing). Every other RHS refuses by name — ``dict(<seed>, key=value)``
+    and ``dict(**kwargs)`` each add a key at the re-wrap that the walker never
+    reported (red-team RED-R3-3, mutant G3). A later MERGE into ``owner``
+    (``owner["k"] = ...``, ``.update(...)``, ``|=``) is read by
+    ``_subscript_assign_keys``, which the same caller runs.
+
+    One function, called by ``_failure_data_sites`` AND by the probe that
+    witnesses it. The probe used to inline a copy of this branch, so deleting
+    either ``dict(...)`` refusal from the walker left the whole gate file green
+    — the pin passed on its own copy (measured, mutants P1/P2 of seat-fix-r4).
+    """
+    keys: list[tuple[str, int]] = []
+    bindings = 0
+    for node in ast.walk(fn):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(isinstance(t, ast.Name) and t.id == owner for t in targets):
+            continue
+        where = f"{site}:{node.lineno}"
+        if isinstance(node.value, ast.Dict):
+            bindings += 1
+            keys.extend((key, node.lineno) for key in _dict_literal_keys(node.value, prefix, where, constants))
+        elif isinstance(node.value, ast.Call) and _call_name(node.value) == "dict":
+            assert not node.value.keywords, f"{where}: dict(..., **kwargs) adds keys the census cannot see"
+            assert len(node.value.args) == 1, f"{where}: dict(...) re-wraps exactly one seed"
+            bindings += 1
+        else:
+            raise AssertionError(f"{where}: {owner} = {type(node.value).__name__} is not a shape the walker reads")
+    return _OwnerAssignments(sorted(keys, key=lambda item: item[1]), bindings)
+
+
 def _failure_data_sites() -> Iterator[ShippedKey]:
     for path, fn_name, owner in _FAILURE_DATA_HELPERS:
         tree = _parse(path)
@@ -968,26 +1111,10 @@ def _failure_data_sites() -> Iterator[ShippedKey]:
         site = f"{_display(path)}:{fn.lineno}"
         found = False
         if owner is not None:
-            for node in ast.walk(fn):
-                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                    continue
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                if any(isinstance(t, ast.Name) and t.id == owner for t in targets):
-                    where = f"{site}:{node.lineno}"
-                    if isinstance(node.value, ast.Dict):
-                        found = True
-                        for key in _dict_literal_keys(node.value, "data.", where, constants):
-                            yield ShippedKey("failure-data", SHARED, key, f"{_display(path)}:{node.lineno}")
-                    elif isinstance(node.value, ast.Call) and _call_name(node.value) == "dict":
-                        # ``dict(<seed>)`` — the seed is a result's own data, counted at its producer.
-                        # The bare re-wrap is the ONLY readable form: ``dict(<seed>, key=value)``
-                        # and ``dict(**kwargs)`` each add keys here that the census would never
-                        # see, and both were silently accepted (red-team RED-R3-3, mutant G3).
-                        assert not node.value.keywords, f"{where}: dict(..., **kwargs) adds keys the census cannot see"
-                        assert len(node.value.args) == 1, f"{where}: dict(...) re-wraps exactly one seed"
-                        found = True
-                    else:
-                        raise AssertionError(f"{where}: {owner} = {type(node.value).__name__} is not a shape the walker reads")
+            owned = _owner_assignment_keys(fn, owner, site, constants, prefix="data.")
+            found = bool(owned.bindings)
+            for key, lineno in owned.keys:
+                yield ShippedKey("failure-data", SHARED, key, f"{_display(path)}:{lineno}")
             for key, lineno in _subscript_assign_keys(fn, owner, site, constants, path=path):
                 found = True
                 yield ShippedKey("failure-data", SHARED, f"data.{key}", f"{_display(path)}:{lineno}")
