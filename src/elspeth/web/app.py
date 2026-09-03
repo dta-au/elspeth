@@ -99,6 +99,7 @@ from elspeth.web.external_state_startup import (
 from elspeth.web.external_state_startup import (
     validate_only_schema_or_raise as validate_external_schema_or_raise,
 )
+from elspeth.web.key_derivation import derive_binding_generation_key, derive_user_secret_master_key
 from elspeth.web.landscape_access import open_landscape_db
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.middleware.request_id import RequestIdMiddleware
@@ -1397,7 +1398,10 @@ def _create_app(
     )
 
     # --- Secret service ---
-    user_secret_store = UserSecretStore(session_engine, settings.secret_key)
+    # Purpose-derived, not the raw secret_key: see web/key_derivation.py. This
+    # value decrypts every stored user secret, so it is bound to the epoch
+    # window in which the sessions store is recreated.
+    user_secret_store = UserSecretStore(session_engine, derive_user_secret_master_key(settings.secret_key))
     server_secret_store = ServerSecretStore(settings.server_secret_allowlist)
     app.state.user_secret_store = user_secret_store
     app.state.server_secret_store = server_secret_store
@@ -1413,7 +1417,7 @@ def _create_app(
         secret_service=app.state.secret_service,
         server_store=server_secret_store,
         user_store=user_secret_store,
-        generation_key=settings.secret_key.encode("utf-8"),
+        generation_key=derive_binding_generation_key(settings.secret_key),
     )
 
     # Interpretation-resolution state writes persist the full runtime-preflight
