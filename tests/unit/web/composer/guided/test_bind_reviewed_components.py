@@ -1670,11 +1670,20 @@ def test_bind_selected_field_mapper_admits_only_public_option_edits() -> None:
     }
 
 
-def test_bind_selected_llm_preserves_withheld_profile_prompt_schema_and_options() -> None:
+def test_bind_selected_llm_overlays_the_published_prompt_and_preserves_withheld_options() -> None:
+    """A node-scoped correction on an llm node may change exactly what the
+    review card publishes for it — model, system prompt, prompt template
+    (I-2, design review 2026-09-02) — and nothing else: the withheld profile,
+    response field and schema come back from the predecessor whatever the
+    candidate says. Until I-2 the llm allowlist was empty, so a correction
+    could not touch the prompt at all; the card's "Edit prompt" routes a
+    correction here, and this is the seam that makes it real."""
     predecessor = _correction_predecessor()
     candidate = _planner_correction_candidate()
     selected = candidate["nodes"][1]
     selected["input"] = "revised_high_value_rows"
+    selected["options"]["prompt_template"] = "Summarize {row[amount]} in two sentences."
+    selected["options"]["system_prompt"] = "You are a careful reviewer."
 
     bound = bind_guided_reviewed_components(
         candidate,
@@ -1686,8 +1695,45 @@ def test_bind_selected_llm_preserves_withheld_profile_prompt_schema_and_options(
         ),
     )
 
+    before = predecessor.to_dict()["nodes"][1]["options"]
     assert bound["nodes"][1]["input"] == "revised_high_value_rows"
-    assert bound["nodes"][1]["options"] == predecessor.to_dict()["nodes"][1]["options"]
+    assert bound["nodes"][1]["options"] == {
+        **before,
+        "prompt_template": "Summarize {row[amount]} in two sentences.",
+        "system_prompt": "You are a careful reviewer.",
+    }
+    # The candidate's invented profile and response field never land.
+    assert bound["nodes"][1]["options"]["profile"] == "task-role"
+    assert bound["nodes"][1]["options"]["response_field"] == "summary"
+
+
+def test_bind_selected_llm_correction_that_omits_a_published_key_drops_it() -> None:
+    """The published keys are overlaid as a set: a correction candidate that
+    omits the system prompt removes the predecessor's, exactly as a
+    field_mapper correction that omits ``select_only`` does. Withheld keys
+    are untouched by the omission."""
+    predecessor = _correction_predecessor()
+    candidate = _planner_correction_candidate()
+    candidate["nodes"][1]["options"] = {
+        "profile": "invented-profile",
+        "prompt_template": "Summarize {row[amount]} in two sentences.",
+        "response_field": "replacement",
+        "schema": {"mode": "observed"},
+    }
+
+    bound = bind_guided_reviewed_components(
+        candidate,
+        _guided(),
+        predecessor=predecessor,
+        correction_target=_node_correction_target(
+            "summarize_standard",
+            stable_id="55555555-5555-4555-8555-555555555555",
+        ),
+    )
+
+    before = predecessor.to_dict()["nodes"][1]["options"]
+    assert "system_prompt" not in before
+    assert bound["nodes"][1]["options"] == {**before, "prompt_template": "Summarize {row[amount]} in two sentences."}
 
 
 def test_bind_rejects_selected_node_identity_replacement() -> None:
@@ -2865,6 +2911,46 @@ def test_node_patch_overlays_gate_condition_without_reauthoring_hidden_routes() 
     assert bound["nodes"][0]["options"] == before["options"]
 
 
+def test_node_patch_overlays_llm_prompt_without_reauthoring_withheld_options() -> None:
+    """The node-patch delta route of the same correction (I-2): the advertised
+    patch schema admits exactly the published llm keys, so a prompt patch
+    lands on the reviewed node while the withheld profile, response field and
+    schema are carried from the predecessor; a patch naming a withheld key is
+    refused as an authority violation."""
+    predecessor = _correction_predecessor()
+    stable_id = "55555555-5555-4555-8555-555555555555"
+    target = _public_node_correction_target(
+        "summarize_standard",
+        stable_id=stable_id,
+        node_type="transform",
+        plugin="llm",
+        behavior={"kind": "transform"},
+    )
+
+    bound = materialize_guided_authorized_candidate(
+        {
+            "node_patch": {"stable_id": stable_id, "options": {"prompt_template": "Summarize {row[amount]} in two sentences."}},
+            "edges": [],
+        },
+        authority=target,
+        guided=_guided(),
+        current_state=predecessor,
+    )
+
+    before = predecessor.to_dict()["nodes"][1]["options"]
+    assert bound["nodes"][1]["options"] == {**before, "prompt_template": "Summarize {row[amount]} in two sentences."}
+    assert bound["nodes"][1]["input"] == "high_value"
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        materialize_guided_authorized_candidate(
+            {"node_patch": {"stable_id": stable_id, "options": {"profile": "invented-profile"}}, "edges": []},
+            authority=target,
+            guided=_guided(),
+            current_state=predecessor,
+        )
+    assert raised.value.error_code == "guided_delta_authority_violation"
+
+
 def test_node_patch_overlays_coalesce_policy_without_reauthoring_hidden_branches() -> None:
     predecessor = _coalesce_correction_predecessor()
     stable_id = "77777777-7777-4777-8777-777777777777"
@@ -3955,3 +4041,106 @@ def test_bind_prose_amend_records_unidentifiable_node_entry_as_malformed(malform
     # topology either: it is neither an existing reconstruction nor an
     # admissible added node.
     assert malformed_entry not in result.pipeline["nodes"]
+
+
+# ---------------------------------------------------------------------------
+# Display-only options are never a correction authority (red-team F1, 2026-09-02)
+# ---------------------------------------------------------------------------
+
+_WEB_SCRAPE_STABLE_ID = "88888888-8888-4888-8888-888888888888"
+
+
+def _web_scrape_predecessor() -> CompositionState:
+    """A reviewed web_scrape node whose ``http`` object carries the SSRF policy
+    beside the two identity members the card renders."""
+    http = {
+        "abuse_contact": "ops@example.org",
+        "scraping_reason": "catalogue refresh",
+        "allowed_hosts": "public_only",
+        "timeout": 30,
+        "max_body_bytes": 1_000_000,
+    }
+    return CompositionState(
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="scrape",
+                options={"path": "blob:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="scrape",
+                node_type="transform",
+                plugin="web_scrape",
+                input="scrape",
+                on_success="output",
+                on_error="discard",
+                options={"url_field": "url", "http": http, "schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(OutputSpec(name="output", plugin="json", options={"path": "rows.jsonl"}, on_write_failure="discard"),),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def test_node_patch_cannot_touch_the_display_only_http_object() -> None:
+    """The card shows web_scrape's contact and reason from the ``http`` object,
+    but that object also holds the SSRF host allowlist, timeout and body cap.
+    It lives in the DISPLAY-ONLY table, so the node-patch schema advertises
+    no ``http`` member and a patch naming it is refused as an authority
+    violation — the policy can never be rewritten behind an unchanged card."""
+    predecessor = _web_scrape_predecessor()
+    target = _public_node_correction_target(
+        "scrape",
+        stable_id=_WEB_SCRAPE_STABLE_ID,
+        node_type="transform",
+        plugin="web_scrape",
+        behavior={"kind": "transform"},
+    )
+
+    schema = guided_authorized_pipeline_schema(_guided(), correction_target=target)["properties"]["node_patch"]
+    # No correctable keys at all: the patch schema advertises no options
+    # member for web_scrape, so there is nothing for a provider to name.
+    assert "options" not in schema["properties"]
+
+    hostile_http = {
+        "abuse_contact": "ops@example.org",
+        "scraping_reason": "catalogue refresh",
+        "allowed_hosts": "allow_private",
+        "timeout": 1,
+        "max_body_bytes": 1,
+    }
+    delta = {"node_patch": {"stable_id": _WEB_SCRAPE_STABLE_ID, "options": {"http": hostile_http}}, "edges": []}
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        materialize_guided_authorized_candidate(delta, authority=target, guided=_guided(), current_state=predecessor)
+    assert raised.value.error_code == "guided_delta_authority_violation"
+
+
+def test_full_candidate_correction_that_omits_http_keeps_the_reviewed_block() -> None:
+    """A full-candidate node correction overlays only the correctable keys.
+    ``http`` is display-only, so a candidate that restates the node without
+    it neither deletes nor rewrites the reviewed block: it comes back from
+    the predecessor intact, policy included."""
+    predecessor = _web_scrape_predecessor()
+    candidate = predecessor.to_dict()
+    candidate.pop("version")
+    candidate["nodes"][0]["options"] = {"url_field": "url", "schema": {"mode": "observed"}}
+
+    bound = bind_guided_reviewed_components(
+        candidate,
+        _guided(),
+        predecessor=predecessor,
+        correction_target=_node_correction_target("scrape", stable_id=_WEB_SCRAPE_STABLE_ID),
+    )
+
+    assert bound["nodes"][0]["options"]["http"] == predecessor.to_dict()["nodes"][0]["options"]["http"]

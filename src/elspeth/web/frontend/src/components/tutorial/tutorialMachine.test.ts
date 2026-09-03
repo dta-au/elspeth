@@ -138,6 +138,32 @@ describe("isAbandonOnPageHide", () => {
   });
 });
 
+describe("tutorialReducer run stage (I-1: the run never auto-fires)", () => {
+  it("guidedCompleted lands on the run stage with no run identity", () => {
+    const run = tutorialReducer(
+      { ...initialTutorialState, step: "guided" },
+      { type: "guidedCompleted", sessionId: "sess-123" },
+    );
+    expect(run.step).toBe("run");
+    expect(run.runId).toBeNull();
+  });
+
+  it("a resumed run stage without a run identity lands on the run stage", () => {
+    // Whether the reload happened before Run was clicked or mid-run, the
+    // persisted fields cannot tell the two apart (no run identity yet), and
+    // nothing may execute on the learner's behalf: the run turn waits for an
+    // explicit Run click, and Exit still cancels whatever may be running.
+    const state = resumeTutorialState({
+      stage: "run",
+      sessionId: "sess-1",
+      runId: null,
+      sourceDataHash: null,
+    });
+    expect(state.step).toBe("run");
+    expect(state.runId).toBeNull();
+  });
+});
+
 describe("tutorialReducer runResultReady", () => {
   it("records the run identity without leaving the run step", () => {
     const run: TutorialState = {

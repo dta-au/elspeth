@@ -45,7 +45,8 @@ the same Composer state and validators.
 
 | Concept or endpoint | Purpose |
 |---|---|
-| `POST /guided/start` | Creates or resumes a guided session entry point and seeds the closed-enum `WorkflowProfile`. |
+| `POST /guided/start` | Creates or resumes a guided session entry point, seeds the closed-enum `WorkflowProfile`, and records the author's required `intent` as the session's durable root goal. |
+| `POST /guided/convert` | Moves a freeform session into a fresh guided wizard; also requires an `intent`, and 409s `guided_already_started` on a session that is already guided. |
 | `WorkflowProfile` | Distinguishes normal guided sessions from tutorial-guided sessions; tutorial profile state is stripped on fork. |
 | `/guided/chat` | Applies the operator's stage instruction through the source, sink, transform, or wiring driver. |
 | `STEP_4_WIRE` | Final guided stage that renders the proposed wiring and contract overlay. |

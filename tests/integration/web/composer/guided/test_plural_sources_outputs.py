@@ -15,11 +15,24 @@ from elspeth.web.sessions.models import composition_proposals_table, guided_oper
 from elspeth.web.sessions.routes.composer.guided_chat_atomic import _current_sink
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
+_GOAL_FIRST_INTENT = "Combine both uploads and write one JSON file per region"
+
 
 def _create_session(client: TestClient) -> str:
+    """Create a session rooted in a goal (goal-first, elspeth-378cfa0e18).
+
+    These walks all end at the Step-2 finish, which refuses without an intent.
+    """
+
     response = client.post("/api/sessions", json={"title": "plural source/output review"})
     assert response.status_code == 201, response.json()
-    return response.json()["id"]
+    session_id = response.json()["id"]
+    started = client.post(
+        f"/api/sessions/{session_id}/guided/start",
+        json={"profile": "live", "intent": _GOAL_FIRST_INTENT, "operation_id": str(uuid4())},
+    )
+    assert started.status_code == 200, started.json()
+    return session_id
 
 
 def _get(client: TestClient, session_id: str) -> dict:

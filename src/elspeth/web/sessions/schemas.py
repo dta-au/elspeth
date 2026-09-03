@@ -433,7 +433,22 @@ class GuidedPlanRequest(_GuidedOperationRequest):
 
 
 class ConvertGuidedRequest(_GuidedOperationRequest):
-    """Request body for POST /api/sessions/{id}/guided/convert."""
+    """Request body for POST /api/sessions/{id}/guided/convert.
+
+    ``intent`` is the author's goal for the converted session and is REQUIRED,
+    exactly as it is on ``StartGuidedRequest``: a conversion seeds a fresh
+    wizard, and a wizard with no root intent cannot reach the planner (the
+    Step-2 finish refuses with ``guided_planner_intent_required``). It is also
+    the durable root row the conversion writes, so it participates in the
+    canonical request hash the custody helpers re-derive.
+    """
+
+    intent: str = pydantic.Field(min_length=1, max_length=4096)
+
+    @field_validator("intent")
+    @classmethod
+    def _validate_intent(cls, value: str) -> str:
+        return _require_visible_content(value, field_label="Guided intent")
 
 
 class ReenterGuidedRequest(_GuidedOperationRequest):

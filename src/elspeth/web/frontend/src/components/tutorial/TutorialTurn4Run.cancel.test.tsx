@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "@/api/client";
+import { TURN_4_RUN_BUTTON } from "./copy";
 import { TutorialTurn4Run } from "./TutorialTurn4Run";
 
 vi.mock("@/api/client", () => ({
@@ -10,6 +11,11 @@ vi.mock("@/api/client", () => ({
 }));
 
 function noop(): void {}
+
+/** The learner's explicit Run gesture (I-1): nothing runs on mount. */
+function clickRun(): void {
+  fireEvent.click(screen.getByRole("button", { name: TURN_4_RUN_BUTTON }));
+}
 
 // Distinct session ids per test: the StrictMode dedupe cache is module-level
 // and keyed by sessionId, so a reused id would replay a previous test's run.
@@ -40,8 +46,10 @@ describe("TutorialTurn4Run — honest cancel + rerun", () => {
         onCancelled={onCancelled}
       />,
     );
+    clickRun();
 
-    // The cancel affordance appears after the show-cancel delay.
+    // The cancel affordance appears after the show-cancel delay, which
+    // starts at the Run click — not at mount.
     act(() => {
       vi.advanceTimersByTime(5_000);
     });
@@ -70,6 +78,7 @@ describe("TutorialTurn4Run — honest cancel + rerun", () => {
         onCancelled={onCancelled}
       />,
     );
+    clickRun();
 
     await waitFor(() => expect(onCancelled).toHaveBeenCalledTimes(1));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -90,6 +99,7 @@ describe("TutorialTurn4Run — honest cancel + rerun", () => {
         onCancelled={onCancelled}
       />,
     );
+    clickRun();
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(/still finishing/i);
@@ -113,6 +123,7 @@ describe("TutorialTurn4Run — honest cancel + rerun", () => {
         onCancelled={noop}
       />,
     );
+    clickRun();
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "pipeline exploded",

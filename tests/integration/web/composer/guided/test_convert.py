@@ -14,14 +14,22 @@ wizard as a NEW composition-state version. The prior freeform pipeline stays
 reachable via GET /state/versions + POST /state/revert — the same
 recoverability contract as YAML import — so nothing is lost.
 
+Goal-first (elspeth-378cfa0e18): the conversion now REQUIRES the author's goal
+and writes it as the session's durable root intent, under its own
+``guided_convert`` operation kind, in the same transaction as the checkpoint.
+
 Branch behaviour:
-  * no persisted state (empty session)         -> persist a fresh schema-8 wizard
-                                                  with an immutable replay locator
-  * guided_session already present             -> idempotent: return it UNCHANGED,
-                                                  including any terminal
+  * no persisted state (empty session)         -> persist a fresh schema-8 wizard,
+                                                  rooted in the goal, with an
+                                                  immutable replay locator
+  * guided_session already present             -> 409 ``guided_already_started``:
+                                                  the session cannot adopt this
+                                                  request's goal, and returning it
+                                                  unchanged would discard it
   * persisted state, guided_session is None    -> THE CONVERSION: reseed a fresh
-                                                  wizard as a new version; the prior
-                                                  freeform version is recoverable
+                                                  rooted wizard as a new version;
+                                                  the prior freeform version is
+                                                  recoverable
 """
 
 from __future__ import annotations
@@ -32,12 +40,17 @@ from dataclasses import replace
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
+import pytest
+from sqlalchemy import select
+
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.composer.guided.protocol import GUIDED_GOAL_ACKNOWLEDGEMENT
 from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalState
 from elspeth.web.sessions.guided_operations import guided_operation_request_hash
 from elspeth.web.sessions.guided_replay import load_guided_json_payload
+from elspeth.web.sessions.models import guided_operations_table
 from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationCompleted, GuidedOperationSettlementConflictError
 from elspeth.web.sessions.schemas import ConvertGuidedRequest
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
@@ -47,6 +60,10 @@ from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 # ---------------------------------------------------------------------------
 
 
+_START_INTENT = "Summarize each page and save the summaries as JSON"
+_CONVERT_INTENT = "Turn the uploaded CSV into a per-region summary"
+
+
 def _create_session(client: TestClient, *, profile: str | None = None) -> str:
     resp = client.post("/api/sessions", json={"title": "convert-test"})
     assert resp.status_code == 201, resp.json()
@@ -54,7 +71,7 @@ def _create_session(client: TestClient, *, profile: str | None = None) -> str:
     if profile is not None:
         start = client.post(
             f"/api/sessions/{session_id}/guided/start",
-            json={"profile": profile, "operation_id": str(uuid4())},
+            json={"profile": profile, "intent": _START_INTENT, "operation_id": str(uuid4())},
         )
         assert start.status_code == 200, start.json()
     return session_id
@@ -63,7 +80,7 @@ def _create_session(client: TestClient, *, profile: str | None = None) -> str:
 def _convert_raw(client: TestClient, session_id: str, *, operation_id: str | None = None) -> object:
     return client.post(
         f"/api/sessions/{session_id}/guided/convert",
-        json={"operation_id": operation_id or str(uuid4())},
+        json={"operation_id": operation_id or str(uuid4()), "intent": _CONVERT_INTENT},
     )
 
 
@@ -74,7 +91,7 @@ def _convert(client: TestClient, session_id: str) -> dict:
 
 
 def _convert_outcome(client: TestClient, session_id: str, operation_id: str) -> GuidedOperationCompleted:
-    request = ConvertGuidedRequest(operation_id=operation_id)
+    request = ConvertGuidedRequest(operation_id=operation_id, intent=_CONVERT_INTENT)
     request_hash = guided_operation_request_hash(
         session_id=UUID(session_id),
         kind="guided_convert",
@@ -270,35 +287,83 @@ class TestConvertFreeformWithWork:
 
 
 # ---------------------------------------------------------------------------
-# Branch 2 — idempotency + terminal fidelity
+# Branch 2 — an already-guided session refuses, it does not absorb the goal
 # ---------------------------------------------------------------------------
 
 
-class TestConvertIdempotent:
-    def test_convert_on_active_guided_returns_it_unchanged(self, composer_test_client: TestClient) -> None:
-        """Convert on an existing schema-8 checkpoint settles against that state."""
+class TestConvertAlreadyStarted:
+    def test_convert_on_active_guided_refuses_instead_of_discarding_the_goal(self, composer_test_client: TestClient) -> None:
+        """Branch 2 answers a coded 409 and changes nothing.
+
+        Before goal-first this branch returned the existing session unchanged,
+        which was harmless when convert carried no payload. Now it carries the
+        author's goal, and "return the existing session" would mean accepting a
+        goal and silently dropping it. The client's GET-first probe makes this
+        reachable only in a cross-tab race, where the loser refetches.
+        """
+
         client = composer_test_client
         session_id = _create_session(client, profile="tutorial")
         before = client.get(f"/api/sessions/{session_id}/guided")
         assert before.status_code == 200, before.json()
 
-        body = _convert(client, session_id)
-        assert body == before.json()
-        # Branch 2 must REBUILD and return the live turn for a non-terminal step,
-        # exactly like GET /guided (elspeth-e2c3dba6b5 review P2). A double-click
-        # / cross-tab race lands the second "Switch to guided" here; if it returns
-        # next_turn=None the frontend keeps guidedSession but drops guidedNextTurn,
-        # isGuidedBuildActive goes false, and ChatPanel falls back to freeform.
-        assert body["next_turn"] is not None, "idempotent convert on a non-terminal step must return the current turn, not null"
+        response = _convert_raw(client, session_id)
 
-    def test_convert_on_completed_session_returns_completed_terminal(self, composer_test_client: TestClient) -> None:
-        """Branch 2 must return a non-exit terminal faithfully.
+        assert response.status_code == 409, response.json()
+        assert response.json()["detail"]["code"] == "guided_already_started"
+        # Nothing moved: no new version, no goal row, and — because the branch
+        # is classified before the reservation — no retry artefact either.
+        after = client.get(f"/api/sessions/{session_id}/guided")
+        assert after.status_code == 200
+        assert after.json() == before.json()
+        versions = asyncio.run(client.app.state.session_service.get_state_versions(UUID(session_id)))
+        assert [version.version for version in versions] == [1]
+        with client.app.state.session_engine.connect() as conn:
+            assert (
+                conn.execute(
+                    select(guided_operations_table.c.operation_id).where(
+                        guided_operations_table.c.session_id == session_id,
+                        guided_operations_table.c.kind == "guided_convert",
+                    )
+                ).all()
+                == []
+            )
+        user_messages = [
+            message.content for message in asyncio.run(client.app.state.session_service.get_messages(UUID(session_id), limit=None))
+        ]
+        assert _CONVERT_INTENT not in user_messages
 
-        enterGuided routes completed / solver-exhausted / protocol-violation
-        terminals through convert (only exited_to_freeform goes to reenter), and
-        ChatPanel renders the CompletionSummary off ``terminal.kind ==
-        'completed'``. If convert dropped or reseeded the terminal the completed
-        surface would vanish.
+    def test_convert_same_operation_id_still_replays_a_settled_conversion(self, composer_test_client: TestClient) -> None:
+        """The 409 is for a NEW operation id; a retry of a settled one replays.
+
+        The replay lookup runs before the branch, so a client that re-sends the
+        same conversion after a dropped response still gets its own settled
+        session rather than the conflict.
+        """
+
+        client = composer_test_client
+        session_id = _create_session(client)
+        _seed_freeform_state_with_work(client, session_id)
+        operation_id = str(uuid4())
+
+        first = _convert_raw(client, session_id, operation_id=operation_id)
+        assert first.status_code == 200, first.json()
+        replay = _convert_raw(client, session_id, operation_id=operation_id)
+
+        assert replay.status_code == 200, replay.json()
+        assert replay.json() == first.json()
+        fresh = _convert_raw(client, session_id)
+        assert fresh.status_code == 409, fresh.json()
+        assert fresh.json()["detail"]["code"] == "guided_already_started"
+
+    def test_convert_on_completed_session_also_refuses(self, composer_test_client: TestClient) -> None:
+        """A terminal guided session is still an already-started one.
+
+        ``enterGuided`` used to route completed / solver-exhausted /
+        protocol-violation terminals through convert to re-read them. Reading a
+        session is GET /guided's job; convert now only ever CREATES a rooted
+        one, so a terminal session takes the same coded refusal as an active
+        one and the client reads the terminal from GET.
         """
         client = composer_test_client
         session_id = _create_session(client, profile="tutorial")
@@ -331,14 +396,16 @@ class TestConvertIdempotent:
             )
         )
 
-        body = _convert(client, session_id)
-        assert body["terminal"] is not None
-        assert body["terminal"]["kind"] == "completed"
-        assert body["guided_session"]["terminal"]["kind"] == "completed"
-        # The turn/None contract's other half: a TERMINAL session has no live
-        # turn, so next_turn stays null (mirrors GET /guided). The non-terminal
-        # rebuild above and this null here together pin both branches.
-        assert body["next_turn"] is None
+        response = _convert_raw(client, session_id)
+
+        assert response.status_code == 409, response.json()
+        assert response.json()["detail"]["code"] == "guided_already_started"
+        # The terminal is still readable where it belongs — on GET /guided,
+        # which is what the client falls back to.
+        read_back = client.get(f"/api/sessions/{session_id}/guided")
+        assert read_back.status_code == 200, read_back.json()
+        assert read_back.json()["terminal"]["kind"] == "completed"
+        assert read_back.json()["next_turn"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -369,15 +436,98 @@ class TestConvertEmptySession:
         outcome = _convert_outcome(client, session_id, operation_id)
         assert str(outcome.result.state_id) == body["composition_state"]["id"]
 
-    def test_convert_requires_operation_id_before_persisting(self, composer_test_client: TestClient) -> None:
+    def test_convert_requires_operation_id_and_intent_before_persisting(self, composer_test_client: TestClient) -> None:
         client = composer_test_client
         session_id = _create_session(client)
 
-        response = client.post(f"/api/sessions/{session_id}/guided/convert", json={})
+        missing_both = client.post(f"/api/sessions/{session_id}/guided/convert", json={})
+        missing_intent = client.post(f"/api/sessions/{session_id}/guided/convert", json={"operation_id": str(uuid4())})
+        blank_intent = client.post(
+            f"/api/sessions/{session_id}/guided/convert",
+            json={"operation_id": str(uuid4()), "intent": "   "},
+        )
 
-        assert response.status_code == 422
+        assert missing_both.status_code == 422
+        assert missing_intent.status_code == 422
+        assert blank_intent.status_code == 422
         versions = client.get(f"/api/sessions/{session_id}/state/versions")
         assert versions.json() == []
+
+    def test_convert_roots_the_session_in_the_goal_and_seeds_the_transcript(self, composer_test_client: TestClient) -> None:
+        """The goal becomes a durable root row bound to the ``guided_convert`` operation.
+
+        Everything lands in ONE transaction: the checkpoint that names the root,
+        the ``route_user_message`` row itself, and the operation row's
+        ``originating_message_id`` binding that the custody helper re-derives
+        from. Without that binding the root row exists but no operation claims
+        it, and the failure only surfaces much later, at proposal staging, as
+        "absent or ambiguous start-operation authority".
+        """
+
+        client = composer_test_client
+        session_id = _create_session(client)
+        _seed_freeform_state_with_work(client, session_id)
+        operation_id = str(uuid4())
+
+        response = _convert_raw(client, session_id, operation_id=operation_id)
+
+        assert response.status_code == 200, response.json()
+        guided = response.json()["guided_session"]
+        assert [(turn["role"], turn["content"], turn["seq"], turn["step"]) for turn in guided["chat_history"]] == [
+            ("user", _CONVERT_INTENT, 0, "step_1_source"),
+            ("assistant", GUIDED_GOAL_ACKNOWLEDGEMENT, 1, "step_1_source"),
+        ]
+        assert guided["chat_turn_seq"] == 2
+
+        service = client.app.state.session_service
+        messages = asyncio.run(service.get_messages(UUID(session_id), limit=None))
+        roots = [message for message in messages if message.role == "user" and message.content == _CONVERT_INTENT]
+        assert len(roots) == 1
+        assert roots[0].writer_principal == "route_user_message"
+
+        with client.app.state.session_engine.connect() as conn:
+            rows = conn.execute(
+                select(
+                    guided_operations_table.c.kind,
+                    guided_operations_table.c.status,
+                    guided_operations_table.c.originating_message_id,
+                ).where(guided_operations_table.c.session_id == session_id)
+            ).all()
+        assert [(row.kind, row.status, row.originating_message_id) for row in rows] == [("guided_convert", "completed", str(roots[0].id))]
+
+        # The custody helper accepts a ``guided_convert`` root: it derives the
+        # operation kind from the row, not from a hardcoded "guided_start".
+        verified = asyncio.run(
+            service.get_verified_guided_root_intent(
+                session_id=UUID(session_id),
+                root_message_id=roots[0].id,
+            )
+        )
+        assert verified.content == _CONVERT_INTENT
+
+    def test_root_custody_refuses_a_user_row_no_start_operation_claims(self, composer_test_client: TestClient) -> None:
+        """Fail-closed: a plain user row is not a root intent just because it exists.
+
+        The custody helper's authority is the completed ``guided_start`` /
+        ``guided_convert`` row that NAMES the message, not the message itself.
+        Widening the helper to accept two operation kinds must not weaken that:
+        an ordinary chat row still has no start-operation authority.
+
+        (Content drift is not testable from here — ``chat_messages.content`` is
+        append-only at the database, so the hash re-derivation guards a row no
+        writer can rewrite in place.)
+        """
+
+        client = composer_test_client
+        session_id = _create_session(client)
+        response = _convert_raw(client, session_id)
+        assert response.status_code == 200, response.json()
+
+        service = client.app.state.session_service
+        unclaimed = asyncio.run(service.add_message(UUID(session_id), "user", "just a chat message", writer_principal="route_user_message"))
+
+        with pytest.raises(AuditIntegrityError, match="absent or ambiguous start-operation authority"):
+            asyncio.run(service.get_verified_guided_root_intent(session_id=UUID(session_id), root_message_id=unclaimed.id))
 
     def test_replay_uses_durable_turn_after_live_catalog_drift(self, composer_test_client: TestClient) -> None:
         """Completed conversion replay never rebuilds from mutable policy state."""

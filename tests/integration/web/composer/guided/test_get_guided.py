@@ -54,7 +54,9 @@ def _get_guided(client: TestClient, session_id: str) -> dict:
 def _start_guided(client: TestClient, session_id: str) -> dict:
     response = client.post(
         f"/api/sessions/{session_id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid4())},
+        # Goal-first (elspeth-378cfa0e18): the tutorial profile carries a goal
+        # through the same door every other profile does.
+        json={"profile": "tutorial", "intent": "Build the pipeline I describe.", "operation_id": str(uuid4())},
     )
     assert response.status_code == 200, response.json()
     return response.json()
@@ -790,10 +792,15 @@ class TestGetGuidedFullStateRebuild:
             f"Expected multi_select_with_custom but got {body['next_turn']['type']!r} — "
             "Codex #10 regression: GET /guided returned single_select instead of multi_select"
         )
-        # Defaults come from the server-held reviewed source projection.
+        # Options come from the server-held reviewed source projection; nothing
+        # is pre-pinned (I-3, design review 2026-09-02): pass-through is the
+        # designed default, pinning is a deliberate tick.
         payload = body["next_turn"]["payload"]
-        assert "col_a" in payload["default_chosen"]
-        assert "col_b" in payload["default_chosen"]
+        option_ids = [option["id"] for option in payload["options"]]
+        assert "col_a" in option_ids
+        assert "col_b" in option_ids
+        assert payload["default_chosen"] == []
+        assert payload["escape_label"] is not None
 
     # ------------------------------------------------------------------
     # M5: Step 1 INSPECT_AND_CONFIRM rebuild (Codex #14)

@@ -78,10 +78,11 @@
   width: 100%;
 }
 
-/* ── Guided step: height-bounded authoring frame (the column scrolls) ─────────
-   The bookend turns (welcome/run/audit/graduation) are short centred cards on
-   the base `.tutorial-shell` document scroll. The guided step instead becomes a
-   FIXED FRAME: the shell stops scrolling, the common workspace's authoring
+/* ── Workspace steps: height-bounded authoring frame (the column scrolls) ────
+   The bookend turns (welcome/audit/graduation) are short centred cards on the
+   base `.tutorial-shell` document scroll. The guided step — and, since I-1,
+   the run step, which keeps the pipeline pane beside its run card — instead
+   becomes a FIXED FRAME: the shell stops scrolling, the common workspace's authoring
    chain terminates in ChatPanel, and `.guided-authoring-scroll` owns the
    conversation scroll, with the composer
    docked beneath it. In the app, ComposerWorkspace provides the surrounding
@@ -175,6 +176,22 @@
    completed panel scroll itself instead. */
 .tutorial-shell--guided .tutorial-guided-authoring > .chat-panel--completed {
   overflow-y: auto;
+}
+
+/* Run step (I-1): the run card lives in the same workspace frame as the
+   guided build, so the pipeline pane keeps showing the graph the learner just
+   confirmed beside the Run button. The card has no internal scroll region
+   (the result table can outgrow the frame), so the authoring wrapper owns the
+   scroll — the same escape the completed panel above takes — and the card
+   keeps its intrinsic height inside the flex column instead of being squashed
+   to fit. */
+.tutorial-shell--guided .tutorial-run-authoring {
+  overflow-y: auto;
+  padding: var(--space-md) var(--space-lg) var(--space-xl);
+}
+
+.tutorial-shell--guided .tutorial-run-authoring > .tutorial-turn {
+  flex: 0 0 auto;
 }
 
 /* (Stepper full-bleed alignment now lives in guided.css — the workspace is
@@ -524,6 +541,15 @@
   to {
     left: 100%;
   }
+}
+
+/* Pre-run framing on the run card (I-1): the sentence that tells the learner
+   the graph beside the card is theirs to check and that nothing runs until
+   they click Run. Secondary tone — the primary Run button is the focal point. */
+.tutorial-run-ready {
+  margin-top: var(--space-lg);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
 }
 
 .tutorial-run-summary {

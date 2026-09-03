@@ -32,6 +32,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.web.composer.guided.protocol import GUIDED_GOAL_ACKNOWLEDGEMENT
 from elspeth.web.composer.guided.state_machine import TerminalReason, TerminalState
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
@@ -82,6 +83,13 @@ class _MetricInstrument:
         self.points.append((value, dict(attributes)))
 
 
+_SEED_INTENT = "Begin this guided chat session."
+# Goal-first (elspeth-378cfa0e18): a started session's transcript opens with
+# the author's goal and one server acknowledgement, so every chat these tests
+# send lands at seq 2 and beyond.
+_SEEDED_TURNS = 2
+
+
 def _create_session(client: TestClient) -> str:
     resp = client.post("/api/sessions", json={"title": "step-chat-test"})
     assert resp.status_code == 201, resp.json()
@@ -90,12 +98,28 @@ def _create_session(client: TestClient) -> str:
         f"/api/sessions/{session_id}/guided/start",
         json={
             "profile": "live",
-            "intent": "Begin this guided chat session.",
+            "intent": _SEED_INTENT,
             "operation_id": str(uuid4()),
         },
     )
     assert start.status_code == 200, start.json()
     return session_id
+
+
+def _chat_after_seed(chat_history: list[dict]) -> list[dict]:
+    """Return the turns this test's own chat produced, past the seeded goal pair.
+
+    Every rooted session opens on [goal, acknowledgement]; asserting on the
+    tail keeps each test below pinning the thing it is actually about. The
+    seeded pair itself is pinned exactly once, in
+    ``test_start_seeds_the_goal_pair_before_any_chat``.
+    """
+
+    assert [turn["content"] for turn in chat_history[:_SEEDED_TURNS]] == [
+        _SEED_INTENT,
+        GUIDED_GOAL_ACKNOWLEDGEMENT,
+    ]
+    return chat_history[_SEEDED_TURNS:]
 
 
 def _outputs_path(client: TestClient, filename: str) -> str:
@@ -316,13 +340,39 @@ class TestStepChatSuccess:
 
         assert body["guided_session"]["history"] == history_before
 
+    def test_start_seeds_the_goal_pair_before_any_chat(self, composer_test_client: TestClient) -> None:
+        """Goal-first: the transcript already reads as a conversation at seq 0.
+
+        The single place the seeded pair itself is pinned in this module —
+        every other test asserts on the tail via ``_chat_after_seed``. The
+        acknowledgement is a server statement about what the SERVER will do,
+        never a claim to have read the goal: the step-1/2 chat solver is given
+        the step skill, the user's message and the current-build block, and
+        never ``chat_history``, so a "I read your goal" line would be false at
+        the very next turn.
+        """
+
+        session_id = _create_session(composer_test_client)
+
+        guided = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["guided_session"]
+
+        assert [(turn["role"], turn["content"], turn["seq"], turn["step"]) for turn in guided["chat_history"]] == [
+            ("user", _SEED_INTENT, 0, "step_1_source"),
+            ("assistant", GUIDED_GOAL_ACKNOWLEDGEMENT, 1, "step_1_source"),
+        ]
+        assert guided["chat_turn_seq"] == _SEEDED_TURNS
+        # The acknowledgement rides the ordinary assistant discriminator; the
+        # closed vocabulary is not widened for it.
+        assert guided["chat_history"][1]["assistant_message_kind"] == "assistant"
+        assert guided["chat_history"][1]["synthetic_failure_reason"] is None
+
     def test_appends_user_and_assistant_turns_to_chat_history(self, composer_test_client: TestClient) -> None:
         """Slice 5: a successful chat appends BOTH turns to chat_history atomically.
 
-        chat_turn_seq advances by 2 (user.seq=0, assistant.seq=1, next=2).
-        Both turns carry the same step and a server-recorded ts_iso; the
-        sequence guarantees deterministic ordering even when two turns
-        share a wall-clock second.
+        chat_turn_seq advances by 2 (user, then assistant), on top of the two
+        turns the goal-first start seeded. Both turns carry the same step and
+        a server-recorded ts_iso; the sequence guarantees deterministic
+        ordering even when two turns share a wall-clock second.
         """
         session_id = _create_session(composer_test_client)
         _seed_guided_session(composer_test_client, session_id)
@@ -338,25 +388,25 @@ class TestStepChatSuccess:
             )
 
         assert status == 200, body
-        chat_history = body["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(body["guided_session"]["chat_history"])
         assert len(chat_history) == 2
 
         user_entry, assistant_entry = chat_history
         assert user_entry["role"] == "user"
         assert user_entry["content"] == "any nulls in col_a?"
-        assert user_entry["seq"] == 0
+        assert user_entry["seq"] == _SEEDED_TURNS
         assert user_entry["step"] == "step_1_source"
         assert user_entry["ts_iso"]  # non-empty ISO string
 
         assert assistant_entry["role"] == "assistant"
         assert assistant_entry["content"] == "rows look fine"
-        assert assistant_entry["seq"] == 1
+        assert assistant_entry["seq"] == _SEEDED_TURNS + 1
         assert assistant_entry["step"] == "step_1_source"
         # Both turns produced in the same request share a single ts_iso —
         # ordering must come from `seq`, not the timestamp.
         assert assistant_entry["ts_iso"] == user_entry["ts_iso"]
 
-        assert body["guided_session"]["chat_turn_seq"] == 2
+        assert body["guided_session"]["chat_turn_seq"] == _SEEDED_TURNS + 2
 
     def test_chat_history_round_trips_through_persistence(self, composer_test_client: TestClient) -> None:
         """Slice 5 invariant: chat_history persists across a service reload.
@@ -383,10 +433,8 @@ class TestStepChatSuccess:
         assert resp.status_code == 200, resp.json()
         reloaded = resp.json()["guided_session"]
 
-        assert reloaded["chat_turn_seq"] == 2
-        assert len(reloaded["chat_history"]) == 2
-        assert reloaded["chat_history"][0]["content"] == "ping"
-        assert reloaded["chat_history"][1]["content"] == "ack"
+        assert reloaded["chat_turn_seq"] == _SEEDED_TURNS + 2
+        assert [turn["content"] for turn in _chat_after_seed(reloaded["chat_history"])] == ["ping", "ack"]
 
     def test_chat_turn_persists_audit_message(self, composer_test_client: TestClient) -> None:
         """Slice 5.1: each chat round-trip persists a ComposerChatTurn audit row.
@@ -422,7 +470,7 @@ class TestStepChatSuccess:
         assert body["status"] == "success"
         assert body["step"] == "step_1_source"
         assert body["initiator"] == "user"
-        assert body["chat_turn_seq"] == 0
+        assert body["chat_turn_seq"] == _SEEDED_TURNS
         # The audit row binds the occurrence the message answered — the
         # token the request was submitted under, not merely "a" token
         # (elspeth-ea80e34fdc).
@@ -492,7 +540,7 @@ class TestStepChatSuccess:
         # The synthetic-failure row is exactly the one a later Retry answers:
         # it must record which occurrence failed (elspeth-ea80e34fdc).
         assert body["turn_token"] == submitted_token
-        assert body["chat_turn_seq"] == 0
+        assert body["chat_turn_seq"] == _SEEDED_TURNS
         llm_audits = _llm_call_audit_bodies(composer_test_client, session_id)
         assert len(llm_audits) == 1, llm_audits
         assert llm_audits[0]["status"] == "timeout"
@@ -517,11 +565,11 @@ class TestStepChatSuccess:
                 message="second",
             )
 
-        # After two chats: seq advances 0,1,2,3 then next=4.
-        chat_history = body["guided_session"]["chat_history"]
-        assert [entry["seq"] for entry in chat_history] == [0, 1, 2, 3]
+        # After two chats: seq advances by four past the seeded goal pair.
+        chat_history = _chat_after_seed(body["guided_session"]["chat_history"])
+        assert [entry["seq"] for entry in chat_history] == [_SEEDED_TURNS + offset for offset in (0, 1, 2, 3)]
         assert [entry["content"] for entry in chat_history] == ["first", "first reply", "second", "second reply"]
-        assert body["guided_session"]["chat_turn_seq"] == 4
+        assert body["guided_session"]["chat_turn_seq"] == _SEEDED_TURNS + 4
 
 
 class TestStep1SourceResolution:
@@ -678,7 +726,7 @@ class TestStep1SourceResolution:
         source_slot = (body["composition_state"]["sources"] or {}).get("source")
         assert source_slot is None, f"expected no committed source, got {source_slot!r}"
         # (d) reply in chat_history (user+assistant), wizard history unchanged
-        assert len(body["guided_session"]["chat_history"]) == 2
+        assert len(_chat_after_seed(body["guided_session"]["chat_history"])) == 2
         assert body["guided_session"]["history"] == history_before
 
     def test_step_1_typed_description_salvages_declined_prose_without_second_call(self, composer_test_client) -> None:
@@ -780,7 +828,7 @@ class TestStep1SourceResolution:
         assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
         assert body["next_turn"]["type"] == "schema_form"
         assert not body["composition_state"]["sources"]
-        chat_history = body["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(body["guided_session"]["chat_history"])
         assert len(chat_history) == 2
         assert chat_history[0]["content"] == user_message
         assert chat_history[1]["content"] == body["assistant_message"]
@@ -948,6 +996,41 @@ class TestStepChatRejections:
         assert status == 409, body
         assert "terminal" in body["detail"].lower()
 
+    def test_completed_session_keeps_its_chat_channel(self, composer_test_client: TestClient) -> None:
+        """The sibling of the refusal above: COMPLETED is admitted, EXITED is not.
+
+        The two terminal kinds now diverge on this endpoint. A confirmed build
+        answers questions about itself over the frozen wire record it settled
+        on; only an exit closes the channel (elspeth-986801d218). Bound to the
+        confirmation hash, not to a current unanswered turn — there is none.
+        """
+        from tests.integration.web.composer.guided.test_chat_schema8_atomic import (
+            _create_session as _create_guided_session,
+        )
+        from tests.integration.web.composer.guided.test_chat_schema8_atomic import (
+            _seed_completed_session,
+        )
+
+        session_id = _create_guided_session(composer_test_client)
+        token = _seed_completed_session(composer_test_client, session_id)
+        completion = _ReturningLiteLLMCompletion(_fake_llm_reply("It writes JSON rows to your output."))
+
+        with patch(_CHAT_SOLVER_ACOMPLETION, completion):
+            response = composer_test_client.post(
+                f"/api/sessions/{session_id}/guided/chat",
+                json={"operation_id": str(uuid4()), "turn_token": token, "message": "What does this pipeline do?"},
+            )
+
+        assert response.status_code == 200, response.json()
+        body = response.json()
+        assert body["assistant_message"] == "It writes JSON rows to your output."
+        assert body["next_turn"] is None
+        assert body["terminal"]["kind"] == "completed"
+        # Exactly one provider round, advisory: no tools are offered on a
+        # settled build because there is nothing left to author.
+        assert len(completion.calls) == 1
+        assert completion.calls[0].get("tools") is None
+
 
 def _terminal_kind_exited():
     """Return the TerminalKind value matching exited_to_freeform."""
@@ -1031,7 +1114,7 @@ class TestStepChatTransientFailure:
         # SYNTHETIC_UNAVAILABLE in ComposerChatTurnStatus.  ChatTurnStatus
         # is the discriminator; on the wire (Phase A) the user sees the
         # synthetic content directly.
-        chat_history = body["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(body["guided_session"]["chat_history"])
         assert len(chat_history) == 2
         assert chat_history[0]["content"] == "anything"
         assert chat_history[1]["content"] == "I'm unavailable right now; you can still use the wizard controls."
@@ -1077,7 +1160,7 @@ class TestStepChatTransientFailure:
         assert "quality check" in body["assistant_message"]
         # The scaffolding never lands in chat_history — only the user turn and
         # the honest reply.
-        chat_history = body["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(body["guided_session"]["chat_history"])
         assert len(chat_history) == 2
         assert "<tool_call" not in chat_history[1]["content"]
         assert chat_history[1]["content"] == body["assistant_message"]
@@ -1241,7 +1324,7 @@ class TestStepChatTransientFailure:
         assert body["guided_session"]["step"] == "step_1_source"
         assert body["guided_session"]["terminal"] is None
         assert body["guided_session"]["history"] == seeded["guided_session"]["history"]
-        chat_history = body["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(body["guided_session"]["chat_history"])
         assert len(chat_history) == 2
         assert chat_history[0]["content"] == "anything"
         assert chat_history[1]["content"] == "I'm unavailable right now; you can still use the wizard controls."
@@ -1392,8 +1475,10 @@ class TestStepChatServerInvariants:
         assert _chat_turn_audit_bodies(composer_test_client, session_id) == []
 
         reloaded = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["guided_session"]
-        assert reloaded["chat_history"] == []
-        assert reloaded["chat_turn_seq"] == 0
+        # Nothing was appended past the goal-first seed: the failed chat left
+        # no transcript trace at all.
+        assert _chat_after_seed(reloaded["chat_history"]) == []
+        assert reloaded["chat_turn_seq"] == _SEEDED_TURNS
 
     def test_terminal_failure_preserves_primary_error_if_slog_raises(
         self,
@@ -1444,8 +1529,10 @@ class TestStepChatServerInvariants:
         assert _chat_turn_audit_bodies(composer_test_client, session_id) == []
 
         reloaded = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["guided_session"]
-        assert reloaded["chat_history"] == []
-        assert reloaded["chat_turn_seq"] == 0
+        # Nothing was appended past the goal-first seed: the failed chat left
+        # no transcript trace at all.
+        assert _chat_after_seed(reloaded["chat_history"]) == []
+        assert reloaded["chat_turn_seq"] == _SEEDED_TURNS
 
 
 class TestStepChatCrossStep:
@@ -1546,18 +1633,18 @@ class TestStepChatCrossStep:
         #    cross-step invariant: a single chat_history list, monotonic
         #    seq, step values reflecting where each turn happened.
         final = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()
-        chat_history = final["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(final["guided_session"]["chat_history"])
         assert len(chat_history) == 4, chat_history
         # Tuple-shaped assertion so a regression on any axis (step/seq/role/content)
         # surfaces in the failure message.
         observed = [(entry["role"], entry["step"], entry["seq"], entry["content"]) for entry in chat_history]
         assert observed == [
-            ("user", "step_1_source", 0, "how do I describe my CSV?"),
-            ("assistant", "step_1_source", 1, "step-1 advice"),
-            ("user", "step_2_sink", 2, "which sink for JSON output?"),
-            ("assistant", "step_2_sink", 3, "step-2 advice"),
+            ("user", "step_1_source", _SEEDED_TURNS + 0, "how do I describe my CSV?"),
+            ("assistant", "step_1_source", _SEEDED_TURNS + 1, "step-1 advice"),
+            ("user", "step_2_sink", _SEEDED_TURNS + 2, "which sink for JSON output?"),
+            ("assistant", "step_2_sink", _SEEDED_TURNS + 3, "step-2 advice"),
         ]
-        assert final["guided_session"]["chat_turn_seq"] == 4
+        assert final["guided_session"]["chat_turn_seq"] == _SEEDED_TURNS + 4
 
 
 def _fake_sink_schema_discovery_call(name: str) -> SimpleNamespace:
@@ -1782,7 +1869,7 @@ class TestChatHistoryDiscriminatorPersistence:
         # from the persisted chat_history.
         get_resp = composer_test_client.get(f"/api/sessions/{session_id}/guided")
         assert get_resp.status_code == 200, get_resp.json()
-        chat_history = get_resp.json()["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(get_resp.json()["guided_session"]["chat_history"])
         assert len(chat_history) == 2
         assert chat_history[0]["assistant_message_kind"] is None  # user turn: not applicable
         assert chat_history[1]["assistant_message_kind"] == "synthetic_failure"
@@ -1849,7 +1936,7 @@ class TestChatHistoryDiscriminatorPersistence:
 
         get_resp = composer_test_client.get(f"/api/sessions/{session_id}/guided")
         assert get_resp.status_code == 200, get_resp.json()
-        chat_history = get_resp.json()["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(get_resp.json()["guided_session"]["chat_history"])
         assert len(chat_history) == 2
         assert chat_history[1]["assistant_message_kind"] == "assistant"
 

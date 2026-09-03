@@ -1,6 +1,11 @@
 # ELSPETH PDF Pipeline
 
-Builds the ELSPETH Architecture Pack as a single professional PDF.
+Builds two document sets as professional PDFs, sharing one visual system:
+
+| Set | Driver | Output |
+|-----|--------|--------|
+| Architecture Pack | `build-arch-pack.sh` | one bound volume, `out/elspeth-arch-pack.pdf` |
+| Project control set | `build-control-pack.sh` | one PDF per document, written beside its source markdown in `docs/project-control/` |
 
 ## Pipeline
 
@@ -43,6 +48,29 @@ Outputs:
 - Intermediate: `tools/pdf/elspeth-arch-pack.typ` (gitignored)
 - Final PDF: `tools/pdf/out/elspeth-arch-pack.pdf` (gitignored)
 
+## Project control set
+
+```bash
+./build-control-pack.sh --list             # show the document keys
+./build-control-pack.sh --pdf              # build every document
+./build-control-pack.sh --pdf programme    # build one
+```
+
+One PDF per document rather than a bound volume: the RAID register carries its
+own review cycle and is reissued independently of the programme document.
+Finished PDFs are written beside their source markdown in
+`docs/project-control/`, which is gitignored in full except its README, so they
+are never staged and never meet the pre-commit large-file threshold. The `.typ`
+intermediates stay in `out/`.
+
+To add a document, add one line to the `DOCUMENTS` manifest in
+`build-control-pack.sh` and a matching metadata YAML under `control-pack/`.
+
+| Variable | Effect |
+|----------|--------|
+| `ELSPETH_CONTROL_PACK_DIR` | Source directory (default `docs/project-control`). |
+| `ELSPETH_CONTROL_PACK_PDF_DIR` | Where finished PDFs are written (default: the source directory). |
+
 ## Environment overrides
 
 | Variable                  | Effect |
@@ -54,14 +82,16 @@ Outputs:
 
 | File                  | Purpose |
 |-----------------------|---------|
+| `build-control-pack.sh` | Driver for the project-control set.  Carries the document manifest (key, source markdown, metadata file) and builds each entry as a standalone PDF. |
+| `control-pack/*.yaml` | Per-document title-page metadata for the control set — one file per document. |
 | `build-arch-pack.sh`  | Top-level driver.  Defines the chapter list across four tracks (narrative, subsystem, appendix, reference) and orchestrates concat → preprocess → pandoc → postprocess → typst. |
 | `lib.sh`              | Shared bash helpers: toolchain version checks, source discovery, chapter concatenation, pandoc invocation, typst compile, build-date stamping. |
-| `metadata.yaml`       | Title-page metadata: title, status, classification, codebase HEAD, scope blurb, revision history.  Pandoc binds these into `template.typ`. |
+| `metadata.yaml`       | Title-page metadata for the **arch pack**: title, status, classification, codebase HEAD, scope blurb, revision history.  Pandoc binds these into `template.typ`.  The control set uses one file per document under `control-pack/`. |
 | `template.typ`        | Pandoc-driven Typst template.  Defines colour palette, page geometry, header/footer, heading styles, table styling, code-block styling, ToC, List of Tables, List of Figures, and the title page. |
 | `preprocess.py`       | Markdown-stage transforms before pandoc.  Renders mermaid fences to PNG, strips standalone hrules, and rewrites relative inter-chapter links to plain text. |
 | `postprocess.py`      | Typst-stage transforms after pandoc.  Strips redundant per-cell alignment directives. |
 | `fix-tables.lua`      | Pandoc Lua filter.  Tags table-containing figures with `kind: table` for numbering, and applies hand-tuned column widths to tables matched by `table-profiles.json`. |
-| `table-profiles.json` | Header-pattern-matched column-width overrides.  Empty by default; add a profile only when an auto-sized table demonstrably reads poorly. |
+| `table-profiles.json` | Header-pattern-matched column-width overrides, shared by both drivers.  Add a profile only when an auto-sized table demonstrably reads poorly in the rendered PDF; match on at least two header cells so a profile cannot capture an unrelated table of the same width. |
 
 ## Adapting the pipeline
 

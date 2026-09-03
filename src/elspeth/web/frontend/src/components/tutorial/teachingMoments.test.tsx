@@ -1,10 +1,11 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "@/api/client";
 import {
   TUTORIAL_ASSUMPTION_CALLOUT,
   TUTORIAL_SHIELD_OVERRIDE_CAVEAT,
   TUTORIAL_SHIELD_WIRED_NOTE,
+  TURN_4_RUN_BUTTON,
 } from "./copy";
 import { TutorialTurn4Run } from "./TutorialTurn4Run";
 import { TutorialTurn5AuditStory } from "./TutorialTurn5AuditStory";
@@ -182,6 +183,8 @@ describe("tutorial teaching moments — render at the right turn", () => {
         onCancelled={noop}
       />,
     );
+    // The run waits for the learner's explicit Run click (I-1).
+    fireEvent.click(screen.getByRole("button", { name: TURN_4_RUN_BUTTON }));
     await waitFor(() => {
       expect(api.runTutorialPipeline).toHaveBeenCalled();
     });
@@ -201,6 +204,7 @@ describe("tutorial teaching moments — render at the right turn", () => {
         onCancelled={noop}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: TURN_4_RUN_BUTTON }));
     await waitFor(() => {
       expect(api.runTutorialPipeline).toHaveBeenCalled();
     });

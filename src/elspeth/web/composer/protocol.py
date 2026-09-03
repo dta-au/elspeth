@@ -1419,8 +1419,18 @@ class ComposerService(Protocol):
         progress: ComposerProgressSink | None = None,
         correction_target: GuidedCorrectionTarget | None = None,
         revision_authority: GuidedRevisionAuthority | None = None,
+        root_goal: str | None = None,
     ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
-        """Run the shared planner once with split private/provider-safe facts."""
+        """Run the shared planner once with split private/provider-safe facts.
+
+        ``root_goal`` is the outcome the author stated when the session
+        started, carried as a NAMED reviewed fact on a correction or revision
+        only — never folded into ``intent``, which always means "the request
+        being made now". A revision that narrows or withdraws part of the goal
+        would otherwise argue against the goal inside the one field the
+        planner (and the deterministic request guards that parse it) read as
+        the current request.
+        """
         ...
 
     async def plan_guided_full_pipeline(

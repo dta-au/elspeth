@@ -3923,6 +3923,7 @@ class ComposerServiceImpl:
         progress: ComposerProgressSink | None = None,
         correction_target: GuidedCorrectionTarget | None = None,
         revision_authority: GuidedRevisionAuthority | None = None,
+        root_goal: str | None = None,
     ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
         """Run one shared planner call for the current guided checkpoint."""
 
@@ -3961,6 +3962,13 @@ class ComposerServiceImpl:
             raise TypeError("revision_authority must be an exact GuidedRevisionAuthority or None")
         if correction_target is not None and revision_authority is not None:
             raise ValueError("guided selected correction and prose revision authority are mutually exclusive")
+        if root_goal is not None and (type(root_goal) is not str or not root_goal):
+            raise TypeError("root_goal must be a non-empty exact str or None")
+        if root_goal is not None and correction_target is None and revision_authority is None:
+            # The fresh-candidate run at the step-2 finish IS the goal being
+            # requested, so there it belongs in ``intent``. The named fact
+            # exists only where a LATER instruction supersedes it.
+            raise ValueError("root_goal names the standing goal behind a correction or revision, not a fresh-candidate request")
         if str(operation_fence.session_id) != originating_message.session_id:
             raise AuditIntegrityError("guided planner operation fence targets a different session")
         if guided.active_proposal is not None:
@@ -3986,6 +3994,31 @@ class ComposerServiceImpl:
             reviewed_context = {
                 **reviewed_context,
                 "revision_authority": revision_authority.planner_context(),
+            }
+        if root_goal is not None:
+            # The session's standing goal, named and ordered rather than
+            # concatenated into the request. Prepending it to ``intent`` made a
+            # revision that narrows, changes, or withdraws part of the goal
+            # argue against the goal inside the field that means "what is being
+            # asked for now" — the default amend policy pushes the same way, so
+            # the likely landing was a pipeline that kept the superseded part.
+            # It also fed the deterministic request guards that parse ``intent``
+            # as the current message: a threshold stated only in the goal
+            # resurrected as a stated_threshold on a revision that had just
+            # withdrawn it, and one stated in the revision went dark behind a
+            # revocation phrase in the goal.
+            #
+            # Same custody class as the intent itself: the author's own words,
+            # verbatim, already read by the planner on the run that produced the
+            # proposal being revised.
+            reviewed_context = {
+                **reviewed_context,
+                "root_goal": root_goal,
+                "root_goal_usage": (
+                    "The outcome the author stated when this session started. It stays the pipeline's purpose, "
+                    "but the current instruction is the request: where the instruction narrows, changes, or "
+                    "withdraws part of the goal, follow the instruction."
+                ),
             }
 
         def evaluate_claims(candidate: CompositionState, claimed_intent_ids: tuple[str, ...]) -> tuple[str, ...]:

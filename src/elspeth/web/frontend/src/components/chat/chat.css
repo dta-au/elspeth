@@ -1304,6 +1304,35 @@
   line-height: var(--line-height-normal);
 }
 
+/* Goal field on the fresh-wizard confirm card (goal-first,
+   elspeth-378cfa0e18). Given a full row of the wrapped flex layout for the
+   same reason the note above is: it must read (and be filled in) BEFORE the
+   confirm/cancel buttons. The <label> is the flex item and stacks its own text
+   above the control, so the question is a real accessible name rather than a
+   placeholder that vanishes on the first keystroke. */
+.mode-switch-goal {
+  display: flex;
+  flex-basis: 100%;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+}
+
+/* Sizing only. The control composes the shared `.textarea` primitive
+   (shared.css) for its border, background, focus ring and AA-gated
+   placeholder colour, so this card does not introduce a second input skin
+   with its own contrast story. chat.css is imported AFTER shared.css in the
+   styles barrel, so these equal-specificity declarations win the overrides
+   they make: a one-sentence answer wants the smaller type and tighter
+   padding of the header's register, not the full form-field rung. */
+.mode-switch-goal-input {
+  padding: var(--space-xs) var(--space-sm);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-regular);
+}
+
 /* Disabled mode switch + adjacent plain-language reason so the affordance never
    reads as a silent no-op — same register as .chat-panel-error's inline
    explanation, without borrowing its alert-red treatment (this is expected,

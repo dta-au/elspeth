@@ -17,8 +17,8 @@ from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
 from elspeth.web.composer.guided.profile import EMPTY_PROFILE
-from elspeth.web.composer.guided.protocol import ChatRole, GuidedStep, validate_current_turn
-from elspeth.web.composer.guided.state_machine import GuidedSession
+from elspeth.web.composer.guided.protocol import ChatRole, GuidedStep, TurnType, validate_current_turn
+from elspeth.web.composer.guided.state_machine import GuidedSession, TerminalKind, TerminalState
 from elspeth.web.composer.no_tool_policy import visible_message_segments
 from elspeth.web.composer.redaction import redact_guided_snapshot_storage_paths, redact_source_storage_path
 from elspeth.web.sessions.protocol import (
@@ -176,6 +176,41 @@ def guided_turn_token(guided: GuidedSession) -> str:
             "payload_hash": record.payload_hash,
         }
     )
+
+
+def guided_completed_chat_token(guided: GuidedSession) -> str:
+    """Bind a completed session's advisory chat to its confirmation occurrence.
+
+    Sibling of :func:`guided_turn_token`, for the state that function refuses by
+    construction: a COMPLETED session has no current *unanswered* turn, so its
+    chat channel is bound to the record that closed the build instead — the
+    answered STEP_4 ``confirm_wiring`` occurrence. The token IS that record's
+    ``response_hash``, the content id of the confirmation response
+    ``{action, proposal_id, draft_hash}``, so it changes if and only if a
+    different confirmation settled, and no wire field or DTO has to change to
+    carry it.
+
+    Raises ``AuditIntegrityError`` for every non-completed or non-conforming
+    session; there is no token for a session that is still building, has exited
+    to freeform, or whose history does not end in an answered confirmation.
+    """
+
+    if type(guided) is not GuidedSession:
+        raise TypeError("guided must be an exact GuidedSession")
+    terminal = guided.terminal
+    if type(terminal) is not TerminalState or terminal.kind is not TerminalKind.COMPLETED:
+        raise AuditIntegrityError("Guided completed chat token requires a completed terminal state")
+    if not guided.history:
+        raise AuditIntegrityError("Guided completed chat token requires a persisted turn record")
+    if any(record.response_hash is None for record in guided.history):
+        raise AuditIntegrityError("Guided completed chat token requires every persisted turn answered")
+    record = guided.history[-1]
+    if record.step is not GuidedStep.STEP_4_WIRE or record.turn_type is not TurnType.CONFIRM_WIRING:
+        raise AuditIntegrityError("Guided completed chat token requires an answered wire confirmation")
+    response_hash = record.response_hash
+    if type(response_hash) is not str or len(response_hash) != 64 or any(char not in "0123456789abcdef" for char in response_hash):
+        raise AuditIntegrityError("Guided completed chat token confirmation hash is malformed")
+    return response_hash
 
 
 def load_guided_json_payload(
@@ -467,6 +502,7 @@ def response_json(response: BaseModel) -> Mapping[str, Any]:
 
 __all__ = [
     "GUIDED_REPLAY_META_KEY",
+    "guided_completed_chat_token",
     "guided_response_projection_hash",
     "guided_turn_token",
     "guided_validation_errors",

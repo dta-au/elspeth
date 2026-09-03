@@ -8,6 +8,8 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { resetStore } from "@/test/store-helpers";
+import { EMPTY_GUIDED_REVIEWED_COMPONENTS } from "@/stores/guidedReviewedComponents";
+import type { TurnPayload } from "@/types/guided";
 import type { CompositionProposal, CompositionState, NodeSpec, EdgeSpec } from "@/types/index";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import { projectValidationWorkspaceStatus } from "@/components/workspace/workspaceStatus";
@@ -205,6 +207,10 @@ vi.mock("@dagrejs/dagre", () => ({
         setNode() {}
         setEdge() {}
         node(_id: string) { return { x: 0, y: 0 }; }
+        // GuidedGraphPane's ReadOnlyPipelineGraph sizes its viewBox from
+        // graph.graph().width/height (elspeth-9f0873426a); the committed
+        // canvas above never calls it, so the shared stub must still answer.
+        graph() { return { width: 480, height: 200 }; }
       },
     },
     layout() {},
@@ -280,7 +286,14 @@ function makeProposal(
 
 describe("GraphView", () => {
   beforeEach(() => {
-    useSessionStore.setState({ compositionState: null, compositionProposals: [] });
+    useSessionStore.setState({
+      compositionState: null,
+      compositionProposals: [],
+      // Guided projection inputs (elspeth-9f0873426a): a test that seeds a
+      // pending guided turn or reviewed ledger must not leak it forward.
+      guidedNextTurn: null,
+      guidedReviewedComponents: EMPTY_GUIDED_REVIEWED_COMPONENTS,
+    });
     // selectedNodeId is store state, not a per-render prop: a test that opens
     // the NodeConfigPanel leaks its selection into every later test in file
     // order unless it is reset here.
@@ -3759,6 +3772,135 @@ describe("GraphView", () => {
       render(<GraphView />);
       const img = screen.getByRole("img", { name: /pipeline graph with/i });
       expect(img.contains(screen.getByTestId("minimap"))).toBe(false);
+    });
+  });
+
+  // Guided builds keep the committed composition empty until Confirm wiring,
+  // so for four steps this pane had nothing to draw while the proposal card
+  // squeezed a six-node DAG into the chat column (design review IA-1/V-1).
+  // The pane now draws from the guided turn payloads via
+  // guidedGraphProjection; these pin the per-step behaviour and the
+  // precedence rule against the committed graph.
+  describe("guided pre-commit projection (elspeth-9f0873426a)", () => {
+    const SOURCE_ID = "00000000-0000-4000-8000-000000000902";
+    const OUTPUT_ID = "00000000-0000-4000-8000-000000000904";
+    const proposalTurn: TurnPayload = {
+      type: "propose_pipeline",
+      step_index: 2,
+      turn_token: "c".repeat(64),
+      payload: {
+        proposal_id: "00000000-0000-4000-8000-000000000901",
+        draft_hash: "d".repeat(64),
+        supersedes_draft_hash: null,
+        summary: "guided.proposal.summary.full_graph.v1",
+        rationale: "guided.proposal.rationale.review_required.v1",
+        component_counts: { sources: 1, nodes: 0, edges: 2, outputs: 1 },
+        blockers: [],
+        graph: {
+          sources: [
+            { stable_id: SOURCE_ID, label: "source-1", plugin: { kind: "source", id: "csv" } },
+          ],
+          edges: [
+            {
+              stable_id: "00000000-0000-4000-8000-000000000905",
+              from_endpoint: { kind: "source", stable_id: SOURCE_ID },
+              to_endpoint: { kind: "output", stable_id: OUTPUT_ID },
+              flow: { kind: "source_success", branch: null },
+            },
+            {
+              stable_id: "00000000-0000-4000-8000-000000000906",
+              from_endpoint: { kind: "source", stable_id: SOURCE_ID },
+              to_endpoint: { kind: "discard" },
+              flow: { kind: "source_validation_failure" },
+            },
+          ],
+        },
+        nodes: [],
+        outputs: [
+          { stable_id: OUTPUT_ID, label: "output-1", plugin: { kind: "sink", id: "json" } },
+        ],
+        edit_targets: [],
+      },
+    };
+    const reviewedSource = {
+      stable_id: SOURCE_ID,
+      name: "source-1",
+      plugin: "csv",
+      status: "reviewed" as const,
+    };
+
+    it("draws the pending proposal from its payload while the composition is empty", () => {
+      useSessionStore.setState({ guidedNextTurn: proposalTurn });
+      const { container } = render(<GraphView />);
+
+      expect(
+        screen.getByRole("img", {
+          name: "Pipeline proposal graph with 3 components and 2 routes",
+        }),
+      ).toBeInTheDocument();
+      expect(container.querySelector(`[data-node-id="${SOURCE_ID}"]`)).not.toBeNull();
+      expect(container.querySelector(`[data-node-id="${OUTPUT_ID}"]`)).not.toBeNull();
+      expect(container.querySelector('[data-node-kind="discard"]')).not.toBeNull();
+      expect(
+        screen.getByText(
+          "Proposed pipeline, not yet committed. Confirm the wiring to commit it.",
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByText("No pipeline to visualise.")).toBeNull();
+      expect(screen.queryByTestId("react-flow")).toBeNull();
+    });
+
+    it("draws the reviewed source alone, with no route, before any proposal exists", () => {
+      useSessionStore.setState({
+        guidedReviewedComponents: { sources: [reviewedSource], outputs: [] },
+      });
+      const { container } = render(<GraphView />);
+
+      expect(
+        screen.getByRole("img", {
+          name: "Reviewed components graph with 1 component and no routes yet",
+        }),
+      ).toBeInTheDocument();
+      expect(container.querySelectorAll("[data-node-id]")).toHaveLength(1);
+      expect(container.querySelectorAll("[data-edge-id]")).toHaveLength(0);
+      expect(
+        screen.getByText(
+          "Reviewed so far: 1 source. Routes appear once a pipeline is proposed.",
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it("keeps the empty state for a guided session with nothing reviewed yet", () => {
+      useSessionStore.setState({
+        guidedNextTurn: {
+          type: "single_select",
+          step_index: 0,
+          turn_token: "a".repeat(64),
+          payload: { question: "Choose a source", options: [], allow_custom: false },
+        },
+      });
+      render(<GraphView />);
+
+      expect(screen.getByText("No pipeline to visualise.")).toBeInTheDocument();
+      expect(screen.queryByRole("img")).toBeNull();
+    });
+
+    it("draws a pending proposal over a committed composition, but lets the committed graph beat the ledger", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          nodes: [makeNode({ id: "classify", node_type: "transform", plugin: "llm_transform" })],
+        }),
+        guidedReviewedComponents: { sources: [reviewedSource], outputs: [] },
+      });
+      const { unmount } = render(<GraphView />);
+      expect(screen.getByTestId("react-flow")).toBeInTheDocument();
+      expect(screen.queryByRole("img", { name: /reviewed components graph/i })).toBeNull();
+      unmount();
+
+      useSessionStore.setState({ guidedNextTurn: proposalTurn });
+      render(<GraphView />);
+      expect(screen.getByRole("img", { name: /pipeline proposal graph/i })).toBeInTheDocument();
+      expect(screen.queryByTestId("react-flow")).toBeNull();
     });
   });
 });

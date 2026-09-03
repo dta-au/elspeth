@@ -659,6 +659,18 @@ export type ProposalNodeBehavior =
       policy: "require_all" | "best_effort";
     };
 
+/** Closed node-kind vocabulary of the proposal and wire-stage surfaces. The
+ *  strict wire decoder (guidedDecoder.ts decodeProposalNodeType) narrows BOTH
+ *  surfaces' `node_type` to this set at runtime; the type says so. */
+export type ProposalNodeType =
+  | "transform"
+  | "gate"
+  | "aggregation"
+  | "queue"
+  | "coalesce"
+  | "row_union"
+  | "collector";
+
 export interface ProposePipelinePayload {
   proposal_id: string;
   draft_hash: string;
@@ -695,14 +707,7 @@ export interface ProposePipelinePayload {
   nodes: Array<{
     stable_id: string;
     label: string;
-    node_type:
-      | "transform"
-      | "gate"
-      | "aggregation"
-      | "queue"
-      | "coalesce"
-      | "row_union"
-      | "collector";
+    node_type: ProposalNodeType;
     plugin: ProposalPluginRef | null;
     behavior: ProposalNodeBehavior;
     node_options_summary: NodeOptionSummary[];
@@ -779,7 +784,7 @@ export interface WireStageData {
   nodes: Array<{
     stable_id: string;
     label: string;
-    node_type: string;
+    node_type: ProposalNodeType;
     plugin: string | null;
     behavior: ProposalNodeBehavior;
     required_fields: string[];

@@ -14,6 +14,7 @@ import { TutorialGuidedShell } from "./TutorialGuidedShell";
 import { abandonTutorialRun, TutorialTurn4Run } from "./TutorialTurn4Run";
 import { TutorialTurn5AuditStory } from "./TutorialTurn5AuditStory";
 import { TutorialTurn7Graduation } from "./TutorialTurn7Graduation";
+import { TutorialWorkspaceFrame } from "./TutorialWorkspaceFrame";
 import {
   isAbandonOnPageHide,
   progressForTutorialState,
@@ -133,6 +134,29 @@ export function HelloWorldTutorial({
       active = false;
     };
   }, [onSessionMissing]);
+
+  // The run step keeps the workspace frame (pipeline pane) mounted around the
+  // run card so the learner sees the graph they just confirmed beside the
+  // Run button (I-1). In-page the guided shell already bound the session
+  // store to this session and the committed composition state is still in
+  // it. After a reload the store is empty, so re-bind it the way the guided
+  // shell does and hydrate through the read-only GET /guided (the store's
+  // `startGuided`): it returns the persisted composition state and the
+  // completed guided session for the inspector, and never writes. No
+  // tutorial-special backend path (ADR-031) — the same load the app performs
+  // for any guided session. A dead resume session 404s here into the store's
+  // error, and the mount-time membership check above recovers to Welcome.
+  useEffect(() => {
+    if (state.step !== "run" || state.sessionId === null) {
+      return;
+    }
+    const store = useSessionStore.getState();
+    if (store.activeSessionId === state.sessionId) {
+      return;
+    }
+    store.resetForTutorialSession(state.sessionId);
+    void store.startGuided(state.sessionId);
+  }, [state.step, state.sessionId]);
 
   // Persist the tutorial stage server-side on every stage transition so a
   // reload resumes instead of restarting. Best-effort: a failed persist
@@ -306,12 +330,12 @@ export function HelloWorldTutorial({
     // deliberately never aborts (StrictMode), and its Cancel button is the
     // only other abort path — without this the backend run (LLM spend, sink
     // writes) outlives the tutorial. runId stays null until the run's result
-    // lands, so this fires only while the run is genuinely still executing.
-    if (
-      state.step === "run" &&
-      state.runId === null &&
-      state.sessionId !== null
-    ) {
+    // lands, so this fires for every exit from the run stage: while a run is
+    // executing, from the pre-run card (nothing to cancel; the endpoint is
+    // idempotent), and after a reload mid-run, where the in-page state
+    // cannot know a server-side run is still going (red-team F3,
+    // 2026-09-02) — which is exactly why this is not gated on a click flag.
+    if (state.step === "run" && state.runId === null && state.sessionId !== null) {
       abandonTutorialRun(state.sessionId);
     }
     void usePreferencesStore
@@ -341,11 +365,12 @@ export function HelloWorldTutorial({
   return (
     <main
       className={
-        // The guided step embeds the full-height ChatPanel, whose composer docks
-        // at the bottom; that dock needs the wrapper to be a growing flex column
-        // (see `.tutorial-shell--guided` in tutorial.css). The bookend turns are
-        // short centred cards and keep the base scrolling-column layout.
-        state.step === "guided"
+        // The guided and run steps embed the workspace frame (ChatPanel or the
+        // run card beside the pipeline pane), which needs the wrapper to be a
+        // growing flex column (see `.tutorial-shell--guided` in tutorial.css).
+        // The bookend turns are short centred cards and keep the base
+        // scrolling-column layout.
+        state.step === "guided" || state.step === "run"
           ? "tutorial-shell tutorial-shell--guided"
           : "tutorial-shell"
       }
@@ -455,15 +480,21 @@ export function HelloWorldTutorial({
         />
       )}
       {state.step === "run" && state.sessionId !== null && (
-        // No onBack: the guided wizard is terminal once completed
-        // (previousStep(run) is null), so the run turn has no prior step to
-        // return to and renders no Back affordance.
-        <TutorialTurn4Run
-          sessionId={state.sessionId}
-          onResult={(result) => dispatch({ type: "runResultReady", result })}
-          onCompleted={(result) => dispatch({ type: "runCompleted", result })}
-          onCancelled={() => dispatch({ type: "cancelRun" })}
-        />
+        // The run card sits in the workspace frame's authoring pane, with the
+        // committed graph in the pipeline pane beside it (I-1). No onBack: the
+        // guided wizard is terminal once completed (previousStep(run) is
+        // null), so the run turn has no prior step to return to and renders
+        // no Back affordance.
+        <TutorialWorkspaceFrame ariaLabel="Tutorial run">
+          <div className="tutorial-guided-authoring tutorial-run-authoring">
+            <TutorialTurn4Run
+              sessionId={state.sessionId}
+              onResult={(result) => dispatch({ type: "runResultReady", result })}
+              onCompleted={(result) => dispatch({ type: "runCompleted", result })}
+              onCancelled={() => dispatch({ type: "cancelRun" })}
+            />
+          </div>
+        </TutorialWorkspaceFrame>
       )}
       {state.step === "audit" &&
         state.sessionId !== null &&

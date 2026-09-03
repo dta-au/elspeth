@@ -47,8 +47,15 @@ import {
 } from "./PendingProposalsBanner";
 import { GuidedChatHistory } from "./guided/GuidedChatHistory";
 import { GuidedPendingStrip } from "./guided/GuidedPendingStrip";
-import { GUIDED_EXPLAIN_MESSAGE } from "./guided/explainPrompt";
+import {
+  GUIDED_EXPLAIN_MESSAGE,
+  GUIDED_EXPLAIN_PIPELINE_MESSAGE,
+} from "./guided/explainPrompt";
 import { GUIDED_STEP_LABELS } from "./guided/stepLabels";
+import {
+  afterConfirmationChatToken,
+  completedGuidedChatToken,
+} from "./guided/completedChatToken";
 import {
   useCompletionOutcome,
   type CompletionOutcome,
@@ -655,6 +662,51 @@ const GUIDED_CHAT_PLACEHOLDERS: Record<GuidedStep, string> = {
     "Clear pending acknowledgements, then press Confirm wiring on the decision card.",
 };
 
+/**
+ * Placeholder for the composer on the COMPLETED surface (elspeth-986801d218).
+ *
+ * A SEPARATE constant, deliberately not a fifth entry in the map above: the
+ * map is keyed by `GuidedStep` (a closed wire enum) and completion is a
+ * TERMINAL state, not a step. Widening the map to carry a pseudo-key would
+ * break the exhaustiveness contract that map exists to hold.
+ *
+ * The wording sets the honest scope of the channel — the pipeline is
+ * committed and chat is advisory: it explains, it cannot edit. (Structural
+ * change is "Open freeform editor".)
+ *
+ * Length budget (the SAME measured one the step_4_wire entry above records):
+ * a placeholder produces no scroll overflow, so anything past the 3-row box
+ * at the 360px pane is cut silently, and a 93-char wording was measured
+ * rendering 4 lines with the last clipped. This is 79; every sibling is
+ * 76-80. The design's quoted copy ran to 100 chars — the three nouns it
+ * named (a step, a route, a check) are kept and the verb phrases dropped.
+ */
+const GUIDED_COMPLETED_CHAT_PLACEHOLDER =
+  "Ask about the pipeline you just built — a step, a route, or what a check means.";
+
+/**
+ * Goal card copy, shown while a guided session has no composition state yet
+ * (goal-first, elspeth-378cfa0e18).
+ *
+ * A SEPARATE pair of constants for the same reason
+ * GUIDED_COMPLETED_CHAT_PLACEHOLDER is one: the step-keyed map is a closed
+ * `GuidedStep` contract and "before the session has started" is not a step —
+ * the session IS at step_1_source, it just has nothing persisted. This mirrors
+ * the local "ready" pseudo-step idiom (a stepper-only label kept out of the
+ * wire-keyed map) rather than widening the map and losing its exhaustiveness.
+ *
+ * The question is the CARD's, so it is a heading, not a placeholder; the
+ * placeholder carries the worked example. Length budget does not bind the same
+ * way here (the box is the only affordance on screen and the card carries the
+ * question), but it stays close to the ≤80-char sibling register by leading
+ * with the short instruction.
+ */
+const GUIDED_GOAL_QUESTION = "What should this pipeline produce?";
+const GUIDED_GOAL_HINT =
+  "One sentence is enough. The assistant plans the processing steps from it after you have reviewed your source and output.";
+const GUIDED_GOAL_PLACEHOLDER =
+  "In one sentence: what should come out the other end — e.g. a summary per page, saved as JSON…";
+
 interface ChatPanelProps {
   onOpenSecrets?: () => void;
   // Concern B (LLM-primary spec §"Frontend"): a TUTORIAL session must never
@@ -1069,10 +1121,32 @@ export function ChatPanel({
       const preceding = guidedSession.chat_history.find(
         (t) => t.seq === turn.seq - 1,
       );
+      // Two ways a recorded token is dead on arrival, both decided here
+      // rather than by spending a round trip to earn a 409:
+      //
+      //  - On a COMPLETED session the only token the channel accepts is the
+      //    confirmation hash, so a synthetic failure recorded BEFORE the
+      //    commit carries a live-turn occurrence the completed arm refuses.
+      //  - On a session that is no longer completed but still carries
+      //    post-commit turns — a fork rewound to Step 2, a `/guided/reenter`
+      //    after a content change, both of which keep `chat_history` and clear
+      //    `terminal` — the confirmation hash is the dead one: resending it
+      //    replays the PARENT's occurrence into a live step-2 session.
+      //
+      // Every other recorded token still goes back verbatim: the server owns
+      // the staleness verdict for a live occurrence (elspeth-ea80e34fdc), and
+      // this must not quietly become "resend only the current token".
+      const completedToken = completedGuidedChatToken(guidedSession);
+      const afterConfirmationToken = afterConfirmationChatToken(guidedSession);
+      const resendable =
+        completedToken !== null
+          ? preceding?.turn_token === completedToken
+          : preceding?.turn_token !== afterConfirmationToken;
       if (
         preceding !== undefined &&
         preceding.role === "user" &&
-        preceding.turn_token !== null
+        preceding.turn_token !== null &&
+        resendable
       ) {
         void sendGuidedChat(preceding.content, undefined, preceding.turn_token);
       } else {
@@ -2518,6 +2592,166 @@ export function ChatPanel({
     );
   }
 
+  // ── Shared guided chrome builders ───────────────────────────────────────────
+  //
+  // The conversation column and its docked composer are the SAME surface on
+  // the active guided branch and on the completed branch (elspeth-986801d218:
+  // a committed session keeps its conversation). They are built here, once,
+  // rather than copied into each branch, because three contracts are attached
+  // to this exact markup and a copy silently drops them:
+  //   - the pending-focus contract (composerSectionRef / composerFocusWithinRef
+  //     + the useLayoutEffect by the ref declarations),
+  //   - the chat-growth reveal effect, which scrolls the newest [data-seq] row
+  //     into view and finds nothing without `guidedWorkspaceScrollRef` mounted,
+  //   - the "Describe what you want" region locator that the staging e2e specs
+  //     and AT navigation both use.
+  // They are plain functions, not components: a component identity declared in
+  // a render body remounts its subtree on every render, which would blow away
+  // the composer's DOM (and its focus) on each keystroke.
+
+  /**
+   * The docked "Describe what you want" composer.
+   *
+   * `lockedValue` non-null puts the box in the tutorial's locked read-only
+   * mode showing that value; null is the ordinary editable draft box. This is
+   * a stage concept, NOT a tutorial-mode branch — the completed surface
+   * passes null and is therefore editable in the tutorial dwell too.
+   * `uploadEnabled` false wires NO blob-upload handlers and disables the
+   * upload affordance: an upload against a session with nothing left to
+   * author would orphan the blob and post "resolve this file" as an ordinary
+   * message.
+   */
+  const buildGuidedComposer = ({
+    placeholder,
+    lockedValue,
+    uploadEnabled,
+    onSend,
+    replacement = null,
+    revisionScope = null,
+  }: {
+    placeholder: string;
+    lockedValue: string | null;
+    uploadEnabled: boolean;
+    onSend: (content: string) => void;
+    /** Renders INSTEAD of the input (the tutorial's static "Sent" line). */
+    replacement?: React.ReactNode;
+    /** Rendered above the input (the step-3 revision-scope selector). */
+    revisionScope?: React.ReactNode;
+  }) => (
+    <section
+      // The composer docks as a plain input strip under the conversation
+      // column (freeform's border-top idiom) — no card chrome; the inner
+      // .chat-input carries the seam. The section + role=region +
+      // aria-label survive in BOTH modes — the "Describe what you want"
+      // landmark is load-bearing for AT navigation and the staging e2e
+      // locators (tutorial-probe/tutorial-reliability .staging.spec.ts).
+      className="guided-step-chat"
+      role="region"
+      aria-label="Describe what you want"
+      // Pending focus contract plumbing (see the useLayoutEffect by the
+      // ref declarations). tabIndex=-1 makes the section itself a legal
+      // programmatic focus landing (tutorial resolve path). The focus/blur
+      // pair track focus-within via bubbling; a null relatedTarget (window
+      // blur, click on non-focusable page chrome) counts as "left" — erring
+      // that way skips a restore after an app-switch, erring the other way
+      // yanks focus back from a user who clicked into the transcript.
+      ref={composerSectionRef}
+      tabIndex={-1}
+      onFocus={() => {
+        composerFocusWithinRef.current = true;
+      }}
+      onBlur={(e) => {
+        if (
+          !(e.relatedTarget instanceof Node) ||
+          !e.currentTarget.contains(e.relatedTarget)
+        ) {
+          composerFocusWithinRef.current = false;
+        }
+      }}
+    >
+      {/* No visible heading — the bare docked strip carries only the
+          aria-label for its accessible name (the old dashed-card heading
+          was live-guided furniture that died with the pre-workspace
+          layout). */}
+      {replacement !== null ? (
+        replacement
+      ) : (
+        <>
+          {revisionScope}
+          <ChatInput
+            onSend={onSend}
+            // Upload handlers are wired only where an upload can mean
+            // something. Passing undefined is the affordance's OFF state,
+            // not a disabled-but-live one.
+            onBlobUploadStarted={
+              uploadEnabled ? handleGuidedBlobUploadStarted : undefined
+            }
+            onBlobUploadCompleted={
+              uploadEnabled ? handleGuidedBlobUploadCompleted : undefined
+            }
+            onBlobUploadRejected={
+              uploadEnabled ? handleGuidedBlobUploadRejected : undefined
+            }
+            onBlobUploadSettled={
+              uploadEnabled ? handleGuidedBlobUploadSettled : undefined
+            }
+            uploadDisabled={!uploadEnabled || hasPendingGuidedSourceUpload}
+            // Both pendings gate Send. `guidedResponsePending` blocks a chat
+            // WHILE a turn-respond is advancing the step — otherwise the chat
+            // captures the stale `guidedSession.step` and the backend rejects
+            // the step mismatch with 409 (guided.py step-match guard).
+            // `guidedChatPending` blocks a second send racing the in-flight
+            // one (belt: ChatInput's handleSend returns early on disabled;
+            // braces: sendGuidedChat's own pending admission gate). The old
+            // pending SWAP — unmounting the input and mounting the working
+            // strip in its place (elspeth-6a9673ecd3) — is retired: it read
+            // as a large panel occluding the typing area (operator
+            // 2026-07-23). The strip now rides in the conversation flow (see
+            // the guided-authoring-scroll mount); the input keeps its place
+            // with its ordinary disabled state, which also preserves any
+            // typed draft. Stop stays in the strip (it renders only while
+            // the abortable chat fetch exists).
+            disabled={guidedResponsePending || guidedChatPending}
+            inputRef={inputRef}
+            placeholder={placeholder}
+            maxLength={GUIDED_CHAT_MESSAGE_MAX_LENGTH}
+            // Kept controlled (value defined) across all phases to avoid
+            // controlled↔uncontrolled flips. Locked: the frozen per-stage
+            // prompt, read-only, with a no-op onChange so a tutorial prompt
+            // never leaks into guidedDraft and out onto a later live surface.
+            // Unlocked: controlled on guidedDraft (elspeth-49b467d91a) so the
+            // typed prompt is parent-owned and sendGuidedChatRetainingDraft
+            // can restore it when a send fails to deliver.
+            value={lockedValue ?? guidedDraft}
+            onChange={lockedValue !== null ? () => undefined : setGuidedDraft}
+            readOnly={lockedValue !== null}
+          />
+        </>
+      )}
+    </section>
+  );
+
+  /**
+   * The bounded conversation column. role="group" is REQUIRED for the
+   * aria-label to be exposed (a name on a role-less div is AT-invisible and
+   * an axe aria-prohibited-attr violation, elspeth-37293a3b7c). Deliberately
+   * NOT role=log / NOT a live region: the transcript log (and, on the active
+   * branch, the wizard log) live INSIDE it and must not nest in an outer live
+   * region (double-announce). tabIndex=0 lets keyboard users arrow-scroll it.
+   */
+  const buildGuidedWorkspaceScroller = (children: React.ReactNode) => (
+    <div
+      ref={guidedWorkspaceScrollRef}
+      onScroll={handleGuidedWorkspaceScroll}
+      className="guided-authoring-scroll"
+      role="group"
+      aria-label="Conversation"
+      tabIndex={0}
+    >
+      {children}
+    </div>
+  );
+
   // ── Guided-mode discriminator ────────────────────────────────────────────────
   //
   // Precedence (intentional):
@@ -2578,6 +2812,74 @@ export function ChatPanel({
           }}
         />
         <CompletionSummary terminal={guidedSession.terminal} isTutorial={isTutorial} />
+        {/* The conversation SURVIVES the commit (elspeth-986801d218). The
+            build is over — there is no wizard turn, no decision card and no
+            forward affordance — but the chat channel stays open so the user
+            can ask what the committed pipeline does. Same scroller, same
+            transcript log, same docked composer as the active branch, built
+            from the shared builders above; only the placeholder, the Explain
+            copy and the absent upload differ. `isGuidedBuildActive` stays
+            false, so the freeform SideRail (Run / Export) keeps its place. */}
+        {buildGuidedWorkspaceScroller(
+          <>
+            <GuidedChatHistory
+              chatHistory={guidedSession.chat_history}
+              onRetrySyntheticFailure={handleRetrySyntheticFailure}
+              // Same readiness gate as the active branch's Retry and Explain:
+              // a restored transcript can render before the backend wall
+              // clock latches, and sendGuidedChat no-ops until it does.
+              retryDisabled={
+                guidedChatPending || guidedResponsePending || !composeTimeoutReady
+              }
+              afterConfirmationToken={afterConfirmationChatToken(guidedSession)}
+            />
+            <div className="guided-completed-actions">
+              <Button
+                compact
+                // Same compact-Button hook the per-step Explain uses;
+                // .btn-compact carries the chrome.
+                className="guided-explain-btn"
+                onClick={() =>
+                  void sendGuidedChat(GUIDED_EXPLAIN_PIPELINE_MESSAGE)
+                }
+                disabled={
+                  guidedChatPending ||
+                  guidedResponsePending ||
+                  !composeTimeoutReady
+                }
+                title={
+                  !guidedChatPending &&
+                  !guidedResponsePending &&
+                  !composeTimeoutReady
+                    ? composerTimeoutUnavailable
+                      ? COMPOSE_UNAVAILABLE_MESSAGE
+                      : COMPOSE_CONNECTING_MESSAGE
+                    : undefined
+                }
+              >
+                Explain this pipeline
+              </Button>
+            </div>
+            {/* Direct child of the scroll region: OUTSIDE the transcript's
+                role=log, so its role=status is announced once. */}
+            {guidedChatPending ? (
+              <GuidedPendingStrip
+                composerProgress={composerProgress}
+                onStop={cancelGuidedChat}
+              />
+            ) : null}
+          </>,
+        )}
+        {buildGuidedComposer({
+          placeholder: GUIDED_COMPLETED_CHAT_PLACEHOLDER,
+          // Editable, in the tutorial dwell too: a locked prompt is an
+          // ACTIVE-stage script concept and there is no stage left to script.
+          lockedValue: null,
+          uploadEnabled: false,
+          onSend: (content) => {
+            void sendGuidedChatRetainingDraft(content);
+          },
+        })}
       </div>
     );
   }
@@ -2601,21 +2903,39 @@ export function ChatPanel({
     !guidedSession.terminal &&
     isGuidedBuildActive(guidedSession, guidedNextTurn)
   ) {
+    // Nothing is persisted for this session yet: the store adopted the lazy
+    // GET /guided stub (non-mutating) so the panel can open on the goal card
+    // without writing a rootless wizard. The session's first Send goes through
+    // chatGuided's cold-start branch and becomes POST /guided/start's intent.
+    const awaitingGoal = compositionState === null;
     // Tutorial: the per-stage locked prompt has already been Sent once the
     // current step carries a user turn in the server-authoritative chat_history.
     // Only true after a SUCCESSFUL chatGuided round-trip (an HTTP failure leaves
     // chat_history untouched — see sessionStore.chatGuided catch), so a failed
     // send still shows the box for retry.
+    //
+    // TRIMMED EXACT EQUALITY against the step's locked prompt, not "any user
+    // turn that isn't Explain" (goal-first, elspeth-378cfa0e18): a started
+    // session's transcript now OPENS with the seeded goal turn, which the
+    // server stamps with step_1_source. Under the old predicate that turn alone
+    // satisfied step 1, so the locked source box flipped to the static "Sent"
+    // line before the learner had sent anything and the single-select the
+    // tutorial suppresses came back. Comparing against the prompt itself is
+    // also what the predicate always meant, and it subsumes the Explain
+    // exclusion the old shape needed as a special case. Trimmed on both sides
+    // because ChatInput trims on send (ChatInput.tsx) — the same trimmed
+    // comparison guidedReplay.ts uses for its own dedupe.
+    const lockedPromptForStep = (
+      lockedChatPrompt?.[guidedSession.step] ?? ""
+    ).trim();
     const tutorialPromptSentForStep =
       isTutorial === true &&
+      lockedPromptForStep !== "" &&
       guidedSession.chat_history.some(
         (t) =>
           t.role === "user" &&
           t.step === guidedSession.step &&
-          // The Explain button's canned question is NOT the step's prompt:
-          // on confirm-only steps it must not flip the locked box to the
-          // "Sent" line (exact-string filter; the constant owns the copy).
-          t.content !== GUIDED_EXPLAIN_MESSAGE,
+          t.content.trim() === lockedPromptForStep,
       );
     // Only swap the locked box for the static "Sent" line when there is actually
     // a forward affordance to confirm below — the turn widget OR a pending
@@ -2648,150 +2968,84 @@ export function ChatPanel({
     // staged proposal via /guided/respond; other later messages use /guided/chat
     // against the existing checkpoint. The caption is keyed on the live step via
     // GUIDED_CHAT_PLACEHOLDERS.
-    const stepComposer = (
-      <section
-        // The composer docks as a plain input strip under the conversation
-        // column (freeform's border-top idiom) — no card chrome; the inner
-        // .chat-input carries the seam. The section + role=region +
-        // aria-label survive in BOTH modes — the "Describe what you want"
-        // landmark is load-bearing for AT navigation and the staging e2e
-        // locators (tutorial-probe/tutorial-reliability .staging.spec.ts).
-        className="guided-step-chat"
-        role="region"
-        aria-label="Describe what you want"
-        // Pending focus contract plumbing (see the useLayoutEffect by the
-        // ref declarations). tabIndex=-1 makes the section itself a legal
-        // programmatic focus landing (tutorial resolve path). The focus/blur
-        // pair track focus-within via bubbling; a null relatedTarget (window
-        // blur, click on non-focusable page chrome) counts as "left" — erring
-        // that way skips a restore after an app-switch, erring the other way
-        // yanks focus back from a user who clicked into the transcript.
-        ref={composerSectionRef}
-        tabIndex={-1}
-        onFocus={() => {
-          composerFocusWithinRef.current = true;
-        }}
-        onBlur={(e) => {
-          if (
-            !(e.relatedTarget instanceof Node) ||
-            !e.currentTarget.contains(e.relatedTarget)
-          ) {
-            composerFocusWithinRef.current = false;
-          }
-        }}
-      >
-        {/* No visible heading — the bare docked strip carries only the
-            aria-label for its accessible name (the old dashed-card heading
-            was live-guided furniture that died with the pre-workspace
-            layout). */}
-        {tutorialStepBuilt ? (
-          // Tutorial: the locked prompt was already Sent for this step (it is
-          // in the transcript above) AND a forward affordance exists below.
-          // Replace the redundant active box — which otherwise kept the
-          // just-sent prompt with a live Send and read as "did it send?" —
-          // with a static confirmation line.
-          <p className="guided-step-chat-sent" role="status">
-            {/* Honest framing (elspeth-3b45c51564): the tutorial's continue is
-                a review-then-proceed, not a choice — don't dress it as one. */}
-            Sent — your request is in the transcript above and the assistant
-            has built this step. Review the decision, then continue.
-          </p>
-        ) : (
-          <>
-            {isProposalRevisionComposer && !isTutorial ? (
-              <label className="guided-proposal-revision-scope">
-                Revision scope
-                <select
-                  value={guidedRevisionMode}
-                  disabled={guidedResponsePending || guidedChatPending}
-                  onChange={(event) => setGuidedRevisionSelection({
-                    identity: proposalRevisionIdentity,
-                    mode: event.target.value as GuidedRevisionMode,
-                  })}
-                >
-                  <option value="amend">Amend current proposal — preserve existing steps</option>
-                  <option value="replace">Replace proposal — steps may be removed</option>
-                </select>
-              </label>
-            ) : null}
-            <ChatInput
-              onSend={(content) => {
-                // Tutorial sends keep the plain action: retention is the
-                // frozen locked-prompt value itself, and writing a tutorial
-                // prompt into guidedDraft would leak it into a later live
-                // guided surface on the same session.
-                if (isTutorial === true) {
-                  void sendGuidedChat(content);
-                  return;
-                }
-                if (isProposalRevisionComposer) {
-                  const liveState = useSessionStore.getState();
-                  const liveTurn = liveState.guidedNextTurn;
-                  const liveProposalRevisionIdentity =
-                    liveState.guidedSession?.step === "step_3_transforms" &&
-                    liveTurn?.type === "propose_pipeline"
-                      ? `${liveState.activeSessionId ?? ""}:${liveTurn.payload.proposal_id}:${liveTurn.payload.draft_hash}`
-                      : null;
-                  const selectedMode =
-                    guidedRevisionSelection.identity === liveProposalRevisionIdentity
-                      ? guidedRevisionSelection.mode
-                      : "amend";
-                  // No eager reset-to-amend here: a DELIVERED revision
-                  // advances the proposal identity, and the identity-keyed
-                  // effect above already resets the selector; an eager reset
-                  // made a FAILED send restore the prompt but silently flip
-                  // the user's "replace" choice back to "amend", so the
-                  // retry resubmitted a semantically different request
-                  // (review finding on elspeth-49b467d91a). Draft and scope
-                  // now retain or clear together.
-                  void sendGuidedChatRetainingDraft(content, selectedMode);
-                  return;
-                }
-                void sendGuidedChatRetainingDraft(content);
-              }}
-            onBlobUploadStarted={handleGuidedBlobUploadStarted}
-            onBlobUploadCompleted={handleGuidedBlobUploadCompleted}
-            onBlobUploadRejected={handleGuidedBlobUploadRejected}
-            onBlobUploadSettled={handleGuidedBlobUploadSettled}
-            uploadDisabled={hasPendingGuidedSourceUpload}
-            // Both pendings gate Send. `guidedResponsePending` blocks a chat
-            // WHILE a turn-respond is advancing the step — otherwise the chat
-            // captures the stale `guidedSession.step` and the backend rejects
-            // the step mismatch with 409 (guided.py step-match guard).
-            // `guidedChatPending` blocks a second send racing the in-flight
-            // one (belt: ChatInput's handleSend returns early on disabled;
-            // braces: sendGuidedChat's own pending admission gate). The old
-            // pending SWAP — unmounting the input and mounting the working
-            // strip in its place (elspeth-6a9673ecd3) — is retired: it read
-            // as a large panel occluding the typing area (operator
-            // 2026-07-23). The strip now rides in the conversation flow (see
-            // the guided-authoring-scroll mount); the input keeps its place
-            // with its ordinary disabled state, which also preserves any
-            // typed draft. Stop stays in the strip (it renders only while
-            // the abortable chat fetch exists).
-            disabled={guidedResponsePending || guidedChatPending}
-            inputRef={inputRef}
-            placeholder={GUIDED_CHAT_PLACEHOLDERS[guidedSession.step]}
-            maxLength={GUIDED_CHAT_MESSAGE_MAX_LENGTH}
-            // Tutorial: the box is locked read-only and prefilled with the
-            // CURRENT phase's per-stage prompt (wire has none → empty,
-            // confirm-only). Kept controlled (value defined) across all phases
-            // to avoid controlled↔uncontrolled flips. Normal session:
-            // controlled on guidedDraft (elspeth-49b467d91a) so the typed
-            // prompt is parent-owned and sendGuidedChatRetainingDraft can
-            // restore it when a send fails to deliver — never uncontrolled.
-            value={
-              isTutorial
-                ? (lockedChatPrompt?.[guidedSession.step] ?? "")
-                : guidedDraft
-            }
-            onChange={isTutorial ? () => undefined : setGuidedDraft}
-            readOnly={isTutorial === true}
-            />
-          </>
-        )}
-      </section>
-    );
+    const stepComposer = buildGuidedComposer({
+      // Before the goal the box IS the goal box: the step-keyed caption would
+      // ask for a source description, which is not what this Send does (it
+      // establishes the session's root intent).
+      placeholder: awaitingGoal
+        ? GUIDED_GOAL_PLACEHOLDER
+        : GUIDED_CHAT_PLACEHOLDERS[guidedSession.step],
+      // Tutorial: the box is locked read-only and prefilled with the CURRENT
+      // phase's per-stage prompt (wire has none → empty, confirm-only).
+      lockedValue: isTutorial
+        ? (lockedChatPrompt?.[guidedSession.step] ?? "")
+        : null,
+      uploadEnabled: true,
+      replacement: tutorialStepBuilt ? (
+        // Tutorial: the locked prompt was already Sent for this step (it is
+        // in the transcript above) AND a forward affordance exists below.
+        // Replace the redundant active box — which otherwise kept the
+        // just-sent prompt with a live Send and read as "did it send?" —
+        // with a static confirmation line.
+        <p className="guided-step-chat-sent" role="status">
+          {/* Honest framing (elspeth-3b45c51564): the tutorial's continue is
+              a review-then-proceed, not a choice — don't dress it as one. */}
+          Sent — your request is in the transcript above and the assistant
+          has built this step. Review the decision, then continue.
+        </p>
+      ) : null,
+      revisionScope:
+        isProposalRevisionComposer && !isTutorial ? (
+          <label className="guided-proposal-revision-scope">
+            Revision scope
+            <select
+              value={guidedRevisionMode}
+              disabled={guidedResponsePending || guidedChatPending}
+              onChange={(event) => setGuidedRevisionSelection({
+                identity: proposalRevisionIdentity,
+                mode: event.target.value as GuidedRevisionMode,
+              })}
+            >
+              <option value="amend">Amend current proposal — preserve existing steps</option>
+              <option value="replace">Replace proposal — steps may be removed</option>
+            </select>
+          </label>
+        ) : null,
+      onSend: (content) => {
+        // Tutorial sends keep the plain action: retention is the
+        // frozen locked-prompt value itself, and writing a tutorial
+        // prompt into guidedDraft would leak it into a later live
+        // guided surface on the same session.
+        if (isTutorial === true) {
+          void sendGuidedChat(content);
+          return;
+        }
+        if (isProposalRevisionComposer) {
+          const liveState = useSessionStore.getState();
+          const liveTurn = liveState.guidedNextTurn;
+          const liveProposalRevisionIdentity =
+            liveState.guidedSession?.step === "step_3_transforms" &&
+            liveTurn?.type === "propose_pipeline"
+              ? `${liveState.activeSessionId ?? ""}:${liveTurn.payload.proposal_id}:${liveTurn.payload.draft_hash}`
+              : null;
+          const selectedMode =
+            guidedRevisionSelection.identity === liveProposalRevisionIdentity
+              ? guidedRevisionSelection.mode
+              : "amend";
+          // No eager reset-to-amend here: a DELIVERED revision
+          // advances the proposal identity, and the identity-keyed
+          // effect above already resets the selector; an eager reset
+          // made a FAILED send restore the prompt but silently flip
+          // the user's "replace" choice back to "amend", so the
+          // retry resubmitted a semantically different request
+          // (review finding on elspeth-49b467d91a). Draft and scope
+          // now retain or clear together.
+          void sendGuidedChatRetainingDraft(content, selectedMode);
+          return;
+        }
+        void sendGuidedChatRetainingDraft(content);
+      },
+    });
 
     // The "current decision" panel (eyebrow + per-step rationale + the turn
     // widget). Rendered LAST inside the conversation-column scroll region
@@ -2801,6 +3055,31 @@ export function ChatPanel({
     // recorded tutorial.css fill-viewport failure); inside the scroll region
     // the step-advance focus effect scrolls it into view after a Send instead.
     const decisionSection = (() => {
+      // Before the goal there is no decision to show. The stub's first
+      // single_select asks the user to pick a source, which is the wrong
+      // question two steps early — and the card's Explain button would be
+      // WORSE than wrong: Explain sends its canned question through
+      // sendGuidedChat, which pre-start is the cold-start branch, so pressing
+      // it would make "Why am I seeing this?" the session's root intent and
+      // the planner's brief. The goal card replaces the whole section (never
+      // renders beside it), so the id, the role=log live region and the
+      // Explain affordance all belong to exactly one of the two.
+      if (awaitingGoal) {
+        return (
+          <section
+            className="guided-goal-prompt"
+            aria-labelledby="guided-goal-prompt-heading"
+          >
+            <h2
+              id="guided-goal-prompt-heading"
+              className="guided-goal-prompt__question"
+            >
+              {GUIDED_GOAL_QUESTION}
+            </h2>
+            <p className="guided-goal-prompt__hint">{GUIDED_GOAL_HINT}</p>
+          </section>
+        );
+      }
       const stepIsSendDriven =
         isTutorial && (lockedChatPrompt?.[guidedSession.step] ?? "") !== "";
       // Lead the decision with the dynamic build rationale (the LLM's "what I
@@ -3066,6 +3345,14 @@ export function ChatPanel({
               retryDisabled={
                 guidedChatPending || guidedResponsePending || !composeTimeoutReady
               }
+              // A LIVE session can still carry post-commit turns: a fork of a
+              // completed session rewinds the child to Step 2 with
+              // `terminal=None` and the transcript intact, and so does a
+              // `/guided/reenter` whose content changed under the exit.
+              // Without the boundary those turns read as ordinary build
+              // conversation under a step_4_wire stage divider sitting ahead
+              // of the session's current step.
+              afterConfirmationToken={afterConfirmationChatToken(guidedSession)}
             />
           );
           // Persistent-mount contract (AcknowledgementStack.tsx): the stack
@@ -3089,41 +3376,29 @@ export function ChatPanel({
           return (
             <>
               {ackLiveRegion}
-              {/* role="group" is REQUIRED for the aria-label to be exposed
-                  (a name on a role-less div is AT-invisible and an axe
-                  aria-prohibited-attr violation, elspeth-37293a3b7c).
-                  Deliberately NOT role=log / NOT a live region: the
-                  transcript log and the wizard log live INSIDE it and must
-                  not nest in an outer live region (double-announce).
-                  tabIndex=0 lets keyboard users arrow-scroll it. */}
-              <div
-                ref={guidedWorkspaceScrollRef}
-                onScroll={handleGuidedWorkspaceScroll}
-                className="guided-authoring-scroll"
-                role="group"
-                aria-label="Conversation"
-                tabIndex={0}
-              >
-                {transcript}
-                {ackStack}
-                {decisionSection}
-                {/* Direct child of the scroll region: OUTSIDE both role=log
-                    containers, so its role=status is announced once. */}
-                {guidedChatPending ? (
-                  <GuidedPendingStrip
-                    composerProgress={composerProgress}
-                    onStop={cancelGuidedChat}
-                    substeps={
-                      isTutorial === true && guidedSession.step === "step_2_sink"
-                        ? TUTORIAL_STEP_2_COMPOSING_SUBSTEPS
-                        : undefined
-                    }
-                    activeSubstepIndex={tutorialStep2ActiveSubstep(
-                      composerProgress?.phase,
-                    )}
-                  />
-                ) : null}
-              </div>
+              {buildGuidedWorkspaceScroller(
+                <>
+                  {transcript}
+                  {ackStack}
+                  {decisionSection}
+                  {/* Direct child of the scroll region: OUTSIDE both role=log
+                      containers, so its role=status is announced once. */}
+                  {guidedChatPending ? (
+                    <GuidedPendingStrip
+                      composerProgress={composerProgress}
+                      onStop={cancelGuidedChat}
+                      substeps={
+                        isTutorial === true && guidedSession.step === "step_2_sink"
+                          ? TUTORIAL_STEP_2_COMPOSING_SUBSTEPS
+                          : undefined
+                      }
+                      activeSubstepIndex={tutorialStep2ActiveSubstep(
+                        composerProgress?.phase,
+                      )}
+                    />
+                  ) : null}
+                </>,
+              )}
               {stepComposer}
             </>
           );
@@ -3310,8 +3585,21 @@ export function ChatPanel({
               component's usual nested live log. The guided-phase user rows
               in `messages` are deduped out of chatTurns above, so each turn
               renders exactly once. */}
+          {/* The exited-replay boundary. `guidedReplayHistory` is non-empty
+              only on a TERMINAL session and a `completed` one returns from the
+              branch above, so the session reaching here is always
+              `exited_to_freeform` — whose channel is closed, which is why the
+              token cannot come from `completedGuidedChatToken`. It comes from
+              the transcript derivation instead: the exit did not un-commit the
+              build, so its post-commit questions are still after-confirmation
+              turns (review round 1, 2026-09-03 — the same second derivation
+              the fork and reenter cases need). */}
           {guidedReplayHistory.length > 0 && (
-            <GuidedChatHistory chatHistory={guidedReplayHistory} replay />
+            <GuidedChatHistory
+              chatHistory={guidedReplayHistory}
+              replay
+              afterConfirmationToken={afterConfirmationChatToken(guidedSession)}
+            />
           )}
           {messages.length === 0 && guidedReplayHistory.length === 0 ? (
             <FreeformIntroduction />
@@ -3617,7 +3905,12 @@ type WorkflowStepId = GuidedStep | "ready";
 const GUIDED_STEP_PURPOSES: Record<GuidedStep, string> = {
   step_1_source: "Choose the input and confirm what ELSPETH can read.",
   step_2_sink: "Choose the output shape and the fields the pipeline should produce.",
-  step_3_transforms: "Review the transform stages that turn source data into the output.",
+  // Names where the steps came from (goal-first, elspeth-378cfa0e18): the
+  // session states its goal up front and the planner runs ONCE, at the step-2
+  // finish, from that goal. "Review the transform stages" described a stage the
+  // user was expected to author here; what actually happens is a review of what
+  // the assistant proposed.
+  step_3_transforms: "Review the processing steps the assistant proposed from your goal.",
   step_4_wire: "Review and confirm the wiring between your pipeline steps.",
 };
 

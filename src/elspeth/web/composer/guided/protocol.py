@@ -9,6 +9,7 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any, Literal, NotRequired, TypedDict, cast
 from uuid import UUID
 
@@ -312,14 +313,21 @@ class ProposePipelinePayload(TypedDict):
     """Redacted display/audit projection of a durable pipeline proposal.
 
     This projection is deliberately non-executable: it contains only
-    catalog-authoritative plugin identities, never component names, prompts,
-    paths, inline content, secret references, or model-authored rationale.
-    Exact canonical arguments remain in private proposal custody. The sole
-    authored values it publishes are the ones a human must see to accept the
-    proposal at all, each drawn from a closed server-owned allowlist: gate
-    behavior (the predicate and its trigger thresholds) and, per
+    catalog-authoritative plugin identities, never component names, paths,
+    inline content, secret references, or model-authored rationale. Exact
+    canonical arguments remain in private proposal custody. The sole authored
+    values it publishes are the ones a human must see to accept the proposal
+    at all, each drawn from a closed server-owned allowlist: gate behavior
+    (the predicate and its trigger thresholds) and, per
     ``_NODE_OPTION_SUMMARY_ALLOWLIST``, a node's key options rendered as
-    display text. Everything outside those allowlists stays private.
+    display text — including an llm node's model and prompts, which are the
+    decision the user is approving (I-2) — and, per
+    ``_NODE_OPTION_DISPLAY_ONLY_ALLOWLIST``, options shown but never
+    correctable (web_scrape's responsible-scraping identity). Everything
+    outside those allowlists stays private. Only the first table is the
+    correction authority (``public_node_option_keys``), so a key goes there
+    only when the card renders its whole value: a partially rendered option
+    would be planner-writable on a correction with the card text unchanged.
     Human copy is selected from exact server-owned template ids; structural
     labels are deterministic ordinals rather than canonical route, branch, or
     component names. Task 4 must validate catalog and private-proposal
@@ -771,6 +779,20 @@ PROPOSAL_RATIONALE_TEMPLATE = "guided.proposal.rationale.review_required.v1"
 GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT = "I re-planned the whole pipeline with that instruction. Review the updated proposal below."
 GUIDED_PROPOSAL_CORRECTION_ACKNOWLEDGEMENT = "I re-planned the selected component with that correction. Review the updated proposal below."
 GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT = "I re-planned the pipeline with that wiring correction. Review the updated wiring below."
+# Goal-first entry: ``/guided/start`` and ``/guided/convert`` now REQUIRE the
+# author's one-sentence goal, seed it as the session's first user turn, and
+# follow it with this single server-authored line so the transcript opens on
+# the source question instead of on silence.
+#
+# The copy is deliberately a server statement about what the SERVER will do,
+# never a claim that the assistant has read the goal: the Step-1/Step-2 chat
+# solver is handed the step skill, the user's message, and
+# ``build_step_chat_context_block`` — never ``GuidedSession.chat_history`` — so
+# "I read your goal" would be false at the very next turn. The planner is the
+# one reader, at the Step-2 finish, which is exactly what this line promises.
+GUIDED_GOAL_ACKNOWLEDGEMENT = (
+    "Goal saved. The planner will build from it once the source and output are reviewed. First, the source: where does the data come from?"
+)
 _PROPOSAL_BLOCKER_SUMMARY: Mapping[str, str] = {
     "pipeline_invalid": "guided.proposal.blocker.pipeline_invalid.v1",
     "policy_review_required": "guided.proposal.blocker.policy_review_required.v1",
@@ -861,9 +883,74 @@ def proposal_structural_label(kind: Literal["route", "branch"], index: int) -> s
 # entry to the lowering.
 _NODE_OPTION_SUMMARY_ALLOWLIST: Mapping[str, Mapping[str, FieldTier]] = {
     "field_mapper": {"mapping": "common", "select_only": "common"},
+    # The llm node's decision inputs (design review 2026-09-02, I-2): what
+    # the model is asked to do was invisible until the post-commit approval
+    # card, so the learner approved a pipeline whose most consequential
+    # authored value they had never seen. Model, system prompt and prompt
+    # template are planner-authored text, not row data; the adjacent
+    # credentials, endpoints, ``*_source`` file paths and sampling knobs stay
+    # private. Order is display order: model first, then the prompts.
+    "llm": {"model": "common", "system_prompt": "common", "prompt_template": "common"},
+    # NOT here: web_scrape's ``http`` object — see
+    # _NODE_OPTION_DISPLAY_ONLY_ALLOWLIST. Every key in THIS table is also
+    # what ``public_node_option_keys`` lets a node-scoped correction
+    # overwrite (planning.py replaces the object wholesale and drops it when
+    # a full candidate omits it), so a key whose value the card renders only
+    # in part would be planner-writable unseen (Phase 1 red-team finding F1,
+    # 2026-09-02). List a key here only when its renderer publishes the
+    # whole value.
 }
+# Options the review cards SHOW but a correction may NEVER touch. Same tier
+# semantics and the same renderer table as the allowlist above; the one
+# difference is that ``public_node_option_keys`` does not return these keys,
+# so the node-patch schema never advertises them and the binder never
+# overlays them — the reviewed value always comes back from the predecessor.
+# web_scrape's ``http`` object carries the SSRF host allowlist, timeout and
+# body cap beside the two responsible-scraping declarations the card renders
+# (the material of the post-commit ``web_scrape_http_identity`` decision);
+# display-only is what lets the identity show before commit without making
+# the policy writable. A key may appear in exactly one of the two tables
+# (pinned by tests/unit/web/composer/guided/test_protocol.py).
+_NODE_OPTION_DISPLAY_ONLY_ALLOWLIST: Mapping[str, Mapping[str, FieldTier]] = {
+    "web_scrape": {"http": "common"},
+}
+
+
+def _node_option_display_tiers(plugin: str | None) -> dict[str, FieldTier]:
+    """Every option key the cards render for ``plugin``, correctable first."""
+
+    # Membership form, not ``.get``: an absent plugin (structural node or an
+    # unlisted plugin) legitimately renders nothing, and the two signed R1
+    # reads of the correctable table below already carry that adjudication.
+    tiers: dict[str, FieldTier] = {}
+    if plugin is not None and plugin in _NODE_OPTION_SUMMARY_ALLOWLIST:
+        tiers.update(_NODE_OPTION_SUMMARY_ALLOWLIST[plugin])
+    if plugin is not None and plugin in _NODE_OPTION_DISPLAY_ONLY_ALLOWLIST:
+        tiers.update(_NODE_OPTION_DISPLAY_ONLY_ALLOWLIST[plugin])
+    return tiers
+
+
 _MAX_NODE_OPTION_SUMMARY_PAIRS = 20
 _MAX_NODE_OPTION_SUMMARY_VALUE = 240
+# The prompt keys reach the card under the SAME bound the post-commit approval
+# card already publishes the prompt at — ``InterpretationEventResponse.llm_draft``
+# (sessions/schemas.py, max_length=8192) — so the projection reuses that
+# boundary rather than adding a second one; the parity is pinned by
+# tests/unit/web/composer/guided/test_protocol.py.
+_MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE = 8_192
+# Room reserved at the tail of a cut prompt for the honest "… (N more
+# characters not shown)" marker: the text is what the user is approving, so
+# it is never cut silently.
+_NODE_OPTION_SUMMARY_PROMPT_MARKER_RESERVE = 64
+_NODE_OPTION_SUMMARY_PROMPT_KEYS = frozenset({"prompt_template", "system_prompt"})
+
+
+def _node_option_summary_value_bound(key: str) -> int:
+    """The rendered-length bound for one allowlisted option key."""
+
+    return _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE if key in _NODE_OPTION_SUMMARY_PROMPT_KEYS else _MAX_NODE_OPTION_SUMMARY_VALUE
+
+
 # The two accepted projected-pair shapes: fresh projections always carry
 # ``tier``, durable turns written before it landed do not.
 _NODE_OPTION_SUMMARY_PAIR_KEYS = frozenset({"key", "value"})
@@ -917,9 +1004,64 @@ def _rendered_select_only(value: object) -> str:
     return ""
 
 
+def _rendered_short_text(value: object) -> str:
+    """Render an exact-string scalar (the llm ``model``) verbatim, bounded."""
+
+    if type(value) is not str or not value.strip():
+        return ""
+    if len(value) > _MAX_NODE_OPTION_SUMMARY_VALUE:
+        return value[: _MAX_NODE_OPTION_SUMMARY_VALUE - 1] + "…"
+    return value
+
+
+def _rendered_prompt_text(value: object) -> str:
+    """Render a prompt verbatim up to the approval card's bound.
+
+    Past the bound the text is cut with an explicit remaining-character count:
+    the prompt is the thing the user is approving, so a silent cut would show
+    them a different instruction than the one the pipeline will run.
+    """
+
+    if type(value) is not str or not value.strip():
+        return ""
+    if len(value) <= _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE:
+        return value
+    shown = value[: _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE - _NODE_OPTION_SUMMARY_PROMPT_MARKER_RESERVE]
+    return f"{shown}… ({len(value) - len(shown)} more characters not shown)"
+
+
+def _rendered_scrape_identity(value: object) -> str:
+    """Render web_scrape's ``http`` identity as "contact: …; reason: …".
+
+    Only the two responsible-scraping declarations are published; every other
+    member of the ``http`` mapping (the SSRF host allowlist, timeout, body cap)
+    is private. A member that is absent, empty or not an exact string is
+    omitted rather than defaulted, and both missing renders to nothing. This
+    partial rendering is exactly why ``http`` lives in the display-only table:
+    a correction must never be able to rewrite the members the card omits.
+    """
+
+    # Exact types, not an ABC test: the value is either the planner's JSON
+    # object (a dict) or the same object deep-frozen for replay
+    # (contracts/freeze.py renders every mapping as MappingProxyType). Those
+    # are the only two producers, so the exact-type idiom IS exact here.
+    if type(value) is not dict and type(value) is not MappingProxyType:
+        return ""
+    parts: list[str] = []
+    for member, label in (("abuse_contact", "contact"), ("scraping_reason", "reason")):
+        text = value[member] if member in value else None
+        if type(text) is str and text.strip():
+            parts.append(f"{label}: {text.strip()}")
+    return _rendered_short_text("; ".join(parts))
+
+
 _NODE_OPTION_SUMMARY_RENDERERS: Mapping[str, Callable[[object], str]] = {
     "mapping": _rendered_mapping,
     "select_only": _rendered_select_only,
+    "model": _rendered_short_text,
+    "system_prompt": _rendered_prompt_text,
+    "prompt_template": _rendered_prompt_text,
+    "http": _rendered_scrape_identity,
 }
 
 
@@ -942,10 +1084,12 @@ def node_options_summary(plugin: str | None, options: Mapping[str, Any]) -> list
 
     Returns ``[]`` for a structural node, an unlisted plugin, or an allowlisted
     knob whose authored value renders to nothing — the review surfaces render
-    an empty summary as "no key options", never as a missing section.
+    an empty summary as "no key options", never as a missing section. Both
+    the correctable and the display-only tables are rendered here; only the
+    former is returned by ``public_node_option_keys``.
     """
 
-    tiers = _NODE_OPTION_SUMMARY_ALLOWLIST.get(plugin or "", {})
+    tiers = _node_option_display_tiers(plugin)
     if not tiers or not isinstance(options, Mapping):
         return []
     summary: list[_NodeOptionSummary] = []
@@ -979,7 +1123,7 @@ def _node_options_summary_error(value: object, path: str, *, plugin: str | None)
     if error is not None:
         return error
     assert items is not None
-    allowed = _NODE_OPTION_SUMMARY_ALLOWLIST.get(plugin or "", {})
+    allowed = _node_option_display_tiers(plugin)
     seen: set[str] = set()
     for index, item in enumerate(items):
         item_path = f"{path}[{index}]"
@@ -1004,7 +1148,7 @@ def _node_options_summary_error(value: object, path: str, *, plugin: str | None)
         seen.add(pair["key"])
         if (error := _current_text_error(pair["value"], f"{item_path}.value", nonempty=True)) is not None:
             return error
-        if len(cast(str, pair["value"])) > _MAX_NODE_OPTION_SUMMARY_VALUE:
+        if len(cast(str, pair["value"])) > _node_option_summary_value_bound(cast(str, pair["key"])):
             return f"{item_path}.value exceeds the bounded option summary length"
     return None
 

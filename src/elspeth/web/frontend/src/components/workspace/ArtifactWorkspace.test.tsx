@@ -24,8 +24,10 @@ import * as api from "@/api/client";
 import * as auditApi from "@/api/auditReadiness";
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import { EMPTY_GUIDED_REVIEWED_COMPONENTS } from "@/stores/guidedReviewedComponents";
 import { useSessionStore } from "@/stores/sessionStore";
 import { makeComposition, makeValidationResult } from "@/test/composerFixtures";
+import type { TurnPayload } from "@/types/guided";
 import { useHashRouter } from "@/hooks/useHashRouter";
 import {
   OPEN_CATALOG_EVENT,
@@ -154,6 +156,8 @@ describe("ArtifactWorkspace", () => {
       staleProposalIds: [],
       exportedYamlBlobBinding: null,
       selectedNodeId: null,
+      guidedNextTurn: null,
+      guidedReviewedComponents: EMPTY_GUIDED_REVIEWED_COMPONENTS,
     });
     useExecutionStore.setState({
       activeRunId: null,
@@ -250,6 +254,61 @@ describe("ArtifactWorkspace", () => {
     expect(panel).toHaveTextContent(
       "No pipeline to visualise. Start a conversation to build one.",
     );
+  });
+
+  it("draws a pending guided proposal in the Graph panel while the composition is empty (elspeth-9f0873426a)", () => {
+    // Guided mode keeps the composition empty until Confirm wiring; the
+    // learner still has to see the structure they are approving, and this
+    // pane — not the chat column — is where it belongs (review IA-1/V-1).
+    const SOURCE_ID = "00000000-0000-4000-8000-000000000912";
+    const OUTPUT_ID = "00000000-0000-4000-8000-000000000914";
+    const proposalTurn: TurnPayload = {
+      type: "propose_pipeline",
+      step_index: 2,
+      turn_token: "c".repeat(64),
+      payload: {
+        proposal_id: "00000000-0000-4000-8000-000000000911",
+        draft_hash: "d".repeat(64),
+        supersedes_draft_hash: null,
+        summary: "guided.proposal.summary.full_graph.v1",
+        rationale: "guided.proposal.rationale.review_required.v1",
+        component_counts: { sources: 1, nodes: 0, edges: 1, outputs: 1 },
+        blockers: [],
+        graph: {
+          sources: [
+            { stable_id: SOURCE_ID, label: "source-1", plugin: { kind: "source", id: "csv" } },
+          ],
+          edges: [
+            {
+              stable_id: "00000000-0000-4000-8000-000000000915",
+              from_endpoint: { kind: "source", stable_id: SOURCE_ID },
+              to_endpoint: { kind: "output", stable_id: OUTPUT_ID },
+              flow: { kind: "source_success", branch: null },
+            },
+          ],
+        },
+        nodes: [],
+        outputs: [
+          { stable_id: OUTPUT_ID, label: "output-1", plugin: { kind: "sink", id: "json" } },
+        ],
+        edit_targets: [],
+      },
+    };
+    useSessionStore.setState({ guidedNextTurn: proposalTurn });
+    renderArtifactWorkspace();
+
+    const panel = screen.getByRole("tabpanel");
+    expect(
+      within(panel).getByRole("img", {
+        name: "Pipeline proposal graph with 2 components and 1 routes",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(panel).getByText(
+        "Proposed pipeline, not yet committed. Confirm the wiring to commit it.",
+      ),
+    ).toBeInTheDocument();
+    expect(panel).not.toHaveTextContent("No pipeline to visualise.");
   });
 
   it("disables Spec, YAML, and Checks without composition content but keeps Graph and Run available", () => {

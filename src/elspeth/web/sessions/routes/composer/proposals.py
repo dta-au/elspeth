@@ -297,7 +297,16 @@ async def accept_composition_proposal(
                 # it directly and let a contract violation (a future tool
                 # building ``success=False`` without the error key) crash
                 # loudly rather than degrade to a generic message.
-                error_summary = result.data[_DATA_ERROR_KEY] or "Composer proposal failed validation."
+                # ``ToolResult.data`` is the closed ``ToolResultData`` union
+                # (Mapping | Sequence | BaseModel | None), so the carrier half
+                # of that contract is asserted before the read rather than
+                # assumed by indexing (ADR-032). The key half stays a bare
+                # subscript: a missing ``_DATA_ERROR_KEY`` is the loud KeyError
+                # the comment above asks for.
+                failure_data = result.data
+                if not isinstance(failure_data, Mapping):
+                    raise TypeError(f"a success=False ToolResult must carry a Mapping data payload, got {type(failure_data).__name__}")
+                error_summary = failure_data[_DATA_ERROR_KEY] or "Composer proposal failed validation."
                 validation_errors_payload: list[dict[str, Any]] = []
                 if result.validation is not None:
                     for entry in result.validation.errors:

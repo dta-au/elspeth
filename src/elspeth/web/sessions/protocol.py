@@ -2693,6 +2693,7 @@ class SessionServiceProtocol(Protocol):
         system_message: str | None = None,
         payloads: tuple[PreparedGuidedJsonPayload, ...] = (),
         audit_evidence: GuidedAuditEvidence | None = None,
+        originating_message: GuidedOriginatingUserMessageDraft | None = None,
         payload_store: PayloadStore | None = None,
     ) -> CompositionStateRecord: ...
 

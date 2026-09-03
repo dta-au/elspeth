@@ -22,6 +22,8 @@
 
 import { expect, test, type Page, type Route } from "@playwright/test";
 
+import { TUTORIAL_TRANSFORMS_PROMPT } from "@/components/tutorial/tutorialMachine";
+
 const session = {
   id: "11111111-1111-4111-8111-222222222222",
   title: "New session",
@@ -96,13 +98,53 @@ const compositionState = {
   plugin_policy_findings: [],
 };
 
+// The server line that follows the goal on every started session
+// (GUIDED_GOAL_ACKNOWLEDGEMENT, composer/guided/protocol.py). This file IS the
+// server for this canary, so the string is held literally.
+const GUIDED_GOAL_ACKNOWLEDGEMENT =
+  "Goal saved. The planner will build from it once the source and output are reviewed. First, the source: where does the data come from?";
+
+/** One `chat_history` entry in the closed ChatTurn wire shape. */
+function chatTurn(
+  role: "user" | "assistant",
+  content: string,
+  seq: number,
+  step: string,
+): Record<string, unknown> {
+  return {
+    role,
+    content,
+    seq,
+    step,
+    ts_iso: "2026-08-25T12:00:00Z",
+    assistant_message_kind: role === "assistant" ? "assistant" : null,
+    synthetic_failure_reason: null,
+    turn_token: null,
+  };
+}
+
+// Goal-first (elspeth-378cfa0e18): a started session's transcript OPENS with
+// the goal the client sent and the server's acknowledgement, stamped with the
+// step the session opens on — never `[]`, which is a shape the backend can no
+// longer emit. The first-run shell is this walk's mount, so the goal it sends
+// is the frozen transforms prompt. The seeded pair rides through every
+// response here so the collector surfaces are exercised against a transcript
+// that already has turns in it.
+function seededGoalTurns(): Array<Record<string, unknown>> {
+  return [
+    chatTurn("user", TUTORIAL_TRANSFORMS_PROMPT, 0, "step_1_source"),
+    chatTurn("assistant", GUIDED_GOAL_ACKNOWLEDGEMENT, 1, "step_1_source"),
+  ];
+}
+
 function guidedSession(step: string): Record<string, unknown> {
+  const chatHistory = seededGoalTurns();
   return {
     step,
     history: [],
     terminal: null,
-    chat_history: [],
-    chat_turn_seq: 0,
+    chat_history: chatHistory,
+    chat_turn_seq: chatHistory.length,
     profile: { coaching: true, bookends: true },
   };
 }
@@ -670,8 +712,9 @@ test.describe("guided collector authoring (mocked wire-contract canary)", () => 
 
     // ── Confirm → completed (turn sequencing pin) ───────────────────────────
     await page.getByRole("button", { name: "Confirm wiring", exact: true }).click();
+    // The run turn mounts on its pre-run card (I-1); no run fires here.
     await expect(
-      page.getByRole("heading", { name: /Running your pipeline/i }),
+      page.getByRole("heading", { name: /Ready to run/i }),
     ).toBeVisible();
 
     expect(state.requestLog).toEqual([
