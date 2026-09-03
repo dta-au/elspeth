@@ -8,6 +8,7 @@ the resulting token.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import time
 from collections.abc import Mapping
 from typing import Any, Literal, NoReturn, cast
@@ -23,6 +24,17 @@ from elspeth.web.auth.urls import validate_oidc_issuer
 from elspeth.web.validation import has_visible_content
 
 slog = structlog.get_logger()
+
+
+# Bounded clock skew between this container and the IdP. Wide enough for
+# ordinary NTP drift, narrow enough that a stolen token's usable lifetime is
+# not meaningfully extended.
+_ID_TOKEN_LEEWAY_SECONDS = 60
+
+# A JWK announcing any other key type is refused BEFORE its key material is
+# used. "oct" is the dangerous one: a symmetric key published in a JWKS, paired
+# with an HMAC algorithm, turns a public document into a signing secret.
+_PERMITTED_JWK_KEY_TYPES = frozenset({"RSA", "EC"})
 
 
 class _UnknownSigningKeyError(AuthenticationError):
@@ -553,6 +565,130 @@ class JWKSTokenValidator:
             # would surface into the 401 response body.
             raise AuthenticationError(f"Invalid token: {type(exc).__name__}") from exc
         return payload
+
+    @staticmethod
+    def _assert_supported_key_type(jwks: Mapping[str, Any], *, kid: str | None) -> None:
+        """Refuse a matched JWK whose key type is not RSA or EC.
+
+        Checked BEFORE the key material is parsed or used. A JWKS is a public
+        document, so an ``oct`` entry paired with an HMAC algorithm would let
+        anyone who can read it forge a token; pinning the algorithm list
+        already blocks that, and this closes the same door from the other
+        side.
+
+        Membership-then-subscript rather than ``.get()``: this is IdP data,
+        and the absent case is a decision worth seeing.
+        """
+        for raw_key in jwks["keys"]:
+            if type(raw_key) is not dict:
+                continue
+            raw_kid = raw_key["kid"] if "kid" in raw_key else None
+            if raw_kid != kid:
+                continue
+            key_type = raw_key["kty"] if "kty" in raw_key else None
+            if key_type not in _PERMITTED_JWK_KEY_TYPES:
+                raise AuthenticationError("Invalid token: JWKS key type is not permitted")
+            return
+
+    @staticmethod
+    def _verify_nonce(payload: Mapping[str, Any], *, expected: str) -> None:
+        """Bind the token to THIS login attempt, in constant time.
+
+        The nonce is the only thing tying an ID token to the browser
+        transaction that asked for it; without this check a token replayed
+        from another session validates perfectly.
+        """
+        actual = payload["nonce"] if "nonce" in payload else None
+        if type(actual) is not str or not hmac.compare_digest(actual, expected):
+            raise AuthenticationError("Invalid token: nonce check failed")
+
+    @staticmethod
+    def _verify_authorized_party(payload: Mapping[str, Any], *, client_id: str) -> None:
+        """When ``aud`` is a list, ``azp`` must name us.
+
+        A multi-audience token is addressed to several relying parties at
+        once. Accepting one because our client id appears somewhere in the
+        list would let a token minted for a different application be
+        presented here; ``azp`` is the claim that says which party it was
+        actually issued to.
+        """
+        audience = payload["aud"] if "aud" in payload else None
+        if type(audience) is str:
+            return
+        authorized_party = payload["azp"] if "azp" in payload else None
+        if type(authorized_party) is not str or not hmac.compare_digest(authorized_party, client_id):
+            raise AuthenticationError("Invalid token: authorized party check failed")
+
+    def decode_id_token(
+        self,
+        token: str,
+        jwks: dict[str, Any],
+        *,
+        algorithms: tuple[str, ...],
+        audience: str,
+        nonce: str,
+        client_id: str,
+    ) -> Mapping[str, Any]:
+        """Decode an ID token from an SSO login. One path, no branches.
+
+        Differs from ``decode_token`` in the way that matters: the accepted
+        algorithms come from the PROFILE, never from the token's own header.
+        The old path passed ``algorithms=[token_alg]``, which is the shape
+        that lets an attacker nominate the algorithm their forged token is
+        checked with (elspeth-e8a9973c37).
+
+        ``exp iat iss sub aud nonce`` are all required — a token missing any
+        of them is refused rather than defaulted — and the checks that PyJWT
+        cannot express (nonce equality, ``azp`` for a list audience) run
+        after decode, in constant time.
+        """
+        try:
+            header = jwt.get_unverified_header(token)
+            # `kid` is optional per RFC 7515; an absent or unknown one
+            # matches no JWK and raises below.
+            kid = header["kid"] if "kid" in header else None
+            self._assert_supported_key_type(jwks, kid=kid)
+            jwk_set = self._parse_jwk_set(jwks)
+            matched_jwk = None
+            for key in jwk_set.keys:
+                if key.key_id == kid:
+                    matched_jwk = key
+                    break
+            if matched_jwk is None:
+                raise _UnknownSigningKeyError("Invalid token: signing key check failed")
+            payload: Mapping[str, Any] = jwt.decode(
+                token,
+                matched_jwk.key,
+                algorithms=list(algorithms),
+                audience=audience,
+                issuer=self._issuer,
+                leeway=_ID_TOKEN_LEEWAY_SECONDS,
+                options={"require": ["exp", "iat", "iss", "sub", "aud", "nonce"]},
+            )
+        except PyJWTError as exc:
+            # Class name only: PyJWT messages echo claim values and token
+            # segments, which AuthenticationError would surface into a 401 body.
+            raise AuthenticationError(f"Invalid token: {type(exc).__name__}") from exc
+        self._verify_nonce(payload, expected=nonce)
+        self._verify_authorized_party(payload, client_id=client_id)
+        return payload
+
+    async def decode_id_token_with_refresh(
+        self,
+        token: str,
+        *,
+        algorithms: tuple[str, ...],
+        audience: str,
+        nonce: str,
+        client_id: str,
+    ) -> Mapping[str, Any]:
+        """``decode_id_token``, refreshing JWKS once on an unknown key."""
+        jwks = await self.ensure_jwks()
+        try:
+            return self.decode_id_token(token, jwks, algorithms=algorithms, audience=audience, nonce=nonce, client_id=client_id)
+        except _UnknownSigningKeyError:
+            refreshed_jwks = await self.ensure_jwks(refresh_if_unchanged=jwks)
+            return self.decode_id_token(token, refreshed_jwks, algorithms=algorithms, audience=audience, nonce=nonce, client_id=client_id)
 
     async def decode_token_with_refresh(self, token: str) -> Mapping[str, Any]:
         """Decode a token, refreshing JWKS once if its signing key is unknown."""

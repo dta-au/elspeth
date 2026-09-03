@@ -654,6 +654,9 @@ allowed_dict_patterns:
   # ═══════════════════════════════════════════════════════════════════════════
   - "src/elspeth/web/auth/oidc.py:JWKSTokenValidator.ensure_jwks:return"
   - "src/elspeth/web/auth/oidc.py:JWKSTokenValidator.decode_token:jwks"
+  # Same foreign JWKS document as decode_token above: PyJWKSet.from_dict
+  # requires a real dict, and this is the SSO ID-token path's copy of it.
+  - "src/elspeth/web/auth/oidc.py:JWKSTokenValidator.decode_id_token:jwks"
   - "src/elspeth/web/auth/oidc.py:JWKSTokenValidator.decode_token:return"
   - "src/elspeth/web/auth/oidc.py:JWKSTokenValidator._parse_jwk_set:jwks"
   - "src/elspeth/web/auth/oidc.py:JWKSTokenValidator._get_token_algorithm:header"
