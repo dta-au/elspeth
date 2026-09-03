@@ -156,7 +156,10 @@ preview stage's own facts:
 - source, node, and output summary data (`sources`, `nodes`, `outputs`, `node_count`, `output_count`)
 
 One entry per producer/consumer pair that was checked, and a pair is checked
-only where the consumer declares required fields. Each entry reports:
+only where the consumer requires fields — through `required_fields`, through a
+fixed/flexible schema's declared fields (checked only against a typed source
+producer), or, for a sink, through an option naming the field it writes from.
+Each entry reports:
 - `from` / `to` (`to` is `output:<sink name>` for a sink)
 - `producer_guarantees`
 - `consumer_requires`
@@ -165,7 +168,7 @@ only where the consumer declares required fields. Each entry reports:
 
 **When to use:** After making a series of changes, to confirm the pipeline is set up correctly before responding to the user or calling `generate_yaml`.
 
-**Important:** `edge_contracts: []` is not positive contract evidence. It means no field contracts were declared. Also treat skipped contract-check warnings as unresolved rather than satisfied.
+**Important:** `edge_contracts: []` is not positive contract evidence. It means no field contract was checked — either nothing required fields, or the only requirement was an implicit one facing a producer that makes no typed claim. Also treat skipped contract-check warnings as unresolved rather than satisfied.
 
 ---
 
