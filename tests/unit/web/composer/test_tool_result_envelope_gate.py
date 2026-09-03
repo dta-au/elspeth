@@ -289,14 +289,22 @@ def _aliases_of(fn: ast.AST, name: str) -> frozenset[str]:
         names = grown
 
 
-def _results_carrying(fn: ast.AST, payload: str) -> frozenset[str]:
-    """Locals bound to a ``ToolResult(..., data=<payload>)`` call, and their aliases: the result
-    is frozen but ``.data`` is the payload dict itself, so ``result.data[k] = v`` ships ``k``."""
+def _results_carrying(fn: ast.AST, payload: ast.AST) -> frozenset[str]:
+    """Locals bound to the ``ToolResult(..., data=<payload>)`` call carrying ``payload``, and their aliases.
+
+    Defence in depth, and say so honestly: ``ToolResult.__post_init__``
+    deep-freezes ``data`` into a FRESH ``MappingProxyType``
+    (``contracts/freeze.py``), so today ``result.data[k] = v`` is a runtime
+    ``TypeError`` and a store on the caller's own dict after construction never
+    reaches the wire — measured, not reasoned (verify-gate VG-F2). This arm
+    exists for a future ``ToolResult`` variant that stops freezing; the pin
+    docstring must not claim ``.data`` is the payload dict itself.
+    """
     bound: set[str] = set()
     for targets, rhs in _name_bindings(fn):
         if not (isinstance(rhs, ast.Call) and _call_name(rhs) == "ToolResult"):
             continue
-        if any(kw.arg == "data" and isinstance(kw.value, ast.Name) and kw.value.id == payload for kw in rhs.keywords):
+        if any(kw.arg == "data" and kw.value is payload for kw in rhs.keywords):
             bound.update(target.id for target in targets if isinstance(target, ast.Name))
     out: set[str] = set()
     for name in bound:
@@ -312,21 +320,34 @@ def _dict_mutations(fn: ast.AST, aliases: frozenset[str], results: frozenset[str
     store, augmented store, or ``del`` on an alias or on a result's ``.data``, and any mutator
     method call (``update``, ``setdefault``, ``pop``, ...) on either. Source order."""
 
-    def refers(node: ast.AST) -> bool:
+    def referenced(node: ast.AST) -> ast.AST | None:
+        """The alias or result ``.data`` a store target names, seeing THROUGH a ``cast(...)``.
+
+        ``cast`` is a no-op at runtime, so ``cast(dict[str, str], x)[k] = v`` stores
+        into ``x`` while silencing mypy. The file's other walkers refuse a cast
+        outright; a mutation walker has to look inside one instead, or the widening
+        is a free pass (verify-gate VG-F1, mutant P5).
+        """
+        if isinstance(node, ast.Call) and _is_cast(node) and len(node.args) == 2:
+            node = node.args[1]
         if isinstance(node, ast.Name):
-            return node.id in aliases
-        return isinstance(node, ast.Attribute) and node.attr == "data" and isinstance(node.value, ast.Name) and node.value.id in results
+            return node if node.id in aliases else None
+        if isinstance(node, ast.Attribute) and node.attr == "data" and isinstance(node.value, ast.Name) and node.value.id in results:
+            return node
+        return None
 
     found: list[tuple[int, str]] = []
     for node in ast.walk(fn):
         if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
             targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
             for target in targets:
-                if isinstance(target, ast.Subscript) and refers(target.value):
-                    found.append((node.lineno, f"{type(node).__name__} through {ast.unparse(target.value)}"))
+                store = referenced(target.value) if isinstance(target, ast.Subscript) else None
+                if store is not None:
+                    found.append((node.lineno, f"{type(node).__name__} through {ast.unparse(store)}"))
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _DICT_MUTATORS:
-            if refers(node.func.value):
-                found.append((node.lineno, f".{node.func.attr} on {ast.unparse(node.func.value)}"))
+            mutated = referenced(node.func.value)
+            if mutated is not None:
+                found.append((node.lineno, f".{node.func.attr} on {ast.unparse(mutated)}"))
     return sorted(found)
 
 
@@ -468,8 +489,11 @@ def f():
     other.data["later"] = 1
     result.data.update({"z": 1})
     del _p["status"]
+    cast(dict[str, str], _p)["cast_store"] = "z"
+    cast(dict[str, int], result.data)["cast_data"] = 2
     unrelated = {"k": 1}
     unrelated["k"] = 2
+    cast(dict[str, int], unrelated)["k"] = 3
     return result
 """
 
@@ -557,11 +581,15 @@ def test_walker_resolves_import_bound_str_constants() -> None:
 def test_walker_finds_stores_through_local_and_result_aliases() -> None:
     """Alias stores re-shape the same dict object (GATE-refute1-2 F-1: ``_p = payload;
     _p["success"] = "true"`` survived the R5 pin). The alias walk follows ``a = payload``
-    chains and the locals bound to ``ToolResult(data=payload)``, and reports every store,
-    ``del`` and mutator call through any of them — and nothing through an unrelated dict."""
+    chains and the locals bound to the ``ToolResult(data=payload)`` call, and reports every
+    store, ``del`` and mutator call through any of them — including one hidden behind a
+    ``cast(...)`` widening (verify-gate VG-F1, mutant P5) — and nothing through an unrelated
+    dict, cast or not."""
     fn = _function(ast.parse(_PROBE_ALIAS_STORES), "f")
+    call = next(node for node in ast.walk(fn) if isinstance(node, ast.Call) and _call_name(node) == "ToolResult")
+    payload = next(kw.value for kw in call.keywords if kw.arg == "data")
     aliases = _aliases_of(fn, "payload")
-    results = _results_carrying(fn, "payload")
+    results = _results_carrying(fn, payload)
     assert aliases == {"payload", "_p", "_q"}
     assert results == {"result", "other"}
     assert _dict_mutations(fn, aliases, results) == [
@@ -569,6 +597,8 @@ def test_walker_finds_stores_through_local_and_result_aliases() -> None:
         (9, "Assign through other.data"),
         (10, ".update on result.data"),
         (11, "Delete through _p"),
+        (12, "Assign through _p"),
+        (13, "Assign through result.data"),
     ]
     # The direct-name walker is blind to every one of them: the reason the alias walk exists.
     assert list(_subscript_assign_keys(fn, "payload", "probe", {})) == []
@@ -714,12 +744,32 @@ def _plugin_schema_sites() -> Iterator[ShippedKey]:
 
 
 # (file, function, the local dict the payload is assembled in) for the shared failure helpers.
+# ``None`` means the payload is passed inline at ``data=`` — as a dict literal, or as a call to
+# an owned TypedDict, which is the form that leaves no local for a later store to travel through.
 _FAILURE_DATA_HELPERS: tuple[tuple[Path, str, str | None], ...] = (
     (COMMON, "_failure_result", "data"),
     (COMMON, "_credential_wiring_contract_failure", None),  # passed inline as data={...}
-    (TOOL_BATCH, "run_tool_batch", "proposal_payload"),
+    (TOOL_BATCH, "run_tool_batch", None),  # passed inline as data=_ProposalPayload(...)
     (TOOL_BATCH, "run_tool_batch", "feedback_data"),
 )
+
+
+def _typed_call_keys(call: ast.Call, path: Path, prefix: str, site: str) -> Iterator[str]:
+    """Keys a ``<OwnedTypedDict>(key=value, ...)`` constructor ships: its keyword names, in call order.
+
+    A TypedDict constructor is ``dict`` at runtime, so the wire order is the
+    order of the CALL's keywords, never the class's declaration order — the two
+    are held equal by the pin, not assumed here. The class is resolved nominally
+    (ADR-032) through the module the walked file belongs to. Refuses a
+    positional argument and a ``**`` splat: either hides keys from the walker.
+    """
+    name = _call_name(call)
+    owned = _owned_payload_type(vars(_module_of(path)).get(name))
+    assert owned is not None and typing.is_typeddict(owned), f"{site}: data={name}(...) is not a call to an owned TypedDict"
+    assert not call.args, f"{site}: {name}(...) takes keyword arguments only"
+    for kw in call.keywords:
+        assert kw.arg is not None, f"{site}: ** splat hides the shape of {name}(...)"
+        yield f"{prefix}{kw.arg}"
 
 
 def _failure_data_sites() -> Iterator[ShippedKey]:
@@ -749,10 +799,19 @@ def _failure_data_sites() -> Iterator[ShippedKey]:
             for node in ast.walk(fn):
                 if isinstance(node, ast.Call) and _call_name(node) == "ToolResult":
                     for kw in node.keywords:
-                        if kw.arg == "data" and isinstance(kw.value, ast.Dict):
-                            found = True
+                        if kw.arg != "data":
+                            continue
+                        found = True
+                        if isinstance(kw.value, ast.Dict):
                             for key in _dict_literal_keys(kw.value, "data.", f"{site}:{node.lineno}", constants):
                                 yield ShippedKey("failure-data", SHARED, key, f"{_display(path)}:{node.lineno}")
+                        elif isinstance(kw.value, ast.Call):
+                            for key in _typed_call_keys(kw.value, path, "data.", f"{site}:{kw.value.lineno}"):
+                                yield ShippedKey("failure-data", SHARED, key, f"{_display(path)}:{kw.value.lineno}")
+                        else:
+                            raise AssertionError(
+                                f"{site}:{node.lineno}: inline data={type(kw.value).__name__} is not a shape the walker reads"
+                            )
         assert found, f"{site}: no readable data payload for {fn_name} — walker out of date"
     yield ShippedKey(
         "failure-data", SHARED, f"data.{common.COMPONENTS_WITHHELD_KEY}", f"{_display(COMMON)}:_merged_component_rejection_result"
@@ -1225,54 +1284,67 @@ _PROPOSAL_PAYLOAD_KEYS: tuple[str, ...] = ("status", "proposal_id", "tool_name",
 
 
 def test_approval_required_proposal_payload_ships_exactly_its_keys() -> None:
-    """Exact-key pin on the proposal payload (red-team R5, mutation RM5; GATE-refute1-2 F-1).
+    """Exact-key pin on the proposal payload (red-team R5, mutation RM5; GATE-refute1-2 F-1; verify-gate VG-F1).
 
     The teaching gate cannot catch ``"success": True`` creeping back into this
     payload: the leaf ``success`` is quoted everywhere the envelope is taught,
-    so ``data.success`` would count as taught. Only an exact pin on the literal
-    the walker reads can refuse it. The shape is closed structurally first: the
-    literal is annotated with the owned ``_ProposalPayload`` TypedDict, whose
-    keys this pin holds equal to the literal's, so mypy refuses an extra key at
-    the literal and any store of an unknown key through the local, an alias, or
-    ``proposal_result.data``. The walker is the backstop for what the type does
-    not police at runtime: exactly one assignment, no store / ``del`` / mutator
-    call through ``proposal_payload``, any local aliased to it, or the ``.data``
-    of any local bound to ``ToolResult(data=proposal_payload)``. A store the
-    walker cannot see — inside a callee — is what the type refuses (a callee
-    that mutates takes ``dict``, which a TypedDict is not). Finally the census
-    rows for this line (the ``_FAILURE_DATA_HELPERS`` row) must equal the pin,
-    so the pin and the matrix cannot drift apart.
+    so ``data.success`` would count as taught. Only an exact pin on the site the
+    walker reads can refuse it.
+
+    The shape is closed STRUCTURALLY rather than by a walker chasing syntax. The
+    payload is built inline as the ``data=`` argument of one result constructor,
+    by calling the owned ``_ProposalPayload`` TypedDict, and is never bound to a
+    name — so there is no local, alias, ``cast`` widening or callee for a store
+    to travel through, and ``__post_init__`` freezes the dict before any other
+    statement runs. That matters because the previous, name-based pin was
+    measurably not closed: an ``Any``-typed callee, an ``Any``-returning helper
+    and ``cast(dict[str, str], proposal_payload)["success"] = ...`` each shipped
+    a sixth key past mypy (``strict = true`` does not imply
+    ``disallow_any_explicit``) AND past every commit-path gate (verify-gate
+    VG-F1). None of the three can be written against an expression that has no
+    name.
+
+    What the type does: mypy refuses an extra, missing or mistyped key at the
+    constructor call (measured — ``Extra key "success" for TypedDict
+    "_ProposalPayload"``). What this pin does: holds the CALL's keyword order
+    equal to the wire order and to the class's own keys (a TypedDict call is a
+    ``dict`` at runtime, so the call site is what orders the wire), and refuses
+    any form that would re-open a handle — a re-introduced local, a ``cast``
+    around the constructor, a ``{**_ProposalPayload(...)}`` splat, a wrapper
+    call — because each of those makes ``data=`` something other than the one
+    construction. The ``_dict_mutations`` arm over the RESULT is defence in
+    depth and nothing more: ``__post_init__`` deep-freezes ``data`` into a fresh
+    ``MappingProxyType``, so ``proposal_result.data[k] = v`` is a runtime
+    ``TypeError`` and could not ship even unpinned (verify-gate VG-F2); it is
+    kept for a future ``ToolResult`` that stops freezing. Finally the census
+    rows for the construction's line must equal the pin, so pin, type, site and
+    matrix cannot drift apart.
     """
     tree = _parse(TOOL_BATCH)
-    constants = _module_str_constants(tree, TOOL_BATCH)
     fn = _function(tree, "run_tool_batch")
     site = f"{_display(TOOL_BATCH)}:{fn.lineno}"
-    assignments = list(_assignments_to(fn, "proposal_payload"))
-    assert len(assignments) == 1, f"{site}: proposal_payload must be assigned exactly once, got {len(assignments)}"
-    literal, index, annotation = assignments[0]
-    assert index is None and isinstance(literal, ast.Dict), f"{site}: proposal_payload is not a plain dict literal"
     payload_type = tool_batch._ProposalPayload
     assert typing.is_typeddict(payload_type)
-    assert isinstance(annotation, ast.Name) and annotation.id == payload_type.__name__, (
-        f"{site}: proposal_payload is not annotated {payload_type.__name__}"
-    )
-    assert _typed_keys(payload_type, "") == list(_PROPOSAL_PAYLOAD_KEYS)
-    keys = list(_dict_literal_keys(literal, "", f"{site}:{literal.lineno}", constants))
-    assert tuple(keys) == _PROPOSAL_PAYLOAD_KEYS
-    assert "success" not in keys
-    aliases = _aliases_of(fn, "proposal_payload")
-    results = _results_carrying(fn, "proposal_payload")
-    assert results, f"{site}: no local is bound to ToolResult(data=proposal_payload)"
-    assert _dict_mutations(fn, aliases, results) == [], f"{site}: the proposal payload is re-shaped after the literal"
+    type_name = payload_type.__name__
+    mentions = [node for node in ast.walk(fn) if isinstance(node, ast.Name) and node.id == type_name]
+    assert len(mentions) == 1, f"{site}: {type_name} is named {len(mentions)} times in run_tool_batch; the payload is built once, inline"
+    constructions = [node for node in ast.walk(fn) if isinstance(node, ast.Call) and _call_name(node) == type_name]
+    assert len(constructions) == 1, f"{site}: expected exactly one {type_name}(...), got {len(constructions)}"
+    construction = constructions[0]
     carried = [
         node
         for node in ast.walk(fn)
-        if isinstance(node, ast.Call)
-        and _call_name(node) == "ToolResult"
-        and any(kw.arg == "data" and isinstance(kw.value, ast.Name) and kw.value.id == "proposal_payload" for kw in node.keywords)
+        if isinstance(node, ast.Call) and _call_name(node) == "ToolResult" and _data_expr(node) is construction
     ]
-    assert len(carried) == 1, f"{site}: expected exactly one ToolResult(data=proposal_payload), got {len(carried)}"
-    census = [row.key for row in _failure_data_sites() if row.site == f"{_display(TOOL_BATCH)}:{literal.lineno}"]
+    assert len(carried) == 1, f"{site}: the {type_name}(...) call is not itself the data= argument of exactly one ToolResult(...)"
+    results = _results_carrying(fn, construction)
+    assert results, f"{site}: no local is bound to the ToolResult(...) that carries the payload"
+    assert _dict_mutations(fn, frozenset(), results) == [], f"{site}: the proposal payload is re-shaped through the result"
+    assert _typed_keys(payload_type, "") == list(_PROPOSAL_PAYLOAD_KEYS)
+    keys = list(_typed_call_keys(construction, TOOL_BATCH, "", f"{site}:{construction.lineno}"))
+    assert tuple(keys) == _PROPOSAL_PAYLOAD_KEYS
+    assert "success" not in keys
+    census = [row.key for row in _failure_data_sites() if row.site == f"{_display(TOOL_BATCH)}:{construction.lineno}"]
     assert census == [f"data.{key}" for key in _PROPOSAL_PAYLOAD_KEYS]
 
 

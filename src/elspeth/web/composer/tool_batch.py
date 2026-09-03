@@ -163,9 +163,15 @@ class _ProposalPayload(TypedDict):
 
     No ``success`` inside the payload: the envelope's own ``success`` already
     says it, and ``status`` is the discriminator a reader keys on
-    (elspeth-e405ad7cd2, F1). The closed type is what stops a later store —
-    through the local, an alias, or ``result.data`` — from re-shaping the
-    payload after the literal; the envelope gate pins the literal to it.
+    (elspeth-e405ad7cd2, F1).
+
+    Constructed inline as the ``data=`` argument in ``run_tool_batch`` and never
+    bound to a name: that — not the type — is what stops a later re-shaping,
+    because there is no local, alias, ``cast`` widening or callee for a store to
+    travel through (verify-gate VG-F1 measured all three escaping both mypy and
+    the previous name-based gate). The type's own job is the constructor call:
+    mypy refuses an extra, missing or mistyped key there. The envelope gate pins
+    the call's keyword order to the wire order and to this class's keys.
     """
 
     status: Literal["APPROVAL_REQUIRED"]
@@ -1480,16 +1486,6 @@ async def run_tool_batch(
                         tool_arguments_hash=audit.binding_arguments_hash,
                     )
                 proposals_this_turn += 1
-                # No ``success`` inside the payload: the envelope's own
-                # ``success`` already says it, and ``status`` is the
-                # discriminator a reader keys on (elspeth-e405ad7cd2, F1).
-                proposal_payload: _ProposalPayload = {
-                    "status": "APPROVAL_REQUIRED",
-                    "proposal_id": str(proposal.id),
-                    "tool_name": proposal_tool_name,
-                    "summary": proposal.summary,
-                    "message": "The requested pipeline change is pending human approval and has not been applied.",
-                }
                 proposal_result = ToolResult(
                     success=True,
                     updated_state=state,
@@ -1503,7 +1499,19 @@ async def run_tool_batch(
                         )
                     ),
                     affected_nodes=(),
-                    data=proposal_payload,
+                    # Built inline and never bound to a name, so nothing stands between
+                    # construction and the freeze in ``ToolResult.__post_init__``: there is no
+                    # local, alias, ``cast`` widening or callee that could re-shape it.
+                    # No ``success`` inside the payload: the envelope's own ``success`` already
+                    # says it, and ``status`` is the discriminator a reader keys on
+                    # (elspeth-e405ad7cd2, F1).
+                    data=_ProposalPayload(
+                        status="APPROVAL_REQUIRED",
+                        proposal_id=str(proposal.id),
+                        tool_name=proposal_tool_name,
+                        summary=proposal.summary,
+                        message="The requested pipeline change is pending human approval and has not been applied.",
+                    ),
                 )
                 recorder.record(
                     finish_success(
