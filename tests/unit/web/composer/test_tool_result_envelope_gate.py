@@ -488,6 +488,28 @@ def _subscript_assign_keys(
     rows (red-team RED2-1, mutants A2d / A1 / C1 and E1). Only ``|=`` merges: a
     ``+=`` or ``&=`` on a payload name is refused by op, since neither ships
     keys a reader could act on and ``dict`` has no ``__iadd__`` at all.
+
+    Finally the walk CLOSES on itself: every statement that can re-shape the
+    dict behind ``target`` must be one of the statements just read. Matching a
+    set of syntactic forms against ONE NAME is what made this walker wrong four
+    rounds running — a ``dict(...)`` re-wrap, a ``.update`` with no positional,
+    a ``|=``, a nested value under a subscript, and then ``alias = data;
+    alias["k"] = v``, each closed in turn while the next stayed open. A second
+    local bound to the same dict is not this name, so the loop above cannot see
+    it: ``alias["zzz"] = ...`` in ``_failure_result`` left the census at 401
+    rows, mypy clean, and survived a 10,126-test selection byte-identical to
+    its baseline (red-team RED5-1). ``_dict_mutations`` over ``_aliases_of``
+    already answers the general question — "does anything OTHER than what I
+    read re-shape this payload?" — and it is what makes the three exact-key
+    pins trustworthy; asking it here closes alias stores, alias ``|=``, alias
+    ``del``, a mutator call and ``result.data[...] = ...`` in one place instead
+    of one arm per syntax. Measured before landing: 33 call sites, ZERO
+    statements newly refused.
+
+    SCOPE, since the check is only worth where it runs: ``_expr_keys``' Name
+    branch returns before reaching this walker for a local attributed in
+    ``_LOCAL_DATA_PAYLOADS`` (``{}`` in the live tree, so no live site) and for
+    one already being resolved one level up, which is checked at that level.
     """
     found: list[tuple[str, int]] = []
     for node in ast.walk(fn):
@@ -516,6 +538,15 @@ def _subscript_assign_keys(
             found.extend(
                 (key, node.lineno) for key in _merged_mapping_keys(node.args[0], form=form, where=where, constants=constants, path=path)
             )
+    read = {lineno for _key, lineno in found}
+    aliases = _aliases_of(fn, target)
+    mutations = _dict_mutations(fn, aliases, _results_carrying_names(fn, aliases))
+    assert read == {lineno for lineno, _form in mutations}, (
+        f"{site}: {target} is re-shaped by statements the census did not read — read lines {sorted(read)}, "
+        f"mutations {mutations}. A store, merge, ``del`` or mutator call through an ALIAS of {target} "
+        f"(or through the result carrying it) ships a key past the census: enumerate it here, or build the "
+        f"payload so it has no second handle (red-team RED5-1)."
+    )
     yield from sorted(found, key=lambda item: item[1])
 
 
@@ -562,6 +593,25 @@ def _results_carrying(fn: ast.AST, payload: ast.AST) -> frozenset[str]:
     out: set[str] = set()
     for name in bound:
         out.update(_aliases_of(fn, name))
+    return frozenset(out)
+
+
+def _results_carrying_names(fn: ast.AST, aliases: frozenset[str]) -> frozenset[str]:
+    """The same as ``_results_carrying``, addressed by the payload's NAMES rather than by its node.
+
+    The three exact-key pins hold the payload EXPRESSION, so they can ask
+    ``_results_carrying`` directly. ``_subscript_assign_keys`` is handed a name
+    instead, so it finds the ``ToolResult(data=<that name>)`` calls first and
+    then asks the same helper — one derivation of "which locals carry this
+    payload", never a second copy of it.
+    """
+    out: set[str] = set()
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Call) and _call_name(node) == "ToolResult"):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "data" and isinstance(kw.value, ast.Name) and kw.value.id in aliases:
+                out.update(_results_carrying(fn, kw.value))
     return frozenset(out)
 
 
@@ -1142,7 +1192,15 @@ def test_walker_finds_stores_through_local_and_result_aliases() -> None:
     (mutant A1) measured missing: ``dict.__ior__`` re-shapes the payload in
     place, but the walker only looked at SUBSCRIPT targets, so the exactness
     pins that read it — "this ``.update`` is the only mutation of the rejection
-    payload" — held while a fifth key was merged in one line below."""
+    payload" — held while a fifth key was merged in one line below.
+
+    The last two assertions are the census's OWN reading of this probe, and
+    they are the witness for red-team RED5-1. The direct-name walker still sees
+    none of the eight statements — that is the fact the alias walk exists for —
+    but it no longer REPORTS that blindness as an empty key list: it refuses,
+    naming the site. Until it did, ``alias = data; alias["zzz"] = ...`` at the
+    shared failure builder left the census at 401 rows with mypy clean and
+    survived the whole 10,126-test selection."""
     fn = _function(ast.parse(_PROBE_ALIAS_STORES), "f")
     call = next(node for node in ast.walk(fn) if isinstance(node, ast.Call) and _call_name(node) == "ToolResult")
     payload = next(kw.value for kw in call.keywords if kw.arg == "data")
@@ -1160,8 +1218,12 @@ def test_walker_finds_stores_through_local_and_result_aliases() -> None:
         (17, "AugAssign through _q"),
         (18, "AugAssign through result.data"),
     ]
-    # The direct-name walker is blind to every one of them: the reason the alias walk exists.
-    assert list(_subscript_assign_keys(fn, "payload", "probe", {})) == []
+    # The name-addressed derivation of the same set, which is what the census walker can ask.
+    assert _results_carrying_names(fn, aliases) == results
+    # The direct-name walker is blind to every one of them — the reason the alias walk exists —
+    # so it REFUSES rather than reporting the empty key list a caller would read as "nothing here".
+    with pytest.raises(AssertionError, match="is re-shaped by statements the census did not read"):
+        list(_subscript_assign_keys(fn, "payload", "probe", {}))
 
 
 def _probe_data_keys(source: str, fn_name: str) -> list[str]:
