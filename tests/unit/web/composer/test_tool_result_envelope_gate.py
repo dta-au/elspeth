@@ -1196,16 +1196,19 @@ class _DataSite(NamedTuple):
     lineno: int
 
 
-def _ambiguous_data_module_names(sites: Iterable[_DataSite]) -> dict[str, list[str]]:
-    """File names that more than one data-shipping module under web/composer answers to.
+def _names_two_modules_answer_to(pairs: Iterable[tuple[str, str]]) -> dict[str, list[str]]:
+    """Every ``name`` in ``(name, module)`` pairs that more than one module answers to.
 
-    The classification registries key on the base name, which only identifies a
-    module while the mapping is injective. ``_all_data_sites`` walks the package
-    recursively, so it is not injective by construction.
+    Both of this file's attribution keys are bare names — a file's base name for
+    the classification registries, a function's name for ``_attribute_tool`` —
+    while ``_all_data_sites`` walks ``web/composer`` recursively. A bare name
+    therefore identifies its subject only while the mapping is injective, and
+    nothing in the package makes it so. Each caller asserts its own injectivity
+    with this, by name, rather than assuming it.
     """
     modules_by_name: dict[str, set[str]] = {}
-    for site in sites:
-        modules_by_name.setdefault(site.file, set()).add(site.module)
+    for name, module in pairs:
+        modules_by_name.setdefault(name, set()).add(module)
     return {name: sorted(modules) for name, modules in modules_by_name.items() if len(modules) > 1}
 
 
@@ -1513,21 +1516,28 @@ def test_no_shared_envelope_key_is_unadmitted_on_a_mutation_tool() -> None:
         assert not missing, f"{tool}: can ship {sorted(missing)} but the audit row does not admit them"
 
 
-def test_ambiguous_data_module_names_reports_a_base_name_two_modules_answer_to() -> None:
-    """Witness for ``_ambiguous_data_module_names``, both arms.
+def test_names_two_modules_answer_to_reports_a_shadowed_name_for_both_attribution_keys() -> None:
+    """Witness for ``_names_two_modules_answer_to``, both arms and both callers' key shapes.
 
-    The live tree is injective today, so the guard's positive arm has no
-    consumer among the real sites and a mutant that returned ``{}`` outright
-    would survive the whole gate file. Feed it the shape it exists to refuse —
-    two modules whose base name is one — and the shape it must pass.
+    The live tree is injective on both keys today, so the guard's positive arm
+    has no consumer among the real sites and a mutant that returned ``{}``
+    outright would survive the whole gate file. Feed it the two shapes it exists
+    to refuse — a base name two modules answer to, and a FUNCTION name two
+    modules answer to — and the shape it must pass.
     """
     shadowed = (
         _DataSite("sources.py", "tools/sources.py", "_execute_add_source", 1),
         _DataSite("sources.py", "guided/sources.py", "_execute_shadow", 2),
-        _DataSite("blobs.py", "tools/blobs.py", "_execute_create_blob", 3),
+        _DataSite("blobs.py", "tools/blobs.py", "_execute_delete_blob_locked", 3),
+        _DataSite("sources.py", "tools/sources.py", "_execute_delete_blob_locked", 4),
     )
-    assert _ambiguous_data_module_names(shadowed) == {"sources.py": ["guided/sources.py", "tools/sources.py"]}
-    assert _ambiguous_data_module_names(shadowed[:1] + shadowed[2:]) == {}
+    by_file = ((site.file, site.module) for site in shadowed)
+    assert _names_two_modules_answer_to(by_file) == {"sources.py": ["guided/sources.py", "tools/sources.py"]}
+    by_function = ((site.function, site.module) for site in shadowed)
+    assert _names_two_modules_answer_to(by_function) == {"_execute_delete_blob_locked": ["tools/blobs.py", "tools/sources.py"]}
+    clean = shadowed[:1] + shadowed[2:3]
+    assert _names_two_modules_answer_to((site.file, site.module) for site in clean) == {}
+    assert _names_two_modules_answer_to((site.function, site.module) for site in clean) == {}
 
 
 def test_every_result_constructor_site_is_attributed() -> None:
@@ -1556,20 +1566,32 @@ def test_every_result_constructor_site_is_attributed() -> None:
 
     ``guided/`` already holds three base-name collisions with its parent package
     (``audit.py``, ``prompts.py``, ``protocol.py``), so this is the tree's live
-    shape and not a hypothetical one. Hence BOTH guards, each with its own
-    killing mutant: ``walked`` is keyed on the MODULE, which is what the
-    tool-data walker actually parses, and ``_ambiguous_data_module_names``
-    refuses a base name two data-shipping modules answer to, because the two
-    classification registries still key on the name and cannot say which of them
-    a row classifies.
+    shape and not a hypothetical one. Hence ``walked`` keyed on the MODULE,
+    which is what the tool-data walker actually parses, plus an injectivity
+    refusal for each bare name this file still attributes by, each with its own
+    killing mutant:
+
+    * the FILE name, because the two classification registries key on it and a
+      row cannot say which of two modules it classifies;
+    * the FUNCTION name, because ``_attribute_tool`` keys on it alone — a second
+      ``_execute_delete_blob_locked`` in another walked file had its keys
+      censused, taught and manifest-checked against ``delete_blob``, silently,
+      34 passed exit 0, whenever the keys it ships are ones that tool already
+      teaches.
     """
     list(_tool_data_sites())
 
     sites = _all_data_sites()
-    ambiguous = _ambiguous_data_module_names(sites)
-    assert not ambiguous, (
-        f"two modules under web/composer ship data= payloads under the same file name: {ambiguous} — "
+    ambiguous_files = _names_two_modules_answer_to((site.file, site.module) for site in sites)
+    assert not ambiguous_files, (
+        f"two modules under web/composer ship data= payloads under the same file name: {ambiguous_files} — "
         "a registry row keyed on the name alone cannot say which of them it classifies"
+    )
+    ambiguous_functions = _names_two_modules_answer_to((site.function, site.module) for site in sites)
+    assert not ambiguous_functions, (
+        f"two modules under web/composer ship data= payloads from a function of the same name: "
+        f"{ambiguous_functions} — _attribute_tool keys on the function name alone, so one of them "
+        "would have its keys censused, taught and manifest-checked against the OTHER's tool"
     )
 
     tool_data_modules = {f"tools/{name}" for name in _TOOL_DATA_FILES}
