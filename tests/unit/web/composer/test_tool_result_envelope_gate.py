@@ -180,7 +180,10 @@ _CONTAINER_ELEMENT_PAYLOADS: dict[str, type | _Elsewhere] = {
 # other end of a name, an attribute, a subscript or a call, and this position has no enclosing
 # function to resolve it through (``_expr_keys`` does, which is why it can refuse one). Named
 # rather than fallen through, so a shape that is NEITHER readable nor one of these — a walrus,
-# an ``await``, a starred element — refuses instead of shipping unseen.
+# an ``await``, a starred element — refuses instead of shipping unseen. Its TIGHTNESS is
+# un-mutated: deleting the arm reds two pins, but WIDENING this tuple (adding ``ast.BinOp``, say)
+# would only stop those pins raising and move no census row, so nothing here proves the four are
+# the right four.
 _OPAQUE_REFERENCES = (ast.Name, ast.Attribute, ast.Subscript, ast.Call)
 # Wrappers that return their first argument's shape unchanged.
 _PASSTHROUGH_HELPERS = frozenset({"redact_source_storage_path"})
@@ -1864,8 +1867,10 @@ def test_no_nested_key_is_a_homonym_of_an_envelope_key() -> None:
     here: the reader cannot tell the two apart, whatever the gate does. A
     depth-blind rule is worth only the walk beneath it: this stayed green
     against a ``version`` planted inside ``data.sources`` until
-    ``_nested_value_keys`` stopped declining comprehension-valued payloads
-    (401 rows).
+    ``_nested_value_keys`` stopped declining comprehension-valued payloads.
+    RE-MEASURED at that new size rather than assumed to still be free: 401
+    rows, 390 of them dotted, against the registry's 11 envelope keys — zero
+    collide, the 42 newly-walked container rows included.
 
     NOT closed by this: a leaf admitted because some OTHER tool's description
     quotes it. That is the same ``is_taught`` mechanism one step out, it needs
