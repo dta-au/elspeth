@@ -144,6 +144,7 @@ describe("ModeSwitchButton", () => {
         terminal: { kind: "exited_to_freeform" },
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       } as never,
     });

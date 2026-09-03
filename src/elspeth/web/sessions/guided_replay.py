@@ -18,7 +18,12 @@ from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityEr
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
 from elspeth.web.composer.guided.profile import EMPTY_PROFILE
 from elspeth.web.composer.guided.protocol import ChatRole, GuidedStep, TurnType, validate_current_turn
-from elspeth.web.composer.guided.state_machine import GuidedSession, TerminalKind, TerminalState
+from elspeth.web.composer.guided.state_machine import (
+    GuidedSession,
+    TerminalKind,
+    TerminalState,
+    reviewed_component_ledger,
+)
 from elspeth.web.composer.no_tool_policy import visible_message_segments
 from elspeth.web.composer.redaction import redact_guided_snapshot_storage_paths, redact_source_storage_path
 from elspeth.web.sessions.protocol import (
@@ -40,6 +45,8 @@ from elspeth.web.sessions.schemas import (
     GuidedChatResponse,
     GuidedPlanDeclinedResponse,
     GuidedRespondResponse,
+    GuidedReviewedComponentResponse,
+    GuidedReviewedComponentsResponse,
     GuidedSessionResponse,
     PipelineProposalMetadataResponse,
     PluginPolicyFindingResponse,
@@ -322,6 +329,40 @@ def _profile_response(guided: GuidedSession) -> WorkflowProfileResponse | None:
     )
 
 
+def project_reviewed_components(guided: GuidedSession) -> GuidedReviewedComponentsResponse:
+    """Project the settled components of both kinds onto the closed wire ledger.
+
+    The ONE redaction boundary for this field: every route that surfaces a
+    ``GuidedSessionResponse`` projects the ledger through here, and the closed
+    :class:`GuidedReviewedComponentResponse` field set is what keeps reviewed
+    option values, inspected samples, paths and anchors out of the top-level
+    response. Built entirely from types ELSPETH owns —
+    :class:`GuidedSession` custody through
+    :func:`reviewed_component_ledger` — so there is nothing here to parse.
+    """
+
+    return GuidedReviewedComponentsResponse(
+        sources=[
+            GuidedReviewedComponentResponse(
+                stable_id=entry.stable_id,
+                name=entry.name,
+                plugin=entry.plugin,
+                status=entry.status,
+            )
+            for entry in reviewed_component_ledger(guided, "source")
+        ],
+        outputs=[
+            GuidedReviewedComponentResponse(
+                stable_id=entry.stable_id,
+                name=entry.name,
+                plugin=entry.plugin,
+                status=entry.status,
+            )
+            for entry in reviewed_component_ledger(guided, "output")
+        ],
+    )
+
+
 def _guided_session_response(guided: GuidedSession) -> GuidedSessionResponse:
     return GuidedSessionResponse(
         step=guided.step.value,
@@ -351,6 +392,7 @@ def _guided_session_response(guided: GuidedSession) -> GuidedSessionResponse:
             for turn in guided.chat_history
         ],
         chat_turn_seq=guided.chat_turn_seq,
+        reviewed_components=project_reviewed_components(guided),
         profile=_profile_response(guided),
     )
 

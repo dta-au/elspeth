@@ -126,6 +126,7 @@ function guidedStubResponse() {
       terminal: null,
       chat_history: [],
       chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] },
       profile: null,
     },
     next_turn: {
@@ -3271,6 +3272,7 @@ describe("sessionStore", () => {
           terminal: { kind: "completed", reason: null },
           chat_history: [],
           chat_turn_seq: 0,
+          reviewed_components: { sources: [], outputs: [] },
           profile: null,
         } as never,
         guidedNextTurn: {} as never,
@@ -3413,6 +3415,7 @@ describe("sessionStore", () => {
           terminal: null,
           chat_history: [],
           chat_turn_seq: 0,
+          reviewed_components: { sources: [], outputs: [] },
           profile: null,
         },
         guidedNextTurn: {

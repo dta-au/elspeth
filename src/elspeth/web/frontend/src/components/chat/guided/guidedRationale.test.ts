@@ -10,6 +10,7 @@ function session(overrides: Partial<GuidedSession>): GuidedSession {
     terminal: null,
     chat_history: [],
     chat_turn_seq: 0,
+    reviewed_components: { sources: [], outputs: [] },
     profile: null,
     ...overrides,
   } as GuidedSession;

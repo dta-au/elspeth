@@ -3,7 +3,7 @@ subtitle: "Everything remaining to build, grouped by delivery theme"
 author: "John Morrissey"
 date: "3 September 2026"
 version: "1.0.0"
-status: "DRAFT FOR EXECUTIVE BRIEFING"
+status: "DRAFT"
 
 # Template variables
 running-title: "Programme of Outstanding Work"
@@ -12,9 +12,9 @@ document-category: "Delivery Planning"
 document-type: "Programme of outstanding work"
 classification: "OFFICIAL"
 
-# Codebase HEAD the figures in this document were measured against.
-# Verified against the remote on 3 September 2026.
-commit: "8ef46621b"
+# NOTE: a source-control revision is deliberately not carried on the cover.
+# It is working-level detail for this audience; the source-data cut-off is
+# stated as a date in the document header.
 
 scope-blurb: >-
   This document states the work remaining to take ELSPETH from its current
@@ -35,4 +35,4 @@ org-tagline: "Auditable LLM and Data Pipelines"
 revisions:
   - version: "1.0.0"
     date: "3 September 2026"
-    changes: "Initial issue. Measured against release/0.8.0 at 8ef46621b."
+    changes: "Initial issue."

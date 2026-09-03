@@ -17,6 +17,7 @@ function wireResponse(payloadOverrides: Record<string, unknown> = {}): Record<st
       terminal: null,
       chat_history: [],
       chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] },
       profile: null,
     },
     next_turn: {
@@ -104,6 +105,7 @@ function singleSelectWireResponse(): Record<string, unknown> {
       terminal: null,
       chat_history: [],
       chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] },
       profile: null,
     },
     next_turn: {
@@ -221,6 +223,7 @@ function rowUnionProposalWireResponse(): Record<string, unknown> {
       terminal: null,
       chat_history: [],
       chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] },
       profile: null,
     },
     next_turn: {
@@ -1596,6 +1599,7 @@ describe("guided collector proposals (WS6 lift, ruling 7878)", () => {
         terminal: null,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       next_turn: {
@@ -1719,5 +1723,153 @@ describe("guided collector proposals (WS6 lift, ruling 7878)", () => {
       });
       (payload.component_counts as Record<string, number>).edges = 7;
     }))).toThrow(/success flow/i);
+  });
+});
+
+// ── Server-projected reviewed-component ledger (elspeth-f2a8550b3d) ──────────
+//
+// The gate for a NEW wire field. `reviewed_components` is what the decision
+// sheets and the pre-commit graph read, so the decoder has to distinguish
+// "nothing settled yet" (two empty lists) from "the route failed to project
+// reviewed custody" (the key absent) — a silently-empty ledger would tell the
+// user they had agreed to nothing.
+describe("guided reviewed-components ledger", () => {
+  function sessionResponse(
+    mutate: (session: Record<string, unknown>) => void = () => {},
+  ): Record<string, unknown> {
+    const response = wireResponse();
+    mutate(response.guided_session as Record<string, unknown>);
+    return response;
+  }
+
+  const REVIEWED_SOURCE = {
+    stable_id: "00000000-0000-4000-8000-000000000602",
+    name: "colours",
+    plugin: "csv",
+    status: "reviewed",
+  };
+
+  it("decodes both kinds, preserving the server's order", () => {
+    const decoded = decodeGetGuidedResponse(sessionResponse((session) => {
+      session.reviewed_components = {
+        sources: [
+          { ...REVIEWED_SOURCE, stable_id: "00000000-0000-4000-8000-000000000601", name: "orders" },
+          REVIEWED_SOURCE,
+        ],
+        outputs: [{
+          stable_id: "00000000-0000-4000-8000-000000000604",
+          name: "report",
+          plugin: "json",
+          status: "reviewed",
+        }],
+      };
+    }));
+
+    expect(decoded.guided_session.reviewed_components.sources.map((item) => item.name)).toEqual([
+      "orders",
+      "colours",
+    ]);
+    expect(decoded.guided_session.reviewed_components.outputs.map((item) => item.plugin)).toEqual([
+      "json",
+    ]);
+  });
+
+  it("accepts an empty ledger", () => {
+    const decoded = decodeGetGuidedResponse(sessionResponse());
+    expect(decoded.guided_session.reviewed_components).toEqual({ sources: [], outputs: [] });
+  });
+
+  it("rejects a missing ledger", () => {
+    expect(() => decodeGetGuidedResponse(sessionResponse((session) => {
+      delete session.reviewed_components;
+    }))).toThrow(/reviewed_components/);
+  });
+
+  it("rejects a ledger missing a kind", () => {
+    expect(() => decodeGetGuidedResponse(sessionResponse((session) => {
+      session.reviewed_components = { sources: [] };
+    }))).toThrow(/outputs/);
+  });
+
+  it("rejects an unexpected key beside the two kinds", () => {
+    expect(() => decodeGetGuidedResponse(sessionResponse((session) => {
+      session.reviewed_components = { sources: [], outputs: [], nodes: [] };
+    }))).toThrow(/nodes/);
+  });
+
+  it("rejects a widened item: a reviewed option value has no business on this wire", () => {
+    // The frontend half of the redaction boundary. If the server ever starts
+    // publishing `on_validation_failure` (a schema-form knob) or a path or a
+    // sample here, the decoder refuses the response instead of rendering it.
+    expect(() => decodeGetGuidedResponse(sessionResponse((session) => {
+      session.reviewed_components = {
+        sources: [{ ...REVIEWED_SOURCE, on_validation_failure: "discard" }],
+        outputs: [],
+      };
+    }))).toThrow(/on_validation_failure/);
+  });
+
+  it("rejects an entry that is not settled", () => {
+    expect(() => decodeGetGuidedResponse(sessionResponse((session) => {
+      session.reviewed_components = {
+        sources: [{ ...REVIEWED_SOURCE, status: "pending" }],
+        outputs: [],
+      };
+    }))).toThrow(/reviewed/);
+  });
+
+  it("rejects a non-canonical stable id", () => {
+    expect(() => decodeGetGuidedResponse(sessionResponse((session) => {
+      session.reviewed_components = {
+        sources: [{ ...REVIEWED_SOURCE, stable_id: "source-1" }],
+        outputs: [],
+      };
+    }))).toThrow(/stable_id/);
+  });
+
+  it("rejects a blank name or plugin", () => {
+    expect(() => decodeGetGuidedResponse(sessionResponse((session) => {
+      session.reviewed_components = { sources: [{ ...REVIEWED_SOURCE, name: "  " }], outputs: [] };
+    }))).toThrow(/name/);
+    expect(() => decodeGetGuidedResponse(sessionResponse((session) => {
+      session.reviewed_components = { sources: [{ ...REVIEWED_SOURCE, plugin: "" }], outputs: [] };
+    }))).toThrow(/plugin/);
+  });
+
+  it("rejects duplicate ids and duplicate names within a kind", () => {
+    expect(() => decodeGetGuidedResponse(sessionResponse((session) => {
+      session.reviewed_components = {
+        sources: [REVIEWED_SOURCE, { ...REVIEWED_SOURCE, name: "other" }],
+        outputs: [],
+      };
+    }))).toThrow(/duplicate stable id/);
+    expect(() => decodeGetGuidedResponse(sessionResponse((session) => {
+      session.reviewed_components = {
+        sources: [
+          REVIEWED_SOURCE,
+          { ...REVIEWED_SOURCE, stable_id: "00000000-0000-4000-8000-000000000603" },
+        ],
+        outputs: [],
+      };
+    }))).toThrow(/duplicate component name/);
+  });
+
+  it("rejects a kind that is not an array", () => {
+    expect(() => decodeGetGuidedResponse(sessionResponse((session) => {
+      session.reviewed_components = { sources: { "0": REVIEWED_SOURCE }, outputs: [] };
+    }))).toThrow(/sources/);
+  });
+
+  it("rejects more than 256 reviewed components in one kind", () => {
+    expect(() => decodeGetGuidedResponse(sessionResponse((session) => {
+      session.reviewed_components = {
+        sources: Array.from({ length: 257 }, (_unused, index) => ({
+          ...REVIEWED_SOURCE,
+          stable_id: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+          name: `source-${index}`,
+        })),
+        outputs: [],
+      };
+    }))).toThrow(/256/);
   });
 });

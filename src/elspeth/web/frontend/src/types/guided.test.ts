@@ -6,11 +6,13 @@ import { describe, expect, it } from "vitest";
 
 import type {
   ChatTurn,
+  ComponentReviewItem,
   ControlSignal,
   GuidedChatResponse,
   GuidedRespondAction,
   GuidedRespondRequest,
   GuidedRespondResponse,
+  GuidedReviewedComponents,
   GuidedSession,
   GuidedStep,
   GetGuidedResponse,
@@ -132,10 +134,12 @@ describe("guided protocol types", () => {
     expect(payload.proposal_id).toMatch(/^[0-9a-f-]{36}$/);
   });
 
-  it("GuidedSession has exactly step, history, terminal, chat_history, chat_turn_seq, profile — exhaustive", () => {
+  it("GuidedSession has exactly step, history, terminal, chat_history, chat_turn_seq, reviewed_components, profile — exhaustive", () => {
     // Compile-time mutual-extends: adding/removing a key in GuidedSession
     // makes this assignment fail tsc.  Slice 5 added chat_history and
-    // chat_turn_seq; P6.2 added profile (server-owned WorkflowProfile).
+    // chat_turn_seq; P6.2 added profile (server-owned WorkflowProfile);
+    // elspeth-f2a8550b3d added reviewed_components (the server-projected
+    // ledger that replaced the client-side fold).
     const _exact: Equals<
       keyof GuidedSession,
       | "step"
@@ -143,9 +147,44 @@ describe("guided protocol types", () => {
       | "terminal"
       | "chat_history"
       | "chat_turn_seq"
+      | "reviewed_components"
       | "profile"
     > = true;
     expect(_exact).toBe(true);
+  });
+
+  it("reviewed_components carries closed review items, per kind", () => {
+    // The ledger's entries ARE ComponentReviewItems: the server projects the
+    // wire ledger and the review card from one derivation, so a type that
+    // let them drift apart here would hide that.
+    const ledger: GuidedReviewedComponents = {
+      sources: [
+        {
+          stable_id: "00000000-0000-4000-8000-000000000001",
+          name: "colours",
+          plugin: "csv",
+          status: "reviewed",
+        },
+      ],
+      outputs: [],
+    };
+    const item: ComponentReviewItem = ledger.sources[0]!;
+    expect(item.status).toBe("reviewed");
+
+    const session: GuidedSession = {
+      step: "step_2_sink",
+      history: [],
+      terminal: null,
+      chat_history: [],
+      chat_turn_seq: 0,
+      reviewed_components: ledger,
+      profile: null,
+    };
+    expect(session.reviewed_components.sources).toHaveLength(1);
+
+    // @ts-expect-error a settled entry cannot be published as anything but reviewed
+    const unsettled: ComponentReviewItem = { ...item, status: "pending" };
+    expect(unsettled.name).toBe("colours");
   });
 
   it("TurnRecord nullable response_hash is honoured", () => {
@@ -356,6 +395,7 @@ describe("guided protocol types", () => {
         terminal: null,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       next_turn: {

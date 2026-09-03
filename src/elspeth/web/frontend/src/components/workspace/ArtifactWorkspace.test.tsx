@@ -1666,6 +1666,7 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
         terminal: null,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       };
     }

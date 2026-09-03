@@ -67,6 +67,7 @@ from elspeth.web.sessions.guided_replay import (
     load_guided_json_payload,
     parse_guided_response_descriptor,
     project_guided_response,
+    project_reviewed_components,
 )
 from elspeth.web.sessions.protocol import (
     GuidedAuditEvidence,
@@ -1021,6 +1022,7 @@ async def get_guided(
                     for t in guided.chat_history
                 ],
                 chat_turn_seq=guided.chat_turn_seq,
+                reviewed_components=project_reviewed_components(guided),
                 profile=_workflow_profile_response(guided),
             ),
             next_turn=_turn_payload_response(turn, guided=guided, shield_available=shield_available),
@@ -1616,6 +1618,7 @@ async def post_guided_start(
                     for chat_turn in guided.chat_history
                 ],
                 chat_turn_seq=guided.chat_turn_seq,
+                reviewed_components=project_reviewed_components(guided),
                 profile=_workflow_profile_response(guided),
             ),
             next_turn=_turn_payload_response(
@@ -2014,6 +2017,7 @@ async def post_guided_convert(
                     for chat_turn in guided.chat_history
                 ],
                 chat_turn_seq=guided.chat_turn_seq,
+                reviewed_components=project_reviewed_components(guided),
                 profile=_workflow_profile_response(guided),
             ),
             next_turn=_turn_payload_response(

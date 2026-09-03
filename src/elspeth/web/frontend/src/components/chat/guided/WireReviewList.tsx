@@ -11,16 +11,20 @@ export interface WireReviewItem {
    * aria-label overrides its text content as the accessible name, so a chip
    * outside the label is invisible to screen readers.
    */
-  status?: "connected" | "warning" | "unchecked";
+  status?: "connected" | "warning" | "unchecked" | "discard";
   ariaLabel?: string;
 }
 
 /** Chip copy reuses the wire stage's plain-language status register
- *  (edgeStatus) — no new vocabulary. */
+ *  (edgeStatus) — no new vocabulary. `unchecked` states what the card knows
+ *  (no static verdict exists) instead of the old "not yet checked", which
+ *  promised a check that never arrives; `discard` is the one absent-contract
+ *  case whose reason the payload does carry — the destination itself. */
 const STATUS_LABELS: Record<NonNullable<WireReviewItem["status"]>, string> = {
   connected: "connected",
   warning: "not connected correctly",
-  unchecked: "not yet checked",
+  unchecked: "no static check",
+  discard: "discard route",
 };
 
 interface WireReviewListProps {

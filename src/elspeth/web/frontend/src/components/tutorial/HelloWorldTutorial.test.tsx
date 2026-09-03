@@ -60,6 +60,7 @@ vi.mock("@/api/client", () => ({
       terminal: { kind: "completed", reason: null },
       chat_history: [],
       chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] },
       profile: null,
     },
     next_turn: null,
