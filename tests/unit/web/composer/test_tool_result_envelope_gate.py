@@ -1714,6 +1714,42 @@ def test_no_shared_envelope_key_is_unadmitted_on_a_mutation_tool() -> None:
         assert not missing, f"{tool}: can ship {sorted(missing)} but the audit row does not admit them"
 
 
+def test_every_attributed_helper_name_answers_to_one_module() -> None:
+    """A helper attribution is keyed on the CALLEE's bare name, so two definitions of it swap payloads.
+
+    ``_expr_keys`` reads ``_DATA_HELPER_PAYLOADS[_call_name(expr)]`` and
+    ``_PASSTHROUGH_HELPERS`` is the same key shape — the THIRD bare name this
+    file attributes by, left open when the file name and the function name were
+    closed and named as the honest close by the seat that closed them (systems
+    seat SYS-R3-7). An attribution written for one module's helper would
+    silently claim another module's helper of the same name, and the payload
+    type it names is what the census then reports for it.
+
+    Method definitions count: ``_call_name`` returns the bare attribute for
+    ``x.helper()``, which is how ``get_schema`` is attributed at all, so a
+    method of the same name is the same collision.
+
+    Measured when this landed: 11 attributions plus 1 passthrough, each defined
+    in exactly one module under ``web/composer`` except ``get_schema``, which is
+    the catalog's method and is defined in none. Hence "at most one" — whether
+    an attribution is still LIVE is a different question, asked by
+    ``_expr_keys`` refusing an unattributed helper.
+    """
+    attributed = set(_DATA_HELPER_PAYLOADS) | set(_PASSTHROUGH_HELPERS)
+    definitions = [
+        (node.name, path.relative_to(COMPOSER).as_posix())
+        for path in sorted(COMPOSER.rglob("*.py"))
+        for node in ast.walk(_parse(path))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in attributed
+    ]
+    ambiguous = _names_two_modules_answer_to(definitions)
+    assert not ambiguous, (
+        f"two modules under web/composer define an attributed helper name: {ambiguous} — "
+        "_DATA_HELPER_PAYLOADS and _PASSTHROUGH_HELPERS key on the bare callee name, so one "
+        "of them would have its payload read as the other's"
+    )
+
+
 def test_names_two_modules_answer_to_reports_a_shadowed_name_for_both_attribution_keys() -> None:
     """Witness for ``_names_two_modules_answer_to``, both arms and both callers' key shapes.
 
