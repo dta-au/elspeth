@@ -247,6 +247,21 @@ def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) ->
     raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
 
 
+def _nested_value_keys(value: ast.AST, path: str, site: str, constants: dict[str, str]) -> Iterator[str]:
+    """Keys nested INSIDE a value already reported at ``path``: a dict literal, or a list/tuple of them.
+
+    One authority for "what is inside a shipped value", because two walkers ask
+    it: a value in a dict literal, and a value stored through a subscript
+    (``changes["sources"] = {...}``). The subscript arm reported only the
+    outer key until now, so three ``diff_pipeline`` keys shipped to the model
+    while the census had never enumerated them.
+    """
+    if isinstance(value, ast.Dict):
+        yield from _dict_literal_keys(value, path + ".", site, constants)
+    elif isinstance(value, (ast.List, ast.Tuple)) and value.elts and isinstance(value.elts[0], ast.Dict):
+        yield from _dict_literal_keys(value.elts[0], path + "[].", site, constants)
+
+
 def _dict_literal_keys(
     node: ast.AST,
     prefix: str,
@@ -270,10 +285,7 @@ def _dict_literal_keys(
         assert not _is_cast(value), f"{site}: cast(...) hides the shape of {prefix}{key}"
         path = f"{prefix}{key}"
         yield path
-        if isinstance(value, ast.Dict):
-            yield from _dict_literal_keys(value, path + ".", site, constants)
-        elif isinstance(value, (ast.List, ast.Tuple)) and value.elts and isinstance(value.elts[0], ast.Dict):
-            yield from _dict_literal_keys(value.elts[0], path + "[].", site, constants)
+        yield from _nested_value_keys(value, path, site, constants)
 
 
 def _merged_mapping_keys(
@@ -315,6 +327,13 @@ def _subscript_assign_keys(
     ``ast.walk`` is breadth-first, so nested assignments would otherwise come
     out after their later siblings and the emission-order pins would lie.
 
+    A subscript store reports what is INSIDE its value too
+    (``_nested_value_keys``, the same policy a dict literal's values get). It
+    reported only the outer key until seat-fix-r4, so
+    ``changes["sources"] = {"added": ..., "removed": ..., "modified": ...}``
+    shipped three ``diff_pipeline`` keys the census had never enumerated —
+    taught ones, as it happens, which is why nothing else noticed.
+
     The merged argument — ``.update``'s or ``|=``'s — is read as a dict literal
     or as a call to an owned TypedDict (``path`` resolves the class nominally,
     ADR-032). Every other shape REFUSES: an update the walker cannot read used
@@ -337,9 +356,11 @@ def _subscript_assign_keys(
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
             tgt = node.targets[0]
             if isinstance(tgt, ast.Subscript) and isinstance(tgt.value, ast.Name) and tgt.value.id == target:
-                key = _key_of(tgt.slice, constants, f"{site}:{node.lineno}")
-                assert not _is_cast(node.value), f"{site}:{node.lineno}: cast(...) hides the shape of {key}"
+                where = f"{site}:{node.lineno}"
+                key = _key_of(tgt.slice, constants, where)
+                assert not _is_cast(node.value), f"{where}: cast(...) hides the shape of {key}"
                 found.append((key, node.lineno))
+                found.extend((nested, node.lineno) for nested in _nested_value_keys(node.value, key, where, constants))
         if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id == target:
             where = f"{site}:{node.lineno}"
             assert isinstance(node.op, ast.BitOr), (
@@ -512,6 +533,7 @@ class ToolResult:
         if self.data is not None:
             result["data"] = self.data
         result[_K] = 1
+        result["nested"] = {"inner": 1, "deep": {"leaf": 2}}
         result.update({"late": 2})
         return result
 """
@@ -772,13 +794,19 @@ def test_failure_owner_assignment_refuses_every_rhs_it_cannot_read() -> None:
 
 
 def test_walker_reads_literal_constant_subscript_and_update_keys_in_emission_order() -> None:
+    """Both walkers report what is nested inside a value, and in the order the wire is built.
+
+    The ``nested`` store is the arm seat-fix-r4 added: a subscript store used to
+    report its outer key only, so a dict literal stored that way shipped its
+    members past the census (three live ``diff_pipeline`` keys did).
+    """
     tree = ast.parse(_PROBE_TO_DICT)
     fn = _function(tree, "to_dict", in_class="ToolResult")
     constants = _module_str_constants(tree)
     initial = list(_dict_literal_keys(_initial_dict_assign(fn, "result", "probe"), "", "probe", constants))
     later = [k for k, _ in _subscript_assign_keys(fn, "result", "probe", constants)]
     assert initial == ["success", "validation", "validation.is_valid", "validation.errors", "version"]
-    assert later == ["data", "const_key", "late"]
+    assert later == ["data", "const_key", "nested", "nested.inner", "nested.deep", "nested.deep.leaf", "late"]
 
 
 @pytest.mark.parametrize(
@@ -1578,7 +1606,9 @@ def test_no_nested_key_is_a_homonym_of_an_envelope_key() -> None:
     nor which surface carries it. The dotted test is what separates a nested
     key from the envelope's own eleven rows, which are the only dotless ones
     (measured). Measured before landing, so the rule costs no churn — zero of
-    the 341 shipped rows collide. A future collision is an adjudication (rename
+    the shipped rows collide (341 when the rule landed, 344 once the subscript
+    walker started reporting nested values). A future collision is an
+    adjudication (rename
     the nested key, or split the envelope's), not something to route around
     here: the reader cannot tell the two apart, whatever the gate does.
 
