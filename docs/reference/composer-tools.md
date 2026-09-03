@@ -574,7 +574,7 @@ Present only when set:
 
 | Field | When | Description |
 |-------|------|-------------|
-| `data` | most tools | The tool-specific payload; each tool's description names its keys. A failure carries `error` and `error_code`; a credential-wiring failure adds `credential_fields`, `components`, and `repair`; a proposal under approval custody carries `status: "APPROVAL_REQUIRED"` with `proposal_id`; a prevalidation rejection carries `status: "PREVALIDATION_REJECTED"` with `applied: false` |
+| `data` | most tools | The tool-specific payload; each tool's description names its keys. A failure carries `error`, and `error_code` when the failure has a closed code; a credential-wiring failure adds `credential_fields`, `components`, and `repair`; a proposal under approval custody carries `status: "APPROVAL_REQUIRED"` with `proposal_id`; a prevalidation rejection carries `status: "PREVALIDATION_REJECTED"` with `applied: false` |
 | `runtime_preflight` | `preview_pipeline` | Runtime readiness check: `is_valid`, `checks`, `readiness`, `errors`, `warnings`, `semantic_contracts` |
 | `validation_delta` | successful mutations | `new_errors`, `resolved_errors`, `new_warnings`, `resolved_warnings` relative to the state before the call |
 | `post_call_hints` | successful mutations whose plugin returns them | Plugin-authored next steps |
@@ -587,8 +587,10 @@ Present only when set:
 
 **Validation drives the loop.** After each mutation, check `validation.errors`
 and `validation_delta`. If there are errors, fix them before responding to the
-user. The LLM should not present a pipeline as complete until `is_valid` is
-`true`.
+user. The LLM should not present a pipeline as complete until `preview_pipeline`
+returns `preview_is_valid: true` — the authoring check passing is necessary but
+not sufficient, because that verdict also folds in the runtime check and the
+source proof.
 
 ---
 

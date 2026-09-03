@@ -204,6 +204,69 @@ def preview_pipeline_result(
     }
 
 
+def get_pipeline_state_result(
+    *,
+    sources: dict[str, dict[str, Any]] | None = None,
+    nodes: list[dict[str, Any]] | None = None,
+    outputs: list[dict[str, Any]] | None = None,
+    edges: list[dict[str, Any]] | None = None,
+    name: str | None = None,
+    description: str | None = None,
+    requested_component: Any = None,
+    version: int = 1,
+) -> dict[str, Any]:
+    """Build a full-state ``get_pipeline_state`` result in the shape the tool ships.
+
+    Mirrors ``ToolResult.to_dict()`` over
+    ``tools/_common.py::_serialize_full_pipeline_state``: ``data`` carries
+    ``sources`` (a MAPPING keyed by source name), ``nodes``, ``outputs`` and
+    ``edges`` as lists, plus ``metadata`` and the ``inspection`` block that
+    reports how the requested component resolved.  There is no singular
+    ``source`` key on any full-state read — the pre-2026-09 stub published one,
+    a shape the tool does not emit, so a scenario whose model read state was
+    scored against a wire that does not exist (elspeth-e405ad7cd2 LLM-R3-6,
+    the sibling of the ``preview_pipeline`` stubs c27587e0f fixed).
+
+    ``accepted_full_state_aliases`` mirrors ``_FULL_STATE_COMPONENT_ALIASES``
+    in that module; it is spelled out here rather than imported because it is
+    private to ``_common``.
+
+    This is the full-state shape only.  The live tool answers
+    ``component="source"`` with a ``sources``-only ``data`` (which
+    ``_default_stub`` routes here), and a component naming a node or output
+    with ``{"node": ...}`` / ``{"output": ...}`` or, when nothing matches, a
+    not-found failure result.  A stub pipeline holds no components, so the
+    default stub does not model that last request; a scenario that needs it
+    supplies its own stub.
+    """
+
+    return {
+        "success": True,
+        "validation": {
+            "is_valid": True,
+            "errors": [],
+            "warnings": [],
+            "suggestions": [],
+            "semantic_contracts": [],
+            "graph_repair_suggestions": [],
+        },
+        "affected_nodes": [],
+        "version": version,
+        "data": {
+            "sources": dict(sources or {}),
+            "nodes": list(nodes or []),
+            "outputs": list(outputs or []),
+            "edges": list(edges or []),
+            "metadata": {"name": name, "description": description},
+            "inspection": {
+                "requested_component": requested_component,
+                "resolved_component": "full",
+                "accepted_full_state_aliases": ["", "full", "all", "pipeline"],
+            },
+        },
+    }
+
+
 def _default_stub(tool_name: str) -> ToolStub:
     """Return a stub that produces a plausible empty / valid response.
 
@@ -227,7 +290,13 @@ def _default_stub(tool_name: str) -> ToolStub:
     if tool_name == "preview_pipeline":
         return lambda _args: preview_pipeline_result(preview_is_valid=True)
     if tool_name == "get_pipeline_state":
-        return lambda _args: {"source": None, "nodes": [], "outputs": {}}
+        # ``component="source"`` is the one slice an empty stub state can
+        # answer truthfully; every other request reads as the full document.
+        return lambda args: (
+            {**get_pipeline_state_result(), "data": {"sources": {}}}
+            if args.get("component") == "source"
+            else get_pipeline_state_result(requested_component=args.get("component"))
+        )
     return lambda _args: {"status": "ok"}
 
 

@@ -556,7 +556,8 @@ class TestStep3DiscoveryTierMigration:
             "check and the source proof all pass), `preview_errors` (entries only "
             "the preview stage produces, such as `runtime_preflight_not_run`), "
             "`edge_contracts`, `proof_diagnostics`, `structural_preview` when "
-            "present, and a read-only overview: `sources`, `nodes`, `outputs`, "
+            "present (an advisory re-check whose `is_valid` is not the verdict), "
+            "and a read-only overview: `sources`, `nodes`, `outputs`, "
             "`node_count`, `output_count`.",
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }

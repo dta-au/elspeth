@@ -310,11 +310,14 @@ closed code, `error_code`. A top-level `validation_guidance` maps each
 `explain_validation_error` with that entry's `error_code`, or with its full
 `message` when it has none. A top-level `plugin_schemas` (when present) is
 the option schema for each plugin a rejected component uses, keyed
-`<kind>/<name>`, each with `plugin_type`, `json_schema`, `knob_schema`, and
-`web_config_authority`. It holds one entry per distinct plugin the rejection
-entries name: match each entry to every rejection whose `rejected_component`
-uses that plugin, and read no other entry. A rejection with no schema entry
-(for example `plugin_not_installed`) is still a component to repair, from
+`<kind>/<name>`, each with `plugin_type`, `json_schema`, `knob_schema`,
+`web_config_authority`, `composer_hints`, and `secret_requirements` (empty
+when the plugin needs no credential). It holds one entry per distinct plugin
+the rejected components use. On a `set_pipeline` rejection, match each entry
+to every rejection whose `rejected_component` uses that plugin; on a
+single-component tool there is one entry and it is the plugin you called it
+with. Read no other entry. A rejection with no schema entry (for example
+`plugin_not_installed`) is still a component to repair, from
 its `message`. `web_config_authority` tells you whether to author raw
 `options` (`user_configurable` or `user_configurable_with_policy`) or to
 author `options.profile` instead and leave the plugin's own options alone
@@ -348,7 +351,8 @@ field on future writes; a blob-backed source mutation may add `source_blob`
 `source.inline_blob` returns the created blob under `inline_blob`
 (`blob_id`, `content_hash`, `originated_in`) — that id is the bound source
 blob; do not call `list_blobs` to rediscover it. `runtime_preflight` appears
-only on `preview_pipeline`, as its own top-level field: `is_valid`, `checks`,
+only on `preview_pipeline`, and only when a runtime check ran, as its own
+top-level field: `is_valid`, `checks`,
 `readiness` (`execution_ready` and `blockers` say whether it can run), and
 runtime `errors` / `warnings` / `semantic_contracts`.
 
@@ -999,7 +1003,10 @@ Before you stop, copy this checklist and confirm each item:
 For build/edit/validate turns, end only in one of these states:
 
 1. `preview_pipeline` returned `preview_is_valid: true` (its `data` verdict,
-   which already folds in the runtime check and the source proof).
+   which already folds in the runtime check and the source proof). When it is
+   false and `validation`, `runtime_preflight` and `preview_errors` are all
+   clean, a `proof_diagnostics` entry with `severity` `blocking` is the
+   reason — apply its `suggested_repair`.
 2. All required `request_interpretation_review` calls succeeded, and the only
    remaining blocker is unresolved pending interpretation reviews. Tell the user
    the review cards are waiting; do not call `preview_pipeline` yet. Announce

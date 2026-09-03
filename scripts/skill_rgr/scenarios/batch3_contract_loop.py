@@ -140,6 +140,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from harness import (
     Scenario,
+    get_pipeline_state_result,
     preview_pipeline_result,
 )
 
@@ -232,33 +233,68 @@ class ContractLoopStub:
     # ----- tool callbacks -----
 
     def get_pipeline_state(self, _args: dict) -> dict:
-        """Mirror the shape ``_execute_get_pipeline_state`` returns."""
-        return {
-            "source": {
-                "plugin": "csv",
-                "on_success": self.INITIAL_NODE_ID,
-                "options": {"path": "data.csv", "schema": self.source_schema},
+        """Mirror the shape ``_execute_get_pipeline_state`` returns.
+
+        Built through ``harness.get_pipeline_state_result``, so the envelope
+        and the ``data`` block are the tool's own: ``sources`` is a MAPPING
+        keyed by the composer-visible source name, ``outputs`` is a LIST whose
+        entries key the sink on ``sink_name``, and every field
+        ``_serialize_source`` / ``_serialize_node`` / ``_serialize_output``
+        emits is present — including the ``None`` ones, which that serializer
+        keeps deliberately "so the LLM sees the full schema". The pre-2026-09
+        stub published a singular ``source``, an ``outputs`` mapping and no
+        envelope at all, none of which the tool emits (elspeth-e405ad7cd2
+        LLM-R3-6; same defect c27587e0f fixed for ``preview_pipeline``).
+        """
+        return get_pipeline_state_result(
+            sources={
+                "source": {
+                    "plugin": "csv",
+                    "on_success": self.INITIAL_NODE_ID,
+                    "options": {"path": "data.csv", "schema": self.source_schema},
+                    "on_validation_failure": "discard",
+                    "description": None,
+                }
             },
-            "nodes": [
+            nodes=[
                 {
                     "id": self.INITIAL_NODE_ID,
                     "node_type": "transform",
                     "plugin": "passthrough",
-                    "options": ({"schema": self.clean_schema} if self.clean_schema is not None else {}),
+                    "input": None,
                     "on_success": f"output:{self.INITIAL_OUTPUT_NAME}",
+                    "on_error": None,
+                    "options": ({"schema": self.clean_schema} if self.clean_schema is not None else {}),
+                    "condition": None,
+                    "routes": None,
+                    "fork_to": None,
+                    "branches": None,
+                    "policy": None,
+                    "merge": None,
+                    "trigger": None,
+                    "output_mode": None,
+                    "expected_output_count": None,
+                    "timeout_seconds": None,
+                    "description": None,
+                    "scope_name": None,
+                    "scope_opener": None,
+                    "scope_policy": None,
                 }
             ],
-            "outputs": {
-                self.INITIAL_OUTPUT_NAME: {
+            outputs=[
+                {
+                    "sink_name": self.INITIAL_OUTPUT_NAME,
                     "plugin": "json",
                     "options": {
                         "path": "out.json",
                         "required_input_fields": list(self.sink_required_fields),
                     },
+                    "on_write_failure": None,
+                    "description": None,
                 }
-            },
-            "version": 1 + len(self.patches),
-        }
+            ],
+            version=1 + len(self.patches),
+        )
 
     def preview_pipeline(self, _args: dict) -> dict:
         """Compute edge_contracts based on current schema state.
