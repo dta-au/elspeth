@@ -1100,7 +1100,7 @@ def f():
     return result
 """
 
-# The ten routes by which the payload leaves the statements the walker reads, and one function
+# The twelve routes by which the payload leaves the statements the walker reads, and one function
 # whose every use of it is accounted. The first three are red-team RED5B-1's measured survivors (each
 # SHIPPED its key with the census at 401 rows and mypy clean); the fourth is the conditional alias
 # ``_same_object_names`` exists for; the next two are the ways a bare CALLEE NAME is not enough —
@@ -1111,6 +1111,18 @@ def f():
 # assertion as well — and the target can be plain or ANNOTATED, alone or in a target LIST that mixes
 # a bare name with one of these. Without a probe on each dimension, reverting the AnnAssign half or
 # relaxing ``all`` to ``any`` leaves this file green while the key reaches the wire.
+#
+# The final two come from the systems seat's survey of the same shape (SYS-C1/SYS-C2) and carry the
+# RULE it measured: a guard owes a probe per cell where its own predicate enumerates a FINITE space
+# AND the unwitnessed direction is fail-OPEN. Relaxing ``grandparent.func is parent`` (a mutator
+# handed to a callee that may store and call it later) and dropping the ``Return`` condition on the
+# tuple/list arm each left this file green; narrowing the equally unprobed ``(Compare, UnaryOp)``
+# arm did NOT, because a fail-CLOSED cell is witnessed by live code whether or not anyone wrote a
+# probe, while a fail-open cell cannot be witnessed by a tree that lacks the shape. That asymmetry
+# is why RED-F-1 shipped a key past a green gate, and it is the reason to write probes here rather
+# than to trust the corpus. Where the predicate instead tests membership in an OPEN universe of node
+# types (``_OPAQUE_REFERENCES``), a per-shape probe cannot close the gap and the disclosed-minimum
+# treatment stands.
 # ``stays_accounted`` is the other direction, without which a mutant that refused everything would
 # pass.
 _PROBE_ESCAPING_PAYLOADS = """
@@ -1178,6 +1190,19 @@ def escapes_into_a_mixed_target(box):
     payload = {"status": "x"}
     keep = box.p = payload
     box.p["zzz"] = "y"
+    return ToolResult(success=True, data=payload)
+
+
+def escapes_as_a_handed_out_mutator(other):
+    payload = {"status": "x"}
+    other(payload.update)
+    return ToolResult(success=True, data=payload)
+
+
+def escapes_into_a_tuple_handle():
+    payload = {"status": "x"}
+    holder = (payload,)
+    holder[0]["zzz"] = "y"
     return ToolResult(success=True, data=payload)
 
 
@@ -1586,6 +1611,8 @@ def test_the_walk_accounts_for_every_use_of_the_payload_and_refuses_an_escape() 
         "escapes_into_an_attribute_handle": "bound to box.p, a handle ``_aliases_of`` does not follow",
         "escapes_into_an_annotated_attribute_handle": "bound to box.p, a handle ``_aliases_of`` does not follow",
         "escapes_into_a_mixed_target": "bound to keep, box.p, a handle ``_aliases_of`` does not follow",
+        "escapes_as_a_handed_out_mutator": "bound as payload.update rather than called there, so no mutator walker sees the call",
+        "escapes_into_a_tuple_handle": "read under Tuple, a position this walker does not classify",
     }
     for fn_name, escape in escapes.items():
         fn = _function(tree, fn_name)
@@ -2344,7 +2371,9 @@ def test_no_nested_key_is_a_homonym_of_an_envelope_key() -> None:
     ``_nested_value_keys`` stopped declining comprehension-valued payloads.
     RE-MEASURED at that new size rather than assumed to still be free: 401
     rows, 390 of them dotted, against the registry's 11 envelope keys — zero
-    collide, the 42 newly-walked container rows included.
+    collide. The set is derived live from every dotted row below, so no count
+    of the newly-walked rows is carried here: one more figure to keep true
+    across every census move, and the derivation already covers them all.
 
     NOT closed by this: a leaf admitted because some OTHER tool's description
     quotes it. That is the same ``is_taught`` mechanism one step out, it needs
