@@ -297,16 +297,47 @@ def _approval_required(content: Mapping[str, Any]) -> bool:
 
 
 def _codes_from(content: Mapping[str, Any] | None) -> tuple[str, ...]:
+    """Codes a deviation can cite, read from whatever shape the row actually has.
+
+    PERSISTED ROWS ARE THE REDACTED PROJECTION, not the wire envelope. A stored
+    tool row carries ``success`` / ``validation`` / ``version`` (plus
+    ``_unknown_response`` when a producer shipped a key the manifest never
+    learned), and ``data`` is a placeholder: ``redaction.py`` builds
+    ``_TOOL_RESULT_OPTIONAL_RESPONSE_KEYS`` by dropping ``"data"``, so nothing
+    under it survives to be read here.
+
+    What DOES survive is ``validation``, structurally — its shadow model keeps
+    ``error_code`` as "the closed machine-readable discriminant"
+    (``_ValidationEntryShadowModel``). So ``validation.errors[].error_code`` is
+    the carrier that exists on a real capture, and it is read first.
+
+    The top-level reads below are kept for wire-shaped and synthetic inputs.
+    They find nothing on a persisted row: no envelope has ever carried
+    ``error_class`` / ``code`` / ``status`` or a top-level ``errors`` list at
+    the top level (elspeth-6aa477c78e).
+    """
     if not content:
         return ()
     codes: list[str] = []
+    validation = content.get("validation")
+    if isinstance(validation, Mapping):
+        for entry in validation.get("errors") or []:
+            if isinstance(entry, Mapping):
+                code = entry.get("error_code")
+                if isinstance(code, str) and code:
+                    codes.append(code)
     for key in ("error_class", "code", "status"):
         v = content.get(key)
         if isinstance(v, str) and v:
             codes.append(v)
     for entry in content.get("errors") or []:
-        if isinstance(entry, Mapping) and isinstance(entry.get("code"), str):
-            codes.append(entry["code"])
+        if isinstance(entry, Mapping):
+            # ``error_code`` is the envelope's spelling; ``code`` is what the
+            # synthetic fixtures use. Accept both rather than silently reading
+            # neither.
+            code = entry.get("error_code") or entry.get("code")
+            if isinstance(code, str) and code:
+                codes.append(code)
     return tuple(dict.fromkeys(codes))
 
 

@@ -457,6 +457,42 @@ def test_cancelled_last_row_on_a_wall_timeout_is_hard_not_excluded() -> None:
     assert s2.excluded is None and _classes(s2) == ["turn_exhaustion"]
 
 
+def test_codes_are_read_from_the_persisted_redacted_shape_not_only_the_synthetic_one() -> None:
+    """A real stored row carries codes under validation.errors[].error_code — nowhere else.
+
+    The other fixtures in this file build ``{"success": false, "errors":
+    [{"code": ...}]}``. No envelope has ever had that shape; it is a synthetic
+    convenience, so those tests cannot tell whether the scorer works on a
+    capture. A persisted row is the REDACTED projection — ``data`` is a
+    placeholder because ``redaction.py`` drops ``"data"`` from
+    ``_TOOL_RESULT_OPTIONAL_RESPONSE_KEYS`` — and the surviving structured
+    carrier is ``validation``, whose shadow entry keeps ``error_code``.
+
+    Before elspeth-6aa477c78e's fix this returned an empty tuple here, so every
+    repair deviation scored off a real capture cited no codes at all.
+    """
+    rows = tg.ideal_thread(ARGS)
+    rows[-1]["composition_state_id"] = None
+    rows[-1]["content"] = json.dumps(
+        {
+            "success": False,
+            "version": 3,
+            "validation": {
+                "is_valid": False,
+                "errors": [
+                    {"component": "output:out", "message": "sink contract unmet", "severity": "high", "error_code": "E_MISSING_SINK"}
+                ],
+                "warnings": [],
+                "suggestions": [],
+            },
+        }
+    )
+    rows.append(tg.assistant_row(30, content="I could not complete the pipeline."))
+    s = score_run(tg.capture(rows, state=None, is_valid=None), SC)
+
+    assert s.deviations[0].codes == ("E_MISSING_SINK",)
+
+
 def test_abandoned_mutation_keeps_its_codes_and_is_not_a_decline() -> None:
     rows = tg.ideal_thread(ARGS)
     rows[-1]["composition_state_id"] = None
