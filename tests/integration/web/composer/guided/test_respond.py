@@ -2421,7 +2421,10 @@ class TestStep2IntraStep:
         assert proposals[old_proposal["proposal_id"]].status == "rejected"
         events = asyncio.run(composer_test_client.app.state.session_service.list_proposal_events(UUID(session_id)))
         proposal_events = [event for event in events if str(event.proposal_id) == old_proposal["proposal_id"]]
-        assert [event.event_type for event in proposal_events] == ["proposal.created", "proposal.rejected"]
+        # elspeth-ed67eb9d0d: the wire-review advance carried this proposal
+        # across a new checkpoint and moved its anchor there, recorded as one
+        # non-terminal ``proposal.rebased`` event before the supersession.
+        assert [event.event_type for event in proposal_events] == ["proposal.created", "proposal.rebased", "proposal.rejected"]
         assert proposal_events[-1].payload["reason_code"] == "superseded"
 
         stale = composer_test_client.post(
@@ -3550,6 +3553,18 @@ class TestStep2IntraStep:
         assert guided["correction_messages"] == before["correction_messages"]
         messages = asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None))
         assert all(message.content != instruction for message in messages)
+        # elspeth-ed67eb9d0d: the POST body alone hid a permanently bricked
+        # session. The decline settles a new checkpoint while the proposal
+        # stays under review, and before the fix the proposal's anchor kept
+        # naming the previous row — so this same clean 200 was followed by
+        # a GET that raised "guided proposal base differs from current
+        # checkpoint" forever, which the frontend tolerates by silently
+        # reopening the session in freeform. Read it back.
+        read_back = _get_guided(composer_test_client, session_id)
+        assert read_back["guided_session"]["step"] == "step_3_transforms"
+        assert read_back["next_turn"]["type"] == "propose_pipeline"
+        assert read_back["next_turn"]["payload"]["proposal_id"] == payload["proposal_id"]
+        assert read_back["next_turn"]["payload"]["draft_hash"] == payload["draft_hash"]
 
     def test_wire_correction_records_the_feedback_in_the_transcript(
         self,
@@ -3718,6 +3733,25 @@ class TestStep2IntraStep:
         assert guided["active_proposal"]["proposal_id"] == wire_payload["proposal_id"]
         assert body["next_turn"]["type"] == "confirm_wiring"
         assert _get_guided(composer_test_client, session_id)["next_turn"]["turn_token"] == wire_turn["turn_token"]
+        # elspeth-ed67eb9d0d: at Step 4 the amputation is the REFINE
+        # affordance, not the read. The Step-3 acceptance into wire review
+        # already spends the one-hop tolerance back_edit allows, so before
+        # the fix this second carrying settlement pushed the proposal's
+        # anchor out of allowed_base_state_ids and "edit this component"
+        # started failing closed on a proposal nothing had changed.
+        edited = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": body["next_turn"]["turn_token"],
+                "proposal_id": wire_payload["proposal_id"],
+                "draft_hash": wire_payload["draft_hash"],
+                "edit_target": {"kind": "source", "stable_id": wire_payload["sources"][0]["stable_id"]},
+                "correction_feedback": "Change the selected source settings.",
+            },
+        )
+        assert edited.status_code == 200, edited.json()
+        assert edited.json()["guided_session"]["step"] == "step_1_source"
 
     def test_competing_respond_answers_fast_coded_conflict_during_planner_settlement(
         self,
@@ -5277,7 +5311,7 @@ class TestStep2IntraStep:
             assert len(prepare_calls) == len(execute_calls) == 1
             assert set(proposals) == {original_id}
             assert proposals[original_id].status == "committed"
-            assert original_events == ["proposal.created", "proposal.accepted"]
+            assert original_events == ["proposal.created", "proposal.rebased", "proposal.accepted"]
             assert len(dispatches) == 1
             assert current["next_turn"] is None
         else:
@@ -5285,7 +5319,7 @@ class TestStep2IntraStep:
             assert len(proposals) == 2
             assert proposals[original_id].status == "rejected"
             assert proposals[original_id].committed_state_id is None
-            assert original_events == ["proposal.created", "proposal.rejected"]
+            assert original_events == ["proposal.created", "proposal.rebased", "proposal.rejected"]
             assert all(event.event_type != "proposal.accepted" for event in events)
             assert dispatches == []
             successor = next(item for proposal_id, item in proposals.items() if proposal_id != original_id)
@@ -6711,7 +6745,7 @@ class TestStep2IntraStep:
 
         assert replayed.status_code == 200, replayed.json()
         events = asyncio.run(service.list_proposal_events(UUID(session_id)))
-        assert [event.event_type for event in events] == ["proposal.created", "proposal.accepted"]
+        assert [event.event_type for event in events] == ["proposal.created", "proposal.rebased", "proposal.accepted"]
         proposals = asyncio.run(service.list_composition_proposals(UUID(session_id)))
         assert len(proposals) == 1 and proposals[0].status == "committed"
         messages = asyncio.run(service.get_messages(UUID(session_id), limit=None))

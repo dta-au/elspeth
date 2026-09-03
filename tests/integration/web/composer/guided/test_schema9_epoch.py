@@ -26,7 +26,11 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # Session epoch 49 (elspeth-3e28029d2f): composition_rejection_events
     # table added — durable session-side rejection reasons (operator ruling
     # 2026-09-02: session data, not Landscape data).
-    assert SESSION_SCHEMA_EPOCH == 49
+    # Session epoch 50 (elspeth-ed67eb9d0d): ck_proposal_events_type widened
+    # with proposal.rebased — a guided settlement that carries a pending
+    # proposal across the checkpoint it writes re-pins the proposal's base
+    # and records the rebinding as an appended immutable lifecycle event.
+    assert SESSION_SCHEMA_EPOCH == 50
     assert SQLITE_SCHEMA_EPOCH == 36
 
 

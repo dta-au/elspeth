@@ -252,7 +252,19 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        composition state current at rejection. Operator ruling 2026-09-02:
 #        session data, not Landscape data. New table ships by DB recreation
 #        (sessions.db only — auth.db is never touched).
-SESSION_SCHEMA_EPOCH = 49
+#   50 -> ``ck_proposal_events_type`` widened with ``proposal.rebased``
+#        (elspeth-ed67eb9d0d): a guided settlement that carries a pending
+#        proposal across the checkpoint it writes must re-pin the
+#        proposal's forward-declared base, and that rebinding is an
+#        appended immutable lifecycle event plus a lifecycle-managed
+#        ``composition_proposals.base_state_id``. Without it the carried
+#        base kept naming the previous checkpoint and every later binding
+#        check failed closed — an unreadable guided session that the
+#        frontend silently reopened in freeform. SQLite cannot ALTER a
+#        CHECK constraint in place, so pre-release policy remains
+#        delete-and-recreate for stale session databases (sessions.db
+#        only — auth.db is never touched).
+SESSION_SCHEMA_EPOCH = 50
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -1063,7 +1075,8 @@ proposal_events_table = Table(
     Column("payload", JSON, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     CheckConstraint(
-        "event_type IN ('proposal.created', 'proposal.accepted', 'proposal.rejected', 'trust_mode.changed', 'auto_commit.revoked')",
+        "event_type IN ('proposal.created', 'proposal.accepted', 'proposal.rejected', "
+        "'trust_mode.changed', 'auto_commit.revoked', 'proposal.rebased')",
         name="ck_proposal_events_type",
     ),
 )

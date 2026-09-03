@@ -149,6 +149,7 @@ from .guided_chat_intent_management import (
     deferred_request_retained_intent_ids,
     maybe_prepare_schema8_management_rewind,
 )
+from .guided_proposal_rebase import carried_pending_proposal_rebase
 
 type GuidedChatProviderOutcome = (
     GuidedStepChatOnlyResult
@@ -2270,6 +2271,21 @@ async def post_guided_chat_schema8(
                         if current_record is not None and current_record.composer_meta is not None
                         else {}
                     )
+                    # A guided chat settles a new checkpoint while leaving any
+                    # pending proposal under review: the transcript lives
+                    # inside ``composer_meta``, so there is no chat-only write
+                    # channel and the row always advances. The proposal's
+                    # anchor therefore has to follow the row being written
+                    # (elspeth-ed67eb9d0d). A rewind that CLEARS the proposal
+                    # supplies ``invalidated_pending_proposal`` instead and
+                    # leaves no carried proposal here — the settlement refuses
+                    # a command carrying both.
+                    chat_rebase = carried_pending_proposal_rebase(
+                        resulting_guided,
+                        from_state_id=(current_record.id if current_record is not None else None),
+                        base_composition_content_hash=(composition_content_hash(current_state) if current_record is not None else None),
+                        reason="advisory_chat",
+                    )
                     existing_meta["guided_session"] = resulting_guided.to_dict()
                     state_dict = resulting_state.to_dict()
                     is_valid: bool
@@ -2356,6 +2372,7 @@ async def post_guided_chat_schema8(
                             retained_deferred_intent_ids=retained_intent_ids,
                             deferred_intent_action=settled_management_action,
                             invalidated_pending_proposal=invalidated_pending_proposal,
+                            rebased_pending_proposal=chat_rebase,
                         ),
                         payload_store=payload_store,
                     )
