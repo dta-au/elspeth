@@ -168,7 +168,7 @@ Each entry reports:
 
 **When to use:** After making a series of changes, to confirm the pipeline is set up correctly before responding to the user or calling `generate_yaml`.
 
-**Important:** `edge_contracts: []` is not positive contract evidence. It means no field contract was checked — either nothing required fields, or the only requirement was an implicit one facing a producer that makes no typed claim. Also treat skipped contract-check warnings as unresolved rather than satisfied.
+**Important:** `edge_contracts: []` is not positive contract evidence. It means no field contract was checked. Also treat skipped contract-check warnings as unresolved rather than satisfied.
 
 ---
 
