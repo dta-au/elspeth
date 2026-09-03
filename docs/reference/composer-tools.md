@@ -155,10 +155,12 @@ preview stage's own facts:
 - `structural_preview` when a tolerant structural check ran
 - source, node, and output summary data (`sources`, `nodes`, `outputs`, `node_count`, `output_count`)
 
-Each `edge_contracts` entry reports:
-- `from` / `to`
+One entry per producer/consumer pair that was checked, and a pair is checked
+only where the consumer declares required fields. Each entry reports:
+- `from` / `to` (`to` is `output:<sink name>` for a sink)
 - `producer_guarantees`
 - `consumer_requires`
+- `missing_fields` — the `consumer_requires` names the producer does not guarantee
 - `satisfied`
 
 **When to use:** After making a series of changes, to confirm the pipeline is set up correctly before responding to the user or calling `generate_yaml`.
