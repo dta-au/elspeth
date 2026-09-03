@@ -86,6 +86,18 @@ def _display(path: Path) -> str:
         return str(path)
 
 
+def leaf_of(key: str) -> str:
+    """The last segment of a dotted key, without its list marker: what a reader sees quoted.
+
+    One authority, because two checks depend on the SAME derivation: whether a
+    key is taught (``is_quoted_leaf``) and whether it is a homonym of another
+    surface's key (the envelope gate's homonym refusal). A second copy of this
+    line would let the refusal and the admission disagree about which word the
+    corpus was matched on.
+    """
+    return key.split(".")[-1].replace("[]", "")
+
+
 def is_quoted_leaf(key: str, text: str) -> bool:
     """The key's leaf appears in house-style quoted form (``'leaf'`` or ```leaf```) in ``text``.
 
@@ -94,5 +106,4 @@ def is_quoted_leaf(key: str, text: str) -> bool:
     ``field``, so deleting the deliberate teaching of a common-word key left
     the gate green (red-team finding on bc8b9e237).
     """
-    leaf = key.split(".")[-1].replace("[]", "")
-    return re.search(rf"['`]{re.escape(leaf)}['`]", text) is not None
+    return re.search(rf"['`]{re.escape(leaf_of(key))}['`]", text) is not None

@@ -57,6 +57,7 @@ from tests.unit.web.composer._teaching_gate_support import (
     _literal_str,
     _typed_keys,
     is_quoted_leaf,
+    leaf_of,
 )
 
 FENCE_PATH = Path(__file__).with_name("tool_result_envelope_fence.json")
@@ -1501,7 +1502,7 @@ def is_taught(shipped: ShippedKey) -> bool:
     # gets this: ``id`` on a blob list is not the node ``id`` the model authored.
     restates_authoring = shipped.surface == "echo" or (shipped.surface == "tool-data" and shipped.tool == "get_pipeline_state")
     if restates_authoring and "[]" in shipped.key:
-        return shipped.key.split(".")[-1] in _authoring_vocabulary()
+        return leaf_of(shipped.key) in _authoring_vocabulary()
     return False
 
 
@@ -1554,6 +1555,46 @@ def test_every_shipped_envelope_key_is_taught_or_fenced() -> None:
         f"{len(unexplained)} tool-result key(s) reach the planner with no prose that names them. "
         "Teach each in skills/pipeline_composer.md ('Reading a tool result') or the tool's declaration "
         "description, or fence it with a checkable reason in tool_result_envelope_fence.json:\n" + "\n".join(lines)
+    )
+
+
+def test_no_nested_key_is_a_homonym_of_an_envelope_key() -> None:
+    """No key nested under an envelope field may have one of the ENVELOPE's own key names as its leaf.
+
+    ``is_taught`` matches a quoted leaf ANYWHERE in the taught corpus, and the
+    corpus quotes every envelope key by construction, so a payload key named
+    after one is "taught" by the sentence describing a different field. Not
+    hypothetical: ``data["success"] = "false"`` added to
+    ``_common._failure_result`` — the shared recoverable-rejection builder, 261
+    producers behind it — was ENUMERATED by the census (342 rows, the new row
+    named at its site) and then admitted, with the whole gate file green
+    (red-team RED2-2, mutant A3). The two payloads that already carry exact-key
+    pins refuse ``success`` by hand (F1); this refuses the class, on every
+    payload, for every envelope key, and takes the forbidden names from the
+    registry rather than from a list of the four that happen to be quoted today.
+
+    Depth-blind, and not scoped to ``data.``, on purpose: the mechanism is a
+    quoted leaf matching anywhere, and it cares neither how deep the key sits
+    nor which surface carries it. The dotted test is what separates a nested
+    key from the envelope's own eleven rows, which are the only dotless ones
+    (measured). Measured before landing, so the rule costs no churn — zero of
+    the 341 shipped rows collide. A future collision is an adjudication (rename
+    the nested key, or split the envelope's), not something to route around
+    here: the reader cannot tell the two apart, whatever the gate does.
+
+    NOT closed by this: a leaf admitted because some OTHER tool's description
+    quotes it. That is the same ``is_taught`` mechanism one step out, it needs
+    either a data-payload-scoped corpus match or a per-tool ruling, and it is
+    recorded on elspeth-e405ad7cd2 rather than fenced here.
+    """
+    envelope = set(env.tool_result_keys(data=True))
+    collisions = sorted(
+        {(shipped.key, shipped.site) for shipped in shipped_keys() if "." in shipped.key and leaf_of(shipped.key) in envelope}
+    )
+    assert not collisions, (
+        f"nested key(s) whose leaf is an envelope key: {collisions} — the taught corpus quotes every "
+        "envelope key, so is_taught would admit these on the ENVELOPE's own sentence. Rename the nested "
+        "key, or split the envelope's."
     )
 
 
