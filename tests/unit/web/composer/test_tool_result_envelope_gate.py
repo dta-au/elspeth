@@ -1543,18 +1543,25 @@ def test_every_result_constructor_site_is_attributed() -> None:
     The registries are checked in both directions: a stale row (its site gone or
     renamed) fails too, so a classification cannot outlive what it classifies.
 
-    Both the walked set and the registries key on the BASE NAME, while
-    ``_all_data_sites`` walks the package recursively — so the name identifies a
-    module only while the mapping is injective, and nothing made it so. A
-    producer in a subpackage whose file name matches a walked one
-    (``guided/sources.py`` against ``tools/sources.py``) counted itself as
-    walked and shipped an unteachable key past this whole file, 33 passed
-    (systems seat, round-3 sign-off). ``guided/`` already holds three base-name
-    collisions with its parent package (``audit.py``, ``prompts.py``,
-    ``protocol.py``), so this is the tree's live shape and not a hypothetical
-    one. ``_ambiguous_data_module_names`` asserts the injectivity the two keyed
-    sets assume, by name, before either is built; the base-name keying below is
-    correct only because it runs after that refusal.
+    ``_all_data_sites`` walks the package recursively while ``_TOOL_DATA_FILES``
+    names files under ``tools/``, so a base name does NOT identify a module. Two
+    distinct escapes came of keying on one, both measured against this file:
+
+    * ``guided/sources.py`` shipping a ``data=`` payload counted itself as
+      walked — 33 passed, exit 0 — while ``_tool_data_sites`` only ever parsed
+      ``tools/sources.py``;
+    * ``guided/outputs.py`` did the same with no collision at all to notice,
+      because ``tools/outputs.py`` ships no ``data=`` site today, so the name is
+      one module's and the injectivity guard has nothing to refuse.
+
+    ``guided/`` already holds three base-name collisions with its parent package
+    (``audit.py``, ``prompts.py``, ``protocol.py``), so this is the tree's live
+    shape and not a hypothetical one. Hence BOTH guards, each with its own
+    killing mutant: ``walked`` is keyed on the MODULE, which is what the
+    tool-data walker actually parses, and ``_ambiguous_data_module_names``
+    refuses a base name two data-shipping modules answer to, because the two
+    classification registries still key on the name and cannot say which of them
+    a row classifies.
     """
     list(_tool_data_sites())
 
@@ -1565,7 +1572,8 @@ def test_every_result_constructor_site_is_attributed() -> None:
         "a registry row keyed on the name alone cannot say which of them it classifies"
     )
 
-    walked = {(site.file, site.function) for site in sites if site.file in _TOOL_DATA_FILES}
+    tool_data_modules = {f"tools/{name}" for name in _TOOL_DATA_FILES}
+    walked = {(site.file, site.function) for site in sites if site.module in tool_data_modules}
     classified = set(_DATA_SITES_COUNTED_AT_THEIR_PRODUCER) | set(_DATA_SITES_OFF_THE_COMPOSER_TOOL_SURFACE)
     seen: set[tuple[str, str]] = set()
     for site in sites:
