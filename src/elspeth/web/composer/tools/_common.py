@@ -1099,9 +1099,13 @@ def diff_states(
         baseline_validation: Pre-computed validation for the baseline state.
         current_validation: Pre-computed validation for the current state.
     """
+    # No ``to_version``: the handler passes ``current`` as the result's state,
+    # so the envelope's own ``version`` IS the "to" side and a copy under
+    # ``data`` would be a twin — the same shape 3a20129be removed from
+    # get_pipeline_state one file away (systems seat SYS-R3-5).
+    # ``from_version`` stays: it is a fact the envelope does not carry.
     changes: dict[str, Any] = {
         "from_version": baseline.version,
-        "to_version": current.version,
         "sources_changed": False,
         "metadata_changed": False,
         "nodes": {"added": [], "removed": [], "modified": []},

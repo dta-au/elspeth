@@ -653,11 +653,20 @@ class TestDiffStates:
         )
 
     def test_version_tracking(self) -> None:
+        """``from_version`` only: the "to" side is the result envelope's own ``version``.
+
+        ``_execute_diff_pipeline`` passes the CURRENT state to
+        ``_discovery_result``, so a ``to_version`` under ``data`` byte-equals
+        the envelope's ``version`` — the twin shape 3a20129be removed from
+        ``get_pipeline_state`` (systems seat SYS-R3-5). ``from_version`` is a
+        fact the envelope does not carry, so it stays.
+        """
         s1 = _empty_state()
         s2 = s1.with_metadata({"name": "Updated"})
         diff = diff_states(s1, s2)
         assert diff["from_version"] == 1
-        assert diff["to_version"] == 2
+        assert "to_version" not in diff
+        assert s2.version == 2, "the version the diff ran TO, which the envelope carries"
 
 
 class TestDiffPipelineTool:

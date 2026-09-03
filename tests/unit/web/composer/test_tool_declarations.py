@@ -566,7 +566,8 @@ class TestStep3DiscoveryTierMigration:
         assert self._get("diff_pipeline") == {
             "name": "diff_pipeline",
             "description": "Show what changed since the session was loaded or created. "
-            "On success `data` carries `from_version`, `to_version`, `sources_changed`, "
+            "On success `data` carries `from_version` (the baseline; the version it "
+            "changed TO is the envelope's own `version`), `sources_changed`, "
             "`metadata_changed`, `total_changes`, `warnings_introduced`, "
             "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
             "lists under `nodes`, `edges`, `outputs`, and — only when `sources_changed` — `sources`. Without a "
