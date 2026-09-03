@@ -47,6 +47,7 @@ from elspeth.web.composer.tools import _dispatch, _registry, blobs, secrets
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.execution.schemas import ValidationResult
+from tests.helpers.tree_gate import ParsedPythonFile, iter_gate_sources
 from tests.unit.web.composer._teaching_gate_support import (
     REPO_ROOT,
     WEB_SRC,
@@ -903,6 +904,21 @@ def _parse(path: Path) -> ast.Module:
     return ast.parse(path.read_text(encoding="utf-8"))
 
 
+def _composer_sources() -> list[ParsedPythonFile]:
+    """Every gate-visible module under ``web/composer``, enumerated and parsed once.
+
+    Never a private recursive glob of this package: such a walk sees worktrees,
+    virtualenvs and a sibling session's scratch file, and it reads a tree that may
+    have moved under it. ``tests/helpers/tree_gate`` derives the file set from the
+    exclusion authority (``elspeth_lints.core.ast_walker``), subtracts what git
+    ignores so a local run measures the tree CI measures, and raises rather than
+    silently skipping a file that vanishes mid-walk — a silent skip would narrow
+    this census without telling anyone. ``test_python_file_walker_authority``
+    forbids a second walker anywhere under ``tests/`` for exactly that reason.
+    """
+    return list(iter_gate_sources(COMPOSER))
+
+
 # --- probes (module level: postponed annotations break function-local TypedDicts) ----------------
 
 
@@ -1583,12 +1599,12 @@ def test_every_payload_consumer_leaves_the_payload_it_is_handed_unreshaped() -> 
     assert elsewhere <= _PAYLOAD_CONSUMERS, f"adjudicated name(s) that are not consumers: {sorted(elsewhere - _PAYLOAD_CONSUMERS)}"
     unresolved = set(_PAYLOAD_CONSUMERS) - elsewhere
     findings: list[str] = []
-    for path in sorted(COMPOSER.rglob("*.py")):
-        for node in ast.walk(_parse(path)):
+    for parsed in _composer_sources():
+        for node in ast.walk(parsed.tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name not in _PAYLOAD_CONSUMERS:
                 continue
             unresolved.discard(node.name)
-            where = f"{_display(path)}:{node.lineno} {node.name}"
+            where = f"{_display(parsed.path)}:{node.lineno} {node.name}"
             parameters = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
             findings.extend(
                 f"{where}: re-shapes its own {parameter.arg} — {form} at line {lineno}"
@@ -2069,8 +2085,8 @@ def _all_data_sites() -> list[_DataSite]:
     (systems seat SYS-R3-2, which found three such sites).
     """
     sites: list[_DataSite] = []
-    for path in sorted(COMPOSER.rglob("*.py")):
-        tree = _parse(path)
+    for parsed in _composer_sources():
+        path, tree = parsed.path, parsed.tree
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or _call_name(node) not in _RESULT_CONSTRUCTORS:
                 continue
@@ -2485,9 +2501,9 @@ def test_every_attributed_helper_name_answers_to_one_module() -> None:
     """
     attributed = set(_DATA_HELPER_PAYLOADS) | set(_PASSTHROUGH_HELPERS) | set(_PAYLOAD_CONSUMERS)
     definitions = [
-        (node.name, path.relative_to(COMPOSER).as_posix())
-        for path in sorted(COMPOSER.rglob("*.py"))
-        for node in ast.walk(_parse(path))
+        (node.name, parsed.path.relative_to(COMPOSER).as_posix())
+        for parsed in _composer_sources()
+        for node in ast.walk(parsed.tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in attributed
     ]
     ambiguous = _names_two_modules_answer_to(definitions)
@@ -2553,11 +2569,11 @@ def test_a_type_attribution_is_derived_from_its_helper_and_never_asserted_over_i
     typed = {name: payload for name, payload in _DATA_HELPER_PAYLOADS.items() if isinstance(payload, type)}
     unresolved = set(typed) - set(_ATTRIBUTIONS_DEFINED_OUTSIDE_THE_COMPOSER)
     findings: list[str] = []
-    for path in sorted(COMPOSER.rglob("*.py")):
-        for node in ast.walk(_parse(path)):
+    for parsed in _composer_sources():
+        for node in ast.walk(parsed.tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name not in typed:
                 continue
-            where = f"{_display(path)}:{node.lineno} {node.name}"
+            where = f"{_display(parsed.path)}:{node.lineno} {node.name}"
             unresolved.discard(node.name)
             expected = typed[node.name].__name__
             annotation = node.returns
