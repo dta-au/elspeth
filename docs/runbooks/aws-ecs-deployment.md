@@ -1515,9 +1515,9 @@ countersigns it. Set `SCENARIO_A_COMPATIBILITY_RECORD_FILE` and
   "rollback_doctor_task_definition": "exact-rollback-doctor-task-definition-arn",
   "previous_package_version": "0.7.1",
   "schema_facts": {
-    "candidate": {"session_epoch": 49, "landscape_epoch": 36, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 50, "landscape_epoch": 37, "run_web_plugin_policy_present": true},
     "previous": {"session_epoch": 35, "landscape_epoch": 29, "run_web_plugin_policy_present": true},
-    "structural_changes": "session_epoch_35_to_49_landscape_epoch_29_to_36_blob_cleanup_guided_decline_and_row_union_barrier",
+    "structural_changes": "session_epoch_35_to_50_landscape_epoch_29_to_37_blob_cleanup_guided_decline_and_row_union_barrier",
     "semantics_only_changes": "guided_coalesce_timeout_seconds_and_node_options_summary_required",
     "archive_export_decision": "required_before_forward_migration",
     "destructive_reset_required": false
@@ -3218,7 +3218,7 @@ if test "$DEPLOYMENT_MODE" = upgrade; then
     .backward_compatible == false
     and .rollback_permitted == false
     and .schema_facts.previous.landscape_epoch == 29
-    and .schema_facts.candidate.landscape_epoch == 36
+    and .schema_facts.candidate.landscape_epoch == 37
   ' "$ROLLBACK_REFUSAL_RECEIPT" >/dev/null
   persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" compatibility-record \
     "$COMPATIBILITY_RECORD_SHA256" "$ROLLBACK_REFUSAL_RECEIPT" >/dev/null

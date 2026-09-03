@@ -4004,7 +4004,7 @@ def health(
 def web(
     port: int = typer.Option(8451, help="Port to listen on"),
     host: str = typer.Option("127.0.0.1", help="Host to bind to"),
-    auth: str = typer.Option("local", help="Auth provider: local, oidc, entra"),
+    auth: str = typer.Option("local", help="Auth provider: local, oidc, entra, vanguard, google"),
     reload: bool = typer.Option(False, help="Enable auto-reload for development"),
 ) -> None:
     """Start the ELSPETH web application."""
@@ -4027,6 +4027,18 @@ def web(
             "Set ELSPETH_WEB__SECRET_KEY or use --host 127.0.0.1 for local development.",
             err=True,
         )
+        raise typer.Exit(1)
+
+    # Reject an unknown provider here rather than letting it reach
+    # ``WebSettings`` inside the uvicorn factory, where the failure surfaces
+    # as a worker that will not boot. The registry is the authority for what
+    # an operator may select, so the list cannot drift from what actually
+    # exists.
+    from elspeth.web.auth.providers import registered_provider_names
+
+    selectable = registered_provider_names()
+    if auth not in selectable:
+        typer.echo(f"Error: unknown auth provider {auth!r}. Choose one of: {', '.join(selectable)}", err=True)
         raise typer.Exit(1)
 
     # Bridge CLI args to create_app() via environment variables.

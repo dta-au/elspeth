@@ -18,7 +18,9 @@ import type { FailedTurn } from "./recovery";
  * The response is cached in memory for the session lifetime.
  */
 export interface AuthConfig {
-  provider: "local" | "oidc" | "entra";
+  /** Mirrors the AuthProviderType Literal in contracts/auth.py; the
+   *  Python-side contract test pins this union against it. */
+  provider: "local" | "oidc" | "entra" | "vanguard" | "google";
   /** Effective registration mode — the LoginPage only renders its
    *  "Create an account" affordance when this is "open" (local auth). */
   registration_mode: "open" | "email_verified" | "closed";

@@ -2,9 +2,9 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and Filigree tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.8.0 blob cleanup, guided decline, and aggregation recovery (session epoch 49 and Landscape epoch 36)
+## Current Cutover: 0.8.0 blob cleanup, guided decline, aggregation recovery, and the identity substrate (session epoch 50 and Landscape epoch 37)
 
-0.8.0 advances `SESSION_SCHEMA_EPOCH` from 35 to 49. Epoch 36 ensures a committed
+0.8.0 advances `SESSION_SCHEMA_EPOCH` from 35 to 50. Epoch 36 ensures a committed
 blob deletion whose tombstone unlink or directory fsync fails remains retryable
 after restart. Epoch 37 adds the completed `guided_plan` `declined`
 result kind and its state-only result locator. Epoch 38 additionally retains the
@@ -44,7 +44,14 @@ leaving a zombie card that gates Run.
 Epoch 49 adds the `composition_rejection_events` table: a composer
 mutation-tool rejection's reason — the exact payload the planner saw —
 persists durably as session data (elspeth-3e28029d2f).
-An epoch-35 through epoch-48 database cannot represent
+Epoch 50 carries the pluggable-SSO identity substrate (elspeth-07cd19ba73):
+the auth provider discriminator widens from three values to five on both
+`sessions` and `user_secrets`, and the identity, org-tree and
+workflow-governance tables land in the same epoch so the whole sprint costs
+exactly one cutover window rather than two. Landscape advances to epoch 37 in
+the same window for the matching widened CHECKs on `auth_events` and
+`run_attributions`.
+An epoch-35 through epoch-49 database cannot represent
 the complete current contract and must be recreated. Only `sessions.db` is
 recreated — `data/auth.db` and the content-addressed payload store are never
 deleted by this procedure; recreating the session DB severs stale payload
@@ -117,9 +124,9 @@ reset requirement and database-operator approval; previous release identity
 and epochs; forward and backward compatibility decisions; and an explicit
 `rollback_permitted` decision with evidence. Older code is not compatible with
 the freshly recreated current databases. Rollback across this boundary is
-unsupported: keep the service drained, repair the epoch-49 release forward,
+unsupported: keep the service drained, repair the epoch-50 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-49/Landscape-epoch-36 record when binding candidate and rollback
+session-epoch-50/Landscape-epoch-37 record when binding candidate and rollback
 decisions.
 
 Deployments crossing the 0.7.0 boundary from an older release must also account
@@ -591,8 +598,8 @@ sentinels before creating any session. If `LANDSCAPE_PATH` is not already set,
 resolve it with the Phase 5b procedure above before running these probes:
 
 ```bash
-sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 49 (== SESSION_SCHEMA_EPOCH)
-sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 36 (== SQLITE_SCHEMA_EPOCH)
+sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 50 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 37 (== SQLITE_SCHEMA_EPOCH)
 ```
 
 Any predecessor session or Landscape epoch is not repairable in place: keep the

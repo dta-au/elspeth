@@ -61,7 +61,12 @@ from elspeth.contracts.audit_export import (
     AuditExportSnapshotWinner,
     AuditExportTerminalWitness,
 )
-from elspeth.contracts.auth import AuthProviderType
+from elspeth.contracts.auth import (
+    AuthProviderType,
+    IdentityProviderType,
+    IdentityRole,
+    RelationshipType,
+)
 from elspeth.contracts.barrier_scalars import (
     AggregationNodeScalars,
     BarrierScalars,
@@ -456,6 +461,9 @@ __all__ = [  # Grouped by category for readability
     "ValidationErrorRecord",
     # auth
     "AuthProviderType",
+    "IdentityProviderType",
+    "IdentityRole",
+    "RelationshipType",
     # config - Runtime protocols (contracts, not core)
     "RuntimeCheckpointProtocol",
     "RuntimeConcurrencyProtocol",

@@ -343,7 +343,19 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        is unchanged (row_id kept, argument on that decision at the
 #        constraint's own definition). Pre-1.0 delete-and-recreate boundary;
 #        no migration.
-SQLITE_SCHEMA_EPOCH = 36
+#   37 → pluggable SSO (elspeth-07cd19ba73, spec
+#        docs/specs/2026-09-02-pluggable-sso-design.md): the auth provider
+#        discriminator widens from three values to five —
+#        ck_run_attributions_auth_provider_type and ck_auth_events_provider
+#        both admit 'vanguard' and 'google'. Landscape compares declared
+#        CHECK text against the reflected constraint structurally, so a
+#        widened constraint trips the schema validator against an existing
+#        database exactly as the 2026-08-14 index change did; it is a schema
+#        change even though every value the old constraint admitted is still
+#        admitted. Cut over in the SAME service-stop window as sessions
+#        epoch 50 (one window, two stores). Pre-1.0 delete-and-recreate
+#        boundary; no migration, rollback_permitted: false.
+SQLITE_SCHEMA_EPOCH = 37
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -462,7 +474,10 @@ run_attributions_table = Table(
     Column("recorded_at", DateTime(timezone=True), nullable=False),
     Column("initiated_by_user_id", String(255), nullable=False),
     Column("auth_provider_type", String(32), nullable=False),
-    CheckConstraint("auth_provider_type IN ('local', 'oidc', 'entra')", name="ck_run_attributions_auth_provider_type"),
+    CheckConstraint(
+        "auth_provider_type IN ('local', 'oidc', 'entra', 'vanguard', 'google')",
+        name="ck_run_attributions_auth_provider_type",
+    ),
 )
 Index("ix_run_attributions_user", run_attributions_table.c.initiated_by_user_id, run_attributions_table.c.auth_provider_type)
 
@@ -2466,7 +2481,7 @@ auth_events_table = Table(
         name="ck_auth_events_outcome",
     ),
     CheckConstraint(
-        "provider IN ('local', 'oidc', 'entra')",
+        "provider IN ('local', 'oidc', 'entra', 'vanguard', 'google')",
         name="ck_auth_events_provider",
     ),
 )

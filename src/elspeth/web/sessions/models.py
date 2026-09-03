@@ -252,11 +252,30 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        composition state current at rejection. Operator ruling 2026-09-02:
 #        session data, not Landscape data. New table ships by DB recreation
 #        (sessions.db only — auth.db is never touched).
-SESSION_SCHEMA_EPOCH = 49
+#   50 → pluggable SSO (elspeth-07cd19ba73, spec
+#        docs/specs/2026-09-02-pluggable-sso-design.md): the auth provider
+#        discriminator widens from three values to five on BOTH tables that
+#        carry it (``sessions`` and ``user_secrets``, via the single
+#        ``_AUTH_PROVIDER_TYPE_CHECK``), admitting 'vanguard' and 'google'.
+#        SQLite cannot ALTER a CHECK constraint in place, so this is a
+#        delete-and-recreate boundary even though the constraint only
+#        widens. The identity substrate (``identities``, ``identity_roles``,
+#        ``identity_relationships``, ``sso_handoffs``), the workflow
+#        governance tables, and the ownership re-key onto ``identity_id``
+#        all land inside this same epoch: ONE cutover window carries the
+#        whole sprint, so no second one is ever required. Cut over together
+#        with Landscape epoch 37. Pre-1.0 delete-and-recreate boundary; no
+#        migration, rollback_permitted: false (sessions.db only — auth.db is
+#        never touched).
+SESSION_SCHEMA_EPOCH = 50
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
-_AUTH_PROVIDER_TYPE_CHECK = "auth_provider_type IN ('local', 'oidc', 'entra')"
+# Hand-written on purpose, and pinned against ``AuthProviderType`` by
+# ``tests/unit/web/auth/test_provider_type_contract.py``.  Deriving the SQL
+# from the Literal would let a contract edit change what the database admits
+# with no epoch bump; pinning it means the drift is caught instead.
+_AUTH_PROVIDER_TYPE_CHECK = "auth_provider_type IN ('local', 'oidc', 'entra', 'vanguard', 'google')"
 
 
 def _sql_non_blank_text(column_name: str, *, dialect: Literal["sqlite", "postgresql"]) -> str:
