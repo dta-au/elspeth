@@ -3945,7 +3945,7 @@ _PREVIEW_PIPELINE_DECLARATION = ToolDeclaration(
     "`edge_contracts` (one entry per producer->consumer pair that was "
     "checked, and a pair is checked only where the consumer REQUIRES "
     "fields — through `required_fields`, through a fixed/flexible schema's "
-    "declared fields (checked only against a typed source producer), or, "
+    "declared fields, or, "
     "for a sink, through an option naming the field it writes from — so an "
     "edge requiring none has no entry and an empty "
     "list is not proof of a satisfied contract: `from`, `to` which is "

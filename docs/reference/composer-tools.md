@@ -157,8 +157,8 @@ preview stage's own facts:
 
 One entry per producer/consumer pair that was checked, and a pair is checked
 only where the consumer requires fields — through `required_fields`, through a
-fixed/flexible schema's declared fields (checked only against a typed source
-producer), or, for a sink, through an option naming the field it writes from.
+fixed/flexible schema's declared fields, or, for a sink, through an option
+naming the field it writes from.
 Each entry reports:
 - `from` / `to` (`to` is `output:<sink name>` for a sink)
 - `producer_guarantees`

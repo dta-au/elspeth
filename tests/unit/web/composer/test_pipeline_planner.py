@@ -176,13 +176,16 @@ _FIXED_SCAFFOLDING_BASELINE_BYTES = 106 * 1024
 # CARDINALITY correction (elspeth-e405ad7cd2 LLM-R5-1) then moved it to
 # 110,564 B, +236 B, recording that only in its commit message; the same
 # description's REQUIREMENT-SOURCE correction (elspeth-e405ad7cd2 LLM-R5C-3)
-# moves it to 110,753 B, +189 B. Each figure is read from this assertion in a
-# throwaway export with the ceiling lowered to 1, per commit, not inferred from
-# a diff. Two model-facing edits in that round cost nothing here and are worth
-# knowing about: the sink_contract_violation repair guidance is per-ERROR text
-# rather than scaffolding, and pipeline_composer.md is not the skill this
-# request carries (the harness renders pipeline_capabilities.md), so both
-# measured +0 B.
+# moves it to 110,753 B, +189 B; deleting one false parenthetical from that
+# same correction — it scoped the schema-declared-fields route to a typed
+# source producer, which holds for a node consumer and not for a sink
+# (elspeth-e405ad7cd2 LLM-F1) — brings it back to 110,706 B, -47 B. Each figure
+# is read from this assertion in a throwaway export with the ceiling lowered to
+# 1, per commit, not inferred from a diff. Two model-facing edits in that round
+# cost nothing here and are worth knowing about: the sink_contract_violation
+# repair guidance is per-ERROR text rather than scaffolding, and
+# pipeline_composer.md is not the skill this request carries (the harness
+# renders pipeline_capabilities.md), so both measured +0 B.
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
 
 
