@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import inspect
 import re
+import secrets
 from collections.abc import Callable
 from pathlib import Path
 from typing import get_args, get_type_hints
 
+from pydantic import SecretStr
 from sqlalchemy import CheckConstraint, Table
 
 from elspeth.contracts.auth import (
@@ -32,7 +34,7 @@ from elspeth.contracts.auth import (
 from elspeth.core.landscape.run_lifecycle_repository import _AUTH_PROVIDER_TYPES
 from elspeth.core.landscape.schema import auth_events_table, run_attributions_table
 from elspeth.web.auth.providers import PROFILE_REGISTRY, registered_provider_names
-from elspeth.web.config import WebSettings
+from elspeth.web.config import WebSettings, configured_auth_settings
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
 from elspeth.web.secrets.user_store import UserSecretStore
 from elspeth.web.sessions.models import (
@@ -52,6 +54,23 @@ from elspeth.web.sessions.service import SessionServiceImpl
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 LOGIN_PROVIDERS = get_args(AuthProviderType)
+
+
+def _local_settings(**overrides: object) -> WebSettings:
+    """A minimal VALID WebSettings -- the real model, not a stand-in.
+
+    Building the real thing matters here: these tests check that a name
+    resolves against ``WebSettings``, and a stub would answer for itself.
+    """
+    return WebSettings(
+        secret_key=secrets.token_hex(40),
+        shareable_link_signing_key=secrets.token_hex(40),
+        composer_max_composition_turns=10,
+        composer_max_discovery_turns=5,
+        composer_timeout_seconds=120.0,
+        composer_rate_limit_per_minute=10,
+        **overrides,
+    )
 
 
 def _annotation(member: Callable[..., object], parameter: str) -> object:
@@ -126,6 +145,71 @@ def test_profile_registry_matches_the_login_contract() -> None:
     assert frozenset(PROFILE_REGISTRY) | {"local"} == frozenset(get_args(AuthProviderType))
     assert "local" not in PROFILE_REGISTRY
     assert registered_provider_names() == tuple(sorted(get_args(AuthProviderType)))
+
+
+def test_every_setting_a_profile_names_actually_exists() -> None:
+    """A profile naming a setting that does not exist fails silently forever.
+
+    ``required_settings`` is resolved by name. If a profile names a typo,
+    ``auth_setting_values`` raises ``KeyError`` at validation time -- but only
+    for a deployment that selects that provider, which may be nobody until it
+    is somebody. Pinned here so the typo cannot leave the branch.
+    """
+    named: set[str] = set()
+    for profile in PROFILE_REGISTRY.values():
+        named |= set(profile.required_settings)
+        named |= profile.forbidden_settings
+
+    unknown_to_settings = sorted(named - set(WebSettings.model_fields))
+    assert not unknown_to_settings, f"profiles name settings WebSettings does not define: {unknown_to_settings}"
+
+    settings = _local_settings()
+    unresolvable = sorted(named - set(configured_auth_settings(settings)))
+    assert not unresolvable, f"auth_setting_values cannot resolve: {unresolvable}"
+
+
+def test_the_settings_reader_carries_nothing_it_is_not_asked_for() -> None:
+    """The reader and the registry must be the same set, both ways.
+
+    A name in the reader that no profile wants is dead weight that reads as
+    supported; a name a profile wants that the reader lacks is a KeyError in
+    production. Equality catches both.
+    """
+    named: set[str] = set()
+    for profile in PROFILE_REGISTRY.values():
+        named |= set(profile.required_settings)
+        named |= profile.forbidden_settings
+    assert set(configured_auth_settings(_local_settings())) == named
+
+
+def test_a_blank_setting_does_not_count_as_configured() -> None:
+    """`ELSPETH_WEB__SSO_ISSUER=` is how a task definition ships a hole.
+
+    A blank satisfies every ``is not None`` check on the way to a deployment
+    that cannot complete a login. The field validators reject blanks at parse
+    time; this pins the readiness-side verdict too, because readiness stays
+    total against state it did not parse.
+    """
+    settings = _local_settings()
+    assert configured_auth_settings(settings)["sso_issuer"] is False
+
+    blank = _local_settings(sso_endpoint_origins=())
+    assert configured_auth_settings(blank)["sso_endpoint_origins"] is False
+
+    configured = _local_settings(
+        sso_client_secret=SecretStr("s3cret"),
+        sso_endpoint_origins=("https://origin.example",),
+        quota_default_tokens_per_day=100_000,
+    )
+    values = configured_auth_settings(configured)
+    assert values["sso_client_secret"] is True
+    assert values["sso_endpoint_origins"] is True
+    assert values["quota_default_tokens_per_day"] is True
+
+
+def test_a_whitespace_only_secret_is_not_a_secret() -> None:
+    """A SecretStr hides its value, including from a truthiness check."""
+    assert configured_auth_settings(_local_settings(sso_client_secret=SecretStr("   ")))["sso_client_secret"] is False
 
 
 def test_sessions_and_user_secrets_share_one_widened_check() -> None:

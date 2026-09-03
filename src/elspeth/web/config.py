@@ -28,6 +28,7 @@ from elspeth.plugins.transforms.aws.guardrail_profiles import (
 )
 from elspeth.plugins.transforms.aws.textract_regions import is_well_formed_aws_region
 from elspeth.telemetry.resource_identity import is_aws_ecs_name, is_aws_resource_label, is_aws_task_revision, is_release_identity
+from elspeth.web.auth.providers import get_profile
 from elspeth.web.auth.urls import (
     validate_oidc_browser_endpoints,
     validate_oidc_browser_origins,
@@ -95,6 +96,15 @@ DeploymentStateMode = Literal["auto", "sqlite-single", "external-postgresql"]
 
 def _allow_insecure_test_keys(host: str) -> bool:
     return host in _LOCAL_HOSTS and ("pytest" in sys.modules or os.environ.get("ELSPETH_ENV") == "test")
+
+
+# Providers whose REQUIRED settings are enforced from the profile registry
+# today. ``oidc`` and ``entra`` still carry hand-written arms for their legacy
+# ``oidc_*`` fields, which the old browser path reads and which are deleted
+# with it; enforcing both vocabularies at once would demand two sets of
+# credentials for one deployment. They join the registry when those fields
+# die, at which point this constant goes with them and no provider has an arm.
+_REGISTRY_VALIDATED_PROVIDERS: frozenset[str] = frozenset({"vanguard", "google"})
 
 
 def is_default_secret_key_placeholder(secret_key: str) -> bool:
@@ -493,6 +503,63 @@ class WebSettings(BaseModel):
     oidc_audience_claim: Literal["aud", "client_id"] = "aud"
     entra_tenant_id: str | None = None
 
+    # --- Pluggable SSO (elspeth-07cd19ba73, spec §Settings) ---------------
+    #
+    # The backend redeems the authorization code as a CONFIDENTIAL client;
+    # the browser never holds a client secret and never performs the token
+    # exchange. ``auth_provider`` selects one registered profile and every
+    # field here is that profile's configuration for THIS container: the
+    # build carries no credentials, the profile carries no deployment facts,
+    # and switching IdP is a config change plus a restart, never a build.
+    #
+    # Which of these are required, optional, or forbidden is decided by the
+    # profile registry, not by branches here — see
+    # ``web/auth/providers``. Adding an IdP must not mean editing a
+    # validator.
+    sso_client_id: str | None = None
+    sso_client_secret: SecretStr | None = None
+    sso_issuer: str | None = None
+    # Exact HTTPS origins the discovered endpoints may use BEYOND the issuer
+    # origin. Generic OIDC only: a Cognito hosted domain differs from the
+    # pool issuer, so same-origin alone would refuse a correct deployment.
+    sso_endpoint_origins: tuple[str, ...] = ()
+    # Break-glass overrides for discovery, all-or-none. The origin policy
+    # still applies to whatever is set here — these skip DISCOVERY, not
+    # validation.
+    sso_authorization_endpoint: str | None = None
+    sso_token_endpoint: str | None = None
+    sso_userinfo_endpoint: str | None = None
+    sso_jwks_uri: str | None = None
+    # Seals the login transaction cookie carrying PKCE verifier, state and
+    # nonce. Independent of ``secret_key`` so rotating one does not
+    # invalidate the other.
+    sso_transaction_secret: SecretStr | None = None
+    # Google only, and required there: without a hosted domain any Google
+    # account in the world is a valid login, so the profile refuses to start
+    # rather than defaulting to open.
+    google_hosted_domain: str | None = None
+    # Bootstrap only. Seeds the first ``admin`` role row at first login, and
+    # ONLY while the container has zero active human admins — after that the
+    # list is inert, so it never becomes a standing grant.
+    sso_admin_subjects: tuple[str, ...] = ()
+    # Every activation writes a quota_policies row from these, so an
+    # activated identity can never hold unbounded spend on the container's
+    # shared LLM credential. Required for an IdP deployment; None is only
+    # coherent for local auth.
+    quota_default_tokens_per_day: int | None = Field(default=None, gt=0)
+    quota_default_storage_bytes: int | None = Field(default=None, gt=0)
+    # Optional container ceiling rows, distinct from the per-identity level.
+    quota_container_tokens_per_day: int | None = Field(default=None, gt=0)
+    quota_container_storage_bytes: int | None = Field(default=None, gt=0)
+    # The marking stamped into exports, library rows and audit metadata, so
+    # the same artifact appearing in two containers is detectable later.
+    compartment_id: str | None = None
+    # R9 dormancy window, and how long a never-activated pending row is kept
+    # before a lazy purge drops it. Both have defaults because both are
+    # policy, not deployment facts.
+    identity_dormancy_days: int = Field(default=90, gt=0)
+    identity_pending_retention_days: int = Field(default=90, gt=0)
+
     # JWKS cache tuning (OIDC / Entra). Defaults match the provider
     # defaults; operators may lower or raise them. Raising the failure
     # retry makes stale-serve windows longer (safer during brief IdP
@@ -590,6 +657,18 @@ class WebSettings(BaseModel):
         "oidc_authorization_endpoint",
         "oidc_token_endpoint",
         "entra_tenant_id",
+        # Pluggable SSO. A blank here is worse than an omission: it satisfies
+        # every ``is not None`` check on the way to a deployment that cannot
+        # complete a login, which is precisely the shape an empty environment
+        # variable in a task definition produces.
+        "sso_client_id",
+        "sso_issuer",
+        "sso_authorization_endpoint",
+        "sso_token_endpoint",
+        "sso_userinfo_endpoint",
+        "sso_jwks_uri",
+        "google_hosted_domain",
+        "compartment_id",
     )
     @classmethod
     def _reject_blank_auth_fields(cls, v: str | None) -> str | None:
@@ -1015,6 +1094,29 @@ class WebSettings(BaseModel):
                 )
                 object.__setattr__(self, "oidc_authorization_endpoint", authorization_endpoint)
                 object.__setattr__(self, "oidc_token_endpoint", token_endpoint)
+
+        # Registry-driven SSO validation. The arms above govern the OLD
+        # browser path and its ``oidc_*`` fields, which are deleted with that
+        # path; they are deliberately left alone here so those settings and
+        # their tests churn once, at deletion, rather than twice.
+        #
+        # What is registry-driven from birth: the forbidden-setting rule for
+        # EVERY provider, and the required-setting rule for the providers
+        # that never had a hand-written arm.
+        if self.auth_provider != "local":
+            profile = get_profile(self.auth_provider)
+            configured_settings = configured_auth_settings(self)
+            configured_but_meaningless = sorted(name for name in profile.forbidden_settings if configured_settings[name])
+            if configured_but_meaningless:
+                raise ValueError(
+                    f"auth_provider={self.auth_provider!r} does not use: "
+                    f"{', '.join(configured_but_meaningless)} "
+                    f"(configuring a setting for a different IdP is silently ignored otherwise)"
+                )
+            if self.auth_provider in _REGISTRY_VALIDATED_PROVIDERS:
+                missing = [name for name in profile.required_settings if not configured_settings[name]]
+                if missing:
+                    raise ValueError(f"auth_provider={self.auth_provider!r} requires: {', '.join(missing)}")
         return self
 
     @model_validator(mode="after")
@@ -1215,6 +1317,10 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
         "cors_origins",
         "server_secret_allowlist",
         "oidc_authorization_allowed_origins",
+        # Both arrive from the ECS task definition as JSON, so they decode the
+        # same way every other collection setting does.
+        "sso_endpoint_origins",
+        "sso_admin_subjects",
         "plugin_allowlist",
         "bedrock_guardrail_profiles",
         "aws_s3_source_profiles",
@@ -1225,6 +1331,54 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
 _JSON_OBJECT_FIELDS: frozenset[str] = frozenset(
     {"plugin_preferences", "plugin_control_modes", "llm_profiles", "bedrock_guardrail_default_profiles"}
 )
+
+
+def _text_configured(value: str | None) -> bool:
+    """True when an operator actually supplied text.
+
+    A blank string is not a value: ``ELSPETH_WEB__SSO_ISSUER=`` in a task
+    definition satisfies every ``is not None`` check on the way to a
+    deployment that cannot complete a login. The field validators reject
+    blanks at parse time; this stays honest for state readiness did not
+    parse, because readiness must be total.
+    """
+    return value is not None and bool(value.strip())
+
+
+def _secret_configured(value: SecretStr | None) -> bool:
+    return value is not None and bool(value.get_secret_value().strip())
+
+
+def configured_auth_settings(settings: WebSettings) -> Mapping[str, bool]:
+    """Which settings the profile registry may name are actually configured.
+
+    Returns a verdict per setting rather than the values themselves, so no
+    caller has to ask "what type is this, and what counts as empty for it?"
+    -- each answer is computed here, where the field's type is known
+    statically. That is also why this is written out rather than reflected:
+    ``getattr(settings, name)`` on a type ELSPETH owns is the defect the
+    masquerade gate exists for, and a comprehension over field names would
+    let a typo in a profile's ``specific_required`` resolve to "missing"
+    forever -- readiness would report a correctly configured deployment as
+    not ready, naming a field nobody can find.
+
+    A ``KeyError`` from a caller is the honest failure: it means a profile
+    names a setting that does not exist. ``test_provider_type_contract``
+    pins the two sets equal so that cannot reach a deployment.
+    """
+    return {
+        "sso_client_id": _text_configured(settings.sso_client_id),
+        "sso_client_secret": _secret_configured(settings.sso_client_secret),
+        "sso_transaction_secret": _secret_configured(settings.sso_transaction_secret),
+        "sso_issuer": _text_configured(settings.sso_issuer),
+        "sso_endpoint_origins": bool(settings.sso_endpoint_origins),
+        "entra_tenant_id": _text_configured(settings.entra_tenant_id),
+        "google_hosted_domain": _text_configured(settings.google_hosted_domain),
+        "public_base_url": _text_configured(settings.public_base_url),
+        "compartment_id": _text_configured(settings.compartment_id),
+        "quota_default_tokens_per_day": settings.quota_default_tokens_per_day is not None,
+        "quota_default_storage_bytes": settings.quota_default_storage_bytes is not None,
+    }
 
 
 def _annotation_scalar_types(annotation: Any) -> set[type]:
