@@ -1,5 +1,22 @@
 # Tool-Result Envelope Explore-and-Pin Implementation Plan
 
+> **STATUS 2026-09-04 — THIS PLAN IS COMPLETE AND CLOSED. Do not execute it.**
+> The lane delivered on branch `strany/tool-result-envelope`: three review
+> seats signed `0848f6f7c`, `release/0.8.0` is merged in, and the full suite is
+> 45,331 passed / 0 failed. Only the live trial is outstanding, and it belongs
+> to the operator after merge.
+>
+> **The boxes below are deliberately left unchecked.** They are the plan as
+> written on 2026-09-02, kept as the historical argument for what was built —
+> not a live worklist. Execution diverged from it in places (the review ran six
+> rounds rather than the planned one; the census grew from 344 to 401 rows when
+> a walker gap closed), so ticking them one by one would assert a
+> step-for-step fidelity that did not happen.
+>
+> **The record of what was actually done is ticket elspeth-e405ad7cd2**, whose
+> comments carry the census numbers, the seat sign-offs, the mutation ledger
+> and the landing-gate evidence. Read the ticket, not the checkboxes.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Close the freeform composer tool-result seam so every key `ToolResult.to_dict()` ships to the planner is derived from one registry, admitted by the redaction manifest from that same registry, and either taught to the model in the skill or tool descriptions or fenced with a ratified reason, with a whole-tree gate that turns red on any future drift.
