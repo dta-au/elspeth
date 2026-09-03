@@ -31,7 +31,11 @@ from elspeth.web.interpretation_state import parse_interpretation_requirements
 from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS, allowed_source_directories, managed_blob_directory, resolve_data_path
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
-from elspeth.web.sessions.protocol import GuidedCompositionStateResult, GuidedOperationSettlementConflictError
+from elspeth.web.sessions.protocol import (
+    GuidedCompositionStateResult,
+    GuidedOperationResult,
+    GuidedOperationSettlementConflictError,
+)
 from elspeth.web.sessions.routes.guided_operations import (
     GuidedOperationLease,
     guided_response_hash,
@@ -636,6 +640,43 @@ async def revert_state(
             raise AuditIntegrityError("State revert session unexpectedly has no current checkpoint")
 
     async def _replay(result: object) -> CompositionStateResponse:
+        """Project the stored response for an already-terminal revert.
+
+        MUST stay side-effect-free. This runs BEFORE the response-hash
+        integrity check in reserve_or_replay_guided_operation, so anything
+        written here would mutate audit-primary interpretation_events under a
+        projection not yet proven to match the stored response -- inserting
+        new review rows and superseding existing pending ones, then failing
+        verification afterwards. The surfacing debt a replayed revert may
+        still owe is repaired in _repair_reverted_surfacing_debt, which runs
+        only after that check.
+        """
+        if type(result) is not GuidedCompositionStateResult:
+            raise AuditIntegrityError("State revert replay has a non-state result locator")
+        replay_state = await service.get_state_in_session(result.state_id, session.id)
+        with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
+            return _state_response(replay_state, policy_catalog=catalog)
+
+    async def _repair_reverted_surfacing_debt(result: GuidedOperationResult) -> None:
+        """Repair the post-commit surfacing this revert's settlement owed.
+
+        revert_state_for_guided_operation terminalizes the operation in the
+        same transaction that writes the reverted state, but the surfacing
+        pass runs after it. An attempt that dies in between leaves the
+        operation terminal, so every retry lands here -- and without this the
+        reverted state keeps pending interpretation_requirements with no event
+        row, so no review card renders and /execute fails closed with nothing
+        the user can resolve.
+
+        The debt is computed per site against durable evidence in ANY
+        resolution status (``only_missing_evidence=True``), so this repairs
+        only genuinely missing sites and writes nothing once the settling
+        attempt -- or a prior replay -- covered them.
+
+        Identity comes from the operation's own result locator, re-resolved
+        here rather than closed over from _replay: after_verified receives the
+        same locator replay does, not the record replay fetched.
+        """
         if type(result) is not GuidedCompositionStateResult:
             raise AuditIntegrityError("State revert replay has a non-state result locator")
         replay_state = await service.get_state_in_session(result.state_id, session.id)
@@ -644,8 +685,6 @@ async def revert_state(
             session_id=session.id,
             state_record=replay_state,
         )
-        with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
-            return _state_response(replay_state, policy_catalog=catalog)
 
     reserved = await reserve_or_replay_guided_operation(
         service=service,
@@ -653,6 +692,7 @@ async def revert_state(
         kind="state_revert",
         request=body,
         replay=_replay,
+        after_verified=_repair_reverted_surfacing_debt,
     )
     if reserved is None:  # pragma: no cover - reserve_if_absent defaults true
         raise AuditIntegrityError("State revert operation was not reserved")

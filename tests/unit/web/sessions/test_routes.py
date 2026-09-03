@@ -28,7 +28,7 @@ from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolStatus,
 )
-from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.enums import CreationModality, TerminalOutcome, TerminalPath
@@ -7320,6 +7320,197 @@ transforms:
             InterpretationKind.LLM_PROMPT_TEMPLATE,
             InterpretationKind.LLM_MODEL_CHOICE,
         }
+
+    @pytest.mark.asyncio
+    async def test_revert_replay_writes_nothing_when_the_stored_response_hash_mismatches(self, tmp_path: Path) -> None:
+        """Response-hash verification must precede every state_revert replay write.
+
+        The revert replay arm repairs surfacing debt, so if that repair ran
+        before the projected response was proven identical to the stored one,
+        a corrupt projection could insert new ``interpretation_events`` rows
+        and flip existing PENDING rows to SUPERSEDED -- and only afterwards
+        fail integrity verification. Both are audit-primary mutations. The
+        mismatch must abort with ZERO interpretation and state writes.
+
+        The fixture drives BOTH halves rather than merely detecting them: the
+        reverted state owes two fresh cards, and a later import leaves two
+        PENDING cards on a different state whose reviewed content the reverted
+        state no longer matches, which the repair's writer supersedes. The
+        positive control at the end proves both writes really do fire on a
+        clean replay, so the zero-write assertions above it are not vacuous.
+
+        Sibling of
+        ``guided/test_respond.py::TestStep2IntraStep::test_confirm_wiring_replay_writes_nothing_when_the_stored_response_hash_mismatches``,
+        which pins the same ordering on the guided RESPOND route.
+        """
+        from elspeth.web.sessions.routes.composer import state as state_module
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Revert replay hash mismatch", "local")
+        yaml_text = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score {{ row.value }}'
+"""
+        superseding_yaml = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-sonnet-4.5
+    prompt_template: 'Rank {{ row.value }} carefully'
+"""
+        imported = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+        assert imported.status_code == 200, imported.text
+        # Resolve the imported state's own cards so the debt this test relies
+        # on belongs to the REVERTED state, not inherited from the import.
+        for event in await service.list_interpretation_events(session.id, status="pending"):
+            resolved = client.post(
+                f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
+                json={"choice": "accepted_as_drafted"},
+            )
+            assert resolved.status_code == 200, resolved.text
+        # Import a DIFFERENT pipeline for the same node, and leave ITS cards
+        # pending. The repair pass reads evidence per state but supersedes
+        # PENDING rows for the site session-wide, so these are what the
+        # supersession half of the hazard would flip. Without them that half
+        # is detectable by the equality below but never actually driven.
+        superseding = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": superseding_yaml})
+        assert superseding.status_code == 200, superseding.text
+        stale_pending = await service.list_interpretation_events(session.id, status="pending")
+        assert {event.kind for event in stale_pending} == {
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            InterpretationKind.LLM_MODEL_CHOICE,
+        }
+        assert {str(event.composition_state_id) for event in stale_pending} == {superseding.json()["id"]}
+        operation_id = str(uuid.uuid4())
+        revert_body = {"operation_id": operation_id, "state_id": imported.json()["id"]}
+
+        def _crash_between_settlement_and_surfacing(*_args: Any, **_kwargs: Any) -> None:
+            raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
+
+        with (
+            patch.object(
+                state_module,
+                "_surface_reverted_interpretation_reviews",
+                side_effect=_crash_between_settlement_and_surfacing,
+            ),
+            pytest.raises(_SurfacingWorkerCrash),
+        ):
+            client.post(f"/api/sessions/{session.id}/state/revert", json=revert_body)
+
+        # NON-VACUITY PRECONDITION, one clause per way the repair can silently
+        # write nothing. (1) ``_surface_reverted_interpretation_reviews``
+        # returns early on a state whose ``metadata_`` is None. (2)
+        # ``only_missing_evidence=True`` makes the surfacer skip every site
+        # already carrying evidence in ANY resolution status, so the debt must
+        # be checked unfiltered -- a resolved or superseded row on the reverted
+        # state would make the replay a no-op. (3) the stale cards the
+        # supersession half needs must still be PENDING once the settlement has
+        # run. All three are preconditions of the ZERO-write assertions below;
+        # the positive control at the end of the test closes the loop by
+        # proving the writes really do happen when the projection is intact.
+        reverted_state = await service.get_current_state(session.id)
+        assert reverted_state is not None
+        assert reverted_state.id != uuid.UUID(imported.json()["id"])
+        assert reverted_state.metadata_ is not None, (
+            "fixture is vacuous: the surfacer returns early on a state with no metadata_, so replay would write nothing"
+        )
+        assert (await service.list_interpretation_events(session.id, composition_state_id=reverted_state.id)) == [], (
+            "fixture is vacuous: the reverted state already carries evidence, so replay would write nothing"
+        )
+        stale_ids = {event.id for event in stale_pending}
+        assert {
+            event.id for event in await service.list_interpretation_events(session.id, status="pending") if event.id in stale_ids
+        } == stale_ids, "fixture cannot drive the supersession half: the settlement already retired the stale cards"
+
+        # Corrupt the PROJECTION, not the stored row: terminal
+        # guided_operations rows are immutable by database trigger, and a
+        # corrupt projection is the failure this ordering actually guards.
+        # ``validation_errors`` is inside the hash domain and survives the
+        # strict re-validation ``guided_response_hash`` performs.
+        original_state_response = state_module._state_response
+
+        def _corrupt_projection(record: Any, **kwargs: Any) -> Any:
+            projected = original_state_response(record, **kwargs)
+            return projected.model_copy(update={"validation_errors": ["tampered"]})
+
+        events_before = sorted(await service.list_interpretation_events(session.id), key=lambda e: str(e.id))
+        versions_before = [record.id for record in await service.get_state_versions(session.id)]
+
+        # The patch goes on ONLY around the replay POST: ``_state_response``
+        # also feeds the settlement path's response_hash_factory, so patching
+        # it earlier would corrupt the stored hash too and no mismatch would
+        # occur.
+        #
+        # ``match=`` pins the ONE raise this test exists for: the hash
+        # comparison in ``routes/guided_operations.py::_replay_completed``.
+        # Four other AuditIntegrityError sites in ``state.py`` alone are
+        # reachable from this POST, and each would satisfy a bare
+        # ``pytest.raises`` while leaving both zero-write assertions trivially
+        # true -- so a bare one cannot tell this test passing from this test
+        # never running the ordering at all. They divide in two:
+        #   - BEFORE the comparison, which therefore never runs: "session
+        #     unexpectedly has no current checkpoint", ``_replay``'s
+        #     "non-state result locator" guard, and "operation was not
+        #     reserved". Further reserve/lookup guards in
+        #     ``routes/guided_operations.py`` sit here too.
+        #   - AFTER a comparison that MATCHED: the locator guard in
+        #     ``_repair_reverted_surfacing_debt``, which runs as
+        #     ``after_verified`` and raises before the surfacing write. It
+        #     writes nothing either, but it proves the opposite of what this
+        #     test asserts -- that verification succeeded.
+        # ``_replay``'s guard and the repair's guard share a message, so only
+        # a match on the comparison's own message discriminates.
+        with (
+            patch.object(state_module, "_state_response", _corrupt_projection),
+            pytest.raises(AuditIntegrityError, match="response hash does not match its stored response hash"),
+        ):
+            client.post(f"/api/sessions/{session.id}/state/revert", json=revert_body)
+
+        replay_events = await service.list_interpretation_events(session.id, composition_state_id=reverted_state.id)
+        assert [event.kind for event in replay_events] == [], (
+            "the rejected replay wrote interpretation_events before the response hash was verified"
+        )
+        # One equality over every column of every row in the session covers
+        # both halves of the hazard: no INSERT, and no PENDING row flipped to
+        # SUPERSEDED by the supersession pass inside the same window. The
+        # fixture drives both -- see the positive control below.
+        assert sorted(await service.list_interpretation_events(session.id), key=lambda e: str(e.id)) == events_before
+        assert [record.id for record in await service.get_state_versions(session.id)] == versions_before
+        current_after = await service.get_current_state(session.id)
+        assert current_after is not None and current_after.id == reverted_state.id
+
+        # POSITIVE CONTROL. Everything above is a ZERO-write assertion, which a
+        # fixture that could never write also satisfies. Re-POST the same
+        # operation with the projection intact and prove that BOTH writes the
+        # rejected replay was in a position to make do in fact happen: two
+        # fresh cards minted on the reverted state, and the two stale PENDING
+        # cards flipped to SUPERSEDED.
+        repaired = client.post(f"/api/sessions/{session.id}/state/revert", json=revert_body)
+        assert repaired.status_code == 200, repaired.text
+        repaired_events = await service.list_interpretation_events(session.id, composition_state_id=reverted_state.id)
+        assert {event.kind for event in repaired_events} == {
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            InterpretationKind.LLM_MODEL_CHOICE,
+        }, "the verified replay did not mint the cards the rejected one was refused, so the INSERT half was never driven"
+        assert [event.choice for event in await service.list_interpretation_events(session.id, status="all") if event.id in stale_ids] == [
+            InterpretationChoice.SUPERSEDED,
+            InterpretationChoice.SUPERSEDED,
+        ], "the verified replay superseded nothing, so the supersession half was never driven"
 
     @pytest.mark.asyncio
     async def test_revert_injects_system_message(self, tmp_path) -> None:
