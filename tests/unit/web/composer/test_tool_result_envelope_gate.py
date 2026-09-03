@@ -207,9 +207,11 @@ _PASSTHROUGH_HELPERS = frozenset({"redact_source_storage_path"})
 # the payload name, and a call ARGUMENT is the one position where the object leaves the statements
 # this file reads: from there the callee decides what happens to it, and a callee that stores into
 # what it is given re-shapes the payload where no walker looks (red-team RED5B-1). The key shape is
-# the bare callee name, the same one ``_DATA_HELPER_PAYLOADS`` uses, so
-# ``test_every_attributed_helper_name_answers_to_one_module`` covers these names too. The guarantee
-# is DERIVED, not trusted: ``test_every_payload_consumer_leaves_the_payload_it_is_handed_unreshaped``
+# the bare callee name, the same one ``_DATA_HELPER_PAYLOADS`` uses, so this dict JOINS that key
+# set's uniqueness check (``test_every_attributed_helper_name_answers_to_one_module``) rather than
+# repeating its exposure; and ``_consumer_refusal`` matches a bare-Name callee only, so
+# ``holder.replace(payload)`` is not one of these however it is spelled. The guarantee itself is
+# DERIVED, not trusted: ``test_every_payload_consumer_leaves_the_payload_it_is_handed_unreshaped``
 # re-reads each definition under ``web/composer`` and refuses one that re-shapes a parameter.
 _PAYLOAD_CONSUMERS = frozenset(
     {"ToolResult", "_discovery_result", "_mutation_result", "redact_source_storage_path", "canonical_json", "replace"}
@@ -778,11 +780,22 @@ def _child_parents(fn: ast.AST) -> dict[ast.AST, ast.AST]:
 
 
 def _consumer_refusal(call: ast.AST | None, label: str) -> str | None:
-    """``None`` when the call is a named payload consumer, otherwise how the payload escapes into it."""
-    name = _call_name(call) if isinstance(call, ast.Call) else None
-    if name in _PAYLOAD_CONSUMERS:
+    """``None`` when the call is a named payload consumer, otherwise how the payload escapes into it.
+
+    The callee must be a BARE NAME. ``_call_name`` reports ``holder.replace(x)``
+    as ``replace``, so matching it alone would let ANY object's method that
+    happens to share a consumer's name take the payload — and the uniqueness
+    check that makes bare-name keying safe
+    (``test_every_attributed_helper_name_answers_to_one_module``) reads
+    definitions under ``web/composer``, so it cannot see an arbitrary receiver's
+    attribute at all. Measured: all six live sites are bare names.
+    """
+    if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)):
+        rendered = ast.unparse(call.func) if isinstance(call, ast.Call) else "?"
+        return f"handed to {rendered}({label}...), whose callee is not a bare name this file can hold to a promise"
+    if call.func.id in _PAYLOAD_CONSUMERS:
         return None
-    return f"handed to {name}({label}...), which is not a named payload consumer"
+    return f"handed to {call.func.id}({label}...), which is not a named payload consumer"
 
 
 def _unaccounted_load(node: ast.expr, parents: dict[ast.AST, ast.AST]) -> str | None:
@@ -799,11 +812,20 @@ def _unaccounted_load(node: ast.expr, parents: dict[ast.AST, ast.AST]) -> str | 
         parent = parents.get(child)
         if parent is None:
             return "read at a position with no enclosing expression"
-        if isinstance(parent, (ast.Subscript, ast.Attribute)) and parent.value is child:
-            # ``payload["k"]`` (store, read or ``del``) and ``payload.update(...)`` /
-            # ``payload.pop(...)``: the walker reads the stores and merges, ``_dict_mutations``
-            # reports every mutator, and the assertion above holds the two equal.
+        if isinstance(parent, ast.Subscript) and parent.value is child:
+            # ``payload["k"]`` — a store, a read or a ``del``. The walker reads the stores and
+            # merges, ``_dict_mutations`` reports the rest, and the assertion above holds the two
+            # equal.
             return None
+        if isinstance(parent, ast.Attribute) and parent.value is child:
+            # ``payload.update(...)`` / ``payload.pop(...)`` — but only where the attribute IS the
+            # call's callee. ``_dict_mutations`` matches a mutator on ``node.func.attr``, so
+            # ``stamp = payload.update`` then ``stamp({...})`` is a mutator call it never sees:
+            # the method is bound here and invoked through a name that is not an alias of anything.
+            grandparent = parents.get(parent)
+            if isinstance(grandparent, ast.Call) and grandparent.func is parent:
+                return None
+            return f"bound as {ast.unparse(parent)} rather than called there, so no mutator walker sees the call"
         if isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is child:
             return None  # a second handle, which ``_aliases_of`` follows and this walk then covers
         if isinstance(parent, (ast.Compare, ast.UnaryOp)):
@@ -1056,11 +1078,13 @@ def f():
     return result
 """
 
-# The four routes by which the payload leaves the statements the walker reads, and one function
-# whose every use of it is accounted. The first three are red-team RED5B-1's measured survivors
-# (each SHIPPED its key with the census at 401 rows and mypy clean); the fourth is the conditional
-# alias ``_same_object_names`` exists for. ``stays_accounted`` is the other direction, without which
-# a mutant that refused everything would pass.
+# The six routes by which the payload leaves the statements the walker reads, and one function whose
+# every use of it is accounted. The first three are red-team RED5B-1's measured survivors (each
+# SHIPPED its key with the census at 401 rows and mypy clean); the fourth is the conditional alias
+# ``_same_object_names`` exists for; the last two are the ways a bare CALLEE NAME is not enough —
+# an impostor receiver whose method shares a consumer's name, and a mutator bound before it is
+# called. ``stays_accounted`` is the other direction, without which a mutant that refused everything
+# would pass.
 _PROBE_ESCAPING_PAYLOADS = """
 def escapes_into_a_call():
     payload = {"status": "x"}
@@ -1085,6 +1109,19 @@ def escapes_through_a_conditional_alias(flag):
     payload = {"status": "x"}
     alias = payload if flag else {}
     alias["zzz"] = "y"
+    return ToolResult(success=True, data=payload)
+
+
+def escapes_through_an_impostor_consumer(holder):
+    payload = {"status": "x"}
+    holder.replace(payload)
+    return ToolResult(success=True, data=payload)
+
+
+def escapes_through_a_bound_method():
+    payload = {"status": "x"}
+    stamp = payload.update
+    stamp({"zzz": "y"})
     return ToolResult(success=True, data=payload)
 
 
@@ -1483,8 +1520,12 @@ def test_the_walk_accounts_for_every_use_of_the_payload_and_refuses_an_escape() 
     tree = ast.parse(_PROBE_ESCAPING_PAYLOADS)
     escapes = {
         "escapes_into_a_call": "handed to _stamp(...), which is not a named payload consumer",
-        "escapes_through_an_unbound_mutator": "handed to update(...), which is not a named payload consumer",
+        "escapes_through_an_unbound_mutator": "handed to dict.update(...), whose callee is not a bare name this file can hold to a promise",
         "escapes_into_a_container": "bound into a dict display, which keeps a handle on it",
+        "escapes_through_an_impostor_consumer": (
+            "handed to holder.replace(...), whose callee is not a bare name this file can hold to a promise"
+        ),
+        "escapes_through_a_bound_method": "bound as payload.update rather than called there, so no mutator walker sees the call",
     }
     for fn_name, escape in escapes.items():
         fn = _function(tree, fn_name)
@@ -2403,13 +2444,22 @@ def test_every_attributed_helper_name_answers_to_one_module() -> None:
     ``x.helper()``, which is how ``get_schema`` is attributed at all, so a
     method of the same name is the same collision.
 
-    Measured when this landed: 11 attributions plus 1 passthrough, each defined
-    in exactly one module under ``web/composer`` except ``get_schema``, which is
-    the catalog's method and is defined in none. Hence "at most one" — whether
-    an attribution is still LIVE is a different question, asked by
-    ``_expr_keys`` refusing an unattributed helper.
+    ``_PAYLOAD_CONSUMERS`` is the FOURTH map on this key, and it joined here
+    rather than growing its own check (red-team RED5B-1): a second
+    ``_discovery_result`` under ``web/composer`` would let the escape rule
+    approve a call to the wrong one. It is only half the exposure, though — the
+    other half is that ``_call_name`` reports ``holder.replace(x)`` as
+    ``replace``, which no walk over definitions can see, so ``_consumer_refusal``
+    requires a bare-Name callee outright.
+
+    Measured at HEAD: 22 distinct names — 16 attributions, 1 passthrough (also a
+    consumer), 6 consumers — each defined in at most one module under
+    ``web/composer``. ``get_schema`` is the catalog's method and ``ToolResult``
+    is a class, so neither is a function definition this walk finds at all;
+    hence "at most one". Whether an attribution is still LIVE is a different
+    question, asked by ``_expr_keys`` refusing an unattributed helper.
     """
-    attributed = set(_DATA_HELPER_PAYLOADS) | set(_PASSTHROUGH_HELPERS)
+    attributed = set(_DATA_HELPER_PAYLOADS) | set(_PASSTHROUGH_HELPERS) | set(_PAYLOAD_CONSUMERS)
     definitions = [
         (node.name, path.relative_to(COMPOSER).as_posix())
         for path in sorted(COMPOSER.rglob("*.py"))
@@ -2419,8 +2469,9 @@ def test_every_attributed_helper_name_answers_to_one_module() -> None:
     ambiguous = _names_two_modules_answer_to(definitions)
     assert not ambiguous, (
         f"two modules under web/composer define an attributed helper name: {ambiguous} — "
-        "_DATA_HELPER_PAYLOADS and _PASSTHROUGH_HELPERS key on the bare callee name, so one "
-        "of them would have its payload read as the other's"
+        "_DATA_HELPER_PAYLOADS, _PASSTHROUGH_HELPERS and _PAYLOAD_CONSUMERS key on the bare "
+        "callee name, so one of them would have its payload read as the other's, or one "
+        "definition's no-re-shape promise would clear a call to the other"
     )
 
 
