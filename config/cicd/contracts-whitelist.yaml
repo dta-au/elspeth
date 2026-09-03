@@ -985,9 +985,11 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tools/blobs.py:_execute_wire_blob_inline_ref:arguments"
   - "src/elspeth/web/composer/tools/generation.py:_execute_diff_pipeline:args"
   - "src/elspeth/web/composer/tools/sessions.py:_execute_get_pipeline_state:args"
-  # Serialization helpers — produce JSON dicts for LLM tool responses
+  # Serialization helpers — produce JSON dicts for LLM tool responses.
+  # ``_serialize_node`` left this list at elspeth-e405ad7cd2 (RED5-2): its return is now the
+  # ``_SetPipelineNodePayload`` TypedDict the envelope census reads, so there is no bare dict
+  # pattern left to exempt.
   - "src/elspeth/web/composer/tools/_common.py:_serialize_source:return"
-  - "src/elspeth/web/composer/tools/_common.py:_serialize_node:return"
   - "src/elspeth/web/composer/tools/_common.py:_serialize_output:return"
   - "src/elspeth/web/composer/tools/_common.py:_serialize_edge:return"
   - "src/elspeth/web/composer/tools/generation.py:_serialize_plugin_assistance_example:return"

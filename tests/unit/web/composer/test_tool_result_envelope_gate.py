@@ -153,6 +153,18 @@ _DATA_HELPER_PAYLOADS: dict[str, type | _Literal | None] = {
     "_serialize_plugin_assistance_example": _Literal(TOOLS_DIR / "generation.py", "_serialize_plugin_assistance_example"),
 }
 
+# A type attribution whose helper is not defined under ``web/composer``, and where its payload IS
+# held instead. Named rather than skipped: ``test_a_type_attribution_is_derived_from_its_helper``
+# reads the derivation off a definition in this tree, so a helper it cannot find must be an
+# adjudicated entry here and not a silent pass.
+_ATTRIBUTIONS_DEFINED_OUTSIDE_THE_COMPOSER: dict[str, str] = {
+    "get_schema": (
+        "the catalog's method, reached as context.catalog.get_schema; four definitions under web/ "
+        "answer to the bare name, and every one is annotated -> PluginSchemaInfo (catalog/protocol.py "
+        "is the contract the other three satisfy), so the payload is held there rather than here"
+    ),
+}
+
 
 class _Elsewhere(NamedTuple):
     """A container whose elements ANOTHER derivation censuses, named here so a reader can check it.
@@ -273,6 +285,19 @@ def _is_own_data(node: ast.AST) -> bool:
     if isinstance(node, ast.Attribute) and node.attr == "data":
         return True
     return isinstance(node, ast.Call) and _is_cast(node) and len(node.args) == 2 and _is_own_data(node.args[1])
+
+
+def _casts_to(fn: ast.AST, type_name: str) -> list[int]:
+    """Linenos inside ``fn`` of every ``cast(<type_name>, ...)``: the shape asserted rather than derived."""
+    return sorted(
+        node.lineno
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and _is_cast(node)
+        and node.args
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == type_name
+    )
 
 
 def _attributed_call_keys(call: ast.Call, *, prefix: str, site: str, depth: int, where: str) -> Iterator[str]:
@@ -752,6 +777,24 @@ class ToolResult:
 _PROBE_NESTED_TUPLE = """
 def f():
     return {"components": ({"component_id": "x", "fields": ("a",)},), "repair": {"inline_form": {"instruction": "i"}}}
+"""
+
+# The laundering form ``_casts_to`` exists to find, and the two shapes it must call clean: a cast to
+# some OTHER type (the ordinary widening this file is full of) and a body with no cast at all. The
+# live tree has none of the first since _serialize_node was annotated, so this probe is its consumer.
+_PROBE_CAST_BODIED_ATTRIBUTION = """
+def launders(node):
+    payload = cast(_ProbePayload, _untyped_serializer(node))
+    return payload
+
+
+def casts_something_else(node):
+    payload = cast(dict[str, str], _untyped_serializer(node))
+    return _ProbePayload(id=payload["id"])
+
+
+def derives(node):
+    return _typed_serializer(node)
 """
 
 # One nested value per arm of ``_nested_value_keys``: the four comprehensions, a multi-element
@@ -2122,6 +2165,72 @@ def test_names_two_modules_answer_to_reports_a_shadowed_name_for_both_attributio
     clean = shadowed[:1] + shadowed[2:3]
     assert _names_two_modules_answer_to((site.file, site.module) for site in clean) == {}
     assert _names_two_modules_answer_to((site.function, site.module) for site in clean) == {}
+
+
+def test_a_type_attribution_is_derived_from_its_helper_and_never_asserted_over_it() -> None:
+    """A helper attributed to a payload TYPE must be annotated with it, and must not ``cast`` its way there.
+
+    The census reports the attributed type's keys as that helper's wire. mypy
+    holds the helper to its RETURN ANNOTATION, so the attribution is only worth
+    what the annotation is: a helper annotated ``-> dict[str, Any]`` is held to
+    nothing, and a body that says ``cast(<the type>, <an untyped call>)``
+    asserts the shape rather than deriving it — which is the same widening the
+    value walkers already refuse two helpers away (``cast(...) hides the shape
+    of ...``), one level further out.
+
+    Measured, because this was live: ``_serialize_set_pipeline_node`` was
+    annotated ``-> _SetPipelineNodePayload`` and its body was
+    ``cast(_SetPipelineNodePayload, _serialize_node(node))`` over a
+    ``-> dict[str, Any]`` producer. A 22nd key added to that producer's literal
+    shipped on the wire while the census went on reporting the TypedDict's 21 —
+    envelope gate exit 0, mypy exit 0 (red-team RED5-2). With the producer
+    annotated instead, the same key is ``Extra key "zzz_untaught_key" for
+    TypedDict "_SetPipelineNodePayload"``, mypy exit 1, at the literal itself.
+
+    SCOPE: the derivation is read from a definition under ``web/composer``, so
+    an attribution whose helper lives elsewhere is named in
+    ``_ATTRIBUTIONS_DEFINED_OUTSIDE_THE_COMPOSER`` with its reason rather than
+    passing silently. ``_Literal`` and ``None`` attributions are out of scope
+    by construction: the first is read FROM the helper's own return literal,
+    the second names a helper that ships no keys at all.
+    """
+    typed = {name: payload for name, payload in _DATA_HELPER_PAYLOADS.items() if isinstance(payload, type)}
+    unresolved = set(typed) - set(_ATTRIBUTIONS_DEFINED_OUTSIDE_THE_COMPOSER)
+    findings: list[str] = []
+    for path in sorted(COMPOSER.rglob("*.py")):
+        for node in ast.walk(_parse(path)):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name not in typed:
+                continue
+            where = f"{_display(path)}:{node.lineno} {node.name}"
+            unresolved.discard(node.name)
+            expected = typed[node.name].__name__
+            annotation = node.returns
+            if not (isinstance(annotation, ast.Name) and annotation.id == expected):
+                rendered = "none" if annotation is None else ast.unparse(annotation)
+                findings.append(f"{where}: returns {rendered}, but the census attributes it {expected}")
+            findings.extend(
+                f"{where}:{lineno}: casts to its own attributed type {expected} instead of deriving it"
+                for lineno in _casts_to(node, expected)
+            )
+    assert not findings, "type attributions that are asserted rather than derived:\n" + "\n".join(findings)
+    assert not unresolved, (
+        f"type-attributed helper(s) with no definition under web/composer: {sorted(unresolved)} — "
+        "name each in _ATTRIBUTIONS_DEFINED_OUTSIDE_THE_COMPOSER with where its payload IS held"
+    )
+
+
+def test_casts_to_reports_only_a_cast_asserting_the_named_type() -> None:
+    """Witness for ``_casts_to``: the live tree has no such cast any more, so nothing else exercises it.
+
+    Both directions, since either alone passes under a mutant that returns
+    ``[]`` outright or one that reports every call: the laundering form is
+    found at its own lineno, and a cast to a DIFFERENT type, a call that is not
+    a cast, and a helper with neither are all reported as clean.
+    """
+    tree = ast.parse(_PROBE_CAST_BODIED_ATTRIBUTION)
+    assert _casts_to(_function(tree, "launders"), "_ProbePayload") == [3]
+    assert _casts_to(_function(tree, "casts_something_else"), "_ProbePayload") == []
+    assert _casts_to(_function(tree, "derives"), "_ProbePayload") == []
 
 
 def test_every_result_constructor_site_is_attributed() -> None:

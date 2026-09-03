@@ -817,7 +817,10 @@ def _duplicate_consumer_repair_suggestions(
         patched_consumers: dict[str, dict[str, Any]] = {}
         for (node, consumer_branch_alias), branch_name in zip(consumer_nodes, branch_names, strict=True):
             if node.id not in patched_consumers:
-                patched_consumers[node.id] = _serialize_node(node)
+                # Widened deliberately: this is a repair-call argument the loop
+                # below re-keys, not the node payload the census reports, so it
+                # must not borrow ``_SetPipelineNodePayload``'s closed key set.
+                patched_consumers[node.id] = dict(_serialize_node(node))
             patched_consumer = patched_consumers[node.id]
             if consumer_branch_alias is None:
                 patched_consumer["input"] = branch_name
@@ -1674,10 +1677,19 @@ def _serialize_source(source: SourceSpec) -> dict[str, Any]:
     }
 
 
-def _serialize_node(node: NodeSpec) -> dict[str, Any]:
-    """Serialize a NodeSpec to a plain dict for LLM consumption.
+def _serialize_node(node: NodeSpec) -> _SetPipelineNodePayload:
+    """Serialize a NodeSpec to the exact node payload for LLM consumption.
 
     Includes all fields (even None) so the LLM sees the full schema.
+
+    Typed rather than ``dict[str, Any]`` because the envelope census reports
+    ``_SetPipelineNodePayload``'s keys as this function's wire (through
+    ``_serialize_set_pipeline_node``). While the type was only asserted over
+    the result, a key added to the literal below shipped while the census kept
+    reporting the TypedDict's — measured: 22 keys on the wire against 21
+    censused, gate green, mypy clean (red-team RED5-2). The annotation is what
+    holds the two equal; consumers wanting a plain mapping widen at their own
+    call site.
     """
     return {
         "id": node.id,
@@ -1730,7 +1742,11 @@ def _serialize_full_pipeline_state(state: CompositionState, *, requested_compone
     """Serialize the full state and expose accepted full-state spellings."""
     return {
         "sources": {name: _serialize_source(source) for name, source in state.sources.items()},
-        "nodes": [_serialize_node(n) for n in state.nodes],
+        # Widened to the declared ``list[dict[str, Any]]``: this payload is
+        # censused from ``_FullPipelineStatePayload``, which stops at ``nodes``.
+        # Narrowing the field would enumerate 21 sub-keys none of these surfaces
+        # teaches yet — the opaque-reference residue on elspeth-657f603fcd.
+        "nodes": [dict(_serialize_node(n)) for n in state.nodes],
         "outputs": [_serialize_output(o) for o in state.outputs],
         "edges": [_serialize_edge(e) for e in state.edges],
         "metadata": {"name": state.metadata.name, "description": state.metadata.description},
@@ -3636,7 +3652,13 @@ def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonVa
 
 
 def _serialize_set_pipeline_node(node: NodeSpec) -> _SetPipelineNodePayload:
-    payload = cast(_SetPipelineNodePayload, _serialize_node(node))
+    """The node payload with authoring-only options, the shape the census attributes to this name.
+
+    No ``cast``: ``_serialize_node`` is annotated with this very TypedDict, so
+    the attribution is derived from what mypy holds the producer to rather than
+    asserted over it (red-team RED5-2).
+    """
+    payload = _serialize_node(node)
     payload["options"] = _serialize_authoring_options(node.options)
     return payload
 
