@@ -1,7 +1,7 @@
 # Pluggable SSO and identity substrate — backend-for-frontend login for Entra, VANguard, Google, and generic OIDC
 
-Date: 2026-09-02. Status: design, revision 2.7, implementation plan = tracker milestone elspeth-07cd19ba73.
-Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**.
+Date: 2026-09-02. Status: design, revision 2.8, implementation plan = tracker milestone elspeth-07cd19ba73.
+Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**. Revision 2.8 applies the verified remainder of that review — the surviving high and medium findings and rulings D24 to D34 — marked **[rev2.8]**; findings the verification pass refuted were not applied, and are listed with their refuting reason in the review record.
 Branch: `release/0.8.0`.
 Revision 2 incorporates six independent reviews (security architecture,
 solution design, reality check against the tree, systems risk, functional
@@ -63,9 +63,18 @@ The tech-debt-free window is weeks, not months.
 | D16 **[rev2.3]** | Role and edge names | `approver` (was `manager`) and `reviewer`. Role `approver` may decide approvals and hold `approver` edges; the tree edge type is `approver` ("A is B's default approver"). Role `reviewer` may attest. "Manager" and "lead" appear nowhere in schema, API, or UI. |
 | D17 **[rev2.3]** | IdP groups | Dropped. `groups_json` is removed; the Entra profile no longer extracts `groups`/`roles` and the group-overage check is gone with them; `UserProfile.groups` is always empty for SSO. |
 | D18 **[rev2.5]** | Disk quota for uploaded blobs | Per person, a **level** not a rate: `SUM(blobs.size_bytes)` over the live blob rows of every session the identity owns (fork copies bytes, so each session's rows are real disk). `quota_default_storage_bytes` is a required container setting written into the identity's `quota_policies` row at activation, overridable per identity by an admin; `quota_container_storage_bytes` is an optional ceiling. Enforced at both upload routes under the existing per-session blob lock, before bytes are written; the existing `max_blob_storage_per_session_bytes` stays as the inner per-session bound. Over quota refuses and writes `quota_exceeded` with `dimension=storage`; accounting unavailable refuses (R13). |
-| D19 **[rev2.7]** | `service` in the provider discriminator | Two L0 types. `AuthProviderType` keeps the five login values and governs settings, the registry, session tokens, `sessions`, `user_secrets` and both Landscape CHECKs. `IdentityProviderType = AuthProviderType | Literal["service"]` governs `identities.provider` alone, under its own named CHECK constant. Putting `service` in `AuthProviderType` fails the import-time parity assert and the app does not boot. **Applied on review recommendation; reversible until phase 1 lands.** |
+| D19 **[rev2.7]** | `service` in the provider discriminator | Two L0 types. `AuthProviderType` keeps the five login values and governs settings, the registry, session tokens, `sessions`, `user_secrets` and both Landscape CHECKs. `IdentityProviderType = Literal[AuthProviderType, "service"]` (nested, so `get_args` flattens) governs `identities.provider` alone, under its own named CHECK constant. Putting `service` in `AuthProviderType` fails the import-time parity assert and the app does not boot. **Applied on review recommendation; reversible until phase 1 lands.** |
 | D20 **[rev2.7]** | Bootstrap admin | The seed and the operator CLI each write `access_state='active'`, an `admin` role, no workload role, and the audit pair in one transaction; the seed fires only while the container has zero active human admins. Activation accepts `role=none`, which is what an `admin` must be activated with under R8. The contradicting "lockout recovery is a config change" sentence is deleted. **Applied on review recommendation.** |
 | D21 **[rev2.7]** | VM in-place rebuild | Withdrawn. Both deployment paths use the existing reset runbook, because the pre-1.0 gate this spec cites for ECS forbids in-place migration everywhere, and the promised byte-for-byte preservation of `user_secrets` is false across a key-derivation change. Re-admission of the known cohort moves inside the cutover window. **Applied on review recommendation; the fact it rests on is the runbook's own standing rule, not an assumption.** |
+| D24 **[rev2.8]** | Storage quota exactness | **Eventually consistent, not exact.** The per-session lock does not serialise two sessions of one identity, and making it exact needs an identity-scoped lock held across the fork copy loop, which would serialise every other upload by that identity for the duration of a fork. R13 instead enumerates all four byte-admitting sites, which is where the real hole was. Revisit only if measurement shows real overshoot. |
+| D26 **[rev2.8]** | Record of a requested review | A sibling `review_requests` table. Widening `review_attestations` with a `requested` verdict contradicts its own append-only, non-null-reviewer, ledger-not-control design and would fill the audit view with requests nobody completed. |
+| D27 **[rev2.8]** | Approver's read of another identity's session | Authorized per request over roles plus the live request row, minting no token, never through the shareable-review bearer capability. It writes an `audit_access_log` row under a new `writer_principal` value added **in this epoch**, because adding it later costs the one-way window. |
+| D28 **[rev2.8]** | Actor column on the container-ceiling quota row | Nullable FK plus a closed `set_by_actor` CHECK (`identity`, `config`, `operator`, `system`), mirroring `writer_principal`. A placeholder identity would put a fake row in the table R5 counts. |
+| D29 **[rev2.8]** | Workflow-table FK deletion rule | `RESTRICT`, declared explicitly, plus `durable_history_exists` extended to count approvals, attestations and library entries so archive refuses instead of discarding them. `published_from_session_id` becomes a provenance column, not an FK. Declaring nothing was never neutral: it ships `RESTRICT` by accident. |
+| D30 **[rev2.8]** | Acceptance criteria for the workflow half | Ship them with it. §Testing gains a workflow-governance subsection, R11 refuses at startup loudly rather than switching enforcement off silently, and the suite runs against a closed local deployment. |
+| D31 **[rev2.8]** | Quota under local, and who writes the policy row | The exemption binds to R11's own predicate (`local` **and** open registration), not to `local` alone, and every path that makes an identity active writes the row. A blanket local exemption would uncap the shared credential in a configuration where governance is deliberately on. |
+| D32 **[rev2.8]** | Does R3 disable the identity | Yes: `disabled`, `disable_reason='rebound'`, actor `system`, audit row. It honours R5 on the last active human admin rather than bricking the container, and it does **not** run the edge-revocation cascade, which is unrecoverable and fires most often on a marriage or a rename. |
+| D34 **[rev2.8]** | Dormancy versus the last admin | R9 carries R5's last-admin exemption. Otherwise a single-admin container reaches zero active admins at day 91 by doing nothing, and the first-login-only seed cannot re-fire. |
 
 ## Architecture
 
@@ -113,15 +122,26 @@ than a test failure. Two L0 types, therefore:
   registry, the session-token `provider` claim, `sessions` and `user_secrets`
   (a `service` identity never owns either), Landscape
   `ck_run_attributions_auth_provider_type` and `ck_auth_events_provider`.
-- `IdentityProviderType = AuthProviderType | Literal["service"]` — how an
+- `IdentityProviderType = Literal[AuthProviderType, "service"]` — how an
   identity row came to exist. Governs `identities.provider` alone, under its
   own named constant `_IDENTITY_PROVIDER_TYPE_CHECK`, distinct from
   `_AUTH_PROVIDER_TYPE_CHECK`.
 
+  **Write it nested, not as a union [rev2.7.1].** `AuthProviderType |
+  Literal["service"]` is a `Union`, and `get_args` on it returns two nested
+  `Literal` objects rather than six strings, so every membership check and
+  every contract assertion over it silently reads the wrong shape. Nesting the
+  alias inside `Literal[...]` flattens it: `get_args` returns the six strings,
+  and mypy accepts assigning an `AuthProviderType` value to an
+  `IdentityProviderType`. Measured on this project's interpreter (3.13.1).
+
 The narrower type is a subset of the wider one, so the `sessions.user_id` →
 `identities.identity_id` FK stays sound: every value `sessions` admits is a
 value `identities` admits. The contract test pins **both** CHECK strings and
-both Literals, and asserts the subset relation.
+both Literals, and asserts
+`set(get_args(IdentityProviderType)) == set(get_args(AuthProviderType)) | {"service"}`
+— an equality over flat strings, which fails loudly if anyone rewrites the
+alias as a union [rev2.7.1].
 
 **Operator selection [rev2.4].** `WebSettings.auth_provider` is the only
 selector: it names one registered profile, and every other `sso_*` field is
@@ -268,8 +288,15 @@ only `sha256(code)` is stored; the session token is never at rest. Consume
 is one statement:
 `UPDATE sso_handoffs SET consumed_at = <db now> WHERE code_hash = ? AND
 consumed_at IS NULL AND expires_at > <db now> RETURNING identity_id`.
-Zero rows means reject. Database clock, not replica clock. Expired rows are
-purged by the existing retention sweep. `complete` is constant-time: hash,
+Zero rows means reject. Database clock, not replica clock. Expired rows are purged **lazily
+[rev2.8]** — on consume and on the next login by the same identity — with a
+`sso_handoffs` TTL of 15 minutes. There is no "existing retention sweep": that
+phrase named nothing, and it was doing the work of bounding a table that grows
+with every abandoned login. Lazy purge matches R9's own idiom and the
+`_reap_stale_pending_registrations` precedent already in the tree, and costs no
+background task and no fourth required setting. The purge writes no
+`auth_events` row: the login attempt's own record already exists, and a
+maintenance delete is not an authority mutation. `complete` is constant-time: hash,
 then conditional update, never select-then-compare.
 
 ### Failure categories [rev2]
@@ -307,7 +334,8 @@ Closed set, each an explicit exception class, never a `detail` prefix:
 `local | oidc | entra | vanguard | google` in:
 
 1. `contracts/auth.py` `AuthProviderType` (hand-written) **and
-   `IdentityProviderType = AuthProviderType | Literal["service"]`
+   `IdentityProviderType = Literal[AuthProviderType, "service"]` (nested, not
+   a union — see §1)
    [rev2.7, D19]**.
 2. `web/sessions/models.py` `_AUTH_PROVIDER_TYPE_CHECK`, used by BOTH
    `sessions` and `user_secrets` and staying at the five login values; **plus
@@ -327,8 +355,10 @@ Closed set, each an explicit exception class, never a `detail` prefix:
 10. `tests/unit/web/auth/test_provider_type_contract.py` pins all of the
     above plus registry parity and **both** CHECK strings
     (`_AUTH_PROVIDER_TYPE_CHECK` and `_IDENTITY_PROVIDER_TYPE_CHECK`), both
-    Literals, and the assertion that `get_args(AuthProviderType)` is a proper
-    subset of `get_args(IdentityProviderType)` [rev2.7].
+    Literals, and
+    `set(get_args(IdentityProviderType)) == set(get_args(AuthProviderType)) | {"service"}`
+    — equality over flat strings, which fails loudly if the alias is ever
+    rewritten as a union [rev2.7.1].
 
 ### Two epochs, one window [rev2]
 
@@ -404,15 +434,15 @@ compatibility-record example.
 | provider | text | CHECK `_IDENTITY_PROVIDER_TYPE_CHECK` = the `IdentityProviderType` values: the five IdP values (`local` included, D7) plus `service` [rev2.7, D19]. A `service` identity authenticates by an operator-issued credential, not OIDC; the mechanism is not built now. This is a **different** constant from the `_AUTH_PROVIDER_TYPE_CHECK` on `sessions`/`user_secrets`, which stays at the five login values — see §1. |
 | kind | text | CHECK `('human','service')`, default `human` [rev2.2]. Service identities may hold only `admin` or `oversight`, never `approver`, `reviewer`, `user`, or `curator`, and may not approve, attest, or publish (CHECKs on the workflow tables). |
 | subject | text | IdP `sub`, or local username |
-| username | text | display only, non-blank; changes update the row and write an audit row |
+| username | text | display only, non-blank; changes update the row and write an audit row. **A `pending` row has no profile yet (`raw_claims_json` is taken at activation) and a pre-provisioned row has never logged in, so `username` is the IdP `subject` until a login supplies better [rev2.8].** That keeps the column NOT NULL and non-blank on every path, and it is what the admin sees in the pending queue. |
 | display_name | text null | |
 | email | text null | |
 | organisation_id | text null | VANguard ABN; null elsewhere |
-| raw_claims_json | text null | bounded 16 KiB; declared profile keys plus `iss aud iat exp`; `groups`, `_claim_*`, `picture`, `at_hash`, `nonce` stripped; forensics only, never returned by any API. **Taken at activation, not at first sight [rev2.2]:** a `pending` row holds only provider, subject, and organisation_id, so the container does not accumulate profile PII of people who merely tried. Never-activated `pending` rows are purged by the retention sweep after a container-set window. |
+| raw_claims_json | text null | bounded 16 KiB; declared profile keys plus `iss aud iat exp`; `groups`, `_claim_*`, `picture`, `at_hash`, `nonce` stripped; forensics only, never returned by any API. **Taken at activation, not at first sight [rev2.2]:** a `pending` row holds only provider, subject, and organisation_id, so the container does not accumulate profile PII of people who merely tried. Never-activated `pending` rows are purged on the same lazy schedule [rev2.8], evaluated when an admin lists pending identities, after `identity_pending_retention_days` (default 90, optional setting). No background task. |
 | subject_email_at_first_seen | text null | D10 detection |
 | rebound_at | datetime null | D10 detection: verified email changed under the same subject |
-| first_seen_at | datetime | |
-| last_login_at | datetime | |
+| first_seen_at | datetime | row creation, including for a pre-provisioned row nobody has used [rev2.8] |
+| last_login_at | datetime null | **nullable [rev2.8]:** a pre-provisioned or never-used identity has no login to stamp, and inventing one would falsify the dormancy window R9 measures |
 | access_state | text | CHECK `('pending','active','disabled')`; default `pending` (D12). Local follows `registration_mode`: `open` activates on registration, otherwise `pending`. Read on **every request** in `get_current_user` [rev2.2], so revocation latency is one request, not the token lifetime. |
 | pre_provisioned_at | datetime null | [rev2.2] An admin may create the row `active` by `(provider, subject)` before first login; first login binds instead of creating. This is how nine people are onboarded without each hitting a wall. |
 | activated_at | datetime null | |
@@ -512,9 +542,23 @@ test keeps pinning that none of these boundaries widens to `str`.
   `identity_enabled`, `role_granted`, `role_revoked`,
   `relationship_asserted`, `relationship_revoked`, `approval_requested`,
   `approval_decided`, `review_attested`, `library_published`,
+  `library_accepted`, `library_rejected`, `library_deprecated` [rev2.8],
   `library_recalled`, `quota_set`, `quota_exceeded`. `quota_set` and
   `quota_exceeded` carry `dimension` (`tokens` or `storage`), the cap, the
   ceiling in force, and the measured usage in `metadata_json` [rev2.5].
+  The three library values close a real gap: curator acceptance is the act
+  that makes an entry readable deployment-wide, and it had no event type,
+  while `library_entries` already carries `rejected_at` and `deprecated_at`
+  columns whose transitions nothing recorded. This CHECK is closed, so
+  missing a value is a self-inflicted outage under R4, which refuses the
+  mutation whose audit write failed — the list has to be right in this epoch.
+- **Authorization denials need no new event type [rev2.8].** `auth_failure`
+  exists, `failure_category` is an unconstrained `String(64)`, and
+  `metadata_json` is free-form, so `{route, required_role}` under
+  `failure_category='authz_denied'` is writable today with no schema change.
+  Business-rule refusals (R5, R7, R8, R10) keep their own categories and are
+  **not** filed as authorization denials: an authorized caller hitting a rule
+  is not an escalation attempt, and conflating them poisons the audit view.
 - `calls` gains nullable `prompt_tokens`, `completion_tokens`,
   `cached_prompt_tokens`, `reasoning_tokens` written from the provider's
   `TokenUsage` at call-record time **[rev2.1]**. Measured 2026-09-02: the
@@ -663,6 +707,20 @@ waits for a registered client.
 - **R3.** Refuse, and record `rebound_at`, a login whose `(provider, subject)`
   resolves to an existing identity while the verified email differs from
   `subject_email_at_first_seen`, until an admin re-enables the identity.
+  **The refusal also sets state [rev2.8, D32].** Refusing the login alone
+  leaves outstanding tokens refreshing for the whole refresh chain, which is
+  the window the refusal exists to close, so R3 sets
+  `access_state='disabled'`, `disable_reason='rebound'`, actor `system`, and
+  writes `identity_disabled`. Three bindings on that:
+  - **It honours R5.** On the last active human admin, R3 refuses the login,
+    writes the audit row, and leaves the identity `active` rather than
+    bricking the container into C2's lockout. The audit row is the signal.
+  - **It does not run the admin-disable cascade.** Edge revocation is
+    unrecoverable — `identity_relationships` keeps `revoked_at` and re-enable
+    restores nothing — and this fires most often on a marriage or a rename.
+    The state change plus the audit row is the whole action.
+  - **Re-enable updates `subject_email_at_first_seen`** to the new verified
+    email, or R3 re-trips on the next login forever.
 - **R4.** Refuse to complete an admin mutation whose audit write failed.
 - **R5.** Refuse to disable the caller's own identity or the last enabled admin.
 - **R6.** Refuse to issue a session token (at `complete` and at refresh) for
@@ -674,25 +732,83 @@ waits for a registered client.
 - **R8.** [rev2.3] Refuse any grant that would make one identity hold
   `admin` together with `approver`, `reviewer`, `user`, or `curator` in the
   same container (D14). Admin is container operations, not a workload role.
+  **This is a route-layer refusal, not a CHECK [rev2.8].** It reads other
+  rows of `identity_roles`, and no dialect can express a cross-row invariant
+  in a CHECK; the same is true of the `identities.kind` restriction, which
+  reads across tables. Both evaluate in the **same transaction** as the role
+  insert, under `SELECT … FOR UPDATE` on the target `identities` row, at every
+  writer: `POST roles`, `activate`, pre-provisioning when it takes a role, and
+  **the D20 operator CLI**, which writes a role row and is therefore a real
+  enforcement site. No trigger. Tested in both grant orders, plus a mutation
+  case seeding a *revoked* workload row beside a live `admin` row, which must
+  not refuse.
 - **R9.** [rev2.2] Refuse a login for an identity dormant longer than the
   container's dormancy window: it drops to `pending` with
   `disable_reason='dormant'`, writes `identity_disabled`, and needs an admin
   to re-activate. This is the recycled-mailbox case R3 cannot see because
-  the email did not change.
+  the email did not change. **R9 carries R5's last-admin exemption [rev2.8,
+  D34]:** it never re-pends the last active human admin. R5 guards only the
+  disable *route*, so without this a single-admin container reaches zero
+  active admins at day 91 by doing nothing, and the seed cannot re-fire
+  because it is first-login-only. The dormant sole admin logs in, is not
+  re-pended, and an `auth_events` row records the exemption.
 - **R10.** [rev2.2] Refuse a service identity's admin write that lacks
   `on_behalf_of` and `console_request_id`; refuse those keys from a human
   identity.
 - **R11.** [rev2.2] Refuse to enable approval, attestation, and library
   enforcement when `provider=local` and `registration_mode=open`, because
   one human can then hold many identities and every ≠ CHECK is defeatable.
+  **R11 refuses at startup, loudly [rev2.8, D30].** It is a readiness failure
+  naming both settings, not enforcement quietly switched off: a silent
+  off-switch makes a good-faith test suite go green against nothing, and the
+  shared route fixture at `tests/unit/web/conftest.py` sits in exactly this
+  combination. The workflow-governance tests therefore configure a closed
+  local deployment (`registration_mode` not `open`), which is a supported
+  configuration and the one the tests must run in.
 - **R12.** [rev2.2] Refuse to resolve a shareable review token for a
   requesting identity that is not `active`.
-- **R13.** [rev2.5] Refuse an upload (multipart or inline) whose bytes
-  would take the identity's live blob total over its `storage_bytes` or the
-  container ceiling, before any byte reaches disk; write `quota_exceeded`
-  with `dimension=storage`. Refuse when the accounting query fails. The
-  response names the cap and the current usage so the user can delete
-  blobs to recover; the existing per-session error keeps its shape.
+- **R13.** [rev2.5, restated rev2.8] Refuse **any path that would add a live
+  `blobs` row for the identity** when the identity's live blob total would
+  exceed its `storage_bytes` or the container ceiling, before any byte
+  reaches disk; write `quota_exceeded` with `dimension=storage`. Refuse when
+  the accounting query fails. The response names the cap and the current
+  usage so the user can delete blobs to recover; the existing per-session
+  error keeps its shape.
+
+  **The four byte-admitting sites [rev2.8, D24].** "Upload" named one of
+  four, so an identity at its cap could previously fork its own session
+  repeatedly and never be refused. All four enforce:
+  1. multipart upload;
+  2. inline upload / inline custody;
+  3. run-output finalize, which writes result blobs;
+  4. `copy_blobs_for_fork`, which physically copies bytes.
+
+  Site 4 refuses **before** the copy loop starts, so a refused fork leaves no
+  half-populated child; the deliberate `missing_bytes == 0` idempotent-replay
+  path stays exempt, because it admits no new bytes. Blobs in archived
+  sessions count, and rows in `pending` or `error` state count: they occupy
+  disk.
+
+  **The bound is eventually consistent, not exact [rev2.8, D24].** The
+  per-session lock is keyed on `session_id` alone, so two uploads into two
+  sessions of one identity take non-conflicting locks and both may pass; the
+  earlier claim that they "cannot both pass" was false on PostgreSQL, the
+  production dialect. Making it exact needs an identity-scoped lock acquired
+  before the session lock on every path, held across the fork copy loop,
+  which would serialise every other upload by that identity for the duration
+  of a fork. The overshoot is bounded by one concurrent admission per extra
+  session and self-corrects on the next check, which is the same guarantee
+  the token dimension already gives. Reconsider only if measurement shows a
+  real overshoot.
+
+- **R14.** [rev2.8] Refuse an LLM call — composer or run — that would take
+  the identity over its `tokens_per_day` or the container ceiling; write
+  `quota_exceeded` with `dimension=tokens`. Refuse when the accounting query
+  fails, and refuse when no applicable policy row exists. The token dimension
+  was previously specified only in a table cell; it is a numbered refusal
+  because this project derives its mutation tests from numbered refusals, and
+  a control with no number gets no adversarial test. Eventually consistent on
+  the same terms as R13. The day boundary is UTC midnight, named in the test.
 
 ## Frontend [rev2]
 
@@ -715,10 +831,26 @@ waits for a registered client.
   eligibility is role-based) and review requests addressed to me, each
   opening the frozen read-only inspect view with the requester's note and
   approve/reject (or sign off/changes requested) plus a note field.
+  **That view is authorized per request, and mints no token [rev2.8, D27].**
+  The predicate follows from the role-based eligibility already ruled at
+  rev2.2: the caller holds an active `approver` (or `reviewer`) role, the
+  caller is not `requested_by_identity_id`, and a live `approvals` or
+  `review_requests` row exists for that `(session_id, state_id)`. It is
+  evaluated on every request over `identity_roles` and the request row,
+  serving the same frozen projection. It must **not** reuse the existing
+  shareable-review transport, which is a 30-day unrevocable bearer
+  capability whose resolve route writes no audit row and never reads the
+  caller identity it accepts — a capability, not an authorization. The read
+  writes an `audit_access_log` row under a new `writer_principal` value,
+  added **in this epoch**: one identity reading another's work is the
+  disclosure an auditor will ask about, and adding the value after epoch 50
+  costs exactly the window this spec is structured to take only once.
   *Sent*: my own requests with their state, the decider, the decision
   note, and when; opening one sets `decision_seen_at`. A badge on the
-  navigation shows unread counts from one summary endpoint polled on the
-  existing session-list cadence. Notification stops at the badge: there is
+  navigation shows unread counts from one summary endpoint. It needs its own
+  timer: the "existing session-list cadence" is not a poll cadence at all —
+  that loader is event-driven [rev2.8]. One timer for the badge, and no
+  second one. Notification stops at the badge: there is
   no email or push transport in this sprint (a seam, see §Future seams).
 
 ## Testing [rev2]
@@ -753,6 +885,43 @@ waits for a registered client.
   tests carry the new epochs. VANguard live once the client exists. Google
   live once a client exists.
 
+### Workflow governance [rev2.8, D30]
+
+Everything above tests the login path. The workflow half ships enforcement —
+R2 refuses a run, R13 and R14 refuse spend — and had no named test at all,
+which is how a sprint ships tables that nothing exercises. These land before
+phase 4 closes, not after.
+
+- **Per refusal that actually refuses** (R2, R7, R8, R11, R13, R14, and R9,
+  which is reachable now that `identity_dormancy_days` ships): a fire test
+  that proves the refusal happens, **and** a mutation-derivation test that
+  proves the guard derives from its authority rather than from a coincidence.
+  This project's discipline keys off numbered refusals, which is why the token
+  quota became R14 rather than staying a sentence in a table cell.
+- **R2 through the real binding tuple.** One integration test that compiles an
+  actual binding and drives the execute gate with it, not a hand-built tuple.
+  A gate tested against a fixture proves the fixture.
+- **The full round trip.** Request with a note, decide with a note, the
+  requester sees the decision and the note, the badge clears. Plus the losing
+  half of the concurrent-decide guard.
+- **Both quota dimensions.** A storage refusal at each of R13's four
+  byte-admitting sites, and a token refusal, each asserting the
+  `quota_exceeded` row carries its `dimension`, cap, ceiling and usage. A
+  day-boundary rollover case with the clock named explicitly (UTC midnight).
+- **The separation rules as violations:** author = approver, curator =
+  publisher, reviewer = author, and R8 in both grant orders including the
+  revoked-workload-role case that must *not* refuse.
+- **A seeded pre-existing cycle** in `identity_relationships`, since R7 guards
+  the insert but says nothing about data that predates it.
+- **Not tested, and why:** R10 has no reachable path because no
+  service-credential mechanism ships this sprint; attestation has no refusal
+  to mutate, by its own design as a ledger; and "flex teams" has no test
+  because it is a property of two live deployments, not of code.
+- **The suite runs against a closed local deployment.** R11 refuses
+  enforcement under `local` plus open registration, and the shared route
+  fixture sits in exactly that combination, so tests written the obvious way
+  would pass against enforcement that was never on.
+
 ## Rollout order [rev2]
 
 1. **Operator, first:** register the confidential Cognito client with the
@@ -772,7 +941,13 @@ waits for a registered client.
    live check.
 7. VANguard live check; Google when a client exists.
 
-## Future seams (recorded, not built)
+## Future seams
+
+**The heading used to say "recorded, not built" and several bullets below are
+built this sprint [rev2.8].** Rather than move them to a fourth list that has
+to stay in sync with the Decisions table, §Workflow tables and the milestone,
+each in-sprint bullet now carries its ruling and its owning step inline. Read
+the bullet, not the heading.
 
 - **Approval** is delivered in this sprint (§Workflow tables, R2). The
   execute route at `web/execution/routes.py` (after ownership, before
@@ -805,7 +980,9 @@ waits for a registered client.
 - **Approver's audit view:** `identity_relationships` × `run_attributions`
   × `auth_events`, scoped to the caller's active `approver` edges.
 - **Preview row trace:** elspeth-8310d6030c, independent.
-- **`auth_events` export and retention:** separate product question.
+- **`auth_events` long-term retention:** a separate product question. The
+  *export* half of this bullet was stale — it is owned in the plan already
+  [rev2.8].
 
 ## Workflow tables (sessions store, epoch 50) — "for but not with" [rev2.1, D13]
 
@@ -814,13 +991,36 @@ its `auth_events` row before responding. Fleshed out later without a new
 epoch only by adding nullable columns; anything needing a CHECK change is a
 deliberate epoch bump.
 
+**Session foreign keys declare `ondelete` explicitly [rev2.8, D29].** Silence
+is not neutral: SQLAlchemy emits `NO ACTION`, and with `PRAGMA foreign_keys=ON`
+enforced at startup that ships the `RESTRICT` branch by accident. The rule is
+`RESTRICT`, chosen deliberately, **plus** an extension of
+`durable_history_exists` to count `approvals`, `review_attestations` and
+`library_entries`. That predicate today counts only runs, composer completion
+events and forks, so `archive_session` would physically delete a session whose
+only history is an approval, silently discarding audit-bearing rows; with the
+extension, archive refuses instead. `token_usage_ledger` is excluded from the
+predicate — it is an accounting index, not audit truth, and its `session_id`
+is nullable. `library_entries.published_from_session_id` becomes a
+**provenance column, not an FK**, exactly as `forked_from_session_id` already
+is, so a published entry outlives the staging session it came from.
+
+**Actor columns that no identity fills [rev2.8, D28].** The container-ceiling
+`quota_policies` row is derived from configuration and has no granting
+identity, so `set_by_identity_id` is a **nullable** FK beside a closed
+`set_by_actor` CHECK over `('identity', 'config', 'operator', 'system')`,
+mirroring the `writer_principal` pattern already used in this codebase. A
+non-null FK with an invented placeholder identity would put a fake row in the
+table R5 counts.
+
 | table | columns | notes |
 |-------|---------|-------|
-| approvals | approval_id PK; session_id FK; state_id; binding_json (`config_hash`, `canonical_version`, `runtime_val_manifest_sha256`, `openrouter_catalog_sha256`, **`binding_generation_fingerprint`, `policy_hash`** [rev2.2]); requested_by_identity_id FK; approver_identity_id FK; requested_at; decided_at NULL; decision NULL CHECK `('approved','rejected','revoked','superseded')` [rev2.2]; required_count int default 1; request_note NULL [rev2.6]; decision_seen_at NULL [rev2.6] | One open request per `(session_id, state_id)`. **Mailbox [rev2.6]:** `request_note` is the requester's message to the approver ("please approve, it's for entirely legitimate business"); the approver's reply travels in `approval_decisions.note`. Both are bounded plain text (4 KiB), rendered as text, never as markup, and both are part of the audit record. `decision_seen_at` is set when the requester opens the decided request, so the badge can clear; it is a UI convenience, never a control. Author ≠ approver (CHECK). **Approver eligibility is role-based [rev2.2]:** any identity holding an active `approver` role in this container who is not the author may decide; the author's active `approver` edge only supplies the default suggestion in the picker. This is what gives the lead's own work an approver and gives leave cover without touching the tree. Any new `state_id` marks the open request `superseded`. Execute refuses (409, distinct `error_type`) unless an `approved` row matches the compiled binding (R2, **delivered in this sprint**, phase 4). `binding_generation_fingerprint` is included because `config_hash` records profile aliases, not the buckets or credentials they resolve to; without it an approval survives an operator repointing an alias. `snapshot_hash` is deliberately excluded (it embeds the principal scope and would never match across approver and author). Pinned by a test that fails if a new field enters `WebPluginPolicyEvidence` without a tuple decision. |
+| approvals | approval_id PK; session_id FK; state_id; binding_json (`config_hash`, `canonical_version`, `runtime_val_manifest_sha256`, `openrouter_catalog_sha256`, **`binding_generation_fingerprint`, `policy_hash`** [rev2.2]); requested_by_identity_id FK; approver_identity_id FK; requested_at; decided_at NULL; decision NULL CHECK `('approved','rejected','revoked','superseded')` [rev2.2]; required_count int default 1; request_note NULL [rev2.6]; decision_seen_at NULL [rev2.6] | One open request per `(session_id, state_id)`. **Mailbox [rev2.6]:** `request_note` is the requester's message to the approver ("please approve, it's for entirely legitimate business"); the approver's reply travels in `approval_decisions.note`. Both are bounded plain text (4 KiB), rendered as text, never as markup, and both are part of the audit record. `decision_seen_at` is set when the requester opens the decided request, so the badge can clear; it is a UI convenience, never a control. **A negative decision must carry a note [rev2.8]:** the route refuses `decision='rejected'` with a blank or missing `note`, because the note is the requester's only channel for learning why, and an empty rejection turns the mailbox round trip into a dead end. Positive decisions and `withdrawn` leave it optional. Author ≠ approver (CHECK). **Approver eligibility is role-based [rev2.2]:** any identity holding an active `approver` role in this container who is not the author may decide; the author's active `approver` edge only supplies the default suggestion in the picker. This is what gives the lead's own work an approver and gives leave cover without touching the tree. Any new `state_id` marks the open request `superseded`. **Two eligible approvers may open the same request, so the decide route is a conditional write [rev2.8]:** it updates `WHERE decision IS NULL` — *not* `WHERE decided_at IS NULL`, because `superseded` and `revoked` set `decision` without being stated to stamp `decided_at`, and guarding on the timestamp would let a superseded request be overwritten to `approved` against a stale binding, defeating R2's own second clause. The loser gets one named `error_type` carrying the current state, rendered by the frontend; one type, not three, since the `superseded` and `revoked` arms are not "already decided by someone". The `approval_decisions` insert, the `approvals` update and the R4 audit write happen in **one transaction**, or the lost update simply reappears between the two tables. This implements quorum 1; `required_count > 1` stays reserved and unenforced. Execute refuses (409, distinct `error_type`) unless an `approved` row matches the compiled binding (R2, **delivered in this sprint**, phase 4). `binding_generation_fingerprint` is included because `config_hash` records profile aliases, not the buckets or credentials they resolve to; without it an approval survives an operator repointing an alias. `snapshot_hash` is deliberately excluded (it embeds the principal scope and would never match across approver and author). Pinned by a test that fails if a new field enters `WebPluginPolicyEvidence` without a tuple decision. |
 | approval_decisions | decision_id PK; approval_id FK; decided_by_identity_id FK; decided_at; decision CHECK `('approved','rejected')`; note NULL | [rev2.2] One row per deciding identity, so `required_count > 1` is a count over rows, not a schema change. Dual control: nullable `quota_policies.dual_control_above_tokens` and a per-container list of secret names / plugins whose wiring raises `required_count` to 2 (reserved, not enforced). |
-| review_attestations | attestation_id PK; session_id FK; state_id; payload_digest; reviewer_identity_id FK; attested_at; verdict CHECK `('signed_off','changes_requested','withdrawn')` [rev2.2]; note NULL | Append-only. Reviewer ≠ author (CHECK); the reviewer must hold an active `reviewer` role [rev2.3]. **Named "reviewer attestations" everywhere — schema, API, UI [rev2.2].** It is a ledger, not a control: nothing refuses on it. The phrase "two-person rule" is reserved for something that refuses; a UI must never say "two-person rule satisfied" over an unenforced count. |
-| library_entries | entry_id PK; published_from_session_id FK; payload_digest; compartment_id; title; version int; published_by_identity_id FK; curated_by_identity_id NULL FK; published_at; accepted_at NULL; rejected_at NULL; rejection_note NULL; deprecated_at NULL; recalled_at NULL; note NULL | Frozen, content-addressed. **A library entry is the public projection (`generate_public_yaml` shape), never a session reference, and it is config-only [rev2.2]:** publishing a pipeline that reads an uploaded blob is refused with a named `error_type` ("publish a profile-bound source instead"), because blob custody proves same-principal on fork and a cross-user fork of a blob-backed source cannot copy the blob without becoming an intra-container exfiltration path. Forking a library entry instantiates the projection into the forker's own staging session; `forked_from_session_id` points at that staging session and the entry's `payload_digest` carries provenance. Visible deployment-wide once `accepted_at` is set by a `curator`. Curator ≠ publisher (CHECK). Recall flags, never deletes. `library_published` audit rows carry `payload_digest` and `compartment_id` so the same artifact appearing in two containers is detectable later. |
-| quota_policies | policy_id PK; identity_id NULL FK; tokens_per_day int; storage_bytes int [rev2.5, D18]; dual_control_above_tokens NULL int; set_by_identity_id FK; set_at; revoked_at NULL | Per person (D11) **plus the container ceiling row (`identity_id` NULL) shipped now [rev2.2]**, because activation otherwise grants unbounded spend on the container's shared LLM credential. Two partial uniques, both dialects: active per identity, and active `WHERE identity_id IS NULL` (NULLs are distinct for uniqueness in Postgres, so one predicate does not cover both). Activation writes the per-identity row from `quota_default_tokens_per_day` (D15), so no applicable policy is reachable only through corruption and refuses. Every `quota_set` / `quota_exceeded` event records the cap and the ceiling in force. **Storage [rev2.5]:** `storage_bytes` is a standing level, not a daily rate; usage is `SUM(blobs.size_bytes)` joined through `sessions.identity_id` over live rows (deleted blobs leave no row), evaluated inside the upload's existing session blob lock so two concurrent uploads cannot both pass. Blobs created by the system on the identity's behalf (inline custody, fork copies) count against the identity; the `system` exemption applies to tokens only. Admin set/revoke is one route for both dimensions. |
+| review_attestations | attestation_id PK; session_id FK; state_id; payload_digest; reviewer_identity_id FK; attested_at; verdict CHECK `('signed_off','changes_requested','withdrawn')` [rev2.2]; note NULL | Append-only; `note` bounded at 4 KiB like the approval notes, and required non-blank when `verdict='changes_requested'` [rev2.8]. Reviewer ≠ author (CHECK); the reviewer must hold an active `reviewer` role [rev2.3]. **"Reviewer ≠ author" needs the author on the row to be a CHECK at all [rev2.8]:** add `author_identity_id`, denormalised as an **immutable snapshot taken at attestation time**, never a mirror of `sessions.identity_id`. A mirror would be a second source of truth that drifts when a session changes hands, the failure this codebase has already documented elsewhere. With the snapshot the rule is a single-row CHECK; without it, it is a cross-table invariant no dialect can express. **Named "reviewer attestations" everywhere — schema, API, UI [rev2.2].** It is a ledger, not a control: nothing refuses on it. The phrase "two-person rule" is reserved for something that refuses; a UI must never say "two-person rule satisfied" over an unenforced count. |
+| review_requests **[rev2.8, D26]** | request_id PK; session_id FK; state_id; requested_by_identity_id FK; reviewer_identity_id NULL FK; requested_at; cancelled_at NULL; request_note NULL (4 KiB) | The rev2.6 mailbox promises an Inbox of "review requests addressed to me" and nothing recorded one: `review_attestations` is append-only with a non-null reviewer and exists only once a review has *happened*. A sibling table, rather than nullable columns and a `requested` verdict on the attestation ledger, because that would contradict the ledger's own append-only, "not a control" design and would fill the approver's audit view with requests nobody ever completed. `reviewer_identity_id` NULL means "any active `reviewer`", matching the role-based eligibility already ruled for approvals. Closed by an attestation on the same `(session_id, state_id)`, or by `cancelled_at`. The badge counts open rows addressed to the caller plus open unaddressed rows the caller is eligible for. |
+| library_entries | entry_id PK; published_from_session_id provenance column (**not an FK** [rev2.8, D29]); payload_digest; compartment_id; title; version int; published_by_identity_id FK; curated_by_identity_id NULL FK; published_at; accepted_at NULL; rejected_at NULL; rejection_note NULL; deprecated_at NULL; recalled_at NULL; note NULL | Frozen, content-addressed. **A library entry is the public projection (`generate_public_yaml` shape), never a session reference, and it is config-only [rev2.2]:** publishing a pipeline that reads an uploaded blob is refused with a named `error_type` ("publish a profile-bound source instead"), because blob custody proves same-principal on fork and a cross-user fork of a blob-backed source cannot copy the blob without becoming an intra-container exfiltration path. Forking a library entry instantiates the projection into the forker's own staging session; `forked_from_session_id` points at that staging session and the entry's `payload_digest` carries provenance. Visible deployment-wide once `accepted_at` is set by a `curator`. Curator ≠ publisher (CHECK). Recall flags, never deletes. `rejection_note` is required non-blank on rejection and bounded at 4 KiB [rev2.8]. `library_published` audit rows carry `payload_digest` and `compartment_id` so the same artifact appearing in two containers is detectable later. |
+| quota_policies | policy_id PK; identity_id NULL FK; tokens_per_day int; storage_bytes int [rev2.5, D18]; dual_control_above_tokens NULL int; set_by_identity_id FK; set_at; revoked_at NULL | Per person (D11) **plus the container ceiling row (`identity_id` NULL) shipped now [rev2.2]**, because activation otherwise grants unbounded spend on the container's shared LLM credential. Two partial uniques, both dialects: active per identity, and active `WHERE identity_id IS NULL` (NULLs are distinct for uniqueness in Postgres, so one predicate does not cover both). **Every path that makes an identity `active` writes the per-identity row** from `quota_default_tokens_per_day` and `quota_default_storage_bytes` [rev2.8, D31] — `POST activate`, local registration under `registration_mode=open`, pre-provisioning, the D20 bootstrap seed and operator CLI, and the D21 cutover re-admission. "At activation" was true of one path of six, and on the other five the identity's first run or upload refused with the audit record this spec defines as evidence of corruption. No applicable policy still refuses; it is now genuinely unreachable. Every `quota_set` / `quota_exceeded` event records the cap and the ceiling in force. **Storage [rev2.5]:** `storage_bytes` is a standing level, not a daily rate; usage is `SUM(blobs.size_bytes)` joined through `sessions.identity_id` over live rows (deleted blobs leave no row), evaluated at each of the four byte-admitting sites R13 enumerates. The bound is eventually consistent, not exact: the existing blob lock is keyed on `session_id` alone, so two sessions of one identity do not serialise against each other [rev2.8, D24]. Blobs created by the system on the identity's behalf (inline custody, fork copies) count against the identity; the `system` exemption applies to tokens only. Admin set/revoke is one route for both dimensions. |
 | token_usage_ledger | entry_id PK; identity_id NULL FK; source CHECK `('composer','run','auto_title','system')` [rev2.2]; session_id NULL FK; run_id NULL; model; prompt_tokens; completion_tokens; cached_prompt_tokens NULL; reasoning_tokens NULL; recorded_at | Operational accounting index, not audit truth (Landscape `calls` is). Composer writes one row per LLM call from `ComposerLLMCall.usage` (today persisted only inside JSON audit payloads, not queryable). Auto-titling (a paid background call per first message, which its own docstring flags as bypassing rate limits) writes `auto_title`; the boot probe writes `system` with `identity_id` NULL. Runs write one row per run at finalisation from the new `calls` token columns. Quota check = `SUM` over the ledger for the identity in the current UTC day, evaluated at execute and at composer turn start only; post-response spend lands in the next window. Over quota refuses and writes `quota_exceeded`. Accounting unavailable ⇒ refuse (fail closed); the `system` arm is exempt from the check. |
 
 ## Terminology
