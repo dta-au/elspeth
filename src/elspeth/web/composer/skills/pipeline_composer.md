@@ -315,12 +315,13 @@ closed code, `error_code`. A top-level `validation_guidance` maps each
 `message` when it has none. A top-level `plugin_schemas` (when present) is
 the option schema for each plugin a rejected component uses, keyed
 `<kind>/<name>`, each with `plugin_type`, `json_schema`, `knob_schema`,
-`web_config_authority`, `composer_hints`, and `secret_requirements` (empty
-when the plugin needs no credential). It holds one entry per distinct plugin
-the rejected components use. On a `set_pipeline` rejection, match each entry
-to every rejection whose `rejected_component` uses that plugin; on a
-single-component tool there is one entry and it is the plugin you called it
-with. Read no other entry. A rejection with no schema entry (for example
+`web_config_authority`, `composer_hints`, and `secret_requirements` (the
+credential fields YOU must wire; empty when there are none — an
+`operator_profiled` plugin's credentials live in its profile, not in your
+`options`). It holds one entry per distinct plugin the rejected components
+use. On a `set_pipeline` rejection, match each entry to every rejection whose
+`rejected_component` uses that plugin; on a single-component tool there is one
+entry: the plugin of the component you called it on. Read no other entry. A rejection with no schema entry (for example
 `plugin_not_installed`) is still a component to repair, from
 its `message`. `web_config_authority` tells you whether to author raw
 `options` (`user_configurable` or `user_configurable_with_policy`) or to
