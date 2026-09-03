@@ -7,6 +7,7 @@ candidate state as a provider result.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import threading
@@ -89,6 +90,7 @@ from elspeth.web.composer.pipeline_proposal import (
 )
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids, planner_plugin_contract
 from elspeth.web.composer.prompts import build_system_prompt
+from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import (
     CoalesceUnionTypeDetail,
     CompositionState,
@@ -2749,7 +2751,11 @@ async def test_redacted_planner_preserves_canonical_failed_state_read(
     assert payload["success"] is False
     assert payload["data"].get("error_code") != "surface_projection_unavailable"
     if "unexpected" in arguments:
-        assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
+        # The argument rejection rides under ``data`` as ``argument_error``,
+        # never as a second ``success`` / ``validation`` beside the envelope's
+        # own (SYS-R3-1): the envelope's ``validation`` here is the STATE's.
+        assert set(payload["data"]) == {"argument_error"}
+        assert payload["data"]["argument_error"]["error_code"] == "SCHEMA_VALIDATION"
     else:
         assert payload["data"]["error"] == (
             "Component 'missing-component' not found. Specify 'source', a node ID, an output name, "
@@ -2923,8 +2929,13 @@ async def test_list_sources_disclosure_closes_authoritative_validation_envelope(
     payload = json.loads(tool_message["content"])
     assert payload["success"] is not failed
     if failed:
-        assert payload["data"]["success"] is False
-        assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
+        # ``data`` carries the argument rejection under its own name. It must
+        # not restate the envelope's ``success`` (a twin) or shadow the
+        # envelope's ``validation``, which on this arm is the STATE's and whose
+        # errors are the pipeline's, not the argument's (SYS-R3-1).
+        assert set(payload["data"]) == {"argument_error"}
+        assert payload["data"]["argument_error"]["error_code"] == "SCHEMA_VALIDATION"
+        assert payload["validation"]["errors"] != [payload["data"]["argument_error"]]
     else:
         assert isinstance(payload["data"], dict)
         assert isinstance(payload["data"]["available"], list)
@@ -2986,8 +2997,13 @@ async def test_preview_pipeline_disclosure_fails_closed_when_authoritative_data_
         assert all(canary not in tool_message["content"] for canary in _ALL_PROVIDER_DISCLOSURE_CANARIES)
         if failed:
             assert payload["success"] is False
-            assert payload["data"]["success"] is False
-            assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
+            # Same shape on the RESTRICTED surface, which is where it matters
+            # most: ``_closed_provider_discovery_payload`` strips messages from
+            # the envelope's validation and then passes ``data`` through
+            # verbatim, so a second validation envelope under ``data`` would
+            # defeat that closure (SYS-R3-1).
+            assert set(payload["data"]) == {"argument_error"}
+            assert payload["data"]["argument_error"]["error_code"] == "SCHEMA_VALIDATION"
             assert payload["data"].get("error_code") != "surface_projection_unavailable"
         else:
             assert payload["success"] is False
@@ -10462,3 +10478,74 @@ def test_rejection_subject_is_read_structurally_never_parsed_from_the_message() 
     (withheld_entry,) = withheld["validation"]["errors"]
     assert withheld_entry["component"] == "pipeline"
     assert "RAW_MESSAGE_CANARY" not in json.dumps(withheld_entry)
+
+
+def test_argument_rejection_projections_split_by_surface() -> None:
+    """The argument rejection has two shapes because it has two surfaces, and one entry builder.
+
+    On the repair loop it is the WHOLE tool message
+    (``_allowlisted_argument_feedback``), with nothing around it, so ``success``
+    and ``validation`` are the message's own top-level fields — the family shape
+    ``_canonical_schema_feedback`` and the other terminal-rejection builders use
+    there. On the discovery arm it rides under the ``data`` of a ``ToolResult``
+    that already carries a ``success`` and a ``validation`` of its own, so the
+    same two keys would be a twin and a homonym: the envelope's ``validation``
+    is the STATE's (its errors are the pipeline's), while this one is the
+    rejected argument (systems seat SYS-R3-1). ``_allowlisted_argument_error_payload``
+    names it ``argument_error`` instead.
+
+    Both projections carry the SAME entry, so a field added to one cannot go
+    missing from the other; the entry's own key ORDER is pinned because it is
+    the wire order on both surfaces.
+    """
+    error = ToolArgumentError(argument="plugin_type", expected="a plugin kind", actual_type="str", code="DISCOVERY_ONLY")
+    entry = pipeline_planner._allowlisted_argument_error_entry(error)
+    assert tuple(entry) == ("component", "severity", "error_code", "error_class")
+    assert entry == {
+        # ``plugin_type`` is not in the closed schema-owned label vocabulary,
+        # so ToolArgumentError canonicalizes it: what the projection carries is
+        # operator-owned whatever the raiser passed.
+        "component": "tool argument",
+        "severity": "high",
+        "error_code": "DISCOVERY_ONLY",
+        "error_class": "ToolArgumentError",
+    }
+
+    payload = pipeline_planner._allowlisted_argument_error_payload(error)
+    assert tuple(payload) == ("argument_error",)
+    assert payload["argument_error"] == entry
+    assert "success" not in payload, "the envelope's success already says the call failed"
+    assert "validation" not in payload, "a data.validation beside the envelope's is a homonym"
+
+    message = pipeline_planner._allowlisted_argument_feedback(error)
+    assert tuple(message) == ("success", "validation")
+    assert message["validation"]["errors"] == [entry]
+    assert tuple(pipeline_planner._canonical_schema_feedback()) == tuple(message), (
+        "the whole-message surface keeps one family shape; this is the sibling that pins it"
+    )
+
+
+def test_discovery_argument_rejection_builds_its_data_inline() -> None:
+    """The discovery ARG_ERROR result's ``data=`` IS the payload constructor call.
+
+    Built inline, the payload has no local, alias or ``cast`` target for a later
+    store to travel through, and ``ToolResult.__post_init__`` freezes it before
+    any other statement runs — the closure c6f857aa0 applied to the
+    APPROVAL_REQUIRED payload, for the same reason. Read from the AST rather
+    than from behaviour because what is pinned is that no OTHER shape can be
+    written here: a re-introduced ``feedback = _allowlisted_argument_feedback(exc)``
+    fed to ``data=dict(feedback)`` (the shape this replaced) reds this test
+    while shipping a payload a behavioural assertion on one example might miss.
+    """
+    tree = ast.parse(Path(pipeline_planner.__file__).read_text(encoding="utf-8"))
+    fns = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "execute_one_discovery"]
+    assert len(fns) == 1, "premise: one execute_one_discovery in the planner"
+    results = [
+        node for node in ast.walk(fns[0]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ToolResult"
+    ]
+    assert len(results) == 1, "premise: the discovery arm constructs exactly one ToolResult"
+    (data_kw,) = [kw for kw in results[0].keywords if kw.arg == "data"]
+    assert isinstance(data_kw.value, ast.Call), "data= must be the payload constructor call, not a name or a dict"
+    assert isinstance(data_kw.value.func, ast.Name)
+    assert data_kw.value.func.id == "_allowlisted_argument_error_payload"
+    assert not data_kw.value.keywords and len(data_kw.value.args) == 1

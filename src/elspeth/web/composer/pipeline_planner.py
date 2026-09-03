@@ -2975,22 +2975,66 @@ def _materialize_terminal_payload(
     return pipeline_result, owned_refs, None, False
 
 
-def _allowlisted_argument_feedback(error: ToolArgumentError) -> Mapping[str, Any]:
+class _AllowlistedArgumentErrorEntry(TypedDict):
+    """One argument rejection, projected without its message or its input.
+
+    ``ToolArgumentError`` canonicalizes ``argument`` to a closed schema-owned
+    label and ``code`` to a closed dispatch discriminant, so every member here
+    is operator-owned; the LLM-supplied value never reaches this projection.
+    """
+
+    component: str
+    severity: str
+    error_code: str
+    error_class: str
+
+
+class _AllowlistedArgumentErrorPayload(TypedDict):
+    """``data`` for a discovery result the planner rejected on its arguments.
+
+    ``argument_error`` rather than ``validation``: on that arm the entry rides
+    under the ``data`` of a ``ToolResult`` whose own ``validation`` is the
+    STATE's, so a same-named key would be a homonym carrying different content
+    (systems seat SYS-R3-1), and the envelope's ``success`` already says the
+    call failed. The whole-message projection below keeps the family shape
+    because it has no envelope beside it.
+    """
+
+    argument_error: _AllowlistedArgumentErrorEntry
+
+
+def _allowlisted_argument_error_entry(error: ToolArgumentError) -> _AllowlistedArgumentErrorEntry:
     """Project a semantic argument failure without its message or input."""
+    return {
+        "component": error.argument,
+        "severity": "high",
+        "error_code": error.code or "argument_error",
+        "error_class": "ToolArgumentError",
+    }
+
+
+def _allowlisted_argument_feedback(error: ToolArgumentError) -> Mapping[str, Any]:
+    """The whole tool-message content for an argument rejection on the repair loop.
+
+    This is a tool message the planner reads on its own, with no envelope
+    around it, so ``success`` and ``validation`` here are the message's own
+    top-level fields — the same shape ``_canonical_schema_feedback`` and the
+    other terminal-rejection builders use on that surface, not a ``data``
+    payload beside an envelope that already carries both. The ``data`` arm is
+    ``_allowlisted_argument_error_payload``.
+    """
     return {
         "success": False,
         "validation": {
             "is_valid": False,
-            "errors": [
-                {
-                    "component": error.argument,
-                    "severity": "high",
-                    "error_code": error.code or "argument_error",
-                    "error_class": "ToolArgumentError",
-                }
-            ],
+            "errors": [_allowlisted_argument_error_entry(error)],
         },
     }
+
+
+def _allowlisted_argument_error_payload(error: ToolArgumentError) -> _AllowlistedArgumentErrorPayload:
+    """``data`` for the ToolResult arm of an argument rejection."""
+    return {"argument_error": _allowlisted_argument_error_entry(error)}
 
 
 class _ClosedProviderValidationEntry(TypedDict):
@@ -4963,7 +5007,13 @@ async def _plan_pipeline_inner(
                 # projection back as this call's tool result and let the model
                 # repair next turn. Raising here would crash the whole request
                 # as a non-PipelinePlannerError 500 with no disposition.
-                feedback = _allowlisted_argument_feedback(exc)
+                #
+                # The payload is the ``data`` projection, not the whole-message
+                # one: this arm has an envelope, whose ``success`` says the call
+                # failed and whose ``validation`` is the STATE's — a second
+                # ``validation`` under ``data`` carrying the argument rejection
+                # instead would be a homonym, and a ``success`` there a twin
+                # (SYS-R3-1). Built inline so there is no local to re-shape.
                 return (
                     call,
                     ToolResult(
@@ -4971,7 +5021,7 @@ async def _plan_pipeline_inner(
                         updated_state=current_state,
                         validation=current_state.validate(),
                         affected_nodes=(),
-                        data=dict(feedback),
+                        data=_allowlisted_argument_error_payload(exc),
                     ),
                     False,
                 )
