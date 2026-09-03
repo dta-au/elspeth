@@ -1503,7 +1503,12 @@ EdgeContractDict = TypedDict(
 
 @dataclass(frozen=True, slots=True)
 class EdgeContract:
-    """Schema contract check result for a single producer->consumer edge."""
+    """Schema contract check result for one producer->consumer PAIR.
+
+    Not one row per graph edge: ``from_id`` is the REAL upstream producer,
+    walked past forwarding nodes, and several routes converging from that
+    producer onto one consumer collapse into a single row.
+    """
 
     from_id: str
     to_id: str
@@ -1529,11 +1534,18 @@ class ValidationSummary:
     """Stage 1 validation result.
 
     errors block execution. warnings are advisory but actionable.
-    suggestions are optional improvements. edge_contracts shows
-    per-edge schema contract check results. semantic_contracts shows
-    per-edge semantic contract check results (Phase 1: line_explode +
-    web_scrape only). All are tuples for structured component
-    attribution.
+    suggestions are optional improvements. edge_contracts shows one
+    schema contract check per producer->consumer PAIR that was checked,
+    not one per graph edge: the producer is the real upstream walked past
+    forwarding nodes, a node pair is emitted only where the consumer
+    requires fields, and a sink pair is deduped per real producer and
+    emitted only where the sink requires fields AND the producer makes a
+    static claim (the ADR-007 abstention clause). An absent pair is
+    therefore "not checked", never "checked and satisfied".
+    semantic_contracts shows one check per (producer, consumer, required
+    field) triple, an unresolvable producer recorded under a ``"?"``
+    from_id (Phase 1: line_explode + web_scrape only). All are tuples for
+    structured component attribution.
     """
 
     is_valid: bool
