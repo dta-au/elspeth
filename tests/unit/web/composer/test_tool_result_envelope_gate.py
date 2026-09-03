@@ -1863,6 +1863,12 @@ def test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censu
             keys = tuple(_key_of(key, {}, f"{_display(TOOL_BATCH)}:{name}") for key in rhs.keys if key is not None)
             assert mappings.setdefault(name, keys) == keys, f"{name}: two dict literals with different keys"
     assert mappings == _ADVISOR_ENVELOPE_PAYLOADS
+    # The recorded keys are the literal's, so they are the whole payload only
+    # while nothing re-shapes it afterwards. Enumerating from the ASSIGNMENTS
+    # alone is what let `|=` past four other walkers (red-team RED2-1); here the
+    # same escape would silently widen an envelope no census reaches at all.
+    reshaped = {name: _dict_mutations(fn, _aliases_of(fn, name), frozenset()) for name in sorted(mappings)}
+    assert not any(reshaped.values()), f"an advisor payload is re-shaped after its literal: {reshaped}"
 
 
 # The APPROVAL_REQUIRED proposal payload, in the order run_tool_batch authors it. ``success`` is
