@@ -330,7 +330,8 @@ author `options.profile` instead and leave the plugin's own options alone
 
 A credential failure carries `credential_fields`, `components`
 (`component_id`, `component_type`, `fields`), and `repair` with an
-`inline_form` (`instruction`, `example_options`) and a `post_hoc_form`
+`inline_form` (`instruction`, `example_options` — each defective field shown
+as a `secret_ref` marker to copy) and a `post_hoc_form`
 (`instruction`, `tool_sequence` — the tool-names-only shape above); follow
 one form exactly. A full-replacement rejection may add
 `components_withheld`: the count of further defective components not

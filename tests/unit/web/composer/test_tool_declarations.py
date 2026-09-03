@@ -432,7 +432,8 @@ class TestStep3DiscoveryTierMigration:
                 "    get_plugin_schema responses; this tool is the explicit path.)\n"
                 "  * Pass an ``issue_code`` (validators emit these as requirement_code "
                 "    on semantic_contracts entries) to get failure-time guidance — "
-                "    `summary`, `suggested_fixes`, and `examples` (before/after configurations).\n"
+                "    `summary`, `suggested_fixes`, and `examples` — each a `title` with the "
+                "    `before` and `after` configurations it contrasts.\n"
                 "Every result names the `plugin_name` and `plugin_type` it describes; a plugin with no published "
                 "guidance returns `summary` null and empty lists."
             ),
@@ -555,10 +556,14 @@ class TestStep3DiscoveryTierMigration:
             "`preview_is_valid` (true only when the authoring check, the runtime "
             "check and the source proof all pass), `preview_errors` (entries only "
             "the preview stage produces, such as `runtime_preflight_not_run`), "
-            "`edge_contracts`, `proof_diagnostics`, `structural_preview` when "
-            "present (an advisory re-check whose `is_valid` is not the verdict), "
-            "and a read-only overview: `sources`, `nodes`, `outputs`, "
-            "`node_count`, `output_count`.",
+            "`edge_contracts` (one entry per edge: `from` and `to`, the "
+            "`producer_guarantees` and `consumer_requires` field names, the "
+            "`missing_fields` between them, and `satisfied`), `proof_diagnostics`, "
+            "`structural_preview` when present (an advisory re-check whose "
+            "`is_valid` is not the verdict), and a read-only overview: `sources` "
+            "(keyed by source name, each with `plugin`, `on_success` and "
+            "`has_schema_config`), `nodes`, `outputs`, `node_count`, "
+            "`output_count`.",
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 

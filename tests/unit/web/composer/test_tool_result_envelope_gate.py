@@ -143,7 +143,45 @@ _DATA_HELPER_PAYLOADS: dict[str, type | _Literal | None] = {
     "facts_to_dict": _Literal(COMPOSER / "source_inspection.py", "facts_to_dict"),
     "diff_states": _Literal(COMMON, "diff_states"),
     "_vf_destination_note": _Literal(COMMON, "_vf_destination_note"),
+    # Element builders of a shipped container. Unreachable from a ``data=`` site directly —
+    # each is called once per item inside a comprehension or splatted into one — and
+    # unattributed until ``_nested_value_keys`` stopped declining containers (RED2-2 residue).
+    "_serialize_source": _Literal(COMMON, "_serialize_source"),
+    "_serialize_edge": _Literal(COMMON, "_serialize_edge"),
+    "_serialize_output": _Literal(COMMON, "_serialize_output"),
+    "_serialize_set_pipeline_node": common._SetPipelineNodePayload,
+    "_serialize_plugin_assistance_example": _Literal(TOOLS_DIR / "generation.py", "_serialize_plugin_assistance_example"),
 }
+
+
+class _Elsewhere(NamedTuple):
+    """A container whose elements ANOTHER derivation censuses, named here so a reader can check it.
+
+    Not a fence and not silence: the keys are enumerated, by the derivation this
+    names, and ``test_every_deferred_container_element_is_censused_by_its_named_derivation``
+    runs that derivation and fails unless it really yields rows under the path.
+    A deferral written for a derivation that stopped covering the path is a red.
+    """
+
+    derivation: str
+
+
+# container path -> the payload its ELEMENTS carry, for a container whose element expression is
+# a method call. ``_DATA_HELPER_PAYLOADS`` keys on the bare callee name, which cannot tell one
+# ``to_dict`` from another (``test_every_attributed_helper_name_answers_to_one_module``), so the
+# element of ``[e.to_dict() for e in ...]`` is attributed on the container's dotted path instead.
+_CONTAINER_ELEMENT_PAYLOADS: dict[str, type | _Elsewhere] = {
+    "validation.errors": _Elsewhere("_validation_typed_sites"),
+    "validation.warnings": _Elsewhere("_validation_typed_sites"),
+    "validation.suggestions": _Elsewhere("_validation_typed_sites"),
+    "data.edge_contracts": state.EdgeContractDict,
+}
+# A nested value the walker can see is a REFERENCE and not a container: its shape lives at the
+# other end of a name, an attribute, a subscript or a call, and this position has no enclosing
+# function to resolve it through (``_expr_keys`` does, which is why it can refuse one). Named
+# rather than fallen through, so a shape that is NEITHER readable nor one of these — a walrus,
+# an ``await``, a starred element — refuses instead of shipping unseen.
+_OPAQUE_REFERENCES = (ast.Name, ast.Attribute, ast.Subscript, ast.Call)
 # Wrappers that return their first argument's shape unchanged.
 _PASSTHROUGH_HELPERS = frozenset({"redact_source_storage_path"})
 # (file name, enclosing function, local name) -> payload type, ONLY for a local the resolver
@@ -234,32 +272,129 @@ def _is_own_data(node: ast.AST) -> bool:
     return isinstance(node, ast.Call) and _is_cast(node) and len(node.args) == 2 and _is_own_data(node.args[1])
 
 
+def _attributed_call_keys(call: ast.Call, *, prefix: str, site: str, depth: int, where: str) -> Iterator[str]:
+    """Keys a CALL contributes, read from its attribution — one authority, because three walkers ask.
+
+    A ``data=`` expression (``_expr_keys``), a ``{**helper(), ...}`` splat
+    (``_splat_keys``) and a container whose elements a helper builds
+    (``_nested_value_keys``) all face the same question, and an unattributed
+    callee is a REFUSAL in all three: a helper the walker cannot name is a
+    payload it cannot enumerate. ``where`` names the syntactic position, because
+    the same missing attribution reads very differently at each one.
+    """
+    helper = _call_name(call)
+    assert helper in _DATA_HELPER_PAYLOADS, f"{site}: {where} built by unattributed helper {helper!r} — add it to _DATA_HELPER_PAYLOADS"
+    attribution = _DATA_HELPER_PAYLOADS[helper]
+    if isinstance(attribution, _Literal):
+        yield from _helper_return_keys(attribution, prefix=prefix, site=site, depth=depth + 1)
+        return
+    yield from _payload_keys(attribution, prefix)
+
+
 def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
     """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
-    producer), the attributed keys for a name in ``_SPLAT_KEYS``, or — inside a handler — whatever
-    the local resolves to. Anything else is a refusal."""
+    producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+    called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+    refusal."""
     if _is_own_data(node):
         return iter(())
     if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
         return iter(_SPLAT_KEYS[node.id])
     if isinstance(node, ast.Name) and resolve_name is not None:
         return resolve_name(node)
+    if isinstance(node, ast.Call):
+        return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
     raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
 
 
-def _nested_value_keys(value: ast.AST, path: str, site: str, constants: dict[str, str]) -> Iterator[str]:
-    """Keys nested INSIDE a value already reported at ``path``: a dict literal, or a list/tuple of them.
+def _container_element(value: ast.AST) -> ast.expr | None:
+    """The per-item expression of a comprehension — what a ``[...]``/``{...}`` comprehension ships."""
+    if isinstance(value, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        return value.elt
+    if isinstance(value, ast.DictComp):
+        return value.value
+    return None
+
+
+def _nested_value_keys(
+    value: ast.AST,
+    path: str,
+    site: str,
+    constants: dict[str, str],
+    resolve_name: _NameResolver | None = None,
+    *,
+    element_of: str | None = None,
+) -> Iterator[str]:
+    """Keys nested INSIDE a value already reported at ``path``. Every shape is ENUMERATED; silence is not an arm.
 
     One authority for "what is inside a shipped value", because two walkers ask
     it: a value in a dict literal, and a value stored through a subscript
     (``changes["sources"] = {...}``). The subscript arm reported only the
-    outer key until now, so three ``diff_pipeline`` keys shipped to the model
-    while the census had never enumerated them.
+    outer key until seat-fix-r4, so three ``diff_pipeline`` keys shipped to the
+    model while the census had never enumerated them.
+
+    Until this, the two readable shapes were an ``if``/``elif`` and EVERY other
+    shape fell off the end and returned nothing. A comprehension therefore
+    contributed its outer key and nothing under it: ``"version": 1`` added to
+    the per-source dict of ``preview_pipeline``'s ``data.sources`` — a homonym
+    of the envelope's own ``version``, the exact class ``d0c40b143`` added a
+    rule to refuse — left the whole gate green with the census unmoved at 344
+    rows, because the key never entered it (mutation ledger 4, the one
+    survivor). The rule was sound; this walk was blind.
+
+    Three verdicts, each named:
+
+    * **Readable.** A dict literal, a list/tuple (every element, not just the
+      first), a comprehension's element expression, and both branches of an
+      ``x if c else y`` — recursed into, so what they ship is enumerated.
+    * **Keyless.** A scalar constant or an f-string ships no keys at all.
+    * **Opaque.** A name, attribute, subscript or call: the walker can see this
+      is a REFERENCE, not that it is a container, and this position carries no
+      enclosing function to resolve it through. It contributes nothing, and
+      that is the honest limit of the position rather than a verdict — a
+      payload built by an unattributed helper and stored under a plain key is
+      still unseen here (recorded on elspeth-e405ad7cd2, not closed).
+
+    Anything else REFUSES, naming the site. And inside a container the source
+    proves IS one, ``element_of`` is set and the opaque arm no longer applies:
+    the walker knows keys are shipped per item, so an element it cannot read is
+    a refusal, resolved by attributing the element or restructuring the
+    producer — never by letting it pass.
     """
     if isinstance(value, ast.Dict):
-        yield from _dict_literal_keys(value, path + ".", site, constants)
-    elif isinstance(value, (ast.List, ast.Tuple)) and value.elts and isinstance(value.elts[0], ast.Dict):
-        yield from _dict_literal_keys(value.elts[0], path + "[].", site, constants)
+        yield from _dict_literal_keys(value, path + ".", site, constants, resolve_name)
+        return
+    element = _container_element(value)
+    if element is not None:
+        yield from _nested_value_keys(element, path + "[]", site, constants, resolve_name, element_of=path)
+        return
+    if isinstance(value, (ast.List, ast.Tuple)):
+        for item in value.elts:
+            yield from _nested_value_keys(item, path + "[]", site, constants, resolve_name, element_of=path)
+        return
+    if isinstance(value, ast.IfExp):
+        yield from _nested_value_keys(value.body, path, site, constants, resolve_name, element_of=element_of)
+        yield from _nested_value_keys(value.orelse, path, site, constants, resolve_name, element_of=element_of)
+        return
+    if isinstance(value, (ast.Constant, ast.JoinedStr)):
+        return
+    if element_of is None:
+        assert isinstance(value, _OPAQUE_REFERENCES), (
+            f"{site}: {path} is a {type(value).__name__}, which is neither a shape the walker reads "
+            f"nor a reference it names ({ast.dump(value)[:60]})"
+        )
+        return
+    attribution = _CONTAINER_ELEMENT_PAYLOADS.get(element_of)
+    if isinstance(attribution, _Elsewhere):
+        return
+    if attribution is not None:
+        yield from _payload_keys(attribution, path + ".")
+        return
+    assert isinstance(value, ast.Call), (
+        f"{site}: {element_of} ships one {type(value).__name__} per item, whose keys the walker cannot "
+        f"read ({ast.dump(value)[:60]}) — attribute it in _CONTAINER_ELEMENT_PAYLOADS or restructure the producer"
+    )
+    yield from _attributed_call_keys(value, prefix=path + ".", site=site, depth=0, where=f"the element of {element_of}")
 
 
 def _dict_literal_keys(
@@ -285,7 +420,7 @@ def _dict_literal_keys(
         assert not _is_cast(value), f"{site}: cast(...) hides the shape of {prefix}{key}"
         path = f"{prefix}{key}"
         yield path
-        yield from _nested_value_keys(value, path, site, constants)
+        yield from _nested_value_keys(value, path, site, constants, resolve_name)
 
 
 def _merged_mapping_keys(
@@ -566,6 +701,50 @@ def f():
     return {"components": ({"component_id": "x", "fields": ("a",)},), "repair": {"inline_form": {"instruction": "i"}}}
 """
 
+# One nested value per arm of ``_nested_value_keys``: the four comprehensions, a multi-element
+# list, both branches of a conditional, the two keyless scalars, an opaque reference, and an
+# empty container. The keys are deliberately distinct per arm, so which arm ran is legible from
+# the result alone rather than inferred.
+_PROBE_NESTED_SHAPES = """
+def f(rows, flag, other):
+    return {
+        "from_list_comp": [{"a": 1} for r in rows],
+        "from_dict_comp": {r: {"b": 2} for r in rows},
+        "from_generator": ({"c": 3} for r in rows),
+        "from_set_comp": {f"{r}" for r in rows},
+        "from_list": [{"d": 4}, {"e": 5}],
+        "from_ifexp": {"g": 6} if flag else {"h": 7},
+        "keyless_constant": 1,
+        "keyless_fstring": f"{flag}",
+        "opaque_reference": other.payload,
+        "empty": [],
+    }
+"""
+
+# Shapes no arm reads. The first two sit in a plain value position, where the walker names
+# references it cannot resolve but refuses anything it cannot even classify; the last two are
+# ELEMENTS of a container the source proves ships keys per item, where a reference is refused
+# too because the walker knows there is something under it to enumerate.
+_PROBE_NESTED_BINOP = """
+def f(head, tail):
+    return {"note": head + tail}
+"""
+
+_PROBE_NESTED_WALRUS = """
+def f(other):
+    return {"payload": (bound := other.payload)}
+"""
+
+_PROBE_NESTED_BARE_ELEMENT = """
+def f(rows):
+    return {"items": [row for row in rows]}
+"""
+
+_PROBE_NESTED_UNATTRIBUTED_ELEMENT = """
+def f(rows):
+    return {"items": [_serialize_nothing(row) for row in rows]}
+"""
+
 _PROBE_IMPORTED_KEY = """
 def f():
     return {_DATA_ERROR_KEY: "boom", "other": 1}
@@ -842,6 +1021,75 @@ def test_walker_recurses_through_tuple_of_dicts_and_nested_dicts() -> None:
     ]
 
 
+def _nested_probe_keys(source: str) -> list[str]:
+    tree = ast.parse(source)
+    fn = _function(tree, "f")
+    ret = next(n for n in ast.walk(fn) if isinstance(n, ast.Return))
+    assert ret.value is not None
+    return list(_dict_literal_keys(ret.value, "data.", "probe", {}))
+
+
+def test_nested_walker_reads_every_container_shape_and_names_what_it_cannot() -> None:
+    """Each arm of ``_nested_value_keys``, so the ENUMERATION is pinned rather than assumed.
+
+    The arms that matter here are the comprehensions. Before them the helper
+    was an ``if``/``elif`` over two literal shapes and everything else fell off
+    the end reporting nothing, so a key added inside a comprehension-valued
+    payload never entered the census at all — measured by a mutant that put
+    ``version`` inside ``preview_pipeline``'s ``data.sources`` and left the
+    whole gate green (mutation ledger 4). The list arm walks EVERY element, not
+    just the first: a heterogeneous list ships each element's keys.
+    """
+    assert _nested_probe_keys(_PROBE_NESTED_SHAPES) == [
+        "data.from_list_comp",
+        "data.from_list_comp[].a",
+        "data.from_dict_comp",
+        "data.from_dict_comp[].b",
+        "data.from_generator",
+        "data.from_generator[].c",
+        "data.from_set_comp",
+        "data.from_list",
+        "data.from_list[].d",
+        "data.from_list[].e",
+        "data.from_ifexp",
+        "data.from_ifexp.g",
+        "data.from_ifexp.h",
+        "data.keyless_constant",
+        "data.keyless_fstring",
+        "data.opaque_reference",
+        "data.empty",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (_PROBE_NESTED_BINOP, "data.note is a BinOp, which is neither a shape the walker reads"),
+        (_PROBE_NESTED_WALRUS, "data.payload is a NamedExpr, which is neither a shape the walker reads"),
+        (_PROBE_NESTED_BARE_ELEMENT, "data.items ships one Name per item, whose keys the walker cannot read"),
+        (_PROBE_NESTED_UNATTRIBUTED_ELEMENT, "the element of data.items built by unattributed helper"),
+    ],
+    ids=["binop", "walrus", "bare-element", "unattributed-element"],
+)
+def test_nested_walker_refuses_a_value_it_can_neither_read_nor_name(source: str, message: str) -> None:
+    """Silence is not an arm: a nested value outside the enumeration REFUSES, naming the site.
+
+    Two registers, and the difference is what the SOURCE proves. In a plain
+    value position the walker can see a name, attribute, subscript or call is a
+    REFERENCE — it cannot resolve one here (no enclosing function) and says so
+    by reporting nothing — but a shape it cannot even classify is a refusal.
+    Inside a comprehension or a list the source proves keys ship per item, so
+    an element it cannot read is a refusal too: a reference is no longer an
+    honest limit when the walker knows there is a payload underneath it.
+
+    Without these, deleting the refusals is invisible — the census had no site
+    that exercised the unreadable branch, which is exactly why the surviving
+    mutant survived.
+    """
+    with pytest.raises(AssertionError, match=re.escape(message)):
+        _nested_probe_keys(source)
+
+
 def test_typed_keys_recurse_through_nested_and_list_of_typed_dicts() -> None:
     assert _typed_keys(_ProbeEnvelope, "x.") == [
         "x.items",
@@ -1010,6 +1258,14 @@ def _validation_typed_sites() -> Iterator[ShippedKey]:
         yield ShippedKey("validation", SHARED, key, f"{_display(COMMON)}:_SemanticEdgeContractPayload")
     for key in _typed_keys(common._GraphRepairSuggestion, "validation.graph_repair_suggestions[]."):
         yield ShippedKey("validation", SHARED, key, f"{_display(COMMON)}:_GraphRepairSuggestion")
+
+
+# The derivations an ``_Elsewhere`` deferral may name, resolved to the function itself so the
+# check runs the real thing. Bound here rather than looked up by name at call time: a deferral
+# that names a derivation this file no longer has is a refusal, not a miss.
+_CENSUS_DERIVATIONS: dict[str, Callable[[], Iterator[ShippedKey]]] = {
+    "_validation_typed_sites": _validation_typed_sites,
+}
 
 
 def _delta_sites() -> Iterator[ShippedKey]:
@@ -1279,12 +1535,7 @@ def _expr_keys(
         if helper == "dict" and expr.args:
             yield from _expr_keys(expr.args[0], fn=fn, tree=tree, path=path, prefix=prefix, site=site, depth=depth + 1, visiting=visiting)
             return
-        assert helper in _DATA_HELPER_PAYLOADS, f"{site}: data built by unattributed helper {helper!r} — add it to _DATA_HELPER_PAYLOADS"
-        attribution = _DATA_HELPER_PAYLOADS[helper]
-        if isinstance(attribution, _Literal):
-            yield from _helper_return_keys(attribution, prefix=prefix, site=site, depth=depth + 1, visiting=visiting)
-        else:
-            yield from _payload_keys(attribution, prefix)
+        yield from _attributed_call_keys(expr, prefix=prefix, site=site, depth=depth, where="data")
         return
     if isinstance(expr, ast.Name):
         fn_name = fn.name
@@ -1610,7 +1861,11 @@ def test_no_nested_key_is_a_homonym_of_an_envelope_key() -> None:
     walker started reporting nested values). A future collision is an
     adjudication (rename
     the nested key, or split the envelope's), not something to route around
-    here: the reader cannot tell the two apart, whatever the gate does.
+    here: the reader cannot tell the two apart, whatever the gate does. A
+    depth-blind rule is worth only the walk beneath it: this stayed green
+    against a ``version`` planted inside ``data.sources`` until
+    ``_nested_value_keys`` stopped declining comprehension-valued payloads
+    (401 rows).
 
     NOT closed by this: a leaf admitted because some OTHER tool's description
     quotes it. That is the same ``is_taught`` mechanism one step out, it needs
@@ -1712,6 +1967,34 @@ def test_no_shared_envelope_key_is_unadmitted_on_a_mutation_tool() -> None:
             continue
         missing = can_ship(tool) - keys - {"data"}  # data admission is per tool by design
         assert not missing, f"{tool}: can ship {sorted(missing)} but the audit row does not admit them"
+
+
+def test_every_deferred_container_element_is_censused_by_its_named_derivation() -> None:
+    """An ``_Elsewhere`` deferral is CHECKED against the derivation it names, never taken on trust.
+
+    ``_nested_value_keys`` reports nothing for a container whose elements
+    another derivation already enumerates — the three ``validation`` entry
+    lists, which reach the census from ``ValidationEntryDict`` at a depth
+    ``_entry_keys`` owns. That is a claim about the census, so this runs the
+    named derivation and fails unless it really yields rows UNDER the deferred
+    path. Without it a deferral is indistinguishable from the silent return
+    this walker was rewritten to remove: the coverage could go away — the
+    derivation renamed, its prefix changed — and the container would quietly
+    stop being censused by anyone.
+    """
+    uncovered = []
+    for path, attribution in sorted(_CONTAINER_ELEMENT_PAYLOADS.items()):
+        if not isinstance(attribution, _Elsewhere):
+            continue
+        derivation = _CENSUS_DERIVATIONS.get(attribution.derivation)
+        assert derivation is not None, f"{path}: deferred to {attribution.derivation!r}, which is not a census derivation"
+        if not [shipped for shipped in derivation() if shipped.key.startswith(f"{path}[].")]:
+            uncovered.append(f"{path} -> {attribution.derivation}")
+    assert not uncovered, (
+        "container element(s) deferred to a derivation that reports nothing under them: "
+        f"{uncovered} — the walker declines these because something else censuses them, so "
+        "either restore that coverage or attribute the element here"
+    )
 
 
 def test_every_attributed_helper_name_answers_to_one_module() -> None:

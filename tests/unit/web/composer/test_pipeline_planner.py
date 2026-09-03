@@ -162,7 +162,9 @@ _FIXED_SCAFFOLDING_BASELINE_BYTES = 106 * 1024
 # boundary — it means teaching was lost rather than retired — and is a
 # judgement call for the operator, not a gate here. Measured 2026-09-03 at
 # 0dda01dfb (tool-result envelope data-key teaching, elspeth-e405ad7cd2):
-# 109,924 B.
+# 109,924 B; re-measured after the census stopped declining comprehension-
+# valued payloads and the eleven keys it newly enumerated were taught
+# (elspeth-e405ad7cd2 RED2-2 residue): 110,328 B, +285 B.
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
 
 
