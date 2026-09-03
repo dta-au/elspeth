@@ -276,10 +276,12 @@ the whole-document check after the call: `is_valid`, and `errors` /
 `severity`, and a closed `error_code`; when the code carries facts they ride
 as a `contract`, `row_union_schema`, or `coalesce_union_type` block. An
 entry whose `component` is the literal `rejected_mutation` is a rejection of
-the call itself — nothing was applied. A `set_pipeline` rejection also names
-the component it is about in `rejected_component` (`source`,
-`source:<name>`, `node:<id>`, or `output:<name>`); a single-component tool's
-rejection is about the component you called it with. Repair that component.
+the call itself — nothing was applied. A `set_pipeline` rejection names the
+component it is about in `rejected_component` (`source`, `source:<name>`,
+`node:<id>`, or `output:<name>`) — repair that component; when that key is
+ABSENT the rejection is about the whole candidate rather than any one
+component, so repair from its `message`. A single-component tool's rejection
+is about the component you called it with.
 `semantic_contracts` lists each edge's `producer_field` → `consumer_field`
 check with its `outcome` and `requirement_code` (`from_id`, `to_id`,
 `producer_plugin`, `consumer_plugin` locate the edge); a `requirement_code`

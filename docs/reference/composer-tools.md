@@ -571,7 +571,7 @@ Always present:
 | Field | Description |
 |-------|-------------|
 | `success` | Whether the tool call succeeded |
-| `validation` | Whole-document validation after this change: `is_valid`, `errors` / `warnings` / `suggestions` (entries with `component`, `message`, `severity`, `error_code` and, when the code carries facts, a `contract`, `row_union_schema`, or `coalesce_union_type` block), `semantic_contracts` (per-edge field checks), `graph_repair_suggestions` (a ready `tool_sequence` for a duplicate-consumer repair) |
+| `validation` | Whole-document validation after this change: `is_valid`, `errors` / `warnings` / `suggestions` (entries with `component`, `message`, `severity`, `error_code`, `rejected_component` when the rejection is about one component (`source` / `source:<name>` / `node:<id>` / `output:<name>`) and absent when it is about the whole candidate, and, when the code carries facts, a `contract`, `row_union_schema`, or `coalesce_union_type` block), `semantic_contracts` (per-edge field checks), `graph_repair_suggestions` (a ready `tool_sequence` for a duplicate-consumer repair) |
 | `affected_nodes` | Component ids the call touched |
 | `version` | Pipeline state version (increments on each mutation) |
 
