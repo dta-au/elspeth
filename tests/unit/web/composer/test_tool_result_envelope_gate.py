@@ -419,6 +419,44 @@ def f():
     return {_DATA_ERROR_KEY: "boom", "other": 1}
 """
 
+# Annotated ``data=`` locals, one per arm of ``_owned_payload_type``. The RHS keys are
+# deliberately DISJOINT from every annotation's fields, so which branch ran is legible from
+# the key set alone. The names must be live module-level bindings of ``_common.py``: that is
+# the namespace ``_expr_keys`` resolves an annotation through.
+_PROBE_ANNOTATED_LOCALS = """
+def typed_dict_annotated():
+    payload: _FullPipelineStatePayload = {"rhs_only": 1}
+    return ToolResult(success=True, data=payload)
+
+
+def pydantic_annotated():
+    payload: PluginSchemaInfo = {"rhs_only": 1}
+    return ToolResult(success=True, data=payload)
+
+
+def plain_class_annotated():
+    payload: ToolResult = {"rhs_only": 1}
+    return ToolResult(success=True, data=payload)
+
+
+def non_type_annotated():
+    payload: _DATA_ERROR_KEY = {"rhs_only": 1}
+    return ToolResult(success=True, data=payload)
+"""
+
+# Two functions in ONE file binding the SAME local name: the fixture for whether local-payload
+# attribution is keyed on the enclosing function or merely on (file, local).
+_PROBE_SHARED_LOCAL_NAME = """
+def build_alpha():
+    payload = {"alpha": 1}
+    return ToolResult(success=True, data=payload)
+
+
+def build_beta():
+    payload = {"beta": 2}
+    return ToolResult(success=True, data=payload)
+"""
+
 _PROBE_ALIAS_STORES = """
 def f():
     payload = {"status": "x"}
@@ -534,6 +572,66 @@ def test_walker_finds_stores_through_local_and_result_aliases() -> None:
     ]
     # The direct-name walker is blind to every one of them: the reason the alias walk exists.
     assert list(_subscript_assign_keys(fn, "payload", "probe", {})) == []
+
+
+def _probe_data_keys(source: str, fn_name: str) -> list[str]:
+    """Keys ``_expr_keys`` reads from the ``data=`` argument of ``fn_name``'s result call.
+
+    ``path`` is ``_common.py`` because the resolver looks an annotation up in the module the
+    walked file belongs to; the probe supplies the AST, ``_common`` supplies the namespace.
+    """
+    tree = ast.parse(source)
+    fn = _function(tree, fn_name)
+    call = next(node for node in ast.walk(fn) if isinstance(node, ast.Call) and _call_name(node) == "ToolResult")
+    expr = _data_expr(call)
+    assert expr is not None, f"probe premise: {fn_name} passes data="
+    return list(_expr_keys(expr, fn=fn, tree=tree, path=COMMON, prefix="data.", site=f"probe:{fn_name}"))
+
+
+def test_an_annotated_data_local_resolves_only_through_an_owned_payload_type() -> None:
+    """``_owned_payload_type`` admits a TypedDict or a pydantic model CLASS and nothing else.
+
+    No census file annotates a ``data=`` local today, so the census cannot notice this branch
+    resolving nothing (R4-refute2-2 G1: ``return None`` survived the whole gate file). This
+    probe is its consumer, and it exercises both arms in both directions, since each annotation
+    below is a live module-level binding of ``_common.py`` — the namespace the resolver reads:
+
+    * ``_FullPipelineStatePayload`` (TypedDict) and ``PluginSchemaInfo`` (pydantic model) are
+      admitted, so the payload's OWN fields ship and the RHS literal is never read;
+    * ``ToolResult`` is a class that is neither, and ``_DATA_ERROR_KEY`` is a ``str`` and so
+      not a class at all — both fall through to the RHS, one per conjunct of the nominal
+      test. That is ADR-032 in this walker: a payload type by what it IS, never by carrying
+      something that looks like ``model_fields``.
+
+    The RHS is a literal whose key (``rhs_only``) appears in no annotation, so a mutant that
+    collapses the admit arms is a key-set mismatch here rather than a silent agreement.
+    """
+    assert _probe_data_keys(_PROBE_ANNOTATED_LOCALS, "typed_dict_annotated") == _typed_keys(common._FullPipelineStatePayload, "data.")
+    assert _probe_data_keys(_PROBE_ANNOTATED_LOCALS, "pydantic_annotated") == [f"data.{name}" for name in PluginSchemaInfo.model_fields]
+    assert _probe_data_keys(_PROBE_ANNOTATED_LOCALS, "plain_class_annotated") == ["data.rhs_only"]
+    assert _probe_data_keys(_PROBE_ANNOTATED_LOCALS, "non_type_annotated") == ["data.rhs_only"]
+
+
+def test_local_payload_attribution_is_keyed_on_the_enclosing_function(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_LOCAL_DATA_PAYLOADS`` is read per (file, FUNCTION, local), so one file's two ``data``
+    locals stay distinct.
+
+    Unlike ``test_walker_resolves_import_bound_str_constants``, whose branch has a live input
+    (``tools/__init__.py`` really does import ``_DATA_ERROR_KEY``), this map is ``{}`` in the
+    live tree: the resolver follows every ``data=`` local unaided today, so the enclosing
+    function's name is genuinely inert and the probe supplies its ONLY consumer. That is why
+    the entry is injected for the duration of this test rather than parked in the map — an
+    attribution the walker does not need is a curated input a reviewer cannot check.
+
+    Without the function in the key, an attribution written for one producer would silently
+    claim every same-named local in its file (R4-refute2-2 G4: replacing ``fn.name`` with a
+    constant survived the whole gate file). Both directions are asserted because either alone
+    passes under a mutant that drops the map lookup entirely.
+    """
+    assert _probe_data_keys(_PROBE_SHARED_LOCAL_NAME, "build_alpha") == ["data.alpha"]
+    monkeypatch.setitem(_LOCAL_DATA_PAYLOADS, (COMMON.name, "build_alpha", "payload"), _ProbeEntry)
+    assert _probe_data_keys(_PROBE_SHARED_LOCAL_NAME, "build_alpha") == ["data.code", "data.detail"]
+    assert _probe_data_keys(_PROBE_SHARED_LOCAL_NAME, "build_beta") == ["data.beta"]
 
 
 # --- shipped side: shared surfaces -----------------------------------------------------------------
