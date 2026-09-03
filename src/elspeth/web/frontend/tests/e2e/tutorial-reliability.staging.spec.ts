@@ -29,6 +29,7 @@ import {
 import { classifyOutcome, type StepSignal } from "./harness/classify";
 import { ACKNOWLEDGEMENT_PRIMARY_ACTION_NAMES } from "./harness/guided-driver";
 import { renderLedgerMarkdown, type TransitionLedger } from "./harness/transition-ledger";
+import { tutorialPlannerShapeViolations } from "./harness/tutorial-planner-shape";
 import type { RunRecord } from "./harness/types";
 import { TransitionLedgerRecorder } from "./helpers/transition-ledger-recorder";
 import {
@@ -179,15 +180,18 @@ async function driveGuidedWalk(page: Page, ledger: TransitionLedgerRecorder): Pr
   const stepChatInput = stepChat.getByLabel("Message input");
   const stepChatSend = stepChat.getByRole("button", { name: "Send message" });
 
-  // The tutorial is the NORMAL guided flow with the intent PRELOCKED at every
-  // phase — that lock is the ONLY difference from guided mode. The learner types
-  // nothing and never picks from a widget: on each LLM-driven phase they press
-  // Send on the prelocked worked-example prompt, and the orchestrator LLM builds
-  // THAT phase via the apply-capable /guided/chat drivers (resolve_source →
-  // resolve_sink → proposal), each extracting its part of the one prompt.
-  // We therefore drive each phase by Send (once per phase) and advance through
-  // the structured result via the stage primaries. Wait for the locked prompt to
-  // populate (synthetic URLs are fetched + appended async).
+  // The tutorial is the NORMAL guided flow with the intent PRELOCKED — that lock
+  // is the ONLY difference from guided mode. Since the goal-first change
+  // (B-2.1/2.2) the lesson's prompt is also the session's GOAL: the tutorial
+  // starts the guided session with it (POST /guided/start carries the intent for
+  // both profiles), and the learner then presses Send on the prelocked prompt at
+  // the source and output phases, where the apply-capable /guided/chat drivers
+  // (resolve_source → resolve_sink) each extract their part of it. The
+  // transforms are planned from that same goal on the step-2 finish, so the
+  // transforms phase has no Send at all.
+  // We therefore drive each driven phase by Send (once per phase) and advance
+  // through the structured result via the stage primaries. Wait for the locked
+  // prompt to populate (synthetic URLs are fetched + appended async).
   await expect(stepChatInput).toBeVisible({ timeout: 30_000 });
   await expect(stepChatInput).not.toHaveValue("", { timeout: 30_000 });
 
@@ -195,23 +199,28 @@ async function driveGuidedWalk(page: Page, ledger: TransitionLedgerRecorder): Pr
   // gate (D12): it stays disabled until the stage's interpretation cards are
   // resolved, which resolveVisibleReviews handles each pass.
   //
-  // "Review wiring" carries a send-first guard (below): the step-2→step-3
-  // transition auto-plans a FIRST proposal from a fallback intent BEFORE the
-  // locked transforms prompt is sent — accepting that one commits a
-  // source→sink passthrough that the tutorial launch gate rejects (run 18,
-  // session 07e8a3a8). The primary is honored only after this driver has
-  // Sent the Transforms-phase prompt, so the proposal it accepts is the
-  // frozen-prompt revision. (The tutorial UI withholds the button on the
-  // pre-Send auto-proposal too — supersedes_draft_hash null — this guard
-  // keeps the driver correct on its own.)
-  const reviewWiring = page.getByRole("button", { name: "Review wiring", exact: true });
+  // "Review wiring" carried a send-first guard until the goal-first change
+  // (B-2.1/2.2): the step-2→step-3 transition used to auto-plan a FIRST proposal
+  // from a server-authored fallback intent BEFORE the locked transforms prompt
+  // was sent, and accepting that one committed a source→sink passthrough the
+  // tutorial launch gate rejects (run 18, session 07e8a3a8). Both halves of that
+  // shape are gone: the walk states its goal at the start, the ONE planner run
+  // happens on "Finish outputs" from that goal, and a respond that would plan
+  // with no intent behind it is refused by the backend. There is no transforms
+  // Send left to order the driver against, so the guard is gone with it.
+  // Its job is now done by EVIDENCE rather than by driver order:
+  // tutorialPlannerShapeViolations (asserted in runOnce) fails the run if a
+  // planner run lands on any other transition, or if a second one appears.
   // Each primary carries the label the ledger records as the learner's gesture.
   const primaries: Array<{ label: string; locator: Locator }> = [
     { label: "Confirm wiring", locator: page.getByRole("button", { name: "Confirm wiring", exact: true }) },
     // Pipeline proposal turn (propose_pipeline): the transforms phase yields a
     // REAL planner proposal; accepting it (chosen ["review_wiring"]) is the
     // only advance into the wire stage. Renders only on the proposal turn.
-    { label: "Review wiring", locator: reviewWiring },
+    {
+      label: "Review wiring",
+      locator: page.getByRole("button", { name: "Review wiring", exact: true }),
+    },
     // Output required-fields turn (multi_select_with_custom): the sink the LLM
     // built is observed-mode (pass-all-through), and the real output fields come
     // from the downstream transforms — so the correct, designed answer here is
@@ -257,9 +266,13 @@ async function driveGuidedWalk(page: Page, ledger: TransitionLedgerRecorder): Pr
     },
   ];
 
-  // The phases the LLM builds from intent (source/sink/transforms). Recipe + Wire
-  // are confirm-only (no chat). Labels come from the workflow stepper.
-  const drivenPhases = new Set(["Source", "Output", "Transforms"]);
+  // The phases the learner drives with a Send. Since the goal-first change the
+  // Transforms phase is NOT one of them: the planner builds the transforms from
+  // the goal the session started with, on the step-2 finish, and the tutorial no
+  // longer locks a step-3 prompt (its step-3 box is the empty confirm-only one).
+  // Recipe + Wire were always confirm-only. Labels come from the workflow
+  // stepper.
+  const drivenPhases = new Set(["Source", "Output"]);
 
   // Active guided phase, read from the stepper's aria-current step — used to send
   // the locked prompt exactly ONCE per phase (re-sending mid-build would
@@ -338,9 +351,6 @@ async function driveGuidedWalk(page: Page, ledger: TransitionLedgerRecorder): Pr
     // 1. Advance through the structured result via an enabled stage primary.
     let advanced = false;
     for (const primary of primaries) {
-      // Send-first guard: never accept a transforms proposal before the
-      // locked Transforms prompt has been sent this walk.
-      if (primary.locator === reviewWiring && lastDrivenPhase !== "Transforms") continue;
       if (
         (await primary.locator.count().catch(() => 0)) > 0 &&
         (await primary.locator.isEnabled().catch(() => false))
@@ -401,7 +411,7 @@ function substantiveRowCount(
 }
 
 async function runOnce(page: Page, runIndex: number): Promise<void> {
-  test.setTimeout(1_800_000); // walk (≤900s, two sequential planner runs) + draft-wait (≤420s) + run-wait (≤360s) + grading
+  test.setTimeout(1_800_000); // walk (≤900s, one planner run) + draft-wait (≤420s) + run-wait (≤360s) + grading
 
   // --- per-run state (Task 5 capture targets; all consumed in the record) ---
   let sessionId: string | null = null;
@@ -828,6 +838,19 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
         ledgerViolations,
         `per-transition ledger violations: ${ledgerViolations.join("; ")}`,
       ).toEqual([]);
+      // Goal-first planner shape (B-2.1/2.2): exactly ONE planner run in the
+      // whole walk, on the "Finish outputs" transition, handing back the
+      // proposal — and no other transition paying a planner call. This is the
+      // per-TRANSITION half the walk-level efficiency gate above cannot see
+      // (it counts calls over the whole walk), and the check that replaces the
+      // drivers' send-first guard. Pure + unit-tested in
+      // harness/tutorial-planner-shape.test.ts; the collector scenario below
+      // is deliberately NOT graded by it.
+      const plannerShape = tutorialPlannerShapeViolations(transitions, ledgerError);
+      expect(
+        plannerShape,
+        `goal-first planner shape: ${plannerShape.join("; ")}`,
+      ).toEqual([]);
     }
   }
 }
@@ -924,11 +947,19 @@ async function driveCollectorScenarioWalk(page: Page): Promise<void> {
   const stepChatInput = stepChat.getByLabel("Message input");
   const stepChatSend = stepChat.getByRole("button", { name: "Send message" });
   const completion = page.getByRole("region", { name: /pipeline summary/i });
-  const drivenPhases = new Set(["Source", "Output", "Transforms"]);
-  const reviewWiring = page.getByRole("button", { name: "Review wiring", exact: true });
+  // Source and Output only, for the same reason as the tutorial walk: since the
+  // goal-first change the transforms are planned once, on the step-2 finish,
+  // from the session's goal (the scenario prompt, set on the convert below)
+  // plus whatever this walk's sends retained as deferred intents. There is no
+  // transforms Send.
+  const drivenPhases = new Set(["Source", "Output"]);
   const primaries = [
     page.getByRole("button", { name: "Confirm wiring", exact: true }),
-    reviewWiring,
+    // No send-first guard: with the pre-Send auto-proposal gone there is no
+    // unpaid-for proposal to accept early. This scenario RECORDS its ledger
+    // without grading it (COLLECTOR_BASELINE is null), so the tutorial walk's
+    // per-transition planner assertions deliberately do not apply here.
+    page.getByRole("button", { name: "Review wiring", exact: true }),
     page.getByRole("button", { name: "Continue", exact: true }),
     page.getByRole("button", { name: "Looks right", exact: true }),
     page.getByRole("button", { name: "Finish sources", exact: true }),
@@ -948,10 +979,6 @@ async function driveCollectorScenarioWalk(page: Page): Promise<void> {
     await resolveVisibleReviews(page);
     let advanced = false;
     for (const primary of primaries) {
-      // Send-first guard (same defect class as the tutorial walk's run-18
-      // fallback proposal): never accept a transforms proposal before the
-      // collector prompt has been sent this walk.
-      if (primary === reviewWiring && lastDrivenPhase !== "Transforms") continue;
       if (
         (await primary.count().catch(() => 0)) > 0 &&
         (await primary.isEnabled().catch(() => false))
@@ -1041,12 +1068,20 @@ test.describe("collector-authoring scenario (ordinary guided surface)", () => {
     // FRESH guided session: create + convert via the API (the same
     // POST /guided/convert the "Switch to guided" affordance calls), then
     // deep-link it by hash (#/{sessionId}).
+    //
+    // The convert carries the scenario prompt as the session's GOAL: since the
+    // goal-first change no guided session starts without a visible intent, and
+    // the "Switch to guided" card the affordance renders now collects one. The
+    // scenario prompt is this walk's fixed input, so it is also its goal — the
+    // same relationship the tutorial's frozen lesson prompt has to the tutorial
+    // session. The driver still sends it at the source and output phases, where
+    // the chat solvers extract their halves of it.
     const entry = await harnessCtx();
     const created = await entry.post("/api/sessions", { data: {} });
     if (!created.ok()) throw new Error(`create session failed ${created.status()}: ${await created.text()}`);
     const sessionId = ((await created.json()) as { id: string }).id;
     const converted = await entry.post(`/api/sessions/${sessionId}/guided/convert`, {
-      data: { operation_id: crypto.randomUUID() },
+      data: { operation_id: crypto.randomUUID(), intent: COLLECTOR_SCENARIO_PROMPT },
     });
     if (!converted.ok()) throw new Error(`guided convert failed ${converted.status()}: ${await converted.text()}`);
     await entry.dispose();

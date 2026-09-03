@@ -315,14 +315,23 @@ async def _complete_guided_start_authority(
 ) -> None:
     """Bind a fixture root and existing guided head through the production start APIs."""
     from elspeth.contracts.hashing import stable_hash
+    from elspeth.web.composer.guided.profile import kind_for_profile
+    from elspeth.web.sessions.converters import state_from_record
     from elspeth.web.sessions.guided_operations import guided_operation_request_hash
     from elspeth.web.sessions.schemas import StartGuidedRequest
 
+    # Hash under the profile the checkpoint ACTUALLY carries. The custody
+    # helper recovers the discriminator from the start checkpoint rather than
+    # assuming "live" (goal-first, elspeth-378cfa0e18), so a tutorial-profile
+    # checkpoint whose start operation was hashed as live is a state no real
+    # start can produce — and pinning it would pin a fiction.
+    head_guided = state_from_record(state).guided_session
+    assert head_guided is not None
     operation_id = str(uuid.uuid4())
     request = StartGuidedRequest.model_validate(
         {
             "operation_id": operation_id,
-            "profile": "live",
+            "profile": kind_for_profile(head_guided.profile).value,
             "intent": root_message.content,
         },
         strict=True,

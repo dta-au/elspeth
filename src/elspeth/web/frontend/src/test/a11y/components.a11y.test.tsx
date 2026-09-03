@@ -97,6 +97,14 @@ const AUDITED_COMPONENTS = [
   // Run-lifecycle feedback (elspeth-3a7b7c7b37): the app-level terminal-run
   // toast is the only completion surface mounted outside the Run panel.
   "RunOutcomeNotice",
+  // Goal-first entry (elspeth-378cfa0e18): before a session has stated its
+  // goal the guided branch REPLACES the current-decision card with a goal
+  // card. That is a distinct arrangement from both audited ChatPanel entries
+  // — the decision card's role=log live region and its Explain control are
+  // absent, and a heading + hint sit where the turn widget was — so the
+  // either/or has to be audited on its own rather than assumed from the
+  // active-branch entry.
+  "ChatPanelGoalCard",
 ] as const;
 
 const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
@@ -106,6 +114,7 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "AuditReadinessPanel",
   "ChatInput",
   "ChatPanelCompletedSurface",
+  "ChatPanelGoalCard",
   "ChatPanelTutorialWorkspace",
   "CommandPalette",
   "ComposerPreferencesPanel",
@@ -951,6 +960,20 @@ describe("ModeSwitchButton", () => {
     );
     expect(await axe(container)).toHaveNoViolations();
   });
+
+  it("has no axe violations on the guided confirm card's required goal field", async () => {
+    // Goal-first (elspeth-378cfa0e18) put a form control on this card. A
+    // placeholder is not an accessible name, so axe's `label` rule is the gate
+    // that keeps the question a real <label>.
+    const { container } = render(
+      <ModeSwitchButton target="guided" hasWork />,
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Switch to guided" }),
+    );
+    screen.getByRole("textbox", { name: "What should this pipeline produce?" });
+    expect(await axe(container)).toHaveNoViolations();
+  });
 });
 
 describe("PipelineGloss", () => {
@@ -1226,9 +1249,8 @@ describe("ProposePipelineTurn", () => {
     );
     // Non-vacuous: the tutorial teaching note renders, the live "Review
     // wiring" primary stays actionable (the tutorial proposal is a REAL
-    // planner proposal the learner must accept to advance; the primary is
-    // live only once the frozen-prompt revision supersedes the pre-Send
-    // auto-proposal), and the off-script reject/revise controls are withheld.
+    // planner proposal the learner must accept to advance), and the off-script
+    // reject/revise controls are withheld.
     screen.getByText(/press Review wiring to continue/i);
     expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
@@ -1236,7 +1258,13 @@ describe("ProposePipelineTurn", () => {
     expect(await axe(container)).toHaveNoViolations();
   });
 
-  it("has no axe violations in the tutorial pre-Send auto-proposal render (primary withheld)", async () => {
+  it("has no axe violations on a tutorial FIRST proposal (null supersedes hash, same live primary)", async () => {
+    // The withheld-primary render this replaces is gone with the proposal it
+    // guarded (goal-first, elspeth-378cfa0e18): the frozen transforms prompt is
+    // the session's root intent now, so the step-2 finish plans once and its
+    // proposal — supersedes_draft_hash null — IS the one the learner reviews.
+    // Audited alongside the superseding case so the two hash states are pinned
+    // to render the same controls.
     const reviewState: GuidedProposalReviewState = {
       status: "active",
       proposal_id: PROPOSAL_ID,
@@ -1245,11 +1273,9 @@ describe("ProposePipelineTurn", () => {
     const { container } = render(
       <ProposePipelineTurn payload={proposalPayload()} reviewState={reviewState} onSubmit={() => {}} isTutorial />,
     );
-    // Non-vacuous: the pre-Send auto-proposal (supersedes_draft_hash null)
-    // withholds every action and directs the learner to Send the frozen
-    // transforms prompt instead (tutorial run 18 committed the passthrough).
-    screen.getByText(/press Send/i);
-    expect(screen.queryByRole("button", { name: "Review wiring" })).toBeNull();
+    expect(proposalPayload().supersedes_draft_hash).toBeNull();
+    screen.getByText(/press Review wiring to continue/i);
+    expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
     expect(screen.queryByRole("button", { name: /Revise/ })).toBeNull();
     expect(await axe(container)).toHaveNoViolations();
@@ -1560,6 +1586,60 @@ describe("ChatPanelCompletedSurface", () => {
     screen.getByRole("region", { name: "Describe what you want" });
     screen.getByRole("button", { name: "Explain this pipeline" });
     screen.getByText("After confirmation");
+
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("ChatPanelGoalCard", () => {
+  // Goal-first entry (elspeth-378cfa0e18). Before the session has a goal the
+  // store has adopted the lazy GET /guided stub — a first turn and NO
+  // composition state — and the panel replaces the current-decision card with
+  // the goal card. Audited on its own because that arrangement drops the
+  // decision card's role=log live region and its Explain control; the risk
+  // being pinned is a second live region (or a duplicated heading id) landing
+  // inside the named conversation group.
+  it("has no axe violations on the pre-goal guided surface", async () => {
+    Element.prototype.scrollIntoView = vi.fn();
+    useSessionStore.setState({
+      activeSessionId: "sess-a11y-goal",
+      messages: [],
+      composeTimeoutReady: true,
+      compositionState: null,
+      guidedSession: {
+        step: "step_1_source",
+        history: [],
+        terminal: null,
+        chat_history: [],
+        chat_turn_seq: 0,
+        profile: null,
+      },
+      guidedNextTurn: {
+        type: "single_select",
+        step_index: 0,
+        turn_token: "a".repeat(64),
+        payload: {
+          question: "Which source plugin should we use?",
+          options: [{ id: "csv", label: "CSV", hint: null }],
+          allow_custom: false,
+        },
+      },
+    } as never);
+
+    const { container } = render(<ChatPanel />);
+
+    // Non-vacuous: the goal card is mounted inside the named conversation
+    // group, the composer landmark survives, and the decision card's log
+    // region and Explain control are BOTH absent — the goal card replaces
+    // that section rather than rendering beside it.
+    const scroll = screen.getByRole("group", { name: "Conversation" });
+    const heading = screen.getByRole("heading", {
+      name: "What should this pipeline produce?",
+    });
+    expect(scroll.contains(heading)).toBe(true);
+    screen.getByRole("region", { name: "Describe what you want" });
+    expect(screen.queryByRole("log", { name: "Guided wizard step" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Explain this step" })).toBeNull();
 
     expect(await axe(container)).toHaveNoViolations();
   });

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import threading
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -29,6 +30,7 @@ from elspeth.contracts.composer_planner_audit import (
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
+from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.guided_operations import guided_operation_request_hash
 from elspeth.web.sessions.models import (
@@ -53,6 +55,7 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationFenceLostError,
     GuidedOperationSettlementConflictError,
     GuidedOperationTakenOver,
+    GuidedOriginatingUserMessageDraft,
     GuidedPipelineProposalResult,
     GuidedSessionResult,
 )
@@ -1081,6 +1084,188 @@ async def test_guided_seed_rejects_cross_service_head_drift_before_writes(file_e
     with file_engine.connect() as conn:
         message_count = conn.execute(select(chat_messages_table.c.id).where(chat_messages_table.c.session_id == str(session_id))).all()
     assert message_count == []
+
+
+#: The empty ``PipelineMetadata`` shape a checkpoint must carry to be readable
+#: back — ``from_dict`` requires both keys, so ``{}`` fails on read rather than
+#: on the guard these tests are about.
+_EMPTY_PIPELINE_METADATA = {"name": None, "description": None}
+
+
+async def _claim_convert(service: SessionServiceImpl, session_id: UUID, operation_id: str) -> GuidedOperationClaimed:
+    """Claim one ``guided_convert`` operation, asserting the claim succeeded."""
+
+    claimed = await service.reserve_guided_operation(
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="guided_convert",
+        request_hash="a" * 64,
+        actor="worker",
+        lease_seconds=60,
+    )
+    assert isinstance(claimed, GuidedOperationClaimed)
+    return claimed
+
+
+@pytest.mark.parametrize(
+    "bind",
+    ["unrooted", "names-another-message"],
+)
+@pytest.mark.asyncio
+async def test_guided_convert_settlement_refuses_a_checkpoint_that_does_not_bind_its_root(file_engine, bind: str) -> None:
+    """A converted root row is written ONLY where the checkpoint names it.
+
+    ``/guided/convert`` writes the author's goal as the session's durable root
+    intent row inside the settlement transaction. The row and the checkpoint
+    are two halves of one fact: a row nothing points at is an unattributable
+    user message in the transcript, and a checkpoint whose
+    ``root_intent_message_id`` names a different message would send
+    ``get_verified_guided_root_intent`` — the custody helper the revision brief
+    depends on — to a row this operation never authorised. The guard is
+    therefore adversarial, not decorative: both halves of the drift fail
+    closed, and the whole transaction rolls back so the operation can be
+    retried honestly rather than replayed onto a half-written root.
+    """
+
+    service = _service(file_engine)
+    session_id = await _create_session(service)
+    operation_id = f"convert-unbound-root-{bind}"
+    claimed = await _claim_convert(service, session_id, operation_id)
+    root_message_id = uuid4()
+    guided = GuidedSession.initial()
+    if bind == "names-another-message":
+        guided = replace(guided, root_intent_message_id=str(uuid4()))
+
+    with pytest.raises(AuditIntegrityError, match="does not bind its exact root intent"):
+        await service.save_state_for_guided_operation(
+            claimed.fence,
+            expected_current_state_id=None,
+            expected_current_state_version=None,
+            state=CompositionStateData(
+                is_valid=True, metadata_=_EMPTY_PIPELINE_METADATA, composer_meta={"guided_session": guided.to_dict()}
+            ),
+            provenance="session_seed",
+            actor="worker",
+            response_hash_factory=lambda record: stable_hash({"state_id": str(record.id)}),
+            originating_message=GuidedOriginatingUserMessageDraft(
+                message_id=root_message_id,
+                content="Summarize each page and save it as JSON.",
+            ),
+        )
+
+    assert await service.get_state_versions(session_id) == []
+    with file_engine.connect() as conn:
+        messages = conn.execute(select(chat_messages_table.c.id).where(chat_messages_table.c.session_id == str(session_id))).all()
+        operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+    assert messages == []
+    assert operation["status"] == "in_progress"
+    assert operation["result_state_id"] is None
+    assert operation["originating_message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_guided_convert_settlement_requires_an_exact_originating_message_draft(file_engine) -> None:
+    """A look-alike root draft is refused before the transaction opens.
+
+    The draft's own ``__post_init__`` is what proves the id is a UUID and the
+    content carries visible text, so a structurally similar object would carry
+    an unvalidated goal into the durable root row. Exact-type, never
+    structural: this is the ADR-032 rule applied to a type ELSPETH owns.
+    """
+
+    service = _service(file_engine)
+    session_id = await _create_session(service)
+    operation_id = "convert-look-alike-root"
+    claimed = await _claim_convert(service, session_id, operation_id)
+
+    @dataclass(frozen=True)
+    class _LookAlikeDraft:
+        message_id: UUID
+        content: str
+
+    with pytest.raises(TypeError, match="exact GuidedOriginatingUserMessageDraft"):
+        await service.save_state_for_guided_operation(
+            claimed.fence,
+            expected_current_state_id=None,
+            expected_current_state_version=None,
+            state=CompositionStateData(
+                is_valid=True, metadata_=_EMPTY_PIPELINE_METADATA, composer_meta={"guided_session": GuidedSession.initial().to_dict()}
+            ),
+            provenance="session_seed",
+            actor="worker",
+            response_hash_factory=lambda record: stable_hash({"state_id": str(record.id)}),
+            originating_message=cast(
+                Any,
+                _LookAlikeDraft(message_id=uuid4(), content="Summarize each page and save it as JSON."),
+            ),
+        )
+
+    assert await service.get_state_versions(session_id) == []
+    with file_engine.connect() as conn:
+        messages = conn.execute(select(chat_messages_table.c.id).where(chat_messages_table.c.session_id == str(session_id))).all()
+        operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+    assert messages == []
+    assert operation["status"] == "in_progress"
+    assert operation["result_state_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_guided_convert_settlement_cannot_adopt_a_pre_existing_row_at_the_root_id(file_engine) -> None:
+    """The root row is WRITTEN here, never adopted from whatever already exists.
+
+    The custody re-read beside the binding check (session, role, content,
+    writer_principal) is defence in depth for a future writer that hands over a
+    row instead of inserting one; through this seam the row is inserted from
+    the draft itself, so the only way to present a foreign row at that id is to
+    put one there first. That must not settle either — this pins the outcome
+    (nothing written, operation unbound) rather than which of the two
+    fail-closed mechanisms fires.
+    """
+
+    service = _service(file_engine)
+    session_id = await _create_session(service)
+    squatter = await service.add_message(
+        session_id,
+        "user",
+        "a message this conversion never authorised",
+        writer_principal="route_user_message",
+    )
+    operation_id = "convert-colliding-root"
+    claimed = await _claim_convert(service, session_id, operation_id)
+    guided = replace(GuidedSession.initial(), root_intent_message_id=str(squatter.id))
+
+    with pytest.raises(Exception) as failure:
+        await service.save_state_for_guided_operation(
+            claimed.fence,
+            expected_current_state_id=None,
+            expected_current_state_version=None,
+            state=CompositionStateData(
+                is_valid=True, metadata_=_EMPTY_PIPELINE_METADATA, composer_meta={"guided_session": guided.to_dict()}
+            ),
+            provenance="session_seed",
+            actor="worker",
+            response_hash_factory=lambda record: stable_hash({"state_id": str(record.id)}),
+            originating_message=GuidedOriginatingUserMessageDraft(
+                message_id=squatter.id,
+                content="Summarize each page and save it as JSON.",
+            ),
+        )
+
+    assert not isinstance(failure.value, AssertionError)
+    assert await service.get_state_versions(session_id) == []
+    with file_engine.connect() as conn:
+        contents = conn.execute(select(chat_messages_table.c.content).where(chat_messages_table.c.session_id == str(session_id))).all()
+        operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+    assert [row.content for row in contents] == ["a message this conversion never authorised"]
+    assert operation["status"] == "in_progress"
+    assert operation["result_state_id"] is None
+    assert operation["originating_message_id"] is None
 
 
 @pytest.mark.asyncio
