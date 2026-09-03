@@ -1112,7 +1112,20 @@ describe("ChatPanel mode discriminator", () => {
     // readiness gate is open and guided sends (sendGuidedChat →
     // runComposeWithTimeout) proceed. resetStore clears it to the fail-closed
     // false default; the per-test setState calls merge over this.
-    useSessionStore.setState({ composeTimeoutReady: true });
+    //
+    // A STARTED guided session also carries a persisted composition state, and
+    // the guided-active tests below are all about a started one. Goal-first
+    // (elspeth-378cfa0e18) made that distinction load-bearing in the panel: a
+    // null composition state now means "this session has stated no goal yet"
+    // and renders the goal card in place of the decision card, so seeding a
+    // live turn on top of a null state describes a session that cannot exist.
+    // Seeded here rather than in ~50 individual setState calls; the tests that
+    // are ABOUT the pre-goal or freeform surfaces set `compositionState: null`
+    // explicitly and merge over this.
+    useSessionStore.setState({
+      composeTimeoutReady: true,
+      compositionState: makeComposition(1),
+    });
     mockedChatInputUpload.blob = null;
     mockedChatInputUpload.requests = [];
     mockedChatInputUpload.completedRequestIds = [];
@@ -2098,12 +2111,10 @@ describe("ChatPanel mode discriminator", () => {
     });
   });
 
-  it("keeps the live Review wiring primary on the tutorial revision proposal review", () => {
+  it("keeps the live Review wiring primary on the tutorial proposal review", () => {
     // The tutorial proposal is a REAL planner proposal (no canned exhibit
     // exists post-7.1); the learner advances by accepting it, so the primary
-    // must stay live while the off-script reject/revise stay withheld. The
-    // primary is live only on the frozen-prompt REVISION proposal
-    // (supersedes_draft_hash set) — the pre-Send auto-proposal withholds it.
+    // must stay live while the off-script reject/revise stay withheld.
     useSessionStore.setState({
       activeSessionId: "session-guided",
       sessions: [guidedSessionFixture],
@@ -2124,11 +2135,16 @@ describe("ChatPanel mode discriminator", () => {
     expect(screen.queryByRole("button", { name: /Revise/ })).toBeNull();
   });
 
-  it("withholds the tutorial Review wiring primary on the pre-Send auto-proposal", () => {
-    // Tutorial run 18: accepting the transition auto-proposal (planned before
-    // the frozen transforms prompt is sent) commits a source→sink
-    // passthrough. The null supersedes_draft_hash identifies it; the learner
-    // is directed to Send instead.
+  it("offers the tutorial Review wiring primary on the FIRST proposal, which carries no supersedes hash", () => {
+    // Goal-first (elspeth-378cfa0e18) retires the pre-Send auto-proposal this
+    // test used to pin as withheld. The frozen transforms prompt is now the
+    // session's ROOT INTENT, stated at /guided/start, so the step-2 finish
+    // plans once from it and the single proposal the learner sees IS the one
+    // to review — with supersedes_draft_hash null, exactly the value the old
+    // withhold keyed on. Keeping that gate would strand the learner on a card
+    // with no forward affordance (the tutorial hides reject/revise and the
+    // step-3 locked prompt is gone), which is why the arm is deleted rather
+    // than re-pointed.
     useSessionStore.setState({
       activeSessionId: "session-guided",
       sessions: [guidedSessionFixture],
@@ -2141,17 +2157,11 @@ describe("ChatPanel mode discriminator", () => {
     render(<ChatPanel isTutorial />);
 
     expect(screen.getByText("Review pipeline proposal")).toBeVisible();
-    expect(screen.queryByRole("button", { name: "Review wiring" })).toBeNull();
-    expect(screen.getByText(/press Send/i)).toBeVisible();
-    // The withheld primary must leave a live path forward: the docked
-    // composer's Send is the ONLY advance on this turn (it re-plans the
-    // proposal as the frozen-prompt revision) — without it this turn is a
-    // dead end, strictly worse than the wrong-completion it prevents.
-    // ChatInput is mocked in this suite; its stub mirrors the live enabled
-    // state via data-disabled, and the region landmark is the same one the
-    // staging drivers target for the Send.
-    expect(screen.getByRole("region", { name: "Describe what you want" })).toBeVisible();
-    expect(screen.getByTestId("chat-input")).toHaveAttribute("data-disabled", "false");
+    expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
+    // The retired "starting sketch" copy directed the learner to Send a
+    // step-3 prompt that no longer exists.
+    expect(screen.queryByText(/press Send/i)).toBeNull();
+    expect(screen.queryByText(/starting sketch/i)).toBeNull();
   });
 
   it("anchors tutorial proposal activity once in the Current Decision footer", () => {
@@ -2448,6 +2458,30 @@ describe("ChatPanel mode discriminator", () => {
       screen.getByRole("heading", {
         level: 2,
         name: /choose the input and confirm what elspeth can read/i,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("names step 3 as a REVIEW of what the assistant proposed from the goal", () => {
+    // Goal-first (elspeth-378cfa0e18). The old copy — "Review the transform
+    // stages that turn source data into the output" — described a stage the
+    // user was expected to author here. What actually happens is that the
+    // planner ran once at the step-2 finish, from the goal stated at the
+    // start, and this step reviews its proposal.
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: { ...activeGuidedSession(), step: "step_3_transforms" },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel />);
+
+    expect(
+      screen.getByRole("heading", {
+        level: 2,
+        name: "Review the processing steps the assistant proposed from your goal.",
       }),
     ).toBeInTheDocument();
   });
@@ -3019,6 +3053,84 @@ describe("ChatPanel mode discriminator", () => {
     expect(screen.getByTestId("chat-input").dataset.placeholder).toBe(
       "Describe what each row should become, or how to fix the proposed transforms…",
     );
+  });
+
+  // ── Pre-goal surface (goal-first, elspeth-378cfa0e18) ─────────────────────
+  //
+  // With no composition state the store has adopted the lazy GET /guided stub
+  // and NOTHING is persisted for this session. The panel must ask for the goal
+  // instead of showing the stub's first decision: answering that decision is
+  // not what this Send does (it establishes the root intent), and the stub's
+  // chips would have the user choosing a source plugin two steps early.
+  describe("before the session has a goal", () => {
+    function seedPreGoalSession(): void {
+      useSessionStore.setState({
+        activeSessionId: "session-guided",
+        sessions: [guidedSessionFixture],
+        messages: [],
+        guidedSession: activeGuidedSession(),
+        guidedNextTurn: singleSelectTurn(),
+        compositionState: null,
+      });
+    }
+
+    it("asks for the goal instead of the per-step source caption", () => {
+      seedPreGoalSession();
+
+      render(<ChatPanel />);
+
+      expect(screen.getByTestId("chat-input").dataset.placeholder).toBe(
+        "In one sentence: what should come out the other end — e.g. a summary per page, saved as JSON…",
+      );
+    });
+
+    it("renders the goal card in place of the decision card, with no stub chips", () => {
+      seedPreGoalSession();
+
+      const { container } = render(<ChatPanel />);
+
+      expect(
+        screen.getByRole("heading", {
+          name: "What should this pipeline produce?",
+        }),
+      ).toBeVisible();
+      expect(container.querySelector(".guided-goal-prompt")).not.toBeNull();
+      // Strictly either/or: the decision card owns a role=log live region and
+      // the heading id, so rendering both would nest live regions and
+      // duplicate an id.
+      expect(container.querySelector(".guided-current-decision")).toBeNull();
+      expect(screen.queryByRole("log", { name: "Guided wizard step" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "CSV" })).toBeNull();
+    });
+
+    it("suppresses Explain, whose canned question would otherwise BECOME the goal", () => {
+      // Explain routes sendGuidedChat(GUIDED_EXPLAIN_MESSAGE) down the same
+      // path the goal takes, and pre-start that path is /guided/start. Pinned
+      // as behaviour rather than left to fall out of the card swap: a later
+      // refactor that hoists Explain out of the decision section would
+      // otherwise silently reintroduce it here.
+      seedPreGoalSession();
+
+      render(<ChatPanel />);
+
+      expect(
+        screen.queryByRole("button", { name: "Explain this step" }),
+      ).toBeNull();
+    });
+
+    it("restores the decision card once the session has a composition state", () => {
+      // The counterpart to the three assertions above: the goal card must not
+      // outlive the pre-start window.
+      seedPreGoalSession();
+      useSessionStore.setState({ compositionState: makeComposition(1) });
+
+      const { container } = render(<ChatPanel />);
+
+      expect(container.querySelector(".guided-goal-prompt")).toBeNull();
+      expect(container.querySelector(".guided-current-decision")).not.toBeNull();
+      screen.getByRole("button", { name: "CSV" });
+      screen.getByRole("button", { name: "Explain this step" });
+    });
   });
 
   it("non-tutorial guided: docks the intent box BELOW the editable form (chat-window layout)", () => {
@@ -5183,6 +5295,140 @@ assistant_message_kind: "synthetic_failure",
     ).toBeNull();
   });
 
+  // ── The locked-prompt "already sent" predicate (goal-first) ───────────────
+  //
+  // It used to be "this step carries ANY user turn that isn't the Explain
+  // question". Goal-first (elspeth-378cfa0e18) breaks that: a started session's
+  // transcript now OPENS with the seeded goal turn, which the server stamps
+  // step_1_source. Under the old predicate that turn alone marked step 1 as
+  // sent — so the locked source box flipped to the static "Sent" line before
+  // the learner had sent anything, and the single-select the tutorial
+  // suppresses came back as a rival driver. The predicate is a TRIMMED EXACT
+  // match against the step's locked prompt, which is what it always meant and
+  // which subsumes the Explain exclusion as a special case.
+  it("tutorial: the seeded goal turn does NOT mark the source step sent", () => {
+    const lockedSource = "Summarise these pages:\nhttps://example.gov.au/page-1";
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        step: "step_1_source",
+        chat_history: [
+          {
+            // The goal, seeded by /guided/start at seq 0 and stamped with the
+            // step the session opens on.
+            role: "user",
+            content: "Summarise each page and save the results as JSON.",
+            seq: 0,
+            step: "step_1_source",
+            ts_iso: "2026-05-12T10:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+          {
+            role: "assistant",
+            content:
+              "Goal saved. The planner will build from it once the source and output are reviewed. First, the source: where does the data come from?",
+            seq: 1,
+            step: "step_1_source",
+            ts_iso: "2026-05-12T10:00:01Z",
+            assistant_message_kind: "assistant",
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+        ],
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel isTutorial lockedChatPrompt={{ step_1_source: lockedSource }} />);
+
+    // The locked box survives with the source prompt still to send…
+    expect(screen.getByTestId("chat-input")).toBeInTheDocument();
+    expect(screen.getByTestId("chat-input").dataset.value).toBe(lockedSource);
+    expect(
+      screen.queryByText(/your request is in the transcript above/i),
+    ).toBeNull();
+    // …and the rival single-select stays suppressed until it IS sent.
+    expect(screen.queryByRole("button", { name: "CSV" })).toBeNull();
+  });
+
+  it("tutorial: a multi-line locked prompt still matches after ChatInput's trim", () => {
+    // ChatInput trims on send, so the transcript copy of a prompt with
+    // trailing whitespace is not byte-identical to the constant. An untrimmed
+    // equality would leave the box live forever, re-offering a Send the
+    // learner has already made.
+    const lockedSource = "Summarise these pages:\nhttps://example.gov.au/page-1\n";
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        step: "step_1_source",
+        chat_history: [
+          {
+            role: "user",
+            content: lockedSource.trim(),
+            seq: 1,
+            step: "step_1_source",
+            ts_iso: "2026-05-12T10:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+        ],
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel isTutorial lockedChatPrompt={{ step_1_source: lockedSource }} />);
+
+    expect(
+      screen.getByText(/your request is in the transcript above/i),
+    ).toBeInTheDocument();
+  });
+
+  it("tutorial: a confirm-only step with no locked prompt is never marked sent", () => {
+    // step_3 joins step_4 as confirm-only (the tutorial's transforms prompt is
+    // the root intent now). With no locked prompt the trimmed comparison is
+    // against "", which no real user turn can equal — the empty read-only box
+    // stays, exactly as it always has at the wire step.
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        step: "step_3_transforms",
+        chat_history: [
+          {
+            role: "user",
+            content: "Summarise each page and save the results as JSON.",
+            seq: 0,
+            step: "step_1_source",
+            ts_iso: "2026-05-12T10:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+        ],
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel isTutorial lockedChatPrompt={{ step_1_source: "create the source" }} />);
+
+    expect(screen.getByTestId("chat-input")).toBeInTheDocument();
+    expect(screen.getByTestId("chat-input").dataset.value).toBe("");
+    expect(
+      screen.queryByText(/your request is in the transcript above/i),
+    ).toBeNull();
+  });
+
   it("tutorial: exposes an Add-created source picker after the stage prompt was sent", async () => {
     const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
     useSessionStore.setState({
@@ -5592,7 +5838,11 @@ assistant_message_kind: "synthetic_failure",
     ).toBeInTheDocument();
   });
 
-  it("'Switch to guided' button calls enterGuided() when clicked from the freeform body", async () => {
+  it("'Switch to guided' collects a goal from the freeform body and passes it to enterGuided()", async () => {
+    // Goal-first (elspeth-378cfa0e18): the fresh-wizard direction always opens
+    // the confirm card, because the new wizard needs a goal to be rooted on and
+    // this is where the user types it. The old single-click switch produced a
+    // rootless wizard.
     const enterGuidedSpy = vi.fn().mockResolvedValue(undefined);
     useSessionStore.setState({
       activeSessionId: "session-guided",
@@ -5609,8 +5859,20 @@ assistant_message_kind: "synthetic_failure",
     await act(async () => {
       button.click();
     });
+    expect(enterGuidedSpy).not.toHaveBeenCalled();
+
+    const goalBox = screen.getByLabelText("What should this pipeline produce?");
+    fireEvent.change(goalBox, {
+      target: { value: "Summarise every page as one JSON row." },
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "Confirm switch to guided" }).click();
+    });
 
     expect(enterGuidedSpy).toHaveBeenCalledTimes(1);
+    expect(enterGuidedSpy).toHaveBeenCalledWith(
+      "Summarise every page as one JSON row.",
+    );
   });
 
   it("falls through to the freeform body when terminal.kind === 'exited_to_freeform'", () => {
@@ -5958,7 +6220,18 @@ assistant_message_kind: "synthetic_failure",
       button.click();
     });
 
+    // A RESUME asks for no goal: the saved wizard already has its root
+    // (goal-first, elspeth-378cfa0e18). Only the fresh-wizard direction
+    // collects one, so the card here is the ordinary two-step confirm.
+    expect(
+      screen.queryByLabelText("What should this pipeline produce?"),
+    ).toBeNull();
+    await act(async () => {
+      screen.getByRole("button", { name: "Confirm switch to guided" }).click();
+    });
+
     expect(enterGuidedSpy).toHaveBeenCalledTimes(1);
+    expect(enterGuidedSpy).toHaveBeenCalledWith(undefined);
   });
 
   it("wraps the guided turn surface in a role=log aria-live=polite region (Task 8.2 a11y)", () => {
@@ -6586,6 +6859,11 @@ describe("ChatPanel guided step-advance focus (spec §7.4)", () => {
     vi.resetAllMocks();
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    // These are all STARTED sessions being advanced through their steps, so
+    // they carry a persisted composition state; without it the panel renders
+    // the pre-goal card (goal-first, elspeth-378cfa0e18) and there is no turn
+    // widget to take focus.
+    useSessionStore.setState({ compositionState: makeComposition(1) });
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
       sendMessage: vi.fn(),
       retryMessage: vi.fn(),

@@ -303,6 +303,7 @@
 /* Cards inside the scroll region align their left/right edges with the bubble
    rows' content gutter. */
 .guided-authoring-scroll > .ack-stack,
+.guided-authoring-scroll > .guided-goal-prompt,
 .guided-authoring-scroll > .guided-current-decision {
   margin-inline: var(--space-lg);
 }
@@ -310,7 +311,10 @@
 /* Current Decision is part of the conversation, so keep it on the same 56rem
    centred measure as .message-row instead of stretching across the whole
    workspace column. The explicit narrow-width calculation preserves the
-   ordinary chat gutters before the max-width cap engages. */
+   ordinary chat gutters before the max-width cap engages. The goal card takes
+   the same measure: it occupies the identical slot (it REPLACES the decision
+   card pre-start), so the column must not reflow when the goal is sent. */
+.guided-authoring-scroll > .guided-goal-prompt,
 .guided-authoring-scroll > .guided-current-decision {
   width: calc(100% - var(--space-lg) - var(--space-lg));
   max-width: 56rem;
@@ -414,6 +418,43 @@
 .guided-current-decision-tutorial-note {
   margin: var(--space-xs) 0 0;
   color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+}
+
+/* ── Goal card (goal-first, elspeth-378cfa0e18) ──────────────────────────────
+   Shown INSTEAD of the current-decision card while the session has no
+   composition state: it asks for the one thing the wizard needs before it can
+   persist anything. Same card chrome as .guided-current-decision — it is the
+   same slot in the same column, and giving it a different frame would read as
+   a different KIND of surface rather than the same surface asking its first
+   question. The card carries no controls of its own: the answer is typed in
+   the docked composer below, which is already the session's only input. */
+.guided-goal-prompt {
+  margin: var(--space-md);
+  padding: var(--space-md);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-lg);
+  background-color: var(--color-surface);
+}
+
+/* The question is the card's heading (h2), matching the decision card's
+   rationale heading rung so the two do not swap type scale when the goal is
+   sent. font-weight explicit for the same reason it is there: a barrel-level
+   heading reset must not flatten it. */
+.guided-goal-prompt__question {
+  margin: 0;
+  font-size: var(--font-size-lg);
+  line-height: 1.4;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+/* One quiet hint line, in the same secondary register as the decision card's
+   body copy. */
+.guided-goal-prompt__hint {
+  margin: var(--space-xs) 0 0;
+  color: var(--color-text-secondary);
   font-size: var(--font-size-sm);
   line-height: 1.45;
 }

@@ -28,7 +28,9 @@ _OPERATION_ID = "00000000-0000-4000-8000-000000000001"
     [
         (StartGuidedRequest, {"profile": "live"}),
         (GuidedPlanRequest, {"intent": "Build a pipeline"}),
-        (ConvertGuidedRequest, {}),
+        # Carries the now-required goal so ``operation_id`` is the ONLY missing
+        # field this case isolates (goal-first, elspeth-378cfa0e18).
+        (ConvertGuidedRequest, {"intent": "Build a pipeline"}),
         (ReenterGuidedRequest, {}),
         (RevertStateRequest, {"state_id": str(uuid4())}),
         (ForkSessionRequest, {"from_message_id": uuid4(), "new_message_content": "Try this"}),
@@ -359,11 +361,42 @@ def test_guided_plan_intent_is_visible_bounded_and_hash_authoritative() -> None:
             GuidedPlanRequest.model_validate({"operation_id": _OPERATION_ID, "intent": invalid})
 
 
+def test_guided_convert_intent_is_required_visible_bounded_and_hash_authoritative() -> None:
+    """Goal-first: a conversion carries the author's goal, and the hash covers it.
+
+    The goal becomes the converted session's durable root row, and the custody
+    helpers re-derive this exact hash from that row's live content — so a
+    conversion whose goal is edited afterwards must stop verifying.
+    """
+
+    session_id = uuid4()
+    request = ConvertGuidedRequest.model_validate({"operation_id": _OPERATION_ID, "intent": "  Summarize each page  "})
+
+    assert request.intent == "  Summarize each page  "
+    request_hash = guided_operation_request_hash(session_id=session_id, kind="guided_convert", request=request)
+    changed_hash = guided_operation_request_hash(
+        session_id=session_id,
+        kind="guided_convert",
+        request=ConvertGuidedRequest.model_validate({"operation_id": _OPERATION_ID, "intent": "Summarize each page"}),
+    )
+    assert request_hash != changed_hash
+
+    with pytest.raises(ValidationError, match="intent"):
+        ConvertGuidedRequest.model_validate({"operation_id": _OPERATION_ID})
+    for invalid in ("", " \n\t", "x" * 4097):
+        with pytest.raises(ValidationError, match="intent"):
+            ConvertGuidedRequest.model_validate({"operation_id": _OPERATION_ID, "intent": invalid})
+
+
 def test_guided_start_carries_optional_exact_intent_for_server_profile_resolution() -> None:
     live = StartGuidedRequest.model_validate({"operation_id": _OPERATION_ID, "profile": "live", "intent": "  Keep exact whitespace  "})
     tutorial = StartGuidedRequest.model_validate({"operation_id": _OPERATION_ID, "profile": "tutorial"})
 
     assert live.intent == "  Keep exact whitespace  "
+    # The DTO still ADMITS an absent intent; the route refuses it, for every
+    # profile (goal-first, elspeth-378cfa0e18). Keeping the field optional here
+    # is what lets the route answer a missing goal with its own 400 rather than
+    # a Pydantic 422 — and lets the omitted and explicit-null forms hash alike.
     assert tutorial.intent is None
     for invalid in ("", " \n\t", "x" * 4097):
         with pytest.raises(ValidationError, match="intent"):

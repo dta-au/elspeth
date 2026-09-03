@@ -58,6 +58,7 @@ import {
   tokenFromStorageState,
   uploadBlob,
 } from "./helpers/api";
+import { switchToGuidedWithGoal } from "./helpers/guided-entry";
 import { ComposerPage } from "./page-objects/composer-page";
 
 // ── Paths ───────────────────────────────────────────────────────────────────
@@ -72,6 +73,27 @@ const EVIDENCE_ROOT = resolve(REPO_ROOT, "output", "playwright", "composer-parit
 
 const SURFACE = "guided_staged";
 const BLOB_FILENAME = "two_llm_colour.csv";
+
+// The session's goal, stated on the "Switch to guided" card (goal-first,
+// elspeth-378cfa0e18). One sentence naming the same outcome the fixture request
+// (REQUEST_TXT) asks for — the request itself is still sent in full as the
+// guided chat message, so the guided surface reads exactly what the freeform
+// surface reads and the parity comparison is unchanged.
+//
+// NOT evidence for the step-3 outcome-goal clause. This sentence restates the
+// fixture request's STEPS (two independent LLMs, one merged row), so it reaches
+// the planner as a plain request for processing and is decided by rule 1's
+// pre-existing branch, never by "when the intent is an outcome goal". The
+// clause's processing half needs a goal that names an outcome and no step; that
+// case is fixed in the goal-first design's live trial, not here.
+//
+// Two re-baselining consequences of stating it at all: the guided brief now
+// carries this outcome twice (once as the root goal, once inside the full
+// request), which the freeform side does not receive, and the walk pays a
+// planner run rooted on it. Read a guided/freeform difference on this walk as
+// that, until the parity numbers are re-measured against the goal-first build.
+const GUIDED_GOAL =
+  "Assess every colour row with two independent LLMs and write one merged row per colour to a JSON file.";
 
 // The six sanitized documents the oracle loads (live_acceptance.EVIDENCE_FILES).
 const EVIDENCE_FILES = [
@@ -122,9 +144,15 @@ test.describe("composer capability parity — guided_staged live acceptance (sta
       await composer.waitForChatReady();
 
       // ── /guided/start ──────────────────────────────────────────────────────
-      // "Switch to guided" issues POST /api/sessions/{id}/guided/start and mounts
-      // the guided composer surface.
-      await page.getByRole("button", { name: "Switch to guided" }).click();
+      // "Switch to guided" collects the session's goal (goal-first,
+      // elspeth-378cfa0e18), then issues POST /api/sessions/{id}/guided/start
+      // with it and mounts the guided composer surface.
+      //
+      // The goal is the one-sentence outcome of the SAME fixture request; the
+      // full request still arrives as the chat message below, which is what the
+      // parity oracle measures. Parity is against the freeform surface reading
+      // that request, so the goal must not add or drop an outcome.
+      await switchToGuidedWithGoal(page, GUIDED_GOAL);
       await expect(page.getByLabel(/guided composer/i)).toBeVisible();
 
       // Staging seam: interpose any deterministic source/sink stages the deployed

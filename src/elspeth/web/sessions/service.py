@@ -23,6 +23,7 @@ from uuid import UUID
 
 import structlog
 from opentelemetry import metrics
+from pydantic import BaseModel
 from sqlalchemy import ColumnElement, Connection, Engine, delete, desc, exists, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -902,6 +903,99 @@ def _verify_guided_correction_message_authority(
             raise AuditIntegrityError("guided correction message content hash mismatch")
 
 
+def _verified_guided_root_message_row(
+    conn: Connection,
+    *,
+    service: Any,
+    session_id: str,
+    message_id: str,
+) -> Any:
+    """Re-derive one guided root intent from the operation that authored it.
+
+    The single authority for "is this message really this session's root
+    intent": the immutable, completed ``guided_start`` OR ``guided_convert``
+    row that names it, its result checkpoint, and the canonical request hash
+    re-derived from the live message content.
+
+    Two facts are read off the RESULT CHECKPOINT rather than assumed:
+
+    * the operation KIND, which selects the request DTO the hash was taken
+      over (``StartGuidedRequest`` carries ``profile``, ``ConvertGuidedRequest``
+      does not), and
+    * for a start, the ``profile`` discriminator, recovered from the
+      checkpoint's own profile constant via
+      :func:`~elspeth.web.composer.guided.profile.kind_for_profile`. Hardcoding
+      ``"live"`` here silently refused every rooted TUTORIAL session, which is
+      why the tutorial could not carry a client goal at all.
+
+    The kind is derived from the START checkpoint and never from the caller's
+    current one: a fork resets the child to ``EMPTY_PROFILE`` and synthesises
+    the child's ``guided_start`` row under a literal ``"profile": "live"``
+    request hash, so the child's own start checkpoint is the consistent
+    authority even when its parent was a tutorial.
+
+    Returns the verified ``chat_messages`` row so callers that must hand the
+    content on do not re-read it.
+    """
+
+    from elspeth.web.composer.guided.profile import kind_for_profile
+    from elspeth.web.sessions.guided_operations import guided_operation_request_hash
+    from elspeth.web.sessions.schemas import ConvertGuidedRequest, StartGuidedRequest
+
+    operations = conn.execute(
+        select(guided_operations_table)
+        .where(guided_operations_table.c.session_id == session_id)
+        .where(guided_operations_table.c.kind.in_(("guided_start", "guided_convert")))
+        .where(guided_operations_table.c.status == "completed")
+        .where(guided_operations_table.c.originating_message_id == message_id)
+        .where(guided_operations_table.c.result_kind == "composition_state")
+    ).fetchall()
+    if len(operations) != 1:
+        raise AuditIntegrityError("guided root intent has absent or ambiguous start-operation authority")
+    operation = operations[0]
+    state_row = conn.execute(
+        select(composition_states_table)
+        .where(composition_states_table.c.session_id == session_id)
+        .where(composition_states_table.c.id == operation.result_state_id)
+    ).one_or_none()
+    if state_row is None:
+        raise AuditIntegrityError("guided root intent start result state is missing")
+    start_guided = state_from_record(service._row_to_state_record(state_row)).guided_session
+    if start_guided is None or start_guided.root_intent_message_id != message_id:
+        raise AuditIntegrityError("guided root intent differs from its live start checkpoint")
+    message_row = conn.execute(
+        select(chat_messages_table).where(chat_messages_table.c.session_id == session_id).where(chat_messages_table.c.id == message_id)
+    ).one_or_none()
+    if message_row is None or message_row.role != "user" or message_row.writer_principal != "route_user_message":
+        raise AuditIntegrityError("guided root intent row failed session/role/writer custody")
+    operation_kind: GuidedOperationKind = "guided_convert" if operation.kind == "guided_convert" else "guided_start"
+    request: BaseModel
+    if operation_kind == "guided_convert":
+        request = ConvertGuidedRequest.model_validate(
+            {"operation_id": operation.operation_id, "intent": message_row.content},
+            strict=True,
+        )
+    else:
+        request = StartGuidedRequest.model_validate(
+            {
+                "operation_id": operation.operation_id,
+                "profile": kind_for_profile(start_guided.profile).value,
+                "intent": message_row.content,
+            },
+            strict=True,
+        )
+    if (
+        guided_operation_request_hash(
+            session_id=UUID(session_id),
+            kind=operation_kind,
+            request=request,
+        )
+        != operation.request_hash
+    ):
+        raise AuditIntegrityError("guided root intent content no longer matches its start request hash")
+    return message_row
+
+
 def _verify_guided_root_message_authority(
     conn: Connection,
     *,
@@ -913,51 +1007,12 @@ def _verify_guided_root_message_authority(
 
     if guided.root_intent_message_id is None:
         return
-    from elspeth.web.sessions.guided_operations import guided_operation_request_hash
-    from elspeth.web.sessions.schemas import StartGuidedRequest
-
-    message_id = guided.root_intent_message_id
-    message_row = conn.execute(
-        select(chat_messages_table.c.role, chat_messages_table.c.content, chat_messages_table.c.writer_principal)
-        .where(chat_messages_table.c.session_id == session_id)
-        .where(chat_messages_table.c.id == message_id)
-    ).one_or_none()
-    if message_row is None or message_row.role != "user" or message_row.writer_principal != "route_user_message":
-        raise AuditIntegrityError("guided root intent row failed session/role/writer custody")
-    operations = conn.execute(
-        select(guided_operations_table)
-        .where(guided_operations_table.c.session_id == session_id)
-        .where(guided_operations_table.c.kind == "guided_start")
-        .where(guided_operations_table.c.status == "completed")
-        .where(guided_operations_table.c.originating_message_id == message_id)
-        .where(guided_operations_table.c.result_kind == "composition_state")
-    ).fetchall()
-    if len(operations) != 1:
-        raise AuditIntegrityError("guided root intent has absent or ambiguous start-operation authority")
-    operation = operations[0]
-    request = StartGuidedRequest.model_validate(
-        {"operation_id": operation.operation_id, "profile": "live", "intent": message_row.content},
-        strict=True,
+    _verified_guided_root_message_row(
+        conn,
+        service=service,
+        session_id=session_id,
+        message_id=guided.root_intent_message_id,
     )
-    if (
-        guided_operation_request_hash(
-            session_id=UUID(session_id),
-            kind="guided_start",
-            request=request,
-        )
-        != operation.request_hash
-    ):
-        raise AuditIntegrityError("guided root intent content no longer matches its start request hash")
-    state_row = conn.execute(
-        select(composition_states_table)
-        .where(composition_states_table.c.session_id == session_id)
-        .where(composition_states_table.c.id == operation.result_state_id)
-    ).one_or_none()
-    if state_row is None:
-        raise AuditIntegrityError("guided root intent start result state is missing")
-    start_guided = state_from_record(service._row_to_state_record(state_row)).guided_session
-    if start_guided is None or start_guided.root_intent_message_id != message_id:
-        raise AuditIntegrityError("guided root intent differs from its live start checkpoint")
 
 
 def _require_exact_guided_intent_cancellation_audit(
@@ -9463,53 +9518,25 @@ class SessionServiceImpl:
         session_id: UUID,
         root_message_id: UUID,
     ) -> ChatMessageRecord:
-        """Re-derive a live start hash before returning its private root row."""
+        """Re-derive a live start hash before returning its private root row.
 
-        from elspeth.web.composer.guided.profile import EMPTY_PROFILE
-        from elspeth.web.sessions.guided_operations import guided_operation_request_hash
-        from elspeth.web.sessions.schemas import StartGuidedRequest
+        Shares one derivation with :func:`_verify_guided_root_message_authority`:
+        the operation row (``guided_start`` or ``guided_convert``) is the
+        authority, its result checkpoint supplies the profile discriminator,
+        and the canonical request hash is re-derived from the live content.
+        """
 
         sid = str(session_id)
         mid = str(root_message_id)
 
         def _sync() -> ChatMessageRecord:
             with self._engine.begin() as conn:
-                message_row = conn.execute(
-                    select(chat_messages_table).where(chat_messages_table.c.session_id == sid).where(chat_messages_table.c.id == mid)
-                ).one_or_none()
-                if message_row is None or message_row.role != "user" or message_row.writer_principal != "route_user_message":
-                    raise AuditIntegrityError("guided root intent row failed session/role/writer custody")
-                operations = conn.execute(
-                    select(guided_operations_table)
-                    .where(guided_operations_table.c.session_id == sid)
-                    .where(guided_operations_table.c.kind == "guided_start")
-                    .where(guided_operations_table.c.status == "completed")
-                    .where(guided_operations_table.c.originating_message_id == mid)
-                    .where(guided_operations_table.c.result_kind == "composition_state")
-                ).fetchall()
-                if len(operations) != 1:
-                    raise AuditIntegrityError("guided root intent has absent or ambiguous start-operation authority")
-                operation = operations[0]
-                request = StartGuidedRequest.model_validate(
-                    {
-                        "operation_id": operation.operation_id,
-                        "profile": "live",
-                        "intent": message_row.content,
-                    },
-                    strict=True,
+                message_row = _verified_guided_root_message_row(
+                    conn,
+                    service=self,
+                    session_id=sid,
+                    message_id=mid,
                 )
-                if guided_operation_request_hash(session_id=session_id, kind="guided_start", request=request) != operation.request_hash:
-                    raise AuditIntegrityError("guided root intent content no longer matches its start request hash")
-                state_row = conn.execute(
-                    select(composition_states_table)
-                    .where(composition_states_table.c.session_id == sid)
-                    .where(composition_states_table.c.id == operation.result_state_id)
-                ).one_or_none()
-                if state_row is None:
-                    raise AuditIntegrityError("guided root intent start result state is missing")
-                guided = state_from_record(self._row_to_state_record(state_row)).guided_session
-                if guided is None or guided.profile != EMPTY_PROFILE or guided.root_intent_message_id != mid:
-                    raise AuditIntegrityError("guided root intent differs from its live start checkpoint")
                 return self._row_to_chat_message_record(message_row)
 
         return cast("ChatMessageRecord", await self._run_sync(_sync))
@@ -10917,32 +10944,64 @@ class SessionServiceImpl:
                     record = self._row_to_state_record(current_row)
                     outcome = GuidedStartStateConverged(state=record)
 
+                settled_root_message_id: UUID | None = None
                 if originating_message is not None:
                     guided = state_from_record(record).guided_session
-                    if guided is None or guided.root_intent_message_id != str(originating_message.message_id):
-                        raise AuditIntegrityError("guided live start checkpoint does not bind its exact root intent")
+                    if guided is None:
+                        raise AuditIntegrityError("guided start checkpoint has no guided session")
+                    owns_root = guided.root_intent_message_id == str(originating_message.message_id)
+                    if owns_root:
+                        # This operation's OWN root: either this transaction
+                        # wrote both the checkpoint and the row (seeded), or
+                        # the head already IS this operation's checkpoint and
+                        # already names the row (converged onto itself). Bind
+                        # it, and hold it to exact content custody.
+                        verified_root_message_id = str(originating_message.message_id)
+                        settled_root_message_id = originating_message.message_id
+                    elif type(outcome) is GuidedStartStateSeeded:
+                        raise AuditIntegrityError("guided start checkpoint does not bind its exact root intent")
+                    else:
+                        # Converged onto a COMPETING start's head, which
+                        # appeared between this route's read and this write.
+                        # Nothing was written here, so the root row this
+                        # request planned does not exist: the operation must
+                        # not claim it, and must not claim the winner's either
+                        # (two completed operations naming ONE root message is
+                        # exactly the "ambiguous start-operation authority" the
+                        # custody helper refuses). Verify the winner is rooted
+                        # in the SAME goal — otherwise this request's goal
+                        # would be silently answered with someone else's
+                        # session, and the caller gets the ordinary
+                        # stale-conflict 409 the route's pre-check path already
+                        # returns for a mismatched winner.
+                        if guided.root_intent_message_id is None:
+                            raise GuidedOperationSettlementConflictError()
+                        verified_root_message_id = guided.root_intent_message_id
                     message_row = conn.execute(
                         select(
                             chat_messages_table.c.session_id,
                             chat_messages_table.c.role,
                             chat_messages_table.c.content,
                             chat_messages_table.c.writer_principal,
-                        ).where(chat_messages_table.c.id == str(originating_message.message_id))
+                        ).where(chat_messages_table.c.id == verified_root_message_id)
                     ).one_or_none()
                     if (
                         message_row is None
                         or message_row.session_id != sid
                         or message_row.role != "user"
-                        or message_row.content != originating_message.content
                         or message_row.writer_principal != "route_user_message"
                     ):
-                        raise AuditIntegrityError("guided live start root intent row failed custody verification")
+                        raise AuditIntegrityError("guided start root intent row failed custody verification")
+                    if message_row.content != originating_message.content:
+                        if owns_root:
+                            raise AuditIntegrityError("guided start root intent row failed custody verification")
+                        raise GuidedOperationSettlementConflictError()
 
                 response_hash = response_hash_factory(record)
                 self.bind_guided_operation_on_connection(
                     conn,
                     fence,
-                    originating_message_id=(originating_message.message_id if originating_message is not None else None),
+                    originating_message_id=settled_root_message_id,
                     result_state_id=record.id,
                 )
                 self.complete_guided_operation_on_connection(
@@ -10979,12 +11038,24 @@ class SessionServiceImpl:
         system_message: str | None = None,
         payloads: tuple[PreparedGuidedJsonPayload, ...] = (),
         audit_evidence: GuidedAuditEvidence | None = None,
+        originating_message: GuidedOriginatingUserMessageDraft | None = None,
         payload_store: PayloadStore | None = None,
     ) -> CompositionStateRecord:
-        """Persist one guided checkpoint and its replay settlement atomically."""
+        """Persist one guided checkpoint and its replay settlement atomically.
+
+        ``originating_message`` mirrors
+        :meth:`seed_or_complete_guided_start_operation`: the goal a
+        ``/guided/convert`` carries becomes the session's durable root intent
+        row, written inside THIS transaction and bound to the operation, so a
+        converted session's root has exactly the custody a started one does.
+        Passing it without the checkpoint naming it — or with a row that fails
+        session/role/content/writer custody — fails the settlement closed.
+        """
 
         if system_message is not None and (type(system_message) is not str or not system_message):
             raise ValueError("guided operation system_message must be a non-empty string or None")
+        if originating_message is not None and type(originating_message) is not GuidedOriginatingUserMessageDraft:
+            raise TypeError("originating_message must be an exact GuidedOriginatingUserMessageDraft or None")
         settled_audit_evidence = audit_evidence if audit_evidence is not None else GuidedAuditEvidence()
         audit_rows = self._prepare_guided_audit_cohort(
             audit_evidence=settled_audit_evidence,
@@ -11012,8 +11083,27 @@ class SessionServiceImpl:
                 )
                 state_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == state_id)).one()
                 record = self._row_to_state_record(state_row)
-                row_count = len(audit_rows) + (1 if system_message is not None else 0)
+                row_count = len(audit_rows) + (1 if system_message is not None else 0) + (1 if originating_message is not None else 0)
                 sequence_no = self._reserve_sequence_range(conn, sid, count=row_count) if row_count else None
+                if originating_message is not None:
+                    if sequence_no is None:  # pragma: no cover - row_count counts this row
+                        raise AuditIntegrityError("Guided root intent has no reserved sequence")
+                    self._insert_chat_message(
+                        conn,
+                        session_id=sid,
+                        role="user",
+                        content=originating_message.content,
+                        raw_content=None,
+                        tool_calls=None,
+                        sequence_no=sequence_no,
+                        writer_principal="route_user_message",
+                        composition_state_id=state_id,
+                        tool_call_id=None,
+                        parent_assistant_id=None,
+                        created_at=now,
+                        message_id=str(originating_message.message_id),
+                    )
+                    sequence_no += 1
                 if system_message is not None:
                     if sequence_no is None:
                         raise AuditIntegrityError("Guided system message has no reserved sequence")
@@ -11043,8 +11133,37 @@ class SessionServiceImpl:
                     )
                 if row_count:
                     conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+                if originating_message is not None:
+                    # Same binding check the start settlement performs: the
+                    # checkpoint being persisted must NAME this root row, and
+                    # the row must be exactly what was asked for. Without it a
+                    # conversion could write a root row no checkpoint points at.
+                    guided = state_from_record(record).guided_session
+                    if guided is None or guided.root_intent_message_id != str(originating_message.message_id):
+                        raise AuditIntegrityError("guided converted checkpoint does not bind its exact root intent")
+                    root_row = conn.execute(
+                        select(
+                            chat_messages_table.c.session_id,
+                            chat_messages_table.c.role,
+                            chat_messages_table.c.content,
+                            chat_messages_table.c.writer_principal,
+                        ).where(chat_messages_table.c.id == str(originating_message.message_id))
+                    ).one_or_none()
+                    if (
+                        root_row is None
+                        or root_row.session_id != sid
+                        or root_row.role != "user"
+                        or root_row.content != originating_message.content
+                        or root_row.writer_principal != "route_user_message"
+                    ):
+                        raise AuditIntegrityError("guided converted root intent row failed custody verification")
                 response_hash = response_hash_factory(record)
-                self.bind_guided_operation_on_connection(conn, fence, result_state_id=record.id)
+                self.bind_guided_operation_on_connection(
+                    conn,
+                    fence,
+                    originating_message_id=(originating_message.message_id if originating_message is not None else None),
+                    result_state_id=record.id,
+                )
                 self.complete_guided_operation_on_connection(
                     conn,
                     fence,

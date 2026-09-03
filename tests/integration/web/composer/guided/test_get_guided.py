@@ -54,7 +54,9 @@ def _get_guided(client: TestClient, session_id: str) -> dict:
 def _start_guided(client: TestClient, session_id: str) -> dict:
     response = client.post(
         f"/api/sessions/{session_id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid4())},
+        # Goal-first (elspeth-378cfa0e18): the tutorial profile carries a goal
+        # through the same door every other profile does.
+        json={"profile": "tutorial", "intent": "Build the pipeline I describe.", "operation_id": str(uuid4())},
     )
     assert response.status_code == 200, response.json()
     return response.json()

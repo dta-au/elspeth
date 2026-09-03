@@ -14,7 +14,7 @@ from elspeth.plugins.infrastructure.validation import get_sink_config_model, get
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.guided.emitters import _inspection_matches_source_plugin, build_component_review_turn
 from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE, WorkflowProfileKind, profile_for_kind
-from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX, Turn, validate_current_turn
+from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX, GUIDED_GOAL_ACKNOWLEDGEMENT, Turn, validate_current_turn
 from elspeth.web.composer.guided.resolved import SinkResolved
 from elspeth.web.composer.guided.stage_transitions import (
     AnsweredTurn,
@@ -1416,6 +1416,54 @@ async def reconcile_guided_start_operation(
     raise AuditIntegrityError("guided-start reconciliation returned an unsupported outcome")
 
 
+def _seed_guided_goal_transcript(guided: GuidedSession, *, intent: str) -> GuidedSession:
+    """Open a freshly rooted session's transcript on the goal and one server line.
+
+    The goal-first entry (elspeth-378cfa0e18): ``/guided/start`` and
+    ``/guided/convert`` both take the author's goal, and both must show it
+    back. Without this the goal was durable only as a private root row and the
+    operator opened a guided session on an empty transcript, with no evidence
+    that the thing they typed had been kept.
+
+    Uses the R2-F6 transcript idiom exactly — a verbatim user turn plus one
+    server-authored acknowledgement on the same ``chat_history`` channel
+    ``/guided/chat`` writes, at the step the author is on. No audit twin, no
+    schema change, and ``assistant_message_kind`` stays ``"assistant"``: the
+    vocabulary is closed to ``{"assistant", "synthetic_failure"}`` and widening
+    it is a schema change this change does not make.
+
+    Both turns share one timestamp because they are one event.
+    """
+
+    from datetime import UTC, datetime
+
+    from .._helpers import ChatRole, ChatTurn
+
+    seeded_ts_iso = datetime.now(UTC).isoformat()
+    return _replace(
+        guided,
+        chat_history=(
+            *guided.chat_history,
+            ChatTurn(
+                role=ChatRole.USER,
+                content=intent,
+                seq=guided.chat_turn_seq,
+                step=guided.step,
+                ts_iso=seeded_ts_iso,
+            ),
+            ChatTurn(
+                role=ChatRole.ASSISTANT,
+                content=GUIDED_GOAL_ACKNOWLEDGEMENT,
+                seq=guided.chat_turn_seq + 1,
+                step=guided.step,
+                ts_iso=seeded_ts_iso,
+                assistant_message_kind="assistant",
+            ),
+        ),
+        chat_turn_seq=guided.chat_turn_seq + 2,
+    )
+
+
 @router.post("/{session_id}/guided/start", response_model=GetGuidedResponse)
 async def post_guided_start(
     session_id: UUID,
@@ -1478,11 +1526,14 @@ async def post_guided_start(
             detail=(f"Unknown profile discriminator. Valid values: {sorted(k.value for k in WorkflowProfileKind)}."),
         ) from exc
     profile = profile_for_kind(profile_kind)
-    if profile_kind is WorkflowProfileKind.LIVE:
-        if body.intent is None:
-            raise HTTPException(status_code=400, detail="Live guided start requires a visible intent.")
-    elif body.intent is not None:
-        raise HTTPException(status_code=400, detail="Tutorial guided start forbids a client intent.")
+    # Goal-first, for EVERY profile (elspeth-378cfa0e18). A guided session with
+    # no root intent cannot reach the planner at all — the Step-2 finish
+    # refuses with ``guided_planner_intent_required`` — so a start that carries
+    # no goal only creates a session that is already stuck. The tutorial takes
+    # its frozen lesson prompt through this same door: ADR-031 forbids a
+    # tutorial-only path, and forbidding a tutorial intent WAS one.
+    if body.intent is None:
+        raise HTTPException(status_code=400, detail="Guided start requires a visible intent.")
 
     from elspeth.contracts.errors import AuditIntegrityError
     from elspeth.web.sessions.protocol import (
@@ -1570,17 +1621,13 @@ async def post_guided_start(
             raise AuditIntegrityError("Guided start result state has no guided checkpoint")
         if guided.profile != profile:
             raise GuidedOperationSettlementConflictError()
-        if profile_kind is WorkflowProfileKind.TUTORIAL:
-            if guided.root_intent_message_id is not None:
-                raise AuditIntegrityError("Tutorial guided start unexpectedly owns a client root intent")
-            return
         if guided.root_intent_message_id is None:
-            raise AuditIntegrityError("Live guided start is missing its durable root intent")
+            raise AuditIntegrityError("Guided start is missing its durable root intent")
         matches = [
             message for message in await service.get_messages(session_id, limit=None) if str(message.id) == guided.root_intent_message_id
         ]
         if len(matches) != 1 or matches[0].role != "user" or matches[0].writer_principal != "route_user_message":
-            raise AuditIntegrityError("Live guided start root intent failed session/role/content custody")
+            raise AuditIntegrityError("Guided start root intent failed session/role/content custody")
         if matches[0].content != body.intent:
             raise GuidedOperationSettlementConflictError()
 
@@ -1684,9 +1731,7 @@ async def post_guided_start(
                     raise AuditIntegrityError("Guided start head disappeared after preflight")
 
                 root_message = (
-                    GuidedOriginatingUserMessageDraft(message_id=uuid4(), content=body.intent)
-                    if profile_kind is WorkflowProfileKind.LIVE and body.intent is not None
-                    else None
+                    GuidedOriginatingUserMessageDraft(message_id=uuid4(), content=body.intent) if body.intent is not None else None
                 )
                 new_state = _initial_composition_state_with_guided_session(profile=profile)
                 seeded_guided = new_state.guided_session
@@ -1710,6 +1755,8 @@ async def post_guided_start(
                     turn=seed_turn,
                     payload_store=request.app.state.payload_store,
                 )
+                if root_message is not None:
+                    seeded_guided = _seed_guided_goal_transcript(seeded_guided, intent=root_message.content)
                 seed_evidence = _turn_emission_evidence(
                     step=seeded_guided.step,
                     turn_type=seed_turn_type,
@@ -1865,14 +1912,21 @@ async def post_guided_convert(
     import. A system message records the switch and names the recoverable
     version.
 
-    Idempotent and safe for every entry state, so "Switch to guided" can route
-    through it unconditionally:
-      * no persisted state (empty session) -> persist a fresh wizard checkpoint
-        so the operation has an immutable replay locator.
-      * ``guided_session`` already present -> return it UNCHANGED, including any
-        terminal (so a completed / solver-exhausted / protocol-violation surface
-        still renders — enterGuided routes those non-exit terminals here).
+    The conversion REQUIRES the author's goal (``intent``) and writes it as the
+    session's durable root intent inside the settlement transaction, exactly as
+    ``/guided/start`` does — a wizard with no root cannot reach the planner at
+    all. The transcript is seeded with that goal and one server acknowledgement
+    so the converted session opens on the same surface a started one does.
+
+    Entry states:
+      * no persisted state (empty session) -> persist a fresh rooted wizard
+        checkpoint so the operation has an immutable replay locator.
       * persisted state with ``guided_session is None`` -> the conversion.
+      * ``guided_session`` already present -> 409 ``guided_already_started``.
+        Returning it unchanged would silently discard the goal this request
+        carries; the client's GET-first probe makes this reachable only in a
+        cross-tab race, where the loser refetches. Same-``operation_id``
+        retries never reach the branch — they replay the settled response.
 
     Raises 404 if the session does not exist or belong to the requesting user.
     """
@@ -1965,42 +2019,67 @@ async def post_guided_convert(
         replay_record = await service.get_state_in_session(result.state_id, session_id)
         return _response_from_record(replay_record)
 
+    compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
     reserved = await reserve_or_replay_guided_operation(
         service=service,
         session_id=session_id,
         kind="guided_convert",
         request=body,
         replay=_replay,
+        reserve_if_absent=False,
     )
+    if reserved is None:
+        # Branch 2, classified BEFORE an operation row is allocated — the same
+        # shape post_guided_reenter and post_guided_start use for an invalid
+        # mode transition. A session that is already guided cannot adopt the
+        # goal this request carries: returning it unchanged would silently
+        # discard what the author typed, so this is an ordinary coded 409 that
+        # leaves no retry artefact behind. A same-``operation_id`` retry never
+        # reaches the classification — the lookup above replays it.
+        async with compose_lock:
+            candidate_record = await service.get_current_state(session_id)
+            if candidate_record is not None and _state_from_record(candidate_record).guided_session is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "guided_already_started",
+                        "detail": "This session is already in guided mode. Reload it to see its current state.",
+                    },
+                )
+        reserved = await reserve_or_replay_guided_operation(
+            service=service,
+            session_id=session_id,
+            kind="guided_convert",
+            request=body,
+            replay=_replay,
+        )
     if reserved is None:  # pragma: no cover - reserve_if_absent defaults true
         raise AuditIntegrityError("Guided conversion operation was not reserved")
     if not isinstance(reserved, GuidedOperationLease):
         return reserved
 
-    compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
     try:
         async with compose_lock:
             state_record = await service.get_current_state(session_id)
 
-            # Branch 2: already guided (idempotent double-click, cross-tab race,
-            # or a terminal session reached via enterGuided's non-exit branch).
-            # Return the existing session unchanged and settle its exact head.
+            # A conversion that won the classification above can still lose the
+            # race to a start or a competing convert before this lock. That is
+            # an ordinary settlement conflict — the caller reloads and sees the
+            # guided session — not a fault to page on.
             if state_record is not None and _state_from_record(state_record).guided_session is not None:
-                settled_record = await service.complete_existing_state_guided_operation(
-                    reserved.fence,
-                    state_id=state_record.id,
-                    expected_current_state_id=state_record.id,
-                    expected_current_state_version=state_record.version,
-                    actor="composer_route",
-                    response_hash_factory=lambda record: guided_response_hash(_response_from_record(record)),
-                )
-                return _response_from_record(settled_record)
+                raise GuidedOperationSettlementConflictError()
 
-            # Branches 1 & 3: seed a fresh guided wizard.
+            # Branches 1 & 3: seed a fresh guided wizard rooted in the author's
+            # goal, the same shape ``/guided/start`` seeds.
+            root_message = GuidedOriginatingUserMessageDraft(message_id=uuid4(), content=body.intent)
             new_state = _initial_composition_state_with_guided_session()
             seeded_guided = new_state.guided_session
             if seeded_guided is None:  # pragma: no cover — helper always attaches a guided session
                 raise InvariantError("post_guided_convert: initial state has no guided_session")
+            seeded_guided = _replace(
+                seeded_guided,
+                root_intent_message_id=str(root_message.message_id),
+            )
             seed_turn = _build_get_guided_turn(new_state, seeded_guided, catalog=catalog)
             if seed_turn is None:  # pragma: no cover - initial STEP_1 always emits
                 raise InvariantError("post_guided_convert: initial guided session has no first turn")
@@ -2014,6 +2093,7 @@ async def post_guided_convert(
                 turn=seed_turn,
                 payload_store=request.app.state.payload_store,
             )
+            seeded_guided = _seed_guided_goal_transcript(seeded_guided, intent=root_message.content)
             seed_evidence = _turn_emission_evidence(
                 step=seeded_guided.step,
                 turn_type=seed_turn_type,
@@ -2053,6 +2133,7 @@ async def post_guided_convert(
                 system_message=system_message,
                 payloads=(prepared_seed_turn,),
                 audit_evidence=seed_evidence,
+                originating_message=root_message,
                 payload_store=request.app.state.payload_store,
             )
             return _response_from_record(state_record_out)
@@ -2089,6 +2170,26 @@ async def post_guided_convert(
             actor="composer_route",
         )
         raise_guided_operation_failure(failed)
+
+
+def _has_planner_intent(guided: GuidedSession) -> bool:
+    """Report whether this session has an author-supplied intent to plan from.
+
+    The planner's brief is assembled from exactly two author-owned sources —
+    the root intent written at start/convert and any intents retained from a
+    step chat — so their union is the whole answer to "is there anything to
+    plan from". A session with neither cannot reach the provider with a real
+    request; before this predicate existed the Step-2 finish substituted a
+    server-authored sentence ("Build the complete pipeline from the reviewed
+    guided components...") and the LLM planned from ELSPETH's words, not the
+    author's.
+
+    Pure and total over owned dataclass attributes: no I/O, no ``getattr``, no
+    Protocol dispatch. Deliberately does NOT verify custody — the callers that
+    plan re-derive the root row through ``get_verified_guided_root_intent``.
+    """
+
+    return guided.root_intent_message_id is not None or bool(guided.deferred_intents)
 
 
 def _schema8_unsupported_stage(step: GuidedStep) -> HTTPException:
@@ -3409,12 +3510,29 @@ async def post_guided_respond(
                 detail="Guided response does not satisfy the current turn contract.",
             ) from exc
         projected_guided = projected_state.guided_session
-        requires_planner = (
+        requires_planner = False
+        if (
             observed_guided.step is GuidedStep.STEP_2_SINK
             and projected_guided is not None
             and projected_guided.step is GuidedStep.STEP_3_TRANSFORMS
             and projected_guided.terminal is None
-        )
+        ):
+            requires_planner = True
+            if not _has_planner_intent(projected_guided):
+                # No planner run without an intent (elspeth-13579d1110).
+                # Refused HERE — inside the preflight, before rate admission
+                # and before any operation row is reserved — so the session
+                # stays exactly where it is, on its unanswered
+                # ``review_components`` turn, with no retry artefact and no
+                # provider call. The settlement carries the same predicate as
+                # defence in depth; reaching THAT one is a server bug.
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "guided_planner_intent_required",
+                        "detail": "Tell the assistant what this pipeline should produce before finishing outputs.",
+                    },
+                )
         return inspection_facts, fallback_blob_inspection, requires_planner
 
     async def _preflight_or_sanitize(attempt_stable_id: UUID) -> tuple[SourceInspectionFacts | None, SourceInspectionFacts | None, bool]:
@@ -3920,14 +4038,33 @@ async def post_guided_respond(
                             )
                             if authority.row.user_message_id != expected_originating_message_id and predecessor_correction is None:
                                 raise AuditIntegrityError("guided proposal revision user-message lineage drifted")
-                            if (
-                                authority.row.user_message_id == expected_originating_message_id
-                                and expected_originating_message_id is not None
-                            ):
-                                await service.get_verified_guided_root_intent(
+                            # The goal stays the planner's ROOT through every
+                            # revision. Before this, a revision brief carried
+                            # only the deferred intents plus the new
+                            # instruction, so "make it faster" re-planned the
+                            # pipeline against no stated outcome and the goal
+                            # silently stopped being a constraint after the
+                            # first proposal. Verified, never read off the
+                            # checkpoint: the custody helper re-derives the row
+                            # from its immutable start/convert operation — and
+                            # it now runs whenever a root exists, not only when
+                            # the superseded proposal happened to name it.
+                            #
+                            # It rides as the NAMED ``root_goal`` fact, never
+                            # prepended to the intent: ``intent`` means the
+                            # request being made now, and a revision that
+                            # narrows or withdraws part of the goal must not
+                            # have to argue against the goal inside that one
+                            # field — nor feed a stated threshold the author
+                            # has already revoked to the request guards that
+                            # parse it.
+                            root_planner_intent = ""
+                            if expected_originating_message_id is not None:
+                                root_intent_record = await service.get_verified_guided_root_intent(
                                     session_id=session_id,
                                     root_message_id=expected_originating_message_id,
                                 )
+                                root_planner_intent = root_intent_record.content
                             message_ids = {
                                 *(intent.originating_message_id for intent in planning_guided.deferred_intents),
                                 *((str(predecessor_correction.message_id),) if predecessor_correction is not None else ()),
@@ -3997,6 +4134,7 @@ async def post_guided_respond(
                                 progress=planner_progress,
                                 correction_target=correction_target,
                                 revision_authority=revision_authority,
+                                root_goal=root_planner_intent or None,
                             )
                             if isinstance(outcome, GuidedPlannerDecline):
                                 assistant_text = outcome.decline_text.strip() or _empty_decline_fallback
@@ -5009,11 +5147,21 @@ async def post_guided_respond(
                                 planner_messages_by_id[deferred.originating_message_id].content
                                 for deferred in resulting_guided.deferred_intents
                             )
-                            planner_intent = (
-                                "\n\n".join(planner_intent_parts)
-                                if planner_intent_parts
-                                else "Build the complete pipeline from the reviewed guided components and deferred constraints."
-                            )
+                            if not planner_intent_parts:
+                                # Defence in depth for the preflight's coded 409
+                                # (elspeth-13579d1110) — the same condition
+                                # ``_has_planner_intent`` tests, re-stated over
+                                # the assembled brief so an empty brief can
+                                # never reach the provider. The literal that used to
+                                # stand here made ELSPETH the author of the
+                                # planner's brief whenever the session had no
+                                # intent — a server-authored request the LLM then
+                                # planned from. There is no honest sentence to
+                                # substitute: reaching this line means the
+                                # preflight predicate was bypassed, so fail the
+                                # operation instead of inventing a goal.
+                                raise AuditIntegrityError("guided planner run requires a root or deferred intent")
+                            planner_intent = "\n\n".join(planner_intent_parts)
                             originating_message = PlannerOriginatingMessage(
                                 session_id=str(session_id),
                                 message_id=str(root_message.id) if root_message is not None else None,

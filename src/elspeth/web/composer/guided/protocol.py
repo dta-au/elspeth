@@ -779,6 +779,20 @@ PROPOSAL_RATIONALE_TEMPLATE = "guided.proposal.rationale.review_required.v1"
 GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT = "I re-planned the whole pipeline with that instruction. Review the updated proposal below."
 GUIDED_PROPOSAL_CORRECTION_ACKNOWLEDGEMENT = "I re-planned the selected component with that correction. Review the updated proposal below."
 GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT = "I re-planned the pipeline with that wiring correction. Review the updated wiring below."
+# Goal-first entry: ``/guided/start`` and ``/guided/convert`` now REQUIRE the
+# author's one-sentence goal, seed it as the session's first user turn, and
+# follow it with this single server-authored line so the transcript opens on
+# the source question instead of on silence.
+#
+# The copy is deliberately a server statement about what the SERVER will do,
+# never a claim that the assistant has read the goal: the Step-1/Step-2 chat
+# solver is handed the step skill, the user's message, and
+# ``build_step_chat_context_block`` — never ``GuidedSession.chat_history`` — so
+# "I read your goal" would be false at the very next turn. The planner is the
+# one reader, at the Step-2 finish, which is exactly what this line promises.
+GUIDED_GOAL_ACKNOWLEDGEMENT = (
+    "Goal saved. The planner will build from it once the source and output are reviewed. First, the source: where does the data come from?"
+)
 _PROPOSAL_BLOCKER_SUMMARY: Mapping[str, str] = {
     "pipeline_invalid": "guided.proposal.blocker.pipeline_invalid.v1",
     "policy_review_required": "guided.proposal.blocker.policy_review_required.v1",

@@ -684,6 +684,29 @@ const GUIDED_CHAT_PLACEHOLDERS: Record<GuidedStep, string> = {
 const GUIDED_COMPLETED_CHAT_PLACEHOLDER =
   "Ask about the pipeline you just built — a step, a route, or what a check means.";
 
+/**
+ * Goal card copy, shown while a guided session has no composition state yet
+ * (goal-first, elspeth-378cfa0e18).
+ *
+ * A SEPARATE pair of constants for the same reason
+ * GUIDED_COMPLETED_CHAT_PLACEHOLDER is one: the step-keyed map is a closed
+ * `GuidedStep` contract and "before the session has started" is not a step —
+ * the session IS at step_1_source, it just has nothing persisted. This mirrors
+ * the local "ready" pseudo-step idiom (a stepper-only label kept out of the
+ * wire-keyed map) rather than widening the map and losing its exhaustiveness.
+ *
+ * The question is the CARD's, so it is a heading, not a placeholder; the
+ * placeholder carries the worked example. Length budget does not bind the same
+ * way here (the box is the only affordance on screen and the card carries the
+ * question), but it stays close to the ≤80-char sibling register by leading
+ * with the short instruction.
+ */
+const GUIDED_GOAL_QUESTION = "What should this pipeline produce?";
+const GUIDED_GOAL_HINT =
+  "One sentence is enough. The assistant plans the processing steps from it after you have reviewed your source and output.";
+const GUIDED_GOAL_PLACEHOLDER =
+  "In one sentence: what should come out the other end — e.g. a summary per page, saved as JSON…";
+
 interface ChatPanelProps {
   onOpenSecrets?: () => void;
   // Concern B (LLM-primary spec §"Frontend"): a TUTORIAL session must never
@@ -2880,21 +2903,39 @@ export function ChatPanel({
     !guidedSession.terminal &&
     isGuidedBuildActive(guidedSession, guidedNextTurn)
   ) {
+    // Nothing is persisted for this session yet: the store adopted the lazy
+    // GET /guided stub (non-mutating) so the panel can open on the goal card
+    // without writing a rootless wizard. The session's first Send goes through
+    // chatGuided's cold-start branch and becomes POST /guided/start's intent.
+    const awaitingGoal = compositionState === null;
     // Tutorial: the per-stage locked prompt has already been Sent once the
     // current step carries a user turn in the server-authoritative chat_history.
     // Only true after a SUCCESSFUL chatGuided round-trip (an HTTP failure leaves
     // chat_history untouched — see sessionStore.chatGuided catch), so a failed
     // send still shows the box for retry.
+    //
+    // TRIMMED EXACT EQUALITY against the step's locked prompt, not "any user
+    // turn that isn't Explain" (goal-first, elspeth-378cfa0e18): a started
+    // session's transcript now OPENS with the seeded goal turn, which the
+    // server stamps with step_1_source. Under the old predicate that turn alone
+    // satisfied step 1, so the locked source box flipped to the static "Sent"
+    // line before the learner had sent anything and the single-select the
+    // tutorial suppresses came back. Comparing against the prompt itself is
+    // also what the predicate always meant, and it subsumes the Explain
+    // exclusion the old shape needed as a special case. Trimmed on both sides
+    // because ChatInput trims on send (ChatInput.tsx) — the same trimmed
+    // comparison guidedReplay.ts uses for its own dedupe.
+    const lockedPromptForStep = (
+      lockedChatPrompt?.[guidedSession.step] ?? ""
+    ).trim();
     const tutorialPromptSentForStep =
       isTutorial === true &&
+      lockedPromptForStep !== "" &&
       guidedSession.chat_history.some(
         (t) =>
           t.role === "user" &&
           t.step === guidedSession.step &&
-          // The Explain button's canned question is NOT the step's prompt:
-          // on confirm-only steps it must not flip the locked box to the
-          // "Sent" line (exact-string filter; the constant owns the copy).
-          t.content !== GUIDED_EXPLAIN_MESSAGE,
+          t.content.trim() === lockedPromptForStep,
       );
     // Only swap the locked box for the static "Sent" line when there is actually
     // a forward affordance to confirm below — the turn widget OR a pending
@@ -2928,7 +2969,12 @@ export function ChatPanel({
     // against the existing checkpoint. The caption is keyed on the live step via
     // GUIDED_CHAT_PLACEHOLDERS.
     const stepComposer = buildGuidedComposer({
-      placeholder: GUIDED_CHAT_PLACEHOLDERS[guidedSession.step],
+      // Before the goal the box IS the goal box: the step-keyed caption would
+      // ask for a source description, which is not what this Send does (it
+      // establishes the session's root intent).
+      placeholder: awaitingGoal
+        ? GUIDED_GOAL_PLACEHOLDER
+        : GUIDED_CHAT_PLACEHOLDERS[guidedSession.step],
       // Tutorial: the box is locked read-only and prefilled with the CURRENT
       // phase's per-stage prompt (wire has none → empty, confirm-only).
       lockedValue: isTutorial
@@ -3009,6 +3055,31 @@ export function ChatPanel({
     // recorded tutorial.css fill-viewport failure); inside the scroll region
     // the step-advance focus effect scrolls it into view after a Send instead.
     const decisionSection = (() => {
+      // Before the goal there is no decision to show. The stub's first
+      // single_select asks the user to pick a source, which is the wrong
+      // question two steps early — and the card's Explain button would be
+      // WORSE than wrong: Explain sends its canned question through
+      // sendGuidedChat, which pre-start is the cold-start branch, so pressing
+      // it would make "Why am I seeing this?" the session's root intent and
+      // the planner's brief. The goal card replaces the whole section (never
+      // renders beside it), so the id, the role=log live region and the
+      // Explain affordance all belong to exactly one of the two.
+      if (awaitingGoal) {
+        return (
+          <section
+            className="guided-goal-prompt"
+            aria-labelledby="guided-goal-prompt-heading"
+          >
+            <h2
+              id="guided-goal-prompt-heading"
+              className="guided-goal-prompt__question"
+            >
+              {GUIDED_GOAL_QUESTION}
+            </h2>
+            <p className="guided-goal-prompt__hint">{GUIDED_GOAL_HINT}</p>
+          </section>
+        );
+      }
       const stepIsSendDriven =
         isTutorial && (lockedChatPrompt?.[guidedSession.step] ?? "") !== "";
       // Lead the decision with the dynamic build rationale (the LLM's "what I
@@ -3834,7 +3905,12 @@ type WorkflowStepId = GuidedStep | "ready";
 const GUIDED_STEP_PURPOSES: Record<GuidedStep, string> = {
   step_1_source: "Choose the input and confirm what ELSPETH can read.",
   step_2_sink: "Choose the output shape and the fields the pipeline should produce.",
-  step_3_transforms: "Review the transform stages that turn source data into the output.",
+  // Names where the steps came from (goal-first, elspeth-378cfa0e18): the
+  // session states its goal up front and the planner runs ONCE, at the step-2
+  // finish, from that goal. "Review the transform stages" described a stage the
+  // user was expected to author here; what actually happens is a review of what
+  // the assistant proposed.
+  step_3_transforms: "Review the processing steps the assistant proposed from your goal.",
   step_4_wire: "Review and confirm the wiring between your pipeline steps.",
 };
 

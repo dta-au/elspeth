@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ModeSwitchButton } from "./ModeSwitchButton";
@@ -10,20 +10,38 @@ describe("ModeSwitchButton", () => {
     resetStore(useSessionStore);
   });
 
-  it("target=guided, no work: a single click switches immediately (no confirm)", () => {
+  /** Type a goal into the confirm card's required box. */
+  function stateGoal(goal: string): void {
+    fireEvent.change(
+      screen.getByLabelText("What should this pipeline produce?"),
+      { target: { value: goal } },
+    );
+  }
+
+  it("target=guided, no work: the card still opens, because the fresh wizard needs a goal", () => {
+    // Goal-first (elspeth-378cfa0e18). The old single-click switch had nothing
+    // to root the new wizard on, so it POSTed an intent-less convert and
+    // persisted a rootless wizard — the state that made the goal card
+    // unreachable and let the step-2 finish plan from a fallback sentence. The
+    // store also cannot tell an empty session from a worked one synchronously
+    // (only GET /guided can), so the card asks once either way.
     const enterGuided = vi.fn().mockResolvedValue(undefined);
     useSessionStore.setState({ enterGuided });
 
     render(<ModeSwitchButton target="guided" hasWork={false} />);
     fireEvent.click(screen.getByRole("button", { name: "Switch to guided" }));
 
-    expect(enterGuided).toHaveBeenCalledTimes(1);
-    expect(
-      screen.queryByRole("button", { name: /^confirm/i }),
-    ).toBeNull();
+    expect(enterGuided).not.toHaveBeenCalled();
+    stateGoal("Summarise every page as one JSON row.");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Confirm switch to guided" }),
+    );
+    expect(enterGuided).toHaveBeenCalledWith(
+      "Summarise every page as one JSON row.",
+    );
   });
 
-  it("target=guided, with work: click reveals a confirm; confirm switches", () => {
+  it("target=guided, with work: click reveals a confirm; confirm switches with the goal", () => {
     const enterGuided = vi.fn().mockResolvedValue(undefined);
     useSessionStore.setState({ enterGuided });
 
@@ -32,10 +50,51 @@ describe("ModeSwitchButton", () => {
 
     // First click only arms the confirmation — it must NOT switch yet.
     expect(enterGuided).not.toHaveBeenCalled();
+    stateGoal("Turn each row into a one-line summary.");
     fireEvent.click(
       screen.getByRole("button", { name: "Confirm switch to guided" }),
     );
     expect(enterGuided).toHaveBeenCalledTimes(1);
+    expect(enterGuided).toHaveBeenCalledWith(
+      "Turn each row into a one-line summary.",
+    );
+  });
+
+  it("target=guided: Confirm stays disabled until a non-blank goal is typed", () => {
+    // A goal-less confirm has nothing to root the wizard on and the store
+    // refuses it, so the affordance must not be live. Whitespace does not
+    // count: the intent is trimmed before it is sent.
+    const enterGuided = vi.fn().mockResolvedValue(undefined);
+    useSessionStore.setState({ enterGuided });
+
+    render(<ModeSwitchButton target="guided" hasWork />);
+    fireEvent.click(screen.getByRole("button", { name: "Switch to guided" }));
+
+    const confirm = screen.getByRole("button", {
+      name: "Confirm switch to guided",
+    });
+    expect(confirm).toBeDisabled();
+
+    stateGoal("   ");
+    expect(confirm).toBeDisabled();
+
+    stateGoal("  Summarise each page.  ");
+    expect(confirm).not.toBeDisabled();
+    fireEvent.click(confirm);
+    // Trimmed on the way out — the server's visible-content rule and the
+    // custody fingerprint both key on the exact string.
+    expect(enterGuided).toHaveBeenCalledWith("Summarise each page.");
+  });
+
+  it("target=guided: the goal box carries a real label, not a placeholder-only name", () => {
+    render(<ModeSwitchButton target="guided" hasWork />);
+    fireEvent.click(screen.getByRole("button", { name: "Switch to guided" }));
+
+    const box = screen.getByRole("textbox", {
+      name: "What should this pipeline produce?",
+    });
+    expect(box).toBeRequired();
+    expect(box).toHaveAttribute("placeholder");
   });
 
   it("target=guided, with work: the confirm is honest that guided starts fresh and the pipeline is recoverable", () => {
@@ -94,6 +153,16 @@ describe("ModeSwitchButton", () => {
 
     expect(screen.getByText(/pick up your guided setup where you left it/i)).toBeInTheDocument();
     expect(screen.getByText(/nothing is discarded/i)).toBeInTheDocument();
+    // A RESUME asks for no goal — the saved wizard already has its root
+    // (goal-first, elspeth-378cfa0e18), and demanding a second one would
+    // reintroduce exactly the "safe action dressed as destructive" defect F10b
+    // fixed. Confirm is therefore live immediately.
+    expect(
+      screen.queryByLabelText("What should this pipeline produce?"),
+    ).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Confirm switch to guided" }),
+    ).not.toBeDisabled();
     expect(screen.queryByText(/fresh/i)).toBeNull();
     expect(screen.queryByText(/version history/i)).toBeNull();
     expect(
@@ -140,6 +209,39 @@ describe("ModeSwitchButton", () => {
     expect(
       screen.getByRole("button", { name: "Confirm exit to freeform" }),
     ).toHaveAccessibleDescription(/continue in the freeform composer/i);
+  });
+
+  it("a session change clears the typed goal and closes the card", () => {
+    // The goal belongs to the session it was typed for. ChatPanel is mounted
+    // without a key, so switching sessions reconciles to this same component
+    // instance and, without the reset, both the text and the open card
+    // survive: session B's card opens prefilled with A's goal, Confirm already
+    // enabled, and one click roots B on words the author never wrote for it —
+    // B's durable root row, first transcript turn and planner brief.
+    const enterGuided = vi.fn().mockResolvedValue(undefined);
+    useSessionStore.setState({ enterGuided, activeSessionId: "session-a" });
+
+    render(<ModeSwitchButton target="guided" hasWork />);
+    fireEvent.click(screen.getByRole("button", { name: "Switch to guided" }));
+    stateGoal("Summarize the invoices.");
+
+    act(() => {
+      useSessionStore.setState({ activeSessionId: "session-b" });
+    });
+
+    expect(
+      screen.queryByLabelText("What should this pipeline produce?"),
+    ).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Switch to guided" }));
+    expect(
+      screen.getByLabelText("What should this pipeline produce?"),
+    ).toHaveValue("");
+    const confirm = screen.getByRole("button", {
+      name: "Confirm switch to guided",
+    });
+    expect(confirm).toBeDisabled();
+    fireEvent.click(confirm);
+    expect(enterGuided).not.toHaveBeenCalled();
   });
 
   it("with work: Cancel dismisses the confirm without switching", () => {

@@ -945,7 +945,7 @@ describe("api/client guided functions", () => {
   });
 
   describe("startGuidedSession", () => {
-    it("POSTs the profile discriminator to the full guided-start route", async () => {
+    it("POSTs the profile discriminator AND the intent for a tutorial start", async () => {
       const body = makeGetGuidedResponse();
       body.guided_session.profile = {
         coaching: true,
@@ -961,6 +961,7 @@ describe("api/client guided functions", () => {
         "sess-1",
         {
           profile: "tutorial",
+          intent: "Summarise each page and save the results as JSON.",
           operationId: "00000000-0000-4000-8000-000000000001",
         },
       );
@@ -972,8 +973,14 @@ describe("api/client guided functions", () => {
       expect((init.headers as Record<string, string>)["Content-Type"]).toBe(
         "application/json",
       );
+      // Goal-first (elspeth-378cfa0e18): the client used to STRIP intent for
+      // every non-live profile, which made a tutorial start intent-less on the
+      // wire no matter what the caller passed. The server now requires an
+      // intent for every profile, so that conditional 400s the whole tutorial;
+      // the body must carry the intent verbatim.
       expect(JSON.parse(init.body as string)).toEqual({
         profile: "tutorial",
+        intent: "Summarise each page and save the results as JSON.",
         operation_id: "00000000-0000-4000-8000-000000000001",
       });
       expect(result.guided_session.profile?.bookends).toBe(true);
@@ -1145,16 +1152,26 @@ describe("api/client guided functions", () => {
         forkFromMessage("sess-1", "00000000-0000-4000-8000-000000000008", "message-1", "edited"),
       ).rejects.toBeInstanceOf(ForkCommittedResponseError);
     });
-    it("sends the store-owned operation id for guided conversion", async () => {
+    it("sends the store-owned operation id AND the goal for guided conversion", async () => {
       const body = makeGetGuidedResponse();
       fetchSpy.mockResolvedValue({ ok: true, status: 200, json: async () => body } as Response);
 
-      await convertToGuided("sess-1", "00000000-0000-4000-8000-000000000003");
+      await convertToGuided(
+        "sess-1",
+        "Turn each row into a one-line summary saved as JSON.",
+        "00000000-0000-4000-8000-000000000003",
+      );
 
       const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
       expect(url).toBe("/api/sessions/sess-1/guided/convert");
+      // Goal-first (elspeth-378cfa0e18): a conversion roots the fresh wizard on
+      // the goal the user stated in the mode-switch card. An intent-less
+      // convert is what the store used to send on EVERY guided-default session
+      // creation, and it is what persisted a rootless, planner-reachable
+      // wizard; the server now refuses it.
       expect(JSON.parse(init.body as string)).toEqual({
         operation_id: "00000000-0000-4000-8000-000000000003",
+        intent: "Turn each row into a one-line summary saved as JSON.",
       });
     });
     it("sends the store-owned operation id for guided re-entry", async () => {
