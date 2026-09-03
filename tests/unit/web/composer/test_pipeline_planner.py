@@ -162,9 +162,17 @@ _FIXED_SCAFFOLDING_BASELINE_BYTES = 106 * 1024
 # boundary — it means teaching was lost rather than retired — and is a
 # judgement call for the operator, not a gate here. Measured 2026-09-03 at
 # 0dda01dfb (tool-result envelope data-key teaching, elspeth-e405ad7cd2):
-# 109,924 B; re-measured after the census stopped declining comprehension-
-# valued payloads and the eleven keys it newly enumerated were taught
-# (elspeth-e405ad7cd2 RED2-2 residue): 110,328 B, +285 B. The edge_contracts
+# 109,924 B; then two round-3 teaching corrections in the same lane moved it
+# before any census work did — the failure-schema and terminal-state
+# reconciliation (6da628fd3) to 109,983 B, +59 B, and diff_pipeline dropping
+# its version twin (414850e27) to 110,043 B, +60 B. Re-measured after the
+# census stopped declining comprehension-valued payloads and the eleven keys
+# it newly enumerated were taught (elspeth-e405ad7cd2 RED2-2 residue):
+# 110,328 B, +285 B on 110,043. Those two steps were reconstructed by
+# measuring every commit in between, because the entry below them recorded
+# +285 against the 109,924 above them: the arithmetic did not close and a
+# reader adding it up landed 119 B low. The chain is the record, so every
+# figure in it must be a measured predecessor of the next. The edge_contracts
 # CARDINALITY correction (elspeth-e405ad7cd2 LLM-R5-1) then moved it to
 # 110,564 B, +236 B, recording that only in its commit message; the same
 # description's REQUIREMENT-SOURCE correction (elspeth-e405ad7cd2 LLM-R5C-3)
