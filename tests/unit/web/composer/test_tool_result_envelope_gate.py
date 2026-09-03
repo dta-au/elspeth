@@ -1100,15 +1100,19 @@ def f():
     return result
 """
 
-# The eight routes by which the payload leaves the statements the walker reads, and one function
+# The ten routes by which the payload leaves the statements the walker reads, and one function
 # whose every use of it is accounted. The first three are red-team RED5B-1's measured survivors (each
 # SHIPPED its key with the census at 401 rows and mypy clean); the fourth is the conditional alias
 # ``_same_object_names`` exists for; the next two are the ways a bare CALLEE NAME is not enough —
 # an impostor receiver whose method shares a consumer's name, and a mutator bound before it is
-# called. The last two are red-team RED-F-1's measured survivors: an assignment whose TARGET is not
-# a bare name binds a handle ``_aliases_of`` cannot grow its set from, so the store through it is
-# invisible to the mutation assertion as well. ``stays_accounted`` is the other direction, without
-# which a mutant that refused everything would pass.
+# called. The last four are red-team RED-F-1's measured survivors and the two dimensions of the
+# guard that closed them (RED-CONF-1): an assignment whose TARGET is not a bare name binds a handle
+# ``_aliases_of`` cannot grow its set from, so the store through it is invisible to the mutation
+# assertion as well — and the target can be plain or ANNOTATED, alone or in a target LIST that mixes
+# a bare name with one of these. Without a probe on each dimension, reverting the AnnAssign half or
+# relaxing ``all`` to ``any`` leaves this file green while the key reaches the wire.
+# ``stays_accounted`` is the other direction, without which a mutant that refused everything would
+# pass.
 _PROBE_ESCAPING_PAYLOADS = """
 def escapes_into_a_call():
     payload = {"status": "x"}
@@ -1159,6 +1163,20 @@ def escapes_into_a_subscript_handle(holder):
 def escapes_into_an_attribute_handle(box):
     payload = {"status": "x"}
     box.p = payload
+    box.p["zzz"] = "y"
+    return ToolResult(success=True, data=payload)
+
+
+def escapes_into_an_annotated_attribute_handle(box):
+    payload = {"status": "x"}
+    box.p: dict = payload
+    box.p["zzz"] = "y"
+    return ToolResult(success=True, data=payload)
+
+
+def escapes_into_a_mixed_target(box):
+    payload = {"status": "x"}
+    keep = box.p = payload
     box.p["zzz"] = "y"
     return ToolResult(success=True, data=payload)
 
@@ -1566,6 +1584,8 @@ def test_the_walk_accounts_for_every_use_of_the_payload_and_refuses_an_escape() 
         "escapes_through_a_bound_method": "bound as payload.update rather than called there, so no mutator walker sees the call",
         "escapes_into_a_subscript_handle": "bound to holder['p'], a handle ``_aliases_of`` does not follow",
         "escapes_into_an_attribute_handle": "bound to box.p, a handle ``_aliases_of`` does not follow",
+        "escapes_into_an_annotated_attribute_handle": "bound to box.p, a handle ``_aliases_of`` does not follow",
+        "escapes_into_a_mixed_target": "bound to keep, box.p, a handle ``_aliases_of`` does not follow",
     }
     for fn_name, escape in escapes.items():
         fn = _function(tree, fn_name)
