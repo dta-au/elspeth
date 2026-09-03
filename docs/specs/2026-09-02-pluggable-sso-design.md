@@ -1,7 +1,7 @@
 # Pluggable SSO and identity substrate — backend-for-frontend login for Entra, VANguard, Google, and generic OIDC
 
-Date: 2026-09-02. Status: design, revision 2.8, implementation plan = tracker milestone elspeth-07cd19ba73.
-Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**. Revision 2.8 applies the verified remainder of that review — the surviving high and medium findings and rulings D24 to D34 — marked **[rev2.8]**; findings the verification pass refuted were not applied, and are listed with their refuting reason in the review record.
+Date: 2026-09-02. Status: design, revision 2.9, implementation plan = tracker milestone elspeth-07cd19ba73.
+Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**. Revision 2.8 applies the verified remainder of that review — the surviving high and medium findings and rulings D24 to D34 — marked **[rev2.8]**; findings the verification pass refuted were not applied, and are listed with their refuting reason in the review record. Revision 2.9 corrects what implementation measured against the tree, marked **[rev2.9]**: the §Discriminator widening site inventory undercounted the `routes.py` local-only guards (four, not two) and misclassified them as sites needing a value edit.
 Branch: `release/0.8.0`.
 Revision 2 incorporates six independent reviews (security architecture,
 solution design, reality check against the tree, systems risk, functional
@@ -350,7 +350,16 @@ Closed set, each an explicit exception class, never a `detail` prefix:
 6. `web/config.py::_validate_auth_fields` — per-provider required/forbidden
    matrix from the registry.
 7. `cli.py:4007` `--auth` help text and value validation.
-8. `web/auth/routes.py` provider guards at lines 246 and 405.
+8. `web/auth/routes.py` local-only guards — **four of them, not the two this
+   list claimed before [rev2.9]** (login, register, password change, refresh),
+   plus the `== "local"` `dev_admin_user` affordance. **None needs a value
+   edit:** every one compares `settings.auth_provider != "local"`, which stays
+   correct as the Literal widens. The pin is therefore an invariant, not an
+   edit — the contract test asserts the set of literals compared against
+   `auth_provider` in that module is exactly `{"local"}`, which catches the
+   real risk (a guard enumerating an IdP, which would expose the credential
+   routes on the next provider added) without pinning a route count that
+   ordinary work may legitimately change.
 9. `web/frontend/src/types/index.ts` provider union.
 10. `tests/unit/web/auth/test_provider_type_contract.py` pins all of the
     above plus registry parity and **both** CHECK strings
