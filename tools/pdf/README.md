@@ -56,8 +56,8 @@ Outputs:
 ./build-control-pack.sh --pdf programme    # build one
 ```
 
-One PDF per document rather than a bound volume: the RAID register carries its
-own review cycle and is reissued independently of the programme document.
+One PDF per document rather than a bound volume: each document carries its own
+review cycle and is reissued independently of the others.
 Finished PDFs are written beside their source markdown in
 `docs/project-control/`, which is gitignored in full except its README, so they
 are never staged and never meet the pre-commit large-file threshold. The `.typ`
