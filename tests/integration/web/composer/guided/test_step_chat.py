@@ -948,6 +948,41 @@ class TestStepChatRejections:
         assert status == 409, body
         assert "terminal" in body["detail"].lower()
 
+    def test_completed_session_keeps_its_chat_channel(self, composer_test_client: TestClient) -> None:
+        """The sibling of the refusal above: COMPLETED is admitted, EXITED is not.
+
+        The two terminal kinds now diverge on this endpoint. A confirmed build
+        answers questions about itself over the frozen wire record it settled
+        on; only an exit closes the channel (elspeth-986801d218). Bound to the
+        confirmation hash, not to a current unanswered turn — there is none.
+        """
+        from tests.integration.web.composer.guided.test_chat_schema8_atomic import (
+            _create_session as _create_guided_session,
+        )
+        from tests.integration.web.composer.guided.test_chat_schema8_atomic import (
+            _seed_completed_session,
+        )
+
+        session_id = _create_guided_session(composer_test_client)
+        token = _seed_completed_session(composer_test_client, session_id)
+        completion = _ReturningLiteLLMCompletion(_fake_llm_reply("It writes JSON rows to your output."))
+
+        with patch(_CHAT_SOLVER_ACOMPLETION, completion):
+            response = composer_test_client.post(
+                f"/api/sessions/{session_id}/guided/chat",
+                json={"operation_id": str(uuid4()), "turn_token": token, "message": "What does this pipeline do?"},
+            )
+
+        assert response.status_code == 200, response.json()
+        body = response.json()
+        assert body["assistant_message"] == "It writes JSON rows to your output."
+        assert body["next_turn"] is None
+        assert body["terminal"]["kind"] == "completed"
+        # Exactly one provider round, advisory: no tools are offered on a
+        # settled build because there is nothing left to author.
+        assert len(completion.calls) == 1
+        assert completion.calls[0].get("tools") is None
+
 
 def _terminal_kind_exited():
     """Return the TerminalKind value matching exited_to_freeform."""

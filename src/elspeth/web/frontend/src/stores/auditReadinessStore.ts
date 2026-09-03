@@ -60,13 +60,23 @@ export interface AuditReadinessState {
     compositionVersion: number,
     options?: LoadSnapshotOptions,
   ) => Promise<void>;
+  /** Re-stamp the cached snapshot onto a version whose authored content is
+   *  identical to the one it was fetched for (elspeth-986801d218). */
+  carrySnapshotForward: (
+    sessionId: string,
+    fromVersion: number,
+    toVersion: number,
+  ) => void;
   loadExplain: (sessionId: string, compositionVersion: number) => Promise<void>;
   clearSession: (sessionId: string) => void;
   reset: () => void;
   setUserExpanded: (sessionId: string, value: boolean) => void;
 }
 
-export const getInitialState = (): Omit<AuditReadinessState, "loadSnapshot" | "loadExplain" | "clearSession" | "reset" | "setUserExpanded"> => ({
+export const getInitialState = (): Omit<
+  AuditReadinessState,
+  "loadSnapshot" | "carrySnapshotForward" | "loadExplain" | "clearSession" | "reset" | "setUserExpanded"
+> => ({
   snapshotsBySession: {},
   explainsBySession: {},
   abortControllers: {},
@@ -326,6 +336,40 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
         };
       });
     }
+  },
+
+  carrySnapshotForward(sessionId: string, fromVersion: number, toVersion: number) {
+    // A version bump that authored NOTHING (a post-completion guided chat
+    // persists a byte-identical composition row) leaves the cached readiness
+    // exactly as true as it was, but every consumer matches on
+    // `composition_version`: without this the Checks badge flips to
+    // "Checking", ExecuteButton's advisory snapshot goes undefined, and the
+    // server runs a second full validation + audit projection — once per
+    // question, forever, on a surface that never used to bump the version.
+    //
+    // Guarded on `fromVersion` the way the auto-validate subscriber guards on
+    // "landed": only the snapshot fetched FOR the content-equal predecessor
+    // may move. A snapshot from some older version is not known to describe
+    // this content, and stamping it forward would assert a readiness the
+    // server never gave. The caller owns the content-equality proof
+    // (`compositionContentEqual`); this owns the identity check.
+    set((state) => {
+      const cached = state.snapshotsBySession[sessionId];
+      if (
+        cached === undefined ||
+        cached.session_id !== sessionId ||
+        cached.composition_version !== fromVersion ||
+        fromVersion === toVersion
+      ) {
+        return state;
+      }
+      return {
+        snapshotsBySession: {
+          ...state.snapshotsBySession,
+          [sessionId]: { ...cached, composition_version: toVersion },
+        },
+      };
+    });
   },
 
   clearSession(sessionId: string) {

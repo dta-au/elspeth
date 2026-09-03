@@ -4766,3 +4766,208 @@ describe("sessionStore — guided-mode fields and actions", () => {
     });
   });
 });
+
+// ── Completed-session chat (elspeth-986801d218 / IA-6) ───────────────────────
+//
+// After Confirm wiring the session is terminal and there is no unanswered
+// turn, but the chat channel stays open. The backend admits the request only
+// when `turn_token` equals the confirmation hash —
+// `guided_session.history[-1].response_hash` — so the store must post THAT,
+// not throw and not invent one.
+describe("sessionStore — chatGuided on a COMPLETED session", () => {
+  const CONFIRMATION_HASH = "c".repeat(64);
+
+  const completedGuidedSession: GuidedSession = {
+    ...sampleGuidedSession,
+    step: "step_4_wire",
+    history: [
+      {
+        step: "step_4_wire",
+        turn_type: "confirm_wiring",
+        payload_hash: "p".repeat(64),
+        response_hash: CONFIRMATION_HASH,
+        summary: "Wiring confirmed",
+        emitter: "server",
+      },
+    ],
+    terminal: sampleTerminal,
+  };
+
+  /** The server's answer to a completed chat: terminal held, next_turn null. */
+  const completedChatResponse: GuidedChatResponse = {
+    assistant_message: "node-2 calls the model once per row.",
+    assistant_message_kind: "assistant",
+    guided_session: {
+      ...completedGuidedSession,
+      chat_history: [
+        {
+          role: "user",
+          content: "what does node-2 do?",
+          seq: 0,
+          step: "step_4_wire",
+          ts_iso: "2026-09-03T00:00:00+00:00",
+          assistant_message_kind: null,
+          synthetic_failure_reason: null,
+          turn_token: CONFIRMATION_HASH,
+        },
+        {
+          role: "assistant",
+          content: "node-2 calls the model once per row.",
+          seq: 1,
+          step: "step_4_wire",
+          ts_iso: "2026-09-03T00:00:00+00:00",
+          assistant_message_kind: "assistant",
+          synthetic_failure_reason: null,
+          turn_token: null,
+        },
+      ],
+      chat_turn_seq: 2,
+    },
+    next_turn: null,
+    terminal: sampleTerminal,
+    composition_state: { ...sampleCompositionState, version: 2 },
+  };
+
+  beforeEach(async () => {
+    vi.resetAllMocks();
+    window.sessionStorage.clear();
+    resetStore(useSessionStore);
+    const apiMod = await import("@/api/client");
+    (apiMod.listInterpretationEvents as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: completedGuidedSession,
+      guidedNextTurn: null,
+      guidedTerminal: sampleTerminal,
+      compositionState: sampleCompositionState,
+    });
+  });
+
+  it("posts the confirmation hash as turn_token and applies the reply", async () => {
+    const { chatGuided } = await import("@/api/client");
+    (chatGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      completedChatResponse,
+    );
+
+    await useSessionStore.getState().chatGuided("what does node-2 do?");
+
+    const [sessionId, body] = (chatGuided as ReturnType<typeof vi.fn>).mock
+      .calls[0];
+    expect(sessionId).toBe(RETRY_SESSION_ID);
+    expect(body.turn_token).toBe(CONFIRMATION_HASH);
+    expect(body.message).toBe("what does node-2 do?");
+
+    const state = useSessionStore.getState();
+    expect(state.guidedSession?.chat_history).toHaveLength(2);
+    // The reply must NOT re-open the wizard or clear the terminal.
+    expect(state.guidedNextTurn).toBeNull();
+    expect(state.guidedTerminal).toEqual(sampleTerminal);
+    expect(state.guidedChatPending).toBe(false);
+  });
+
+  it("keys retry custody on the confirmation hash", async () => {
+    const { chatGuided } = await import("@/api/client");
+    // Never resolves: custody is held for the LIFE of the request, so the
+    // slot can be read while it is in flight (a settled chat clears it).
+    (chatGuided as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      new Promise(() => undefined),
+    );
+
+    void useSessionStore.getState().chatGuided("what does node-2 do?");
+    await Promise.resolve();
+    expect(window.sessionStorage.getItem(GUIDED_RETRY_STORAGE_KEY)).not.toBeNull();
+
+    // Custody is keyed [turn_token, message] through an opaque fingerprint,
+    // so the token is not literally in the slot — re-deriving the key is how
+    // you read it. Re-acquiring with the SAME identity recovers the same
+    // operation ("acquired"); any other token collides with the held slot
+    // ("conflict"). A completed chat that claimed its slot under some other
+    // token would invert both.
+    const sameIdentity = acquireGuidedRetry("guided_chat", RETRY_SESSION_ID, [
+      CONFIRMATION_HASH,
+      "what does node-2 do?",
+    ]);
+    expect(sameIdentity.status).toBe("acquired");
+    const otherToken = acquireGuidedRetry("guided_chat", RETRY_SESSION_ID, [
+      "e".repeat(64),
+      "what does node-2 do?",
+    ]);
+    expect(otherToken.status).toBe("conflict");
+  });
+
+  it("resyncs on a 409 and leaves guidedNextTurn null", async () => {
+    const { chatGuided, getGuided } = await import("@/api/client");
+    (chatGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      status: 409,
+      detail: "The committed pipeline was changed outside guided mode.",
+    });
+    // GET /guided on a completed session returns next_turn null.
+    (getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      guided_session: completedGuidedSession,
+      next_turn: null,
+      terminal: sampleTerminal,
+      composition_state: sampleCompositionState,
+    });
+
+    await useSessionStore.getState().chatGuided("confirm the wiring");
+
+    const state = useSessionStore.getState();
+    expect(state.guidedNextTurn).toBeNull();
+    expect(state.guidedTerminal).toEqual(sampleTerminal);
+    expect(state.error).toBe(
+      "The committed pipeline was changed outside guided mode.",
+    );
+    expect(state.guidedChatPending).toBe(false);
+  });
+
+  it("still throws on an EXITED terminal — that channel is closed", async () => {
+    // Discrimination against a "any terminal chats" implementation: the route
+    // refuses an exited session verbatim, so the client must not post at all.
+    const { chatGuided } = await import("@/api/client");
+    useSessionStore.setState({
+      guidedSession: sampleExitedGuidedSession,
+      guidedNextTurn: null,
+      guidedTerminal: sampleExitedGuidedSession.terminal,
+    });
+
+    await expect(
+      useSessionStore.getState().chatGuided("what does node-2 do?"),
+    ).rejects.toThrow("chatGuided called without a current unanswered turn");
+    expect(chatGuided).not.toHaveBeenCalled();
+  });
+
+  it("still throws when a completed session's last record is unanswered", async () => {
+    const { chatGuided } = await import("@/api/client");
+    useSessionStore.setState({
+      guidedSession: {
+        ...completedGuidedSession,
+        history: [
+          { ...completedGuidedSession.history[0], response_hash: null },
+        ],
+      },
+    });
+
+    await expect(
+      useSessionStore.getState().chatGuided("what does node-2 do?"),
+    ).rejects.toThrow("chatGuided called without a current unanswered turn");
+    expect(chatGuided).not.toHaveBeenCalled();
+  });
+
+  it("a Retry token still wins over the completed token", async () => {
+    // Occurrence binding is unchanged: a retry submits the token its message
+    // was originally submitted under, and the server decides.
+    const { chatGuided } = await import("@/api/client");
+    (chatGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      completedChatResponse,
+    );
+    const retryToken = "d".repeat(64);
+
+    await useSessionStore
+      .getState()
+      .chatGuided("what does node-2 do?", undefined, "amend", retryToken);
+
+    expect(
+      (chatGuided as ReturnType<typeof vi.fn>).mock.calls[0][1].turn_token,
+    ).toBe(retryToken);
+  });
+});

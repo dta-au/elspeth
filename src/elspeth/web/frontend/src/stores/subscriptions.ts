@@ -8,8 +8,9 @@ import { useSessionStore } from "./sessionStore";
 import { useExecutionStore } from "./executionStore";
 import { useAuditReadinessStore } from "./auditReadinessStore";
 import { useAuthStore } from "./authStore";
-import type { ValidationResult } from "@/types/index";
+import type { CompositionState, ValidationResult } from "@/types/index";
 import { hasCompositionContent } from "@/utils/compositionState";
+import { compositionContentEqual } from "@/lib/compositionContent";
 import {
   humaniseValidationMessage,
   makePhraseFor,
@@ -25,6 +26,47 @@ let previousVersion: number | null = null;
 let previousSessionIds: Set<string> = new Set();
 let initialized = false;
 let unsubscribe: (() => void) | null = null;
+
+/**
+ * Last composition each version-keyed subscriber acted on, so a version bump
+ * that authored NOTHING can be recognised and skipped (elspeth-986801d218 —
+ * a post-completion guided chat persists a byte-identical state row, and
+ * clearing + re-validating on it flipped the completed heading off "Pipeline
+ * ready" for the round trip).
+ *
+ * ONE SNAPSHOT PER SUBSCRIBER, never a shared one. Zustand fires listeners in
+ * registration order on a single `setState`: the version-clear subscriber
+ * (registered first) would advance a shared snapshot to the current state and
+ * the auto-validate subscriber (registered second) would then compare the
+ * current state against itself, find it equal, and never validate again.
+ *
+ * Both must be reset in `_resetSubscriptionsForTesting()` AND in
+ * `resetPerUserState()` — a snapshot surviving a logout / user switch would
+ * suppress the first real change of the next identity.
+ */
+interface CompositionSnapshot {
+  sessionId: string | null;
+  version: number;
+  state: CompositionState;
+}
+let previousClearSnapshot: CompositionSnapshot | null = null;
+let previousValidatedSnapshot: CompositionSnapshot | null = null;
+
+/**
+ * True when `snapshot` describes the SAME session's composition and its
+ * authored content matches `state` — i.e. the version bump between them is a
+ * bookkeeping write, not an edit. Fails closed on a null snapshot or a
+ * session change (see compositionContent.ts's safe-direction rule).
+ */
+function isContentOnlyVersionBump(
+  snapshot: CompositionSnapshot | null,
+  sessionId: string | null,
+  state: CompositionState | null,
+): boolean {
+  if (snapshot === null || state === null) return false;
+  if (snapshot.sessionId !== sessionId) return false;
+  return compositionContentEqual(snapshot.state, state);
+}
 
 // Tracks the last-seen activeSessionId so the run-rehydration subscriber
 // fires once per session activation, not on every sessionStore write.
@@ -184,6 +226,8 @@ function authIdentityFingerprint(state: { token: string | null; user: { user_id:
  */
 function resetPerUserState(): void {
   previousVersion = null;
+  previousClearSnapshot = null;
+  previousValidatedSnapshot = null;
   previousValidationFingerprint = null;
   previousWasPendingReview = false;
   previousSessionIds = new Set();
@@ -235,12 +279,53 @@ export function initStoreSubscriptions(): void {
   previousSessionIds = new Set(useSessionStore.getState().sessions.map((s) => s.id));
 
   unsubscribe = useSessionStore.subscribe((state) => {
-    // Version-change clears validation.
-    const currentVersion = state.compositionState?.version ?? null;
+    // Version-change clears validation — UNLESS the new version carries the
+    // same authored content as the one it replaced. A content-equal bump
+    // (a post-completion guided chat's byte-identical settlement row) leaves
+    // the existing verdict exactly as true as it was; clearing it would blank
+    // the run gate's readiness and read on screen as "Pipeline updated" until
+    // a redundant re-validate landed.
+    const composition = state.compositionState;
+    const currentVersion = composition?.version ?? null;
     if (previousVersion !== null && currentVersion !== previousVersion) {
-      useExecutionStore.getState().clearValidation();
+      const contentOnlyBump = isContentOnlyVersionBump(
+        previousClearSnapshot,
+        state.activeSessionId,
+        composition,
+      );
+      if (!contentOnlyBump) {
+        useExecutionStore.getState().clearValidation();
+      } else if (
+        previousClearSnapshot !== null &&
+        state.activeSessionId !== null &&
+        currentVersion !== null
+      ) {
+        // Same authored content ⇒ the readiness the server computed for the
+        // previous version is exact for this one. Carry it forward rather
+        // than let `useAuditReadinessSync`'s version-keyed effect refetch:
+        // that fetch is the SAME defect on a third surface (Checks badge to
+        // "Checking", ExecuteButton's advisory snapshot to undefined, one
+        // extra server-side validation + audit projection per question).
+        // The store re-checks that the cached snapshot is the predecessor's
+        // before it moves — this side owns only the content proof.
+        useAuditReadinessStore
+          .getState()
+          .carrySnapshotForward(
+            state.activeSessionId,
+            previousClearSnapshot.version,
+            currentVersion,
+          );
+      }
     }
     previousVersion = currentVersion;
+    previousClearSnapshot =
+      composition === null || currentVersion === null
+        ? null
+        : {
+            sessionId: state.activeSessionId,
+            version: currentVersion,
+            state: composition,
+          };
 
     // Session removal clears audit-readiness cache.
     const currentIds = new Set(state.sessions.map((s) => s.id));
@@ -412,6 +497,38 @@ export function initStoreSubscriptions(): void {
     const exec = useExecutionStore.getState();
     if (exec.isExecuting || exec.progress?.status === "running") return;
 
+    // Content-equal carry-forward: a verdict that LANDED for this exact
+    // content is carried to the new version instead of re-POSTing /validate.
+    //
+    // "Landed" is the load-bearing half — `lastValidatedVersionBySession`
+    // holding the snapshot's own version. Without it this would swallow the
+    // deliberate retry of a version whose validate FAILED or was suppressed:
+    // that path leaves the cache empty precisely so a re-fire validates
+    // again, and there is no verdict to carry forward from it.
+    //
+    // Advancing the cache is what makes the skip safe to repeat — a LATER
+    // version with genuinely different content still misses it and validates.
+    // This subscriber owns that map, so the advance lives here and nowhere
+    // else.
+    const carriedVerdict =
+      previousValidatedSnapshot !== null &&
+      lastValidatedVersionBySession.get(sessionId) ===
+        previousValidatedSnapshot.version &&
+      isContentOnlyVersionBump(
+        previousValidatedSnapshot,
+        sessionId,
+        state.compositionState,
+      );
+    previousValidatedSnapshot = {
+      sessionId,
+      version,
+      state: state.compositionState,
+    };
+    if (carriedVerdict) {
+      lastValidatedVersionBySession.set(sessionId, version);
+      return;
+    }
+
     pendingValidateTarget = { sessionId, version, force: false };
     if (validateInflight) return;
     void fireValidateLoop();
@@ -519,6 +636,8 @@ export function _resetSubscriptionsForTesting(): void {
   unsubscribeRunRehydration = null;
   previousActiveSessionId = null;
   previousVersion = null;
+  previousClearSnapshot = null;
+  previousValidatedSnapshot = null;
   previousValidationFingerprint = null;
   previousWasPendingReview = false;
   previousSessionIds = new Set();

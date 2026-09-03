@@ -18,7 +18,7 @@ from copy import deepcopy
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any, get_args
+from typing import Any, ClassVar, get_args
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
@@ -30,7 +30,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import ConfigFieldSummary, PluginSecretRequirement, PluginSummary
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.guided import chat_solver
+from elspeth.web.composer.guided import chat_solver, planning
 from elspeth.web.composer.guided.chat_solver import (
     _STEP_2_SINK_DIGEST_MAX_UTF8_BYTES,
     AssistantScaffoldLeakError,
@@ -92,6 +92,9 @@ from elspeth.web.sessions.routes.composer.guided_chat_intent_management import (
     DeferredRequestEdited,
     DeferredRequestRetained,
     DeferredRequestUnchanged,
+)
+from tests.unit.web.composer.guided.test_propose_pipeline_protocol import (
+    GATE_ROUTE_KEYS,
 )
 from tests.unit.web.composer.guided.test_propose_pipeline_protocol import (
     _fork_coalesce_payload as _advisory_fork_coalesce_payload,
@@ -4190,6 +4193,7 @@ async def test_guided_chat_route_selects_active_output_for_revision_and_keeps_al
         reviewed_outputs=outputs,
         pending_output_intents={"pending-gap": SimpleNamespace()},
         deferred_intents=(),
+        terminal=None,
     )
     captured: dict[str, Any] = {}
 
@@ -4267,6 +4271,7 @@ async def test_guided_chat_route_preserves_gapped_index_for_single_advisory_outp
         reviewed_outputs={"output-b": output},
         pending_output_intents={"pending-a": SimpleNamespace(), "pending-b": SimpleNamespace()},
         deferred_intents=(),
+        terminal=None,
     )
     captured: dict[str, Any] = {}
 
@@ -4365,6 +4370,7 @@ async def test_applied_component_chat_revision_is_form_directed_without_mutation
         reviewed_outputs={"output-a": output},
         pending_source_intents={},
         deferred_intents=(),
+        terminal=None,
     )
     captured: dict[str, Any] = {}
 
@@ -6644,3 +6650,749 @@ class TestStep1SourceToolSchema:
 
         _step_1_source_tool(plugin_hint=None, available_source_plugins=("csv",))
         assert "enum" not in _STEP_1_SOURCE_TOOL["function"]["parameters"]["properties"]["plugin"]
+
+
+class TestCommittedBuildContext:
+    """The post-commit context block: all after-confirmation teaching lives here.
+
+    The step skills stay byte-identical (so the wire-correction planner and
+    the management call are untouched), which means this block is the ONLY
+    place that can tell the model the build is finished, that there are no
+    wizard controls to point at, and that it cannot change anything. Two
+    properties therefore matter: the default must not have moved a byte for
+    the four in-progress callers, and the committed variant must supersede
+    exactly the three passages that would otherwise be false.
+    """
+
+    _DEFAULT_OPENER_BY_STEP: ClassVar[dict[GuidedStep, str]] = {
+        GuidedStep.STEP_1_SOURCE: (
+            "The user is on wizard step step_1_source. When they ask what they are "
+            "seeing or why, explain from THIS build context: name the concrete "
+            "plugins and structural details below, why they fit what the user asked "
+            "for, and what the listed details mean in plain language. Exact settings "
+            "may be intentionally withheld or summarized only as counts; never treat "
+            "a count as the setting values and do not invent values that are not listed."
+        ),
+        GuidedStep.STEP_2_SINK: (
+            "The user is on wizard step step_2_sink. When they ask what they are "
+            "seeing or why, explain from THIS build context: name the concrete "
+            "plugins and structural details below, why they fit what the user asked "
+            "for, and what the listed details mean in plain language. Exact settings "
+            "may be intentionally withheld or summarized only as counts; never treat "
+            "a count as the setting values and do not invent values that are not listed."
+        ),
+        GuidedStep.STEP_3_TRANSFORMS: (
+            "The user is on wizard step step_3_transforms. When they ask what they are "
+            "seeing or why, explain from THIS build context: name the concrete "
+            "plugins and structural details below, why they fit what the user asked "
+            "for, and what the listed details mean in plain language. Exact settings "
+            "may be intentionally withheld or summarized only as counts; never treat "
+            "a count as the setting values and do not invent values that are not listed."
+        ),
+        GuidedStep.STEP_4_WIRE: (
+            "The user is on wizard step step_4_wire. When they ask what they are "
+            "seeing or why, explain from THIS build context: name the concrete "
+            "plugins and structural details below, why they fit what the user asked "
+            "for, and what the listed details mean in plain language. Exact settings "
+            "may be intentionally withheld or summarized only as counts; never treat "
+            "a count as the setting values and do not invent values that are not listed."
+        ),
+    }
+
+    @staticmethod
+    def _wire_payload() -> dict[str, Any]:
+        return _advisory_wire_payload_with_gate(_advisory_gate_payload()["nodes"][0]["behavior"])
+
+    @classmethod
+    def _wire_context(cls, *, committed_build: Any = False, payload: dict[str, Any] | None = None) -> Any:
+        wire = payload if payload is not None else cls._wire_payload()
+        return build_step_chat_context_block(
+            step=GuidedStep.STEP_4_WIRE,
+            current_source=None,
+            current_sink=None,
+            state=None,
+            deferred_intents=(),
+            graph_authority=_advisory_graph_authority(wire, turn_type=TurnType.CONFIRM_WIRING),
+            committed_build=committed_build,
+        )
+
+    @pytest.mark.parametrize("step", list(GuidedStep))
+    def test_default_opener_is_byte_identical_for_every_in_progress_caller(self, step: GuidedStep) -> None:
+        """Golden pin: omitting ``committed`` renders exactly what it always did."""
+
+        graph_authority = None
+        if step in {GuidedStep.STEP_3_TRANSFORMS, GuidedStep.STEP_4_WIRE}:
+            payload = (
+                _advisory_gate_payload()
+                if step is GuidedStep.STEP_3_TRANSFORMS
+                else _advisory_wire_payload_with_gate(_advisory_gate_payload()["nodes"][0]["behavior"])
+            )
+            graph_authority = _advisory_graph_authority(
+                payload,
+                turn_type=(TurnType.PROPOSE_PIPELINE if step is GuidedStep.STEP_3_TRANSFORMS else TurnType.CONFIRM_WIRING),
+            )
+        block = build_step_chat_context_block(
+            step=step,
+            current_source=None,
+            current_sink=None,
+            state=None,
+            deferred_intents=(),
+            graph_authority=graph_authority,
+        )
+
+        expected_head = "## Current build (what the user is looking at)\n\n" + self._DEFAULT_OPENER_BY_STEP[step] + "\n\n"
+        assert block.system_content.startswith(expected_head)
+        assert "The guided build is FINISHED" not in block.system_content
+
+    def test_explicit_false_renders_identically_to_omitting_the_keyword(self) -> None:
+        assert self._wire_context(committed_build=False) == self._wire_context()
+
+    def test_committed_block_supersedes_exactly_the_teaching_passages(self) -> None:
+        """The opener, the two graph-usage sentences, and the Applied lines.
+
+        Pinned as a whole-line diff so a sentence cannot be added to the
+        committed context without a reviewer reading it: every line here is
+        model-facing teaching, and the defect class this block exists to
+        prevent is a passage that is true on a live build and false on a
+        settled one.
+        """
+
+        # The serialized graph record is excluded: it is a JSON line, not a
+        # teaching sentence, and on a committed build it legitimately differs —
+        # the facts the drift gate cannot compare are renamed with the
+        # ``_at_confirmation`` suffix. That rename has its own test below.
+        default_lines = [line for line in self._wire_context().system_content.splitlines() if not line.startswith("{")]
+        committed_lines = [
+            line for line in self._wire_context(committed_build=True).system_content.splitlines() if not line.startswith("{")
+        ]
+
+        removed = [line for line in default_lines if line not in committed_lines]
+        added = [line for line in committed_lines if line not in default_lines]
+        assert removed == [
+            self._DEFAULT_OPENER_BY_STEP[GuidedStep.STEP_4_WIRE],
+            # An active-stage projection of the ONE component just applied.
+            # On a settled build it read "none yet." three lines above a graph
+            # listing every source and output the user confirmed.
+            "Applied source: none yet.",
+            "Applied output: none yet.",
+            (
+                "Use the exact endpoint relations above when explaining what the graph does. Only those covered IDs may be "
+                "used to explain why a graph decision was made from a pending instruction; every other pending instruction "
+                "is management context only. Exact authored predicates, route keys, field names, mappings, enum values, and "
+                "typed numeric/time literals follow only in a delimited user-role data block."
+            ),
+            "No pending instruction is covered, so do not attribute any graph decision to one.",
+            # The omission sentence is NOT in this list as a committed-only
+            # supersession any more: its shared option-value clause is rendered
+            # from one constant on both arms, so the in-progress line moved too
+            # (round 4, LLM-4 — unqualified it was false on both paths).
+            (
+                "Paths, prompts, samples, blobs, secrets, raw option values other than those summarized in each component's "
+                "behavior and row cardinality, warning/blocker prose, and unstructured semantic-contract detail are "
+                "intentionally omitted. State that omission exactly when the user asks for one of those values; never infer "
+                "it from counts or absence."
+            ),
+        ]
+        assert added == [
+            (
+                "The guided build is FINISHED: the user confirmed and committed this "
+                "pipeline. Chat is advisory only and you have NO build tools; the step "
+                "playbook's instruction to point the user at the wizard controls does not "
+                "apply here. Explain the committed graph from THIS context — what each "
+                "component does and why each route exists. You cannot change, re-plan, "
+                "confirm, or run anything from here; never claim to have done so, and "
+                "never name an on-screen button or control — you cannot see which controls "
+                "this surface is showing, so say in general terms that changing the "
+                "pipeline's structure means leaving guided mode. Every field below whose "
+                "name ends in _at_confirmation was RECORDED WHEN THE USER CONFIRMED and is "
+                "not re-checked against the pipeline as it stands now. THE SAME HOLDS FOR "
+                "EVERY VALUE NESTED INSIDE ONE, however deep, none of which repeats the "
+                "suffix in its own name: describe any such value as what was recorded "
+                "then, never as what is true now. Only `row_cardinality_at_confirmation`, "
+                "`schema_contract_at_confirmation` and `review_status_at_confirmation` ever "
+                "carry the suffix. Every other fact in the graph record below is CURRENT: "
+                "it is re-checked against the live pipeline and this chat is refused "
+                "outright if it moved since confirmation, so state those plainly rather "
+                "than hedging them. The review counts, and everything else inside "
+                "`review_status_at_confirmation`, are what the review said at the moment "
+                "the user confirmed; nothing here reports the pipeline's validity, its "
+                "outstanding review items or its run readiness now, so never state whether "
+                "the pipeline is valid or ready to run."
+            ),
+            (
+                "Use the exact endpoint relations above when explaining what the graph does, but never state a field whose "
+                "name ends in _at_confirmation, or any value nested inside one, as a current fact. A delimited user-role "
+                "data block follows with this build's field names. These record keys describe the pipeline as it stands: "
+                "`structured_output_fields` and `business_schema`, the second of them including the `fields`, "
+                "`guaranteed_fields` and `required_fields` nested INSIDE it. Every other key in those records — "
+                "`guaranteed_fields`, `required_fields`, `producer_guarantees`, `consumer_requires` and `missing_fields`, "
+                "at a record's own top level — was recorded at confirmation, like the _at_confirmation fields above. Where "
+                "the same name appears both inside `business_schema` and at the top of a record, only the nested one is "
+                "current. Those records carry field names with their declared types and flags, any enum values and the "
+                "schema mode; the authored settings named below are withheld."
+            ),
+            "Saved build instructions were all resolved at confirmation: none is pending, and no graph decision may be attributed to one.",
+            (
+                "Paths, prompts, samples, blobs, secrets, raw option values other than those summarized in each component's "
+                "behavior and row cardinality, warning/blocker prose, and unstructured semantic-contract detail are "
+                "intentionally omitted, and on a committed build so are the authored settings behind each component — "
+                "plugin option values such as prompt text, gate predicates, route keys, trigger counts and timeouts — "
+                "because they can be rewritten after confirmation without changing the structure above. The authored values "
+                "that ARE published are the closed vocabulary each component's `behavior` summarizes, an aggregation's "
+                "expected output count inside its `row_cardinality`, and `structured_output_fields` and `business_schema` "
+                "in the user-role block. Every one of those is checked against the live pipeline, so rewriting one — "
+                "including the plugin options behind it — ends this chat rather than leaving it stale. State that omission "
+                "exactly when the user asks for one of those values; never infer it from counts or absence."
+            ),
+        ]
+
+    def test_committed_block_keeps_the_pending_section_empty(self) -> None:
+        content = self._wire_context(committed_build=True).system_content
+
+        assert "Pending saved instructions (stable identities):\nnone" in content
+
+    def test_committed_block_states_no_validity_or_readiness_verdict(self) -> None:
+        """The context carries the CONFIRMATION-time review COUNTS and nothing else.
+
+        Regression pin for the two-authorities defect (review round 1,
+        2026-09-03): a ``Committed validation: is_valid=…`` line built from the
+        frozen wire payload's ``can_confirm`` told the model the build was
+        valid in exactly the state where the head record said ``is_valid`` was
+        False, the completion heading read "Review required", and Run was
+        refused.
+
+        Round 4 (LLM-1) closed the second half of it. The opener denied that
+        the context carried any validity or readiness signal while the JSON two
+        lines below published ``can_confirm: true`` — a guardrail whose premise
+        the model can see is false. ``can_confirm`` is now DROPPED from the
+        committed arm: ``protocol._validate_wire_payload`` refuses any payload
+        where it differs from ``not blockers``, so it restated the
+        ``blocker_count`` beside it and was the only verdict-shaped leaf in the
+        block. The in-progress arm keeps it — there the wire payload IS the
+        live review.
+        """
+
+        content = self._wire_context(committed_build=True).system_content
+        default_content = self._wire_context().system_content
+
+        assert "is_valid" not in content
+        assert "Committed validation:" not in content
+        assert "can_confirm" not in content
+        assert '"can_confirm": true' in default_content
+        assert '"blocker_count": 0' in content, "the counts stay: dropping the flag must not drop the review"
+        assert "never state whether the pipeline is valid or ready to run" in content
+
+    def test_committed_block_time_qualifies_the_facts_the_drift_gate_cannot_compare(self) -> None:
+        """One idiom for "recorded then, not now": the ``_at_confirmation`` suffix.
+
+        A completed session's chat is admitted only while the live head still
+        matches the frozen wire record on the facts
+        ``planning.guided_structure_projection`` compares. Everything else the
+        system block publishes CAN have moved since, so it is renamed rather
+        than left looking current, and the opener explains the suffix once.
+        Prose alone cannot say which key it qualifies, and a partition a test
+        can derive is the only kind a future projection arm cannot silently
+        join — ``test_guided_structure_projection.TestPublishedFactPartition``
+        holds that derivation.
+        """
+
+        default_content = self._wire_context().system_content
+        committed_content = self._wire_context(committed_build=True).system_content
+
+        assert '"review_status":' in default_content
+        assert '"review_status_at_confirmation":' in committed_content
+        assert '"review_status":' not in committed_content
+        assert "_at_confirmation was RECORDED WHEN THE USER CONFIRMED" in committed_content
+        # The suffix marks the whole SUBTREE. Both rules say so explicitly
+        # because the model quotes a leaf — ``satisfied``, ``output``,
+        # ``missing_field_count`` — and no leaf repeats the suffix, so a rule
+        # scoped to "a field whose name ends in _at_confirmation" bound the
+        # container the model does not quote (round 4, LLM-3).
+        assert "THE SAME HOLDS FOR EVERY VALUE NESTED INSIDE ONE" in committed_content
+        assert (
+            "never state a field whose name ends in _at_confirmation, or any value nested inside one, as a current fact"
+            in committed_content
+        )
+
+    def test_committed_block_withholds_authored_setting_values(self) -> None:
+        """Structure is bound to the live pipeline; authored settings are not.
+
+        The admission gate compares only the ordinal-label structure, so an
+        options-only write under a completed session (the interpretation
+        Accept the design requires be admitted) leaves the frozen record's
+        authored literals describing values the pipeline no longer has.
+        Field-name records survive — they answer "what does this check mean".
+        """
+
+        default_literals = self._wire_context().untrusted_user_content
+        committed_literals = self._wire_context(committed_build=True).untrusted_user_content
+        assert default_literals is not None
+        assert committed_literals is not None
+
+        # Quoted form: the bare route key "low" is a substring of the block's
+        # own "allow" prose, so a raw containment check would pass off the
+        # boilerplate rather than off the literal.
+        for authored in ("\"row['tier']\"", *(f'"{key}"' for key in GATE_ROUTE_KEYS)):
+            assert authored in default_literals
+            assert authored not in committed_literals
+        assert "business_schema" in default_literals
+        assert "business_schema" in committed_literals
+
+    def test_committed_block_still_omits_the_withheld_value_classes(self) -> None:
+        """The classes stay omitted, and the option-value claim carries its exception.
+
+        Unqualified, "raw option values are omitted" is contradicted by the
+        projection's own sibling keys — a coalesce's ``policy`` and ``merge``,
+        an aggregation's ``output_mode`` and ``expected_output_count`` (round 4,
+        LLM-4). The exception is positional so a future behavior arm cannot
+        falsify it again.
+        """
+
+        content = self._wire_context(committed_build=True).system_content
+
+        assert "Paths, prompts, samples, blobs, secrets, raw option values" in content
+        assert "raw option values other than those summarized in each component's behavior and row cardinality" in content
+
+    @pytest.mark.parametrize("step", [GuidedStep.STEP_1_SOURCE, GuidedStep.STEP_2_SINK, GuidedStep.STEP_3_TRANSFORMS])
+    def test_committed_build_is_refused_outside_the_wire_step(self, step: GuidedStep) -> None:
+        graph_authority = None
+        if step is GuidedStep.STEP_3_TRANSFORMS:
+            graph_authority = _advisory_graph_authority(_advisory_gate_payload(), turn_type=TurnType.PROPOSE_PIPELINE)
+        with pytest.raises(InvariantError):
+            build_step_chat_context_block(
+                step=step,
+                current_source=None,
+                current_sink=None,
+                state=None,
+                deferred_intents=(),
+                graph_authority=graph_authority,
+                committed_build=True,
+            )
+
+    def test_committed_build_is_refused_while_an_instruction_is_pending(self) -> None:
+        """The coverage sentence claims nothing is pending; prove it cannot lie."""
+
+        intent = DeferredStageIntent.create(
+            intent_id="00000000-0000-4000-8000-000000000901",
+            receiving_stage="source",
+            target_stage="topology",
+            catalog_kind=None,
+            catalog_name=None,
+            redacted_summary="Add a gate.",
+            originating_message_id="00000000-0000-4000-8000-000000000902",
+            message_content_hash=stable_hash("add a gate"),
+            constraints=(),
+        )
+        with pytest.raises(InvariantError):
+            build_step_chat_context_block(
+                step=GuidedStep.STEP_4_WIRE,
+                current_source=None,
+                current_sink=None,
+                state=None,
+                deferred_intents=(intent,),
+                graph_authority=_advisory_graph_authority(self._wire_payload(), turn_type=TurnType.CONFIRM_WIRING),
+                committed_build=True,
+            )
+
+    def test_committed_build_is_refused_with_an_applied_component(self) -> None:
+        """A settled build has no "applied" component to project.
+
+        The reviewed source/output maps are populated on every real completed
+        session, so without this the block would render "Applied source: …"
+        for the first of two sources above a graph listing both.
+        """
+
+        with pytest.raises(InvariantError):
+            build_step_chat_context_block(
+                step=GuidedStep.STEP_4_WIRE,
+                current_source=SourceResolved(
+                    name="source",
+                    plugin="csv",
+                    options={"schema": {"mode": "observed"}},
+                    observed_columns=("name",),
+                    sample_rows=(),
+                    on_validation_failure="discard",
+                ),
+                current_sink=None,
+                state=None,
+                deferred_intents=(),
+                graph_authority=_advisory_graph_authority(self._wire_payload(), turn_type=TurnType.CONFIRM_WIRING),
+                committed_build=True,
+            )
+
+    def test_committed_build_flag_must_be_an_exact_bool(self) -> None:
+        with pytest.raises(InvariantError):
+            self._wire_context(committed_build=1)
+
+
+# --------------------------------------------------------------------------
+# The committed context makes CLAIMS ABOUT ITS OWN KEYS, and round 4 found
+# three of them falsified by the JSON rendered in the same message: an opener
+# that denied carrying any validity signal above a published ``can_confirm``
+# (LLM-1), a currency claim that named ``business_schema``'s nested field lists
+# and the record's own top-level ones under one word (LLM-2), and an omission
+# list contradicted by a sibling key (LLM-4). Prose that names a key set is only
+# safe while a test holds it to the key set, so these fixtures render the real
+# committed context over shapes that between them emit EVERY published record
+# key, every qualified system key, and the published authored count.
+# --------------------------------------------------------------------------
+
+
+def _committed_field_record_payload() -> dict[str, Any]:
+    """A wire payload emitting every user-role record kind at once.
+
+    Non-vacuous on purpose: the default wire fixture authors empty field lists
+    and an ``observed`` schema, under which every record either disappears or
+    renders as empty lists — so a registry asserted against it would hold for
+    keys nothing publishes.
+    """
+
+    payload = deepcopy(_advisory_wire_payload_with_gate(_advisory_gate_payload()["nodes"][0]["behavior"]))
+    payload["sources"][0]["guaranteed_fields"] = ["name"]
+    node = payload["nodes"][0]
+    node["node_type"] = "transform"
+    node["plugin"] = "llm"
+    node["behavior"] = {"kind": "transform"}
+    node["required_fields"] = ["name"]
+    node["guaranteed_fields"] = ["verdict"]
+    node["structured_output_fields"] = [
+        {"name": "verdict", "type": "string", "values": ["yes", "no"]},
+        {"name": "score", "type": "integer", "values": []},
+    ]
+    output = payload["outputs"][0]
+    output["required_fields"] = ["name"]
+    output["business_schema"] = {
+        "mode": "declared",
+        "fields": [{"name": "name", "type": "string", "required": True, "nullable": False}],
+        "guaranteed_fields": ["name"],
+        "required_fields": ["name"],
+    }
+    payload["connections"] = [
+        {
+            "stable_id": "cccccccc-cccc-4ccc-8ccc-cccccccccc01",
+            "from_endpoint": {"kind": "source", "stable_id": payload["sources"][0]["stable_id"]},
+            "to_endpoint": {"kind": "node", "stable_id": node["stable_id"]},
+            "flow": {"kind": "source_success", "branch": None},
+            "schema_contract": None,
+        },
+        {
+            "stable_id": "cccccccc-cccc-4ccc-8ccc-cccccccccc02",
+            "from_endpoint": {"kind": "node", "stable_id": node["stable_id"]},
+            "to_endpoint": {"kind": "output", "stable_id": output["stable_id"]},
+            "flow": {"kind": "node_success", "branch": None},
+            "schema_contract": {
+                "from": "node:node-1",
+                "to": "output:output-1",
+                "producer_guarantees": ["verdict"],
+                "consumer_requires": ["name"],
+                "missing_fields": ["name"],
+                "satisfied": False,
+            },
+        },
+        {
+            "stable_id": "cccccccc-cccc-4ccc-8ccc-cccccccccc03",
+            "from_endpoint": {"kind": "node", "stable_id": node["stable_id"]},
+            "to_endpoint": {"kind": "discard"},
+            "flow": {"kind": "node_error"},
+            "schema_contract": None,
+        },
+    ]
+    return payload
+
+
+def _committed_counted_aggregation_payload() -> dict[str, Any]:
+    """An aggregation publishing an authored count, under a non-zero warning count.
+
+    Both halves are evidence: ``expected_output_count`` is the authored option
+    value the omission prose used to call withheld, and a warning IS an
+    outstanding review item, which the opener used to deny carrying.
+    """
+
+    payload = deepcopy(_advisory_wire_payload_with_gate(_advisory_gate_payload()["nodes"][0]["behavior"]))
+    node = payload["nodes"][0]
+    node["node_type"] = "aggregation"
+    node["plugin"] = "passthrough"
+    node["behavior"] = {
+        "kind": "aggregation",
+        "trigger_kinds": ["count"],
+        "count": "7",
+        "timeout_seconds": None,
+        "output_mode": "transform",
+        "expected_output_count": "3",
+    }
+    node["row_cardinality"] = {"input": "batch", "output": "expected_count", "expected_output_count": "3"}
+    payload["warnings"] = [{"code": "guided.proposal.warning.unmapped_field.v1", "component_label": "node-1"}]
+    return payload
+
+
+class TestCommittedContextNamesWhatItPublishes:
+    """Every prose claim about a key is held to the keys actually rendered.
+
+    THE DEFECT CLASS: the committed block teaches the model which published
+    facts are current and which were recorded at confirmation, and it does so
+    by NAME because the model quotes names. A key added to either projection
+    then leaves the prose describing a key set that is no longer the one beside
+    it — and a guardrail whose premise the model can falsify from the same
+    message is a guardrail it discounts.
+
+    So the name lists in the prose render from module tuples, and these tests
+    assert each tuple equals what a rendered committed context publishes.
+    Adding a published key fails here until its author states, in the tuple that
+    puts it into the sentence, whether it is current or recorded.
+    """
+
+    @staticmethod
+    def _committed_block(payload: dict[str, Any]) -> Any:
+        return build_step_chat_context_block(
+            step=GuidedStep.STEP_4_WIRE,
+            current_source=None,
+            current_sink=None,
+            state=None,
+            deferred_intents=(),
+            graph_authority=_advisory_graph_authority(payload, turn_type=TurnType.CONFIRM_WIRING),
+            committed_build=True,
+        )
+
+    @classmethod
+    def _corpus(cls) -> tuple[tuple[dict[str, Any], Any], ...]:
+        payloads = (
+            _advisory_wire_payload_with_gate(_advisory_gate_payload()["nodes"][0]["behavior"]),
+            _committed_field_record_payload(),
+            _committed_counted_aggregation_payload(),
+        )
+        return tuple((payload, cls._committed_block(payload)) for payload in payloads)
+
+    @staticmethod
+    def _system_json(block: Any) -> dict[str, Any]:
+        system: dict[str, Any] = json.loads(next(line for line in block.system_content.splitlines() if line.startswith('{"connections"')))
+        return system
+
+    @staticmethod
+    def _user_records(block: Any) -> list[dict[str, Any]]:
+        payload = json.loads(next(line for line in block.untrusted_user_content.splitlines() if line.startswith("{")))
+        return list(payload["records"])
+
+    @classmethod
+    def _suffixed_keys(cls, value: Any) -> set[str]:
+        """Every key ending in the confirmation suffix, at any depth."""
+
+        found: set[str] = set()
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if key.endswith(chat_solver._GUIDED_CONFIRMATION_TIME_SUFFIX):
+                    found.add(key)
+                found |= cls._suffixed_keys(nested)
+        elif isinstance(value, list):
+            for item in value:
+                found |= cls._suffixed_keys(item)
+        return found
+
+    @staticmethod
+    def _prose_list(parts: list[str]) -> str:
+        """Rebuild the enumeration INDEPENDENTLY of the module's own renderer.
+
+        Asserting the module's rendered constant against the sentence it was
+        interpolated into is a tautology: truncating the derivation moves both
+        sides together. Rebuilding it here from the key tuple means a
+        derivation that stops enumerating fails.
+        """
+
+        return parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])} and {parts[-1]}"
+
+    @classmethod
+    def _qualified_values(cls, value: Any) -> list[Any]:
+        """Every value published UNDER a suffixed key, at any depth."""
+
+        found: list[Any] = []
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if key.endswith(chat_solver._GUIDED_CONFIRMATION_TIME_SUFFIX):
+                    found.append(nested)
+                found.extend(cls._qualified_values(nested))
+        elif isinstance(value, list):
+            for item in value:
+                found.extend(cls._qualified_values(item))
+        return found
+
+    def test_the_opener_names_every_qualified_system_key(self) -> None:
+        """LLM-1's durable half, from the system side.
+
+        A fourth qualified family would otherwise be published under a name the
+        opener does not list, while the opener kept claiming to enumerate them.
+        """
+
+        observed: set[str] = set()
+        for _payload, block in self._corpus():
+            observed |= self._suffixed_keys(self._system_json(block))
+
+        assert observed == set(chat_solver._GUIDED_COMMITTED_QUALIFIED_FACT_KEYS), (
+            "the opener names the qualified keys; a new one must join that tuple and the sentence with it"
+        )
+        # The whole enumerated CLAUSE, not each name somewhere in the line:
+        # two of the three keys are also mentioned elsewhere in the opener, so
+        # a per-name containment check passes for a list that dropped one.
+        expected = self._prose_list([f"`{key}`" for key in chat_solver._GUIDED_COMMITTED_QUALIFIED_FACT_KEYS])
+        opener = next(line for line in self._corpus()[0][1].system_content.splitlines() if line.startswith("The guided build is FINISHED"))
+        assert f"Only {expected} ever carry the suffix." in opener
+
+    def test_no_qualified_leaf_repeats_the_suffix_so_the_rule_states_its_own_closure(self) -> None:
+        """The reason the rule cannot be scoped to the field name alone (LLM-3).
+
+        The model quotes ``satisfied``, ``output``, ``missing_field_count`` —
+        leaves. If any of them ever carried the suffix this test would go green
+        for the wrong reason, so it asserts the premise (no leaf repeats it) and
+        the remedy (the rule says it is closed under nesting) together.
+        """
+
+        qualified_values = [value for _payload, block in self._corpus() for value in self._qualified_values(self._system_json(block))]
+        leaves = {leaf for value in qualified_values if isinstance(value, dict) for leaf in value}
+
+        assert leaves, "corpus publishes no qualified object at all"
+        assert not self._suffixed_keys(qualified_values), "a leaf now repeats the suffix; the rule may no longer need its closure clause"
+        opener = next(line for line in self._corpus()[0][1].system_content.splitlines() if line.startswith("The guided build is FINISHED"))
+        assert "THE SAME HOLDS FOR EVERY VALUE NESTED INSIDE ONE" in opener
+
+    def test_the_graph_usage_line_names_every_published_record_key(self) -> None:
+        """LLM-2/LLM-4's durable half, from the user-role side.
+
+        The alias keys are the record's identity rather than a fact about the
+        build, so they are excluded by name; every other key must have been
+        classified as current or recorded, and the classification must reach the
+        rendered sentence.
+        """
+
+        observed: set[str] = set()
+        for _payload, block in self._corpus():
+            for record in self._user_records(block):
+                observed |= set(record) - {"component_alias", "connection_alias"}
+
+        current = set(chat_solver._GUIDED_COMMITTED_CURRENT_RECORD_KEYS)
+        recorded = set(chat_solver._GUIDED_COMMITTED_RECORDED_RECORD_KEYS)
+        assert not current & recorded, "a key cannot be both current and recorded at confirmation"
+        assert observed == current | recorded, "every published record key needs a compare-or-qualify decision the sentence states"
+        usage_line = next(
+            line for line in self._corpus()[0][1].system_content.splitlines() if line.startswith("Use the exact endpoint relations")
+        )
+        expected_current = self._prose_list([f"`{key}`" for key in chat_solver._GUIDED_COMMITTED_CURRENT_RECORD_KEYS])
+        expected_recorded = self._prose_list([f"`{key}`" for key in chat_solver._GUIDED_COMMITTED_RECORDED_RECORD_KEYS])
+        assert f"describe the pipeline as it stands: {expected_current}," in usage_line
+        assert f"— {expected_recorded}, at a record's own top level — was recorded at confirmation" in usage_line
+
+    def test_the_current_record_keys_are_the_compared_ones_and_the_recorded_keys_are_not(self) -> None:
+        """The classification is DERIVED from the gate, not asserted beside it.
+
+        Round 4 (LLM-2) found the previous sentence calling the business-schema
+        field lists confirmation-time when the gate had begun comparing them,
+        and calling the record's own top-level lists current by the same word.
+        The compared half is read from the drift gate's own mirror over the
+        same payload, so a widening or narrowing of the gate moves this test.
+        """
+
+        for payload, _block in self._corpus():
+            components, connections = guided_chat_atomic_module._wire_payload_structure(payload)
+            compared_top_level = {key for item in (*components, *connections) for key in dict(item)}
+
+            for key in chat_solver._GUIDED_COMMITTED_CURRENT_RECORD_KEYS:
+                assert key in compared_top_level, f"{key} is published as current but the gate does not compare it"
+            for key in chat_solver._GUIDED_COMMITTED_RECORDED_RECORD_KEYS:
+                assert key not in compared_top_level, f"{key} is called recorded-at-confirmation but the gate compares it"
+
+    def test_the_same_field_list_name_is_current_nested_and_recorded_at_top_level(self) -> None:
+        """The collision the sentence disambiguates BY POSITION rather than name.
+
+        ``business_schema`` is compared whole, so the ``guaranteed_fields`` and
+        ``required_fields`` inside it are current — while the record's own
+        top-level lists of those exact names are frozen review data. One record,
+        one name, two opposite truth statuses, which is why the sentence points
+        at the position and this test proves the collision is real.
+        """
+
+        payload = _committed_field_record_payload()
+        components, _connections = guided_chat_atomic_module._wire_payload_structure(payload)
+        schemas = [dict(dict(item)["business_schema"]) for item in components if "business_schema" in dict(item)]
+
+        assert schemas, "corpus authors no business schema"
+        colliding = {"guaranteed_fields", "required_fields"}
+        assert colliding <= set(schemas[0]), "the nested collision this sentence exists for is gone"
+        assert colliding <= set(chat_solver._GUIDED_COMMITTED_RECORDED_RECORD_KEYS), "the top-level halves are the recorded ones"
+        assert schemas[0]["required_fields"], "an empty nested list proves nothing about currency"
+
+        usage_line = next(
+            line
+            for line in self._committed_block(payload).system_content.splitlines()
+            if line.startswith("Use the exact endpoint relations")
+        )
+        assert (
+            "Where the same name appears both inside `business_schema` and at the top of a record, only the nested one is current"
+            in usage_line
+        )
+
+    def test_the_withheld_settings_sentence_enumerates_the_withheld_authority(self) -> None:
+        """RT-3: nothing the sentence calls rewritable may be compared.
+
+        The pre-fix sentence promised rewritability for "field mappings" and
+        "counts" after the gate had begun comparing the schema and
+        structured-output field lists and publishing an aggregation's expected
+        output count — so a user told "yes, you can change the output schema"
+        lost the only channel a settled build has. The phrase map is therefore
+        keyed on the withheld-literal authority and asserted against it, and
+        every key it names is checked to be outside the compared behavior set.
+        """
+
+        phrases = chat_solver._GUIDED_COMMITTED_WITHHELD_SETTING_PHRASES
+        assert set(phrases) == (planning.GUIDED_COMMITTED_WITHHELD_LITERAL_KEYS - planning._GUIDED_WITHHELD_KEYS_PUBLISHED_ELSEWHERE), (
+            "the sentence must enumerate exactly the settings that are withheld AND uncompared"
+        )
+
+        for record_key in phrases:
+            behavior_name = planning._GUIDED_WITHHELD_RECORD_KEY_BEHAVIOR_NAMES.get(record_key, record_key)
+            if behavior_name is not None:
+                assert behavior_name in planning.GUIDED_UNCOMPARED_BEHAVIOR_KEYS, (
+                    f"{record_key} is named rewritable but the drift gate compares it"
+                )
+
+        omission_line = next(
+            line for line in self._corpus()[0][1].system_content.splitlines() if line.startswith("Paths, prompts, samples")
+        )
+        expected_withheld = self._prose_list(list(phrases.values()))
+        assert f"behind each component — {expected_withheld} — because they can be rewritten" in omission_line
+        assert "field mappings" not in omission_line, "schema and structured-output field lists are compared, so rewriting one refuses"
+
+    def test_the_published_authored_count_is_named_rather_than_called_omitted(self) -> None:
+        """LLM-4: the omission claim and its own sibling key, reconciled.
+
+        ``expected_output_count`` is withheld from the authored record and
+        published verbatim at system authority inside ``row_cardinality``, so a
+        blanket "counts are omitted" was falsifiable from three lines above it.
+        """
+
+        block = self._committed_block(_committed_counted_aggregation_payload())
+        system = self._system_json(block)
+        cardinalities = [node["row_cardinality"] for node in system["nodes"] if "row_cardinality" in node]
+
+        assert [card["expected_output_count"] for card in cardinalities] == ["3"], "the authored count is published verbatim"
+        assert "expected_output_count" in planning.GUIDED_COMMITTED_WITHHELD_LITERAL_KEYS
+        assert "expected_output_count" in planning._GUIDED_WITHHELD_KEYS_PUBLISHED_ELSEWHERE
+        omission_line = next(line for line in block.system_content.splitlines() if line.startswith("Paths, prompts, samples"))
+        assert "an aggregation's expected output count inside its `row_cardinality`" in omission_line
+        assert "trigger counts" in omission_line, "the count that IS withheld stays named as withheld"
+
+    def test_the_option_value_omission_admits_the_behavior_values_it_publishes(self) -> None:
+        """The same contradiction in machine-readable form, on BOTH arms.
+
+        The projection's own ``omitted`` array said "raw option values" while
+        publishing a coalesce's ``policy`` and ``merge``, an aggregation's
+        ``output_mode``, and an aggregation's ``expected_output_count``. The
+        exception is stated positionally so a future behavior arm summarizing
+        another authored option does not falsify it again.
+        """
+
+        block = self._committed_block(_committed_counted_aggregation_payload())
+        system = self._system_json(block)
+        behaviors = [node["behavior"] for node in system["nodes"]]
+
+        assert any(behavior.get("output_mode") == "transform" for behavior in behaviors), "corpus publishes no authored option value"
+        assert chat_solver._GUIDED_RAW_OPTION_OMISSION in system["omitted"]
+        assert "raw option values" not in system["omitted"], "the unqualified claim is what the sibling key falsifies"
+        for content in (block.system_content, self._corpus()[0][1].system_content):
+            assert chat_solver._GUIDED_RAW_OPTION_OMISSION in content

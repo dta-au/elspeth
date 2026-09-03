@@ -87,6 +87,13 @@ const AUDITED_COMPONENTS = [
   // itself (landmark structure, live-region siblinghood, the named scroll
   // group) had zero axe coverage.
   "ChatPanelTutorialWorkspace",
+  // A completed guided session keeps its conversation (elspeth-986801d218):
+  // the completed branch grew a live transcript log, an Explain control, the
+  // pending strip and the docked composer alongside the completion summary.
+  // That is a NEW landmark/live-region arrangement — summary + announcer as
+  // siblings of a role=log inside a named scroll group — and the tutorial
+  // workspace entry above audits the ACTIVE branch only.
+  "ChatPanelCompletedSurface",
   // Run-lifecycle feedback (elspeth-3a7b7c7b37): the app-level terminal-run
   // toast is the only completion surface mounted outside the Run panel.
   "RunOutcomeNotice",
@@ -98,6 +105,7 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "AppHeader",
   "AuditReadinessPanel",
   "ChatInput",
+  "ChatPanelCompletedSurface",
   "ChatPanelTutorialWorkspace",
   "CommandPalette",
   "ComposerPreferencesPanel",
@@ -1470,6 +1478,88 @@ describe("ChatPanelTutorialWorkspace", () => {
     screen.getByRole("button", { name: "Stop composing" });
     screen.getByRole("region", { name: "Describe what you want" });
     expect(screen.getByLabelText("Message input")).toBeInTheDocument();
+
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("ChatPanelCompletedSurface", () => {
+  // A completed guided session keeps its conversation (elspeth-986801d218).
+  // The arrangement this audits: the completion summary and the always-mounted
+  // acknowledgement announcer are SIBLINGS of the named "Conversation" scroll
+  // group, and the transcript's role=log lives INSIDE that group — one live
+  // region per event kind, never nested, with the docked composer below.
+  it("has no axe violations with a live transcript and the docked composer", async () => {
+    Element.prototype.scrollIntoView = vi.fn();
+    vi.mocked(apiClient.fetchRuns).mockResolvedValue([]);
+    const confirmationHash = "c".repeat(64);
+    useSessionStore.setState({
+      compositionState: makeFullCompositionState(),
+      compositionProposals: [],
+      guidedSession: {
+        step: "step_4_wire",
+        history: [
+          {
+            step: "step_4_wire",
+            turn_type: "confirm_wiring",
+            payload_hash: "aabbcc001122",
+            response_hash: confirmationHash,
+            emitter: "server",
+            summary: "Wiring confirmed",
+          },
+        ],
+        terminal: {
+          kind: "completed",
+          reason: null,
+          pipeline_yaml: "source:\n  plugin: csv\n",
+        },
+        chat_history: [
+          {
+            role: "user",
+            content: "Write the results out as JSONL.",
+            seq: 1,
+            step: "step_4_wire",
+            ts_iso: "2026-09-03T00:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: "a".repeat(64),
+          },
+          {
+            role: "assistant",
+            content: "Done — the output writes JSONL.",
+            seq: 2,
+            step: "step_4_wire",
+            ts_iso: "2026-09-03T00:00:01Z",
+            assistant_message_kind: "assistant",
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+          {
+            role: "user",
+            content: "What does the transform step do?",
+            seq: 3,
+            step: "step_4_wire",
+            ts_iso: "2026-09-03T00:01:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: confirmationHash,
+          },
+        ],
+        chat_turn_seq: 4,
+        profile: null,
+      },
+      guidedNextTurn: null,
+    } as never);
+
+    const { container } = render(<ChatPanel />);
+
+    // Guard against a vacuous pass: the audited arrangement must be mounted.
+    const scroll = screen.getByRole("group", { name: "Conversation" });
+    const log = screen.getByRole("log", { name: "Step chat history" });
+    expect(scroll.contains(log)).toBe(true);
+    screen.getByRole("region", { name: "Describe what you want" });
+    screen.getByRole("button", { name: "Explain this pipeline" });
+    screen.getByText("After confirmation");
 
     expect(await axe(container)).toHaveNoViolations();
   });

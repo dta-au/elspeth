@@ -46,6 +46,9 @@ import {
   type WiringApprovalClientBlockers,
   type WiringApprovalOutcome,
 } from "@/components/chat/guided/wiringApproval";
+// Pure leaf (imports only types/guided): the ONE derivation of the token a
+// completed session chats under. The view binds to the same function.
+import { completedGuidedChatToken } from "@/components/chat/guided/completedChatToken";
 import { usePreferencesStore } from "./preferencesStore";
 import {
   acquireGuidedRetry,
@@ -3751,7 +3754,25 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       }
       return;
     }
-    if (guidedNextTurn === null) {
+    // Occurrence binding, in precedence order (elspeth-ea80e34fdc + IA-6):
+    //   1. `retryTurnToken` — a Retry submits the token its message was
+    //      ORIGINALLY submitted under, never a current one.
+    //   2. `completedToken` — after Confirm wiring there is no unanswered
+    //      turn, so the channel is bound to the CONFIRMATION hash
+    //      (`history[-1].response_hash`), which is what the backend's
+    //      completed-chat admission arm re-derives and compares. Checked
+    //      before the live turn for the same reason ChatPanel checks the
+    //      completed branch first: a stale `guidedNextTurn` left beside a
+    //      completed terminal must not win.
+    //   3. the live unanswered turn's token.
+    // No token at all means there is nothing sound to submit against — the
+    // offensive guard fires here rather than letting the server reject it.
+    const completedToken = completedGuidedChatToken(guidedSession);
+    const requestedTurnToken =
+      retryTurnToken ??
+      completedToken ??
+      (guidedNextTurn === null ? null : guidedNextTurn.turn_token);
+    if (requestedTurnToken === null) {
       throw new Error("chatGuided called without a current unanswered turn");
     }
     // Step-3 proposal revision. The 7.1 planner auto-stages a pipeline proposal
@@ -3766,6 +3787,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // on the GuidedSessionResponse wire, so the gate is the proposal turn itself.)
     if (
       retryTurnToken === undefined &&
+      // A live unanswered turn is the whole premise of a proposal revision:
+      // the reroute reuses respondGuided's CURRENT turn_token custody. A
+      // completed session has no such turn (and never sits at step 3).
+      guidedNextTurn !== null &&
       guidedSession.step === "step_3_transforms" &&
       guidedNextTurn.type === "propose_pipeline"
     ) {
@@ -3793,11 +3818,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // mirroring respondGuided / startGuided).  If the user switches
     // session or the wizard advances mid-flight, the response is dropped.
     const requestedSessionId = activeSessionId;
-    // Occurrence binding (elspeth-ea80e34fdc): a Retry of a historical
-    // failure submits the token its message was ORIGINALLY submitted under,
-    // never the current one — the server's stale-turn 409 is the authority
-    // on whether that occurrence is still answerable.
-    const requestedTurnToken = retryTurnToken ?? guidedNextTurn.turn_token;
+    // `requestedTurnToken` was resolved above (retry → completed → live turn)
+    // so the reroute guard and the throw could both read it. Retry custody is
+    // keyed on it verbatim, unchanged: [turn_token, message].
     let acquisition = acquireGuidedRetry("guided_chat", requestedSessionId, [
       requestedTurnToken,
       message,
