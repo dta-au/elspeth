@@ -37,6 +37,12 @@ from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
 from elspeth.web.secrets.user_store import UserSecretStore
 from elspeth.web.sessions.models import (
     _AUTH_PROVIDER_TYPE_CHECK,
+    _IDENTITY_PROVIDER_TYPE_CHECK,
+    _IDENTITY_ROLE_CHECK,
+    _RELATIONSHIP_TYPE_CHECK,
+    identities_table,
+    identity_relationships_table,
+    identity_roles_table,
     sessions_table,
     user_secrets_table,
 )
@@ -127,6 +133,30 @@ def test_sessions_and_user_secrets_share_one_widened_check() -> None:
     assert expected == _AUTH_PROVIDER_TYPE_CHECK
     assert _check_constraint_text(sessions_table, "ck_sessions_auth_provider_type") == expected
     assert _check_constraint_text(user_secrets_table, "ck_user_secrets_auth_provider_type") == expected
+
+
+def test_identities_admits_the_wider_set_than_sessions_does() -> None:
+    """The two discriminators are different constants, and must stay so.
+
+    ``identities`` admits ``service``; ``sessions`` and ``user_secrets`` do
+    not, because a service principal never completes a browser login and so
+    can own neither. Collapsing these onto one constant would either admit a
+    session for a principal that cannot log in, or refuse an identity row for
+    a principal the model requires.
+    """
+    identity_providers = get_args(IdentityProviderType)
+    assert f"provider IN ({_sql_in_list(identity_providers)})" == _IDENTITY_PROVIDER_TYPE_CHECK
+    assert _check_constraint_text(identities_table, "ck_identities_provider") == _IDENTITY_PROVIDER_TYPE_CHECK
+    assert _IDENTITY_PROVIDER_TYPE_CHECK != _AUTH_PROVIDER_TYPE_CHECK
+    assert "'service'" in _IDENTITY_PROVIDER_TYPE_CHECK
+    assert "'service'" not in _AUTH_PROVIDER_TYPE_CHECK
+
+
+def test_stored_role_and_edge_checks_derive_from_their_literals() -> None:
+    assert f"role IN ({_sql_in_list(get_args(IdentityRole))})" == _IDENTITY_ROLE_CHECK
+    assert _check_constraint_text(identity_roles_table, "ck_identity_roles_role") == _IDENTITY_ROLE_CHECK
+    assert f"relationship_type IN ({_sql_in_list(get_args(RelationshipType))})" == _RELATIONSHIP_TYPE_CHECK
+    assert _check_constraint_text(identity_relationships_table, "ck_identity_relationships_type") == _RELATIONSHIP_TYPE_CHECK
 
 
 def test_landscape_checks_admit_exactly_the_login_providers() -> None:

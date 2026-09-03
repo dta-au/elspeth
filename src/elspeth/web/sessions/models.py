@@ -2595,3 +2595,273 @@ audit_access_log_table = Table(
     ),
     Index("ix_audit_access_log_session_timestamp", "session_id", "timestamp"),
 )
+
+
+# === Identity substrate (epoch 50, elspeth-07cd19ba73) ==================
+#
+# Spec: docs/specs/2026-09-02-pluggable-sso-design.md, §Data model.
+#
+# ``identities`` is CURRENT STATE. The history of record is the per-login
+# profile snapshot in the Landscape ``auth_events.metadata_json``; nothing
+# here is an audit log, and nothing here may be read as one.
+#
+# The provider discriminator on ``identities`` is DELIBERATELY WIDER than
+# the one on ``sessions`` and ``user_secrets``: an identity may exist for a
+# ``service`` principal that authenticates with an operator-issued
+# credential and never completes an OIDC walk, while a session or a user
+# secret can only ever belong to something that logged in through a browser.
+# The narrow set is a subset of the wide one, which is what keeps the
+# ownership foreign keys sound in that direction.
+
+_IDENTITY_PROVIDER_TYPE_CHECK = "provider IN ('local', 'oidc', 'entra', 'vanguard', 'google', 'service')"
+_IDENTITY_KIND_CHECK = "kind IN ('human', 'service')"
+_IDENTITY_ACCESS_STATE_CHECK = "access_state IN ('pending', 'active', 'disabled')"
+_IDENTITY_ROLE_CHECK = "role IN ('admin', 'approver', 'reviewer', 'user', 'curator', 'auditor', 'oversight')"
+_RELATIONSHIP_TYPE_CHECK = "relationship_type IN ('approver')"
+
+
+def _identities_text_columns_non_blank_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
+    """``subject`` and ``username`` must both carry real text.
+
+    ``(provider, subject)`` is the identity key, so a blank subject would
+    collapse every identity from one provider onto a single row. ``username``
+    is what an admin reads in the pending queue, and a blank one makes the
+    activation decision unreadable; it defaults to the IdP subject until a
+    login supplies something better, so there is no path that legitimately
+    has nothing to write.
+    """
+    return f"{_sql_non_blank_text('subject', dialect=dialect)} AND {_sql_non_blank_text('username', dialect=dialect)}"
+
+
+identities_table = Table(
+    "identities",
+    metadata,
+    Column("identity_id", String, primary_key=True),
+    Column("provider", String, nullable=False),
+    # ``human`` or ``service``. A service identity may hold only ``admin`` or
+    # ``oversight`` and may never approve, attest, or publish. That rule reads
+    # two tables, so no dialect can express it as a CHECK; it is refused at
+    # the route layer in the same transaction as the role insert.
+    Column("kind", String, nullable=False, server_default="human"),
+    Column("subject", String, nullable=False),
+    Column("username", String, nullable=False),
+    Column("display_name", String, nullable=True),
+    Column("email", String, nullable=True),
+    # VANguard ABN; null for every other provider.
+    Column("organisation_id", String, nullable=True),
+    # Forensics only — never returned by any API. Taken at ACTIVATION, not at
+    # first sight, so the container does not accumulate profile PII belonging
+    # to people who merely tried to log in. Bounded at 16 KiB by the write
+    # boundary rather than a CHECK: the bound is in bytes, and the byte-length
+    # SQL differs per dialect in a way that would make the constraint a
+    # character count on one of them and silently admit more than intended.
+    Column("raw_claims_json", Text, nullable=True),
+    # D10 rebound detection: the verified email seen the first time this
+    # subject appeared, and the moment it was observed to have changed.
+    Column("subject_email_at_first_seen", String, nullable=True),
+    Column("rebound_at", DateTime(timezone=True), nullable=True),
+    Column("first_seen_at", DateTime(timezone=True), nullable=False),
+    # Nullable: a pre-provisioned identity nobody has used has no login to
+    # stamp, and inventing one would falsify the dormancy window R9 measures.
+    Column("last_login_at", DateTime(timezone=True), nullable=True),
+    # Read on EVERY request in get_current_user, so revocation latency is one
+    # request rather than the token lifetime.
+    Column("access_state", String, nullable=False, server_default="pending"),
+    # An admin may create the row ``active`` by (provider, subject) before the
+    # person's first login; that login then BINDS to this row instead of
+    # creating one. This is how a known cohort is onboarded without each
+    # person hitting the pending wall.
+    Column("pre_provisioned_at", DateTime(timezone=True), nullable=True),
+    Column("activated_at", DateTime(timezone=True), nullable=True),
+    # Nullable on purpose: the bootstrap seed and the operator recovery CLI
+    # both activate the FIRST admin with actor ``operator`` and no activating
+    # identity, because there is by definition no active admin to name.
+    Column(
+        "activated_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=True,
+    ),
+    Column("disabled_at", DateTime(timezone=True), nullable=True),
+    Column(
+        "disabled_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=True,
+    ),
+    Column("disable_reason", String, nullable=True),
+    CheckConstraint(_IDENTITY_PROVIDER_TYPE_CHECK, name="ck_identities_provider"),
+    CheckConstraint(_IDENTITY_KIND_CHECK, name="ck_identities_kind"),
+    CheckConstraint(_IDENTITY_ACCESS_STATE_CHECK, name="ck_identities_access_state"),
+    CheckConstraint(
+        _identities_text_columns_non_blank_check(dialect="sqlite"),
+        name="ck_identities_subject_and_username_non_blank",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _identities_text_columns_non_blank_check(dialect="postgresql"),
+        name="ck_identities_subject_and_username_non_blank",
+    ).ddl_if(dialect="postgresql"),
+    UniqueConstraint("provider", "subject", name="uq_identities_provider_subject"),
+)
+Index("ix_identities_access_state", identities_table.c.access_state)
+
+
+# A role row is never deleted; it is revoked, so the grant remains readable.
+# "Active" therefore means ``revoked_at IS NULL`` and nothing else — a
+# partial-index predicate must be immutable, so it cannot consult the clock
+# and ``expires_at`` is not part of it. Expiry is evaluated at read time by
+# the code that answers "what roles does this identity hold now".
+identity_roles_table = Table(
+    "identity_roles",
+    metadata,
+    Column("role_id", String, primary_key=True),
+    Column(
+        "identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    ),
+    Column("role", String, nullable=False),
+    # JIT grants: the organisation console's role in a container is granted
+    # with an expiry by a CONTAINER admin. The compartment owner reads the
+    # console in, never the reverse.
+    Column("expires_at", DateTime(timezone=True), nullable=True),
+    # Activation is the most consequential act in the model and must carry a
+    # reason.
+    Column("note", Text, nullable=True),
+    # Reserved (library id, team id); NULL means deployment-wide.
+    Column("scope", String, nullable=True),
+    Column(
+        "granted_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("granted_at", DateTime(timezone=True), nullable=False),
+    Column("revoked_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint(_IDENTITY_ROLE_CHECK, name="ck_identity_roles_role"),
+)
+# TWO partial uniques, for the same reason quota_policies needs two: NULLs
+# are DISTINCT for uniqueness in both dialects, so an index over
+# ``(identity_id, role, scope)`` does not constrain the deployment-wide case
+# at all — ``scope IS NULL`` is every ordinary grant, and without the second
+# index one identity could hold two active ``admin`` rows. The first index
+# covers scoped grants; the second covers the unscoped ones.
+Index(
+    "uq_identity_roles_active_scoped",
+    identity_roles_table.c.identity_id,
+    identity_roles_table.c.role,
+    identity_roles_table.c.scope,
+    unique=True,
+    sqlite_where=identity_roles_table.c.revoked_at.is_(None),
+    postgresql_where=identity_roles_table.c.revoked_at.is_(None),
+)
+Index(
+    "uq_identity_roles_active_unscoped",
+    identity_roles_table.c.identity_id,
+    identity_roles_table.c.role,
+    unique=True,
+    sqlite_where=identity_roles_table.c.revoked_at.is_(None) & identity_roles_table.c.scope.is_(None),
+    postgresql_where=identity_roles_table.c.revoked_at.is_(None) & identity_roles_table.c.scope.is_(None),
+)
+
+
+# The org tree carries ONE job: who oversees whom, for the approver's audit
+# view. Approver eligibility and leave cover are role questions answered by
+# ``identity_roles``, not tree questions — which is why there is exactly one
+# relationship type and why widening this vocabulary is a design change
+# rather than a schema convenience.
+identity_relationships_table = Table(
+    "identity_relationships",
+    metadata,
+    Column("relationship_id", String, primary_key=True),
+    Column(
+        "from_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    ),
+    Column(
+        "to_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    ),
+    Column("relationship_type", String, nullable=False),
+    Column(
+        "asserted_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("asserted_at", DateTime(timezone=True), nullable=False),
+    # ANNOTATION ONLY. A partial-index predicate must be immutable, so
+    # "active" cannot consult this window and no check reads it. Leave cover
+    # is a second ``approver`` role grant, not an edge.
+    Column("effective_from", DateTime(timezone=True), nullable=True),
+    Column("effective_until", DateTime(timezone=True), nullable=True),
+    Column("revoked_at", DateTime(timezone=True), nullable=True),
+    Column(
+        "revoked_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=True,
+    ),
+    Column("note", Text, nullable=True),
+    CheckConstraint(_RELATIONSHIP_TYPE_CHECK, name="ck_identity_relationships_type"),
+    CheckConstraint("from_identity_id <> to_identity_id", name="ck_identity_relationships_not_self"),
+)
+# One active default approver per person. Cycles are a different problem and
+# are refused at write time by a bounded ancestor walk in the route layer —
+# no index can express reachability.
+Index(
+    "uq_identity_relationships_active_incoming",
+    identity_relationships_table.c.to_identity_id,
+    identity_relationships_table.c.relationship_type,
+    unique=True,
+    sqlite_where=identity_relationships_table.c.revoked_at.is_(None),
+    postgresql_where=identity_relationships_table.c.revoked_at.is_(None),
+)
+Index(
+    "uq_identity_relationships_active_edge",
+    identity_relationships_table.c.from_identity_id,
+    identity_relationships_table.c.to_identity_id,
+    identity_relationships_table.c.relationship_type,
+    unique=True,
+    sqlite_where=identity_relationships_table.c.revoked_at.is_(None),
+    postgresql_where=identity_relationships_table.c.revoked_at.is_(None),
+)
+
+
+# The browser-to-backend handoff after a completed SSO walk. The code itself
+# is ``secrets.token_urlsafe(32)`` and is NEVER stored: only its SHA-256 is,
+# so a reader of this table cannot mint a session. Consume is ONE statement
+# (conditional UPDATE ... RETURNING) against the DATABASE clock, never a
+# select-then-compare and never a replica clock.
+#
+# Rows are purged lazily — on consume, and on the next login by the same
+# identity — with a 15 minute TTL. No background task, and no audit row: the
+# login attempt's own record already exists, and a maintenance delete is not
+# an authority mutation.
+sso_handoffs_table = Table(
+    "sso_handoffs",
+    metadata,
+    Column("code_hash", String, primary_key=True),
+    Column(
+        "identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    ),
+    Column("issued_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("consumed_at", DateTime(timezone=True), nullable=True),
+    Column("request_id", String, nullable=False),
+    CheckConstraint(_lower_sha256_check("code_hash", dialect="sqlite"), name="ck_sso_handoffs_code_hash").ddl_if(dialect="sqlite"),
+    CheckConstraint(_lower_sha256_check("code_hash", dialect="postgresql"), name="ck_sso_handoffs_code_hash").ddl_if(dialect="postgresql"),
+)
+Index("ix_sso_handoffs_expires_at", sso_handoffs_table.c.expires_at)
