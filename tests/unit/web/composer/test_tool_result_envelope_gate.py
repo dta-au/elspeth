@@ -203,6 +203,36 @@ _CONTAINER_ELEMENT_PAYLOADS: dict[str, type | _Elsewhere] = {
 _OPAQUE_REFERENCES = (ast.Name, ast.Attribute, ast.Subscript, ast.Call)
 # Wrappers that return their first argument's shape unchanged.
 _PASSTHROUGH_HELPERS = frozenset({"redact_source_storage_path"})
+# Callees a shipped payload may be handed to. ``_subscript_assign_keys`` accounts for every LOAD of
+# the payload name, and a call ARGUMENT is the one position where the object leaves the statements
+# this file reads: from there the callee decides what happens to it, and a callee that stores into
+# what it is given re-shapes the payload where no walker looks (red-team RED5B-1). The key shape is
+# the bare callee name, the same one ``_DATA_HELPER_PAYLOADS`` uses, so
+# ``test_every_attributed_helper_name_answers_to_one_module`` covers these names too. The guarantee
+# is DERIVED, not trusted: ``test_every_payload_consumer_leaves_the_payload_it_is_handed_unreshaped``
+# re-reads each definition under ``web/composer`` and refuses one that re-shapes a parameter.
+_PAYLOAD_CONSUMERS = frozenset(
+    {"ToolResult", "_discovery_result", "_mutation_result", "redact_source_storage_path", "canonical_json", "replace"}
+)
+# A consumer whose no-re-shape guarantee is not readable as a function body under ``web/composer``,
+# named with where the guarantee IS held — the same treatment, and for the same reason, as
+# ``_ATTRIBUTIONS_DEFINED_OUTSIDE_THE_COMPOSER``: a derivation that cannot find its subject must be
+# an adjudicated entry here, never a silent pass.
+_CONSUMER_GUARANTEES_HELD_ELSEWHERE: dict[str, str] = {
+    "ToolResult": (
+        "the envelope's own dataclass, not a function: __post_init__ deep-freezes ``data`` into a "
+        "FRESH MappingProxyType (contracts/freeze.py), so what it keeps is a copy — measured, and "
+        "recorded where the census relies on it (``_results_carrying``, verify-gate VG-F2)"
+    ),
+    "replace": (
+        "dataclasses.replace: it builds a NEW ToolResult and hands the mapping to the constructor "
+        "above, which is where the freeze happens; it never touches the mapping itself"
+    ),
+    "canonical_json": (
+        "the deterministic encoder (core/canonical.py, contracts/hashing.py): it reads the mapping "
+        "to produce a str and returns no reference to it"
+    ),
+}
 # (file name, enclosing function, local name) -> payload type, ONLY for a local the resolver
 # cannot follow (it follows assignments, subscript stores, .update, if/else, ``or``, and tuple
 # unpacking from a _Literal helper on its own).
@@ -518,22 +548,36 @@ def _subscript_assign_keys(
     ``+=`` or ``&=`` on a payload name is refused by op, since neither ships
     keys a reader could act on and ``dict`` has no ``__iadd__`` at all.
 
-    Finally the walk CLOSES on itself: every statement that can re-shape the
-    dict behind ``target`` must be one of the statements just read. Matching a
-    set of syntactic forms against ONE NAME is what made this walker wrong four
-    rounds running — a ``dict(...)`` re-wrap, a ``.update`` with no positional,
-    a ``|=``, a nested value under a subscript, and then ``alias = data;
-    alias["k"] = v``, each closed in turn while the next stayed open. A second
-    local bound to the same dict is not this name, so the loop above cannot see
-    it: ``alias["zzz"] = ...`` in ``_failure_result`` left the census at 401
-    rows, mypy clean, and survived a 10,126-test selection byte-identical to
-    its baseline (red-team RED5-1). ``_dict_mutations`` over ``_aliases_of``
-    already answers the general question — "does anything OTHER than what I
-    read re-shape this payload?" — and it is what makes the three exact-key
-    pins trustworthy; asking it here closes alias stores, alias ``|=``, alias
-    ``del``, a mutator call and ``result.data[...] = ...`` in one place instead
-    of one arm per syntax. Measured before landing: 33 call sites, ZERO
-    statements newly refused.
+    Finally the walk closes, in TWO assertions that ask opposite questions.
+
+    ``_dict_mutations`` over ``_aliases_of`` asks "does anything other than
+    what I read re-shape this payload?", and it is what makes the three
+    exact-key pins trustworthy: alias stores, alias ``|=``, alias ``del``, a
+    mutator call and ``result.data[...] = ...`` in one place instead of one arm
+    per syntax. A second local bound to the same dict is not this name, so the
+    loop above cannot see it — ``alias["zzz"] = ...`` in ``_failure_result``
+    left the census at 401 rows, mypy clean, and survived a 10,126-test
+    selection byte-identical to its baseline (red-team RED5-1).
+
+    That question alone is still a set of RECOGNISED forms, and recognising
+    forms is what made this walker wrong five rounds running — a ``dict(...)``
+    re-wrap, a ``.update`` with no positional, a ``|=``, a nested value under a
+    subscript, ``alias = data; alias["k"] = v``, and then three more the alias
+    walk could not see because the payload LEAVES the name: ``_stamp(data)``
+    where the callee stores into its argument, ``dict.update(data, {...})``
+    where the alias is the argument rather than the receiver, and ``holder =
+    {"payload": data}`` where the handle is another container. All three left
+    the census at 401 rows with mypy clean, all three survived the whole
+    10,128-test selection, and the first was measured putting its key on the
+    real wire (red-team RED5B-1). So ``_unaccounted_loads`` asks the converse
+    and unbounded question — "is every USE of this object one I have
+    classified?" — and REFUSES anything else, the posture ``_OPAQUE_REFERENCES``
+    and ``cast(...) hides the shape of ...`` already take elsewhere in this
+    file. A call argument is the position where the object leaves what this
+    file can read, so the callee must be named in ``_PAYLOAD_CONSUMERS``, whose
+    guarantee is re-derived from each definition rather than trusted. Measured
+    before landing: 33 walker call sites, 94 loads over 15 distinct positions,
+    ZERO statements newly refused.
 
     SCOPE, since the check is only worth where it runs: ``_expr_keys``' Name
     branch returns before reaching this walker for a local attributed in
@@ -576,6 +620,14 @@ def _subscript_assign_keys(
         f"(or through the result carrying it) ships a key past the census: enumerate it here, or build the "
         f"payload so it has no second handle (red-team RED5-1)."
     )
+    escapes = _unaccounted_loads(fn, aliases)
+    assert not escapes, (
+        f"{site}: {target} is used where the census cannot account for it — {escapes}. Whatever holds "
+        f"the payload next can store into it where no walker looks, which ships a key past the census "
+        f"with the row count unmoved and mypy clean (red-team RED5B-1). Build the payload so it has no "
+        f"second handle; or, if the callee genuinely cannot re-shape what it is given, name it in "
+        f"_PAYLOAD_CONSUMERS, where that claim is re-derived from its own definition."
+    )
     yield from sorted(found, key=lambda item: item[1])
 
 
@@ -588,14 +640,36 @@ def _name_bindings(fn: ast.AST) -> Iterator[tuple[list[ast.expr], ast.AST]]:
             yield [node.target], node.value
 
 
+def _same_object_names(expr: ast.AST) -> Iterator[str]:
+    """Names an expression can evaluate to WITHOUT copying: the bare name, and either branch of a
+    conditional or of an ``or`` chain, to any depth.
+
+    ``x = payload`` is not the only binding that yields a second handle on the
+    same dict: ``data = source_blob_payload if data is None else {**data, ...}``
+    (``sessions.py``) binds ``data`` to the payload object itself down one
+    branch. Reading only the bare-Name form left ``alias = payload if cond else
+    {}; alias["zzz"] = ...`` outside the alias set, which is the RED5-1 route
+    again with two extra tokens. A dict display, a ``dict(...)`` call and a
+    ``{**payload}`` splat all build a NEW mapping and are deliberately NOT here.
+    """
+    if isinstance(expr, ast.Name):
+        yield expr.id
+    elif isinstance(expr, ast.IfExp):
+        yield from _same_object_names(expr.body)
+        yield from _same_object_names(expr.orelse)
+    elif isinstance(expr, ast.BoolOp):
+        for value in expr.values:
+            yield from _same_object_names(value)
+
+
 def _aliases_of(fn: ast.AST, name: str) -> frozenset[str]:
-    """``name`` plus every local bound to it by a plain assignment, to a fixpoint: an alias of an
-    alias is still the same dict object, so a store through any of them re-shapes the payload."""
+    """``name`` plus every local bound to the same object, to a fixpoint: an alias of an alias is
+    still the same dict object, so a store through any of them re-shapes the payload."""
     names = {name}
     while True:
         grown = set(names)
         for targets, rhs in _name_bindings(fn):
-            if isinstance(rhs, ast.Name) and rhs.id in names:
+            if any(bound in names for bound in _same_object_names(rhs)):
                 grown.update(target.id for target in targets if isinstance(target, ast.Name))
         if grown == names:
             return frozenset(names)
@@ -695,6 +769,78 @@ def _dict_mutations(fn: ast.AST, aliases: frozenset[str], results: frozenset[str
             mutated = referenced(node.func.value)
             if mutated is not None:
                 found.append((node.lineno, f".{node.func.attr} on {ast.unparse(mutated)}"))
+    return sorted(found)
+
+
+def _child_parents(fn: ast.AST) -> dict[ast.AST, ast.AST]:
+    """Every node inside ``fn`` mapped to the node that holds it — ``ast`` records no parent link."""
+    return {child: node for node in ast.walk(fn) for child in ast.iter_child_nodes(node)}
+
+
+def _consumer_refusal(call: ast.AST | None, label: str) -> str | None:
+    """``None`` when the call is a named payload consumer, otherwise how the payload escapes into it."""
+    name = _call_name(call) if isinstance(call, ast.Call) else None
+    if name in _PAYLOAD_CONSUMERS:
+        return None
+    return f"handed to {name}({label}...), which is not a named payload consumer"
+
+
+def _unaccounted_load(node: ast.expr, parents: dict[ast.AST, ast.AST]) -> str | None:
+    """``None`` when this LOAD of the payload cannot re-shape it, otherwise how it escapes the walk.
+
+    The question is deliberately the opposite of ``_dict_mutations``': not
+    "which mutations do I recognise" — a set that has been wrong at every round
+    — but "is every USE of this object one I have classified". A load in an
+    unclassified position REFUSES, the same posture ``_OPAQUE_REFERENCES`` and
+    ``cast(...) hides the shape of ...`` already take a few helpers away.
+    """
+    child: ast.AST = node
+    while True:
+        parent = parents.get(child)
+        if parent is None:
+            return "read at a position with no enclosing expression"
+        if isinstance(parent, (ast.Subscript, ast.Attribute)) and parent.value is child:
+            # ``payload["k"]`` (store, read or ``del``) and ``payload.update(...)`` /
+            # ``payload.pop(...)``: the walker reads the stores and merges, ``_dict_mutations``
+            # reports every mutator, and the assertion above holds the two equal.
+            return None
+        if isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is child:
+            return None  # a second handle, which ``_aliases_of`` follows and this walk then covers
+        if isinstance(parent, (ast.Compare, ast.UnaryOp)):
+            return None  # ``"k" in payload``, ``payload is None``, ``not payload``: reads only
+        if isinstance(parent, (ast.For, ast.AsyncFor, ast.comprehension)) and parent.iter is child:
+            return None  # iterating a mapping yields its keys and cannot re-shape it
+        if isinstance(parent, ast.Dict):
+            splatted = [value for value, key in zip(parent.values, parent.keys, strict=True) if key is None]
+            if any(value is child for value in splatted):
+                return None  # ``{**payload, ...}`` COPIES into a new dict the walkers read on its own
+            return "bound into a dict display, which keeps a handle on it"
+        if isinstance(parent, ast.Return):
+            return None  # leaves this function; the site that receives it is walked in its own right
+        if isinstance(parent, (ast.Tuple, ast.List)) and isinstance(parents.get(parent), ast.Return):
+            return None  # ``return payload, None`` — the same boundary, one container out
+        if isinstance(parent, ast.keyword):
+            return _consumer_refusal(parents.get(parent), f"{parent.arg}=")
+        if isinstance(parent, ast.Call):
+            if any(arg is child for arg in parent.args):
+                return _consumer_refusal(parent, "")
+            return f"read inside a {_call_name(parent)}(...) call in a position this walker does not classify"
+        if isinstance(parent, (ast.IfExp, ast.BoolOp)):
+            child = parent  # yields the SAME object; whatever consumes the conditional consumes this
+            continue
+        return f"read under {type(parent).__name__}, a position this walker does not classify"
+
+
+def _unaccounted_loads(fn: ast.AST, aliases: frozenset[str]) -> list[str]:
+    """Every LOAD of ``aliases`` inside ``fn`` that sits somewhere this file has not classified."""
+    parents = _child_parents(fn)
+    found: set[str] = set()
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Name) and node.id in aliases and isinstance(node.ctx, ast.Load)):
+            continue
+        escape = _unaccounted_load(node, parents)
+        if escape is not None:
+            found.add(f"line {node.lineno}: {node.id} {escape}")
     return sorted(found)
 
 
@@ -908,6 +1054,49 @@ def f():
     result.data |= {"merged_data": 1}
     unrelated |= {"k": 4}
     return result
+"""
+
+# The four routes by which the payload leaves the statements the walker reads, and one function
+# whose every use of it is accounted. The first three are red-team RED5B-1's measured survivors
+# (each SHIPPED its key with the census at 401 rows and mypy clean); the fourth is the conditional
+# alias ``_same_object_names`` exists for. ``stays_accounted`` is the other direction, without which
+# a mutant that refused everything would pass.
+_PROBE_ESCAPING_PAYLOADS = """
+def escapes_into_a_call():
+    payload = {"status": "x"}
+    _stamp(payload)
+    return ToolResult(success=True, data=payload)
+
+
+def escapes_through_an_unbound_mutator():
+    payload = {"status": "x"}
+    dict.update(payload, {"zzz": "y"})
+    return ToolResult(success=True, data=payload)
+
+
+def escapes_into_a_container():
+    payload = {"status": "x"}
+    holder = {"payload": payload}
+    holder["payload"]["zzz"] = "y"
+    return ToolResult(success=True, data=payload)
+
+
+def escapes_through_a_conditional_alias(flag):
+    payload = {"status": "x"}
+    alias = payload if flag else {}
+    alias["zzz"] = "y"
+    return ToolResult(success=True, data=payload)
+
+
+def stays_accounted(other):
+    payload = {"status": "x"}
+    payload["also"] = "y"
+    if "also" in payload and payload is not other:
+        payload["also"] = "z"
+    encoded = canonical_json(payload)
+    for key in payload:
+        other[key] = encoded
+    return _discovery_result(None, payload)
 """
 
 
@@ -1271,6 +1460,81 @@ def test_walker_finds_stores_through_local_and_result_aliases() -> None:
     # so it REFUSES rather than reporting the empty key list a caller would read as "nothing here".
     with pytest.raises(AssertionError, match="is re-shaped by statements the census did not read"):
         list(_subscript_assign_keys(fn, "payload", "probe", {}))
+
+
+def test_the_walk_accounts_for_every_use_of_the_payload_and_refuses_an_escape() -> None:
+    """A payload that LEAVES its own name is re-shaped where no walker looks, so an unclassified use refuses.
+
+    The alias walk above closes every route that stays inside the payload's
+    names. Three that do not were measured surviving the whole 10,128-test
+    selection with the census at 401 rows and mypy exit 0, and the first was
+    read off the real wire — ``data keys on the wire: ['error', 'error_code',
+    'zzz_untaught_key']`` from ``_common._failure_result`` (red-team RED5B-1).
+    Recognising three more forms would have been the fifth round of that; the
+    walk asks the converse question instead, and what a mutant must now defeat
+    is the classification of every USE, not a list of mutations.
+
+    The last two assertions are the direction a refuse-everything mutant would
+    pass: the conditional alias is ACCOUNTED as a use (it binds a name, which
+    ``_same_object_names`` follows) and refused one assertion earlier as a
+    mutation, and a function whose every use is classified still yields its
+    keys.
+    """
+    tree = ast.parse(_PROBE_ESCAPING_PAYLOADS)
+    escapes = {
+        "escapes_into_a_call": "handed to _stamp(...), which is not a named payload consumer",
+        "escapes_through_an_unbound_mutator": "handed to update(...), which is not a named payload consumer",
+        "escapes_into_a_container": "bound into a dict display, which keeps a handle on it",
+    }
+    for fn_name, escape in escapes.items():
+        fn = _function(tree, fn_name)
+        reported = _unaccounted_loads(fn, _aliases_of(fn, "payload"))
+        assert len(reported) == 1 and reported[0].endswith(escape), f"{fn_name}: {reported}"
+        with pytest.raises(AssertionError, match="is used where the census cannot account for it"):
+            list(_subscript_assign_keys(fn, "payload", f"probe:{fn_name}", {}))
+    conditional = _function(tree, "escapes_through_a_conditional_alias")
+    assert _aliases_of(conditional, "payload") == {"payload", "alias"}
+    assert _unaccounted_loads(conditional, _aliases_of(conditional, "payload")) == []
+    with pytest.raises(AssertionError, match="is re-shaped by statements the census did not read"):
+        list(_subscript_assign_keys(conditional, "payload", "probe:conditional", {}))
+    accounted = _function(tree, "stays_accounted")
+    assert _unaccounted_loads(accounted, _aliases_of(accounted, "payload")) == []
+    assert [key for key, _ in _subscript_assign_keys(accounted, "payload", "probe:accounted", {})] == ["also", "also"]
+
+
+def test_every_payload_consumer_leaves_the_payload_it_is_handed_unreshaped() -> None:
+    """A named consumer's promise is re-read from its own body, never taken from this file's list.
+
+    ``_unaccounted_loads`` lets the payload leave the walk in exactly one
+    position — as an argument to one of these — so the census's whole account
+    of that payload rests on each consumer keeping its hands off what it is
+    given. A hand-list makes that a claim; reading the definition makes it a
+    derivation. A consumer whose promise is not readable as a function body
+    under ``web/composer`` is an adjudicated entry instead of a silent pass,
+    the same treatment ``_ATTRIBUTIONS_DEFINED_OUTSIDE_THE_COMPOSER`` gives an
+    attribution whose helper it cannot find.
+    """
+    elsewhere = set(_CONSUMER_GUARANTEES_HELD_ELSEWHERE)
+    assert elsewhere <= _PAYLOAD_CONSUMERS, f"adjudicated name(s) that are not consumers: {sorted(elsewhere - _PAYLOAD_CONSUMERS)}"
+    unresolved = set(_PAYLOAD_CONSUMERS) - elsewhere
+    findings: list[str] = []
+    for path in sorted(COMPOSER.rglob("*.py")):
+        for node in ast.walk(_parse(path)):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name not in _PAYLOAD_CONSUMERS:
+                continue
+            unresolved.discard(node.name)
+            where = f"{_display(path)}:{node.lineno} {node.name}"
+            parameters = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+            findings.extend(
+                f"{where}: re-shapes its own {parameter.arg} — {form} at line {lineno}"
+                for parameter in parameters
+                for lineno, form in _dict_mutations(node, _aliases_of(node, parameter.arg), frozenset())
+            )
+    assert not findings, "payload consumer(s) that re-shape what they are handed:\n" + "\n".join(findings)
+    assert not unresolved, (
+        f"payload consumer(s) with no definition under web/composer: {sorted(unresolved)} — name each in "
+        "_CONSUMER_GUARANTEES_HELD_ELSEWHERE with where its no-re-shape guarantee IS held"
+    )
 
 
 def _probe_data_keys(source: str, fn_name: str) -> list[str]:
