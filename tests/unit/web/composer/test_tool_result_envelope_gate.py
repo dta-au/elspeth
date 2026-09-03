@@ -192,10 +192,14 @@ _CONTAINER_ELEMENT_PAYLOADS: dict[str, type | _Elsewhere] = {
 # other end of a name, an attribute, a subscript or a call, and this position has no enclosing
 # function to resolve it through (``_expr_keys`` does, which is why it can refuse one). Named
 # rather than fallen through, so a shape that is NEITHER readable nor one of these — a walrus,
-# an ``await``, a starred element — refuses instead of shipping unseen. Its TIGHTNESS is
-# un-mutated: deleting the arm reds two pins, but WIDENING this tuple (adding ``ast.BinOp``, say)
-# would only stop those pins raising and move no census row, so nothing here proves the four are
-# the right four.
+# an ``await``, a starred element — refuses instead of shipping unseen. Its TIGHTNESS is pinned
+# exactly as far as the refusal probes reach, and no further. MEASURED, one mutant at a time:
+# widening with a shape that HAS a probe reds it, because the probes assert a raise
+# (``ast.BinOp`` -> ``…refuses_a_value_it_can_neither_read_nor_name[binop]`` fails, 1 failed);
+# widening with one that has none survives the whole file (``ast.Await``, ``ast.Starred``,
+# ``ast.Lambda`` -> exit 0). This comment said the opposite of the first of those until red-team
+# RED5-3 measured it. Adding a probe per shape cannot close the gap — the set of shapes outside
+# the tuple is unbounded — so read the four as pinned-as-a-minimum, never as proved to be right.
 _OPAQUE_REFERENCES = (ast.Name, ast.Attribute, ast.Subscript, ast.Call)
 # Wrappers that return their first argument's shape unchanged.
 _PASSTHROUGH_HELPERS = frozenset({"redact_source_storage_path"})
@@ -1981,8 +1985,21 @@ def test_no_nested_key_is_a_homonym_of_an_envelope_key() -> None:
     quotes it. That is the same ``is_taught`` mechanism one step out, it needs
     either a data-payload-scoped corpus match or a per-tool ruling, and it is
     recorded on elspeth-e405ad7cd2 rather than fenced here.
+
+    The DERIVATION is asserted, not only its consequence. Coming from the
+    registry rather than from the four names that happen to be quoted today is
+    one of the three ways this rule was generalised, and it was free to lose:
+    narrowing ``envelope`` back to ``{success, validation, version,
+    affected_nodes}`` left the whole gate file green, because no shipped row
+    collides with any of the other seven either (measured, red-team RED5-4).
+    So the set is re-derived here from the two registry constants
+    ``tool_result_keys`` is built out of — a different expression from the one
+    under test, which is the point: a hand-list substituted for either reds.
     """
     envelope = set(env.tool_result_keys(data=True))
+    assert envelope == set(env.TOOL_RESULT_REQUIRED_KEYS) | set(env.TOOL_RESULT_OPTIONAL_KEYS), (
+        "the forbidden names must be the registry's whole envelope, not a hand-list of the ones a shipped row happens to collide with today"
+    )
     collisions = sorted(
         {(shipped.key, shipped.site) for shipped in shipped_keys() if "." in shipped.key and leaf_of(shipped.key) in envelope}
     )
