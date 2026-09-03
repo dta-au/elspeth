@@ -72,6 +72,35 @@ SHARED = "*"  # the ``tool`` column for surfaces every tool ships
 _TOOL_DATA_FILES: tuple[str, ...] = ("blobs.py", "generation.py", "outputs.py", "secrets.py", "sessions.py", "sources.py", "transforms.py")
 _RESULT_CONSTRUCTORS = frozenset({"_discovery_result", "_mutation_result", "ToolResult", "replace"})
 
+# Every ``data=`` result-constructor site in web/composer that ``_TOOL_DATA_FILES`` does NOT walk,
+# with the reason. ``test_every_result_constructor_site_is_attributed`` derives the site set from
+# the package and refuses one that is neither walked nor named here — the file list alone could
+# not notice a new site, and three real ones were reachable by nothing (systems seat SYS-R3-2).
+# Keyed on (file, enclosing function) so the row survives a line move but not a new producer.
+_DATA_SITES_COUNTED_AT_THEIR_PRODUCER: dict[tuple[str, str], str] = {
+    ("_common.py", "_discovery_result"): "generic constructor: ships the payload its caller passed, counted at that call",
+    ("_common.py", "_mutation_result"): "generic constructor: ships the payload its caller passed, counted at that call",
+    ("_common.py", "_failure_result"): "_FAILURE_DATA_HELPERS row: its ``data`` local is walked there",
+    ("_common.py", "_credential_wiring_contract_failure"): "_FAILURE_DATA_HELPERS row: inline data={...}",
+    ("_common.py", "_merged_component_rejection_result"): (
+        "merges two already-censused payloads; the one key the merge adds is yielded explicitly by _failure_data_sites"
+    ),
+    ("tool_batch.py", "run_tool_batch"): "two _FAILURE_DATA_HELPERS rows: the proposal payload and the rejection payload",
+    ("discovery_cache.py", "result_from_cached_discovery_payload"): (
+        "re-envelopes a cached discovery result's own data under the current state; adds no key, and every key it "
+        "carries was censused at the tool that produced it"
+    ),
+}
+# Sites on a surface this gate's taught side does not cover. The taught text is the COMPOSER skill
+# plus the composer tool descriptions (``taught_text``); the planner reads pipeline_capabilities.md
+# and its own briefs, so admitting planner payloads here would ask the composer skill to teach a
+# wire no composer model ever sees. Their shapes are closed by owned types and pinned in
+# test_pipeline_planner.py instead.
+_DATA_SITES_OFF_THE_COMPOSER_TOOL_SURFACE: dict[tuple[str, str], str] = {
+    ("pipeline_planner.py", "_serialize_provider_discovery_result"): "planner disclosure surface",
+    ("pipeline_planner.py", "execute_one_discovery"): "planner disclosure surface",
+}
+
 
 class ShippedKey(NamedTuple):
     surface: str  # envelope | validation | delta | guidance | echo | preflight | plugin-schema | failure-data | tool-data
@@ -246,11 +275,25 @@ def _dict_literal_keys(
             yield from _dict_literal_keys(value.elts[0], path + "[].", site, constants)
 
 
-def _subscript_assign_keys(fn: ast.AST, target: str, site: str, constants: dict[str, str]) -> Iterator[tuple[str, int]]:
-    """``target["key"] = ...`` and ``target.update({...})`` statements inside ``fn``: (key, lineno), in source order.
+def _subscript_assign_keys(
+    fn: ast.AST,
+    target: str,
+    site: str,
+    constants: dict[str, str],
+    *,
+    path: Path | None = None,
+) -> Iterator[tuple[str, int]]:
+    """``target["key"] = ...`` and ``target.update(...)`` statements inside ``fn``: (key, lineno), in source order.
 
     ``ast.walk`` is breadth-first, so nested assignments would otherwise come
     out after their later siblings and the emission-order pins would lie.
+
+    The ``.update`` argument is read as a dict literal or as a call to an owned
+    TypedDict (``path`` resolves the class nominally, ADR-032). Every other
+    shape REFUSES: an update the walker cannot read used to be skipped
+    silently whenever it had no positional argument, which is a key shipped
+    past the census (red-team RED-R3-3, the sibling of the ``dict(...)`` arm
+    below).
     """
     found: list[tuple[str, int]] = []
     for node in ast.walk(fn):
@@ -261,8 +304,17 @@ def _subscript_assign_keys(fn: ast.AST, target: str, site: str, constants: dict[
                 assert not _is_cast(node.value), f"{site}:{node.lineno}: cast(...) hides the shape of {key}"
                 found.append((key, node.lineno))
         is_update = isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "update"
-        if is_update and isinstance(node.func.value, ast.Name) and node.func.value.id == target and node.args:
-            found.extend((key, node.lineno) for key in _dict_literal_keys(node.args[0], "", f"{site}:{node.lineno}", constants))
+        if is_update and isinstance(node.func.value, ast.Name) and node.func.value.id == target:
+            where = f"{site}:{node.lineno}"
+            assert len(node.args) == 1 and not node.keywords, f"{where}: {target}.update(...) takes exactly one positional mapping"
+            argument = node.args[0]
+            if isinstance(argument, ast.Dict):
+                found.extend((key, node.lineno) for key in _dict_literal_keys(argument, "", where, constants))
+            elif isinstance(argument, ast.Call):
+                assert path is not None, f"{where}: {target}.update(<call>) needs the walked file to resolve the payload type"
+                found.extend((key, node.lineno) for key in _typed_call_keys(argument, path, "", where))
+            else:
+                raise AssertionError(f"{where}: {target}.update({type(argument).__name__}) is not a shape the walker reads")
     yield from sorted(found, key=lambda item: item[1])
 
 
@@ -498,6 +550,140 @@ def f():
 """
 
 
+# One ``.update`` per readable and unreadable shape. ``_FullPipelineStatePayload`` must be a
+# live module-level binding of ``_common.py``: that is the namespace ``_typed_call_keys``
+# resolves the class through, exactly as it does for a real site.
+_PROBE_UPDATE_SHAPES = """
+def typed_call():
+    payload = {}
+    payload.update(_FullPipelineStatePayload(sources={}, nodes=[], outputs=[], edges=[], metadata={}, inspection={}))
+    return payload
+
+
+def unreadable_name():
+    payload = {}
+    other = {"success": True}
+    payload.update(other)
+    return payload
+
+
+def unreadable_kwargs():
+    payload = {}
+    payload.update(success=True)
+    return payload
+
+
+def unreadable_empty():
+    payload = {}
+    payload.update()
+    return payload
+"""
+
+
+def test_walker_reads_an_update_of_an_owned_typed_dict_and_refuses_every_other_shape() -> None:
+    """``target.update(...)`` is readable as a dict literal or an owned TypedDict call, and REFUSES otherwise.
+
+    Before this, the arm required ``node.args`` and yielded nothing when the
+    argument list was empty, so ``payload.update(other)`` was read as zero keys
+    and ``payload.update(success=True)`` was skipped outright — a key on the
+    wire that the census never enumerates and the teaching gate therefore never
+    adjudicates (red-team RED-R3-3, the ``dict(...)`` sibling of the same
+    shape). The TypedDict arm is what lets a payload be closed by its type at
+    the merge site instead of by a walker chasing a dict literal.
+    """
+    tree = ast.parse(_PROBE_UPDATE_SHAPES)
+    keys = [k for k, _ in _subscript_assign_keys(_function(tree, "typed_call"), "payload", "probe", {}, path=COMMON)]
+    assert keys == ["sources", "nodes", "outputs", "edges", "metadata", "inspection"]
+    assert keys == list(typing.get_type_hints(common._FullPipelineStatePayload)), (
+        "the CALL orders the wire; the pin holds it equal to the class's declaration order"
+    )
+
+    for fn_name, expected in (
+        ("unreadable_name", "is not a shape the walker reads"),
+        ("unreadable_kwargs", "takes exactly one positional mapping"),
+        ("unreadable_empty", "takes exactly one positional mapping"),
+    ):
+        with pytest.raises(AssertionError, match=expected):
+            list(_subscript_assign_keys(_function(tree, fn_name), "payload", "probe", {}, path=COMMON))
+
+
+# One owner assignment per unreadable RHS, against the two shapes the walker does read
+# (a dict literal, and a bare ``dict(<seed>)`` re-wrap).
+_PROBE_OWNER_SHAPES = """
+def readable_literal():
+    data = {"status": "x"}
+    return ToolResult(success=False, data=data)
+
+
+def readable_rewrap():
+    data = dict(seed)
+    return ToolResult(success=False, data=data)
+
+
+def dict_with_kwargs():
+    data = dict(seed, success=True)
+    return ToolResult(success=False, data=data)
+
+
+def dict_with_two_args():
+    data = dict(seed, other)
+    return ToolResult(success=False, data=data)
+
+
+def owner_from_a_call():
+    data = build_payload()
+    return ToolResult(success=False, data=data)
+"""
+
+
+def _probe_owner_keys(fn_name: str) -> list[str]:
+    """Run ``_failure_data_sites``' owner branch over one probe function.
+
+    The branch is inlined here rather than reached through ``_FAILURE_DATA_HELPERS``
+    because that tuple names LIVE helpers; a parked probe row would be a curated
+    input a reviewer cannot check (the reason c1f1d4622 gave for monkeypatching
+    instead of parking).
+    """
+    fn = _function(ast.parse(_PROBE_OWNER_SHAPES), fn_name)
+    keys: list[str] = []
+    for node in ast.walk(fn):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(isinstance(t, ast.Name) and t.id == "data" for t in targets):
+            continue
+        where = f"probe:{node.lineno}"
+        if isinstance(node.value, ast.Dict):
+            keys.extend(_dict_literal_keys(node.value, "data.", where, {}))
+        elif isinstance(node.value, ast.Call) and _call_name(node.value) == "dict":
+            assert not node.value.keywords, f"{where}: dict(..., **kwargs) adds keys the census cannot see"
+            assert len(node.value.args) == 1, f"{where}: dict(...) re-wraps exactly one seed"
+        else:
+            raise AssertionError(f"{where}: data = {type(node.value).__name__} is not a shape the walker reads")
+    return keys
+
+
+def test_failure_owner_assignment_refuses_every_rhs_it_cannot_read() -> None:
+    """The owner branch reads a dict literal or a BARE ``dict(<seed>)``; everything else refuses.
+
+    ``dict(<seed>, success=True)`` adds a key at the re-wrap that the walker
+    never reported, and no other test in the tree killed it (red-team RED-R3-3,
+    mutant G3: gate green, and green again with a key that is not a homonym of
+    anything, so it never even reached the census). A call the walker does not
+    recognise is now a named refusal rather than a silent skip, matching what
+    ``_typed_call_keys`` already does on the inline ``data=`` branch.
+    """
+    assert _probe_owner_keys("readable_literal") == ["data.status"]
+    assert _probe_owner_keys("readable_rewrap") == []
+    for fn_name, expected in (
+        ("dict_with_kwargs", "adds keys the census cannot see"),
+        ("dict_with_two_args", "re-wraps exactly one seed"),
+        ("owner_from_a_call", "is not a shape the walker reads"),
+    ):
+        with pytest.raises(AssertionError, match=expected):
+            _probe_owner_keys(fn_name)
+
+
 def test_walker_reads_literal_constant_subscript_and_update_keys_in_emission_order() -> None:
     tree = ast.parse(_PROBE_TO_DICT)
     fn = _function(tree, "to_dict", in_class="ToolResult")
@@ -676,7 +862,7 @@ def _envelope_sites() -> Iterator[ShippedKey]:
     for key in _dict_literal_keys(_initial_dict_assign(fn, "result", site), "", site, constants):
         surface = "validation" if key.startswith("validation.") else "envelope"
         yield ShippedKey(surface, SHARED, key, site)
-    for key, lineno in _subscript_assign_keys(fn, "result", site, constants):
+    for key, lineno in _subscript_assign_keys(fn, "result", site, constants, path=path):
         yield ShippedKey("envelope", SHARED, key, f"{_display(COMMON)}:{lineno}")
 
 
@@ -727,7 +913,9 @@ def _guidance_sites() -> Iterator[ShippedKey]:
 def _echo_sites() -> Iterator[ShippedKey]:
     tree = _parse(COMMON)
     fn = _function(tree, "_applied_component_echo")
-    for key, lineno in _subscript_assign_keys(fn, "echo", f"{_display(COMMON)}:{fn.lineno}", _module_str_constants(tree, COMMON)):
+    for key, lineno in _subscript_assign_keys(
+        fn, "echo", f"{_display(COMMON)}:{fn.lineno}", _module_str_constants(tree, COMMON), path=COMMON
+    ):
         yield ShippedKey("echo", SHARED, f"applied_component.{key}", f"{_display(COMMON)}:{lineno}")
 
 
@@ -785,14 +973,22 @@ def _failure_data_sites() -> Iterator[ShippedKey]:
                     continue
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 if any(isinstance(t, ast.Name) and t.id == owner for t in targets):
+                    where = f"{site}:{node.lineno}"
                     if isinstance(node.value, ast.Dict):
                         found = True
-                        for key in _dict_literal_keys(node.value, "data.", f"{site}:{node.lineno}", constants):
+                        for key in _dict_literal_keys(node.value, "data.", where, constants):
                             yield ShippedKey("failure-data", SHARED, key, f"{_display(path)}:{node.lineno}")
                     elif isinstance(node.value, ast.Call) and _call_name(node.value) == "dict":
                         # ``dict(<seed>)`` — the seed is a result's own data, counted at its producer.
+                        # The bare re-wrap is the ONLY readable form: ``dict(<seed>, key=value)``
+                        # and ``dict(**kwargs)`` each add keys here that the census would never
+                        # see, and both were silently accepted (red-team RED-R3-3, mutant G3).
+                        assert not node.value.keywords, f"{where}: dict(..., **kwargs) adds keys the census cannot see"
+                        assert len(node.value.args) == 1, f"{where}: dict(...) re-wraps exactly one seed"
                         found = True
-            for key, lineno in _subscript_assign_keys(fn, owner, site, constants):
+                    else:
+                        raise AssertionError(f"{where}: {owner} = {type(node.value).__name__} is not a shape the walker reads")
+            for key, lineno in _subscript_assign_keys(fn, owner, site, constants, path=path):
                 found = True
                 yield ShippedKey("failure-data", SHARED, f"data.{key}", f"{_display(path)}:{lineno}")
         else:
@@ -960,7 +1156,7 @@ def _expr_keys(
                 yield from _helper_return_keys(attribution, prefix=prefix, site=site, depth=depth + 1, index=index, visiting=visiting)
                 continue
             yield from _expr_keys(rhs, fn=fn, tree=tree, path=path, prefix=prefix, site=site, depth=depth + 1, visiting=visiting)
-        for key, _ in _subscript_assign_keys(fn, expr.id, site, constants):
+        for key, _ in _subscript_assign_keys(fn, expr.id, site, constants, path=path):
             seen = True
             yield f"{prefix}{key}"
         assert seen, f"{site}: local {expr.id!r} is never assigned in its function — attribute it in _LOCAL_DATA_PAYLOADS"
@@ -989,6 +1185,37 @@ def _helper_return_keys(
             assert isinstance(value, ast.Tuple), f"{site}: {lit.function!r} return is not a tuple"
             target = value.elts[index]
         yield from _expr_keys(target, fn=fn, tree=tree, path=lit.path, prefix=prefix, site=f"{site} via {lit.function}", depth=depth)
+
+
+class _DataSite(NamedTuple):
+    """One ``<result constructor>(..., data=<expr>)`` call in web/composer."""
+
+    file: str  # file name, as the classification registries key it
+    function: str  # enclosing function name
+    lineno: int
+
+
+def _all_data_sites() -> list[_DataSite]:
+    """Every non-``None`` ``data=`` result-constructor call under ``src/elspeth/web/composer``.
+
+    Derived from the package, not from a file list: the census can only claim to
+    see every payload if the SITE SET it walks is the tree's, so that a producer
+    added in a file nobody thought of refuses instead of shipping unseen
+    (systems seat SYS-R3-2, which found three such sites).
+    """
+    sites: list[_DataSite] = []
+    for path in sorted(COMPOSER.rglob("*.py")):
+        tree = _parse(path)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or _call_name(node) not in _RESULT_CONSTRUCTORS:
+                continue
+            data = _data_expr(node)
+            if data is None or (isinstance(data, ast.Constant) and data.value is None):
+                continue
+            fn_name = _enclosing_function(tree, node.lineno)
+            assert fn_name is not None, f"{_display(path)}:{node.lineno}: result constructed outside any function"
+            sites.append(_DataSite(path.name, fn_name, node.lineno))
+    return sites
 
 
 def _tool_data_sites(files: Iterable[Path] | None = None) -> Iterator[ShippedKey]:
@@ -1273,8 +1500,90 @@ def test_no_shared_envelope_key_is_unadmitted_on_a_mutation_tool() -> None:
 
 
 def test_every_result_constructor_site_is_attributed() -> None:
-    """The tool-data walker must not skip a site silently: it raises on the first unattributed one."""
+    """Every ``data=`` result-constructor site in web/composer is walked or classified, and nothing is skipped.
+
+    Two claims, and before this the test made only half of the first: it ran
+    the tool-data walker, which raises on an unattributed site — but only over
+    a HAND-LIST of seven files, so a producer outside them was invisible rather
+    than refused, and three real ones were (systems seat SYS-R3-2). The site set
+    is now derived from the package, and a site that is neither walked as tool
+    data nor named in one of the two classification registries fails here.
+
+    The registries are checked in both directions: a stale row (its site gone or
+    renamed) fails too, so a classification cannot outlive what it classifies.
+    """
     list(_tool_data_sites())
+
+    walked = {(name, site.function) for name in _TOOL_DATA_FILES for site in _all_data_sites() if site.file == name}
+    classified = set(_DATA_SITES_COUNTED_AT_THEIR_PRODUCER) | set(_DATA_SITES_OFF_THE_COMPOSER_TOOL_SURFACE)
+    seen: set[tuple[str, str]] = set()
+    for site in _all_data_sites():
+        key = (site.file, site.function)
+        seen.add(key)
+        if key in walked:
+            continue
+        assert key in classified, (
+            f"{site.file}:{site.lineno}: {site.function} ships a data= payload that no census walks — "
+            "walk it in _TOOL_DATA_FILES or classify it in one of the two registries"
+        )
+    stale = classified - seen
+    assert not stale, f"classification rows whose site no longer exists: {sorted(stale)}"
+    assert not (classified & walked), f"rows classified as unwalked that the tool-data walker DOES walk: {sorted(classified & walked)}"
+
+
+# The ``request_advisor_hint`` envelopes: the one composer tool whose wire is a plain Mapping built
+# outside execute_tool, so it has no ToolResult and no census row at all. Keys recorded per payload
+# local so a new one refuses here; bringing them under the taught-or-fenced census needs 8 teach-or-
+# fence adjudications (measured: only budget_remaining / guidance / status / error / model / note of
+# its keys are quoted anywhere the model reads), which is an operator decision, not a lane one —
+# elspeth-12e113ff83.
+_ADVISOR_ENVELOPE_PAYLOADS: dict[str, tuple[str, ...]] = {
+    "budget_payload": ("status", "budget_used", "budget_remaining", "guidance"),
+    "deadline_payload": ("status", "outbound_call_made", "budget_used", "budget_remaining"),
+    "timeout_payload": ("status", "error", "error_class", "budget_used", "budget_remaining"),
+    "advisor_error_payload": ("status", "error", "error_class", "budget_used", "budget_remaining"),
+    "success_payload": (
+        "status",
+        "guidance",
+        "model",
+        "prompt_tokens",
+        "completion_tokens",
+        "cached_prompt_tokens",
+        "advisor_latency_ms",
+        "budget_used",
+        "budget_remaining",
+        "note",
+    ),
+}
+
+
+def test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censused() -> None:
+    """``request_advisor_hint`` ships a Mapping, not a ToolResult, so no census surface reaches it.
+
+    That is a scope hole this gate cannot close by itself — the keys would need
+    a teach-or-fence ruling each — but silence about it is what let it sit at
+    zero rows. The payloads are derived from ``run_tool_batch`` (every
+    ``_append_tool_outcome(response=<local>)`` whose local is bound to a dict
+    literal, which is exactly the Mapping arm ``service.py`` dispatches on) and
+    compared to the recorded shapes, so a new advisor payload or a new key on
+    one refuses here until it is adjudicated.
+    """
+    fn = _function(_parse(TOOL_BATCH), "run_tool_batch")
+    responses = {
+        kw.value.id
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and _call_name(node) == "_append_tool_outcome"
+        for kw in node.keywords
+        if kw.arg == "response" and isinstance(kw.value, ast.Name)
+    }
+    mappings: dict[str, tuple[str, ...]] = {}
+    for name in sorted(responses):
+        for rhs, _index, _annotation in _assignments_to(fn, name):
+            if not isinstance(rhs, ast.Dict):
+                continue  # a ToolResult-carrying local; its envelope is censused
+            keys = tuple(_key_of(key, {}, f"{_display(TOOL_BATCH)}:{name}") for key in rhs.keys if key is not None)
+            assert mappings.setdefault(name, keys) == keys, f"{name}: two dict literals with different keys"
+    assert mappings == _ADVISOR_ENVELOPE_PAYLOADS
 
 
 # The APPROVAL_REQUIRED proposal payload, in the order run_tool_batch authors it. ``success`` is
@@ -1346,6 +1655,89 @@ def test_approval_required_proposal_payload_ships_exactly_its_keys() -> None:
     assert "success" not in keys
     census = [row.key for row in _failure_data_sites() if row.site == f"{_display(TOOL_BATCH)}:{construction.lineno}"]
     assert census == [f"data.{key}" for key in _PROPOSAL_PAYLOAD_KEYS]
+
+
+# The status fields merged onto the PREVALIDATION_REJECTED payload, in the order run_tool_batch
+# authors them. ``success`` is absent for the same reason it is absent from the proposal payload,
+# and ``applied_version`` is gone because the result now carries the unapplied state on its
+# envelope (SYS-R3-3), leaving ``candidate_version`` as the only fact the envelope lacks.
+_PREVALIDATION_REJECTED_KEYS: tuple[str, ...] = ("status", "applied", "candidate_version", "message")
+
+
+def test_prevalidation_rejected_payload_ships_exactly_its_status_keys() -> None:
+    """Exact-key pin on the OTHER payload in ``run_tool_batch`` (red-team RED-R3-2, mutant G6).
+
+    The proposal payload eleven lines below was pinned; this one was not, and
+    ``"success": True`` added to its merge SURVIVED the envelope gate and a wide
+    kill search of 8665 tests. The census does enumerate the key — but
+    ``is_taught`` matches a quoted leaf anywhere in the skill, and the skill
+    quotes the ENVELOPE's ``success``, so the teaching gate reads the homonym as
+    taught. Only an exact pin on the site refuses it.
+
+    Closed the same way as the proposal payload: the merge argument is a call to
+    an owned TypedDict, so mypy refuses an extra, missing or mistyped key at the
+    constructor, and this pin holds the CALL's keyword order equal to the wire
+    order and to the class's own keys. Unlike the proposal payload the merge
+    result IS bound to a name (it is seeded from the candidate's own ``data``),
+    so the pin also asserts the seed is a bare re-wrap and that no store
+    re-shapes the local afterwards — the walker refusals that make those
+    readable are ``_failure_data_sites``' owner branch and ``_subscript_assign_keys``.
+    """
+    tree = _parse(TOOL_BATCH)
+    fn = _function(tree, "run_tool_batch")
+    site = f"{_display(TOOL_BATCH)}:{fn.lineno}"
+    payload_type = tool_batch._PrevalidationRejectedStatus
+    assert typing.is_typeddict(payload_type)
+    type_name = payload_type.__name__
+    constructions = [node for node in ast.walk(fn) if isinstance(node, ast.Call) and _call_name(node) == type_name]
+    assert len(constructions) == 1, f"{site}: expected exactly one {type_name}(...), got {len(constructions)}"
+    construction = constructions[0]
+    updates = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "update"
+        and node.args
+        and node.args[0] is construction
+    ]
+    assert len(updates) == 1, f"{site}: the {type_name}(...) call is not itself the argument of exactly one .update(...)"
+    assert _typed_keys(payload_type, "") == list(_PREVALIDATION_REJECTED_KEYS)
+    keys = list(_typed_call_keys(construction, TOOL_BATCH, "", f"{site}:{construction.lineno}"))
+    assert tuple(keys) == _PREVALIDATION_REJECTED_KEYS
+    assert "success" not in keys, "the envelope's own success already says the call failed"
+    assert "applied_version" not in keys, "the envelope's version IS the applied version once nothing is applied"
+    census = [row.key for row in _failure_data_sites() if row.site == f"{_display(TOOL_BATCH)}:{updates[0].lineno}"]
+    assert census == [f"data.{key}" for key in _PREVALIDATION_REJECTED_KEYS]
+    assert _dict_mutations(fn, _aliases_of(fn, "feedback_data"), frozenset()) == [(updates[0].lineno, ".update on feedback_data")], (
+        f"{site}: the pinned merge must be the ONLY mutation of the rejection payload or of any alias of it"
+    )
+
+
+def test_prevalidation_rejected_result_keeps_the_unapplied_state_on_its_envelope() -> None:
+    """The rejected result is built with ``updated_state=state``, not the candidate's.
+
+    The skill teaches ``version`` as "the state version after the call"; nothing
+    was applied, so it must be the pre-call state. Three sibling paths in the
+    same function already corrected for the candidate's state
+    (``_version_after``, the loop's post-dispatch state update, and
+    ``_append_tool_outcome``) — only the wire was left uncorrected, which is
+    what made the audit and the tool result disagree in one test (systems seat
+    SYS-R3-3). Read from the AST because what is pinned is that the replace()
+    passes the unapplied state at all: a behavioural assertion needs a candidate
+    whose version differs, which only the integration harness builds.
+    """
+    tree = _parse(TOOL_BATCH)
+    fn = _function(tree, "run_tool_batch")
+    replaces = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and _call_name(node) == "replace" and any(kw.arg == "data" for kw in node.keywords)
+    ]
+    assert len(replaces) == 1, "premise: run_tool_batch re-datas exactly one result"
+    updated = [kw.value for kw in replaces[0].keywords if kw.arg == "updated_state"]
+    assert len(updated) == 1, "the rejected result must state its envelope version, not inherit the candidate's"
+    assert isinstance(updated[0], ast.Name) and updated[0].id == "state"
 
 
 def test_is_taught_requires_the_quoted_form() -> None:

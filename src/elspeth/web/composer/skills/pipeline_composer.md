@@ -289,8 +289,10 @@ Two `status` values ride under `data` regardless of `success`.
 `APPROVAL_REQUIRED` (with `proposal_id`, `tool_name`, `summary`, `message`)
 means the change is a proposal awaiting human approval and nothing was
 applied: tell the user it awaits approval and stop. `PREVALIDATION_REJECTED`
-with `applied` false (`applied_version`, `candidate_version`, `message`)
-means the candidate was not applied: repair from `validation`.
+with `applied` false (`candidate_version`, `message`) means the candidate was
+not applied: repair from `validation`. The envelope's `version` is still the
+unapplied state; `candidate_version` is what the rejected candidate would
+have been.
 
 `graph_repair_suggestions` gives a ready repair for a duplicate consumer:
 `code`, `connection`, `strategy`, the `affected_consumers` (`id`,

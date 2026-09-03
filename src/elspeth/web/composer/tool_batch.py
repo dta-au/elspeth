@@ -181,6 +181,29 @@ class _ProposalPayload(TypedDict):
     message: str
 
 
+class _PrevalidationRejectedStatus(TypedDict):
+    """The status fields merged onto a PREVALIDATION_REJECTED payload, in wire order.
+
+    The payload itself is the candidate's own ``data`` (its ``error`` /
+    ``error_code``) plus these; they are merged through a TypedDict constructor
+    rather than a bare dict literal so mypy refuses an extra key at the merge —
+    a ``"success": True`` added here is the F1 twin returning eleven lines from
+    the payload that pins it out, and nothing in the tree killed that mutant
+    (red-team RED-R3-2, mutant G6).
+
+    No ``applied_version``. The result now carries the unapplied state on its
+    envelope, so the envelope's ``version`` IS the applied version and a second
+    copy under ``data`` would be a twin (systems seat SYS-R3-3).
+    ``candidate_version`` stays: it is the only carrier of a fact the envelope
+    does not have.
+    """
+
+    status: Literal["PREVALIDATION_REJECTED"]
+    applied: Literal[False]
+    candidate_version: int
+    message: str
+
+
 _MISSING_TOOL_CALL_FIELD = object()
 
 
@@ -1333,20 +1356,33 @@ async def run_tool_batch(
                             # _prevalidation_feedback_seed for the full contract.
                             feedback_data = dict(_prevalidation_feedback_seed(finalized_candidate_result.data))
                             feedback_data.update(
-                                {
-                                    "status": "PREVALIDATION_REJECTED",
-                                    "applied": False,
-                                    "applied_version": state.version,
-                                    "candidate_version": finalized_candidate_result.updated_state.version,
-                                    "message": (
+                                _PrevalidationRejectedStatus(
+                                    status="PREVALIDATION_REJECTED",
+                                    applied=False,
+                                    candidate_version=finalized_candidate_result.updated_state.version,
+                                    message=(
                                         "The candidate pipeline failed prevalidation, was not applied, and was not "
                                         "submitted for approval. Repair the reported validation errors and retry."
                                     ),
-                                }
+                                )
                             )
+                            # ``updated_state=state``: nothing was applied, so the
+                            # envelope's ``version`` — which the skill teaches as
+                            # "the state version after the call" — must be the
+                            # unapplied one. Keeping the candidate's state made the
+                            # wire say the mutation landed while the audit
+                            # (``_version_after``), the loop (which refuses the
+                            # candidate state) and ``_append_tool_outcome`` all
+                            # recorded that it had not (systems seat SYS-R3-3).
+                            # Contained to this result: it reaches only
+                            # ``_do_dispatch`` -> ``dispatch_with_audit`` ->
+                            # ``_serialize_tool_result`` / ``_append_tool_outcome``,
+                            # and ``pipeline_commit`` builds its own candidate from
+                            # the proposal rather than reading this one.
                             prevalidated_unapplied_result = replace(
                                 finalized_candidate_result,
                                 data=feedback_data,
+                                updated_state=state,
                             )
                             # Route the rejected result through canonical
                             # dispatch/outcome without proposal publication.
