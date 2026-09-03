@@ -1379,10 +1379,32 @@ async def run_tool_batch(
                             # ``_serialize_tool_result`` / ``_append_tool_outcome``,
                             # and ``pipeline_commit`` builds its own candidate from
                             # the proposal rather than reading this one.
+                            #
+                            # ``prior_validation=None`` and ``affected_nodes=()``
+                            # for the same reason: both describe CHANGES, and
+                            # nothing changed. ``to_dict`` emits
+                            # ``validation_delta`` only when ``prior_validation``
+                            # is set, and the delta it emitted was measurably
+                            # false — on a real compose loop it reported
+                            # ``resolved_errors`` naming the two errors the
+                            # unapplied state still had, next to a ``version``
+                            # saying nothing was applied, while the skill tells
+                            # the model to act on the delta and never re-read
+                            # state to check it (LLM seat LLM-R3B-1). The
+                            # candidate's own ``affected_nodes`` said the same
+                            # thing in the other direction: components touched by
+                            # a state that was discarded. ``validation`` stays the
+                            # candidate's — it is the rejection the model repairs
+                            # from, and the skill says whose it is. This is now
+                            # the APPROVAL_REQUIRED envelope's shape on the same
+                            # path: unapplied state, empty affected_nodes, no
+                            # delta.
                             prevalidated_unapplied_result = replace(
                                 finalized_candidate_result,
                                 data=feedback_data,
                                 updated_state=state,
+                                prior_validation=None,
+                                affected_nodes=(),
                             )
                             # Route the rejected result through canonical
                             # dispatch/outcome without proposal publication.

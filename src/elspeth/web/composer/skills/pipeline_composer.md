@@ -290,9 +290,11 @@ Two `status` values ride under `data` regardless of `success`.
 means the change is a proposal awaiting human approval and nothing was
 applied: tell the user it awaits approval and stop. `PREVALIDATION_REJECTED`
 with `applied` false (`candidate_version`, `message`) means the candidate was
-not applied: repair from `validation`. The envelope's `version` is still the
-unapplied state; `candidate_version` is what the rejected candidate would
-have been.
+not applied: repair from `validation`, which describes the rejected candidate,
+not the unchanged state the envelope's `version` names. Nothing changed, so
+`affected_nodes` is empty and there is no `validation_delta`;
+`candidate_version` is the version the candidate would have taken (equal to
+`version` when it failed before one was assigned).
 
 `graph_repair_suggestions` gives a ready repair for a duplicate consumer:
 `code`, `connection`, `strategy`, the `affected_consumers` (`id`,

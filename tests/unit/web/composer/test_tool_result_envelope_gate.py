@@ -1972,8 +1972,8 @@ def test_prevalidation_rejected_payload_ships_exactly_its_status_keys() -> None:
     )
 
 
-def test_prevalidation_rejected_result_keeps_the_unapplied_state_on_its_envelope() -> None:
-    """The rejected result is built with ``updated_state=state``, not the candidate's.
+def test_prevalidation_rejected_result_states_the_unapplied_envelope_on_every_field() -> None:
+    """The rejected result re-states EVERY envelope field that describes a change, not just the state.
 
     The skill teaches ``version`` as "the state version after the call"; nothing
     was applied, so it must be the pre-call state. Three sibling paths in the
@@ -1981,9 +1981,25 @@ def test_prevalidation_rejected_result_keeps_the_unapplied_state_on_its_envelope
     (``_version_after``, the loop's post-dispatch state update, and
     ``_append_tool_outcome``) — only the wire was left uncorrected, which is
     what made the audit and the tool result disagree in one test (systems seat
-    SYS-R3-3). Read from the AST because what is pinned is that the replace()
-    passes the unapplied state at all: a behavioural assertion needs a candidate
-    whose version differs, which only the integration harness builds.
+    SYS-R3-3).
+
+    ``updated_state`` alone was not enough, and fixing one of four fields is how
+    the second defect became legible: ``affected_nodes`` and
+    ``prior_validation`` still came from the discarded candidate, so the
+    envelope shipped a ``validation_delta`` whose ``resolved_errors`` named the
+    two errors the unapplied state still had — measured on a real compose loop,
+    next to a ``version`` saying nothing was applied, while the skill tells the
+    model to act on the delta and never re-read state to check it (LLM seat
+    LLM-R3B-1). Both are now restated: no delta (``to_dict`` emits it only when
+    ``prior_validation`` is set) and no touched components. ``validation`` is
+    the one field that stays the candidate's — it is the rejection the model
+    repairs from, and the skill says so.
+
+    Read from the AST because what is pinned is that the ``replace()`` passes
+    each of them at all; the resulting WIRE is pinned behaviourally by
+    ``tests/integration/web/composer/test_freeform_proposal_prevalidation.py::
+    test_final_profile_rejection_is_unapplied_audited_and_repairable``, which
+    needs a candidate whose version differs and only the harness builds one.
     """
     tree = _parse(TOOL_BATCH)
     fn = _function(tree, "run_tool_batch")
@@ -1993,9 +2009,18 @@ def test_prevalidation_rejected_result_keeps_the_unapplied_state_on_its_envelope
         if isinstance(node, ast.Call) and _call_name(node) == "replace" and any(kw.arg == "data" for kw in node.keywords)
     ]
     assert len(replaces) == 1, "premise: run_tool_batch re-datas exactly one result"
-    updated = [kw.value for kw in replaces[0].keywords if kw.arg == "updated_state"]
-    assert len(updated) == 1, "the rejected result must state its envelope version, not inherit the candidate's"
-    assert isinstance(updated[0], ast.Name) and updated[0].id == "state"
+    restated = {kw.arg: kw.value for kw in replaces[0].keywords}
+    assert set(restated) == {"data", "updated_state", "prior_validation", "affected_nodes"}, (
+        "the rejected result must restate every envelope field that describes a change, and nothing else"
+    )
+    updated = restated["updated_state"]
+    assert isinstance(updated, ast.Name) and updated.id == "state", "the envelope's version must be the unapplied state's"
+    prior = restated["prior_validation"]
+    assert isinstance(prior, ast.Constant) and prior.value is None, (
+        "a delta against a state nothing was applied to is a false report of change"
+    )
+    affected = restated["affected_nodes"]
+    assert isinstance(affected, ast.Tuple) and not affected.elts, "nothing was applied, so no component was touched"
 
 
 def test_is_taught_requires_the_quoted_form() -> None:
