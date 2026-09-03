@@ -21,11 +21,14 @@ such a name raised out of ``execute_tool`` as a model-triggerable 500.
 from __future__ import annotations
 
 import ast
+import re
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import MagicMock
+
+import pytest
 
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -51,6 +54,7 @@ from elspeth.web.composer.tools import sessions as sessions_tools
 from elspeth.web.composer.tools import sources as sources_tools
 from elspeth.web.composer.tools import transforms as transforms_tools
 from elspeth.web.composer.tools._common import ToolContext, build_plugin_schemas_for_failure
+from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.composer.tools.sources import _execute_set_source_from_blobs
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import (
@@ -321,7 +325,7 @@ class TestFailureSchemaAugmentationSetPipeline:
             assert schema["plugin_type"] == kind
             assert "json_schema" in schema
 
-    def test_set_pipeline_omitted_output_options_repair_hint_carries_the_sink_schema(self, tmp_path: Any) -> None:
+    def test_set_pipeline_omitted_output_options_repair_hint_carries_the_sink_schema_and_the_option_code(self, tmp_path: Any) -> None:
         """The omitted-options repair hint embeds the sink's option-shape rejection.
 
         ``set_pipeline`` wraps that rejection in ``_missing_output_options_repair_error``
@@ -330,6 +334,23 @@ class TestFailureSchemaAugmentationSetPipeline:
         see it. This is the wire pin for that one site: the sink was resolved
         before the hint was built, so the augmentation carries it exactly as
         the message-parsing consumer used to.
+
+        It is also the pin for the identity/code PAIRING (R8-refute2-2 residue
+        1). The site stamped ``plugin_identity`` but no ``error_code``, so the
+        schema rode on a codeless entry and ``validation_guidance`` resolved
+        nothing for a message that quotes ``Invalid options for sink '<p>'``
+        verbatim — the model was handed the contract and told to look up the
+        rejection with ``explain_validation_error`` it already had the code
+        for. Both keywords now ride the SAME ``out_prevalidation is not None``
+        predicate, which is what makes the pairing true rather than coincident.
+
+        NOT PROVEN HERE: the predicate's false arm (a collision-policy failure
+        on omitted options, which may claim neither the identity nor the code).
+        It is unreachable through this tool — every installed sink requires
+        ``schema``, so ``_prevalidate_sink(plugin, {})`` rejects for all nine
+        and ``out_prevalidation`` is never ``None`` at this site. Reachability
+        is a property of the plugin set, not of this code: a sink shipping with
+        all-optional options revives it, and this test is where its arm goes.
         """
         catalog = _make_catalog_with_schemas(
             source_schemas={"csv": _csv_schema()},
@@ -356,6 +377,19 @@ class TestFailureSchemaAugmentationSetPipeline:
         assert leading["message"].startswith("Output 'main': Missing options."), leading
         assert "Invalid options for sink 'json'" in leading["message"], leading
         assert payload["plugin_schemas"] == {"sink/json": catalog.get_schema("sink", "json").model_dump(mode="json")}
+        assert leading["error_code"] == "plugin_options_invalid", leading
+        assert payload["data"]["error_code"] == "plugin_options_invalid", payload["data"]
+        # The code is only worth stamping because a consumer resolves it: the
+        # guidance the planner's redacted repair turn gets is keyed BY code, so
+        # a codeless entry left this rejection with an empty ``codes`` map and
+        # the generic explain-tool pointer instead.
+        catalogued = explain_validation_code("plugin_options_invalid")
+        assert catalogued is not None, "plugin_options_invalid must resolve in the guidance catalogue"
+        explanation, suggested_fix = catalogued
+        guidance = payload["validation_guidance"]
+        assert list(guidance["codes"]) == ["plugin_options_invalid"], guidance
+        assert guidance["codes"]["plugin_options_invalid"] == {"explanation": explanation, "suggested_fix": suggested_fix}
+        assert "explain_tool" not in guidance, guidance
 
     def test_successful_set_pipeline_omits_plugin_schemas(self, tmp_path: Any) -> None:
         """A successful mutation must NOT carry the optional plugin_schemas field."""
@@ -689,6 +723,96 @@ class TestFailureSchemaAugmentationFailsClosed:
         assert leading["error_code"] == "plugin_options_invalid"
         assert payload["data"]["error_code"] == "plugin_options_invalid"
         assert payload["plugin_schemas"] == {"source/csv": _csv_schema().model_dump(mode="json")}
+
+
+class TestFailureSchemaAugmentationPropagatesAnomalies:
+    """A stamped identity the catalog cannot resolve is a Tier-1 anomaly that must RAISE.
+
+    ``build_plugin_schemas_for_failure``'s contract has two halves and they
+    point opposite ways. Absence fails closed (``plugin_identity=None``
+    attaches nothing, silently) because a missing stamp costs an enrichment
+    and nothing more. PRESENCE fails LOUD: ``_failure_result``'s contract is
+    "pass ``plugin_identity`` only for a plugin already resolved through the
+    request's policy view", so a stamped name ``catalog.get_schema`` then
+    refuses means a producer stamped a name it never resolved — the exact
+    class of defect the R8-fix1 ``patch_*`` sites had.
+
+    Silence would be worse than the raise on both counts. It would ship the
+    model a rejection with no schema and no signal, so the repair turn looks
+    identical to an unstamped one and the model burns a ``get_plugin_schema``
+    round-trip the augmentation exists to save. And it would erase the only
+    evidence that the resolve-before-stamp invariant broke: the AST tripwires
+    above see the SHAPE of a stamp, not whether the name is live, so a
+    swallowed raise leaves a policy-view bypass with no runtime witness
+    anywhere. Louder is cheaper — the raise names the plugin in a 500 the
+    operator sees, once, instead of a schema that quietly stops arriving.
+
+    Pins the mutant `wf/R8-refute2-mut-MF_builder_swallows_raise.log` found
+    (``try/except ValueError: continue`` around the lookup, 28 passed).
+    ``ValueError`` is the honest expectation, not an owned composer type:
+    ``CatalogService.get_schema`` documents ``ValueError`` in its protocol
+    and both implementations raise it bare (``PolicyCatalogView`` for a
+    plugin the request may not use, ``CatalogServiceImpl`` for one the
+    registry does not know). The builder re-raises whatever the boundary
+    threw rather than translating it, so translating here would pin a fiction.
+    """
+
+    def test_a_stamped_identity_the_catalog_refuses_propagates(self) -> None:
+        from elspeth.web.composer.state import ValidationEntry, ValidationSummary
+        from elspeth.web.composer.tools._common import ToolResult
+
+        sentinel = "sentinel-anomaly: unknown source plugin: csv"
+        catalog = _make_catalog_with_schemas(schema_error=ValueError(sentinel))
+        result = ToolResult(
+            success=False,
+            updated_state=_empty_state(),
+            validation=ValidationSummary(
+                is_valid=False,
+                errors=(
+                    ValidationEntry(
+                        component="rejected_mutation",
+                        message="Invalid options for source 'csv': path: Field required",
+                        severity="high",
+                        error_code="plugin_options_invalid",
+                        plugin_identity=("source", "csv"),
+                    ),
+                ),
+            ),
+            affected_nodes=(),
+        )
+
+        with pytest.raises(ValueError, match=re.escape(sentinel)):
+            build_plugin_schemas_for_failure(result, catalog)
+
+    def test_the_same_entry_without_the_stamp_attaches_nothing_instead(self) -> None:
+        """The twin direction, so the pin above cannot be read as "any lookup raises".
+
+        Same catalog, same message, no ``plugin_identity``: the builder never
+        reaches ``get_schema`` at all and returns ``None``. Absence is silent;
+        only a stamp the catalog refuses is loud.
+        """
+        from elspeth.web.composer.state import ValidationEntry, ValidationSummary
+        from elspeth.web.composer.tools._common import ToolResult
+
+        catalog = _make_catalog_with_schemas(schema_error=ValueError("must not be reached"))
+        result = ToolResult(
+            success=False,
+            updated_state=_empty_state(),
+            validation=ValidationSummary(
+                is_valid=False,
+                errors=(
+                    ValidationEntry(
+                        component="rejected_mutation",
+                        message="Invalid options for source 'csv': path: Field required",
+                        severity="high",
+                        error_code="plugin_options_invalid",
+                    ),
+                ),
+            ),
+            affected_nodes=(),
+        )
+
+        assert build_plugin_schemas_for_failure(result, catalog) is None
 
 
 def _assert_state_held_plugin_rejected_cleanly(result: Any, state: CompositionState, reason: PluginUnavailableReason) -> None:

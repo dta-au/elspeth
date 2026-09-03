@@ -1557,7 +1557,16 @@ def build_set_pipeline_candidate(
                         # above, so the schema augmentation carries it. A
                         # collision-policy failure is not an option-shape
                         # rejection and carries nothing.
+                        #
+                        # ``error_code`` rides the SAME predicate: every other
+                        # producer of the embedded rejection pairs the identity
+                        # with ``plugin_options_invalid``, and a codeless entry
+                        # here left ``validation_guidance`` unable to resolve
+                        # the very rejection the hint quotes. The collision arm
+                        # keeps the identity's ``None`` — that failure is not an
+                        # option-shape rejection, so it may claim neither.
                         plugin_identity=("sink", out_plugin) if out_prevalidation is not None else None,
+                        error_code="plugin_options_invalid" if out_prevalidation is not None else None,
                         rejected_component=output_ref,
                     )
                 )
