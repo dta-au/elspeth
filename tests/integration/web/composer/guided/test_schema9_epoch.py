@@ -26,8 +26,15 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # Session epoch 49 (elspeth-3e28029d2f): composition_rejection_events
     # table added — durable session-side rejection reasons (operator ruling
     # 2026-09-02: session data, not Landscape data).
-    assert SESSION_SCHEMA_EPOCH == 49
-    assert SQLITE_SCHEMA_EPOCH == 36
+    # Session epoch 50 / Landscape epoch 37 (elspeth-07cd19ba73, pluggable
+    # SSO): the auth provider discriminator widens from three values to five
+    # in both stores, and the identity substrate plus the workflow-governance
+    # tables land in session epoch 50. The two bump TOGETHER and cut over in
+    # one service-stop window, which is why this test pins them as a PAIR:
+    # a change that moved only one of them would be a deployment with two
+    # stores disagreeing about which release they belong to.
+    assert SESSION_SCHEMA_EPOCH == 50
+    assert SQLITE_SCHEMA_EPOCH == 37
 
 
 def test_epoch_40_session_store_fails_before_schema_use(tmp_path: Path) -> None:
