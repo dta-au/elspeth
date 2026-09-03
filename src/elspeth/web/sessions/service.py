@@ -135,6 +135,7 @@ from elspeth.web.sessions.locking import (
     sqlite_transaction_session_lock,
 )
 from elspeth.web.sessions.models import (
+    approvals_table,
     audit_access_log_table,
     blob_inline_resolutions_table,
     blobs_table,
@@ -147,7 +148,10 @@ from elspeth.web.sessions.models import (
     guided_operation_events_table,
     guided_operations_table,
     interpretation_events_table,
+    library_entries_table,
     proposal_events_table,
+    review_attestations_table,
+    review_requests_table,
     run_events_table,
     runs_table,
     sessions_table,
@@ -6401,6 +6405,36 @@ class SessionServiceImpl:
                             .limit(1)
                         ).first()
                         is not None
+                        # Workflow governance (epoch 50). Without these four,
+                        # a session whose ONLY history is an approval or an
+                        # attestation falls to the delete branch below, which
+                        # physically removes the row: audit-bearing history
+                        # discarded because the predicate had never heard of
+                        # it. The session FKs are RESTRICT, so the delete
+                        # would raise rather than silently succeed — but a
+                        # crash is not the behaviour archive should have, and
+                        # ``library_entries`` has no FK at all (its session
+                        # column is provenance), so for that one the
+                        # predicate is the ONLY protection.
+                        or conn.execute(select(approvals_table.c.approval_id).where(approvals_table.c.session_id == sid).limit(1)).first()
+                        is not None
+                        or conn.execute(
+                            select(review_requests_table.c.request_id).where(review_requests_table.c.session_id == sid).limit(1)
+                        ).first()
+                        is not None
+                        or conn.execute(
+                            select(review_attestations_table.c.attestation_id).where(review_attestations_table.c.session_id == sid).limit(1)
+                        ).first()
+                        is not None
+                        or conn.execute(
+                            select(library_entries_table.c.entry_id)
+                            .where(library_entries_table.c.published_from_session_id == sid)
+                            .limit(1)
+                        ).first()
+                        is not None
+                        # ``token_usage_ledger`` is deliberately NOT counted:
+                        # it is an accounting index, not audit truth, and its
+                        # session_id is nullable.
                     )
                     if durable_history_exists:
                         now = self._now()
