@@ -48,11 +48,13 @@ from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle
 from elspeth_lints.core.source_snapshot import observe_source_snapshot
 from elspeth_lints.core.tier_model_scan import (
     TargetCensus,
+    TargetCoverage,
     census_tree_targets,
     diagnosis_deferred_prefixes,
     plan_non_judge_rotations,
     routable_new_judgment_findings,
     scan_single_file_findings,
+    scan_tree_findings,
 )
 from elspeth_lints.rules.trust_tier.tier_model.rotate import (
     RotationPlan,
@@ -136,23 +138,36 @@ def verify_bundle_against_tree(
     diagnosis = diagnose_judge_signatures(root=root, allowlist_dir=allowlist_dir)
     index: dict[str, Any] = {item.key: item for item in diagnosis.items}
     allowlist = _load_tier_model_allowlist(allowlist_dir)
-    covered_keys = frozenset(entry.key for entry in allowlist.entries)
-    target_scan = census_tree_targets(
-        root=root,
-        covered_keys=covered_keys,
-        per_file_rules=allowlist.per_file_rules,
-    )
-    deferred_prefixes = diagnosis_deferred_prefixes(diagnosis.items)
+    raw_findings = tuple(scan_tree_findings(root=root))
 
     # Survey every non-judge-gated rotation even when the staged bundle omits
     # the lane. Remove findings already assigned to judge-gated diagnosis so a
     # mixed signed/pre-judge identity group is classified on its true residual
     # population rather than producing filtered-plan pollution.
     full_rotation_plan = plan_non_judge_rotations(
-        findings=target_scan.findings,
+        findings=raw_findings,
         allowlist=allowlist,
         diagnosis_items=diagnosis.items,
     )
+    # Coverage is exact at the canonical-key level: the live allowlist keys,
+    # the live keys diagnosis paired with a drifted signed entry, and the live
+    # keys a planned rotation will own. Each set is accounted separately so a
+    # covered fingerprint never covers a same-prefix peer.
+    target_coverage = TargetCoverage(
+        exact_keys=frozenset(entry.key for entry in allowlist.entries),
+        diagnosis_assigned_keys=frozenset(
+            item.repair_key for item in diagnosis.items if item.status in _SIGNABLE_DIAGNOSIS_STATUSES and item.repair_key is not None
+        ),
+        resign_assigned_keys=frozenset(rotation.new_key for rotation in full_rotation_plan.rotations),
+    )
+    target_scan = census_tree_targets(
+        root=root,
+        findings=raw_findings,
+        coverage=target_coverage,
+        per_file_rules=allowlist.per_file_rules,
+    )
+    deferred_prefixes = diagnosis_deferred_prefixes(diagnosis.items)
+
     for group in full_rotation_plan.ambiguous:
         mismatches.append(
             "target census found ambiguous non-judge target group "
@@ -202,7 +217,7 @@ def verify_bundle_against_tree(
                     action,
                     root=root,
                     live_findings_by_file=new_judgment_findings_by_file,
-                    covered_keys=covered_keys,
+                    covered_keys=target_coverage.exact_keys,
                     deferred_prefixes=deferred_prefixes,
                     per_file_rules=allowlist.per_file_rules,
                 )
