@@ -68,6 +68,11 @@ from elspeth.web.shareable_reviews.signer import InvalidToken, ShareTokenPayload
 
 _VALID_SIGNING_KEY = b"k" * 32
 
+# The owner's human-readable login name, deliberately DIFFERENT from the
+# ``session_record`` fixture's opaque ``user_id`` so a test that asserts on
+# attribution cannot pass by accident when the two are conflated.
+_OWNER_USERNAME = "alice-the-analyst"
+
 
 def _ready_readiness() -> ValidationReadiness:
     return ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[])
@@ -497,7 +502,7 @@ async def test_mark_ready_for_review_happy_path(
         validation=_ok_validation(),
         readiness=snapshot,
     )
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
     assert response.token
     assert response.payload_digest.startswith("sha256:")
     # Blob is in the payload store (hex digest without prefix).
@@ -543,7 +548,7 @@ async def test_mark_ready_for_review_passes_session_id_to_validation(
         validation=_ok_validation(),
         readiness=snapshot,
     )
-    await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
     assert execution_service.validate_state_session_ids == [session_record.id]
 
 
@@ -589,7 +594,7 @@ async def test_mark_ready_for_review_yaml_strips_blob_bound_source_storage_path(
         readiness=_readiness_snapshot(session_record.id),
     )
 
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
 
     payload = json.loads(payload_store.retrieve(response.payload_digest.removeprefix("sha256:")).decode("utf-8"))
     assert storage_path not in payload["yaml"]
@@ -729,7 +734,7 @@ async def test_share_snapshot_uses_one_recursive_public_projection(
         readiness=readiness,
     )
 
-    marked = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    marked = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
     stored = json.loads(payload_store.retrieve(marked.payload_digest.removeprefix("sha256:")))
     resolved = await service.resolve_token(token=marked.token, requesting_user_id="reviewer")
     representations = (
@@ -795,7 +800,7 @@ async def test_share_content_is_invariant_to_unrelated_owner_secret_inventory(
         validation=_ok_validation(),
         readiness=readiness_with_inventory_count(1),
     )
-    before_mark = await before.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    before_mark = await before.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
 
     after, *_ = _build_service(
         engine=session_engine_with_row,
@@ -806,7 +811,7 @@ async def test_share_content_is_invariant_to_unrelated_owner_secret_inventory(
         validation=_ok_validation(),
         readiness=readiness_with_inventory_count(9),
     )
-    after_mark = await after.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    after_mark = await after.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
 
     assert after_mark.payload_digest == before_mark.payload_digest
     assert payload_store.retrieve(after_mark.payload_digest.removeprefix("sha256:")) == payload_store.retrieve(
@@ -826,7 +831,7 @@ async def test_mark_ready_for_review_fails_validation(session_engine_with_row, p
         readiness=_readiness_snapshot(session_record.id),
     )
     with pytest.raises(CompositionNotRunnableError):
-        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
     # No audit row was written, no blob was stored.
     with session_engine_with_row.connect() as conn:
         rows = conn.execute(select(composer_completion_events_table)).all()
@@ -856,7 +861,7 @@ async def test_mark_ready_for_review_pending_review_gets_honest_reason(
         readiness=_readiness_snapshot(session_record.id),
     )
     with pytest.raises(CompositionNotRunnableError) as exc_info:
-        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
 
     assert exc_info.value.reason == "review_pending"
     assert "review" in exc_info.value.detail
@@ -886,7 +891,7 @@ async def test_mark_ready_for_review_genuine_failure_keeps_validation_failed(
         readiness=_readiness_snapshot(session_record.id),
     )
     with pytest.raises(CompositionNotRunnableError) as exc_info:
-        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
     assert exc_info.value.reason == "validation_failed"
 
 
@@ -919,7 +924,7 @@ async def test_mark_ready_for_review_rejects_completion_not_ready(
     )
 
     with pytest.raises(CompositionNotRunnableError) as exc_info:
-        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
 
     assert exc_info.value.reason == "completion_not_ready"
     assert store_calls == []
@@ -944,7 +949,7 @@ async def test_mark_ready_for_review_blocks_error_readiness_row(
         readiness=snapshot,
     )
     with pytest.raises(CompositionNotRunnableError):
-        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
 
 
 @pytest.mark.asyncio
@@ -962,7 +967,7 @@ async def test_mark_ready_for_review_allows_warning_readiness_row(
         validation=_ok_validation(),
         readiness=snapshot,
     )
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
     assert response.token
 
 
@@ -1006,7 +1011,7 @@ async def test_mark_ready_for_review_audit_first_ordering(
         conn.execute(text("DELETE FROM sessions WHERE id = :id"), {"id": str(session_record.id)})
 
     with pytest.raises(Exception):  # noqa: B017 — any IntegrityError variant fails the request
-        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
     # CRITICAL: no blob was written.
     assert store_calls == [], "audit insert must precede blob write — blob should not exist when audit fails"
 
@@ -1067,7 +1072,7 @@ async def test_get_shareable_link_rejects_state_drift_even_when_digest_matches(
         readiness=snapshot,
     )
 
-    await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
 
     drifted_state = replace(state_record, id=uuid4())
     session_service.current_state = drifted_state
@@ -1097,7 +1102,7 @@ async def test_get_shareable_link_requires_existing_mark_ready_blob(
         validation=_ok_validation(),
         readiness=snapshot,
     )
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
     payload_store.delete(response.payload_digest.removeprefix("sha256:"))
 
     with pytest.raises(CompositionNotRunnableError) as exc_info:
@@ -1128,7 +1133,7 @@ async def test_get_shareable_link_remints_with_stable_digest(
         validation=_ok_validation(),
         readiness=snapshot,
     )
-    marked = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    marked = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
     r1 = await service.get_shareable_link(session_id=session_record.id, user_id=session_record.user_id)
     r2 = await service.get_shareable_link(session_id=session_record.id, user_id=session_record.user_id)
     assert r1.payload_digest == marked.payload_digest
@@ -1196,7 +1201,7 @@ async def test_mark_ready_for_review_rejects_readiness_snapshot_drift(
     )
 
     with pytest.raises(CompositionNotRunnableError, match="composition changed"):
-        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
 
 
 @pytest.mark.asyncio
@@ -1218,7 +1223,7 @@ async def test_resolve_token_returns_frozen_snapshot(
         validation=_ok_validation(),
         readiness=mark_time_snapshot,
     )
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
     # Mutate the readiness fake so a re-fetch would return a different snapshot.
     later_snapshot = _readiness_snapshot(session_record.id, version=99)
     readiness_service.snapshot = later_snapshot
@@ -1330,6 +1335,89 @@ async def test_resolve_token_projects_legacy_signed_blob_without_mutating_eviden
 
 
 @pytest.mark.asyncio
+async def test_mark_ready_freezes_username_alongside_the_opaque_identity(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+):
+    """The snapshot carries BOTH attribution fields, and resolve surfaces both.
+
+    ``created_by_user_id`` is the opaque identity id the token signature
+    binds; it names nobody to a recipient who has no login. The username is
+    frozen next to it so the shared view can say who shared the pipeline.
+    """
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+    )
+    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
+
+    blob = json.loads(payload_store.retrieve(response.payload_digest.removeprefix("sha256:")))
+    assert blob["created_by_user_id"] == session_record.user_id
+    assert blob["created_by_username"] == _OWNER_USERNAME
+
+    resolved = await service.resolve_token(token=response.token, requesting_user_id="bob")
+    assert resolved.created_by_user_id == session_record.user_id
+    assert resolved.created_by_username == _OWNER_USERNAME
+
+
+@pytest.mark.asyncio
+async def test_resolve_token_reports_absent_username_for_pre_field_blob(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+):
+    """A snapshot minted before the username key resolves with ``None``.
+
+    The legacy blob here is the real producer's output with the key
+    removed, so it stays the exact shape an outstanding share artifact has.
+    Those bytes are signed and content-addressed: backfilling attribution
+    into them is not an option, so resolve reports the absence and the
+    frontend decides what to show.
+    """
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+    )
+    marked = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
+    blob = json.loads(payload_store.retrieve(marked.payload_digest.removeprefix("sha256:")))
+    del blob["created_by_username"]
+    legacy_hex = payload_store.store(canonical_json(blob).encode())
+    now = datetime.now(UTC)
+    legacy_token = signer.sign(
+        ShareTokenPayload(
+            version=1,
+            session_id=session_record.id,
+            state_id=state_record.id,
+            created_at=now,
+            expires_at=now + timedelta(days=1),
+            nonce_hex="ab" * 16,
+            payload_digest=f"sha256:{legacy_hex}",
+            created_by_user_id=session_record.user_id,
+        )
+    )
+
+    resolved = await service.resolve_token(token=legacy_token, requesting_user_id="bob")
+
+    assert resolved.created_by_username is None
+    assert resolved.created_by_user_id == session_record.user_id
+
+
+@pytest.mark.asyncio
 async def test_resolve_token_rejects_tampered_token(
     session_engine_with_row,
     payload_store,
@@ -1346,7 +1434,7 @@ async def test_resolve_token_rejects_tampered_token(
         validation=_ok_validation(),
         readiness=_readiness_snapshot(session_record.id),
     )
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
     tampered = response.token[:-2] + ("aa" if response.token[-2:] != "aa" else "bb")
     with pytest.raises(InvalidToken):
         await service.resolve_token(token=tampered, requesting_user_id="bob")
@@ -1372,7 +1460,7 @@ async def test_resolve_token_rejects_expired_token(
         readiness=snapshot,
     )
     service._settings.shareable_link_lifetime_seconds = -1  # type: ignore[attr-defined]
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
     with pytest.raises(InvalidToken, match="expired"):
         await service.resolve_token(token=response.token, requesting_user_id="bob")
 
@@ -1396,7 +1484,7 @@ async def test_resolve_token_blob_expired_raises_not_found(
         validation=_ok_validation(),
         readiness=snapshot,
     )
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
     # Delete the blob.
     digest_hex = response.payload_digest.removeprefix("sha256:")
     payload_store.delete(digest_hex)
@@ -1423,7 +1511,7 @@ async def test_resolve_token_does_not_call_readiness_service(
         validation=_ok_validation(),
         readiness=snapshot,
     )
-    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+    response = await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id, username=_OWNER_USERNAME)
     readiness_service.reset_counts()
     await service.resolve_token(token=response.token, requesting_user_id="bob")
     assert readiness_service.compute_snapshot_await_count == 0

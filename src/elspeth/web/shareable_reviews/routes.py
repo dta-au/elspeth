@@ -78,7 +78,15 @@ def create_shareable_reviews_router() -> APIRouter:
         await verify_session_ownership(session_id, user, request)
         service: ShareableReviewService = request.app.state.shareable_review_service
         try:
-            result = await service.mark_ready_for_review(session_id=session_id, user_id=user.user_id)
+            result = await service.mark_ready_for_review(
+                session_id=session_id,
+                user_id=user.user_id,
+                # The identity id is what everything downstream authorises and
+                # signs on; the username rides alongside purely so the shared
+                # view can name the sharer to a recipient who cannot resolve
+                # an opaque id.
+                username=user.username,
+            )
         except CompositionNotRunnableError as exc:
             # ``from exc``: preserves the server-side __context__ chain for
             # logs. Wire-facing ``detail`` is unaffected — only the internal

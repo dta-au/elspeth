@@ -114,7 +114,12 @@ the schema owner; the runtime role remains DML-only.
 
 Validate-only startup and doctor must leave stale databases unchanged. Do not
 use `create_all`, `--init-schema`, an old migrator, or code rollback as an improvised repair
-mechanism. `auth.db` is a separate file and is not reset.
+mechanism. `auth.db` is a separate file and is not reset. Credentials therefore
+survive this cutover — but from 0.8.0, access does not follow them. Admission
+moved into the recreated session DB, so every local account is refused at login
+until an operator activates it. Clearing that is
+[Every local account lands `pending` after this reset](#every-local-account-lands-pending-after-this-reset)
+below, and it belongs to this window rather than the morning after.
 
 The release/schema compatibility record for every candidate using this shape
 must state: candidate git SHA and immutable image/task-definition identity;
@@ -131,6 +136,142 @@ decisions.
 
 Deployments crossing the 0.7.0 boundary from an older release must also account
 for the historical epoch-21 to epoch-22 Landscape reset described below.
+
+### Every local account lands `pending` after this reset
+
+Recreating `sessions.db` recreates the new `identities` table with it, and
+`data/auth.db` is deliberately not touched — so on the far side of this cutover
+every pre-existing local account has a credential and no identity. Admission is
+a property of issuance in 0.8.0: `LocalAuthProvider` verifies the password,
+then resolves the identity row whose `identity_id` becomes the session token's
+`sub`, and `_build_local_auth_provider` creates that row `active` only when
+`registration_mode` is `open`. On a deployment running `closed` or
+`email_verified`, every returning user therefore authenticates with the correct
+password and is refused at issuance with HTTP 401 `Account is pending —
+awaiting administrator approval`. The account named by `dev_admin_user` is
+refused identically, and the dev-admin surface could not clear it even if it
+were reachable: it manages `auth.db` credentials, not identities.
+
+0.8.0 ships no activation route and no activation command — `elspeth composer
+users add` / `remove` write `auth.db`, and the bootstrap CLI the SSO design
+assumes for cohort re-admission belongs to a later phase. Until it lands, the
+operator clears the wall with direct SQL against the recreated session DB,
+inside the same window, before handing the deployment back. Do not reach for
+`registration_mode=open` as the shortcut: it admits every stranger who can
+reach the service for as long as it is set, which is the opposite of what a
+`closed` deployment is configured for.
+
+**Pre-provision the cohort before the users come back.** A pending row does
+not exist until an account's first login creates it, and only a *correct*
+credential gets that far — `_login_sync` refuses a bad password, and an
+unverified email, before reaching the admission wall. So the operator cannot
+activate a row that does not exist yet, and cannot make it exist without the
+user's password. Waiting for each person to hit a 401 first would mean handing
+the deployment back before the window can close.
+
+Insert the rows instead. `identities.pre_provisioned_at` exists for exactly
+this: an administrator may create an `active` row by `(provider, subject)`
+before anyone logs in, and that person's first login BINDS to it rather than
+creating a second identity. It needs only the usernames, which `auth.db`
+already has. Resolve `$DB_PATH` first — the assignment lives in the Procedure
+script below, so set it explicitly if you are running this section on its own:
+
+```bash
+DB_PATH="${ELSPETH_DATA_DIR:-data}/sessions.db"
+
+# The cohort to admit, read from the credential store that survived the reset.
+sqlite3 "${ELSPETH_DATA_DIR:-data}/auth.db" \
+  "SELECT user_id FROM users WHERE email_verified = 1 ORDER BY user_id;"
+
+# One statement per account. Repeat for each username from the list above.
+sqlite3 "$DB_PATH" "
+  INSERT INTO identities (identity_id, provider, kind, subject, username,
+                          first_seen_at, access_state, pre_provisioned_at, activated_at)
+  VALUES (lower(hex(randomblob(4))||'-'||hex(randomblob(2))||'-4'||substr(hex(randomblob(2)),2)
+          ||'-'||substr('89ab',abs(random())%4+1,1)||substr(hex(randomblob(2)),2)||'-'||hex(randomblob(6))),
+          'local', 'human', 'THE_USERNAME', 'THE_USERNAME',
+          datetime('now'), 'active', datetime('now'), datetime('now'));"
+```
+
+For the local provider the `subject` **is** the username, so both columns take
+the same value. The `identity_id` expression generates a v4 UUID, matching what
+`ensure_identity` writes; the column has no format constraint, but a value
+shaped like every other id is what makes the table readable later.
+`datetime('now')` is UTC at second precision, which the typed columns read back
+unchanged.
+
+**Mop-up, for anyone missed.** Someone left off the list meets the 401 and
+creates their own `pending` row. Activate those by name once they appear:
+
+```bash
+sqlite3 "$DB_PATH" \
+  "SELECT username, access_state, first_seen_at FROM identities WHERE provider = 'local' ORDER BY first_seen_at;"
+
+sqlite3 "$DB_PATH" \
+  "UPDATE identities SET access_state = 'active', activated_at = datetime('now')
+   WHERE provider = 'local' AND subject = 'THE_USERNAME' AND access_state = 'pending';"
+```
+
+Both predicates on that UPDATE are load-bearing. Without `access_state =
+'pending'` a recovery sweep resurrects any identity an administrator
+deliberately `disabled`; without the `subject` predicate the sweep admits
+everyone holding a pending row, which under `email_verified` includes anyone
+who self-registered and verified an address since the reset — exactly the
+population that mode exists to gate.
+
+Two consequences of activating this way, both of which the deploy record must
+carry because the audit trail cannot:
+
+- **No `identity_activated` event is written.** That event and its `quota_set`
+  partner are emitted by the admission callback inside `ensure_identity`, and
+  that callback runs only when `ensure_identity` CREATES an activated row. It
+  is unreachable for any row that already exists, whatever its state — a later
+  login on a still-`pending` row does not emit it either. The Landscape trail will
+  show these identities acting as admitted principals with no activating
+  actor — an admission with no activation event, which is precisely the shape
+  the normal path is built to make impossible. Record the operator, the window,
+  and the activated usernames in the deploy record.
+- **No `quota_policies` row is written.** Activation normally writes one from
+  the container defaults, but only when both `quota_default_tokens_per_day` and
+  `quota_default_storage_bytes` are configured. If this deployment configures
+  them, the identities activated by SQL will need those rows backfilled when
+  quota enforcement lands; nothing reads them in this phase.
+
+Verify by having one activated account log in again: the same credential now
+returns a token instead of the 401.
+
+### What the derived keys change across this boundary
+
+0.8.0 stops handing the operator's `secret_key` to three unrelated jobs raw.
+`src/elspeth/web/key_derivation.py` HKDF-derives one independent key per job,
+so a disclosure of one is no longer a disclosure of all three. Two of the three
+change a value that is compared against something already at rest, which is why
+this delivery is bound to a window that recreates the stores:
+
+- **`derive_session_token_key`** signs and verifies session tokens. Every token
+  minted before the cutover fails verification after it, and its `sub` carries
+  a username where the new code expects an `identity_id`, so every browser
+  session logs in again. That re-login is what surfaces the `pending` wall
+  above.
+- **`derive_user_secret_master_key`** is the master key `UserSecretStore`
+  stretches per secret. Rows written under the raw key cannot be decrypted
+  under the derived one. This confirms an outcome the reset already guarantees
+  rather than adding a hazard — `user_secrets` lives in the session DB being
+  recreated, and users re-enter their secrets either way.
+- **`derive_binding_generation_key`** tags plugin-binding evidence. The
+  fingerprint persisted in the Landscape `run_web_plugin_policy` table and
+  embedded in exported bundles takes a **different value for unchanged policy
+  state**, for two independent reasons: the HMAC key changed, and so did the
+  hashed payload, because `principal_scope` is `{provider}:{user_id}` and
+  `user_id` is now the opaque `identity_id` rather than the username. A
+  fingerprint compared across this boundary is therefore meaningless: a
+  difference is not evidence that a binding rotated, and a match would not be
+  evidence that nothing changed. Compare fingerprints only within one side of
+  the window, and treat a pre-cutover bundle as uninterpretable against a
+  post-cutover one.
+
+`shareable_link_signing_key` is deliberately not derived — it keeps its own
+independent Secrets Manager binding — and is unaffected by this boundary.
 
 ## Historical Cutover: 0.7.0 (two-DB reset)
 
@@ -464,10 +605,14 @@ For SQLite, `sessions.db`, `sessions.db-wal`, `sessions.db-shm`, and `sessions.d
 8. The operator has explicitly signed off on the `user_secrets` blast radius and
    has a documented re-entry/reseed procedure before users resume Composer work.
    **Any archive is a long-lived copy of live encrypted secret material and is
-   retained as evidence, not as a recovery database.** The `user_secrets` rows
-   are encrypted with `settings.secret_key`; if the key is reused, the archive
-   remains decryptable. Decide the key-rotation and archive-retention outcomes
-   up front and record them in the deploy plan.
+   retained as evidence, not as a recovery database.** From 0.8.0 the
+   `user_secrets` rows are encrypted under a key HKDF-derived from
+   `settings.secret_key` (`derive_user_secret_master_key`); rows in an archive
+   taken from an earlier store were encrypted under the raw key. Derivation
+   does not narrow the blast radius here — anyone holding `settings.secret_key`
+   can produce either key — so if the key is reused, the archive remains
+   decryptable exactly as before. Decide the key-rotation and archive-retention
+   outcomes up front and record them in the deploy plan.
 9. No other host-side process is writing the SQLite DB. The procedure stops `elspeth-web.service` and checks open handles before copying; if another process still has the main DB or a sidecar open, stop and identify it before continuing.
 
 ### Procedure
@@ -552,7 +697,8 @@ fi
 # Checkpoint the WAL into the main DB FIRST so the archive captures a
 # self-contained copy. The session DB also stores the encrypted
 # UserSecretStore (constructed on the session engine in app.py:
-# `UserSecretStore(session_engine, settings.secret_key)`), so the -wal
+# `UserSecretStore(session_engine,
+# derive_user_secret_master_key(settings.secret_key))`), so the -wal
 # sidecar can hold uncheckpointed encrypted secret material. Folding the
 # WAL into the main file means the long-lived archive does not depend on a
 # matched -wal/-shm sidecar set to be readable, and no secret rows are
@@ -641,9 +787,9 @@ B1 interpretation-surfacing fix is in the deployed build). Any of these in
 the journal means the deploy is not clean — stop and inspect before
 handing staging back to users.
 
-Before handing staging back to users, verify the `user_secrets` outcome the operator chose in the preconditions. Confirm the affected composer/provider flow reports the expected missing-secret state and that the operator has re-entered or reseeded any required staging secrets. Never reopen the predecessor archive in the current release.
+Before handing staging back to users, verify the `user_secrets` outcome the operator chose in the preconditions. Confirm the affected composer/provider flow reports the expected missing-secret state and that the operator has re-entered or reseeded any required staging secrets. Never reopen the predecessor archive in the current release. On the 0.8.0 cutover, also settle the identity lockout at this point: every local account is `pending` until an operator activates it, per [Every local account lands `pending` after this reset](#every-local-account-lands-pending-after-this-reset).
 
-At the **end of the deploy window**, destroy or secure the archive directories created above. Each is a long-lived copy of live encrypted secret material. It is only inert if `settings.secret_key` was **rotated** during this deploy; if the key was reused, the archive is decryptable with the running app's key, so an unattended snapshot directory is equivalent to leaving a readable copy of every staging secret on disk. If evidence retention requires keeping an archive, rotate `settings.secret_key` or move the archive to access-controlled storage.
+At the **end of the deploy window**, destroy or secure the archive directories created above. Each is a long-lived copy of live encrypted secret material. It is only inert if `settings.secret_key` was **rotated** during this deploy; if the key was reused, the archive is decryptable with the running app's key, so an unattended snapshot directory is equivalent to leaving a readable copy of every staging secret on disk. Deriving the encryption key from `settings.secret_key` rather than using it raw does not change that conclusion: the derivation is deterministic and unsalted, so holding `settings.secret_key` still yields the key the archived rows were written under. If evidence retention requires keeping an archive, rotate `settings.secret_key` or move the archive to access-controlled storage.
 
 ### Failed Cutover
 

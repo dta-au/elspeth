@@ -22,7 +22,9 @@ EPOCH BINDING
 -------------
 Two of the three derivations change a value that is compared against something
 already at rest, so both are bound to the epoch window where the stores are
-recreated (see the operator notice and ``docs/runbooks``):
+recreated. What an operator must do about that is
+"What the derived keys change across this boundary" in
+``docs/runbooks/staging-session-db-recreation.md``:
 
 * user-secret encryption -- every stored secret was encrypted under the raw
   key and cannot be decrypted under the derived one;

@@ -247,6 +247,16 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
   // null name.
   const pipelineName = response.pipeline_metadata.name ?? "Untitled pipeline";
   const pipelineDescription = response.pipeline_metadata.description ?? "";
+  // Attribution for the banner. `created_by_user_id` is an opaque identity
+  // id: a recipient of a share link has no login and no way to resolve it,
+  // so it names nobody. Prefer the username the backend froze into the
+  // snapshot at mark-time. Snapshots minted before that field existed are
+  // immutable signed blobs that cannot be backfilled — for those we fall
+  // back to the opaque id rather than dropping attribution entirely, so the
+  // reviewer still has an identifier to quote back to the sender. The
+  // fallback is self-limiting: share links expire, so pre-change snapshots
+  // age out on their own.
+  const sharedBy = response.created_by_username ?? response.created_by_user_id;
 
   return (
     <ReadOnlyProvider value={true}>
@@ -257,9 +267,14 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
         style={MAIN_STYLE}
       >
         <header>
-          <p className="shared-inspect-banner" role="status" style={BANNER_STYLE}>
+          <p
+            className="shared-inspect-banner"
+            role="status"
+            data-testid="shared-inspect-banner"
+            style={BANNER_STYLE}
+          >
             Read-only shared view. Shared by{" "}
-            <strong>{response.created_by_user_id}</strong> on{" "}
+            <strong data-testid="shared-inspect-shared-by">{sharedBy}</strong> on{" "}
             <time dateTime={response.created_at}>
               {new Date(response.created_at).toLocaleString()}
             </time>

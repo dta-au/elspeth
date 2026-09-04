@@ -196,9 +196,16 @@ class SharedInspectResponse(_StrictResponse):
     strict Pydantic mirrors of their respective dataclasses so producer/
     consumer drift fails at construction.
 
-    ``created_by_user_id`` is surfaced so the reviewer can see who shared
-    the pipeline. ``expires_at`` lets the frontend show "this link expires
-    in N days" without re-decoding the token.
+    Attribution comes in two fields. ``created_by_user_id`` is the opaque
+    identity id the token signature binds — stable, but meaningless to a
+    recipient who has no login. ``created_by_username`` is the sharer's
+    human-readable name, frozen into the snapshot at mark-time, and is
+    what the reviewer's banner shows. It is ``None`` for snapshots minted
+    before the field existed; those blobs are immutable signed bytes and
+    cannot be backfilled, so the frontend falls back to the opaque id.
+
+    ``expires_at`` lets the frontend show "this link expires in N days"
+    without re-decoding the token.
     """
 
     session_id: str
@@ -208,5 +215,8 @@ class SharedInspectResponse(_StrictResponse):
     yaml: str
     audit_readiness: AuditReadinessSnapshot
     created_by_user_id: str
+    # Required-but-nullable rather than defaulted: every producer must decide
+    # what attribution it has. Only the legacy-blob path may answer "none".
+    created_by_username: str | None
     created_at: datetime
     expires_at: datetime

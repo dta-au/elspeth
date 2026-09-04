@@ -228,8 +228,21 @@ def ensure_identity(
 
     Two costs are accepted deliberately:
 
-    * the sessions write lock is held across one Landscape write. It happens
-      once per identity, at first admission, never on a returning login.
+    * the GLOBAL sessions write lock is held across one Landscape write. Not
+      an identities-scoped lock: on SQLite ``engine.begin()`` is rewritten to
+      ``BEGIN IMMEDIATE``, so for the duration any unrelated sessions writer
+      (a composer save, a blob write, a preferences update) meets
+      ``SQLITE_BUSY``. The hold spans a Landscape engine construction, its
+      schema probe, and two INSERTs on a different file. It happens ONCE per
+      identity, at first admission, never on a returning login.
+
+      This ordering is load-bearing and must not be "optimised" by moving the
+      audit outside the transaction: the loser of an insert race would then
+      write an activation event for an identity that never existed, because
+      the Landscape write commits independently of the sessions rollback.
+      Shrinking the hold means making the Landscape open cheaper (reusing one
+      engine built at app-factory time), not resequencing it —
+      elspeth-9c171c00fa carries the measurement.
     * if the audit commits and THIS transaction then fails, Landscape carries
       an activation that did not take. That residual is chosen over its
       opposite: an over-recorded activation is a visible contradiction (an

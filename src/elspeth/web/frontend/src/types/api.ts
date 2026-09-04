@@ -227,7 +227,18 @@ export interface SharedInspectResponse {
   composition_snapshot: _CompositionState;
   yaml: string;
   audit_readiness: _AuditReadinessSnapshot;
+  /**
+   * Opaque identity id of the sharer — what the share token's signature
+   * binds. Not human-readable; do not render it as a name except as the
+   * legacy fallback described on `created_by_username`.
+   */
   created_by_user_id: string;
+  /**
+   * Human-readable name of the sharer, frozen into the snapshot at
+   * mark-time. `null` for snapshots minted before the backend carried it;
+   * those blobs are immutable signed bytes and cannot be backfilled.
+   */
+  created_by_username: string | null;
   created_at: string;
   expires_at: string;
 }
