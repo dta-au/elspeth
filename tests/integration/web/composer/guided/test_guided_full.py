@@ -54,6 +54,7 @@ from elspeth.web.sessions.routes.guided_operations import (
 )
 from elspeth.web.sessions.schemas import CompositionProposalResponse
 from elspeth.web.sessions.service import _composition_state_data_content_hash
+from tests.integration.web.composer.guided.test_respond import _assert_compose_context_for
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 
 
@@ -1611,8 +1612,11 @@ def test_guided_full_cancel_after_atomic_settlement_still_publishes_terminal_pro
     settlement_committed = asyncio.Event()
     release_settlement = asyncio.Event()
 
-    async def committed_then_paused(command):
-        result = await real_stage(command)
+    async def committed_then_paused(command, *, session_operation_context):
+        result = await real_stage(
+            command,
+            session_operation_context=_assert_compose_context_for(session_operation_context, session["id"]),
+        )
         settlement_committed.set()
         await release_settlement.wait()
         return result

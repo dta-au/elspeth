@@ -68,12 +68,13 @@ from tests.integration.web.composer.guided.test_respond import (
     TestStep2IntraStep as _Step2Journey,
 )
 from tests.integration.web.composer.guided.test_respond import (
-    _outputs_path as _respond_outputs_path,
-)
-from tests.integration.web.composer.guided.test_respond import (
+    _assert_compose_context_for,
     _post_current_response,
     _respond,
     _review_wiring,
+)
+from tests.integration.web.composer.guided.test_respond import (
+    _outputs_path as _respond_outputs_path,
 )
 from tests.integration.web.composer.guided.test_respond_schema8_atomic import _respond_operation_count
 from tests.integration.web.composer.guided.test_step_chat import (
@@ -2887,7 +2888,7 @@ def test_corrupt_origin_custody_is_an_integrity_failure_and_rolls_back_atomicall
     service = client.app.state.session_service
     real_settle = service.settle_guided_state_operation
 
-    async def corrupt_command(command, *, payload_store=None):
+    async def corrupt_command(command, *, payload_store=None, session_operation_context):
         metadata = deep_thaw(command.state.composer_meta)
         guided = GuidedSession.from_dict(metadata["guided_session"])
         (intent,) = guided.deferred_intents
@@ -2906,6 +2907,7 @@ def test_corrupt_origin_custody_is_an_integrity_failure_and_rolls_back_atomicall
         return await real_settle(
             replace(command, state=corrupted_state, originating_message=originating),
             payload_store=payload_store,
+            session_operation_context=_assert_compose_context_for(session_operation_context, target_session_id),
         )
 
     monkeypatch.setattr(service, "settle_guided_state_operation", corrupt_command)
