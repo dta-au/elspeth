@@ -132,7 +132,12 @@ from elspeth.web.secrets.user_store import UserSecretStore
 from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome, ensure_identity, read_identity
+from elspeth.web.sessions.identity_repository import (
+    EnsureIdentityOutcome,
+    ensure_identity,
+    read_identity,
+    retire_identity,
+)
 from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
     AuditAccessLogWriteError,
@@ -1029,18 +1034,25 @@ def _build_local_auth_provider(
         # An absent row is never an implicit grant.
         return record is not None and record.is_active
 
-    def _record_admission(identity_id: str, username: str) -> None:
+    def _record_admission(identity_id: str, username: str, quota_written: bool) -> None:
         # Runs INSIDE ensure_identity's transaction, so a failed audit rolls
         # the activation back rather than leaving an activated identity that
         # no later login will ever audit. The surrounding ``login`` event
         # carries the request context; this pair carries the authority
         # decision and joins to it by identity_id.
+        #
+        # The quota caps are passed ONLY when a policy row was written. A
+        # container may configure one default and not the other, in which case
+        # no row is created — and a quota_set event carrying a cap that no row
+        # records would tell an auditor an allowance was granted when none
+        # was, and point a later refusal at corruption rather than at the
+        # missing configuration.
         audit_recorder.record_identity_admitted(
             provider="local",
             identity_id=identity_id,
             username=username,
-            tokens_per_day=settings.quota_default_tokens_per_day,
-            storage_bytes=settings.quota_default_storage_bytes,
+            tokens_per_day=settings.quota_default_tokens_per_day if quota_written else None,
+            storage_bytes=settings.quota_default_storage_bytes if quota_written else None,
         )
 
     def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
@@ -1066,10 +1078,20 @@ def _build_local_auth_provider(
         max_refresh_chain_hours=DEFAULT_MAX_REFRESH_CHAIN_HOURS,
         principal_is_active=_principal_is_active,
     )
+
+    def _retire_identity(username: str) -> None:
+        retire_identity(
+            session_engine,
+            provider="local",
+            subject=username,
+            reason="local credential deleted",
+        )
+
     return LocalAuthProvider(
         db_path=settings.data_dir / "auth.db",
         token_issuer=issuer,
         admit_identity=_admit_identity,
+        retire_identity=_retire_identity,
     )
 
 

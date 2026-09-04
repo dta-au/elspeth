@@ -40,6 +40,12 @@ if TYPE_CHECKING:
 # ``sessions/ownership.py``).
 AdmitIdentity = Callable[[IdentityClaims], "EnsureIdentityOutcome"]
 
+# Retire the identity bound to a local username whose credential has been
+# deleted, so the next holder of that username cannot inherit its admission.
+# Injected for the same reason as AdmitIdentity: the write lands in the
+# SESSIONS store, which web.auth does not depend on.
+RetireIdentity = Callable[[str], None]
+
 _slog = structlog.get_logger(__name__)
 
 _EMAIL_VERIFICATION_TOKEN_BYTES = 32
@@ -261,6 +267,7 @@ class LocalAuthProvider:
         *,
         token_issuer: SessionTokenIssuer | None,
         admit_identity: AdmitIdentity | None,
+        retire_identity: RetireIdentity | None = None,
     ) -> None:
         """Bind the credential store to the token issuer and the identity substrate.
 
@@ -285,6 +292,7 @@ class LocalAuthProvider:
         self._db_path = db_path
         self._token_issuer = token_issuer
         self._admit_identity = admit_identity
+        self._retire_identity = retire_identity
         self._ensure_schema()
         with self._connect(immediate=True) as conn:
             now = int(time.time())
@@ -578,9 +586,32 @@ class LocalAuthProvider:
         return cleared.rowcount == 1
 
     def delete_user(self, user_id: str) -> bool:
-        """Delete a local auth user and any pending verification tokens."""
+        """Delete a local auth user, and retire the identity it was bound to.
+
+        Deleting the credential is not enough. ``identities`` is a separate
+        store keyed on ``(provider, subject)`` — for local auth, the username
+        — and ``ensure_identity`` never upgrades or downgrades an existing
+        row. So without the second step the next holder of a freed username
+        binds to the deleted user's identity and inherits their admission,
+        their quota row and every row FK'd to that identity_id.
+
+        The identity is retired rather than deleted (its history and its
+        foreign keys must survive) and its natural key is retired with it, so
+        a later registration of the same username gets a FRESH identity rather
+        than being permanently refused at the admission wall.
+
+        Order: credential first. A retired identity whose credential deletion
+        then failed would lock out a user who still has a password; a deleted
+        credential whose identity retirement failed leaves an unreachable
+        identity that the next registration would inherit — worse, but it is
+        the ordering that fails safe for the person who is still using the
+        account, and the retirement is retried by the next delete.
+        """
         with self._connect() as conn:
-            return self._delete_user_rows(conn, user_id)
+            deleted = self._delete_user_rows(conn, user_id)
+        if deleted and self._retire_identity is not None:
+            self._retire_identity(user_id)
+        return deleted
 
     def list_users(self) -> list[LocalUserAccount]:
         """List every local account, ordered by user_id."""

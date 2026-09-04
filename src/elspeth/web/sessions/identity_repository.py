@@ -36,6 +36,7 @@ from typing import Any, Final, cast, get_args
 
 from sqlalchemy import Row, select
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.auth import IdentityProviderType
 from elspeth.web.auth.models import IdentityClaims
@@ -70,6 +71,18 @@ class EnsureIdentityOutcome:
     record: IdentityRecord
     created: bool
     activated_now: bool
+    # Whether a quota_policies row was actually written. The container
+    # defaults are independently optional, so an activation can legitimately
+    # write none -- and an audit event claiming an allowance that no row
+    # records would tell an auditor the opposite of the truth.
+    quota_written: bool
+
+
+# Write the ``identity_activated`` + ``quota_set`` pair for a first admission.
+# Takes ``quota_written`` because the two facts must agree: a ``quota_set``
+# event for an activation that wrote no policy row asserts an allowance that
+# does not exist, which is worse than recording no allowance at all.
+RecordAdmission = Callable[[str, str, bool], None]
 
 
 class IdentityRowCorruptionError(RuntimeError):
@@ -178,14 +191,25 @@ def ensure_identity(
     activate: bool,
     quota_tokens_per_day: int | None,
     quota_storage_bytes: int | None,
-    record_admission: Callable[[str, str], None] | None = None,
+    record_admission: RecordAdmission | None = None,
 ) -> EnsureIdentityOutcome:
     """Resolve ``(provider, subject)`` to its identity row, creating it once.
 
-    Runs as ONE write transaction. The select-then-insert is safe under
-    concurrency because ``uq_identities_provider_subject`` is the arbiter: two
-    simultaneous first logins cannot both insert, and the loser re-reads the
-    winner's row rather than creating a second identity for one person.
+    Runs as ONE write transaction, with an explicit loser path.
+    ``uq_identities_provider_subject`` is the arbiter: two simultaneous first
+    logins cannot both insert, and the loser CATCHES the resulting
+    ``IntegrityError``, re-reads the winner's row, and binds to it rather than
+    creating a second identity for one person.
+
+    That handler is not decoration. Without it the loser's exception is not an
+    ``AuthenticationError``, so the login route does not catch it and the
+    request becomes a 500 with no ``login`` row and no failure row -- the
+    attempt vanishes from the audit trail entirely. On the registration paths
+    the same raise would leave a committed credential with no identity. The
+    race is reachable on any dialect from a double-submitted login form, a
+    client retry after a slow bcrypt hash, or two browser tabs; it is merely
+    likelier on PostgreSQL, where concurrent writers are not serialised by a
+    single database-level write lock.
 
     A pre-provisioned row is BOUND, not replaced -- an administrator who
     admitted a cohort by ``(provider, subject)`` before anyone logged in has
@@ -214,6 +238,63 @@ def ensure_identity(
       silently short is worth less than one that can be provably wrong.
     """
     now = datetime.now(UTC)
+    try:
+        return _ensure_identity_once(
+            engine,
+            claims=claims,
+            activate=activate,
+            quota_tokens_per_day=quota_tokens_per_day,
+            quota_storage_bytes=quota_storage_bytes,
+            record_admission=record_admission,
+            now=now,
+        )
+    except IntegrityError:
+        # WE LOST THE RACE. Our transaction is fully rolled back, so if a row
+        # for this natural key exists now, another login inserted it while we
+        # were between the SELECT and the INSERT. Bind to their row.
+        #
+        # Deliberately NOT a blind retry: if no row exists, the violation came
+        # from something else (the quota partial unique, a foreign key) and
+        # swallowing it would turn a real defect into a confusing second
+        # error. Re-raise in that case.
+        winner = read_identity_by_natural_key(engine, provider=claims.provider, subject=claims.subject)
+        if winner is None:
+            raise
+
+        with engine.begin() as conn:
+            conn.execute(
+                identities_table.update()
+                .where(identities_table.c.identity_id == winner.identity_id)
+                .values(last_login_at=now, username=claims.username)
+            )
+        # ``activated_now`` is False and ``record_admission`` does NOT fire:
+        # the winner already wrote the activation pair, and a second one would
+        # claim an administrator acted twice.
+        return EnsureIdentityOutcome(
+            record=IdentityRecord(
+                identity_id=winner.identity_id,
+                provider=winner.provider,
+                subject=winner.subject,
+                username=claims.username,
+                access_state=winner.access_state,
+            ),
+            created=False,
+            activated_now=False,
+            quota_written=False,
+        )
+
+
+def _ensure_identity_once(
+    engine: Engine,
+    *,
+    claims: IdentityClaims,
+    activate: bool,
+    quota_tokens_per_day: int | None,
+    quota_storage_bytes: int | None,
+    record_admission: RecordAdmission | None,
+    now: datetime,
+) -> EnsureIdentityOutcome:
+    """One attempt. Raises ``IntegrityError`` when another writer wins."""
     with engine.begin() as conn:
         existing = _select_by_natural_key(conn, provider=claims.provider, subject=claims.subject)
 
@@ -259,6 +340,7 @@ def ensure_identity(
             # container that has already admitted people therefore needs a
             # backfill; that belongs with the enforcement, which reads these
             # rows and does not exist yet.
+            quota_written = False
             if activate and quota_tokens_per_day is not None and quota_storage_bytes is not None:
                 _write_default_quota_policy(
                     conn,
@@ -267,10 +349,13 @@ def ensure_identity(
                     tokens_per_day=quota_tokens_per_day,
                     storage_bytes=quota_storage_bytes,
                 )
+                quota_written = True
             if activate and record_admission is not None:
                 # Raises on audit failure, which rolls this transaction back
                 # and leaves no activated-but-unaudited identity behind.
-                record_admission(identity_id, claims.username)
+                # ``quota_written`` travels with it so the audit can only
+                # claim an allowance that a row actually records.
+                record_admission(identity_id, claims.username, quota_written)
             record = IdentityRecord(
                 identity_id=identity_id,
                 provider=claims.provider,
@@ -278,7 +363,12 @@ def ensure_identity(
                 username=claims.username,
                 access_state=access_state,
             )
-            return EnsureIdentityOutcome(record=record, created=True, activated_now=activate)
+            return EnsureIdentityOutcome(
+                record=record,
+                created=True,
+                activated_now=activate,
+                quota_written=quota_written,
+            )
 
         conn.execute(
             identities_table.update()
@@ -295,7 +385,14 @@ def ensure_identity(
             ),
             created=False,
             activated_now=False,
+            quota_written=False,
         )
+
+
+def read_identity_by_natural_key(engine: Engine, *, provider: str, subject: str) -> IdentityRecord | None:
+    """Read one identity by ``(provider, subject)`` on its own connection."""
+    with engine.connect() as conn:
+        return _select_by_natural_key(conn, provider=provider, subject=subject)
 
 
 def read_identity(engine: Engine, identity_id: str) -> IdentityRecord | None:
@@ -308,3 +405,60 @@ def read_identity(engine: Engine, identity_id: str) -> IdentityRecord | None:
     with engine.connect() as conn:
         row = conn.execute(select(*_IDENTITY_COLUMNS).where(identities_table.c.identity_id == identity_id)).first()
     return None if row is None else _row_to_record(row)
+
+
+def retire_identity(engine: Engine, *, provider: str, subject: str, reason: str) -> IdentityRecord | None:
+    """Retire the identity behind a credential that has been deleted.
+
+    Returns the retired record, or ``None`` when there was no identity (the
+    account never logged in, so no row was ever created).
+
+    THE ROW IS NOT DELETED, and cannot be: every ownership foreign key to
+    ``identities.identity_id`` is ``ondelete='RESTRICT'``, and an activated
+    identity already owns a ``quota_policies`` row, so a delete would raise.
+    More importantly the row is the anchor for that person's audit history,
+    which must outlive their account.
+
+    TWO THINGS HAPPEN, and the second is the one that matters. The row is
+    disabled, and its ``(provider, subject)`` binding is RETIRED by rewriting
+    the subject to a form no login can produce.
+
+    Disabling alone would be a trap. ``ensure_identity`` binds by
+    ``(provider, subject)`` and never upgrades an existing row, so the next
+    holder of a freed username would bind to the disabled identity and be
+    refused at the admission wall -- with no activation route in this phase to
+    clear it, which turns "delete a user" into "burn that username forever".
+    Retiring the binding instead means a later registration of the same
+    username creates a FRESH identity, while the old one keeps its history,
+    its grants and its quota row under a subject that can never be reached
+    again.
+
+    Scoped to LOCAL credential deletion. Rewriting the subject of an SSO
+    identity would falsify what the IdP called that person; for those, the
+    identity outlives the session and there is no credential to delete here.
+    """
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        existing = _select_by_natural_key(conn, provider=provider, subject=subject)
+        if existing is None:
+            return None
+        # The identity_id makes the retired subject unique, so retiring the
+        # same username twice cannot collide on the natural-key unique.
+        retired_subject = f"{subject}#retired-{existing.identity_id}"
+        conn.execute(
+            identities_table.update()
+            .where(identities_table.c.identity_id == existing.identity_id)
+            .values(
+                subject=retired_subject,
+                access_state="disabled",
+                disabled_at=now,
+                disable_reason=reason,
+            )
+        )
+    return IdentityRecord(
+        identity_id=existing.identity_id,
+        provider=existing.provider,
+        subject=retired_subject,
+        username=existing.username,
+        access_state="disabled",
+    )

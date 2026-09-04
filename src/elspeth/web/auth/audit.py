@@ -405,6 +405,15 @@ class AuthAuditRecorder:
                 user_agent=None,
                 metadata={"activated_by": "registration_mode", "actor": "operator"},
             )
+            if tokens_per_day is None or storage_bytes is None:
+                # NO quota_set row. The caller writes a policy row only when
+                # BOTH container defaults are configured, so this container
+                # has no quota regime for the identity and there is no
+                # allowance to record. Emitting the event anyway would assert
+                # an allowance no row records, and point a later quota refusal
+                # at corruption rather than at the missing configuration —
+                # exactly backwards for whoever has to diagnose it.
+                return
             recorder.record_auth_event(
                 event_type="quota_set",
                 outcome="success",
