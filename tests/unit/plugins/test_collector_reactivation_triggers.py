@@ -16,6 +16,7 @@ ticket and build the arm the finding describes.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import cast
 
 from elspeth.contracts.enums import Determinism
 from elspeth.core.secrets import SECRET_FIELD_NAMES, SECRET_FIELD_SUFFIXES
@@ -26,13 +27,16 @@ from elspeth.plugins.infrastructure.manager import PluginManager
 def _builtin_transforms() -> tuple[type[BaseTransform], ...]:
     manager = PluginManager()
     manager.register_builtin_plugins()
-    transforms: list[type[BaseTransform]] = []
-    for transform in manager.get_transforms():
-        # Fail loudly rather than skip: a registered transform outside the
-        # BaseTransform hierarchy would be invisible to both tripwires.
-        assert issubclass(transform, BaseTransform), f"{transform!r} is not a BaseTransform"
-        transforms.append(transform)
-    return tuple(transforms)
+    registered = tuple(manager.get_transforms())
+    # Fail loudly rather than skip: a registered transform outside the
+    # BaseTransform hierarchy would be invisible to both tripwires. mypy
+    # treats TransformProtocol and BaseTransform as disjoint (structural vs
+    # nominal), so the narrowing is a runtime MRO check plus one explicit
+    # cast at this boundary rather than an issubclass() it would call
+    # unreachable.
+    foreign = [transform for transform in registered if BaseTransform not in transform.__mro__]
+    assert foreign == [], f"registered transforms outside BaseTransform: {foreign!r}"
+    return cast(tuple[type[BaseTransform], ...], registered)
 
 
 def input_semantic_requirement_overriders(transforms: Iterable[type[BaseTransform]]) -> tuple[type[BaseTransform], ...]:
