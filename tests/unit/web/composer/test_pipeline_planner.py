@@ -7686,6 +7686,29 @@ def test_schema_contract_detail_withholding_follows_the_participants_not_the_ent
     )
     assert "contract" not in into_reviewed_sink["validation"]["errors"][0]
 
+    # THE THIRD ROUTE. An entry whose subject cannot be attributed
+    # (``rejected_mutation`` with no ``rejected_component``) makes
+    # ``_entry_component_ref`` return None, and ``config = ref is None or ...``
+    # then fails CLOSED while the finalizer owns anything. Withholding has
+    # three routes, not one: the entry's own component is config-owned, a
+    # participant is config-owned, or the subject is unattributable. A fix
+    # aimed only at the reviewed-source case leaves the other two live (peer
+    # finding on elspeth-aad0394b95, 2026-09-04).
+    #
+    # REDUNDANT FOR DETECTION, kept for the matrix. Measured: mutating
+    # ``_entry_component_ref`` to never return None fails this assertion, but
+    # ALSO fails ``test_violated_plugin_contract_is_withheld_for_a_config_owned_component``
+    # and ``test_rejection_subject_is_read_structurally_never_parsed_from_the_message``
+    # with this test deselected. Those two are the guards; this line exists so
+    # the three routes read as one matrix. Stated because the first version of
+    # this test claimed coverage it did not add, and the same claim was nearly
+    # made again here.
+    unattributable = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=_summary("llm_1", "field_mapper_1", "rejected_mutation"))),
+        finalizer_owned=guided_binder_owns_reviewed_ends,
+    )
+    assert "contract" not in unattributable["validation"]["errors"][0]
+
     # Freeform baseline: no finalizer ownership, nothing to withhold against.
     freeform = _allowlisted_candidate_feedback(
         cast(Any, SimpleNamespace(validation=_summary("llm_1", "field_mapper_1", "node:field_mapper_1"))),
