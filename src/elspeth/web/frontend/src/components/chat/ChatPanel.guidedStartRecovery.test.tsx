@@ -66,6 +66,7 @@ const guidedSession: GuidedSession = {
   terminal: null,
   chat_history: [],
   chat_turn_seq: 0,
+  reviewed_components: { sources: [], outputs: [] },
   profile: null,
 };
 const completedResponse: GetGuidedResponse = {

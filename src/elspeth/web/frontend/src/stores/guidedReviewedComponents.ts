@@ -1,34 +1,30 @@
 // src/stores/guidedReviewedComponents.ts
 //
-// Reviewed-components ledger for the guided build (elspeth-9f0873426a, IA-1).
+// Reviewed-components ledger for the guided build (elspeth-9f0873426a IA-1,
+// server-projected by elspeth-f2a8550b3d).
 //
-// The guided wire carries the CURRENT turn only, and the pre-commit
-// composition state is empty by design until Confirm wiring. Between the
-// moment the learner finishes reviewing the source (step 1) and the moment a
-// proposal arrives (step 3) nothing on the wire names the components already
-// agreed — GuidedSession.history holds payload hashes and prose summaries.
-// This ledger is the frontend's only memory of them: it folds every
-// review_components turn as it is published, so the right-pane graph can draw
-// the reviewed source (and later the reviewed output) while the learner is
-// still deciding. It is server-derived display data — nothing here reads
-// source rows (epic elspeth-e7757e5c58 D1) and nothing here authors structure
-// (AGENTS.md composer invariant 1): a reviewed component is drawn as a lone
-// node, never joined by an edge the planner has not proposed.
+// WHAT CHANGED: this module used to FOLD the ledger client-side, replacing a
+// kind wholesale every time a `review_components` turn was published. That
+// fold was the frontend's only memory of the settled components, and it was
+// reconstructed rather than authoritative — the guided wire carried the
+// CURRENT turn only, so a browser reload mid-step-2 started the ledger empty,
+// and a completed session (whose `next_turn` is `null`) could never have one
+// at all. The graduation view selects exactly such a session.
 //
-// Semantics are deliberately narrow: a review turn REPLACES the kind it
-// reviews wholesale (the turn's `items` is the server's complete current list
-// for that kind), leaves the other kind alone, and every other turn is an
-// identity fold. The ledger resets with the rest of the guided context on
-// session navigation (sessionStore clearedGuidedState). Known limit: a
-// browser reload mid-step-2 starts the ledger empty, so the source is drawn
-// again only once the proposal names it.
+// The server now projects `guided_session.reviewed_components` on every
+// guided response, so this module holds no derivation of its own: it reads
+// the wire field, and that field is the one authority for "what has been
+// settled so far". The fold is gone rather than kept beside it — two
+// derivations of one fact is how the stale-ledger bug arose.
+//
+// The ledger stays display data: nothing here reads source rows (epic
+// elspeth-e7757e5c58 D1) and nothing here authors structure (AGENTS.md
+// composer invariant 1) — the right-pane graph draws a reviewed component as
+// a lone node, never joined by an edge the planner has not proposed.
 
-import type { ComponentReviewItem, TurnPayload } from "@/types/guided";
+import type { GuidedReviewedComponents, GuidedSession } from "@/types/guided";
 
-export interface GuidedReviewedComponents {
-  readonly sources: readonly ComponentReviewItem[];
-  readonly outputs: readonly ComponentReviewItem[];
-}
+export type { GuidedReviewedComponents } from "@/types/guided";
 
 export const EMPTY_GUIDED_REVIEWED_COMPONENTS: GuidedReviewedComponents = {
   sources: [],
@@ -36,20 +32,15 @@ export const EMPTY_GUIDED_REVIEWED_COMPONENTS: GuidedReviewedComponents = {
 };
 
 /**
- * Fold one published turn into the ledger. Returns the SAME ledger object for
- * every non-review turn (and for no turn) so store subscribers keyed on
- * reference equality do not re-render.
+ * The ledger the server projected for this session, or the empty ledger when
+ * there is no guided session in the store (freeform, or before the first
+ * fetch). Returns the wire object itself — a stable reference for the life of
+ * the published session — and the module-level empty constant otherwise, so
+ * store subscribers keyed on reference equality do not re-render.
  */
-export function foldGuidedReviewedComponents(
-  ledger: GuidedReviewedComponents,
-  turn: TurnPayload | null,
+export function selectGuidedReviewedComponents(
+  session: GuidedSession | null,
 ): GuidedReviewedComponents {
-  if (turn === null || turn.type !== "review_components") return ledger;
-  const { component_kind, items } = turn.payload;
-  switch (component_kind) {
-    case "source":
-      return { sources: items, outputs: ledger.outputs };
-    case "output":
-      return { sources: ledger.sources, outputs: items };
-  }
+  if (session === null) return EMPTY_GUIDED_REVIEWED_COMPONENTS;
+  return session.reviewed_components;
 }

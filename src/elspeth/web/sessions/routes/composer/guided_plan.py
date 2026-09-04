@@ -72,6 +72,7 @@ from ..guided_operations import (
     raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
+from .guided_proposal_rebase import carried_pending_proposal_rebase
 from .pipeline_settlement import (
     _GUIDED_ATOMIC_SETTLEMENT_COMPLETED,
     _GUIDED_ATOMIC_SETTLEMENT_FAILURE,
@@ -324,12 +325,20 @@ async def post_guided_plan(
             proposal_id=result.proposal_id,
             reviewed_facts={},
         )
+        # The replay locator names the checkpoint this operation STAGED at,
+        # so it binds to ``proposal.base`` — the immutable reviewed identity
+        # hashed into ``draft_hash``. The row's ``base_state_id`` is NOT
+        # compared here any more: it tracks the proposal's lifecycle-managed
+        # ANCHOR, which a later guided settlement legally moves forward when
+        # it carries the still-pending proposal across a new checkpoint
+        # (elspeth-ed67eb9d0d). The restore already binds the row column to
+        # that derived anchor, and replaying this operation afterwards must
+        # still verify against what the operation actually did.
         if (
             authority.proposal.surface is not PlannerSurface.GUIDED_FULL
             or type(authority.proposal.base) is not PresentBase
             or authority.proposal.base.state_id != result.checkpoint_state_id
             or authority.proposal.base.composition_content_hash != composition_content_hash(_state_from_record(checkpoint))
-            or authority.row.base_state_id != result.checkpoint_state_id
             or authority.row.user_message_id is None
         ):
             raise AuditIntegrityError("guided-full replay authority differs from its operation locator")
@@ -453,6 +462,19 @@ async def post_guided_plan(
             # GuidedOperationFailureCode (mirrors the freeform surface's
             # identical PlannerDeclined handling in ComposerServiceImpl).
             decline_text = outcome.decline_text.strip() or _EMPTY_DECLINE_FALLBACK
+            # The checkpoint above copies ``observed_record.composer_meta``
+            # verbatim, so a guided walk holding a pending proposal carries
+            # that proposal across this settlement. Its anchor has to follow
+            # the row being written or every later currency check names a
+            # checkpoint that is no longer current — the same permanent brick
+            # elspeth-ed67eb9d0d fixed on the guided RESPOND and CHAT paths,
+            # reachable here through the same session.
+            decline_rebase = carried_pending_proposal_rebase(
+                observed_state.guided_session,
+                from_state_id=(observed_record.id if observed_record is not None else None),
+                base_composition_content_hash=(composition_content_hash(observed_state) if observed_record is not None else None),
+                reason="guided_full_declined",
+            )
             async with compose_lock:
                 renewed_fence = await service.renew_guided_operation(
                     fence,
@@ -477,6 +499,7 @@ async def post_guided_plan(
                                 planner_attempts=recorder.planner_attempts,
                                 chat_turns=recorder.chat_turns,
                             ),
+                            rebased_pending_proposal=decline_rebase,
                         )
                     )
                 )

@@ -56,6 +56,7 @@ METADATA_DIR="$SCRIPT_DIR/control-pack"
 DOCUMENTS=(
     "programme|2026-09-03-work-packages.md|programme.yaml"
     "raid-register|2026-09-03-implementation-raid-register.md|raid-register.yaml"
+    "prd|elspeth-prd.md|prd.yaml"
 )
 
 doc_key()      { echo "${1%%|*}"; }

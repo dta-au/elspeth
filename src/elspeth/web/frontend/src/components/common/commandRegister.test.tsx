@@ -83,6 +83,7 @@ const exitedGuidedSession: GuidedSession = {
   },
   chat_history: [],
   chat_turn_seq: 0,
+  reviewed_components: { sources: [], outputs: [] },
   profile: null,
 };
 

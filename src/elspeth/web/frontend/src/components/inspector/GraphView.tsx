@@ -840,9 +840,12 @@ export function GraphView() {
   const selectedNodeId = useSessionStore((s) => s.selectedNodeId);
   const selectNode = useSessionStore((s) => s.selectNode);
   // Guided pre-commit projection (elspeth-9f0873426a, IA-1 / V-1): what the
-  // learner has reviewed or is being asked to approve, drawn from the guided
-  // turn payloads already in the store. Both selectors return stable
-  // references (the ledger fold is identity for non-review turns).
+  // learner has reviewed or is being asked to approve. The pending decision
+  // comes from the guided turn payload; the reviewed ledger is the SERVER's
+  // projection (elspeth-f2a8550b3d), published on `guided_session` and read
+  // through `selectGuidedReviewedComponents` — not folded from turns, so a
+  // reload mid-build still draws the confirmed components. Both selectors
+  // return stable references (the ledger is the wire object itself).
   const guidedNextTurn = useSessionStore((s) => s.guidedNextTurn);
   const guidedReviewedComponents = useSessionStore(
     (s) => s.guidedReviewedComponents,

@@ -62,6 +62,7 @@ from elspeth.web.composer.pipeline_proposal import (
     PipelineProposal,
     PlannerSurface,
     PresentBase,
+    ProposalBase,
     composition_content_hash,
     is_owned_composition_state_authority,
     owned_composition_state_review_arguments,
@@ -162,6 +163,7 @@ from elspeth.web.sessions.protocol import (
     GUIDED_FAILURE_AUDIT_LINEAGE_KEY,
     GUIDED_OPERATION_FAILURE_CODE_VALUES,
     GUIDED_OPERATION_KIND_VALUES,
+    GUIDED_PROPOSAL_REBASE_REASONS,
     LEGAL_RUN_TRANSITIONS,
     OPERATOR_COMPLETION_RUN_STATUS_VALUES,
     SESSION_RUN_EVENT_TYPE_VALUES,
@@ -207,6 +209,7 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationTakenOver,
     GuidedOriginatingUserMessageDraft,
     GuidedPendingProposalInvalidation,
+    GuidedPendingProposalRebase,
     GuidedPipelineConfirmationAdmissionCommand,
     GuidedPipelineDispatchRecordCommand,
     GuidedPipelineProposalAcceptCommand,
@@ -216,6 +219,7 @@ from elspeth.web.sessions.protocol import (
     GuidedPipelineProposalStageCommand,
     GuidedPipelineProposalStageSettlement,
     GuidedProposalInvalidationReason,
+    GuidedProposalRebaseReason,
     GuidedSessionResult,
     GuidedStartStateConverged,
     GuidedStartStateOutcome,
@@ -396,6 +400,39 @@ class _PipelineRejectedEventPayload(TypedDict):
     reason_code: PipelineProposalRejectionReason
     draft_hash: str
     dispatch: PipelineDispatchAuditPayload | None
+
+
+class _PipelineRebasedEventPayload(TypedDict):
+    """One appended, non-terminal anchor move of a still-pending proposal.
+
+    ``from_state_id``/``to_state_id`` make the rebase chain a linked list the
+    restore walks deterministically (unique successor per hop, every event
+    consumed) rather than a timestamp sort, which cannot see a fork and
+    breaks on same-microsecond ties. ``composition_content_hash`` is the base
+    content hash that did NOT change across the move — the admission that
+    keeps a rebase from laundering a graph that actually moved.
+
+    ``reason_code`` names WHICH settlement moved the anchor. Without it the
+    four carrying gestures emit byte-identical payloads modulo ids and the
+    proposal's own trail cannot say what happened to it — the same
+    completeness ``_pipeline_rejected_payload.reason_code`` exists to give
+    its terminal sibling. It is a closed vocabulary, not the settlement's
+    diagnostic origin string: two carrying sites settle the same
+    ``guided_respond`` operation kind, so that string does not discriminate
+    them, and it embeds an operation UUID this payload has no business
+    carrying.
+    """
+
+    schema: str
+    tool_call_id: str
+    tool_name: str
+    status: str
+    outcome: str
+    reason_code: GuidedProposalRebaseReason
+    draft_hash: str
+    from_state_id: str
+    to_state_id: str
+    composition_content_hash: str
 
 
 def _pipeline_private_arguments_hash(arguments: Mapping[str, Any]) -> str:
@@ -598,6 +635,50 @@ _PIPELINE_REJECTED_FIELDS = frozenset(
         "dispatch",
     }
 )
+
+_PIPELINE_REBASED_SCHEMA = "pipeline_proposal_rebased.v1"
+_PIPELINE_REBASED_FIELDS = frozenset(
+    {
+        "schema",
+        "tool_call_id",
+        "tool_name",
+        "status",
+        "outcome",
+        "reason_code",
+        "draft_hash",
+        "from_state_id",
+        "to_state_id",
+        "composition_content_hash",
+    }
+)
+
+
+def _validated_guided_proposal_rebase_reason(value: object) -> GuidedProposalRebaseReason:
+    if type(value) is not str or value not in GUIDED_PROPOSAL_REBASE_REASONS:
+        raise AuditIntegrityError("pipeline proposal rebase reason is outside the closed vocabulary")
+    return cast(GuidedProposalRebaseReason, value)
+
+
+def _pipeline_rebased_payload(
+    *,
+    authority: AuthoritativePipelineProposal,
+    reason: GuidedProposalRebaseReason,
+    from_state_id: UUID,
+    to_state_id: UUID,
+    composition_content_hash_value: str,
+) -> _PipelineRebasedEventPayload:
+    return {
+        "schema": _PIPELINE_REBASED_SCHEMA,
+        "tool_call_id": authority.row.tool_call_id,
+        "tool_name": "set_pipeline",
+        "status": "pending",
+        "outcome": "rebased",
+        "reason_code": _validated_guided_proposal_rebase_reason(reason),
+        "draft_hash": authority.proposal.draft_hash,
+        "from_state_id": str(from_state_id),
+        "to_state_id": str(to_state_id),
+        "composition_content_hash": composition_content_hash_value,
+    }
 
 
 def _pipeline_rejected_payload(
@@ -1956,6 +2037,117 @@ def _record_auto_commit_revocation_on_connection(
     return _proposal_event_record_from_row(row)
 
 
+@dataclass(frozen=True, slots=True)
+class _PipelineProposalRebaseHop:
+    """One appended anchor move, parsed from its immutable event payload."""
+
+    from_state_id: UUID
+    to_state_id: UUID
+    composition_content_hash: str
+
+
+def _pipeline_proposal_rebase_hop(
+    payload: object,
+    *,
+    tool_call_id: str,
+    draft_hash: str,
+) -> _PipelineProposalRebaseHop:
+    """Parse one ``proposal.rebased`` payload and bind it to its proposal."""
+
+    thawed = deep_thaw(payload)
+    if type(thawed) is not dict or set(thawed) != _PIPELINE_REBASED_FIELDS:
+        raise AuditIntegrityError("pipeline proposal rebase event fields are malformed")
+    if thawed["schema"] != _PIPELINE_REBASED_SCHEMA or thawed["outcome"] != "rebased":
+        raise AuditIntegrityError("pipeline proposal rebase event schema is malformed")
+    if thawed["tool_name"] != "set_pipeline" or thawed["status"] != "pending":
+        raise AuditIntegrityError("pipeline proposal rebase event status/tool is malformed")
+    _validated_guided_proposal_rebase_reason(thawed["reason_code"])
+    if thawed["tool_call_id"] != tool_call_id or thawed["draft_hash"] != draft_hash:
+        raise AuditIntegrityError("pipeline proposal rebase event is bound to a different proposal")
+    raw_content_hash = thawed["composition_content_hash"]
+    if not is_lower_sha256_hex(raw_content_hash):
+        raise AuditIntegrityError("pipeline proposal rebase event content hash is malformed")
+    hop_ids: list[UUID] = []
+    for field_name in ("from_state_id", "to_state_id"):
+        raw_state_id = thawed[field_name]
+        if type(raw_state_id) is not str:
+            raise AuditIntegrityError("pipeline proposal rebase event state id is malformed")
+        try:
+            hop_state_id = UUID(raw_state_id)
+        except ValueError as exc:
+            raise AuditIntegrityError("pipeline proposal rebase event state id is malformed") from exc
+        if str(hop_state_id) != raw_state_id:
+            raise AuditIntegrityError("pipeline proposal rebase event state id is not canonical")
+        hop_ids.append(hop_state_id)
+    if hop_ids[0] == hop_ids[1]:
+        raise AuditIntegrityError("pipeline proposal rebase event does not move the anchor")
+    return _PipelineProposalRebaseHop(
+        from_state_id=hop_ids[0],
+        to_state_id=hop_ids[1],
+        composition_content_hash=raw_content_hash,
+    )
+
+
+def _effective_pipeline_proposal_base(
+    conn: Connection,
+    *,
+    session_id: str,
+    proposal_id: str,
+    creation_base: ProposalBase,
+    tool_call_id: str,
+    draft_hash: str,
+) -> ProposalBase:
+    """Return the creation base moved forward by the appended rebase chain.
+
+    ``composition_proposals.base_state_id`` is lifecycle-managed
+    (elspeth-ed67eb9d0d): a guided settlement that carries a still-pending
+    proposal across the checkpoint it writes moves the proposal's anchor
+    there and appends one ``proposal.rebased`` event recording the hop. The
+    creation event keeps its original base forever, so the current anchor is
+    DERIVED here rather than trusted from the mutable column — the column is
+    then checked against this derivation by the caller.
+
+    The chain is walked as a linked list (each hop's ``from_state_id``
+    naming the previous ``to_state_id``), never sorted by ``created_at``:
+    same-microsecond ties are possible and a timestamp sort cannot see a
+    fork. Every event must be consumed by the walk, so a fork or a dangling
+    hop is detectable corruption instead of a silently shortened chain.
+    """
+
+    rows = conn.execute(
+        select(proposal_events_table)
+        .where(proposal_events_table.c.session_id == session_id)
+        .where(proposal_events_table.c.proposal_id == proposal_id)
+        .where(proposal_events_table.c.event_type == "proposal.rebased")
+    ).fetchall()
+    if not rows:
+        return creation_base
+    if type(creation_base) is not PresentBase:
+        raise AuditIntegrityError("pipeline proposal rebase chain has no present creation base")
+    successors: dict[UUID, _PipelineProposalRebaseHop] = {}
+    for event_row in rows:
+        hop = _pipeline_proposal_rebase_hop(event_row.payload, tool_call_id=tool_call_id, draft_hash=draft_hash)
+        if hop.from_state_id in successors:
+            raise AuditIntegrityError("pipeline proposal rebase chain forks at one base")
+        successors[hop.from_state_id] = hop
+    base = creation_base
+    walked = 0
+    while base.state_id in successors:
+        hop = successors[base.state_id]
+        if hop.composition_content_hash != base.composition_content_hash:
+            raise AuditIntegrityError("pipeline proposal rebase chain changed the base content binding")
+        base = PresentBase(state_id=hop.to_state_id, composition_content_hash=base.composition_content_hash)
+        walked += 1
+        if walked > len(successors):
+            # A cycle inside the reachable chain would otherwise loop
+            # forever; an unreachable cycle is caught by the walk-length
+            # equality below.
+            raise AuditIntegrityError("pipeline proposal rebase chain is cyclic")
+    if walked != len(successors):
+        raise AuditIntegrityError("pipeline proposal rebase chain is not one append-only walk from the creation base")
+    return base
+
+
 def _restore_authoritative_pipeline_proposal(
     *,
     conn: Connection,
@@ -2057,7 +2249,20 @@ def _restore_authoritative_pipeline_proposal(
     )
     if reviewed_facts is not None and proposal.reviewed_anchor_hash != reviewed_anchor_hash(reviewed_facts):
         raise AuditIntegrityError("pipeline proposal reviewed anchor does not match current server facts")
-    expected_base_state_id = proposal.base.state_id if type(proposal.base) is PresentBase else None
+    # ``proposal.base`` is the immutable reviewed identity — it is hashed
+    # into ``draft_hash``, so it never moves. The proposal's ANCHOR is that
+    # base moved forward by every appended rebase hop, and the mutable row
+    # column is checked against that derivation rather than being trusted
+    # as the source of truth (elspeth-ed67eb9d0d).
+    current_base = _effective_pipeline_proposal_base(
+        conn,
+        session_id=str(row.session_id),
+        proposal_id=str(row.id),
+        creation_base=proposal.base,
+        tool_call_id=row.tool_call_id,
+        draft_hash=proposal.draft_hash,
+    )
+    expected_base_state_id = current_base.state_id if type(current_base) is PresentBase else None
     if row.base_state_id != expected_base_state_id:
         raise AuditIntegrityError("pipeline proposal row/base state binding mismatch")
     supersedes_raw = payload["supersedes_proposal_id"]
@@ -2105,6 +2310,7 @@ def _restore_authoritative_pipeline_proposal(
         creation_event_id=creation_event.id,
         custody_result=payload["custody_result"],
         supersedes_proposal_id=supersedes_proposal_id,
+        current_base=current_base,
     )
     return replace(
         authority,
@@ -2210,8 +2416,16 @@ def _require_pending_guided_checkpoint_proposal_authority(
 
 
 @dataclass(frozen=True, slots=True)
-class _GuidedPendingProposalInvalidationContext:
-    """Frozen checkpoint and database authority for one proposal invalidation."""
+class _GuidedPendingProposalTransitionContext:
+    """Frozen checkpoint and database authority for one proposal transition.
+
+    A guided settlement does exactly one of three things to the checkpoint's
+    pending-proposal reference: nothing (there is none), CLEAR it (rewind or
+    terminal exit), or CARRY it forward onto the checkpoint being written.
+    ``checkpoint_state_id`` is the id of that new row, and
+    ``settlement_origin`` names the operation for the failure messages —
+    a stale binding is undiagnosable without knowing which gesture wrote it.
+    """
 
     service: SessionServiceImpl
     session_id: str
@@ -2219,39 +2433,101 @@ class _GuidedPendingProposalInvalidationContext:
     prior_guided: GuidedSession
     candidate_guided: GuidedSession
     expected_current_content_hash: str | None
+    checkpoint_state_id: UUID
+    candidate_content_hash: str
+    settlement_origin: str
+
+
+@dataclass(frozen=True, slots=True)
+class _GuidedPendingProposalTransitionRefs:
+    """The checkpoint reference one settlement clears or carries, never both."""
+
+    cleared: GuidedProposalRef | None
+    carried: GuidedProposalRef | None
+
+
+@dataclass(frozen=True, slots=True)
+class _GuidedPendingProposalRebasePlan:
+    """One verified anchor move, ready to append once the checkpoint exists.
+
+    ``reason`` rides with the authority rather than being re-read from the
+    command at the write site: the verifier is what proves a rebase is
+    happening at all, so the value the event records comes from the same
+    place that admitted it.
+    """
+
+    authority: AuthoritativePipelineProposal
+    reason: GuidedProposalRebaseReason
+
+
+@dataclass(frozen=True, slots=True)
+class _GuidedPendingProposalAuthorities:
+    """Restored row authority for whichever pending transition a settlement performs."""
+
+    invalidated: AuthoritativePipelineProposal | None
+    rebased: _GuidedPendingProposalRebasePlan | None
 
 
 def _require_guided_pending_proposal_transition(
-    context: _GuidedPendingProposalInvalidationContext,
+    context: _GuidedPendingProposalTransitionContext,
     invalidation: GuidedPendingProposalInvalidation | None,
-) -> GuidedProposalRef | None:
-    """Verify that the candidate clears exactly the checkpoint's active ref."""
+    rebase: GuidedPendingProposalRebase | None,
+) -> _GuidedPendingProposalTransitionRefs:
+    """Classify the candidate's transition on the checkpoint's active ref.
 
-    if context.prior_guided.active_proposal == context.candidate_guided.active_proposal:
+    A guided settlement either clears exactly one active reference or
+    carries one forward unchanged. ``GuidedProposalRef`` mirrors the
+    proposal's IMMUTABLE reviewed identity — ``base`` included, because
+    ``base`` is hashed into ``draft_hash`` — so a carry is an exact
+    equality, and any other edit to a live reference is illegal here.
+
+    The carrying arm used to return unconditionally with no checks at all
+    (elspeth-ed67eb9d0d). The check it was missing needs the live row, so it
+    lives in :func:`_verify_guided_pending_proposal_rebase`; this function
+    only says WHICH transition is happening.
+    """
+
+    prior_active = context.prior_guided.active_proposal
+    candidate_active = context.candidate_guided.active_proposal
+    if prior_active is not None and candidate_active is not None:
         if invalidation is not None:
             raise AuditIntegrityError("guided proposal invalidation sideband did not clear an active proposal")
-        return None
+        if prior_active != candidate_active:
+            raise AuditIntegrityError(
+                "guided settlement edited a carried pending proposal reference: "
+                f"{context.settlement_origin} carried proposal {prior_active.proposal_id} as "
+                f"{candidate_active.proposal_id}"
+            )
+        return _GuidedPendingProposalTransitionRefs(cleared=None, carried=candidate_active)
+    if prior_active is None and candidate_active is None:
+        if invalidation is not None:
+            raise AuditIntegrityError("guided proposal invalidation sideband did not clear an active proposal")
+        if rebase is not None:
+            raise AuditIntegrityError("guided proposal rebase sideband did not carry an active proposal forward")
+        return _GuidedPendingProposalTransitionRefs(cleared=None, carried=None)
+    if rebase is not None:
+        raise AuditIntegrityError("guided proposal rebase sideband did not carry an active proposal forward")
     if invalidation is None:
         raise AuditIntegrityError("clearing guided active proposal requires an exact invalidation sideband")
-    active = context.prior_guided.active_proposal
-    if active is None or context.candidate_guided.active_proposal is not None:
+    active = prior_active
+    if active is None or candidate_active is not None:
         raise AuditIntegrityError("guided proposal invalidation must clear one exact active proposal")
     if active.proposal_id != invalidation.proposal_id or active.draft_hash != invalidation.draft_hash:
         raise AuditIntegrityError("guided proposal invalidation sideband differs from checkpoint authority")
     if context.current_record is None:
         raise AuditIntegrityError("guided proposal invalidation requires a current checkpoint")
-    return active
+    return _GuidedPendingProposalTransitionRefs(cleared=active, carried=None)
 
 
 def _verify_guided_pending_proposal_invalidation(
     conn: Connection,
     *,
-    context: _GuidedPendingProposalInvalidationContext,
+    context: _GuidedPendingProposalTransitionContext,
     invalidation: GuidedPendingProposalInvalidation | None,
+    active: GuidedProposalRef | None,
 ) -> AuthoritativePipelineProposal | None:
     """Verify one exact active-reference clear and restore pending row authority."""
 
-    active = _require_guided_pending_proposal_transition(context, invalidation)
     if active is None:
         return None
     if invalidation is None or context.current_record is None:  # pragma: no cover - transition verifier owns this
@@ -2357,6 +2633,282 @@ def _reject_guided_pending_proposal(
     )
     if updated.rowcount != 1:
         raise AuditIntegrityError("guided proposal invalidation lost the pending proposal CAS")
+
+
+def _verify_guided_pending_proposal_rebase(
+    conn: Connection,
+    *,
+    context: _GuidedPendingProposalTransitionContext,
+    rebase: GuidedPendingProposalRebase | None,
+    carried: GuidedProposalRef | None,
+) -> _GuidedPendingProposalRebasePlan | None:
+    """Require a carried pending proposal to be anchored to the checkpoint written.
+
+    THIS IS THE GUARD the carrying arm never had (elspeth-ed67eb9d0d).
+    Every guided settlement mints a fresh ``composition_states`` row —
+    ``GuidedSession``, ``chat_history`` included, lives inside
+    ``composer_meta``, so an advisory chat or a declined revision is
+    structurally a new version even when the graph is untouched — and a
+    proposal carried across one kept its anchor on the PREVIOUS checkpoint.
+    Nothing on the write path noticed, and the content-hash halves of the
+    downstream guards could not notice either: the graph is empty until
+    commit, so every version through Steps 1-3 shares one content hash. The
+    damage surfaced only later, as a permanently unreadable guided session
+    or a dead "edit this component" affordance.
+
+    So a settlement that carries a live proposal must move its anchor onto
+    the row being written, and moving it is a lifecycle fact requiring the
+    exact rebase sideband. Sibling of
+    :func:`_verify_guided_pending_proposal_invalidation`: every binding is
+    re-derived from the live tree rather than trusted from the caller. The
+    LOAD-BEARING admission is the last check — the checkpoint the anchor
+    moves ONTO must carry the same composition content as the one it moves
+    OFF, so a rebase can never launder a graph that actually changed.
+    Without it the sideband would be a hole: any settlement could re-anchor
+    a reviewed proposal onto an arbitrary later composition.
+    """
+
+    if carried is None:
+        if rebase is not None:  # pragma: no cover - transition verifier owns this
+            raise AuditIntegrityError("guided proposal rebase sideband did not carry an active proposal forward")
+        return None
+    if context.current_record is None:  # pragma: no cover - a carried ref implies a persisted prior checkpoint
+        raise AuditIntegrityError("carrying a guided pending proposal requires a current checkpoint")
+    proposal_row = conn.execute(
+        select(composition_proposals_table)
+        .where(composition_proposals_table.c.session_id == context.session_id)
+        .where(composition_proposals_table.c.id == str(carried.proposal_id))
+    ).one_or_none()
+    if proposal_row is None:
+        raise AuditIntegrityError("guided carried proposal authority is missing or cross-session")
+    creation_rows = conn.execute(
+        select(proposal_events_table)
+        .where(proposal_events_table.c.session_id == context.session_id)
+        .where(proposal_events_table.c.proposal_id == str(carried.proposal_id))
+        .where(proposal_events_table.c.event_type == "proposal.created")
+    ).fetchall()
+    if len(creation_rows) != 1:
+        raise AuditIntegrityError("guided carried proposal requires one creation event")
+    # The reviewed-anchor assertion rides on the sideband, so it is checked
+    # below rather than here: this restore also runs on the path where NO
+    # sideband was supplied, which is the path whose whole purpose is to
+    # refuse the settlement.
+    authority = _restore_authoritative_pipeline_proposal(
+        conn=conn,
+        row=_proposal_record_from_row(proposal_row),
+        creation_event=_proposal_event_record_from_row(creation_rows[0]),
+        reviewed_facts=None,
+    )
+    _verify_pipeline_lifecycle_authority(conn, service=context.service, authority=authority)
+    if authority.row.status != "pending":
+        raise AuditIntegrityError("guided carried proposal requires a pending proposal")
+    proposal = authority.proposal
+    if (
+        proposal.draft_hash != carried.draft_hash
+        or proposal.base != carried.base
+        or proposal.reviewed_anchor_hash != carried.reviewed_anchor_hash
+        or proposal.covered_deferred_intent_ids != carried.covered_deferred_intent_ids
+        or authority.supersedes_proposal_id != carried.supersedes_proposal_id
+        or proposal.supersedes_draft_hash != carried.supersedes_draft_hash
+    ):
+        raise AuditIntegrityError("guided carried proposal restored authority differs from checkpoint")
+    current_base = authority.current_base
+    if type(current_base) is not PresentBase:
+        raise AuditIntegrityError("guided carried proposal anchor is not a persisted checkpoint")
+    if current_base.state_id == context.checkpoint_state_id:  # pragma: no cover - the checkpoint id is freshly minted
+        if rebase is not None:
+            raise AuditIntegrityError("guided proposal rebase sideband did not move a carried proposal anchor")
+        return None
+    if rebase is None:
+        raise AuditIntegrityError(
+            "a guided settlement carrying a pending proposal must rebase its anchor onto the checkpoint it writes: "
+            f"{context.settlement_origin} writes checkpoint {context.checkpoint_state_id} while proposal "
+            f"{carried.proposal_id} is still anchored to {current_base.state_id}"
+        )
+    if carried.proposal_id != rebase.proposal_id or carried.draft_hash != rebase.draft_hash:
+        raise AuditIntegrityError(
+            "guided proposal rebase sideband differs from checkpoint authority: "
+            f"{context.settlement_origin} carried proposal {carried.proposal_id}"
+        )
+    if proposal.reviewed_anchor_hash != reviewed_anchor_hash(deep_thaw(rebase.reviewed_facts)):
+        raise AuditIntegrityError("guided proposal rebase reviewed anchor does not match current server facts")
+    if current_base.state_id != rebase.from_state_id:
+        raise AuditIntegrityError(
+            "guided proposal rebase sideband names an anchor the live proposal does not hold: "
+            f"{context.settlement_origin} claims anchor {rebase.from_state_id} while proposal "
+            f"{carried.proposal_id} holds {current_base.state_id}"
+        )
+    if current_base.composition_content_hash != rebase.composition_content_hash:
+        raise AuditIntegrityError("guided proposal rebase sideband content hash differs from the live anchor")
+    base_row = conn.execute(
+        select(composition_states_table)
+        .where(composition_states_table.c.session_id == context.session_id)
+        .where(composition_states_table.c.id == str(current_base.state_id))
+    ).one_or_none()
+    if base_row is None:
+        raise AuditIntegrityError("guided proposal rebase anchor is missing or cross-session")
+    base_record = context.service._row_to_state_record(base_row)
+    if composition_content_hash(state_from_record(base_record)) != current_base.composition_content_hash:
+        raise AuditIntegrityError("guided proposal rebase anchor content binding changed")
+    if current_base.composition_content_hash != context.expected_current_content_hash:
+        raise AuditIntegrityError("guided proposal rebase anchor content hash changed")
+    if context.candidate_content_hash != current_base.composition_content_hash:
+        raise AuditIntegrityError(
+            "guided proposal rebase would move a pending proposal onto a checkpoint whose composition content changed: "
+            f"{context.settlement_origin} writes checkpoint {context.checkpoint_state_id} with content "
+            f"{context.candidate_content_hash} while proposal {carried.proposal_id} was reviewed against "
+            f"{current_base.composition_content_hash}"
+        )
+    return _GuidedPendingProposalRebasePlan(authority=authority, reason=rebase.reason)
+
+
+def _rebind_guided_pending_proposal(
+    conn: Connection,
+    *,
+    authority: AuthoritativePipelineProposal,
+    reason: GuidedProposalRebaseReason,
+    actor: str,
+    created_at: datetime,
+    to_state_id: UUID,
+) -> None:
+    """Append one immutable rebase event and re-pin the pending row's base.
+
+    Non-terminal sibling of :func:`_reject_guided_pending_proposal`: the row
+    stays pending and keeps its ``audit_event_id`` terminal binding slot
+    free, but ``base_state_id`` becomes lifecycle-managed. The event is the
+    only durable record of the hop, so it is appended in the same
+    transaction as the column write and the checkpoint that motivated it.
+
+    RULING on the admission fence, which is deliberate and unconditional. A
+    carrying settlement refuses with ``stale_conflict`` while an admitted
+    confirmation still owns dispatch on this proposal, exactly as the
+    terminalizing sibling does. The anchor move is inseparable from the
+    checkpoint that motivates it, so an in-flight dispatch would fail its
+    own ``expected_current_state_id`` check against that new head anyway:
+    the fence buys nothing but the diagnosis, turning a late failure named
+    after the wrong thing into an early conflict named after the right one.
+    The window is bounded by the lease — an abandoned admission (the
+    realistic producer is process death mid-confirm, the scenario
+    ``test_expired_confirmation_takeover_recovers_without_duplicate_dispatch``
+    models) releases its proposal locator on the first call past expiry,
+    which is the release this function's own guard performs.
+
+    No owner discrimination is needed here, unlike
+    :meth:`SessionServiceImpl.admit_guided_pipeline_confirmation`, which
+    excepts its own operation so a re-entering confirmation can re-admit.
+    That admission is the only writer that binds
+    ``guided_operations.proposal_id`` and leaves the operation
+    ``in_progress`` past its transaction; every other binder
+    (``stage_``/``back_edit_``/``reject_``/``accept_guided_pipeline_proposal``)
+    completes the operation in the same transaction, and the two settlements
+    that reach here bind their own operation with no ``proposal_id`` at all.
+    So the fence can never fire on the settling operation itself.
+    """
+
+    session_id = str(authority.row.session_id)
+    proposal_id = str(authority.row.id)
+    if type(authority.current_base) is not PresentBase:  # pragma: no cover - the rebase verifier owns this
+        raise AuditIntegrityError("guided proposal rebase lost its persisted anchor")
+    from_state_id = authority.current_base.state_id
+    _require_no_active_guided_confirmation_admission(
+        conn,
+        session_id=session_id,
+        proposal_id=proposal_id,
+        now=created_at,
+    )
+    event_id = str(uuid.uuid4())
+    conn.execute(
+        insert(proposal_events_table).values(
+            id=event_id,
+            session_id=session_id,
+            proposal_id=proposal_id,
+            event_type="proposal.rebased",
+            actor=actor,
+            payload=_pipeline_rebased_payload(
+                authority=authority,
+                reason=reason,
+                from_state_id=from_state_id,
+                to_state_id=to_state_id,
+                composition_content_hash_value=authority.current_base.composition_content_hash,
+            ),
+            created_at=created_at,
+        )
+    )
+    updated = conn.execute(
+        update(composition_proposals_table)
+        .where(composition_proposals_table.c.session_id == session_id)
+        .where(composition_proposals_table.c.id == proposal_id)
+        .where(composition_proposals_table.c.status == "pending")
+        .where(composition_proposals_table.c.base_state_id == str(from_state_id))
+        .values(
+            base_state_id=str(to_state_id),
+            updated_at=created_at,
+        )
+    )
+    if updated.rowcount != 1:
+        raise AuditIntegrityError("guided proposal rebase lost the pending proposal CAS")
+
+
+def _carried_guided_checkpoint_session(composer_meta: object, *, role: str) -> GuidedSession:
+    """Parse a checkpoint's guided session, treating absence as "no guided walk".
+
+    Deliberately more tolerant than the parser inside
+    :meth:`SessionServiceImpl.settle_guided_state_operation`, and the
+    difference is the question being asked. A RESPOND/CHAT settlement IS a
+    guided state transition, so a checkpoint of one without a guided session
+    is corruption. The guided-full surface instead writes a checkpoint over
+    whatever head it observed — including a freeform head that never had a
+    guided session — so absence there means only that there is no proposal to
+    carry, and the transition classifies as "nothing to do".
+
+    A guided session that is PRESENT but unparseable is still corruption,
+    both here and there: an unreadable checkpoint must never be silently
+    downgraded to "no pending proposal", which is exactly how a carried
+    proposal would slip past the transition guard.
+    """
+
+    from elspeth.web.composer.guided.errors import InvariantError
+    from elspeth.web.composer.guided.state_machine import GuidedSession
+
+    if composer_meta is None:
+        return GuidedSession.initial()
+    metadata = deep_thaw(composer_meta)
+    if type(metadata) is not dict:
+        raise AuditIntegrityError(f"{role} guided checkpoint metadata is malformed")
+    if "guided_session" not in metadata:
+        return GuidedSession.initial()
+    if type(metadata["guided_session"]) is not dict:
+        raise AuditIntegrityError(f"{role} guided checkpoint is malformed")
+    try:
+        return GuidedSession.from_dict(metadata["guided_session"])
+    except (InvariantError, KeyError, TypeError, ValueError) as exc:
+        raise AuditIntegrityError(f"{role} guided checkpoint is malformed") from exc
+
+
+def _verify_guided_pending_proposal_transition(
+    conn: Connection,
+    *,
+    context: _GuidedPendingProposalTransitionContext,
+    invalidation: GuidedPendingProposalInvalidation | None,
+    rebase: GuidedPendingProposalRebase | None,
+) -> _GuidedPendingProposalAuthorities:
+    """Classify one settlement's pending-proposal transition and verify it."""
+
+    refs = _require_guided_pending_proposal_transition(context, invalidation, rebase)
+    return _GuidedPendingProposalAuthorities(
+        invalidated=_verify_guided_pending_proposal_invalidation(
+            conn,
+            context=context,
+            invalidation=invalidation,
+            active=refs.cleared,
+        ),
+        rebased=_verify_guided_pending_proposal_rebase(
+            conn,
+            context=context,
+            rebase=rebase,
+            carried=refs.carried,
+        ),
+    )
 
 
 def _require_no_active_guided_confirmation_admission(
@@ -6904,6 +7456,7 @@ class SessionServiceImpl:
                     creation_event_id=UUID(event_id),
                     custody_result=plan.custody_result,
                     supersedes_proposal_id=supersedes_proposal_id,
+                    current_base=proposal.base,
                 )
                 return replace(record, pipeline_metadata=_pipeline_public_metadata(authority))
 
@@ -11273,18 +11826,24 @@ class SessionServiceImpl:
                     candidate_guided=candidate_guided,
                 )
 
-                invalidated_authority = _verify_guided_pending_proposal_invalidation(
+                pending_proposal_authorities = _verify_guided_pending_proposal_transition(
                     conn,
-                    context=_GuidedPendingProposalInvalidationContext(
+                    context=_GuidedPendingProposalTransitionContext(
                         service=self,
                         session_id=sid,
                         current_record=current_record,
                         prior_guided=prior_guided,
                         candidate_guided=candidate_guided,
                         expected_current_content_hash=command.expected_current_content_hash,
+                        checkpoint_state_id=command.state_id,
+                        candidate_content_hash=_composition_state_data_content_hash(command.state),
+                        settlement_origin=f"guided {command.response.kind} operation {command.fence.operation_id}",
                     ),
                     invalidation=command.invalidated_pending_proposal,
+                    rebase=command.rebased_pending_proposal,
                 )
+                invalidated_authority = pending_proposal_authorities.invalidated
+                rebased_authority = pending_proposal_authorities.rebased
 
                 inserted_state_id = self._insert_composition_state(
                     conn,
@@ -11311,6 +11870,19 @@ class SessionServiceImpl:
                         actor=command.actor,
                         created_at=now,
                         reason=command.invalidated_pending_proposal.reason,
+                    )
+
+                if rebased_authority is not None:
+                    # After the insert: ``composition_proposals.base_state_id``
+                    # carries a foreign key onto ``composition_states``, so the
+                    # checkpoint the base moves onto must already exist.
+                    _rebind_guided_pending_proposal(
+                        conn,
+                        authority=rebased_authority.authority,
+                        reason=rebased_authority.reason,
+                        actor=command.actor,
+                        created_at=now,
+                        to_state_id=command.state_id,
                     )
 
                 row_count = len(audit_rows) + (1 if command.originating_message is not None else 0)
@@ -11536,6 +12108,9 @@ class SessionServiceImpl:
                     .order_by(desc(composition_states_table.c.version))
                     .limit(1)
                 ).one_or_none()
+                current_record: CompositionStateRecord | None = None
+                if current_row is not None:
+                    current_record = self._row_to_state_record(current_row)
                 if command.expected_current_state_id is None:
                     if current_row is not None:
                         raise GuidedOperationSettlementConflictError()
@@ -11546,9 +12121,41 @@ class SessionServiceImpl:
                         or current_row.version != command.expected_current_state_version
                     ):
                         raise GuidedOperationSettlementConflictError()
-                    current_record = self._row_to_state_record(current_row)
+                    if current_record is None:  # pragma: no cover - paired with current_row
+                        raise AuditIntegrityError("guided-full stage current state conversion failed")
                     if composition_content_hash(state_from_record(current_record)) != command.expected_current_content_hash:
                         raise AuditIntegrityError("guided-full observed composition content changed before staging")
+
+                # Interim fail-closed refusal (elspeth-da0e3db919). Staging
+                # copies the observed head's ``composer_meta`` verbatim, so a
+                # guided walk mid-review carries its live ``active_proposal``
+                # onto this new checkpoint while the anchor keeps naming the
+                # PREVIOUS row — the identical stranding elspeth-ed67eb9d0d
+                # fixed on the settlement paths, and the identical outcome: a
+                # clean 200 followed by a permanently unreadable guided
+                # session. The decline twin's remedy — rebase the anchor onto
+                # the checkpoint — is WRONG here, because staging also mints a
+                # SECOND pending proposal based on that same checkpoint, and
+                # which of the two the walk then owns is a semantics question
+                # (refuse, or supersede the predecessor) that belongs to the
+                # operator, not to this fix. Refusing costs a coded
+                # ``integrity_error`` on a route the SPA never calls;
+                # proceeding costs the session. ``active_proposal`` cannot be
+                # a stale reference to a terminal row: ``GuidedSession``'s own
+                # invariants bind it to a sole unanswered trailing
+                # PROPOSE_PIPELINE/CONFIRM_WIRING turn, so its presence on a
+                # parsed checkpoint IS a live review.
+                staging_prior_guided = _carried_guided_checkpoint_session(
+                    current_record.composer_meta if current_record is not None else None,
+                    role="guided-full stage prior",
+                )
+                if staging_prior_guided.active_proposal is not None:
+                    raise AuditIntegrityError(
+                        "guided-full staging cannot write a checkpoint over a guided walk still reviewing a proposal: "
+                        f"operation {command.fence.operation_id} would carry pending proposal "
+                        f"{staging_prior_guided.active_proposal.proposal_id} onto checkpoint {command.checkpoint_state_id} "
+                        "while staging a second proposal against it (elspeth-da0e3db919)"
+                    )
 
                 # Blob-reference validation moved below the deferred-custody
                 # settle: the staged source's blob row may be materialized in
@@ -11676,6 +12283,7 @@ class SessionServiceImpl:
                     creation_event_id=UUID(event_id),
                     custody_result=command.plan.custody_result,
                     supersedes_proposal_id=None,
+                    current_base=proposal.base,
                 )
                 proposal_record = replace(stored, pipeline_metadata=_pipeline_public_metadata(authority))
                 response = project_composition_proposal(proposal_record)
@@ -11760,6 +12368,9 @@ class SessionServiceImpl:
                     .order_by(desc(composition_states_table.c.version))
                     .limit(1)
                 ).one_or_none()
+                current_record: CompositionStateRecord | None = None
+                if current_row is not None:
+                    current_record = self._row_to_state_record(current_row)
                 if command.expected_current_state_id is None:
                     if current_row is not None:
                         raise GuidedOperationSettlementConflictError()
@@ -11770,9 +12381,44 @@ class SessionServiceImpl:
                         or current_row.version != command.expected_current_state_version
                     ):
                         raise GuidedOperationSettlementConflictError()
-                    current_record = self._row_to_state_record(current_row)
+                    if current_record is None:  # pragma: no cover - paired with current_row
+                        raise AuditIntegrityError("guided-full decline current state conversion failed")
                     if composition_content_hash(state_from_record(current_record)) != command.expected_current_content_hash:
                         raise AuditIntegrityError("guided-full decline observed composition content changed before staging")
+
+                # A guided-full decline writes a checkpoint over the observed
+                # head with ``composer_meta`` carried forward verbatim, so a
+                # guided walk holding a pending proposal carries that proposal
+                # across this settlement exactly as a RESPOND or CHAT
+                # settlement does — and used to strand its anchor on the
+                # previous checkpoint in exactly the same way
+                # (elspeth-ed67eb9d0d). Same class, same guard: this route was
+                # missed the first time because the class was closed by
+                # censusing GuidedStateOperationCommand construction sites
+                # rather than every writer that carries a live active_proposal
+                # onto a new row.
+                pending_proposal_authorities = _verify_guided_pending_proposal_transition(
+                    conn,
+                    context=_GuidedPendingProposalTransitionContext(
+                        service=self,
+                        session_id=sid,
+                        current_record=current_record,
+                        prior_guided=_carried_guided_checkpoint_session(
+                            current_record.composer_meta if current_record is not None else None,
+                            role="guided-full decline prior",
+                        ),
+                        candidate_guided=_carried_guided_checkpoint_session(
+                            command.state.composer_meta,
+                            role="guided-full decline candidate",
+                        ),
+                        expected_current_content_hash=command.expected_current_content_hash,
+                        checkpoint_state_id=command.checkpoint_state_id,
+                        candidate_content_hash=checkpoint_content_hash,
+                        settlement_origin=f"guided-full decline operation {command.fence.operation_id}",
+                    ),
+                    invalidation=None,
+                    rebase=command.rebased_pending_proposal,
+                )
 
                 checkpoint_id = self._insert_composition_state(
                     conn,
@@ -11789,6 +12435,20 @@ class SessionServiceImpl:
                 )
                 checkpoint_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == checkpoint_id)).one()
                 checkpoint = self._row_to_state_record(checkpoint_row)
+
+                rebase_plan = pending_proposal_authorities.rebased
+                if rebase_plan is not None:
+                    # After the insert: ``composition_proposals.base_state_id``
+                    # carries a foreign key onto ``composition_states``, so the
+                    # checkpoint the anchor moves onto must already exist.
+                    _rebind_guided_pending_proposal(
+                        conn,
+                        authority=rebase_plan.authority,
+                        reason=rebase_plan.reason,
+                        actor=command.actor,
+                        created_at=now,
+                        to_state_id=command.checkpoint_state_id,
+                    )
 
                 sequence_no = self._reserve_sequence_range(conn, sid, count=2 + len(audit_rows))
                 self._insert_chat_message(
@@ -12316,6 +12976,7 @@ class SessionServiceImpl:
                     creation_event_id=UUID(event_id),
                     custody_result=command.plan.custody_result,
                     supersedes_proposal_id=command.supersedes_proposal_id,
+                    current_base=proposal.base,
                 )
                 proposal_record = replace(record, pipeline_metadata=_pipeline_public_metadata(authority))
 
@@ -12476,12 +13137,23 @@ class SessionServiceImpl:
                 _verify_pipeline_lifecycle_authority(conn, service=self, authority=authority)
                 if authority.row.status != "pending" or authority.proposal.draft_hash != command.draft_hash:
                     raise AuditIntegrityError("guided back-edit does not name the active pending draft")
+                # Currency is asked of the proposal's ANCHOR, which a guided
+                # settlement legally moves forward when it carries the
+                # proposal across a new checkpoint (elspeth-ed67eb9d0d).
+                # ``proposal.base`` is hashed into ``draft_hash`` and never
+                # moves, so it cannot answer this question.
+                #
+                # The ``wire_review`` one-hop tolerance predates the rebase
+                # and is retained: a wire-review back-edit is answered from
+                # a turn the author was already looking at, so a settlement
+                # that landed between render and press must not kill the
+                # affordance.
                 allowed_base_state_ids = {current_record.id}
                 if command.origin == "wire_review" and current_record.derived_from_state_id is not None:
                     allowed_base_state_ids.add(current_record.derived_from_state_id)
-                if type(authority.proposal.base) is not PresentBase or authority.proposal.base.state_id not in allowed_base_state_ids:
+                if type(authority.current_base) is not PresentBase or authority.current_base.state_id not in allowed_base_state_ids:
                     raise AuditIntegrityError("guided back-edit proposal base differs from current checkpoint")
-                if authority.proposal.base.composition_content_hash != current_content_hash:
+                if authority.current_base.composition_content_hash != current_content_hash:
                     raise AuditIntegrityError("guided back-edit proposal base content hash changed")
 
                 guided = current_state.guided_session
