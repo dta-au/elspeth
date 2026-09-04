@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import re
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
@@ -14,7 +13,6 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.guided import intent_management as intent_management_module
 from elspeth.web.composer.guided.deferred_intents import (
-    _MESSAGE_OPERATOR_PATTERN,
     DeferredIntentAccepted,
     DeferredIntentAction,
     DeferredIntentCancelAction,
@@ -50,6 +48,8 @@ from elspeth.web.composer.guided.stage_subjects import (
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailability, PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
+
+from .stated_demand_oracle import assert_demand_is_satisfiable
 
 INTENT_ID = "11111111-1111-4111-8111-111111111111"
 MESSAGE_ID = "22222222-2222-4222-8222-222222222222"
@@ -1521,101 +1521,20 @@ _LIVE_COLLECTOR_MESSAGE = (
 )
 
 
-def _stated_acceptances_from_message_tokens(message: str) -> tuple[int, int]:
-    """Brute-force oracle, written INDEPENDENTLY of the demand derivation.
-
-    Returns how many StatedGateRouting and StatedPredicate actions built
-    from the message's own tokens the REAL validator accepts. Column: any
-    word token before an operator occurrence; value: the token right after
-    it; targets: any two distinct word tokens after the operator. Both
-    falsification lanes showed this token space is complete for the
-    grounding regex, so zero accepted routing actions here means the
-    acceptance set for a routing demand is genuinely empty.
-    """
-
-    catalog = _view((("source", "csv"),))
-    tokens = [(match.group(), match.start(), match.end()) for match in re.finditer(r"[A-Za-z0-9_][A-Za-z0-9_-]*", message)]
-    routing_accepted = 0
-    predicate_accepted = 0
-    seen: set[tuple[object, ...]] = set()
-    for operator, pattern in _MESSAGE_OPERATOR_PATTERN.items():
-        for occurrence in re.finditer(pattern, message, re.IGNORECASE):
-            after = [token for token in tokens if token[1] >= occurrence.end()]
-            if not after:
-                continue
-            raw_value = after[0][0]
-            value: object = int(raw_value) if raw_value.isdigit() else raw_value
-            columns = {token[0] for token in tokens if token[2] <= occurrence.start()}
-            targets = {token[0] for token in after[1:]}
-            for column in columns:
-                predicate_key = ("predicate", column, operator, value)
-                if predicate_key not in seen:
-                    seen.add(predicate_key)
-                    predicate = DeferredIntentAction(
-                        target_stage="topology",
-                        catalog_kind=None,
-                        catalog_name=None,
-                        redacted_summary="oracle",
-                        constraints=(
-                            StatedPredicateConstraint(
-                                kind="stated_predicate", subject=_CSV_SOURCE_SUBJECT, column=column, operator=operator, value=value
-                            ),
-                        ),
-                    )
-                    if (
-                        type(
-                            validate_deferred_intent_action(
-                                predicate,
-                                receiving_stage="source",
-                                catalog=catalog,
-                                guided=GuidedSession.initial(),
-                                originating_message_content=message,
-                            )
-                        )
-                        is DeferredIntentAccepted
-                    ):
-                        predicate_accepted += 1
-                for true_target in targets:
-                    for false_target in targets - {true_target}:
-                        routing_key = ("routing", column, operator, value, true_target, false_target)
-                        if routing_key in seen:
-                            continue
-                        seen.add(routing_key)
-                        try:
-                            constraint = StatedGateRoutingConstraint(
-                                kind="stated_gate_routing",
-                                subject=_CSV_SOURCE_SUBJECT,
-                                column=column,
-                                operator=operator,
-                                value=value,
-                                true_target=true_target,
-                                false_target=false_target,
-                            )
-                        except (ValueError, InvariantError):
-                            # Not a statable output name (e.g. "JSON"): the
-                            # planner cannot emit it, so it is not a candidate.
-                            continue
-                        routing = DeferredIntentAction(
-                            target_stage="topology",
-                            catalog_kind=None,
-                            catalog_name=None,
-                            redacted_summary="oracle",
-                            constraints=(constraint,),
-                        )
-                        if (
-                            type(
-                                validate_deferred_intent_action(
-                                    routing,
-                                    receiving_stage="source",
-                                    catalog=catalog,
-                                    guided=GuidedSession.initial(),
-                                    originating_message_content=message,
-                                )
-                            )
-                            is DeferredIntentAccepted
-                        ):
-                            routing_accepted += 1
-    return routing_accepted, predicate_accepted
+_ADVERSARIAL_NO_COMPARISON_ROUTING_PROMPTS = (
+    # elspeth-6155f11add's six: genuine routing prose the closed grammar
+    # cannot bind (categorical / boolean / null-check gates, and two whose
+    # destinations are joined by a bare " and " the destination grammar does
+    # not close on). The false-negative direction of the canary
+    # (elspeth-b24ec0945f option (b)): the derived demand must stay silent
+    # here BECAUSE nothing grounds, and the oracle proves nothing grounds.
+    "route flagged rows to review and everything else to standard",
+    "a gate that sends approved records to approved and the rest to rejected",
+    "send rows where the urgent flag is set to fast, otherwise to slow",
+    "route records with a missing email to quarantine and the rest to main",
+    "route rows where status equals cancelled to review and everything else to main",
+    "route rows where amount is greater than 500 to high_value and the rest to standard",
+)
 
 
 @pytest.mark.parametrize(
@@ -1629,6 +1548,7 @@ def _stated_acceptances_from_message_tokens(message: str) -> tuple[int, int]:
         "Later route csv rows where status equals priority to high_value, and everything else to standard.",
         _LIVE_COLLECTOR_MESSAGE,
         *(message for message, _ in _UNBINDABLE_GATE_PROSE),
+        *_ADVERSARIAL_NO_COMPARISON_ROUTING_PROMPTS,
     ),
 )
 def test_a_stated_demand_is_raised_only_when_the_real_validator_accepts_some_stated_action(message: str) -> None:
@@ -1645,14 +1565,7 @@ def test_a_stated_demand_is_raised_only_when_the_real_validator_accepts_some_sta
     """
 
     demand = _message_requires_stated_constraint(message)
-    routing_accepted, predicate_accepted = _stated_acceptances_from_message_tokens(message)
-    if demand == "routing":
-        assert routing_accepted > 0, "routing demanded but no routing action from the message's own tokens is accepted"
-    elif demand == "predicate":
-        assert predicate_accepted > 0 or routing_accepted > 0, "predicate demanded but nothing stated is accepted"
-    else:
-        assert routing_accepted == 0, "no demand, yet a routing action grounds — the demand was suppressed wrongly"
-    assert routing_accepted > 0 or demand != "routing"
+    assert_demand_is_satisfiable(message, demand, _view((("source", "csv"),)))
 
 
 def test_hard_wrapped_routing_prose_keeps_its_demand_and_refuses_the_weaker_kind() -> None:
