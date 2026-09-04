@@ -91,6 +91,56 @@ result to a single string (`:3338`), discarding the structured
 (`:1243`, `error_code` parameter at `:1247`) — the subject of
 `elspeth-42f8e9e66f`.
 
+## The sharpest instance: facts computed, tested, documented — and never sent
+
+**Found by the systems-thinker seat 2026-09-04, verified independently before
+being recorded here.** This displaces `locked_input_extras` as the headline,
+and it is a cleaner defect than anything above because nothing about it is
+uncertain.
+
+`_bind_guided_revision` (`guided/planning.py:3116`) computes one fact record
+per amend-contract breach — `_record(kind, **facts)` at `:3223`, nine kinds,
+in discovery order. The dataclass docstring (`:330`) states their purpose
+outright:
+
+> "the facts are what let a repair name the offending node instead of
+> re-guessing the whole contract"
+
+and pre-clears their custody in the same breath: "Every value is either a node
+id the provider authored or already sees in `current_state`, a closed
+violation kind, or an option/field KEY — never a reviewed option value."
+
+They are computed. They are unit-tested. They are documented as the repair
+payload. They are custody-cleared by their own author.
+
+**And they are dropped one line after they are returned.**
+`service.py:4156` reads `pending_revision_rejection = binding.rejection_code`
+— the code alone. `GuidedRevisionBindingResult.violations` has no Python
+consumer anywhere in `src/` (verified by grep; the only other `.violations`
+hits are an unrelated class in `contracts/declaration_contracts.py` and
+frontend harness TypeScript). What the model receives instead is built at
+`pipeline_planner.py:2027`: `component="pipeline"`, and the fixed sentence
+
+> "The candidate did not satisfy a surface-specific semantic obligation."
+
+That is not a persistence gap and not a custody decision. The facts never
+reach the wire at all, and the sentence that replaces them names neither the
+node, nor the kind, nor the field.
+
+**This also corrects the "one code over nine kinds" framing** used earlier in
+this document and in `elspeth-15c60e7c66`. The nine kinds belong to
+`guided_amend_contract_violation` (`rejection_code: Literal[...]`,
+`guided/planning.py:340`), NOT to `locked_input_extras` — which is a narrow
+single-rule code that already carries its facts in `SchemaContractDetail`.
+Both the ticket and this spec inherited the misattribution.
+
+**Consequence for the layering below.** Layer 1 was scoped as persistence.
+For THIS defect persistence is not the fix and would not help: the remedy is
+to project the violations the binder already computed, on the custody terms
+its own docstring already establishes. It is the same "carry the fact
+structurally" discipline, at a surface where the fact is not merely lossy in
+the record but absent from the conversation.
+
 ## The pattern already exists in this codebase, at two surfaces
 
 This design is not proposing a new mechanism. It is proposing that a proven
