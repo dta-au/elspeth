@@ -22,6 +22,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -107,6 +108,65 @@ def session_id(db_engine) -> UUID:
 def blob_service(db_engine, tmp_path) -> BlobServiceImpl:
     """BlobServiceImpl backed by the shared engine and a temp directory."""
     return BlobServiceImpl(db_engine, tmp_path)
+
+
+async def _seed_active_run(
+    db_engine,
+    session_id: UUID,
+    *,
+    source: dict[str, Any],
+    nodes: list[dict[str, Any]] | None = None,
+    status: str = "pending",
+) -> str:
+    """Seed a composition state through the REAL writer, attach a run, return its id.
+
+    A direct ``composition_states_table.insert()`` must not be used to pin the
+    active-run retention guard. Since ``f0fd36087`` (2026-05) every production
+    writer folds ``source`` into ``sources`` and stores each JSON column wrapped
+    as ``{"_version": 1, "data": ...}``; a hand-seeded row with a populated,
+    bare ``source`` is a shape the database never contains. Pinning the guard
+    against that shape is exactly how ``elspeth-3db5745ba7`` stayed green while
+    production raised ``TypeError`` (500) on every blob delete or replace under
+    a pending or running run. Routing through ``save_composition_state`` keeps
+    these tests sensitive to the storage shape they exist to defend.
+    """
+    from elspeth.web.sessions.models import runs_table
+    from elspeth.web.sessions.protocol import CompositionStateData
+    from elspeth.web.sessions.service import SessionServiceImpl
+    from elspeth.web.sessions.telemetry import build_sessions_telemetry
+
+    sessions = SessionServiceImpl(
+        db_engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test"),
+    )
+    state = await sessions.save_composition_state(
+        session_id,
+        CompositionStateData(
+            source=source,
+            nodes=nodes if nodes is not None else [],
+            edges=[],
+            outputs=[],
+            metadata_={"name": "Test", "description": ""},
+            is_valid=True,
+        ),
+        provenance="session_seed",
+    )
+
+    run_id = str(uuid4())
+    with db_engine.begin() as conn:
+        conn.execute(
+            runs_table.insert().values(
+                id=run_id,
+                session_id=str(session_id),
+                state_id=str(state.id),
+                status=status,
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                rows_processed=0,
+                rows_failed=0,
+            )
+        )
+    return run_id
 
 
 # ---------------------------------------------------------------------------
@@ -933,11 +993,6 @@ class TestDeleteBlob:
         nothing.  The composition-state guard must block deletion because
         the run's source references this blob via blob_ref.
         """
-        from elspeth.web.sessions.models import (
-            composition_states_table,
-            runs_table,
-        )
-
         record = await blob_service.create_blob(
             session_id=session_id,
             filename="pre-link.csv",
@@ -946,50 +1001,20 @@ class TestDeleteBlob:
             created_by="user",
         )
 
-        state_id = str(uuid4())
-        session_id_str = str(session_id)
-        run_id = str(uuid4())
-
-        with db_engine.begin() as conn:
-            conn.execute(
-                composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    # Source references this blob via blob_ref — the run is
-                    # about to link it once link_blob_to_run() fires.
-                    source={
-                        "plugin": "csv",
-                        "on_success": "output",
-                        "on_validation_failure": "quarantine",
-                        "options": {"blob_ref": str(record.id), "path": str(record.storage_path)},
-                    },
-                    nodes=[],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
-                    is_valid=True,
-                    # Plan §2294: every test-side direct composition_states
-                    # insert must supply provenance after Task 3's CHECK
-                    # constraint. ``session_seed`` is the broadened-semantics
-                    # default for setup-only rows that don't model a real
-                    # compose-loop transition.
-                    provenance="session_seed",
-                    created_at=datetime(2026, 1, 1, tzinfo=UTC),
-                )
-            )
-            conn.execute(
-                runs_table.insert().values(
-                    id=run_id,
-                    session_id=session_id_str,
-                    state_id=state_id,
-                    status="pending",
-                    started_at=datetime(2026, 1, 1, tzinfo=UTC),
-                    rows_processed=0,
-                    rows_failed=0,
-                )
-            )
-            # Deliberately NO blob_run_links row — simulating the pre-link window
+        # Source references this blob via blob_ref — the run is about to link
+        # it once link_blob_to_run() fires. Deliberately NO blob_run_links row,
+        # so this pins the composition-state guard rather than the
+        # explicit-link guard that would short-circuit it.
+        await _seed_active_run(
+            db_engine,
+            session_id,
+            source={
+                "plugin": "csv",
+                "on_success": "output",
+                "on_validation_failure": "quarantine",
+                "options": {"blob_ref": str(record.id), "path": str(record.storage_path)},
+            },
+        )
 
         with pytest.raises(BlobActiveRunError):
             await blob_service.delete_blob(record.id)
@@ -1003,11 +1028,6 @@ class TestDeleteBlob:
         with no blob_ref.  The scoped guard checks the composition state's
         source.options.blob_ref and only blocks if it matches this blob.
         """
-        from elspeth.web.sessions.models import (
-            composition_states_table,
-            runs_table,
-        )
-
         record = await blob_service.create_blob(
             session_id=session_id,
             filename="unrelated.csv",
@@ -1016,49 +1036,18 @@ class TestDeleteBlob:
             created_by="user",
         )
 
-        state_id = str(uuid4())
-        session_id_str = str(session_id)
-        run_id = str(uuid4())
-
-        with db_engine.begin() as conn:
-            conn.execute(
-                composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    # Source uses file path, NOT blob_ref — run is unrelated
-                    # to the blob being deleted.
-                    source={
-                        "plugin": "csv",
-                        "on_success": "output",
-                        "on_validation_failure": "quarantine",
-                        "options": {"path": "/data/external/other.csv"},
-                    },
-                    nodes=[],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
-                    is_valid=True,
-                    # Plan §2294: every test-side direct composition_states
-                    # insert must supply provenance after Task 3's CHECK
-                    # constraint. ``session_seed`` is the broadened-semantics
-                    # default for setup-only rows that don't model a real
-                    # compose-loop transition.
-                    provenance="session_seed",
-                    created_at=datetime(2026, 1, 1, tzinfo=UTC),
-                )
-            )
-            conn.execute(
-                runs_table.insert().values(
-                    id=run_id,
-                    session_id=session_id_str,
-                    state_id=state_id,
-                    status="pending",
-                    started_at=datetime(2026, 1, 1, tzinfo=UTC),
-                    rows_processed=0,
-                    rows_failed=0,
-                )
-            )
+        # Source uses a file path, NOT blob_ref — the run is unrelated to the
+        # blob being deleted.
+        await _seed_active_run(
+            db_engine,
+            session_id,
+            source={
+                "plugin": "csv",
+                "on_success": "output",
+                "on_validation_failure": "quarantine",
+                "options": {"path": "/data/external/other.csv"},
+            },
+        )
 
         # Should succeed — active run does not reference this blob
         await blob_service.delete_blob(record.id)
@@ -1069,10 +1058,6 @@ class TestDeleteBlob:
     @pytest.mark.asyncio
     async def test_delete_blob_rejects_when_transform_option_references_blob(self, blob_service, session_id, db_engine) -> None:
         """Pre-link guard walks canonical pipeline sections beyond source.options."""
-        from elspeth.web.sessions.models import (
-            composition_states_table,
-            runs_table,
-        )
 
         record = await blob_service.create_blob(
             session_id=session_id,
@@ -1082,58 +1067,33 @@ class TestDeleteBlob:
             created_by="user",
         )
 
-        state_id = str(uuid4())
-        session_id_str = str(session_id)
-        run_id = str(uuid4())
-
-        with db_engine.begin() as conn:
-            conn.execute(
-                composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    source={
-                        "plugin": "csv",
-                        "on_success": "classify",
-                        "on_validation_failure": "quarantine",
-                        "options": {"path": "/data/external/other.csv"},
-                    },
-                    nodes=[
-                        {
-                            "id": "classify",
-                            "node_type": "transform",
-                            "plugin": "llm",
-                            "input": "source_out",
-                            "on_success": "output",
-                            "on_error": "discard",
-                            "options": {
-                                "system_prompt": {
-                                    "blob_ref": str(record.id),
-                                    "mode": "inline_content",
-                                    "sha256": record.content_hash,
-                                }
-                            },
+        await _seed_active_run(
+            db_engine,
+            session_id,
+            source={
+                "plugin": "csv",
+                "on_success": "classify",
+                "on_validation_failure": "quarantine",
+                "options": {"path": "/data/external/other.csv"},
+            },
+            nodes=[
+                {
+                    "id": "classify",
+                    "node_type": "transform",
+                    "plugin": "llm",
+                    "input": "source_out",
+                    "on_success": "output",
+                    "on_error": "discard",
+                    "options": {
+                        "system_prompt": {
+                            "blob_ref": str(record.id),
+                            "mode": "inline_content",
+                            "sha256": record.content_hash,
                         }
-                    ],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
-                    is_valid=True,
-                    provenance="session_seed",
-                    created_at=datetime(2026, 1, 1, tzinfo=UTC),
-                )
-            )
-            conn.execute(
-                runs_table.insert().values(
-                    id=run_id,
-                    session_id=session_id_str,
-                    state_id=state_id,
-                    status="pending",
-                    started_at=datetime(2026, 1, 1, tzinfo=UTC),
-                    rows_processed=0,
-                    rows_failed=0,
-                )
-            )
+                    },
+                }
+            ],
+        )
 
         with pytest.raises(BlobActiveRunError):
             await blob_service.delete_blob(record.id)
@@ -1146,11 +1106,6 @@ class TestDeleteBlob:
         options.path (no blob_ref).  The guard must check path/file matches
         in addition to blob_ref.
         """
-        from elspeth.web.sessions.models import (
-            composition_states_table,
-            runs_table,
-        )
-
         record = await blob_service.create_blob(
             session_id=session_id,
             filename="path-backed.csv",
@@ -1159,48 +1114,17 @@ class TestDeleteBlob:
             created_by="user",
         )
 
-        state_id = str(uuid4())
-        session_id_str = str(session_id)
-        run_id = str(uuid4())
-
-        with db_engine.begin() as conn:
-            conn.execute(
-                composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    # Source references this blob via path, NOT blob_ref.
-                    source={
-                        "plugin": "csv",
-                        "on_success": "output",
-                        "on_validation_failure": "quarantine",
-                        "options": {"path": record.storage_path},
-                    },
-                    nodes=[],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
-                    is_valid=True,
-                    # Plan §2294: every test-side direct composition_states
-                    # insert must supply provenance after Task 3's CHECK
-                    # constraint. ``session_seed`` is the broadened-semantics
-                    # default for setup-only rows that don't model a real
-                    # compose-loop transition.
-                    provenance="session_seed",
-                    created_at=datetime(2026, 1, 1, tzinfo=UTC),
-                )
-            )
-            conn.execute(
-                runs_table.insert().values(
-                    id=run_id,
-                    session_id=session_id_str,
-                    state_id=state_id,
-                    status="pending",
-                    started_at=datetime(2026, 1, 1, tzinfo=UTC),
-                    rows_processed=0,
-                    rows_failed=0,
-                )
-            )
+        # Source references this blob via path, NOT blob_ref.
+        await _seed_active_run(
+            db_engine,
+            session_id,
+            source={
+                "plugin": "csv",
+                "on_success": "output",
+                "on_validation_failure": "quarantine",
+                "options": {"path": record.storage_path},
+            },
+        )
 
         with pytest.raises(BlobActiveRunError):
             await blob_service.delete_blob(record.id)
@@ -1258,6 +1182,109 @@ class TestDeleteBlob:
 
         with pytest.raises(BlobNotFoundError):
             await blob_service.get_blob(record.id)
+
+    @pytest.mark.asyncio
+    async def test_delete_blob_rejects_a_blob_the_real_writer_referenced_from_a_source(self, blob_service, session_id, db_engine) -> None:
+        """The active-run guard must read the shape production actually writes.
+
+        Every other test in this class hand-seeds ``composition_states`` with a
+        populated ``source`` column holding a bare (un-enveloped) mapping. No
+        production writer has emitted that shape since ``f0fd36087`` (2026-05):
+        ``save_composition_state`` folds ``source`` into ``sources`` and stores
+        every JSON column wrapped as ``{"_version": 1, "data": ...}``. Those
+        tests therefore pass against a row the database never contains, which
+        is how ``elspeth-3db5745ba7`` stayed green while production 500'd.
+
+        This test seeds through the real writer, so it is sensitive to both
+        halves of that defect, which fail in OPPOSITE directions:
+
+        * **Prong 1, fail-closed.** Passing the enveloped columns straight into
+          ``CompositionStateRecord`` makes ``pipeline_dict_from_record`` index a
+          ``{"_version": ...}`` dict — ``TypeError: string indices must be
+          integers``, surfacing as a 500 on every delete/replace under a
+          pending or running run.
+        * **Prong 2, fail-open.** ``_ACTIVE_RUN_COMPOSITION_COLUMNS`` selected
+          ``source`` (always NULL) and never selected ``sources`` (the real
+          payload), so once prong 1 stops raising, the guard walks a
+          source-less pipeline dict, ``_composition_references_blob`` returns
+          ``False``, and a blob referenced *only* from a source's options is
+          DELETED under an active run.
+
+        Repairing prong 1 alone therefore downgrades loud-wrong to
+        silently-wrong. This test fails in both of those states and passes only
+        when both are fixed: unrepaired it raises ``TypeError`` instead of
+        ``BlobActiveRunError``; prong-1-only it raises nothing at all and the
+        blob is gone.
+        """
+        from elspeth.web.sessions.models import composition_states_table, runs_table
+        from elspeth.web.sessions.protocol import CompositionStateData
+        from elspeth.web.sessions.service import SessionServiceImpl
+        from elspeth.web.sessions.telemetry import build_sessions_telemetry
+
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="real-writer.csv",
+            content=b"important",
+            mime_type="text/csv",
+            created_by="user",
+        )
+
+        sessions = SessionServiceImpl(
+            db_engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test"),
+        )
+        state = await sessions.save_composition_state(
+            session_id,
+            CompositionStateData(
+                source={
+                    "plugin": "csv",
+                    "on_success": "output",
+                    "on_validation_failure": "quarantine",
+                    "options": {"blob_ref": str(record.id), "path": str(record.storage_path)},
+                },
+                nodes=[],
+                edges=[],
+                outputs=[],
+                metadata_={"name": "Test", "description": ""},
+                is_valid=True,
+            ),
+            provenance="session_seed",
+        )
+
+        # NON-VACUITY PRECONDITION. Assert the writer really produced the shape
+        # this test exists to exercise, so the test cannot quietly degrade into
+        # yet another hand-seeded row that proves nothing.
+        with db_engine.begin() as conn:
+            stored = conn.execute(select(composition_states_table).where(composition_states_table.c.id == str(state.id))).first()
+        assert stored is not None
+        assert stored.source is None, "production writes the legacy singular `source` column as NULL; the guard must not read it"
+        assert isinstance(stored.sources, dict) and stored.sources.get("_version") == 1, (
+            f"production wraps `sources` in a _version envelope; got {stored.sources!r}"
+        )
+        assert str(record.id) in json.dumps(stored.sources), "the blob_ref must live inside the enveloped `sources` payload"
+
+        with db_engine.begin() as conn:
+            conn.execute(
+                runs_table.insert().values(
+                    id=str(uuid4()),
+                    session_id=str(session_id),
+                    state_id=str(state.id),
+                    status="pending",
+                    started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    rows_processed=0,
+                    rows_failed=0,
+                )
+            )
+            # Deliberately NO blob_run_links row: this pins the composition-state
+            # guard, not the explicit-link guard that would short-circuit it.
+
+        with pytest.raises(BlobActiveRunError):
+            await blob_service.delete_blob(record.id)
+
+        # The fail-open half, stated as an outcome rather than inferred from the
+        # raise: a refused delete must leave the blob readable.
+        assert await blob_service.get_blob(record.id) is not None
 
 
 # ---------------------------------------------------------------------------

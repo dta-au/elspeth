@@ -85,6 +85,7 @@ from elspeth.web.secrets.wiring_policy import (
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from elspeth.web.sessions.state_envelope import envelope_state_column
 
 
 def _attached_notes(exc: BaseException) -> tuple[str, ...]:
@@ -5732,11 +5733,19 @@ class TestDeleteBlobActiveRunGuard:
                     id=state_id,
                     session_id=self.session_id,
                     version=1,
-                    source=source,
-                    nodes=[],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
+                    # Production shape, not the pre-2026-05 one. Since
+                    # f0fd36087 every writer folds `source` into
+                    # `sources={"source": ...}` and wraps each JSON column
+                    # through the one envelope rule, so the active-run guard
+                    # this fixture pins must be exercised against that shape --
+                    # seeding a populated, bare `source` is what let
+                    # elspeth-3db5745ba7 stay green while production 500'd.
+                    source=None,
+                    sources=envelope_state_column({"source": source}),
+                    nodes=envelope_state_column([]),
+                    edges=envelope_state_column([]),
+                    outputs=envelope_state_column([]),
+                    metadata_=envelope_state_column({"name": "Test", "description": ""}),
                     is_valid=False,
                     validation_errors=None,
                     # Plan §2294: composer-tools test fixture; provenance
@@ -15591,11 +15600,19 @@ class TestUpdateBlobActiveRunGuard:
                     id=state_id,
                     session_id=self.session_id,
                     version=1,
-                    source=source,
-                    nodes=[],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
+                    # Production shape, not the pre-2026-05 one. Since
+                    # f0fd36087 every writer folds `source` into
+                    # `sources={"source": ...}` and wraps each JSON column
+                    # through the one envelope rule, so the active-run guard
+                    # this fixture pins must be exercised against that shape --
+                    # seeding a populated, bare `source` is what let
+                    # elspeth-3db5745ba7 stay green while production 500'd.
+                    source=None,
+                    sources=envelope_state_column({"source": source}),
+                    nodes=envelope_state_column([]),
+                    edges=envelope_state_column([]),
+                    outputs=envelope_state_column([]),
+                    metadata_=envelope_state_column({"name": "Test", "description": ""}),
                     is_valid=False,
                     validation_errors=None,
                     # Plan §2294: composer-tools test fixture; provenance
