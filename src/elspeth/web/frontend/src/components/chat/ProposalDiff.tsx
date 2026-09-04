@@ -91,6 +91,29 @@ function outputSummaryFromArgs(args: Record<string, unknown>): string | null {
   return `${name} (${plugin})`;
 }
 
+/**
+ * Records that a projection SKIPPED a comparison rather than performing it.
+ *
+ * The distinction is load-bearing on an approval surface. An empty entry list
+ * can mean two different things, and only one of them is "nothing changed":
+ *
+ *   * every provided key was compared and matched — a real no-difference; or
+ *   * some keys could not be compared at all, because the redactor replaced
+ *     their values with shape summaries before this view ever saw them.
+ *
+ * A `set_pipeline` whose ONLY change is plugin options produces a payload
+ * byte-identical to one that changes nothing — only `entry_count` and the
+ * value-shape counts survive redaction. Rendering the unconditional sentence
+ * "No difference from the current pipeline." for that case is an affirmative
+ * false claim, and worse than the false "Changed" rows it replaced, because it
+ * positively asserts safety. This ledger is what lets the empty state say
+ * which of the two it is — the module's own "no projection, not no change"
+ * contract (top of file) applied to the empty-list case.
+ */
+interface ComparisonLedger {
+  skippedRedactedOptions: boolean;
+}
+
 function upsertEntry(
   section: DiffSection,
   identity: string,
@@ -269,6 +292,7 @@ function metadataPatchEntries(
 function setPipelineEntries(
   current: CompositionState,
   args: Record<string, unknown>,
+  ledger: ComparisonLedger,
 ): DiffEntry[] {
   const entries: DiffEntry[] = [];
 
@@ -302,7 +326,9 @@ function setPipelineEntries(
     const afterSummary = sourceSummaryFromArgs(name, after) ?? name;
     if (before === undefined) {
       entries.push(upsertEntry("source", name, undefined, null, afterSummary, after));
-    } else if (providedKeysDiffer(before as unknown as Record<string, unknown>, after)) {
+    } else if (
+      providedKeysDiffer(before as unknown as Record<string, unknown>, after, new Map(), ledger)
+    ) {
       entries.push(upsertEntry("source", name, before, sourceEntrySummary([name, before]), afterSummary, after));
     }
   }
@@ -317,6 +343,7 @@ function setPipelineEntries(
       (item) => asString(item.id),
       (item) => nodeSummaryFromArgs(item) ?? "node",
       new Map([["id", "id"]]),
+      ledger,
     ),
     ...replaceCollectionEntries<EdgeSpec>(
       "edge",
@@ -327,6 +354,7 @@ function setPipelineEntries(
       (item) => asString(item.id),
       (item) => edgeSummaryFromArgs(item) ?? "edge",
       new Map([["id", "id"]]),
+      ledger,
     ),
     ...replaceCollectionEntries<OutputSpec>(
       "output",
@@ -339,6 +367,7 @@ function setPipelineEntries(
       // set_pipeline output args key their identity as sink_name; the state
       // spec calls the same field name.
       new Map([["sink_name", "name"]]),
+      ledger,
     ),
   );
   return entries;
@@ -361,12 +390,18 @@ function setPipelineEntries(
 function providedKeysDiffer(
   before: Record<string, unknown>,
   provided: Record<string, unknown>,
-  keyAliases: Map<string, string> = new Map(),
+  keyAliases: Map<string, string>,
+  ledger: ComparisonLedger,
 ): boolean {
   for (const [key, value] of Object.entries(provided)) {
     const beforeKey = keyAliases.get(key) ?? key;
     if (!(beforeKey in before)) continue;
-    if (isRedactedOptionSummary(value)) continue;
+    if (isRedactedOptionSummary(value)) {
+      // Record the blind spot. An empty result must not be reported as "no
+      // difference" when a key was never compared — see ComparisonLedger.
+      ledger.skippedRedactedOptions = true;
+      continue;
+    }
     if (stableStringify(before[beforeKey]) !== stableStringify(value)) {
       return true;
     }
@@ -383,6 +418,7 @@ function replaceCollectionEntries<T>(
   proposedIdentityOf: (item: Record<string, unknown>) => string | null,
   proposedSummarize: (item: Record<string, unknown>) => string,
   keyAliases: Map<string, string>,
+  ledger: ComparisonLedger,
 ): DiffEntry[] {
   const entries: DiffEntry[] = [];
   const proposedById = new Map<string, Record<string, unknown>>();
@@ -412,7 +448,7 @@ function replaceCollectionEntries<T>(
       entries.push(upsertEntry(section, identity, undefined, null, proposedSummarize(after), after));
       continue;
     }
-    if (providedKeysDiffer(before as Record<string, unknown>, after, keyAliases)) {
+    if (providedKeysDiffer(before as Record<string, unknown>, after, keyAliases, ledger)) {
       entries.push(
         upsertEntry(section, identity, before, summarize(before), proposedSummarize(after), after),
       );
@@ -421,19 +457,45 @@ function replaceCollectionEntries<T>(
   return entries;
 }
 
+/** A projection plus what it could not compare. See ComparisonLedger. */
+export interface ProposalDiffResult {
+  entries: DiffEntry[];
+  /**
+   * At least one key was skipped because its proposed value arrived as a
+   * redacted option summary. An empty `entries` with this set means "nothing
+   * comparable differs", NOT "nothing differs" — the renderer must not claim
+   * the latter.
+   */
+  optionValuesNotCompared: boolean;
+}
+
 /**
  * Project a mutating proposal's arguments onto before/after diff entries
  * against the current composition state.
  *
  * Returns null when no structured projection exists — unknown tool, malformed
  * arguments, or no current state to diff against. Callers fall back to the
- * structured argument-field rendering. Returns [] when a projection exists
- * but finds nothing to report (e.g. a patch whose keys are all no-ops).
+ * structured argument-field rendering. Returns an empty `entries` when a
+ * projection exists but finds nothing to report (e.g. a patch whose keys are
+ * all no-ops) — read `optionValuesNotCompared` before calling that "no
+ * difference".
  */
 export function buildProposalDiff(
   toolName: string,
   args: Record<string, unknown>,
   currentState: CompositionState | null,
+): ProposalDiffResult | null {
+  const ledger: ComparisonLedger = { skippedRedactedOptions: false };
+  const entries = projectEntries(toolName, args, currentState, ledger);
+  if (entries === null) return null;
+  return { entries, optionValuesNotCompared: ledger.skippedRedactedOptions };
+}
+
+function projectEntries(
+  toolName: string,
+  args: Record<string, unknown>,
+  currentState: CompositionState | null,
+  ledger: ComparisonLedger,
 ): DiffEntry[] | null {
   if (currentState === null) return null;
 
@@ -558,7 +620,7 @@ export function buildProposalDiff(
       return optionPatchEntries(name, fragment.options, args.patch);
     }
     case "set_pipeline": {
-      return setPipelineEntries(currentState, args);
+      return setPipelineEntries(currentState, args, ledger);
     }
     default:
       return null;
@@ -566,21 +628,31 @@ export function buildProposalDiff(
 }
 
 interface ProposalChangesProps {
-  entries: DiffEntry[];
+  diff: ProposalDiffResult;
 }
 
 /**
  * Renders projected proposal diff entries with the shared recovery-diff row
  * styling. The caller (ToolCallCard) owns the derivability/staleness gate and
- * passes only entries it already computed.
+ * passes only a projection it already computed.
+ *
+ * The empty state has TWO forms, and picking the wrong one is a false claim on
+ * a human approval gate. "No difference from the current pipeline." is only
+ * honest when every provided key was actually compared. When option values
+ * were skipped, the same empty list means the comparison could not be made —
+ * a set_pipeline that changes only plugin options is byte-identical, after
+ * redaction, to one that changes nothing.
  */
-export function ProposalChanges({ entries }: ProposalChangesProps) {
+export function ProposalChanges({ diff }: ProposalChangesProps) {
+  const { entries, optionValuesNotCompared } = diff;
   return (
     <div className="proposal-diff" data-testid="proposal-diff">
       <div className="proposal-diff-heading">Proposed changes</div>
       {entries.length === 0 ? (
         <p className="proposal-diff-empty">
-          No difference from the current pipeline.
+          {optionValuesNotCompared
+            ? "No difference in what this view can compare. Plugin option values are redacted, so a change to them would not appear here."
+            : "No difference from the current pipeline."}
         </p>
       ) : (
         <ul className="recovery-diff-list proposal-diff-list">

@@ -274,6 +274,26 @@
       },
       "tool": "set_pipeline"
     },
+    "set_source_with_options": {
+      "arguments": {
+        "on_success": "rows",
+        "on_validation_failure": "discard",
+        "options": {
+          "delimiter": ",",
+          "path": "in.csv"
+        },
+        "plugin": "csv"
+      },
+      "redacted": {
+        "description": null,
+        "on_success": "rows",
+        "on_validation_failure": "discard",
+        "options": "{\"_option_shape\":\"mapping\",\"entry_count\":2,\"value_shape_counts\":{\"mapping\":0,\"scalar\":2,\"sequence\":0,\"set\":0}}",
+        "plugin": "csv",
+        "source_name": "source"
+      },
+      "tool": "set_source"
+    },
     "upsert_node_with_options": {
       "arguments": {
         "id": "extract",

@@ -181,7 +181,7 @@ export function ToolCallCard({
           per-argument fields. The raw JSON stays available behind the
           details expander below in both cases. */}
       {diffEntries !== null ? (
-        <ProposalChanges entries={diffEntries} />
+        <ProposalChanges diff={diffEntries} />
       ) : (
         <ArgumentFields args={proposal.arguments_redacted_json} />
       )}

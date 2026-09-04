@@ -26,7 +26,13 @@ from typing import Any
 
 import pytest
 
-from elspeth.web.composer.redaction import redact_tool_call_arguments
+from elspeth.web.composer.redaction import (
+    MANIFEST,
+    ToolRedaction,
+    _SensitiveMarker,
+    redact_tool_call_arguments,
+    walk_model_schema,
+)
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 
 # ``__file__`` is ``<project_root>/tests/unit/web/composer/<this file>``.
@@ -69,25 +75,90 @@ def test_recorded_redaction_matches_the_live_redactor(case_name: str) -> None:
     )
 
 
-def test_fixture_covers_every_tool_the_proposal_diff_projects() -> None:
-    """The projection's tool arms each have at least one recorded payload.
-
-    ProposalDiff.tsx switches on the tool name; an arm with no recorded
-    payload is an arm whose live shape nothing verifies, which is exactly the state
-    elspeth-b1c14dd3c2 was filed for. `set_source`, `clear_source`,
-    `remove_node`, `upsert_edge`, `remove_edge` and `remove_output` are
-    deliberately absent: they carry no summarized argument, so their live
-    shape is the shape the frontend already builds.
-    """
-    tools_recorded = {case["tool"] for case in _cases().values()}
-
-    assert {
+# The tools ProposalDiff.tsx's `switch (toolName)` projects. Hand-maintained:
+# the frontend switch is the authority and Python cannot read it, so a new arm
+# there means a line here. Everything ELSE about coverage is derived below
+# rather than asserted, because the first version of this guard hard-coded
+# which tools "carry no summarized argument" and was wrong about `set_source`
+# — a coverage claim resting on an untrue statement about the producer, which
+# is the very defect class this file exists to prevent.
+PROJECTED_TOOLS = frozenset(
+    {
+        "set_source",
+        "clear_source",
+        "upsert_node",
+        "remove_node",
+        "upsert_edge",
+        "remove_edge",
+        "set_output",
+        "remove_output",
+        "set_metadata",
         "patch_source_options",
         "patch_node_options",
         "patch_output_options",
-        "set_metadata",
         "set_pipeline",
-    } <= tools_recorded
+    }
+)
+
+
+def _summarizes_an_argument(entry: ToolRedaction) -> bool:
+    """Does this manifest entry replace any ARGUMENT with a summary?
+
+    Mirrors the two manifest shapes (``ToolRedaction`` invariant: exactly one).
+    Deliberately argument-only — a tool that summarizes only its RESPONSE
+    changes nothing about the payload the proposal card renders.
+    """
+    if entry.argument_model is not None:
+        return any(
+            any(isinstance(marker, _SensitiveMarker) for marker in node.metadata) for node in walk_model_schema(entry.argument_model)
+        )
+    assert entry.policy is not None  # ToolRedaction invariant
+    return bool(entry.policy.sensitive_argument_keys)
+
+
+def test_fixture_records_every_projected_tool_whose_arguments_are_summarized() -> None:
+    """Coverage derived from the live MANIFEST, not from a hand-written list.
+
+    A projected tool whose redaction summarizes an argument is a tool whose
+    live payload differs from anything a frontend test would hand-build — the
+    exact gap elspeth-b1c14dd3c2 was filed for. Which tools those are is read
+    off the manifest here, so adding a Sensitive argument to any projected
+    tool fails this test until the fixture records it.
+    """
+    tools_recorded = {case["tool"] for case in _cases().values()}
+    must_record = {name for name, entry in MANIFEST.items() if name in PROJECTED_TOOLS and _summarizes_an_argument(entry)}
+
+    assert must_record, "manifest introspection found nothing — the derivation is broken"
+    missing = must_record - tools_recorded
+    assert not missing, (
+        f"Projected tools whose arguments are summarized but have no fixture case: {sorted(missing)}. Add them to CASES. {REGENERATE_HINT}"
+    )
+
+
+def test_uncovered_projected_tools_really_do_carry_no_summarized_argument() -> None:
+    """The other half of the claim, made executable rather than asserted.
+
+    A projected tool absent from the fixture is only safe to omit if its live
+    argument shape is the shape a frontend test already builds — i.e. nothing
+    is summarized. The original docstring asserted that about `set_source` and
+    was wrong: `set_source.options` goes through the same
+    ``_summarize_set_source_options`` as `upsert_node` and `set_output`.
+    """
+    tools_recorded = {case["tool"] for case in _cases().values()}
+    omitted = PROJECTED_TOOLS - tools_recorded
+
+    wrongly_omitted = {name for name in omitted if name in MANIFEST and _summarizes_an_argument(MANIFEST[name])}
+    assert not wrongly_omitted, (
+        f"These projected tools are absent from the fixture but DO summarize an "
+        f"argument, so their live shape is unverified: {sorted(wrongly_omitted)}. "
+        f"{REGENERATE_HINT}"
+    )
+
+
+def test_projected_tools_all_exist_in_the_manifest() -> None:
+    """PROJECTED_TOOLS is hand-maintained; catch a typo or a renamed tool."""
+    unknown = PROJECTED_TOOLS - set(MANIFEST)
+    assert not unknown, f"PROJECTED_TOOLS names tools absent from MANIFEST: {sorted(unknown)}"
 
 
 def test_every_summarized_argument_is_recorded_as_a_string() -> None:

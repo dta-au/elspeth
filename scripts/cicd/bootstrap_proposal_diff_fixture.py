@@ -130,7 +130,20 @@ CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
     ("set_metadata_no_arguments", "set_metadata", {}),
     # --- the identity-bearing arms, which DO survive redaction -------------
     # Pinned so a future redaction change that starts summarizing `plugin` or
-    # `id` fails here instead of silently emptying the proposal card.
+    # `id` fails here instead of silently emptying the proposal card. All
+    # three route `options` through the SAME summarizer the patch tools use,
+    # so they belong in the corpus even though their projections read only the
+    # identity keys.
+    (
+        "set_source_with_options",
+        "set_source",
+        {
+            "plugin": "csv",
+            "options": {"path": "in.csv", "delimiter": ","},
+            "on_success": "rows",
+            "on_validation_failure": "discard",
+        },
+    ),
     (
         "upsert_node_with_options",
         "upsert_node",
