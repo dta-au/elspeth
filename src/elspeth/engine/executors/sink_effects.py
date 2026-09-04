@@ -491,6 +491,10 @@ class SinkEffectCoordinator:
             if self._make_shutdown_error is None:
                 raise InterruptedError("shutdown requested during sink-effect lease wait")
             raise self._make_shutdown_error()
+        self._guard_external_effect()
+
+    def _guard_external_effect(self) -> None:
+        """Poll caller authority immediately before an external-effect cohort."""
         if self._check_coordination_latch is not None:
             self._check_coordination_latch()
 
@@ -624,6 +628,7 @@ class SinkEffectCoordinator:
             # Repair a spool-lost staged body from durable inputs before the
             # commit attempt opens; a failed re-derivation is a local
             # precondition failure and must not accrete attempt rows.
+            self._guard_external_effect()
             cast("_RestagingSinkEffectAdapter", sink).restage_effect(
                 plan,
                 cast("SinkEffectPipelineMembersInput", request.effect_input),
@@ -800,6 +805,7 @@ class SinkEffectCoordinator:
         lease: SinkEffectLease,
         heartbeat: _SinkEffectLeaseHeartbeat,
     ) -> tuple[SinkEffectReconcileResult, SinkEffectAttempt]:
+        self._guard_external_effect()
         attempt = self._effects.begin_attempt(
             SinkEffectAttemptRequest(
                 effect_id=plan.effect_id,
@@ -810,6 +816,7 @@ class SinkEffectCoordinator:
                 request_hash=self._member_reconcile_request_hash(plan, member),
             )
         )
+        self._guard_external_effect()
         started = time.monotonic()
         try:
             result = sink.reconcile_member_effect(plan, member, effect_input, ctx)
@@ -836,6 +843,7 @@ class SinkEffectCoordinator:
         lease: SinkEffectLease,
         heartbeat: _SinkEffectLeaseHeartbeat,
     ) -> tuple[SinkEffectCommitResult, SinkEffectAttempt]:
+        self._guard_external_effect()
         attempt = self._effects.begin_attempt(
             SinkEffectAttemptRequest(
                 effect_id=plan.effect_id,
@@ -847,6 +855,7 @@ class SinkEffectCoordinator:
             )
         )
         self._fault(SinkEffectExecutionSeam.BEFORE_EFFECT)
+        self._guard_external_effect()
         started = time.monotonic()
         try:
             result = sink.commit_member_effect(plan, member, effect_input, ctx)
@@ -1018,6 +1027,7 @@ class SinkEffectCoordinator:
             return
         for member in effect_input.members:
             content = canonical_json(deep_thaw(member.row)).encode("utf-8")
+            self._guard_external_effect()
             content_hash = store.store(content)
             if content_hash != member.payload_hash:
                 raise LandscapeRecordError("sink effect payload store returned a divergent member content hash")
@@ -1026,6 +1036,7 @@ class SinkEffectCoordinator:
         store = self._factory.payload_store
         if store is None:
             raise LandscapeRecordError("replacing sink effect recovery requires the configured payload store")
+        self._guard_external_effect()
         content = store.retrieve(durable.payload_hash)
         try:
             row = json.loads(content)
@@ -1107,6 +1118,7 @@ class SinkEffectCoordinator:
             if returned_inspection is not None:
                 inspection, _attempt = returned_inspection
             else:
+                self._guard_external_effect()
                 inspection_attempt = self._effects.begin_attempt(
                     SinkEffectAttemptRequest(
                         effect_id=effect.effect_id,
@@ -1117,6 +1129,7 @@ class SinkEffectCoordinator:
                         request_hash=request_hash,
                     )
                 )
+                self._guard_external_effect()
                 started = time.monotonic()
                 try:
                     inspection = sink.inspect_effect(inspection_request, ctx)
@@ -1137,6 +1150,7 @@ class SinkEffectCoordinator:
                 effect_input=request.effect_input,  # type: ignore[arg-type]
                 inspection=inspection,
             )
+            self._guard_external_effect()
             plan = sink.prepare_effect(prepare_request, ctx)
             prepare_request.validate_plan(plan)
         finally:
@@ -1233,6 +1247,7 @@ class SinkEffectCoordinator:
         if returned is not None:
             result, attempt = returned
             return result, attempt.attempt_id
+        self._guard_external_effect()
         attempt = self._effects.begin_attempt(
             SinkEffectAttemptRequest(
                 effect_id=plan.effect_id,
@@ -1243,6 +1258,7 @@ class SinkEffectCoordinator:
                 request_hash=request_hash,
             )
         )
+        self._guard_external_effect()
         started = time.monotonic()
         try:
             result = sink.reconcile_effect(plan, ctx)
@@ -1268,6 +1284,7 @@ class SinkEffectCoordinator:
         heartbeat: _SinkEffectLeaseHeartbeat,
     ) -> tuple[SinkEffectCommitResult, str]:
         request_hash = self._commit_request_hash(plan)
+        self._guard_external_effect()
         attempt = self._effects.begin_attempt(
             SinkEffectAttemptRequest(
                 effect_id=plan.effect_id,
@@ -1279,6 +1296,7 @@ class SinkEffectCoordinator:
             )
         )
         self._fault(SinkEffectExecutionSeam.BEFORE_EFFECT)
+        self._guard_external_effect()
         started = time.monotonic()
         try:
             result = sink.commit_effect(plan, ctx)

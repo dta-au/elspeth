@@ -80,6 +80,7 @@ class _FailingService:
         *,
         writer_principal: str,
         composition_state_id: UUID | None = None,
+        **_fenced_kwargs: object,
     ) -> None:
         raise self.raise_on_call
 

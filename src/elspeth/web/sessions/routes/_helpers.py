@@ -42,6 +42,7 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerP
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, GuidedCustodyIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.core.dag.models import GraphValidationError
@@ -1700,6 +1701,8 @@ async def _persist_tool_invocations(
     *,
     parent_assistant_id: UUID | None = None,
     plugin_crash_pending: bool,
+    session_operation_context: SessionOperationContext | None = None,
+    session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
 ) -> tuple[PipelineDispatchAuditBinding, ...]:
     """Persist per-tool-call audit records, splitting role by parent presence.
 
@@ -1787,6 +1790,8 @@ async def _persist_tool_invocations(
             tuple(drafts),
             composition_state_id=composition_state_id,
             writer_principal="compose_loop",
+            session_operation_context=session_operation_context,
+            session_operation_kind=session_operation_kind,
         )
     except SQLAlchemyError as save_err:
         if plugin_crash_pending:
@@ -1846,6 +1851,7 @@ async def _persist_llm_calls(
     composition_state_id: UUID | None,
     *,
     plugin_crash_pending: bool,
+    session_operation_context: SessionOperationContext | None = None,
 ) -> None:
     """Persist per-LLM-call audit records as audit-only ``role=audit`` rows.
 
@@ -1881,6 +1887,7 @@ async def _persist_llm_calls(
             drafts,
             composition_state_id=composition_state_id,
             writer_principal="compose_loop",
+            session_operation_context=session_operation_context,
         )
     except SQLAlchemyError as save_err:
         if plugin_crash_pending:
@@ -2757,6 +2764,7 @@ async def _handle_convergence_error(
     plugin_snapshot: PluginAvailabilitySnapshot,
     profile_registry: OperatorProfileRegistry,
     catalog: CatalogServiceProtocol,
+    session_operation_context: SessionOperationContext,
 ) -> dict[str, object]:
     """Build 422 response body and persist partial state for convergence errors.
 
@@ -2856,6 +2864,7 @@ async def _handle_convergence_error(
                 session_id,
                 state_data,
                 provenance="convergence_persist",
+                session_operation_context=session_operation_context,
             )
             persisted_state_id = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
@@ -2927,6 +2936,7 @@ async def _handle_plugin_crash(
     plugin_snapshot: PluginAvailabilitySnapshot,
     profile_registry: OperatorProfileRegistry,
     catalog: CatalogServiceProtocol,
+    session_operation_context: SessionOperationContext,
 ) -> dict[str, object]:
     """Build 500 response body and persist partial state for plugin crashes.
 
@@ -3013,6 +3023,7 @@ async def _handle_plugin_crash(
                 session_id,
                 state_data,
                 provenance="plugin_crash_persist",
+                session_operation_context=session_operation_context,
             )
             persisted_state_id_pc = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
@@ -3093,6 +3104,7 @@ async def _handle_runtime_preflight_failure(
     plugin_snapshot: PluginAvailabilitySnapshot,
     profile_registry: OperatorProfileRegistry,
     catalog: CatalogServiceProtocol,
+    session_operation_context: SessionOperationContext,
 ) -> dict[str, object]:
     """Build 500 response body and persist partial state for runtime-preflight failures.
 
@@ -3258,6 +3270,7 @@ async def _handle_runtime_preflight_failure(
                 session_id,
                 state_data,
                 provenance="preflight_persist",
+                session_operation_context=session_operation_context,
             )
             persisted_state_id_rpf = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)

@@ -1,7 +1,7 @@
 """SQLAlchemy Core table definitions for the session database.
 
-Tables: sessions, chat_messages, composition_states, runs, blobs,
-blob_run_links, blob_inline_resolutions, user_secrets.
+Tables include session content plus epoch-44 web coordination authority,
+run-start, transient handoff, rate-limit, and cleanup state.
 
 Current schema bootstrap lives in ``sessions/schema.py``. Pre-release
 session databases are created from this metadata and stale runtime DBs
@@ -252,7 +252,33 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        composition state current at rejection. Operator ruling 2026-09-02:
 #        session data, not Landscape data. New table ships by DB recreation
 #        (sessions.db only — auth.db is never touched).
-#   50 → pluggable SSO (elspeth-07cd19ba73, spec
+#   50 -> ``ck_proposal_events_type`` widened with ``proposal.rebased``
+#        (elspeth-ed67eb9d0d): a guided settlement that carries a pending
+#        proposal across the checkpoint it writes must re-pin the
+#        proposal's forward-declared base, and that rebinding is an
+#        appended immutable lifecycle event plus a lifecycle-managed
+#        ``composition_proposals.base_state_id``. Without it the carried
+#        base kept naming the previous checkpoint and every later binding
+#        check failed closed — an unreadable guided session that the
+#        frontend silently reopened in freeform. SQLite cannot ALTER a
+#        CHECK constraint in place, so pre-release policy remains
+#        delete-and-recreate for stale session databases (sessions.db
+#        only — auth.db is never touched).
+#   51 -> persistent session-operation authority, compatible-generation
+#        membership/run-start coordination, cross-replica ticket/progress/rate
+#        state, bounded cleanup claims, monotonic user-secret row versions, and
+#        durable proposal blob-effect receipts. Epoch 50 cannot represent these
+#        authorities or receipts and is rejected outright; no migration exists.
+#        The composer_inflight_requests / composer_progress_snapshots tables
+#        drafted for cross-replica composer progress were removed before this
+#        substrate shipped (John 2026-08-31: progress persistence is deferred
+#        to the cross-replica ticket work). The substrate carried the number
+#        44 and then 48 on the original multi-replica lane and shipped under
+#        neither; it lands here as 51 because both of those numbers already
+#        name different schemas on the release line, and the epoch sentinel is
+#        enforced by exact equality, so one integer must name exactly one
+#        shape.
+#   52 → pluggable SSO (elspeth-07cd19ba73, spec
 #        docs/specs/2026-09-02-pluggable-sso-design.md): the auth provider
 #        discriminator widens from three values to five on BOTH tables that
 #        carry it (``sessions`` and ``user_secrets``, via the single
@@ -264,10 +290,13 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        governance tables, and the ownership re-key onto ``identity_id``
 #        all land inside this same epoch: ONE cutover window carries the
 #        whole sprint, so no second one is ever required. Cut over together
-#        with Landscape epoch 37. Pre-1.0 delete-and-recreate boundary; no
-#        migration, rollback_permitted: false (sessions.db only — auth.db is
-#        never touched).
-SESSION_SCHEMA_EPOCH = 50
+#        with Landscape epoch 37. It lands as 52 rather than 50 because the
+#        coordination substrate took 51 on the release line first, and the
+#        sentinel is exact equality — one integer names exactly one shape.
+#        Pre-1.0 delete-and-recreate boundary; no migration,
+#        rollback_permitted: false (sessions.db only — auth.db is never
+#        touched).
+SESSION_SCHEMA_EPOCH = 52
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -282,6 +311,36 @@ def _sql_non_blank_text(column_name: str, *, dialect: Literal["sqlite", "postgre
     if dialect == "sqlite":
         return f"length(trim({column_name}, {_SQLITE_ASCII_WHITESPACE})) > 0"
     return f"length(btrim({column_name}, {_POSTGRESQL_ASCII_WHITESPACE})) > 0"
+
+
+def _non_blank_text_constraints(
+    column_name: str,
+    *,
+    name: str,
+    nullable: bool = False,
+) -> tuple[CheckConstraint, CheckConstraint]:
+    def expression(dialect: Literal["sqlite", "postgresql"]) -> str:
+        non_blank = _sql_non_blank_text(column_name, dialect=dialect)
+        return f"{column_name} IS NULL OR {non_blank}" if nullable else non_blank
+
+    return (
+        CheckConstraint(expression("sqlite"), name=name).ddl_if(dialect="sqlite"),
+        CheckConstraint(expression("postgresql"), name=name).ddl_if(dialect="postgresql"),
+    )
+
+
+def _lower_sha256_check(column_name: str, *, dialect: Literal["sqlite", "postgresql"]) -> str:
+    base = f"length({column_name}) = 64"
+    if dialect == "sqlite":
+        return f"{base} AND {column_name} NOT GLOB '*[^a-f0-9]*'"
+    return f"{base} AND {column_name} ~ '^[a-f0-9]+$'"
+
+
+def _lower_sha256_constraints(column_name: str, *, name: str) -> tuple[CheckConstraint, CheckConstraint]:
+    return (
+        CheckConstraint(_lower_sha256_check(column_name, dialect="sqlite"), name=name).ddl_if(dialect="sqlite"),
+        CheckConstraint(_lower_sha256_check(column_name, dialect="postgresql"), name=name).ddl_if(dialect="postgresql"),
+    )
 
 
 def _composition_proposals_composer_provenance_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
@@ -430,6 +489,75 @@ sessions_table = Table(
     CheckConstraint(
         _AUTH_PROVIDER_TYPE_CHECK,
         name="ck_sessions_auth_provider_type",
+    ),
+)
+
+# One membership row per live web process. SQLite deployments do not use this
+# distributed membership surface, but the table remains part of the recreated
+# schema so both supported database modes share one exact metadata contract.
+web_instances_table = Table(
+    "web_instances",
+    metadata,
+    Column("instance_id", String, primary_key=True),
+    Column("deployment_target", String, nullable=False),
+    Column("deployment_generation", String, nullable=False),
+    Column("session_epoch", Integer, nullable=False),
+    Column("landscape_epoch", Integer, nullable=False),
+    Column("coordination_protocol", Integer, nullable=False),
+    Column("image_digest", String, nullable=False),
+    Column("revision_label", String, nullable=False),
+    Column("state", String, nullable=False),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("last_heartbeat_at", DateTime(timezone=True), nullable=False),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=False, index=True),
+    *_non_blank_text_constraints("instance_id", name="ck_web_instances_instance_id_nonblank"),
+    *_non_blank_text_constraints("deployment_target", name="ck_web_instances_target_nonblank"),
+    *_non_blank_text_constraints("deployment_generation", name="ck_web_instances_generation_nonblank"),
+    *_non_blank_text_constraints("image_digest", name="ck_web_instances_image_digest_nonblank"),
+    *_non_blank_text_constraints("revision_label", name="ck_web_instances_revision_label_nonblank"),
+    CheckConstraint(
+        "session_epoch > 0 AND landscape_epoch > 0 AND coordination_protocol > 0",
+        name="ck_web_instances_positive_compatibility",
+    ),
+    CheckConstraint("state IN ('active', 'draining', 'stopped')", name="ck_web_instances_state"),
+)
+Index(
+    "ix_web_instances_compatibility",
+    web_instances_table.c.deployment_generation,
+    web_instances_table.c.session_epoch,
+    web_instances_table.c.landscape_epoch,
+    web_instances_table.c.coordination_protocol,
+)
+
+# Exactly one persistent operation-fence row belongs to each retained session.
+# Release never nulls forensic authority; released_at alone discriminates an
+# inactive row. lease_token is random fencing authority and must not collapse
+# into the diagnostic owner identity.
+session_operation_fences_table = Table(
+    "session_operation_fences",
+    metadata,
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("operation_id", String, nullable=False),
+    Column("lease_token", String, nullable=False),
+    Column("operation_kind", String, nullable=False),
+    Column("owner_instance_id", String, nullable=False),
+    Column("operation_epoch", Integer, nullable=False),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("released_at", DateTime(timezone=True), nullable=True),
+    *_non_blank_text_constraints("session_id", name="ck_session_operation_fences_session_id_nonblank"),
+    *_non_blank_text_constraints("operation_id", name="ck_session_operation_fences_operation_id_nonblank"),
+    *_non_blank_text_constraints("lease_token", name="ck_session_operation_fences_lease_token_nonblank"),
+    *_non_blank_text_constraints("owner_instance_id", name="ck_session_operation_fences_owner_nonblank"),
+    CheckConstraint("lease_token <> owner_instance_id", name="ck_session_operation_fences_token_not_owner"),
+    CheckConstraint("operation_epoch > 0", name="ck_session_operation_fences_positive_epoch"),
+    CheckConstraint(
+        "operation_kind IN ('create', 'compose', 'proposal', 'execute', 'archive', 'progress', 'blob_read', 'session_fork')",
+        name="ck_session_operation_fences_kind",
     ),
 )
 
@@ -631,7 +759,8 @@ composition_states_table = Table(
     #                                    routes/composer.py recompose successful
     #                                    LLM-driven state advances, including the
     #                                    transition_consumed metadata-only row.
-    #   - ``session_seed``            — service.py create_session + set_active_state
+    #   - ``session_seed``            — route-driven seed/import writes and
+    #                                    service.py guided state reverts
     #   - ``session_fork``            — service.py fork_session_at_message and
     #                                    routes/sessions.py fork blob-reference
     #                                    rewrite, which is part of the same fork
@@ -744,15 +873,6 @@ composition_proposals_table = Table(
         name="ck_composition_proposals_composer_provenance_all_or_none",
     ).ddl_if(dialect="postgresql"),
 )
-
-
-def _lower_sha256_check(column_name: str, *, dialect: Literal["sqlite", "postgresql"]) -> str:
-    base = f"length({column_name}) = 64"
-    if dialect == "sqlite":
-        return f"{base} AND {column_name} NOT GLOB '*[^a-f0-9]*'"
-    return f"{base} AND {column_name} ~ '^[a-f0-9]+$'"
-
-
 # Durable negative admission authority for a guided start whose client lost
 # its request body before the server ever reserved an operation row. The row
 # deliberately carries no request hash or raw intent: an exact operation id is
@@ -1082,7 +1202,8 @@ proposal_events_table = Table(
     Column("payload", JSON, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     CheckConstraint(
-        "event_type IN ('proposal.created', 'proposal.accepted', 'proposal.rejected', 'trust_mode.changed', 'auto_commit.revoked')",
+        "event_type IN ('proposal.created', 'proposal.accepted', 'proposal.rejected', "
+        "'trust_mode.changed', 'auto_commit.revoked', 'proposal.rebased')",
         name="ck_proposal_events_type",
     ),
 )
@@ -1090,6 +1211,54 @@ Index(
     "ix_proposal_events_session_created",
     proposal_events_table.c.session_id,
     proposal_events_table.c.created_at,
+)
+
+# One durable obligation per approved blob effect. The blob coordinator writes
+# this row in the same database transaction that changes/removes blob metadata;
+# ordinary proposal settlement then binds the receipt to its accepted event.
+# A receipt may remain unaccepted after process death, but it may never be
+# rejected or cause the tool to execute again.
+proposal_blob_effect_receipts_table = Table(
+    "proposal_blob_effect_receipts",
+    metadata,
+    Column("proposal_id", String, primary_key=True),
+    Column("session_id", String, nullable=False, index=True),
+    Column("tool_name", String, nullable=False),
+    Column("blob_id", String, nullable=False),
+    Column("arguments_hash", String, nullable=False),
+    Column("result_blob_snapshot", JSON, nullable=False),
+    Column("result_blob_snapshot_hash", String, nullable=False),
+    Column("accepted_event_id", String, ForeignKey("proposal_events.id"), nullable=True, unique=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("accepted_at", DateTime(timezone=True), nullable=True),
+    ForeignKeyConstraint(
+        ["proposal_id", "session_id"],
+        ["composition_proposals.id", "composition_proposals.session_id"],
+        name="fk_proposal_blob_effect_receipts_proposal_session",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint("tool_name IN ('update_blob', 'delete_blob')", name="ck_proposal_blob_effect_receipts_tool"),
+    CheckConstraint(
+        "(accepted_event_id IS NULL) = (accepted_at IS NULL)",
+        name="ck_proposal_blob_effect_receipts_acceptance_bundle",
+    ),
+    *_non_blank_text_constraints("blob_id", name="ck_proposal_blob_effect_receipts_blob_id_nonblank"),
+    CheckConstraint(
+        _lower_sha256_check("arguments_hash", dialect="sqlite"),
+        name="ck_proposal_blob_effect_receipts_arguments_hash",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _lower_sha256_check("arguments_hash", dialect="postgresql"),
+        name="ck_proposal_blob_effect_receipts_arguments_hash",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint(
+        _lower_sha256_check("result_blob_snapshot_hash", dialect="sqlite"),
+        name="ck_proposal_blob_effect_receipts_result_hash",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _lower_sha256_check("result_blob_snapshot_hash", dialect="postgresql"),
+        name="ck_proposal_blob_effect_receipts_result_hash",
+    ).ddl_if(dialect="postgresql"),
 )
 
 interpretation_events_table = Table(
@@ -1464,7 +1633,7 @@ Index(
 # ``skill_markdown_history`` (F-5c) — content-addressed archive of every
 # distinct ``pipeline_composer.md`` version seen at runtime.
 #
-# One row per (SHA-256 hash, filename) pair. The compose loop upserts
+# One row per SHA-256 hash. The compose loop upserts
 # (INSERT OR IGNORE) on first use of a hash, capturing the exact text that
 # was in memory when the LLM was prompted. This makes every
 # ``composer_skill_hash`` on ``interpretation_events`` rows forensically
@@ -2098,6 +2267,16 @@ for postgresql_audit_ddl in POSTGRESQL_AUDIT_DDL_COHORT:
         DDL(postgresql_audit_ddl.trigger_sql).execute_if(dialect="postgresql"),  # type: ignore[no-untyped-call]
     )
 
+
+def _runs_ownership_all_or_none_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
+    return (
+        "((owner_instance_id IS NULL AND owner_epoch IS NULL AND owner_lease_expires_at IS NULL) OR "
+        "(owner_instance_id IS NOT NULL AND "
+        f"{_sql_non_blank_text('owner_instance_id', dialect=dialect)} AND "
+        "owner_epoch IS NOT NULL AND owner_epoch > 0 AND owner_lease_expires_at IS NOT NULL))"
+    )
+
+
 runs_table = Table(
     "runs",
     metadata,
@@ -2125,6 +2304,16 @@ runs_table = Table(
     Column("error", Text, nullable=True),
     Column("landscape_run_id", String, nullable=True),
     Column("pipeline_yaml", Text, nullable=True),
+    # Epoch-37 durable run ownership and cross-database saga projection.
+    # Runtime acquisition is wired in later tasks; until then the ownership
+    # tuple is either wholly absent or wholly populated.
+    Column("owner_instance_id", String, nullable=True),
+    Column("owner_epoch", Integer, nullable=True),
+    Column("owner_lease_expires_at", DateTime(timezone=True), nullable=True, index=True),
+    Column("cancel_requested_at", DateTime(timezone=True), nullable=True),
+    Column("cancellation_source", String, nullable=True),
+    Column("saga_state", String, nullable=False, server_default="draft", index=True),
+    Column("recovery_required_reason", String, nullable=True),
     ForeignKeyConstraint(
         ["state_id", "session_id"],
         ["composition_states.id", "composition_states.session_id"],
@@ -2137,6 +2326,31 @@ runs_table = Table(
     CheckConstraint(
         "status IN ('pending', 'running', 'completed', 'completed_with_failures', 'failed', 'empty', 'cancelled')",
         name="ck_runs_status",
+    ),
+    *_non_blank_text_constraints("id", name="ck_runs_id_nonblank"),
+    *_non_blank_text_constraints("session_id", name="ck_runs_session_id_nonblank"),
+    CheckConstraint(
+        _runs_ownership_all_or_none_check(dialect="sqlite"),
+        name="ck_runs_ownership_all_or_none",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _runs_ownership_all_or_none_check(dialect="postgresql"),
+        name="ck_runs_ownership_all_or_none",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint(
+        "cancellation_source IS NULL OR cancellation_source IN ('user', 'operator', 'shutdown', 'reconciler')",
+        name="ck_runs_cancellation_source",
+    ),
+    CheckConstraint(
+        "saga_state IN ('draft', 'start_intent', 'start_permit_issued', 'baseline_checkpointed', "
+        "'running', 'recovery_required', 'cancel_pending', 'terminal', 'terminal_cancelled')",
+        name="ck_runs_saga_state",
+    ),
+    CheckConstraint(
+        "recovery_required_reason IS NULL OR recovery_required_reason IN "
+        "('implementation_drift', 'generation_drift', 'compatibility_mismatch', 'missing_baseline', "
+        "'incomplete_source', 'secret_version_unavailable', 'unsafe_effect', 'authority_lost', 'unknown')",
+        name="ck_runs_recovery_required_reason",
     ),
 )
 
@@ -2163,6 +2377,207 @@ Index(
     unique=True,
     sqlite_where=runs_table.c.status.in_(["pending", "running"]),
     postgresql_where=runs_table.c.status.in_(["pending", "running"]),
+)
+
+# Sessions-side start-versus-cancel linearization. Pending and
+# cancelled-before-permit rows contain no permit authority; start_permitted
+# rows retain the exact immutable non-secret fence identities and subject.
+_RUN_START_PERMIT_SUBJECT_IS_NULL = (
+    "permit_id IS NULL AND permit_epoch IS NULL AND session_operation_id IS NULL AND "
+    "session_operation_epoch IS NULL AND run_owner_instance_id IS NULL AND run_owner_epoch IS NULL AND "
+    "envelope_hash IS NULL AND topology_hash IS NULL AND source_manifest_hash IS NULL AND "
+    "checkpoint_subject_hash IS NULL AND deployment_generation IS NULL AND session_epoch IS NULL AND "
+    "landscape_epoch IS NULL AND coordination_protocol IS NULL AND permit_subject_hash IS NULL AND issued_at IS NULL"
+)
+
+
+def _run_start_permits_state_fields_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
+    return (
+        f"((start_state = 'pending' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NULL) OR "
+        f"(start_state = 'cancelled_before_permit' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NOT NULL) OR "
+        "(start_state = 'start_permitted' AND permit_id IS NOT NULL AND "
+        f"{_sql_non_blank_text('permit_id', dialect=dialect)} AND "
+        "permit_epoch IS NOT NULL AND permit_epoch > 0 AND session_operation_id IS NOT NULL AND "
+        f"{_sql_non_blank_text('session_operation_id', dialect=dialect)} AND "
+        "session_operation_epoch IS NOT NULL AND session_operation_epoch > 0 AND run_owner_instance_id IS NOT NULL AND "
+        f"{_sql_non_blank_text('run_owner_instance_id', dialect=dialect)} AND "
+        "run_owner_epoch IS NOT NULL AND run_owner_epoch > 0 AND envelope_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('envelope_hash', dialect=dialect)} AND topology_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('topology_hash', dialect=dialect)} AND source_manifest_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('source_manifest_hash', dialect=dialect)} AND checkpoint_subject_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('checkpoint_subject_hash', dialect=dialect)} AND deployment_generation IS NOT NULL AND "
+        f"{_sql_non_blank_text('deployment_generation', dialect=dialect)} AND "
+        "session_epoch IS NOT NULL AND session_epoch > 0 AND landscape_epoch IS NOT NULL AND landscape_epoch > 0 AND "
+        "coordination_protocol IS NOT NULL AND coordination_protocol > 0 AND permit_subject_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('permit_subject_hash', dialect=dialect)} AND "
+        "issued_at IS NOT NULL AND cancelled_at IS NULL))"
+    )
+
+
+run_start_permits_table = Table(
+    "run_start_permits",
+    metadata,
+    Column("run_id", String, ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True),
+    Column("start_state", String, nullable=False, server_default="pending"),
+    Column("permit_id", String, nullable=True, unique=True),
+    Column("permit_epoch", Integer, nullable=True),
+    Column("session_operation_id", String, nullable=True),
+    Column("session_operation_epoch", Integer, nullable=True),
+    Column("run_owner_instance_id", String, nullable=True),
+    Column("run_owner_epoch", Integer, nullable=True),
+    Column("envelope_hash", String, nullable=True),
+    Column("topology_hash", String, nullable=True),
+    Column("source_manifest_hash", String, nullable=True),
+    Column("checkpoint_subject_hash", String, nullable=True),
+    Column("deployment_generation", String, nullable=True),
+    Column("session_epoch", Integer, nullable=True),
+    Column("landscape_epoch", Integer, nullable=True),
+    Column("coordination_protocol", Integer, nullable=True),
+    Column("permit_subject_hash", String, nullable=True),
+    Column("issued_at", DateTime(timezone=True), nullable=True),
+    Column("cancelled_at", DateTime(timezone=True), nullable=True),
+    Column("retention_expires_at", DateTime(timezone=True), nullable=True, index=True),
+    CheckConstraint("start_state IN ('pending', 'start_permitted', 'cancelled_before_permit')", name="ck_run_start_permits_state"),
+    *_non_blank_text_constraints("run_id", name="ck_run_start_permits_run_id_nonblank"),
+    CheckConstraint(
+        _run_start_permits_state_fields_check(dialect="sqlite"),
+        name="ck_run_start_permits_state_fields",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _run_start_permits_state_fields_check(dialect="postgresql"),
+        name="ck_run_start_permits_state_fields",
+    ).ddl_if(dialect="postgresql"),
+)
+
+# Immutable, secret-reference-only envelope substrate. Task 8 owns the public
+# serialization and resolver carrier; epoch 44 reserves and constrains its
+# durable shape now so deployment compatibility cannot drift underneath it.
+_RUN_EXECUTION_IDENTITY_COLUMNS = (
+    "canonical_input_digest",
+    "topology_digest",
+    "source_manifest_digest",
+    "application_fingerprint",
+    "plugin_registry_fingerprint",
+    "configuration_fingerprint",
+    "graph_fingerprint",
+    "runtime_fingerprint",
+    "implementation_fingerprint",
+)
+
+
+def _run_execution_inputs_identity_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
+    return " AND ".join(f"({_lower_sha256_check(column_name, dialect=dialect)})" for column_name in _RUN_EXECUTION_IDENTITY_COLUMNS)
+
+
+run_execution_inputs_table = Table(
+    "run_execution_inputs",
+    metadata,
+    Column("run_id", String, ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True),
+    Column("schema_version", Integer, nullable=False),
+    Column("envelope", JSON, nullable=False),
+    Column("canonical_input_digest", String, nullable=False),
+    Column("topology_digest", String, nullable=False),
+    Column("source_manifest_digest", String, nullable=False),
+    Column("application_fingerprint", String, nullable=False),
+    Column("plugin_registry_fingerprint", String, nullable=False),
+    Column("configuration_fingerprint", String, nullable=False),
+    Column("graph_fingerprint", String, nullable=False),
+    Column("runtime_fingerprint", String, nullable=False),
+    Column("implementation_fingerprint", String, nullable=False),
+    Column("deployment_generation", String, nullable=False),
+    Column("session_epoch", Integer, nullable=False),
+    Column("landscape_epoch", Integer, nullable=False),
+    Column("coordination_protocol", Integer, nullable=False),
+    Column("automatic_recovery_eligible", Boolean, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    *_non_blank_text_constraints("run_id", name="ck_run_execution_inputs_run_id_nonblank"),
+    *_non_blank_text_constraints(
+        "deployment_generation",
+        name="ck_run_execution_inputs_deployment_generation_nonblank",
+    ),
+    CheckConstraint(
+        _run_execution_inputs_identity_check(dialect="sqlite"),
+        name="ck_run_execution_inputs_sha256_identities",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _run_execution_inputs_identity_check(dialect="postgresql"),
+        name="ck_run_execution_inputs_sha256_identities",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint("schema_version > 0", name="ck_run_execution_inputs_positive_schema_version"),
+    CheckConstraint(
+        "session_epoch > 0 AND landscape_epoch > 0 AND coordination_protocol > 0",
+        name="ck_run_execution_inputs_positive_compatibility",
+    ),
+)
+
+websocket_tickets_table = Table(
+    "websocket_tickets",
+    metadata,
+    Column("ticket_digest", String, primary_key=True),
+    Column("run_id", String, ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("user_id", String, nullable=False),
+    Column("auth_provider_type", String, nullable=False),
+    Column("issued_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("consumed_at", DateTime(timezone=True), nullable=True),
+    *_lower_sha256_constraints("ticket_digest", name="ck_websocket_tickets_digest_sha256"),
+    *_non_blank_text_constraints("run_id", name="ck_websocket_tickets_run_id_nonblank"),
+    *_non_blank_text_constraints("user_id", name="ck_websocket_tickets_user_id_nonblank"),
+    CheckConstraint(_AUTH_PROVIDER_TYPE_CHECK, name="ck_websocket_tickets_auth_provider_type"),
+)
+
+rate_limit_buckets_table = Table(
+    "rate_limit_buckets",
+    metadata,
+    Column("subject_digest", String, primary_key=True),
+    Column("window_seconds", Integer, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    *_lower_sha256_constraints("subject_digest", name="ck_rate_limit_buckets_digest_sha256"),
+    CheckConstraint("window_seconds > 0", name="ck_rate_limit_buckets_positive_window"),
+)
+
+rate_limit_events_table = Table(
+    "rate_limit_events",
+    metadata,
+    Column("event_id", String, primary_key=True),
+    Column(
+        "subject_digest",
+        String,
+        ForeignKey("rate_limit_buckets.subject_digest", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("occurred_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    *_non_blank_text_constraints("event_id", name="ck_rate_limit_events_event_id_nonblank"),
+    *_lower_sha256_constraints("subject_digest", name="ck_rate_limit_events_digest_sha256"),
+)
+Index("ix_rate_limit_events_subject_occurred", rate_limit_events_table.c.subject_digest, rate_limit_events_table.c.occurred_at)
+
+sessions_cleanup_claims_table = Table(
+    "sessions_cleanup_claims",
+    metadata,
+    Column("claim_name", String, primary_key=True),
+    Column("claim_token", String, nullable=False),
+    Column("owner_instance_id", String, nullable=False),
+    Column("claim_epoch", Integer, nullable=False),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("renewal_count", Integer, nullable=False),
+    Column("batch_count", Integer, nullable=False),
+    Column("max_renewals", Integer, nullable=False),
+    Column("max_batches", Integer, nullable=False),
+    Column("acquired_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    *_non_blank_text_constraints("claim_name", name="ck_sessions_cleanup_claims_name_nonblank"),
+    *_non_blank_text_constraints("claim_token", name="ck_sessions_cleanup_claims_token_nonblank"),
+    *_non_blank_text_constraints("owner_instance_id", name="ck_sessions_cleanup_claims_owner_nonblank"),
+    CheckConstraint("claim_token <> owner_instance_id", name="ck_sessions_cleanup_claims_token_not_owner"),
+    CheckConstraint("claim_epoch > 0", name="ck_sessions_cleanup_claims_positive_epoch"),
+    CheckConstraint(
+        "renewal_count >= 0 AND batch_count >= 0 AND max_renewals > 0 AND max_batches > 0 "
+        "AND renewal_count <= max_renewals AND batch_count <= max_batches",
+        name="ck_sessions_cleanup_claims_bounded_counts",
+    ),
 )
 
 blobs_table = Table(
@@ -2230,6 +2645,12 @@ blobs_table = Table(
     Column("creating_provider", String, nullable=True),
     Column("creating_composer_skill_hash", String, nullable=True),
     Column("creating_arguments_hash", String, nullable=True),
+    # Transient exact owner of a standalone-create reservation. The complete
+    # operation identity is cleared when the row becomes ready; a later
+    # current creator may retire only the exact abandoned pending obligation.
+    Column("custody_operation_id", String, nullable=True),
+    Column("custody_operation_epoch", Integer, nullable=True),
+    Column("custody_operation_kind", String, nullable=True),
     # Composite FK: (created_from_message_id, session_id) must reference an
     # existing (chat_messages.id, chat_messages.session_id) pair.  Mirrors
     # fk_chat_messages_parent_assistant_session above.  ON DELETE RESTRICT
@@ -2244,6 +2665,28 @@ blobs_table = Table(
         ["chat_messages.id", "chat_messages.session_id"],
         name="fk_blobs_created_from_message_session",
         ondelete="RESTRICT",
+    ),
+    CheckConstraint(
+        "(custody_operation_id IS NULL) = (custody_operation_epoch IS NULL) "
+        "AND (custody_operation_id IS NULL) = (custody_operation_kind IS NULL)",
+        name="ck_blobs_custody_operation_identity",
+    ),
+    *_non_blank_text_constraints(
+        "custody_operation_id",
+        name="ck_blobs_custody_operation_id_nonblank",
+        nullable=True,
+    ),
+    CheckConstraint(
+        "custody_operation_epoch IS NULL OR custody_operation_epoch > 0",
+        name="ck_blobs_custody_operation_positive_epoch",
+    ),
+    CheckConstraint(
+        "custody_operation_kind IS NULL OR custody_operation_kind IN ('create', 'compose', 'proposal', 'execute')",
+        name="ck_blobs_custody_operation_kind",
+    ),
+    CheckConstraint(
+        "(status = 'pending') OR custody_operation_id IS NULL",
+        name="ck_blobs_custody_pending_only",
     ),
     CheckConstraint(
         "creation_modality IN ('verbatim', 'llm_generated', 'disambiguated', 'llm_generated_then_amended')",
@@ -2316,14 +2759,12 @@ blobs_table = Table(
     ).ddl_if(dialect="postgresql"),
 )
 
-# A blob delete spans two durability domains: the metadata row is removed in a
-# database transaction, then its same-directory filesystem tombstone is unlinked
-# and the parent directory is fsynced. Keep the exact stage transactionally so a
-# post-commit purge failure remains discoverable and retryable after restart.
-# This row deliberately does not reference ``blobs.id`` because the blob row and
-# its dependent run links are removed in the same transaction that creates this
-# cleanup record. Session archival owns the whole blob directory, so its cascade
-# may retire cleanup rows after moving that directory into archive quarantine.
+# A blob delete spans database and filesystem durability domains. Persist the
+# exact intent before staging bytes, advance it to ``staged`` after rename+fsync,
+# and atomically pair metadata deletion with ``purge_pending``. The row does not
+# reference ``blobs.id`` because it must survive that metadata deletion for
+# cleanup-only retry. Session archival owns the whole blob directory, so its
+# cascade may retire cleanup rows after moving that directory into quarantine.
 blob_deletion_cleanups_table = Table(
     "blob_deletion_cleanups",
     metadata,
@@ -2337,7 +2778,119 @@ blob_deletion_cleanups_table = Table(
     ),
     Column("storage_path", String, nullable=False),
     Column("tombstone_path", String, nullable=True),
+    Column("operation_id", String, nullable=True),
+    Column("operation_epoch", Integer, nullable=True),
+    Column("operation_kind", String, nullable=True),
+    Column("phase", String, nullable=True),
+    Column("blob_snapshot_hash", String, nullable=True),
+    Column("expected_file_present", Boolean, nullable=True),
+    Column("expected_file_size", Integer, nullable=True),
+    Column("expected_file_hash", String, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("operation_epoch > 0", name="ck_blob_deletion_cleanups_positive_epoch"),
+    CheckConstraint(
+        "operation_kind IN ('archive', 'compose', 'proposal', 'session_fork')",
+        name="ck_blob_deletion_cleanups_kind",
+    ),
+    CheckConstraint("phase IN ('intent', 'staged', 'purge_pending')", name="ck_blob_deletion_cleanups_phase"),
+    *_non_blank_text_constraints("storage_path", name="ck_blob_deletion_cleanups_storage_path_nonblank"),
+    *_non_blank_text_constraints("tombstone_path", name="ck_blob_deletion_cleanups_tombstone_path_nonblank"),
+    *_non_blank_text_constraints("operation_id", name="ck_blob_deletion_cleanups_operation_id_nonblank"),
+    CheckConstraint(
+        "expected_file_present IN (0, 1)",
+        name="ck_blob_deletion_cleanups_expected_file_present",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint("storage_path <> tombstone_path", name="ck_blob_deletion_cleanups_paths_differ"),
+    CheckConstraint(
+        "expected_file_present = (expected_file_size IS NOT NULL) AND expected_file_present = (expected_file_hash IS NOT NULL)",
+        name="ck_blob_deletion_cleanups_expected_file_evidence",
+    ),
+    CheckConstraint("expected_file_size IS NULL OR expected_file_size >= 0", name="ck_blob_deletion_cleanups_nonnegative_size"),
+    CheckConstraint("updated_at >= created_at", name="ck_blob_deletion_cleanups_monotonic_timestamps"),
+    CheckConstraint("length(blob_snapshot_hash) = 64", name="ck_blob_deletion_cleanups_snapshot_hash_length"),
+    CheckConstraint("expected_file_hash IS NULL OR length(expected_file_hash) = 64", name="ck_blob_deletion_cleanups_file_hash_length"),
+    CheckConstraint(
+        "blob_snapshot_hash NOT GLOB '*[^a-f0-9]*'",
+        name="ck_blob_deletion_cleanups_snapshot_hash_lowercase",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        "blob_snapshot_hash ~ '^[a-f0-9]+$'",
+        name="ck_blob_deletion_cleanups_snapshot_hash_lowercase",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint(
+        "expected_file_hash IS NULL OR expected_file_hash NOT GLOB '*[^a-f0-9]*'",
+        name="ck_blob_deletion_cleanups_file_hash_lowercase",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        "expected_file_hash IS NULL OR expected_file_hash ~ '^[a-f0-9]+$'",
+        name="ck_blob_deletion_cleanups_file_hash_lowercase",
+    ).ddl_if(dialect="postgresql"),
+)
+
+# A blob replacement crosses the same database/filesystem durability seam as a
+# delete, but its recovery evidence is intentionally separate: the live blob
+# row survives, and commit atomically changes its exact metadata while advancing
+# this obligation to ``purge_pending``. ``blob_id`` therefore has no FK to
+# ``blobs.id``; the session FK alone owns lifecycle cleanup.
+blob_replacement_cleanups_table = Table(
+    "blob_replacement_cleanups",
+    metadata,
+    Column("blob_id", String, primary_key=True),
+    Column("replacement_id", String, nullable=False, unique=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("storage_path", String, nullable=False),
+    Column("staging_path", String, nullable=False),
+    Column("backup_path", String, nullable=False),
+    Column("operation_id", String, nullable=False),
+    Column("operation_epoch", Integer, nullable=False),
+    Column("operation_kind", String, nullable=False),
+    Column("lease_token", String, nullable=False),
+    Column("owner_instance_id", String, nullable=False),
+    Column("phase", String, nullable=False),
+    Column("old_blob_snapshot", JSON, nullable=False),
+    Column("replacement_blob_snapshot", JSON, nullable=False),
+    Column("old_blob_snapshot_hash", String, nullable=False),
+    Column("replacement_blob_snapshot_hash", String, nullable=False),
+    Column("old_size_bytes", Integer, nullable=False),
+    Column("old_content_hash", String, nullable=False),
+    Column("replacement_size_bytes", Integer, nullable=False),
+    Column("replacement_content_hash", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("operation_epoch > 0", name="ck_blob_replacement_cleanups_positive_epoch"),
+    CheckConstraint("operation_kind IN ('compose', 'proposal')", name="ck_blob_replacement_cleanups_kind"),
+    CheckConstraint("phase IN ('intent', 'swap_pending', 'purge_pending')", name="ck_blob_replacement_cleanups_phase"),
+    *_non_blank_text_constraints("replacement_id", name="ck_blob_replacement_cleanups_replacement_id_nonblank"),
+    *_non_blank_text_constraints("storage_path", name="ck_blob_replacement_cleanups_storage_path_nonblank"),
+    *_non_blank_text_constraints("staging_path", name="ck_blob_replacement_cleanups_staging_path_nonblank"),
+    *_non_blank_text_constraints("backup_path", name="ck_blob_replacement_cleanups_backup_path_nonblank"),
+    *_non_blank_text_constraints("operation_id", name="ck_blob_replacement_cleanups_operation_id_nonblank"),
+    *_non_blank_text_constraints("lease_token", name="ck_blob_replacement_cleanups_lease_token_nonblank"),
+    *_non_blank_text_constraints("owner_instance_id", name="ck_blob_replacement_cleanups_owner_nonblank"),
+    CheckConstraint(
+        "storage_path <> staging_path AND storage_path <> backup_path AND staging_path <> backup_path",
+        name="ck_blob_replacement_cleanups_paths_distinct",
+    ),
+    CheckConstraint("old_size_bytes >= 0", name="ck_blob_replacement_cleanups_old_size_nonnegative"),
+    CheckConstraint("replacement_size_bytes >= 0", name="ck_blob_replacement_cleanups_replacement_size_nonnegative"),
+    CheckConstraint("updated_at >= created_at", name="ck_blob_replacement_cleanups_monotonic_timestamps"),
+    CheckConstraint("length(old_blob_snapshot_hash) = 64", name="ck_blob_replacement_cleanups_old_snapshot_hash_length"),
+    CheckConstraint(
+        "length(replacement_blob_snapshot_hash) = 64",
+        name="ck_blob_replacement_cleanups_replacement_snapshot_hash_length",
+    ),
+    CheckConstraint("length(old_content_hash) = 64", name="ck_blob_replacement_cleanups_old_content_hash_length"),
+    CheckConstraint(
+        "length(replacement_content_hash) = 64",
+        name="ck_blob_replacement_cleanups_replacement_content_hash_length",
+    ),
 )
 
 # Index for the reverse-lookup path: "given a chat message, which inline
@@ -2435,6 +2988,7 @@ run_events_table = Table(
     Column("event_type", String, nullable=False),
     Column("data", JSON, nullable=False),
     UniqueConstraint("run_id", "sequence", name="uq_run_events_run_sequence"),
+    CheckConstraint("sequence >= 1", name="ck_run_events_positive_sequence"),
     CheckConstraint(
         "event_type IN ('progress', 'error', 'completed', 'cancelled', 'failed')",
         name="ck_run_events_type",
@@ -2450,6 +3004,7 @@ user_secrets_table = Table(
     Column("auth_provider_type", String, nullable=False),
     Column("encrypted_value", LargeBinary, nullable=False),
     Column("salt", LargeBinary, nullable=False),
+    Column("version", Integer, nullable=False, server_default="1"),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
     UniqueConstraint("name", "user_id", "auth_provider_type", name="uq_user_secret_name_user_provider"),
@@ -2457,6 +3012,8 @@ user_secrets_table = Table(
         _AUTH_PROVIDER_TYPE_CHECK,
         name="ck_user_secrets_auth_provider_type",
     ),
+    *_non_blank_text_constraints("id", name="ck_user_secrets_id_nonblank"),
+    CheckConstraint("version > 0", name="ck_user_secrets_positive_version"),
 )
 Index("ix_user_secrets_user_provider", user_secrets_table.c.user_id, user_secrets_table.c.auth_provider_type)
 

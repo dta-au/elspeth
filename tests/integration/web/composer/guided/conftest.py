@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from testcontainers.postgres import PostgresContainer
 
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import stable_hash
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -45,9 +46,9 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.routes._helpers import _runtime_preflight_for_state
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 class _GuidedTestExecutionService:
@@ -60,11 +61,18 @@ class _GuidedTestExecutionService:
         self,
         state: CompositionState,
         *,
+        session_operation_context: SessionOperationContext,
         user_id: str | None = None,
         session_id: UUID | None = None,
         completion_gates: object | None = None,
     ) -> ValidationResult:
+        # Mirror the production protocol exactly: the operation context is a
+        # required keyword there, so a route that omits it must fail HERE, not
+        # only on a live deployment (the platform lane's guided wiring-confirm
+        # call shipped without it because this fake did not demand it).
         del completion_gates
+        if not isinstance(session_operation_context, SessionOperationContext):
+            raise AssertionError("guided confirmation validation requires the operation's session context")
         if user_id is None or session_id is None:
             raise AssertionError("guided confirmation validation requires principal and session custody")
         app_state = self._app.state
@@ -416,7 +424,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
     # Session service — profile-aware, mirroring production create_app()
     # wiring: the guided proposal settlement independently re-derives wire
     # reviews through the session principal's snapshot.
-    session_service = SessionServiceImpl(
+    session_service = DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -488,7 +496,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
 
         restarted_app.state.plugin_snapshot_factory = lambda user: _restarted_principal_snapshot(user.user_id)
         restarted_app.state.execution_service = _GuidedTestExecutionService(restarted_app)
-        restarted_app.state.session_service = SessionServiceImpl(
+        restarted_app.state.session_service = DualFencedSessionServiceHarness(
             restarted_engine,
             data_dir=tmp_path,
             telemetry=build_sessions_telemetry(),

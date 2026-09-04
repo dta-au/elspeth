@@ -55,7 +55,7 @@ security and recovery fixes. The notes below intentionally cover only major
 changes and critical correctness or security fixes.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
-to 50. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
+to 52. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
 completed guided-plan decline contract, epoch 38 adds the decline result
 message locator that pins the exact assistant message a decline replays, and
 epoch 39 adds the `policy_blocked` guided-operation failure code so a
@@ -89,11 +89,25 @@ instead of leaving a zombie card that gates Run forever. Epoch 49 adds the
 `composition_rejection_events` table so a composer mutation-tool rejection's
 reason — the exact payload the planner saw — persists durably as session
 data instead of reaching the operator nowhere (elspeth-3e28029d2f). Epoch 50
-carries the pluggable-SSO identity substrate: the auth provider discriminator
-widens from three values to five on both `sessions` and `user_secrets`, and
-the identity, org-tree and workflow-governance tables land in the same epoch
-so the sprint costs exactly one cutover window rather than two
-(elspeth-07cd19ba73).
+adds the `proposal.rebased` proposal-event type so a guided settlement that
+carries a still-pending proposal across the checkpoint it writes can move the
+proposal's anchor there and record the move, instead of leaving it anchored to
+a superseded checkpoint — which made the session unreadable through the guided
+route and killed the wire-review "edit this component" affordance
+(elspeth-ed67eb9d0d). Epoch 51 adds the multi-replica coordination substrate: a
+persistent session-operation authority, compatible-generation membership and
+run-start coordination, cross-replica ticket, progress and rate state, bounded
+cleanup claims, monotonic user-secret row versions, and durable proposal
+blob-effect receipts. Epoch 50 cannot represent those authorities or receipts
+and is rejected outright; no migration exists. That substrate carried the
+number 44 and then 48 on its original lane and shipped under neither — both of
+those integers already name different schemas on this release line, and the
+epoch sentinel is enforced by exact equality, so one integer must name exactly
+one shape. Epoch 52 carries the pluggable-SSO identity substrate: the auth
+provider discriminator widens from three values to five on both `sessions` and
+`user_secrets`, and the identity, org-tree and workflow-governance tables land
+in the same epoch so the sprint costs exactly one cutover window rather than
+two (elspeth-07cd19ba73).
 Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 37. Epoch 30 adds durable
 row-union barrier attribution, epoch 31 closes scheduler status over the public
 six-state vocabulary, epoch 32 atomically records aggregation results and their

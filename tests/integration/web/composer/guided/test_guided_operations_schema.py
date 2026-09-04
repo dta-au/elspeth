@@ -23,8 +23,9 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 SESSION_ID = "00000000-0000-4000-8000-000000000001"
 OPERATION_ID = "00000000-0000-4000-8000-000000000002"
@@ -96,14 +97,15 @@ def engine():
                 updated_at=NOW,
             )
         )
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided-operation-schema"),
     )
     with patch("elspeth.web.sessions.service.uuid.uuid4", return_value=UUID(STATE_ID)):
         state = asyncio.run(
-            service.save_composition_state(
+            _save_composition_state_with_compose_authority(
+                service,
                 UUID(SESSION_ID),
                 CompositionStateData(is_valid=False),
                 provenance="session_seed",

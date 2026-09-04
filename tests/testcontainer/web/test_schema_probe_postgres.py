@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import threading
 import time
@@ -32,6 +33,7 @@ from elspeth.core.landscape.schema import schema_identity_table as landscape_sch
 from elspeth.core.schema_identity import SCHEMA_IDENTITY_APPLICATION_ID
 from elspeth.core.schema_shape import _text_builtin_identity_rows_on_connection
 from elspeth.web import schema_probe as schema_probe_module
+from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.preferences.models import UpdateComposerPreferencesRequest
 from elspeth.web.preferences.service import PreferencesService
 from elspeth.web.schema_probe import (
@@ -62,6 +64,7 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
+from elspeth.web.sessions.skill_markdown_history import RepositorySkillMarkdownHistoryAuthority
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 pytestmark = pytest.mark.testcontainer
@@ -275,11 +278,23 @@ async def test_postgres_guided_operation_takeover_fences_late_worker(postgres_en
         log=structlog.get_logger("test.guided-operation-postgres-b"),
     )
     session_id = (await service_a.create_session("alice", "PostgreSQL guided operation", "local")).id
-    state = await service_a.save_composition_state(
-        session_id,
-        CompositionStateData(is_valid=False),
-        provenance="session_seed",
+    compose_context = await service_a._run_sync(
+        lambda: service_a.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service_a.session_operation_owner_instance_id,
+            lease_seconds=service_a.session_operation_lease_seconds,
+        )
     )
+    try:
+        state = await service_a.save_composition_state(
+            session_id,
+            CompositionStateData(is_valid=False),
+            provenance="session_seed",
+            session_operation_context=compose_context,
+        )
+    finally:
+        await service_a._run_sync(service_a.session_operation_authority.release, compose_context)
     state_id = state.id
 
     operation_id = "postgres-takeover"
@@ -869,18 +884,20 @@ def test_skill_markdown_history_upsert_round_trips_on_postgres(postgres_engine: 
         log=structlog.get_logger("test"),
     )
 
+    content = "# Composer skill"
+    skill_hash = hashlib.sha256(content.encode()).hexdigest()
     first_inserted = asyncio.run(
         service.upsert_skill_markdown_history(
-            skill_hash="a" * 64,
+            skill_hash=skill_hash,
             filename="pipeline_composer.md",
-            content="# Composer skill",
+            content=content,
         )
     )
     duplicate_inserted = asyncio.run(
         service.upsert_skill_markdown_history(
-            skill_hash="a" * 64,
+            skill_hash=skill_hash,
             filename="pipeline_composer.md",
-            content="# Composer skill",
+            content=content,
         )
     )
 
@@ -889,6 +906,32 @@ def test_skill_markdown_history_upsert_round_trips_on_postgres(postgres_engine: 
     assert first_inserted is True
     assert duplicate_inserted is False
     assert len(rows) == 1
+
+
+def test_skill_markdown_history_duplicate_race_across_independent_postgres_engines(postgres_engine: Engine) -> None:
+    init_session_schema(postgres_engine)
+    second_engine = create_engine(postgres_engine.url)
+    first = RepositorySkillMarkdownHistoryAuthority(postgres_engine)
+    second = RepositorySkillMarkdownHistoryAuthority(second_engine)
+    content = "# Concurrent Composer skill"
+    skill_hash = hashlib.sha256(content.encode()).hexdigest()
+    barrier = threading.Barrier(2)
+
+    def upsert(authority: RepositorySkillMarkdownHistoryAuthority) -> bool:
+        barrier.wait()
+        return authority.upsert_exact(skill_hash=skill_hash, filename="pipeline_composer.md", content=content)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = [future.result() for future in (pool.submit(upsert, first), pool.submit(upsert, second))]
+    finally:
+        second_engine.dispose()
+
+    assert set(results) == {True, False}
+    with postgres_engine.connect() as conn:
+        assert conn.execute(select(skill_markdown_history_table.c.hash).where(skill_markdown_history_table.c.hash == skill_hash)).all() == [
+            (skill_hash,)
+        ]
 
 
 def test_landscape_server_default_is_false(postgres_engine: Engine) -> None:

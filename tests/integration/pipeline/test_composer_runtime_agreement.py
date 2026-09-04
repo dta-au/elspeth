@@ -3696,6 +3696,27 @@ class _RunSnapshot:
     error: str | None = None
 
 
+def _execute_lease(loop: asyncio.AbstractEventLoop, session_id: Any) -> Any:
+    """Mint the EXECUTE lease the /execute route transfers into _run_pipeline.
+
+    The recording authority mints exact contexts without a database; the
+    lease's renewal task lives on ``loop`` for the test's lifetime.
+    """
+    from elspeth.contracts.session_operation import SessionOperationKind
+    from elspeth.web.coordination.lifecycle import SessionOperationLease
+    from tests.helpers.session_fences import RecordingSessionOperationAuthority
+
+    return loop.run_until_complete(
+        SessionOperationLease.acquire(
+            RecordingSessionOperationAuthority(),
+            session_id=session_id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id="test-execute-owner",
+            lease_seconds=60,
+        )
+    )
+
+
 @dataclass(slots=True)
 class _FakeSessionService:
     run: _RunSnapshot
@@ -3721,6 +3742,7 @@ class _FakeSessionService:
         timestamp: datetime,
         event_type: str,
         data: dict[str, Any],
+        session_operation_context: Any = None,
     ) -> SimpleNamespace:
         self.next_event_sequence += 1
         self.appended_run_events.append(
@@ -3739,6 +3761,7 @@ class _FakeSessionService:
         run_id: UUID,
         resolutions: Any,
         attempt: int = 1,
+        session_operation_context: Any = None,
     ) -> None:
         if self.record_blob_inline_resolutions_hook is not None:
             await self.record_blob_inline_resolutions_hook(
@@ -4020,9 +4043,16 @@ sinks:
         cast(Any, service)._blob_service = blob_service
 
         try:
+            lease = _execute_lease(loop, _session_service.run.session_id)
             with pytest.raises(BlobIntegrityError):
-                service._run_pipeline(str(run_id), self._pipeline_yaml(blob_id, "b" * 64), threading.Event())
+                service._run_pipeline(
+                    str(run_id),
+                    self._pipeline_yaml(blob_id, "b" * 64),
+                    threading.Event(),
+                    session_operation_lease=lease,
+                )
         finally:
+            loop.run_until_complete(lease.close())
             loop.close()
 
         mock_load.assert_not_called()
@@ -4077,9 +4107,16 @@ sinks:
         mock_load.side_effect = stop_after_audit
 
         try:
+            lease = _execute_lease(loop, session_service.run.session_id)
             with pytest.raises(RuntimeError, match="stop after inline audit"):
-                service._run_pipeline(str(run_id), self._pipeline_yaml(blob_id, sha256), threading.Event())
+                service._run_pipeline(
+                    str(run_id),
+                    self._pipeline_yaml(blob_id, sha256),
+                    threading.Event(),
+                    session_operation_lease=lease,
+                )
         finally:
+            loop.run_until_complete(lease.close())
             loop.close()
 
         assert len(session_service.recorded_blob_inline_resolutions) == 1

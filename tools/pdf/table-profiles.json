@@ -2,86 +2,36 @@
   "_comment": "Table column-width profiles for the ELSPETH PDF pipelines (arch-pack and control-pack). Each profile matches a table by exact column count + header-cell prefix or substring match, and applies hand-tuned widths summing to 1.0 for A4 layout. Add a profile only when Pandoc's auto-sizing produces a table that demonstrably reads poorly in the rendered PDF. Matchers name at least two header cells so a profile cannot capture an unrelated table of the same width.",
   "profiles": [
     {
-      "_doc": "control-pack: RAID issues",
-      "cols": 6,
+      "_doc": "control-pack: RAID tier table (reader / visibility)",
+      "cols": 7,
       "match": {
         "col_1": "id",
-        "col_2": "issue",
-        "col_3": "exp"
+        "col_2": "entry",
+        "col_5": "posture"
       },
       "widths": [
         0.05,
-        0.44,
-        0.08,
+        0.34,
+        0.07,
+        0.14,
+        0.07,
         0.1,
-        0.22,
-        0.11
+        0.23
       ]
     },
     {
-      "_doc": "control-pack: RAID risks",
-      "cols": 8,
-      "match": {
-        "col_1": "id",
-        "col_2": "risk",
-        "col_6": "trend"
-      },
-      "widths": [
-        0.05,
-        0.4,
-        0.07,
-        0.05,
-        0.09,
-        0.08,
-        0.16,
-        0.1
-      ]
-    },
-    {
-      "_doc": "control-pack: RAID assumptions",
-      "cols": 6,
-      "match": {
-        "col_1": "id",
-        "col_2": "assumption",
-        "col_3": "if false"
-      },
-      "widths": [
-        0.05,
-        0.33,
-        0.2,
-        0.09,
-        0.22,
-        0.11
-      ]
-    },
-    {
-      "_doc": "control-pack: RAID dependencies",
-      "cols": 6,
-      "match": {
-        "col_1": "id",
-        "col_2": "dependency",
-        "col_4": "responsible"
-      },
-      "widths": [
-        0.05,
-        0.4,
-        0.07,
-        0.12,
-        0.24,
-        0.12
-      ]
-    },
-    {
-      "_doc": "control-pack: RAID closes-on-a-decision",
-      "cols": 3,
+      "_doc": "control-pack: RAID what-is-being-asked",
+      "cols": 5,
       "match": {
         "col_1": "decision",
-        "col_2": "closes",
-        "col_3": "cost of delay"
+        "col_2": "options",
+        "col_3": "decide by"
       },
       "widths": [
-        0.3,
-        0.4,
+        0.2,
+        0.28,
+        0.15,
+        0.07,
         0.3
       ]
     },
@@ -109,21 +59,6 @@
       "widths": [
         0.7,
         0.3
-      ]
-    },
-    {
-      "_doc": "control-pack: RAID closed",
-      "cols": 4,
-      "match": {
-        "col_1": "id",
-        "col_2": "entry",
-        "col_4": "evidence"
-      },
-      "widths": [
-        0.06,
-        0.26,
-        0.1,
-        0.58
       ]
     },
     {

@@ -37,6 +37,13 @@ allowed_external_types:
   # Composition state types - shared between web composer and composer MCP server
   - "web/composer/state:CompositionState"
   - "web/composer/state:PipelineMetadata"
+  # The wire dict ValidationEntry.to_dict() emits. The composer MCP server
+  # serializes the same objects and used to hand-copy this shape (a 3-key
+  # mirror of an 8-key dict — elspeth-e405ad7cd2, systems ledger #41);
+  # importing the producer's own TypedDict is the honest form. (EdgeContractDict
+  # is shared the same way but is a functional-form TypedDict the checker
+  # does not index, so it needs no entry.)
+  - "web/composer/state:ValidationEntryDict"
   # Runtime preflight coordination types - shared between web execution and composer MCP
   - "web/execution/runtime_preflight:RuntimePreflightKey"
   - "web/execution/runtime_preflight:RuntimePreflightFailure"
@@ -766,7 +773,6 @@ allowed_dict_patterns:
   # the check.
   # ═══════════════════════════════════════════════════════════════════════════
   - "src/elspeth/web/interpretation_state.py:strip_authoring_options:return"
-  - "src/elspeth/web/sessions/service.py:_patch_structured_interpretation_prompt:return"
 
   # ═══════════════════════════════════════════════════════════════════════════
   # WEB COMPOSER — Compose-loop helpers (Tier 3 LiteLLM API shapes)
@@ -817,7 +823,6 @@ allowed_dict_patterns:
   # LLM tool-use loop. Tool JSON schemas define optional fields.
   # ═══════════════════════════════════════════════════════════════════════════
   - "src/elspeth/web/composer/tools/_common.py:ToolResult.to_dict:return"
-  - "src/elspeth/web/composer/tools/sessions.py:_authoring_validation_payload:return"
   - "src/elspeth/web/composer/tools/_common.py:_secret_ref_placement_error:options"
   - "src/elspeth/web/composer/tools/_dispatch.py:get_tool_definitions:return (list)"
   - "src/elspeth/web/composer/tools/_dispatch.py:execute_tool:arguments"
@@ -982,9 +987,11 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tools/blobs.py:_execute_wire_blob_inline_ref:arguments"
   - "src/elspeth/web/composer/tools/generation.py:_execute_diff_pipeline:args"
   - "src/elspeth/web/composer/tools/sessions.py:_execute_get_pipeline_state:args"
-  # Serialization helpers — produce JSON dicts for LLM tool responses
+  # Serialization helpers — produce JSON dicts for LLM tool responses.
+  # ``_serialize_node`` left this list at elspeth-e405ad7cd2 (RED5-2): its return is now the
+  # ``_SetPipelineNodePayload`` TypedDict the envelope census reads, so there is no bare dict
+  # pattern left to exempt.
   - "src/elspeth/web/composer/tools/_common.py:_serialize_source:return"
-  - "src/elspeth/web/composer/tools/_common.py:_serialize_node:return"
   - "src/elspeth/web/composer/tools/_common.py:_serialize_output:return"
   - "src/elspeth/web/composer/tools/_common.py:_serialize_edge:return"
   - "src/elspeth/web/composer/tools/generation.py:_serialize_plugin_assistance_example:return"
@@ -1006,9 +1013,6 @@ allowed_dict_patterns:
   # from the dialect-specific excluded/inserted namespace.
   # ═══════════════════════════════════════════════════════════════════════════
   - "src/elspeth/web/secrets/user_store.py:_upsert_update_mapping:return"
-  - "src/elspeth/web/secrets/user_store.py:_sqlite_upsert:values"
-  - "src/elspeth/web/secrets/user_store.py:_pg_upsert:values"
-  - "src/elspeth/web/secrets/user_store.py:_mysql_upsert:values"
 
   # WEB COMPOSER — provider-bound LLM message lists. In-process persisted
   # history uses ComposerHistoryMessage; only the outbound provider shapes

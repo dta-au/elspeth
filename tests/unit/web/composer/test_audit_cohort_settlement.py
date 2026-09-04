@@ -50,6 +50,7 @@ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.models import chat_messages_table, composition_proposals_table
 from elspeth.web.sessions.routes import _handle_convergence_error
+from tests.helpers.session_fences import acquire_compose_context
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
 
 _CATALOG = create_catalog_service()
@@ -215,19 +216,21 @@ async def _drive_turn_then_provider_timeout(
 
 async def _run_convergence_handler(service: ComposerServiceImpl, session_id: str, exc: ComposerConvergenceError) -> dict[str, object]:
     sessions_service = service._sessions_service  # type: ignore[attr-defined]
-    return await _handle_convergence_error(
-        exc,
-        service=sessions_service,
-        session_id=UUID(session_id),
-        user_id="phase3-test-user",
-        log_prefix="cohort_test",
-        llm_composition_state_id=None,
-        settings=service._settings,  # type: ignore[attr-defined]
-        secret_service=None,
-        plugin_snapshot=_PLUGIN_SNAPSHOT,
-        profile_registry=MagicMock(spec=OperatorProfileRegistry),
-        catalog=_CATALOG,
-    )
+    async with acquire_compose_context(sessions_service, session_id) as compose_context:
+        return await _handle_convergence_error(
+            exc,
+            service=sessions_service,
+            session_id=UUID(session_id),
+            user_id="phase3-test-user",
+            log_prefix="cohort_test",
+            llm_composition_state_id=None,
+            settings=service._settings,  # type: ignore[attr-defined]
+            secret_service=None,
+            plugin_snapshot=_PLUGIN_SNAPSHOT,
+            profile_registry=MagicMock(spec=OperatorProfileRegistry),
+            catalog=_CATALOG,
+            session_operation_context=compose_context,
+        )
 
 
 @pytest.mark.asyncio
@@ -375,20 +378,22 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
     preflight = AsyncMock(spec=service._cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
 
     async def _stage() -> Any:
-        return await service._stage_pipeline_plan(  # type: ignore[attr-defined]
-            plan=_plan(),
-            state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
-            session_id=UUID(result_session_id),
-            current_state_id=None,
-            user_message_id=user_message_id,
-            user_id="phase3-test-user",
-            preferences=_FakePreferences(trust_mode="explicit_approve"),
-            recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
-            planner_llm_calls=(),
-            planner_attempts=(),
-            planner_invocations=_PLANNER_COHORT,
-            plugin_snapshot=None,
-        )
+        async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
+            return await service._stage_pipeline_plan(  # type: ignore[attr-defined]
+                session_operation_context=compose_context,
+                plan=_plan(),
+                state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+                session_id=UUID(result_session_id),
+                current_state_id=None,
+                user_message_id=user_message_id,
+                user_id="phase3-test-user",
+                preferences=_FakePreferences(trust_mode="explicit_approve"),
+                recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
+                planner_llm_calls=(),
+                planner_attempts=(),
+                planner_invocations=_PLANNER_COHORT,
+                plugin_snapshot=None,
+            )
 
     with patch.object(service, "_cached_runtime_preflight", preflight):
         if fail_at is None:
@@ -584,20 +589,22 @@ async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_n
     preflight = AsyncMock(spec=service._cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
 
     async def _stage() -> Any:
-        return await service._stage_pipeline_plan(  # type: ignore[attr-defined]
-            plan=_plan(),
-            state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
-            session_id=UUID(result_session_id),
-            current_state_id=None,
-            user_message_id=user_message_id,
-            user_id="phase3-test-user",
-            preferences=_FakePreferences(trust_mode="explicit_approve"),
-            recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
-            planner_llm_calls=(),
-            planner_attempts=(),
-            planner_invocations=_PLANNER_COHORT,
-            plugin_snapshot=None,
-        )
+        async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
+            return await service._stage_pipeline_plan(  # type: ignore[attr-defined]
+                session_operation_context=compose_context,
+                plan=_plan(),
+                state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+                session_id=UUID(result_session_id),
+                current_state_id=None,
+                user_message_id=user_message_id,
+                user_id="phase3-test-user",
+                preferences=_FakePreferences(trust_mode="explicit_approve"),
+                recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
+                planner_llm_calls=(),
+                planner_attempts=(),
+                planner_invocations=_PLANNER_COHORT,
+                plugin_snapshot=None,
+            )
 
     with patch.object(service, "_cached_runtime_preflight", preflight):
         task = asyncio.create_task(_stage())

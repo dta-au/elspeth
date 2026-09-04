@@ -41,6 +41,7 @@ from elspeth.web.composer.guided_blob_refs import (
 )
 from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
 from elspeth.web.composer.state import EdgeType
+from elspeth.web.composer.tool_result_envelope import TOOL_RESULT_OPTIONAL_KEYS, TOOL_RESULT_REQUIRED_KEYS, tool_result_keys
 
 REDACTED_BLOB_SOURCE_PATH = "<redacted-blob-source-path>"
 _REDACTED_OPTION_VALUE = "<redacted-option-value>"
@@ -88,8 +89,14 @@ REDACTED_UNKNOWN_RESPONSE_FIELD = "_unknown_response"
 # every serialized tool result.  Implicitly known (never sentinel'd) for
 # declarative manifest entries unless a policy explicitly declares one
 # sensitive; tool payload lives under other keys (``data`` etc.) which remain
-# policy-declared and fail-closed.
-_TOOL_RESULT_ENVELOPE_KEYS: frozenset[str] = frozenset({"success", "validation", "version"})
+# policy-declared and fail-closed.  Derived from the registry
+# (``tool_result_envelope.TOOL_RESULT_REQUIRED_KEYS``): ``affected_nodes`` is
+# part of it since elspeth-e405ad7cd2 (D1) — while it was missing, every
+# declarative discovery row fired ``unknown_response_key_redacted`` on every
+# call, which made the drift counter permanently non-zero. Node ids go through
+# ``_project_untrusted_response_structure`` exactly as the type-driven path
+# projects them (text sentinels), so no new byte reaches the audit row.
+_TOOL_RESULT_ENVELOPE_KEYS: frozenset[str] = frozenset(TOOL_RESULT_REQUIRED_KEYS)
 
 # Fixed sentinel for arguments that appear in the input but are not declared in
 # a manifest entry's optional known_argument_keys allowlist. Unknown key names
@@ -3156,9 +3163,12 @@ class _ValidationEntryShadowModel(BaseModel):
     ``contract`` the structured schema-contract facts, emitted only for the
     schema-contract family, ``row_union_schema`` the branch declarations
     emitted only for row-union incompatibility, and ``coalesce_union_type``
-    the conflicting declaration emitted only for a union-coalesce type clash.
-    The response scalar projection preserves the closed severity value and
-    summarizes all free-form diagnostic text.
+    the conflicting declaration emitted only for a union-coalesce type clash,
+    and ``rejected_component`` the validation-component ref a
+    ``rejected_mutation`` entry is about, emitted only when the set_pipeline
+    component loop stamped it (elspeth-e405ad7cd2). The response scalar
+    projection preserves the closed severity value and summarizes all
+    free-form diagnostic text.
 
     This model is ``extra="forbid"``, so it must carry EVERY optional key
     ``ValidationEntry.to_dict()`` can emit: a missing one is not a silent
@@ -3174,6 +3184,7 @@ class _ValidationEntryShadowModel(BaseModel):
     contract: _SchemaContractDetailShadowModel | None = None
     row_union_schema: _RowUnionSchemaDetailShadowModel | None = None
     coalesce_union_type: _CoalesceUnionTypeDetailShadowModel | None = None
+    rejected_component: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3211,7 +3222,6 @@ class _RequestInterpretationReviewPendingDataModel(BaseModel):
 
     kind_marker: Literal["interpretation_review_pending", "interpretation_review_pending_idempotent"] = Field(alias="_kind")
     event_id: str
-    affected_node_id: str
     kind: InterpretationKind
     interpretation_source: str
     message: str
@@ -3230,7 +3240,6 @@ class _RequestInterpretationReviewPendingTextDataModel(BaseModel):
 
     kind_marker: Literal["interpretation_review_pending", "interpretation_review_pending_idempotent"] = Field(alias="_kind")
     event_id: str
-    affected_node_id: str
     kind: InterpretationKind
     user_term: Annotated[str, Sensitive(summarizer=_summarize_interpretation_term)]
     llm_draft: Annotated[str, Sensitive(summarizer=_summarize_interpretation_term)]
@@ -3558,28 +3567,15 @@ def _summarize_advisor_schema_excerpt(value: str) -> str:
     return f"<advisor-schema-excerpt:{len(value)}-chars>"
 
 
-_TOOL_RESULT_REQUIRED_RESPONSE_KEYS: tuple[str, ...] = (
-    "success",
-    "validation",
-    "affected_nodes",
-    "version",
-)
-_TOOL_RESULT_OPTIONAL_RESPONSE_KEYS: tuple[str, ...] = (
-    "runtime_preflight",
-    "validation_delta",
-    "post_call_hints",
-    "plugin_schemas",
-    "validation_guidance",
-    "applied_component",
-)
+# Both tables derive from the registry that ``ToolResult.to_dict`` is pinned to;
+# they were hand-maintained copies with no cross-check until elspeth-e405ad7cd2.
+_TOOL_RESULT_REQUIRED_RESPONSE_KEYS: tuple[str, ...] = TOOL_RESULT_REQUIRED_KEYS
+_TOOL_RESULT_OPTIONAL_RESPONSE_KEYS: tuple[str, ...] = tuple(key for key in TOOL_RESULT_OPTIONAL_KEYS if key != "data")
 
 
 def _tool_result_response_keys(*, data: bool) -> tuple[str, ...]:
-    """Return the shared top-level ``ToolResult.to_dict`` response envelope."""
-    keys = _TOOL_RESULT_REQUIRED_RESPONSE_KEYS
-    if data:
-        keys = (*keys, "data")
-    return (*keys, *_TOOL_RESULT_OPTIONAL_RESPONSE_KEYS)
+    """Return the shared top-level ``ToolResult.to_dict`` response envelope, from the registry."""
+    return tool_result_keys(data=data)
 
 
 # Manifest entries are grouped by tool family. The binding is rebuilt as a

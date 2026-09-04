@@ -23,11 +23,12 @@ import pytest
 import structlog
 from asgi_lifespan import LifespanManager
 from fastapi import FastAPI, HTTPException
-from sqlalchemy import Connection, event, insert
+from sqlalchemy import Connection, event, insert, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.state import (
@@ -38,15 +39,22 @@ from elspeth.web.composer.state import (
     SourceSpec,
 )
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions import models
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    CompositionStateProvenance,
+    CompositionStateRecord,
+)
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.composer_lease import install_fenced_compose_adapter
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 def _make_session(
@@ -73,6 +81,60 @@ def _make_session(
     )
 
 
+async def _save_composition_state_with_compose_authority(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    """Persist test state under a real COMPOSE lease from ``service``."""
+    _ensure_released_session_operation_fence(service, session_id)
+    lease = await SessionOperationLease.acquire(
+        service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
+    )
+    async with lease:
+        record = await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=lease.context,
+        )
+    return record
+
+
+def _ensure_released_session_operation_fence(
+    service: SessionServiceImpl,
+    session_id: UUID,
+) -> None:
+    """Backfill the released CREATE fence omitted by direct-SQL fixtures."""
+    with service._engine.begin() as conn:
+        existing = conn.execute(
+            select(models.session_operation_fences_table.c.session_id).where(
+                models.session_operation_fences_table.c.session_id == str(session_id)
+            )
+        ).one_or_none()
+        if existing is not None:
+            return
+        seeded_at = datetime.now(UTC)
+        conn.execute(
+            insert(models.session_operation_fences_table).values(
+                session_id=str(session_id),
+                operation_id=str(uuid4()),
+                lease_token=f"test-seed-{uuid4()}",
+                operation_kind=SessionOperationKind.CREATE.value,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                operation_epoch=1,
+                lease_expires_at=seeded_at,
+                released_at=seeded_at,
+            )
+        )
+
+
 @pytest.fixture
 def composer_test_client(tmp_path: Path) -> TestClient:
     """FastAPI ``TestClient`` configured for generic compose-route tests."""
@@ -83,7 +145,7 @@ def composer_test_client(tmp_path: Path) -> TestClient:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    session_service = SessionServiceImpl(
+    session_service = DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -396,7 +458,8 @@ def _seed_session_with_state(
         (settings.data_dir / "outputs" / str(record.id)).mkdir(parents=True, exist_ok=True)
         state = _passthrough_composition_state(settings.data_dir, record.id)
         state_d = state.to_dict()
-        await session_service.save_composition_state(
+        await _save_composition_state_with_compose_authority(
+            session_service,
             record.id,
             CompositionStateData(
                 sources=state_d["sources"],
@@ -536,7 +599,8 @@ def _seed_session_with_mismatched_auth_provider(
         (settings.data_dir / "outputs" / str(record.id)).mkdir(parents=True, exist_ok=True)
         state = _passthrough_composition_state(settings.data_dir, record.id)
         state_d = state.to_dict()
-        await session_service.save_composition_state(
+        await _save_composition_state_with_compose_authority(
+            session_service,
             record.id,
             CompositionStateData(
                 sources=state_d["sources"],
@@ -597,3 +661,9 @@ def inject_commit_OperationalError() -> object:
         event.listen(engine, "commit", _raise)
 
     return _install
+
+
+@pytest.fixture(autouse=True)
+def _fenced_compose_for_legacy_tests(monkeypatch):
+    """See tests/helpers/composer_lease.py."""
+    install_fenced_compose_adapter(monkeypatch)

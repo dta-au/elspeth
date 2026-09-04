@@ -75,11 +75,9 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, get_args, get_origin
 from unittest.mock import MagicMock
-from uuid import uuid4
 
 import hypothesis.strategies as st
 import pytest
@@ -119,10 +117,10 @@ from elspeth.web.composer.tools._common import ToolContext
 from elspeth.web.config import WebSettings
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 def _dict_strategy(thing: type) -> st.SearchStrategy[dict[Any, Any]]:
@@ -661,23 +659,16 @@ def _composer_available_for_phase3(monkeypatch: pytest.MonkeyPatch) -> None:
 def result_session_id(composer_service_with_real_sessions: ComposerServiceImpl) -> str:
     """Session id used by ``_run_one_turn_for_test`` result assertions."""
 
-    session_id = str(uuid4())
-    now = datetime.now(UTC)
     sessions_service = composer_service_with_real_sessions._sessions_service
-    with sessions_service._engine.begin() as conn:
-        conn.execute(
-            sessions_table.insert().values(
-                id=session_id,
-                user_id="phase3-test-user",
-                auth_provider_type="local",
-                title="Phase 3 test session",
-                trust_mode="auto_commit",
-                density_default="high",
-                created_at=now,
-                updated_at=now,
-            )
-        )
-    return session_id
+    assert sessions_service is not None
+    session = sessions_service.session_operation_authority.create_session_with_initial_fence(
+        user_id="phase3-test-user",
+        auth_provider_type="local",
+        title="Phase 3 test session",
+        owner_instance_id=sessions_service.session_operation_owner_instance_id,
+        lease_seconds=sessions_service.session_operation_lease_seconds,
+    )
+    return str(session.id)
 
 
 def build_test_sessions_service(
@@ -699,7 +690,7 @@ def build_test_sessions_service(
     )
     if engine is None:
         initialize_session_schema(resolved_engine)
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         resolved_engine,
         data_dir=data_dir,
         telemetry=build_sessions_telemetry(),
@@ -1212,3 +1203,98 @@ def inject_IntegrityError_on_chat_messages(monkeypatch: pytest.MonkeyPatch) -> N
         return original_insert(self, *args, **kwargs)
 
     monkeypatch.setattr(SessionServiceImpl, "_insert_chat_message", _raise_for_chat_messages)
+
+
+@pytest.fixture(autouse=True)
+def _fenced_compose_for_legacy_tests(monkeypatch):
+    """Test adapter: compose() calls that name a session but carry no
+    session-operation context acquire an exact, short-lived COMPOSE lease on
+    the composer's sessions service for the duration of the call (mirrors
+    DualFencedSessionServiceHarness for the session writers)."""
+    from elspeth.contracts.session_operation import SessionOperationKind
+    from elspeth.web.composer.service import ComposerServiceImpl
+    from elspeth.web.coordination.contracts import SessionOperationFenceLost
+    from elspeth.web.coordination.lifecycle import SessionOperationLease
+
+    async def _with_lease(self, session_id, kwargs, call):
+        sessions = getattr(self, "_sessions_service", None)
+        authority = getattr(sessions, "session_operation_authority", None)
+        if session_id is None or kwargs.get("session_operation_context") is not None or authority is None:
+            return await call(**kwargs)
+        try:
+            lease = await SessionOperationLease.acquire(
+                authority,
+                session_id=session_id if not isinstance(session_id, str) else __import__("uuid").UUID(session_id),
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=sessions.session_operation_owner_instance_id,
+                lease_seconds=sessions.session_operation_lease_seconds,
+            )
+        except SessionOperationFenceLost:
+            from tests.helpers.session_fences import ensure_session_fence
+
+            session_uuid = session_id if not isinstance(session_id, str) else __import__("uuid").UUID(session_id)
+            engine = getattr(sessions, "_engine", None)
+            seeded = engine is not None and ensure_session_fence(
+                engine,
+                session_uuid,
+                owner_instance_id=sessions.session_operation_owner_instance_id,
+            )
+            if not seeded:
+                # No durable session row to fence (fixture-minted ids): run
+                # the call exactly as the legacy test wrote it.
+                return await call(**kwargs)
+            lease = await SessionOperationLease.acquire(
+                authority,
+                session_id=session_uuid,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=sessions.session_operation_owner_instance_id,
+                lease_seconds=sessions.session_operation_lease_seconds,
+            )
+        try:
+            forwarded = {name: value for name, value in kwargs.items() if name != "session_operation_context"}
+            return await call(session_operation_context=lease.context, **forwarded)
+        finally:
+            await lease.close()
+
+    real_compose = ComposerServiceImpl.compose
+    real_turn = ComposerServiceImpl._run_one_turn_for_test
+
+    async def compose(
+        self,
+        message,
+        messages,
+        state,
+        session_id=None,
+        current_state_id=None,
+        user_id=None,
+        progress=None,
+        guided_terminal=None,
+        user_message_id=None,
+        session_operation_context=None,
+    ):
+        kwargs = {
+            "message": message,
+            "messages": messages,
+            "state": state,
+            "session_id": session_id,
+            "current_state_id": current_state_id,
+            "user_id": user_id,
+            "progress": progress,
+            "guided_terminal": guided_terminal,
+            "user_message_id": user_message_id,
+            "session_operation_context": session_operation_context,
+        }
+
+        async def call(**kw):
+            return await real_compose(self, **kw)
+
+        return await _with_lease(self, session_id, kwargs, call)
+
+    async def run_one_turn(self, **kwargs):
+        async def call(**kw):
+            return await real_turn(self, **kw)
+
+        return await _with_lease(self, kwargs.get("session_id"), kwargs, call)
+
+    monkeypatch.setattr(ComposerServiceImpl, "compose", compose)
+    monkeypatch.setattr(ComposerServiceImpl, "_run_one_turn_for_test", run_one_turn)

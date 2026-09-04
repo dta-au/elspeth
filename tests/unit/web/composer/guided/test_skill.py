@@ -6,7 +6,11 @@ from collections.abc import Iterator, Mapping
 
 import pytest
 
-from elspeth.web.composer.guided.prompts import _summarize_sample_row, load_step_chat_skill
+from elspeth.web.composer.guided.prompts import (
+    _summarize_sample_row,
+    load_step_chat_skill,
+    load_step_planner_skill,
+)
 from elspeth.web.composer.guided.protocol import GuidedStep
 
 
@@ -102,6 +106,44 @@ def test_step_3_skill_keeps_fail_closed_mapping_direction_rules() -> None:
     assert "never reverse" in text
     assert "Required downstream fields belong in output targets" in text
     assert "unproven source" in text
+
+
+def test_step_3_skill_reads_an_outcome_goal_as_a_request_for_processing() -> None:
+    """Pin both halves of the goal-first stage-timing clause (B-2.1/2.2).
+
+    Since the goal-first change the step-2 finish runs the planner ONCE, from
+    the session's opening goal: one sentence naming what should come out the
+    other end. Rule 1 of the stage-timing section decides whether that intent
+    needs transforms at all, so it is the pivot of the whole change, and it can
+    fail in two directions. Without the first half the planner can classify a
+    real outcome goal as "the user asked for no processing" and hand back an
+    empty pass-through; without the second half — and without rule 1's original
+    three-part conjunction, which this clause must leave intact — it can add
+    steps to a goal that genuinely asked for none.
+
+    The skill is model-facing prose whose line breaks are wrapping, not
+    meaning, so the pins run over whitespace-normalized text: a future re-wrap
+    must not turn this tripwire red, and must not be able to silence it either.
+    Both overlays are checked because the chat solver reads the step skill and
+    the planner reads it rendered with the capability core.
+    """
+    for overlay in (
+        load_step_chat_skill(GuidedStep.STEP_3_TRANSFORMS),
+        load_step_planner_skill(GuidedStep.STEP_3_TRANSFORMS),
+    ):
+        text = " ".join(overlay.split())
+
+        # An outcome goal counts as asking for processing.
+        assert "When the intent is an outcome goal" in text
+        assert "read it as asking for processing" in text
+        # ... and the empty set is still reachable, anchored on the user's own words.
+        assert "Such a goal asks for no processing only when what it names is the source's own rows" in text
+        # The three-part condition the clause qualifies survives verbatim.
+        assert (
+            "When the user asked for no processing, no deferred intents are pending, "
+            "and the server named no `unproducible_output_fields`, "
+            "the correct transform set is EMPTY" in text
+        )
 
 
 def test_step_4_skill_has_no_fixed_linear_topology_contract() -> None:

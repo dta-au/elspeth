@@ -77,6 +77,8 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -151,7 +153,7 @@ def _make_session_service() -> tuple[SessionServiceImpl, Any]:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -269,7 +271,8 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
             "merge": None,
         }
     ]
-    state = await service.save_composition_state(
+    state = await _save_composition_state_with_compose_authority(
+        service,
         sid,
         CompositionStateData(
             nodes=nodes,
@@ -612,7 +615,8 @@ async def test_session_db_records_match_runtime_landscape_join() -> None:
             "merge": None,
         }
     ]
-    state = await service.save_composition_state(
+    state = await _save_composition_state_with_compose_authority(
+        service,
         sid,
         CompositionStateData(
             nodes=nodes,

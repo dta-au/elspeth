@@ -33,6 +33,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # ---------------------------------------------------------------------------
 # Test app factory
@@ -51,7 +52,7 @@ def _make_app(
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
-    session_service = SessionServiceImpl(
+    session_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -402,7 +403,7 @@ class TestIDORProtection:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
-        session_service = SessionServiceImpl(
+        session_service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -455,7 +456,7 @@ class TestIDORProtection:
         assert resp.status_code == 404
 
     def test_blob_delete_from_wrong_session_returns_404(self, tmp_path) -> None:
-        """DELETE another user's blob returns 404."""
+        """DELETE another user's blob returns 404 and leaves the blob intact."""
         alice, bob = self._make_two_session_app(tmp_path)
 
         alice_session = _create_session(alice, "Alice Session")
@@ -464,6 +465,7 @@ class TestIDORProtection:
 
         resp = bob.delete(f"/api/sessions/{bob_session}/blobs/{blob['id']}")
         assert resp.status_code == 404
+        assert alice.get(f"/api/sessions/{alice_session}/blobs/{blob['id']}/content").content
 
     def test_blob_download_from_wrong_session_returns_404(self, tmp_path) -> None:
         """GET content for another user's blob returns 404."""

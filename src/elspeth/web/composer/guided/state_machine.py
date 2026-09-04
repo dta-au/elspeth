@@ -1379,3 +1379,66 @@ class GuidedSession:
             raise
         except (KeyError, ValueError, TypeError) as exc:
             raise InvariantError(f"GuidedSession.from_dict: malformed record {d!r}") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewedComponentEntry:
+    """One settled component's identity: exactly what a reviewed card shows.
+
+    Deliberately narrow. This entry is the single derivation behind both the
+    ``review_components`` turn payload (``emitters.build_component_review_turn``)
+    and the ``reviewed_components`` wire ledger published on every guided
+    response (``guided_replay.project_reviewed_components``), so it is a
+    redaction boundary: it carries component identity, the display name and
+    the plugin id, and nothing else. Authored option values, inspected
+    ``sample_rows``, storage paths, and content-identity anchors stay inside
+    the schema-8 checkpoint under ``composition_state.composer_meta`` and out
+    of the top-level projection (the invariant recorded on
+    ``tests/integration/web/composer/guided/test_respond.py::_full_guided_session``).
+    """
+
+    stable_id: str
+    name: str
+    plugin: str
+    status: Literal["reviewed"] = "reviewed"
+
+    def __post_init__(self) -> None:
+        _canonical_uuid_text(self.stable_id, "ReviewedComponentEntry.stable_id")
+        _require_nonempty_str(self.name, "ReviewedComponentEntry.name")
+        _require_nonempty_str(self.plugin, "ReviewedComponentEntry.plugin")
+        if self.status != "reviewed":
+            raise InvariantError("ReviewedComponentEntry.status must be 'reviewed'")
+
+
+def reviewed_component_ledger(guided: GuidedSession, kind: Literal["source", "output"]) -> tuple[ReviewedComponentEntry, ...]:
+    """Project the settled components of one kind, in their authored order.
+
+    Pure read of reviewed custody. Unlike ``build_component_review_turn`` this
+    imposes no completeness invariant: the ledger is published on every guided
+    response, including mid-stage states where one kind still holds pending
+    intents (a reviewed source while an output is being configured) and
+    including a terminal session, whose reviewed mappings survive commit. The
+    order is the session's own ``source_order`` / ``output_order`` filtered to
+    the settled ids, so pending components are absent rather than half-named.
+    """
+
+    if type(guided) is not GuidedSession:
+        raise TypeError("reviewed_component_ledger requires an exact GuidedSession")
+    reviewed: Mapping[str, SourceResolved | SinkOutputResolved]
+    if kind == "source":
+        order = guided.source_order
+        reviewed = guided.reviewed_sources
+    elif kind == "output":
+        order = guided.output_order
+        reviewed = guided.reviewed_outputs
+    else:
+        raise InvariantError("reviewed_component_ledger kind must be 'source' or 'output'")
+    return tuple(
+        ReviewedComponentEntry(
+            stable_id=stable_id,
+            name=reviewed[stable_id].name,
+            plugin=reviewed[stable_id].plugin,
+        )
+        for stable_id in order
+        if stable_id in reviewed
+    )

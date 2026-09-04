@@ -28,7 +28,7 @@ settings(max_examples=50, deadline=None) for stable CI execution.
 from __future__ import annotations
 
 import pytest
-from hypothesis import event, given, settings
+from hypothesis import HealthCheck, event, given, settings
 from hypothesis import strategies as st
 
 from elspeth.web.composer.redaction import (
@@ -279,8 +279,24 @@ def test_redaction_replaces_every_sensitive_response_value(tool_name: str) -> No
     )
 
     # F6 drift guard (conftest.py) ensures future response models with Field(default_factory=dict) raise at collection time.
+    #
+    # ``data_too_large`` is suppressed because it measures GENERATION entropy,
+    # not the redaction property this test asserts. The manifest response
+    # models are large by design — ``GetBlobContentResponseModel`` embeds the
+    # full validation envelope, whose entry shadow carries seven optional
+    # detail fields across three entry lists — so ``st.from_type`` routinely
+    # draws past the per-example budget and the check aborts the whole run on
+    # an unlucky seed rather than on a defect (red-team RED-R3-1: the default
+    # ``ci`` profile draws a fresh seed per run, so this reached the suite as
+    # an intermittent red). Suppressing it costs the property NOTHING here:
+    # hypothesis discards the oversized draws and still reaches the full
+    # ``max_examples``. Measured on the two seeds that reproduced the abort
+    # (318221544769056840230922461945507808755 and
+    # 252711905402331931842654384287111304020): 50 executed examples for every
+    # one of the 12 parametrizations, where the unsuppressed run aborted
+    # ``get_blob_content`` after 7.
     @given(st.from_type(model))  # type: ignore[arg-type]
-    @settings(max_examples=50, deadline=None)
+    @settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.data_too_large])
     def check(payload: object) -> None:
         raw_response = payload.model_dump()
         redacted_response = redact_tool_call_response(tool_name, raw_response, telemetry=NoopRedactionTelemetry())

@@ -7,6 +7,7 @@ inline-blob effects, not private control flow.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
@@ -2044,7 +2045,7 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             "manual_blob_ref",
             manual_blob_ref,
             _trained_context(data_dir=tmp_path),
-            "Use set_source_from_blob, source.blob_id, or source.inline_blob to bind a blob to the source. set_pipeline "
+            "Source 'source': Use set_source_from_blob, source.blob_id, or source.inline_blob to bind a blob to the source. set_pipeline "
             "must not be called with 'blob_ref' in source.options because it cannot enforce that 'path' equals the "
             "blob's canonical storage_path.",
             None,
@@ -3195,3 +3196,149 @@ def test_component_rejections_are_bounded_and_report_what_they_withheld(tmp_path
     # Truncation is reported, never silent: eleven components failed, eight
     # are listed, and the remaining three are counted.
     assert candidate.result.data["components_withheld"] == 3
+
+
+# The validation-component ref each semantic-failure case's rejection is
+# about, keyed by case name. Every case's message may or may not carry a
+# ``Node 'x': `` prefix — ``manual_blob_ref`` and ``credential_policy`` do
+# not — and the subject must arrive structurally either way.
+_REJECTED_COMPONENT_BY_CASE: dict[str, str] = {
+    "unknown_plugin": "node:copy",
+    "blocked_plugin": "node:copy",
+    "profile_validation": "node:copy",
+    "invalid_options": "node:copy",
+    "escaping_path": "output:main",
+    "invalid_gate": "node:threshold",
+    "manual_blob_ref": "source",
+    "credential_policy": "node:classify",
+    "resolver_owned_interpretation_review": "node:classify",
+}
+
+
+@pytest.mark.parametrize("case_index", range(9))
+def test_component_rejection_carries_its_subject_structurally(tmp_path: Path, case_index: int) -> None:
+    """A ``rejected_mutation`` entry names WHICH component was rejected in ``rejected_component``.
+
+    ``component`` stays the literal ``rejected_mutation`` discriminator; the
+    subject used to live only in the message prefix, which the planner parsed
+    back with a regex and the model had to match by prose on a
+    multi-component rejection (elspeth-e405ad7cd2, F10). The set_pipeline
+    component loop stamps it from its loop variable, so it is present whether
+    or not the producer prefixed the message — two of these cases do not.
+    """
+    case, args, context, _expected_error, _expected_error_code = _semantic_failure_cases(tmp_path)[case_index]
+
+    result = _execute_set_pipeline(args, _empty_state(), context)
+
+    entry = result.validation.errors[0]
+    assert entry.component == "rejected_mutation"
+    assert entry.rejected_component == _REJECTED_COMPONENT_BY_CASE[case], (case, entry)
+    wire = result.to_dict()["validation"]["errors"][0]
+    assert wire["rejected_component"] == _REJECTED_COMPONENT_BY_CASE[case]
+
+
+def test_two_component_rejection_names_each_subject_structurally(tmp_path: Path) -> None:
+    """One merged rejection envelope, one ``rejected_component`` per defective component.
+
+    Wire sample 12 on elspeth-e405ad7cd2: both entries carried
+    ``component: "rejected_mutation"`` and only the message text (one
+    prefixed, one not) said which component each was about, while
+    ``data.error`` carried only the first. The model repairs by
+    ``rejected_component`` now, never by prose.
+    """
+    args = _linear_args(tmp_path)
+    args["nodes"][0]["options"] = {}
+    args["outputs"][0]["options"]["path"] = "/etc/candidate-escape.json"
+
+    result = _execute_set_pipeline(args, _empty_state(), _trained_context(data_dir=tmp_path))
+
+    assert result.success is False
+    rejections = [entry for entry in result.validation.errors if entry.component == "rejected_mutation"]
+    assert [entry.rejected_component for entry in rejections] == ["node:copy", "output:main"]
+    wire = [entry for entry in result.to_dict()["validation"]["errors"] if entry["component"] == "rejected_mutation"]
+    assert [entry["rejected_component"] for entry in wire] == ["node:copy", "output:main"]
+
+
+def test_rejection_outside_a_component_loop_is_not_stamped(tmp_path: Path) -> None:
+    """A rejection with no component subject carries no ``rejected_component``.
+
+    Fail-closed contract: consumers treat absence as "unattributable" rather
+    than parsing the message, so the stamp must never be invented for a
+    whole-candidate rejection.
+    """
+    args = _linear_args(tmp_path)
+    args["sources"] = {}
+    args.pop("source", None)
+
+    result = _execute_set_pipeline(args, _empty_state(), _trained_context(data_dir=tmp_path))
+
+    assert result.success is False
+    entry = result.validation.errors[0]
+    assert entry.component == "rejected_mutation"
+    assert entry.rejected_component is None
+    assert "rejected_component" not in result.to_dict()["validation"]["errors"][0]
+
+
+def _builder_rejection_calls() -> list[tuple[str, ast.Call, bool]]:
+    """Every rejection-constructor call in ``build_set_pipeline_candidate``.
+
+    Returns ``(callee, call, inside_component_body)`` where the third value is
+    True when the call sits lexically inside a ``for`` loop body or inside the
+    ``_legacy_source_rejection`` helper — the two places a rejection is about
+    ONE component.
+    """
+    tree = ast.parse(Path(sessions_tools.__file__).read_text(encoding="utf-8"))
+    builder = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "build_set_pipeline_candidate")
+    calls: list[tuple[str, ast.Call, bool]] = []
+
+    def visit(node: ast.AST, in_component: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            child_in_component = in_component
+            if isinstance(child, (ast.For, ast.AsyncFor)):
+                child_in_component = True
+            if isinstance(child, ast.FunctionDef) and child.name == "_legacy_source_rejection":
+                child_in_component = True
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id in {"_failure_result", "_plugin_policy_failure"}
+            ):
+                calls.append((child.func.id, child, in_component))
+            visit(child, child_in_component)
+
+    visit(builder, False)
+    return calls
+
+
+def test_every_component_rejection_names_its_subject_and_no_other_rejection_does() -> None:
+    """The structural tripwire behind ``rejected_component`` (elspeth-e405ad7cd2, F10 round 2).
+
+    The subject is carried EXPLICITLY at every rejection constructor call —
+    the keyword is required, so mypy refuses a call that omits it — but a
+    required keyword can be satisfied with ``None``. This pins the rule the
+    keyword exists for: a rejection built inside a per-component loop body
+    (or the legacy single-source helper) names its subject with a non-None
+    expression, and a rejection built anywhere else says ``None`` out loud.
+    The closure this replaced left a fifth per-node loop unattributed and
+    stamped a stale subject when a reset was dropped; neither can recur
+    without this test naming the exact call.
+    """
+    calls = _builder_rejection_calls()
+    assert len(calls) >= 40, f"expected the builder's rejection sites, found {len(calls)}"
+    # The one rejection inside a component body with nothing to name: a blank
+    # ``sources`` key. Its subject IS the missing name, so ``None`` is the
+    # honest value; listed by message so a second such site cannot hide here.
+    subjectless_in_body = {"set_pipeline sources keys must be non-empty source names."}
+    wrong: list[str] = []
+    for callee, call, in_component in calls:
+        keyword = next((kw for kw in call.keywords if kw.arg == "rejected_component"), None)
+        assert keyword is not None, f"{callee} at line {call.lineno} passes no rejected_component="
+        says_none = isinstance(keyword.value, ast.Constant) and keyword.value.value is None
+        message = call.args[1] if len(call.args) > 1 else None
+        if in_component and says_none and isinstance(message, ast.Constant) and message.value in subjectless_in_body:
+            continue
+        if in_component and says_none:
+            wrong.append(f"line {call.lineno}: {callee} inside a component body says rejected_component=None")
+        if not in_component and not says_none:
+            wrong.append(f"line {call.lineno}: {callee} outside any component body names a subject")
+    assert not wrong, "\n".join(wrong)

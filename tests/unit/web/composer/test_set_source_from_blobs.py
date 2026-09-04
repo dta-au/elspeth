@@ -25,8 +25,8 @@ from elspeth.web.composer.tools.sources import _execute_set_source_from_blobs
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 from .test_tools import _mock_catalog, _trained_tool_context
 
@@ -58,7 +58,7 @@ def harness(tmp_path):
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
-    SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     blob_service = BlobServiceImpl(engine, tmp_path)
     session_id = str(uuid4())
     from datetime import UTC, datetime

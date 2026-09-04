@@ -136,7 +136,6 @@ def test_response_redaction_summarizes_review_text_if_present() -> None:
         "data": {
             "_kind": "interpretation_review_pending",
             "event_id": "8b255fb7-71d1-4b06-8848-8af5463e86a5",
-            "affected_node_id": "rate_node",
             "kind": "vague_term",
             "user_term": long_term,
             "llm_draft": long_draft,
@@ -157,5 +156,7 @@ def test_response_redaction_summarizes_review_text_if_present() -> None:
     assert long_term not in data["user_term"]
     assert long_draft not in data["llm_draft"]
     assert data["event_id"] == "<redacted-response-text>"
-    assert data["affected_node_id"] == "<redacted-response-text>"
+    # ``affected_node_id`` no longer rides under data: the envelope's
+    # ``affected_nodes`` is its only carrier (elspeth-e405ad7cd2, ledger #35).
+    assert "affected_node_id" not in data
     assert data["message"] == "<redacted-interpretation-text>"

@@ -103,6 +103,7 @@ from elspeth.web.sessions.models import (
     composition_states_table,
     runs_table,
 )
+from elspeth.web.sessions.proposal_blob_effects import record_applied_blob_proposal_effect
 from elspeth.web.sessions.proposal_blob_refs import pending_proposal_reference_id
 
 
@@ -377,7 +378,10 @@ _LIST_BLOBS_DECLARATION = ToolDeclaration(
     name="list_blobs",
     handler=_handle_list_blobs,
     kind=ToolKind.BLOB_DISCOVERY,
-    description="List uploaded/created files (blobs) in this session with metadata.",
+    description=(
+        "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, filename, "
+        "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`."
+    ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
 
@@ -407,7 +411,8 @@ _LIST_COMPOSER_BLOBS_DECLARATION = ToolDeclaration(
     kind=ToolKind.BLOB_DISCOVERY,
     description=(
         "List ready blobs available for audited inline-content authoring. "
-        "Returns only blob_id, mime_type, size_bytes, content_hash, and filename; never content bytes."
+        "Returns a `blobs` list whose entries carry only `blob_id`, `mime_type`, `size_bytes`, `content_hash`, "
+        "and `filename`; never content bytes."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
@@ -443,7 +448,7 @@ _GET_BLOB_METADATA_DECLARATION = ToolDeclaration(
     name="get_blob_metadata",
     handler=_handle_get_blob_metadata,
     kind=ToolKind.BLOB_DISCOVERY,
-    description="Get metadata for a specific blob (file) by ID.",
+    description="Get metadata for a specific blob (file) by ID: `id`, filename, `mime_type`, `size_bytes`, `content_hash`, and `status`.",
     json_schema={
         "type": "object",
         "properties": {
@@ -715,7 +720,8 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
     kind=ToolKind.BLOB_MUTATION,
     description=(
         "Author a widened blob_ref inline_content marker at a canonical field_path. "
-        "Composer pins sha256 from blob metadata; callers must not pass content bytes."
+        "Composer pins sha256 from blob metadata; callers must not pass content bytes. "
+        "Returns the `field_path` that was wired."
     ),
     json_schema={
         "type": "object",
@@ -1237,7 +1243,9 @@ _CREATE_BLOB_DECLARATION = ToolDeclaration(
     description=(
         "Create a new file (blob) from inline content. "
         "Use this to create seed input files (URLs, JSON, CSV snippets) "
-        "mid-conversation without requiring manual upload."
+        "mid-conversation without requiring manual upload. Returns the new blob's `blob_id`, "
+        "`content_hash`, `size_bytes`, and `originated_in` (`this_tool_call`: the blob was authored by "
+        "this call, not uploaded)."
     ),
     json_schema={
         "type": "object",
@@ -1543,7 +1551,8 @@ def _execute_update_blob(
                         conn,
                         session_id=session_id,
                         blob_id=blob_id,
-                        exclude_proposal_id=context.executing_proposal_id,
+                        accepting_proposal_id=context.executing_proposal_id,
+                        accepting_tool_name="update_blob" if context.executing_proposal_id is not None else None,
                     )
                     if retaining_proposal_id is not None:
                         raise _BlobUpdateBlockedByRetentionGuard(
@@ -1656,6 +1665,25 @@ def _execute_update_blob(
                         )
                         .values(**update_values)
                     )
+                    if context.executing_proposal_id is not None:
+                        # Accept-path execution: the durable applied-effect
+                        # receipt commits with the metadata so acceptance can
+                        # credit exactly this effect (blob-only proposals).
+                        committed_row = conn.execute(
+                            select(blobs_table).where(
+                                blobs_table.c.id == blob_id,
+                                blobs_table.c.session_id == session_id,
+                            )
+                        ).one()
+                        record_applied_blob_proposal_effect(
+                            conn,
+                            session_id=session_id,
+                            accepting_proposal_id=str(context.executing_proposal_id),
+                            tool_name="update_blob",
+                            blob_id=blob_id,
+                            result_row=committed_row,
+                            now=datetime.now(UTC),
+                        )
 
                     # Atomic two-rename swap — the final mutations before
                     # the with-block commit.  The prior bytes are parked at
@@ -1793,7 +1821,10 @@ _UPDATE_BLOB_DECLARATION = ToolDeclaration(
     name="update_blob",
     handler=_execute_update_blob,
     kind=ToolKind.BLOB_MUTATION,
-    description="Update the content of an existing blob (file). Overwrites the file content while preserving metadata.",
+    description=(
+        "Update the content of an existing blob (file). Overwrites the file content while preserving metadata. "
+        "Returns the new `content_hash` and `size_bytes`."
+    ),
     json_schema={
         "type": "object",
         "properties": {
@@ -1836,6 +1867,7 @@ def _execute_delete_blob(
             session_engine=session_engine,
             session_id=session_id,
             data_dir=context.data_dir,
+            executing_proposal_id=(str(context.executing_proposal_id) if context.executing_proposal_id is not None else None),
         )
 
 
@@ -1846,6 +1878,7 @@ def _execute_delete_blob_locked(
     session_engine: Engine,
     session_id: str,
     data_dir: str | None,
+    executing_proposal_id: str | None = None,
 ) -> ToolResult:
     """Delete one blob while the caller holds its session blob lock."""
     blob = _sync_get_blob(session_engine, blob_id, session_id)
@@ -1900,6 +1933,8 @@ def _execute_delete_blob_locked(
                 conn,
                 session_id=session_id,
                 blob_id=blob_id,
+                accepting_proposal_id=executing_proposal_id,
+                accepting_tool_name="delete_blob" if executing_proposal_id is not None else None,
             )
             if retaining_proposal_id is not None:
                 return _failure_result(
@@ -1961,13 +1996,17 @@ def _execute_delete_blob_locked(
             # ``reconcile_blob_storage_versions`` on the next
             # custody-locked read or mutation.
             stage = _stage_blob_deletion(storage_path)
+            registered_at = datetime.now(UTC)
             conn.execute(
                 blob_deletion_cleanups_table.insert().values(
                     blob_id=blob_id,
                     session_id=session_id,
                     storage_path=str(stage.storage),
                     tombstone_path=str(stage.tombstone) if stage.tombstone is not None else None,
-                    created_at=datetime.now(UTC),
+                    created_at=registered_at,
+                    # The lane ledger keeps a monotonic (created_at, updated_at)
+                    # pair; a fresh registration was updated when created.
+                    updated_at=registered_at,
                 )
             )
             _remove_blob_temp_artifacts(storage_path)
@@ -1981,6 +2020,18 @@ def _execute_delete_blob_locked(
             )
             if deleted.rowcount != 1:
                 raise AuditIntegrityError(f"blob {blob_id} left session custody before its qualified delete completed")
+            if executing_proposal_id is not None:
+                # Accept-path execution: bind the durable applied-effect
+                # receipt to the pre-delete row snapshot in this commit.
+                record_applied_blob_proposal_effect(
+                    conn,
+                    session_id=session_id,
+                    accepting_proposal_id=executing_proposal_id,
+                    tool_name="delete_blob",
+                    blob_id=blob_id,
+                    result_row=locked_row,
+                    now=registered_at,
+                )
     except Exception as primary_exc:
         if stage is not None:
             _restore_staged_blob_deletion(stage, primary_exc)
@@ -2051,7 +2102,7 @@ _DELETE_BLOB_DECLARATION = ToolDeclaration(
     name="delete_blob",
     handler=_execute_delete_blob,
     kind=ToolKind.BLOB_MUTATION,
-    description="Delete a blob (file) and its storage.",
+    description="Delete a blob (file) and its storage. Returns `deleted`: true.",
     json_schema={
         "type": "object",
         "properties": {
@@ -2257,9 +2308,10 @@ _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(
     handler=_execute_get_blob_content,
     kind=ToolKind.BLOB_DISCOVERY,
     description=(
-        "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters. "
-        "The result also carries the blob's recorded origin — created_by (user, assistant, or pipeline) and "
-        "creation_modality — so content the assistant generated earlier is not mistaken for a discovered file."
+        "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters "
+        "(`truncated` is true when so; `size_bytes` is the full size). "
+        "The result also carries the blob's recorded origin — `created_by` (user, assistant, or pipeline) and "
+        "`creation_modality` — so content the assistant generated earlier is not mistaken for a discovered file."
     ),
     json_schema={
         "type": "object",

@@ -59,6 +59,7 @@ from elspeth.web.execution.schemas import (
 )
 from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+from tests.helpers.session_fences import make_compose_context
 from tests.unit.web.composer._helpers import _empty_state, _make_settings
 
 pytestmark = pytest.mark.anyio
@@ -223,10 +224,12 @@ async def _stage(
         patch.object(service, "_persist_pipeline_planner_audit", new_callable=AsyncMock),
         patch.object(service, "_cached_runtime_preflight", preflight_mock),
     ):
+        staged_session_id = uuid4()
         result = await service._stage_pipeline_plan(
             plan=_plan(candidate_state),
             state=state,
-            session_id=uuid4(),
+            session_id=staged_session_id,
+            session_operation_context=make_compose_context(staged_session_id),
             current_state_id=None,
             user_message_id=uuid4(),
             user_id="user-1",

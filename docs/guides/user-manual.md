@@ -589,10 +589,19 @@ sends the operator's instruction to the shared pipeline planner, which returns a
 validated proposal. Guided records the reviewed facts as it goes and
 materializes the pipeline when you confirm the wiring.
 
-Guided sessions are created through `POST /guided/start`. The response carries
-a closed-enum `WorkflowProfile` so ELSPETH can distinguish a normal guided
-session from the passive first-run tutorial. Tutorial profile state is stripped
-on fork so it cannot leak into an ordinary session.
+Guided sessions are created through `POST /guided/start`, and start with your
+goal: the request requires a one-sentence `intent` ("what should come out the
+other end"), which becomes the session's durable root and opens its transcript.
+That goal is what the planner builds from at the end of the output stage, and it
+stays the planner's root through later revisions. A guided session that has no
+goal and no retained instruction cannot plan at all — finishing outputs answers
+`guided_planner_intent_required` rather than asking the planner to build from
+nothing. Switching a worked freeform session across with `POST /guided/convert`
+takes a goal the same way.
+
+The response carries a closed-enum `WorkflowProfile` so ELSPETH can distinguish
+a normal guided session from the passive first-run tutorial. Tutorial profile
+state is stripped on fork so it cannot leak into an ordinary session.
 
 ### Guided and freeform differ in interaction, not in capability
 

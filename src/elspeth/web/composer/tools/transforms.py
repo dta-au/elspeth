@@ -668,7 +668,12 @@ def _execute_upsert_node(
 
         prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
         if prevalidation_error is not None:
-            return _failure_result(state, prevalidation_error, error_code="plugin_options_invalid")
+            return _failure_result(
+                state,
+                prevalidation_error,
+                error_code="plugin_options_invalid",
+                plugin_identity=("transform", plugin),
+            )
 
         # Operator-profiled nodes carry their private provider config (retry
         # budget / provider binding) in the profile, injected only at lowering;
@@ -1524,9 +1529,20 @@ def _execute_patch_node_options(
         return credential_error
 
     if current.node_type in ("transform", "aggregation", "collector") and current.plugin is not None:
+        # State-held plugin: resolve it through the request's policy view
+        # before prevalidation stamps it (see _execute_patch_source_options).
+        plugin_error = _validate_plugin_name(context, "transform", current.plugin)
+        if plugin_error is not None:
+            return _plugin_policy_failure(state, plugin_error)
+
         prevalidation_error = _prevalidate_transform_for_context(context, current.plugin, new_options)
         if prevalidation_error is not None:
-            return _failure_result(state, prevalidation_error)
+            return _failure_result(
+                state,
+                prevalidation_error,
+                error_code="plugin_options_invalid",
+                plugin_identity=("transform", current.plugin),
+            )
 
         # Operator-profiled nodes carry their private provider config (retry
         # budget / provider binding) in the profile, injected only at lowering;
@@ -1723,7 +1739,12 @@ def _prepare_transform_candidate(
 
     prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("transform", plugin),
+        )
     # Operator-profiled nodes carry their private provider config (retry budget /
     # provider binding) in the profile, injected only at lowering; the
     # prevalidation above already validated the LOWERED executable. The raw
@@ -1787,7 +1808,10 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
     kind=ToolKind.MUTATION,
     description=(
         "Insert one transform between a predecessor and successor on an existing direct linear on_success path. "
-        "Use this for insert/between/before/after edits; the server derives input, on_success, connection, and edge IDs."
+        "Use this for insert/between/before/after edits; the server derives input, on_success, connection, and edge IDs. "
+        "Returns `inserted_node_id`, `predecessor_id`, `successor_id`, `derived_connection` (the on_success carried "
+        "over), `replaced_edge_id`, and `new_edge_id`; repeating an identical splice returns `already_applied`: true "
+        "with the node ids but no edge ids, instead of failing."
     ),
     json_schema={
         "type": "object",

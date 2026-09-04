@@ -15,6 +15,117 @@ identical on `origin`.
 
 ---
 
+## 0. Processed 2026-09-04 — corrections, and what is now discharged
+
+Read this section before §1. Everything below §0 is a correct measurement **as
+of 2026-09-03** and is left standing as such; this section records what
+re-measurement changed, and which of §7's actions are done. Every figure the
+brief states was re-derived at its own base `f7d741d2f` and **reproduced
+exactly** — the brief was right, the tree moved.
+
+**Baseline: `release/0.8.0` @ `cbae1ef0c`, and mainline is now PUSHED.**
+`origin/release/0.8.0 == cbae1ef0c == HEAD`, 0 ahead / 0 behind. **The inversion
+this brief highlights in §2 is gone** — mainline is no longer the private side,
+so "do not push" now reads only as its surviving intent: *do not merge or open a
+PR from `feature/deferred-platform-recovery` into `release/0.8.0`* until the
+corpus is reaccepted. Two major changes set this baseline: `51b43a770`
+(fix/guided-decline-rebind — a settlement carrying a proposal must rebase its
+anchor, P0 `elspeth-ed67eb9d0d`; it also bumped the schema epoch) and
+`cbae1ef0c` (strany/tool-result-envelope — every `data.*` key the composer ships
+is taught or fenced, and `ToolResult.data` closed to a real union per ADR-032).
+
+**Anchors that moved.** Integration debt is now **496 commits / 843
+mainline-changed files / 82 touched on both sides** (was 408 / 789 / 80 eight
+hours earlier — the gap is widening fast, so re-measure before acting on it).
+§3's workspace table now holds **nine** worktrees: `identity-sprint` and
+`guided-decline-brick` are new. **H6's epoch collision widened from one to two:
+mainline is now `SESSION_SCHEMA_EPOCH = 50`** (set by `b7992af66`), platform
+still 48. The `receipt_contracts.py` coupling H6 names is unchanged and still
+bakes the epoch into the rollback-baseline receipt.
+Full per-claim corrections list (34 still true, 10 moved, each with the command
+that settles it): [`2026-09-04-multi-replica-anchor-reverification.md`](2026-09-04-multi-replica-anchor-reverification.md)
+— measured at `77537c8de`, so read its *reasoning* as current and its *figures*
+as superseded by the paragraph above.
+
+**§4 step 8 and U3 — SETTLED, and the harvest list is TOO NARROW.** The
+2026-08-02 handoff enumerates **four** things the interrupted implementer
+began; step 8 reproduces bullets 1, 2 and 4 and drops bullet 3, *"moved more
+interpretation resolution work behind repository authority"*. That dropped
+bullet is the largest unique body in the commit and is absent from both
+branches (`resolve_pending`, `SessionInterpretationResolutionCommand/Result/
+Snapshot`, `_SessionInterpretationResolution{Plan,Planner,Validator}` all grep
+to zero on `a2176dfe2` and on mainline). **The three named items do not work
+without it:** the platform protocol still takes `validator:` rather than
+`validation_inputs:`, so harvest item 1 is a DTO nothing calls; and item 3's
+hunk passes `session_operation_context=` to a signature the platform does not
+have — it applies textually but does not typecheck. Also: the slice is **16
+paths / 2,342 insertions**, not 14 / 1,827 — the smaller figures are the
+tracked-at-capture-time subset, understating it by exactly the 515 lines of the
+two then-untracked new files. Per-path classification, with the command behind
+each: [`2026-09-04-multi-replica-u3-slice-uniqueness.md`](2026-09-04-multi-replica-u3-slice-uniqueness.md).
+
+**Comment 8915 is not evidence about `3f3857d20`.** It describes merging lane
+`4c59c9d02`, which is 12 commits past the WIP's parent, while the WIP was cut
+from `64b7d144e` directly. Its substance holds (20 helpers moved, all 20
+carrying HEAD's versions — more than the 12 claimed), but none of the WIP's
+resolution work was ever on that lane.
+
+**H1's grep warning is wrong, and H1 is fixed.** The warning that
+`grep -rn "replay=" src/elspeth/` is inflated by "overload stubs and internal
+forwarding" does not hold: the stubs spell the parameter `replay:` (an
+annotation), so `replay=` never matches them. **All hits are real call sites,
+zero exclusions** — 22 at `f7d741d2f`, 23 today. The defect itself is repaired
+(§7 item 3, below).
+
+**H11 is half-retired.** Loomweave is worktree-aware: worktrees route to
+isolated stores via `loomweave worktree analyze <name>`, so the prohibition on
+running an analyze from the main checkout no longer applies, and the index is
+`fresh` at `77537c8de`. The half that survives is the operative one — *"any
+`mcp__loomweave__*` result about `a2176dfe2` is a mainline result"* — because
+isolated stores are per-worktree and the platform branch **has no worktree**.
+Provisioning one and analyzing it is now a prerequisite for asking Loomweave
+anything during the integration, not a prohibition.
+
+### §7 status
+
+1. **Back up `recovery/deferred-platform-wip-broken` — HALF DONE.** Tagged
+   locally as `backup/deferred-platform-wip-broken-2026-09-04` (it was
+   contained in no remote branch and no tag). **Pushing it remains owed** and
+   is an operator call.
+2. **Settle which plan governs — STILL OPEN**, and now one of **eight**
+   operator decisions, not one. See the method document below.
+3. **Fix the `state_revert` ordering (H1) — LANDED** at `2a64b8ff7`
+   ("fix(composer): repair state_revert surfacing only after hash
+   verification"), merged to `release/0.8.0` via `b74783a5e`. The durable
+   surfacing call moved out of `_replay` into `after_verified=`, mirroring
+   `post_guided_respond`. Proven RED-then-GREEN with a non-vacuity control, and
+   signed off by three independent adversarial reviewers. It ships with a new
+   whole-tree gate, `tests/unit/architecture/test_guided_operation_replay_after_verified_sites.py`,
+   which pins the per-`(module, function, posture)` **count** of every
+   `reserve_or_replay_guided_operation` call site and forbids rebinding the
+   primitive's name. **Read its docstring before adding a route:** it states
+   plainly that no declaration-level key — count or set — can see a durable
+   write added *inside* an existing `replay` callable, which is the shape H1
+   itself had. Green at `cbae1ef0c`; the site census is unchanged at 23.
+
+**The integration method is now written down**, as §7 requires it to be before
+the pass starts: [`2026-09-04-multi-replica-integration-method.md`](2026-09-04-multi-replica-integration-method.md).
+It settles the pass shape (a **merge**, not a rebase), the six-cohort
+partition, all five operator rulings, and the completion criterion — and routes
+**eight** open decisions to the operator, two of which this brief does not
+name: **which ref is even "mainline" for this pass** (the nine comments never
+say `release/0.8.0`; they were written when `feature/unified-lineage` was the
+candidate), and **what Phase-0 cohort E was** (comment 8966 claims it partly
+complete; it is defined nowhere).
+
+**H9's prescribed tracker writes are made:** cross-reference on
+`elspeth-64c319bf4d` (comment 9265), the fix-polarity hazard on
+`elspeth-3db5745ba7` (9266), both dead leases released with rationale
+(9267/9268), and the branch-now-published correction on `elspeth-4d6c0dd0f5`
+(9269).
+
+---
+
 ## 1. What changed since the pause
 
 Read this section before any instruction in the old handoff. Ten of its

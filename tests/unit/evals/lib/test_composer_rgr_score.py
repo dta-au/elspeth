@@ -175,6 +175,44 @@ class TestBaselineRedSignals:
 
         assert result["verdict"] == "GREEN", result["red_reasons"]
 
+    def test_red_when_relaxed_validity_cannot_read_codes_off_a_stringified_state(self) -> None:
+        """The allowance is undecidable on the HTTP state shape, and the reason must say so.
+
+        ``CompositionStateResponse.validation_errors`` is ``list[str] | None``
+        (``src/elspeth/web/sessions/schemas.py``), so a state that came through
+        the HTTP boundary carries bare messages and
+        ``_extract_error_codes_from_entries`` ignores them BY DESIGN. That is the
+        branch this pins, and it had no test before: both sibling relaxation
+        tests supply dict entries, which only the mocked-LLM harness produces.
+
+        Failing closed is correct — an unreadable state must not buy a GREEN.
+        What would be wrong is the WORDING: reporting "no codes were present"
+        states a fact about the pipeline that the scorer cannot know, when the
+        run may well have raised coded errors that the boundary stringified.
+        The reason must attribute the blindness to the observation.
+        """
+        result = score(
+            scenario=_scenario(
+                red={
+                    "must_be_valid": False,
+                    "allow_is_valid_false_when_error_codes": ["interpretation_review_pending"],
+                },
+                green={"must_be_valid": False},
+            ),
+            messages=[_msg("assistant", "Reviews are surfaced for operator resolution.")],
+            state=_state_valid(
+                is_valid=False,
+                validation_errors=["LLM model choice review is pending"],
+            ),
+        )
+
+        assert result["verdict"] == "RED"
+        reason = next(r for r in result["red_reasons"] if "is_valid=false" in r and "allowed" in r)
+        assert "structurally readable" in reason
+        assert "what the state made observable" in reason
+        # The scorer must NOT assert the pipeline raised nothing.
+        assert "no structured validation error codes were present" not in reason
+
     def test_red_when_relaxed_validity_has_disallowed_error_code(self) -> None:
         result = score(
             scenario=_scenario(

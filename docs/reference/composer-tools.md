@@ -45,7 +45,8 @@ the same Composer state and validators.
 
 | Concept or endpoint | Purpose |
 |---|---|
-| `POST /guided/start` | Creates or resumes a guided session entry point and seeds the closed-enum `WorkflowProfile`. |
+| `POST /guided/start` | Creates or resumes a guided session entry point, seeds the closed-enum `WorkflowProfile`, and records the author's required `intent` as the session's durable root goal. |
+| `POST /guided/convert` | Moves a freeform session into a fresh guided wizard; also requires an `intent`, and 409s `guided_already_started` on a session that is already guided. |
 | `WorkflowProfile` | Distinguishes normal guided sessions from tutorial-guided sessions; tutorial profile state is stripped on fork. |
 | `/guided/chat` | Applies the operator's stage instruction through the source, sink, transform, or wiring driver. |
 | `STEP_4_WIRE` | Final guided stage that renders the proposed wiring and contract overlay. |
@@ -119,7 +120,7 @@ Get the gate expression syntax reference.
 
 **Parameters:** None
 
-**Returns:** Text reference for valid expression constructs in gate conditions.
+**Returns:** `grammar` — the text reference for valid expression constructs in gate conditions.
 
 **When to use:** Before writing any gate `condition` expression. Expressions are security-validated — only a restricted subset of Python is allowed.
 
@@ -145,21 +146,30 @@ Preview the current pipeline configuration — validation status, source summary
 
 **Parameters:** None
 
-**Returns:** Structured summary of the pipeline's current state including:
-- `is_valid`
-- structured validation `errors`, `warnings`, and `suggestions`
+**Returns:** The authoring check rides on the envelope's `validation` and the
+runtime check on its top-level `runtime_preflight`; `data` carries only the
+preview stage's own facts:
+- `preview_is_valid` — true only when the authoring check, the runtime check, and the source proof all pass (false when no runtime check ran)
+- `preview_errors` — entries the preview stage itself produces (`runtime_preflight_not_run` when no runtime check was wired); authoring errors stay on `validation.errors`
 - `edge_contracts` for declared producer/consumer field contracts
-- source, node, and output summary data
+- `proof_diagnostics` — the source proof against the bound blob; a `blocking` entry forces `preview_is_valid` false
+- `structural_preview` when a tolerant structural check ran
+- source, node, and output summary data (`sources`, `nodes`, `outputs`, `node_count`, `output_count`)
 
-Each `edge_contracts` entry reports:
-- `from` / `to`
+One entry per producer/consumer pair that was checked, and a pair is checked
+only where the consumer requires fields — through `required_fields`, through a
+fixed/flexible schema's declared fields, or, for a sink, through an option
+naming the field it writes from.
+Each entry reports:
+- `from` / `to` (`to` is `output:<sink name>` for a sink)
 - `producer_guarantees`
 - `consumer_requires`
+- `missing_fields` — the `consumer_requires` names the producer does not guarantee
 - `satisfied`
 
 **When to use:** After making a series of changes, to confirm the pipeline is set up correctly before responding to the user or calling `generate_yaml`.
 
-**Important:** `edge_contracts: []` is not positive contract evidence. It means no field contracts were declared. Also treat skipped contract-check warnings as unresolved rather than satisfied.
+**Important:** `edge_contracts: []` is not positive contract evidence. It means no field contract was checked. Also treat skipped contract-check warnings as unresolved rather than satisfied.
 
 ---
 
@@ -530,7 +540,12 @@ Place a secret reference marker in the pipeline config. The secret is resolved a
 
 ## Tool Result Format
 
-Every tool returns a `ToolResult` with this structure:
+Every tool returns a `ToolResult`. The model receives it serialized verbatim;
+the audit row receives the redaction manifest's projection of the same object.
+The key vocabulary is one registry (`src/elspeth/web/composer/tool_result_envelope.py`)
+that the producer, the redaction manifest, and the planner's closed discovery
+twin all derive from, and this section is pinned to it by
+`tests/unit/web/composer/test_tool_result_envelope_gate.py`.
 
 ```json
 {
@@ -538,24 +553,50 @@ Every tool returns a `ToolResult` with this structure:
   "validation": {
     "is_valid": true,
     "errors": [],
-    "warnings": ["Source schema mode is 'observed' — consider 'fixed' for stricter validation"],
-    "suggestions": []
+    "warnings": [
+      {"component": "source", "message": "Source schema mode is 'observed' — consider 'fixed'", "severity": "low", "error_code": "source_schema_mode_observed"}
+    ],
+    "suggestions": [],
+    "semantic_contracts": [],
+    "graph_repair_suggestions": []
   },
   "affected_nodes": ["classifier", "quality_gate"],
   "version": 3,
-  "data": null
+  "applied_component": {"nodes": [{"id": "classifier", "node_type": "transform", "plugin": "llm_classifier", "input": "source"}]},
+  "validation_delta": {"new_errors": [], "resolved_errors": [], "new_warnings": [], "resolved_warnings": []}
 }
 ```
+
+Always present:
 
 | Field | Description |
 |-------|-------------|
 | `success` | Whether the tool call succeeded |
-| `validation` | Current pipeline validation state after this change |
-| `affected_nodes` | Node IDs that were changed or have changed edges |
+| `validation` | Whole-document validation after this change: `is_valid`, `errors` / `warnings` / `suggestions` (entries with `component`, `message`, `severity`, `error_code`, `rejected_component` when the rejection is about one component (`source` / `source:<name>` / `node:<id>` / `output:<name>`) and absent when it is about the whole candidate, and, when the code carries facts, a `contract`, `row_union_schema`, or `coalesce_union_type` block), `semantic_contracts` (one check per producer, consumer and required field), `graph_repair_suggestions` (a ready `tool_sequence` for a duplicate-consumer repair) |
+| `affected_nodes` | Component ids the call touched |
 | `version` | Pipeline state version (increments on each mutation) |
-| `data` | Discovery tool payload (plugin lists, schemas, etc.) — null for mutations |
 
-**Validation drives the loop.** After each mutation, check `validation.errors`. If there are errors, fix them before responding to the user. The LLM should not present a pipeline as complete until `is_valid` is `true`.
+Present only when set:
+
+| Field | When | Description |
+|-------|------|-------------|
+| `data` | most tools | The tool-specific payload; each tool's description names its keys. A failure carries `error`, and `error_code` when the failure has a closed code; a credential-wiring failure adds `credential_fields`, `components`, and `repair`; a proposal under approval custody carries `status: "APPROVAL_REQUIRED"` with `proposal_id`; a prevalidation rejection carries `status: "PREVALIDATION_REJECTED"` with `applied: false` |
+| `runtime_preflight` | `preview_pipeline` | Runtime readiness check: `is_valid`, `checks`, `readiness`, `errors`, `warnings`, `semantic_contracts` |
+| `validation_delta` | successful mutations | `new_errors`, `resolved_errors`, `new_warnings`, `resolved_warnings` relative to the state before the call |
+| `post_call_hints` | successful mutations whose plugin returns them | Plugin-authored next steps |
+| `plugin_schemas` | failed option-shape mutations | `"<kind>/<plugin>"` → the plugin's schema (`json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, …) |
+| `validation_guidance` | failed mutations | `codes`: each `error_code` → `explanation` and `suggested_fix`; `explain_tool` when a code had no catalogue entry |
+| `applied_component` | successful incremental mutations | The stored `source` / `sources` / `nodes` / `outputs` / `edges` the call touched — the authoritative post-change state, so no confirming read is needed |
+
+`set_pipeline` results additionally carry `pipeline_content_hash_schema` and
+`pipeline_content_hash`, attached after dispatch for recovery.
+
+**Validation drives the loop.** After each mutation, check `validation.errors`
+and `validation_delta`. If there are errors, fix them before responding to the
+user. The LLM should not present a pipeline as complete until `preview_pipeline`
+returns `preview_is_valid: true` — the authoring check passing is necessary but
+not sufficient, because that verdict also folds in the runtime check and the
+source proof.
 
 ---
 

@@ -6,7 +6,8 @@ import asyncio
 import json
 import threading
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ import pytest
 import structlog
 import yaml
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import CheckConstraint, insert
 from sqlalchemy.exc import OperationalError
@@ -28,13 +30,14 @@ from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolStatus,
 )
-from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.enums import CreationModality, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import (
     nodes_table,
@@ -60,6 +63,9 @@ from elspeth.web.composer.service import ComposerAvailability, ComposerServiceIm
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
 from elspeth.web.composer.yaml_generator import PUBLIC_EXPORT_REBIND_GUIDANCE, PUBLIC_EXPORT_REDACTION_HEADER
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.coordination.repository import SessionOperationConflictError
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.accounting import RunAccountingBatch
 from elspeth.web.execution.schemas import (
@@ -91,7 +97,9 @@ from elspeth.web.sessions.models import composition_states_table
 from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
     ChatMessageRole,
+    CompositionProposalRecord,
     CompositionStateData,
+    CompositionStateProvenance,
     CompositionStateRecord,
     SessionRecord,
     TransitionResponseSettlement,
@@ -101,6 +109,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # Sentinel empty state for mock composer responses
 _EMPTY_STATE = CompositionState(
@@ -144,6 +153,100 @@ def _async_return(value: Any):
         return value
 
     return _return_value
+
+
+@asynccontextmanager
+async def _execute_session_operation_context(
+    service: SessionServiceImpl,
+    session_id: uuid.UUID,
+) -> AsyncIterator[SessionOperationContext]:
+    """Hold one real EXECUTE authority for direct run mutations in tests."""
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        yield context
+    finally:
+        await service._run_sync(
+            service.session_operation_authority.release,
+            context,
+        )
+
+
+@asynccontextmanager
+async def _compose_session_operation_context(
+    service: SessionServiceImpl | _ProgressRouteSessionService,
+    session_id: uuid.UUID,
+) -> AsyncIterator[SessionOperationContext]:
+    """Hold one real COMPOSE authority for direct proposal creation in tests."""
+    lease = await SessionOperationLease.acquire(
+        service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
+    )
+    async with lease:
+        yield lease.context
+
+
+async def _save_test_composition_state(
+    service: SessionServiceImpl | _ProgressRouteSessionService,
+    session_id: uuid.UUID,
+    data: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    """Save one seeded state under a short-lived real COMPOSE authority."""
+    async with _compose_session_operation_context(service, session_id) as context:
+        return await service.save_composition_state(
+            session_id,
+            data,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+
+
+async def _create_test_composition_proposal(
+    service: SessionServiceImpl,
+    *,
+    session_id: uuid.UUID,
+    **kwargs: Any,
+) -> CompositionProposalRecord:
+    async with _compose_session_operation_context(service, session_id) as context:
+        return await service.create_composition_proposal(
+            session_id=session_id,
+            session_operation_context=context,
+            **kwargs,
+        )
+
+
+async def _create_test_pipeline_composition_proposal(
+    service: SessionServiceImpl,
+    *,
+    session_id: uuid.UUID,
+    **kwargs: Any,
+) -> CompositionProposalRecord:
+    async with _compose_session_operation_context(service, session_id) as context:
+        return await service.create_pipeline_composition_proposal(
+            session_id=session_id,
+            session_operation_context=context,
+            **kwargs,
+        )
+
+
+async def _update_test_composer_preferences(
+    service: SessionServiceImpl,
+    *,
+    session_id: uuid.UUID,
+    **kwargs: Any,
+) -> None:
+    await service.update_composer_preferences(session_id, **kwargs)
 
 
 def _ready_blob_record(
@@ -362,8 +465,9 @@ class _BlockingRecordingComposer:
         progress=None,
         guided_terminal=None,
         user_message_id: str | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ComposerResult:
-        del state, session_id, current_state_id, user_id, progress, guided_terminal, user_message_id
+        del state, session_id, current_state_id, user_id, progress, guided_terminal, user_message_id, session_operation_context
 
         self.calls.append(
             {
@@ -402,8 +506,10 @@ class _ProgressAwareComposer:
         progress=None,
         guided_terminal=None,
         user_message_id: str | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> ComposerResult:
         del message, chat_messages, session_id, current_state_id, user_id, guided_terminal, user_message_id
+        assert session_operation_context is not None
         assert progress is not None, "session routes must pass a composer progress sink"
         self.progress_sink_seen = True
         await progress(
@@ -429,14 +535,22 @@ class _ProgressRouteSessionService:
     """Minimal async session service for progress route tests."""
 
     def __init__(self, *, user_id: str = "alice", auth_provider_type: str = "local") -> None:
-        now = datetime.now(UTC)
-        self.session = SessionRecord(
-            id=uuid.uuid4(),
+        operation_engine = create_session_engine(
+            "sqlite:///:memory:",
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+        initialize_session_schema(operation_engine)
+        self._engine = operation_engine
+        self.session_operation_authority = SQLiteLocalSessionOperationAuthority(operation_engine)
+        self.session_operation_owner_instance_id = f"progress-route-{uuid.uuid4()}"
+        self.session_operation_lease_seconds = 30
+        self.session = self.session_operation_authority.create_session_with_initial_fence(
             user_id=user_id,
             auth_provider_type=auth_provider_type,
             title="Pipeline",
-            created_at=now,
-            updated_at=now,
+            owner_instance_id=self.session_operation_owner_instance_id,
+            lease_seconds=self.session_operation_lease_seconds,
         )
         self.messages: list[ChatMessageRecord] = []
         self.current_state: CompositionStateRecord | None = None
@@ -463,7 +577,11 @@ class _ProgressRouteSessionService:
         raw_content: str | None = None,
         tool_call_id: str | None = None,
         parent_assistant_id: uuid.UUID | None = None,
+        session_operation_context: SessionOperationContext | None = None,
+        session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
     ) -> ChatMessageRecord:
+        del session_operation_context
+        del session_operation_kind
         if session_id != self.session.id:
             raise ValueError("Session not found")
         message = ChatMessageRecord(
@@ -489,6 +607,7 @@ class _ProgressRouteSessionService:
         *,
         writer_principal: str,
         composition_state_id: uuid.UUID | None = None,
+        **_fenced_kwargs: object,
     ) -> None:
         # In-memory double: appending the cohort draft-by-draft is
         # trivially atomic, mirroring the production single-transaction
@@ -517,6 +636,7 @@ class _ProgressRouteSessionService:
         raw_content: str | None = None,
         tool_call_id: str | None = None,
         parent_assistant_id: uuid.UUID | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> tuple[ChatMessageRecord, list[ChatMessageRecord]]:
         # In-memory double: append + snapshot are trivially one atomic
         # step, mirroring the production single-transaction contract
@@ -531,6 +651,7 @@ class _ProgressRouteSessionService:
             raw_content=raw_content,
             tool_call_id=tool_call_id,
             parent_assistant_id=parent_assistant_id,
+            session_operation_context=session_operation_context,
         )
         return record, list(self.messages)
 
@@ -552,8 +673,11 @@ class _ProgressRouteSessionService:
         session_id: uuid.UUID,
         data: CompositionStateData,
         *,
-        provenance: str,
+        provenance: CompositionStateProvenance,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord:
+        assert session_operation_context.fence.session_id == str(session_id)
+        assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
         if session_id != self.session.id:
             raise ValueError("Session not found")
         version = 1 if self.current_state is None else self.current_state.version + 1
@@ -589,6 +713,26 @@ class _ProgressRouteSessionService:
         state: CompositionStateData,
         assistant_content: str,
         raw_content: str | None,
+        session_operation_context: SessionOperationContext,
+    ) -> TransitionResponseSettlement:
+        return await self.commit_composition_response(
+            session_id=session_id,
+            expected_current_state_id=expected_current_state_id,
+            state=state,
+            assistant_content=assistant_content,
+            raw_content=raw_content,
+            session_operation_context=session_operation_context,
+        )
+
+    async def commit_composition_response(
+        self,
+        *,
+        session_id: uuid.UUID,
+        expected_current_state_id: uuid.UUID | None,
+        state: CompositionStateData,
+        assistant_content: str,
+        raw_content: str | None,
+        session_operation_context: SessionOperationContext,
     ) -> TransitionResponseSettlement:
         current_id = self.current_state.id if self.current_state is not None else None
         if current_id != expected_current_state_id:
@@ -597,6 +741,7 @@ class _ProgressRouteSessionService:
             session_id,
             state,
             provenance="post_compose",
+            session_operation_context=session_operation_context,
         )
         message = await self.add_message(
             session_id,
@@ -605,6 +750,7 @@ class _ProgressRouteSessionService:
             raw_content=raw_content,
             composition_state_id=record.id,
             writer_principal="compose_loop",
+            session_operation_context=session_operation_context,
         )
         return TransitionResponseSettlement(state=record, message=message)
 
@@ -706,7 +852,7 @@ def _make_app(
     )
     initialize_session_schema(engine)
     telemetry = build_sessions_telemetry()
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=telemetry,
         log=structlog.get_logger("test"),
@@ -858,6 +1004,7 @@ def test_send_message_response_includes_pending_proposals_created_during_compose
             arguments_redacted_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
             base_state_id=None,
             actor="composer-web:alice",
+            session_operation_context=cast(SessionOperationContext, kwargs["session_operation_context"]),
         )
         return ComposerResult(message="Needs approval.", state=_EMPTY_STATE)
 
@@ -920,7 +1067,8 @@ def test_accept_proposal_executes_tool_and_commits_state(tmp_path, monkeypatch) 
     input_path.parent.mkdir(parents=True, exist_ok=True)
     input_path.write_text("value\n1\n", encoding="utf-8")
     proposal = asyncio.run(
-        service.create_composition_proposal(
+        _create_test_composition_proposal(
+            service,
             session_id=session_id,
             tool_call_id="call_set_pipeline",
             tool_name="set_pipeline",
@@ -1003,7 +1151,8 @@ def test_accept_schema_stale_proposal_returns_422_and_rejects(tmp_path) -> None:
     session_id = uuid.UUID(session["id"])
     arguments: dict[str, Any] = {}
     proposal = asyncio.run(
-        service.create_composition_proposal(
+        _create_test_composition_proposal(
+            service,
             session_id=session_id,
             tool_call_id="call_stale_set_metadata",
             tool_name="set_metadata",
@@ -1092,7 +1241,8 @@ async def _create_canonical_pipeline_route_proposal(
         covered_deferred_intent_ids=(),
         supersedes_draft_hash=None,
     )
-    row = await service.create_pipeline_composition_proposal(
+    row = await _create_test_pipeline_composition_proposal(
+        service,
         session_id=session_id,
         plan=PipelinePlanResult(
             proposal=proposal,
@@ -1339,8 +1489,9 @@ def test_send_message_explicit_approval_leaves_canonical_pipeline_pending(tmp_pa
         _create_canonical_pipeline_route_proposal(tmp_path, monkeypatch, tool_call_id="send-explicit-pipeline")
     )
     asyncio.run(
-        service.update_composer_preferences(
-            session_id,
+        _update_test_composer_preferences(
+            service,
+            session_id=session_id,
             trust_mode="explicit_approve",
             density_default="high",
             actor="user:alice",
@@ -1828,7 +1979,8 @@ def test_canonical_pipeline_accept_requires_and_echoes_draft_hash(tmp_path, monk
         provider="test",
     )
     row = asyncio.run(
-        service.create_pipeline_composition_proposal(
+        _create_test_pipeline_composition_proposal(
+            service,
             session_id=session_id,
             plan=plan,
             summary="Replace the pipeline.",
@@ -1898,6 +2050,15 @@ def test_canonical_pipeline_accept_requires_and_echoes_draft_hash(tmp_path, monk
     ]
     assert surfaced_state_ids == [str(committed_state.id), str(committed_state.id)], (
         f"expected the accept and its exact-committed retry to each surface against the committed state, got {surfaced_state_ids!r}"
+    )
+    surfaced_contexts = [
+        call.kwargs.get("session_operation_context")
+        for call in app.state.composer_service.surface_pending_interpretation_reviews.call_args_list
+    ]
+    assert all(type(context) is SessionOperationContext for context in surfaced_contexts)
+    assert all(context.fence.session_id == str(session_id) for context in surfaced_contexts if type(context) is SessionOperationContext)
+    assert all(
+        context.operation_kind is SessionOperationKind.PROPOSAL for context in surfaced_contexts if type(context) is SessionOperationContext
     )
 
 
@@ -2024,7 +2185,8 @@ def test_generic_accept_rejects_guided_pipeline_surfaces_before_dispatch(tmp_pat
     session = client.post("/api/sessions", json={"title": "Guided pipeline"}).json()
     session_id = uuid.UUID(session["id"])
     row = asyncio.run(
-        service.create_pipeline_composition_proposal(
+        _create_test_pipeline_composition_proposal(
+            service,
             session_id=session_id,
             plan=plan,
             summary="Replace the pipeline.",
@@ -2109,7 +2271,8 @@ def test_malformed_canonical_creation_event_fails_closed_without_legacy_fallback
     session = client.post("/api/sessions", json={"title": "Malformed canonical"}).json()
     session_id = uuid.UUID(session["id"])
     row = asyncio.run(
-        service.create_pipeline_composition_proposal(
+        _create_test_pipeline_composition_proposal(
+            service,
             session_id=session_id,
             plan=plan,
             summary="Replace the pipeline.",
@@ -2199,7 +2362,8 @@ def test_accept_proposal_threads_originating_message_id_to_inline_blob(tmp_path,
     }
     arguments_hash = stable_hash(arguments)
     proposal = asyncio.run(
-        service.create_composition_proposal(
+        _create_test_composition_proposal(
+            service,
             session_id=session_id,
             tool_call_id="call_set_pipeline_inline_blob",
             tool_name="set_pipeline",
@@ -2277,7 +2441,8 @@ def test_accept_inline_blob_proposal_without_composer_provenance_fails_closed(tm
         )
     )
     proposal = asyncio.run(
-        service.create_composition_proposal(
+        _create_test_composition_proposal(
+            service,
             session_id=session_id,
             tool_call_id="call_set_pipeline_inline_blob_legacy",
             tool_name="set_pipeline",
@@ -2429,7 +2594,8 @@ def test_accept_empty_inline_blob_proposal_without_composer_provenance_fails_clo
         )
     )
     proposal = asyncio.run(
-        service.create_composition_proposal(
+        _create_test_composition_proposal(
+            service,
             session_id=session_id,
             tool_call_id="call_set_pipeline_empty_inline_blob_legacy",
             tool_name="set_pipeline",
@@ -2814,8 +2980,6 @@ class TestSessionCRUDRoutes:
         app, service = _make_app(tmp_path)
         registry = _SessionComposeLockRegistry()
         app.state.session_compose_lock_registry = registry
-        clear_progress = AsyncMock(spec=app.state.composer_progress_registry.clear)
-        app.state.composer_progress_registry.clear = clear_progress
 
         async with AsyncClient(
             transport=ASGITransport(app=app, raise_app_exceptions=False),
@@ -2834,7 +2998,6 @@ class TestSessionCRUDRoutes:
 
         assert await registry.get_lock(admission_key) is admission
         assert app.state.execution_service.cleanup_session_lock.calls == []
-        clear_progress.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_delete_session_blocked_by_active_run(self, tmp_path) -> None:
@@ -2850,8 +3013,13 @@ class TestSessionCRUDRoutes:
         session_id = uuid.UUID(create_resp.json()["id"])
 
         # Create a pending run via the service layer
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.create_run(session_id, state.id)
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        async with _execute_session_operation_context(service, session_id) as context:
+            await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
 
         del_resp = client.delete(f"/api/sessions/{session_id}")
         assert del_resp.status_code == 409
@@ -2915,10 +3083,24 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Completed Run"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session_id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(run.id, "completed", landscape_run_id="lscp-delete-allowed")
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        async with _execute_session_operation_context(service, session_id) as context:
+            run = await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "running",
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "completed",
+                landscape_run_id="lscp-delete-allowed",
+                session_operation_context=context,
+            )
 
         del_resp = client.delete(f"/api/sessions/{session_id}")
         assert del_resp.status_code == 204
@@ -2932,15 +3114,25 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Failed Run"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session_id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(
-            run.id,
-            "failed",
-            error="Pipeline execution failed (FrameworkBugError)",
-            rows_processed=1,
-        )
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        async with _execute_session_operation_context(service, session_id) as context:
+            run = await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "running",
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "failed",
+                error="Pipeline execution failed (FrameworkBugError)",
+                rows_processed=1,
+                session_operation_context=context,
+            )
 
         runs_resp = client.get(f"/api/sessions/{session_id}/runs")
 
@@ -2962,20 +3154,30 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Fanout Run"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session_id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(
-            run.id,
-            "completed",
-            landscape_run_id=str(run.id),
-            rows_processed=1,
-            rows_succeeded=9323,
-            rows_failed=0,
-            rows_routed_success=0,
-            rows_routed_failure=0,
-            rows_quarantined=0,
-        )
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        async with _execute_session_operation_context(service, session_id) as context:
+            run = await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "running",
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "completed",
+                landscape_run_id=str(run.id),
+                rows_processed=1,
+                rows_succeeded=9323,
+                rows_failed=0,
+                rows_routed_success=0,
+                rows_routed_failure=0,
+                rows_quarantined=0,
+                session_operation_context=context,
+            )
 
         monkeypatch.setattr(
             "elspeth.web.sessions.routes.runs.load_run_accounting_for_settings",
@@ -3067,20 +3269,30 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Missing Accounting"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session_id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(
-            run.id,
-            "completed",
-            landscape_run_id=str(run.id),
-            rows_processed=1,
-            rows_succeeded=1,
-            rows_failed=0,
-            rows_routed_success=0,
-            rows_routed_failure=0,
-            rows_quarantined=0,
-        )
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        async with _execute_session_operation_context(service, session_id) as context:
+            run = await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "running",
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "completed",
+                landscape_run_id=str(run.id),
+                rows_processed=1,
+                rows_succeeded=1,
+                rows_failed=0,
+                rows_routed_success=0,
+                rows_routed_failure=0,
+                rows_quarantined=0,
+                session_operation_context=context,
+            )
 
         monkeypatch.setattr(
             "elspeth.web.sessions.routes.runs.load_run_accounting_for_settings",
@@ -3109,20 +3321,30 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Open Accounting"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session_id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(
-            run.id,
-            "completed",
-            landscape_run_id=str(run.id),
-            rows_processed=1,
-            rows_succeeded=1,
-            rows_failed=0,
-            rows_routed_success=0,
-            rows_routed_failure=0,
-            rows_quarantined=0,
-        )
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        async with _execute_session_operation_context(service, session_id) as context:
+            run = await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "running",
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "completed",
+                landscape_run_id=str(run.id),
+                rows_processed=1,
+                rows_succeeded=1,
+                rows_failed=0,
+                rows_routed_success=0,
+                rows_routed_failure=0,
+                rows_quarantined=0,
+                session_operation_context=context,
+            )
 
         monkeypatch.setattr(
             "elspeth.web.sessions.routes.runs.load_run_accounting_for_settings",
@@ -3150,23 +3372,33 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Discarded Rows"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session_id, state.id)
-        landscape_run_id = "lscape-discard-summary"
-        _insert_discard_audit_records(app.state.settings, landscape_run_id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(
-            run.id,
-            "failed",
-            landscape_run_id=landscape_run_id,
-            error="No row reached a success path.",
-            rows_processed=2,
-            rows_succeeded=0,
-            rows_failed=2,
-            rows_routed_success=0,
-            rows_routed_failure=1,
-            rows_quarantined=0,
-        )
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        async with _execute_session_operation_context(service, session_id) as context:
+            run = await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
+            landscape_run_id = "lscape-discard-summary"
+            _insert_discard_audit_records(app.state.settings, landscape_run_id)
+            await service.update_run_status(
+                run.id,
+                "running",
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "failed",
+                landscape_run_id=landscape_run_id,
+                error="No row reached a success path.",
+                rows_processed=2,
+                rows_succeeded=0,
+                rows_failed=2,
+                rows_routed_success=0,
+                rows_routed_failure=1,
+                rows_quarantined=0,
+                session_operation_context=context,
+            )
 
         runs_resp = client.get(f"/api/sessions/{session_id}/runs")
 
@@ -3210,9 +3442,19 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Running Run"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session_id, state.id)
-        await service.update_run_status(run.id, "running", landscape_run_id="lscape-running")
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        async with _execute_session_operation_context(service, session_id) as context:
+            run = await service.create_run(
+                session_id,
+                state.id,
+                session_operation_context=context,
+            )
+            await service.update_run_status(
+                run.id,
+                "running",
+                landscape_run_id="lscape-running",
+                session_operation_context=context,
+            )
 
         def fail_if_called(*args: object, **kwargs: object) -> dict[str, object]:
             raise AssertionError("discard summary lookup should not run for non-terminal runs")
@@ -3622,7 +3864,7 @@ class TestIDORProtection:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
-        service = SessionServiceImpl(
+        service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -3943,7 +4185,7 @@ class TestSendMessageStateIdValidation:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
-        service = SessionServiceImpl(
+        service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -3988,7 +4230,8 @@ class TestSendMessageStateIdValidation:
                 service.create_session("alice", "Alice Only", "local"),
             )
             alice_state = loop.run_until_complete(
-                service.save_composition_state(
+                _save_test_composition_state(
+                    service,
                     alice_session.id,
                     CompositionStateData(
                         metadata_={"name": "Alice", "description": ""},
@@ -4008,7 +4251,8 @@ class TestSendMessageStateIdValidation:
                 service.create_session("bob", "Bob's Own", "local"),
             )
             loop.run_until_complete(
-                service.save_composition_state(
+                _save_test_composition_state(
+                    service,
                     bob_session.id,
                     CompositionStateData(
                         metadata_={"name": "Bob", "description": ""},
@@ -4173,7 +4417,8 @@ class TestMessageRoutes:
         # route, so we seed one directly).
         loop = asyncio.new_event_loop()
         state_record = loop.run_until_complete(
-            service.save_composition_state(
+            _save_test_composition_state(
+                service,
                 uuid.UUID(session_id),
                 CompositionStateData(
                     metadata_={"name": "Test", "description": ""},
@@ -4246,7 +4491,8 @@ class TestMessageRoutes:
         loop = asyncio.new_event_loop()
         try:
             stale_record = loop.run_until_complete(
-                service.save_composition_state(
+                _save_test_composition_state(
+                    service,
                     uuid.UUID(session_id),
                     CompositionStateData(
                         metadata_={"name": "v1", "description": ""},
@@ -4256,7 +4502,8 @@ class TestMessageRoutes:
                 ),
             )
             head_record = loop.run_until_complete(
-                service.save_composition_state(
+                _save_test_composition_state(
+                    service,
                     uuid.UUID(session_id),
                     CompositionStateData(
                         metadata_={"name": "v2", "description": ""},
@@ -4657,7 +4904,8 @@ class TestMessageRoutes:
         loop = asyncio.new_event_loop()
         try:
             pre_state = loop.run_until_complete(
-                service.save_composition_state(
+                _save_test_composition_state(
+                    service,
                     session_id,
                     CompositionStateData(metadata_={"name": "Precompose", "description": ""}, is_valid=True),
                     provenance="session_seed",
@@ -5479,7 +5727,14 @@ class TestMessageRoutes:
         )
         app.state.catalog_service = catalog
 
-        async def fake_create_blob(session_uuid, filename, content, mime_type, created_by="user", source_description=None):
+        async def fake_create_blob(
+            session_uuid,
+            filename,
+            content,
+            mime_type,
+            created_by="user",
+            source_description=None,
+        ):
             return BlobRecord(
                 id=uuid.uuid4(),
                 session_id=session_uuid,
@@ -7101,12 +7356,14 @@ class TestRevertEndpoint:
         registry = _SessionComposeLockRegistry()
         app.state.session_compose_lock_registry = registry
         session = await service.create_session("alice", "Pipeline", "local")
-        target = await service.save_composition_state(
+        target = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(is_valid=True),
             provenance="session_seed",
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(is_valid=True),
             provenance="session_seed",
@@ -7144,18 +7401,83 @@ class TestRevertEndpoint:
         assert lock_observations == [("target", True), ("reserve", False), ("mutation", True)]
 
     @pytest.mark.asyncio
+    async def test_revert_cancellation_terminalizes_guided_before_releasing_session_authority(self, tmp_path) -> None:
+        from sqlalchemy import select
+
+        from elspeth.web.sessions.models import guided_operations_table, session_operation_fences_table
+
+        app, service = _make_app(tmp_path)
+        session = await service.create_session("alice", "Pipeline", "local")
+        target = await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+        )
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+        )
+        operation_id = str(uuid.uuid4())
+        mutation_started = asyncio.Event()
+        release_mutation = asyncio.Event()
+        original_revert = service.revert_state_for_guided_operation
+
+        async def blocking_revert(*args, **kwargs):
+            mutation_started.set()
+            await release_mutation.wait()
+            return await original_revert(*args, **kwargs)
+
+        with patch.object(service, "revert_state_for_guided_operation", side_effect=blocking_revert):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                request_task = asyncio.create_task(
+                    client.post(
+                        f"/api/sessions/{session.id}/state/revert",
+                        json={"operation_id": operation_id, "state_id": str(target.id)},
+                    )
+                )
+                await asyncio.wait_for(mutation_started.wait(), timeout=3)
+                request_task.cancel("operator cancelled state revert")
+                request_task.cancel("shutdown repeated state revert cancellation")
+                with pytest.raises(asyncio.CancelledError, match="operator cancelled state revert") as caught:
+                    await request_task
+
+        assert caught.value.args == ("operator cancelled state revert",)
+        with service._engine.connect() as connection:
+            operation = (
+                connection.execute(
+                    select(guided_operations_table).where(
+                        guided_operations_table.c.session_id == str(session.id),
+                        guided_operations_table.c.operation_id == operation_id,
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            session_fence = connection.execute(
+                select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(session.id))
+            ).one()
+        assert operation["status"] == "failed"
+        assert operation["failure_code"] == "request_cancelled"
+        assert session_fence.released_at is not None
+
+    @pytest.mark.asyncio
     async def test_revert_creates_new_version(self, tmp_path) -> None:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
 
         # Create session and two state versions via the service
         session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await service.save_composition_state(
+        v1 = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(source={"plugin": "csv"}, is_valid=True),
             provenance="session_seed",
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(source={"plugin": "json"}, is_valid=True),
             provenance="session_seed",
@@ -7322,13 +7644,204 @@ transforms:
         }
 
     @pytest.mark.asyncio
+    async def test_revert_replay_writes_nothing_when_the_stored_response_hash_mismatches(self, tmp_path: Path) -> None:
+        """Response-hash verification must precede every state_revert replay write.
+
+        The revert replay arm repairs surfacing debt, so if that repair ran
+        before the projected response was proven identical to the stored one,
+        a corrupt projection could insert new ``interpretation_events`` rows
+        and flip existing PENDING rows to SUPERSEDED -- and only afterwards
+        fail integrity verification. Both are audit-primary mutations. The
+        mismatch must abort with ZERO interpretation and state writes.
+
+        The fixture drives BOTH halves rather than merely detecting them: the
+        reverted state owes two fresh cards, and a later import leaves two
+        PENDING cards on a different state whose reviewed content the reverted
+        state no longer matches, which the repair's writer supersedes. The
+        positive control at the end proves both writes really do fire on a
+        clean replay, so the zero-write assertions above it are not vacuous.
+
+        Sibling of
+        ``guided/test_respond.py::TestStep2IntraStep::test_confirm_wiring_replay_writes_nothing_when_the_stored_response_hash_mismatches``,
+        which pins the same ordering on the guided RESPOND route.
+        """
+        from elspeth.web.sessions.routes.composer import state as state_module
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Revert replay hash mismatch", "local")
+        yaml_text = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score {{ row.value }}'
+"""
+        superseding_yaml = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-sonnet-4.5
+    prompt_template: 'Rank {{ row.value }} carefully'
+"""
+        imported = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+        assert imported.status_code == 200, imported.text
+        # Resolve the imported state's own cards so the debt this test relies
+        # on belongs to the REVERTED state, not inherited from the import.
+        for event in await service.list_interpretation_events(session.id, status="pending"):
+            resolved = client.post(
+                f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
+                json={"choice": "accepted_as_drafted"},
+            )
+            assert resolved.status_code == 200, resolved.text
+        # Import a DIFFERENT pipeline for the same node, and leave ITS cards
+        # pending. The repair pass reads evidence per state but supersedes
+        # PENDING rows for the site session-wide, so these are what the
+        # supersession half of the hazard would flip. Without them that half
+        # is detectable by the equality below but never actually driven.
+        superseding = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": superseding_yaml})
+        assert superseding.status_code == 200, superseding.text
+        stale_pending = await service.list_interpretation_events(session.id, status="pending")
+        assert {event.kind for event in stale_pending} == {
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            InterpretationKind.LLM_MODEL_CHOICE,
+        }
+        assert {str(event.composition_state_id) for event in stale_pending} == {superseding.json()["id"]}
+        operation_id = str(uuid.uuid4())
+        revert_body = {"operation_id": operation_id, "state_id": imported.json()["id"]}
+
+        def _crash_between_settlement_and_surfacing(*_args: Any, **_kwargs: Any) -> None:
+            raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
+
+        with (
+            patch.object(
+                state_module,
+                "_surface_reverted_interpretation_reviews",
+                side_effect=_crash_between_settlement_and_surfacing,
+            ),
+            pytest.raises(_SurfacingWorkerCrash),
+        ):
+            client.post(f"/api/sessions/{session.id}/state/revert", json=revert_body)
+
+        # NON-VACUITY PRECONDITION, one clause per way the repair can silently
+        # write nothing. (1) ``_surface_reverted_interpretation_reviews``
+        # returns early on a state whose ``metadata_`` is None. (2)
+        # ``only_missing_evidence=True`` makes the surfacer skip every site
+        # already carrying evidence in ANY resolution status, so the debt must
+        # be checked unfiltered -- a resolved or superseded row on the reverted
+        # state would make the replay a no-op. (3) the stale cards the
+        # supersession half needs must still be PENDING once the settlement has
+        # run. All three are preconditions of the ZERO-write assertions below;
+        # the positive control at the end of the test closes the loop by
+        # proving the writes really do happen when the projection is intact.
+        reverted_state = await service.get_current_state(session.id)
+        assert reverted_state is not None
+        assert reverted_state.id != uuid.UUID(imported.json()["id"])
+        assert reverted_state.metadata_ is not None, (
+            "fixture is vacuous: the surfacer returns early on a state with no metadata_, so replay would write nothing"
+        )
+        assert (await service.list_interpretation_events(session.id, composition_state_id=reverted_state.id)) == [], (
+            "fixture is vacuous: the reverted state already carries evidence, so replay would write nothing"
+        )
+        stale_ids = {event.id for event in stale_pending}
+        assert {
+            event.id for event in await service.list_interpretation_events(session.id, status="pending") if event.id in stale_ids
+        } == stale_ids, "fixture cannot drive the supersession half: the settlement already retired the stale cards"
+
+        # Corrupt the PROJECTION, not the stored row: terminal
+        # guided_operations rows are immutable by database trigger, and a
+        # corrupt projection is the failure this ordering actually guards.
+        # ``validation_errors`` is inside the hash domain and survives the
+        # strict re-validation ``guided_response_hash`` performs.
+        original_state_response = state_module._state_response
+
+        def _corrupt_projection(record: Any, **kwargs: Any) -> Any:
+            projected = original_state_response(record, **kwargs)
+            return projected.model_copy(update={"validation_errors": ["tampered"]})
+
+        events_before = sorted(await service.list_interpretation_events(session.id), key=lambda e: str(e.id))
+        versions_before = [record.id for record in await service.get_state_versions(session.id)]
+
+        # The patch goes on ONLY around the replay POST: ``_state_response``
+        # also feeds the settlement path's response_hash_factory, so patching
+        # it earlier would corrupt the stored hash too and no mismatch would
+        # occur.
+        #
+        # ``match=`` pins the ONE raise this test exists for: the hash
+        # comparison in ``routes/guided_operations.py::_replay_completed``.
+        # Four other AuditIntegrityError sites in ``state.py`` alone are
+        # reachable from this POST, and each would satisfy a bare
+        # ``pytest.raises`` while leaving both zero-write assertions trivially
+        # true -- so a bare one cannot tell this test passing from this test
+        # never running the ordering at all. They divide in two:
+        #   - BEFORE the comparison, which therefore never runs: "session
+        #     unexpectedly has no current checkpoint", ``_replay``'s
+        #     "non-state result locator" guard, and "operation was not
+        #     reserved". Further reserve/lookup guards in
+        #     ``routes/guided_operations.py`` sit here too.
+        #   - AFTER a comparison that MATCHED: the locator guard in
+        #     ``_repair_reverted_surfacing_debt``, which runs as
+        #     ``after_verified`` and raises before the surfacing write. It
+        #     writes nothing either, but it proves the opposite of what this
+        #     test asserts -- that verification succeeded.
+        # ``_replay``'s guard and the repair's guard share a message, so only
+        # a match on the comparison's own message discriminates.
+        with (
+            patch.object(state_module, "_state_response", _corrupt_projection),
+            pytest.raises(AuditIntegrityError, match="response hash does not match its stored response hash"),
+        ):
+            client.post(f"/api/sessions/{session.id}/state/revert", json=revert_body)
+
+        replay_events = await service.list_interpretation_events(session.id, composition_state_id=reverted_state.id)
+        assert [event.kind for event in replay_events] == [], (
+            "the rejected replay wrote interpretation_events before the response hash was verified"
+        )
+        # One equality over every column of every row in the session covers
+        # both halves of the hazard: no INSERT, and no PENDING row flipped to
+        # SUPERSEDED by the supersession pass inside the same window. The
+        # fixture drives both -- see the positive control below.
+        assert sorted(await service.list_interpretation_events(session.id), key=lambda e: str(e.id)) == events_before
+        assert [record.id for record in await service.get_state_versions(session.id)] == versions_before
+        current_after = await service.get_current_state(session.id)
+        assert current_after is not None and current_after.id == reverted_state.id
+
+        # POSITIVE CONTROL. Everything above is a ZERO-write assertion, which a
+        # fixture that could never write also satisfies. Re-POST the same
+        # operation with the projection intact and prove that BOTH writes the
+        # rejected replay was in a position to make do in fact happen: two
+        # fresh cards minted on the reverted state, and the two stale PENDING
+        # cards flipped to SUPERSEDED.
+        repaired = client.post(f"/api/sessions/{session.id}/state/revert", json=revert_body)
+        assert repaired.status_code == 200, repaired.text
+        repaired_events = await service.list_interpretation_events(session.id, composition_state_id=reverted_state.id)
+        assert {event.kind for event in repaired_events} == {
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            InterpretationKind.LLM_MODEL_CHOICE,
+        }, "the verified replay did not mint the cards the rejected one was refused, so the INSERT half was never driven"
+        assert [event.choice for event in await service.list_interpretation_events(session.id, status="all") if event.id in stale_ids] == [
+            InterpretationChoice.SUPERSEDED,
+            InterpretationChoice.SUPERSEDED,
+        ], "the verified replay superseded nothing, so the supersession half was never driven"
+
+    @pytest.mark.asyncio
     async def test_revert_injects_system_message(self, tmp_path) -> None:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
 
         session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        v1 = await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
 
         client.post(
             f"/api/sessions/{session.id}/state/revert",
@@ -7351,7 +7864,7 @@ transforms:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
-        service = SessionServiceImpl(
+        service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -7387,7 +7900,7 @@ transforms:
 
         # Alice creates a session with a state
         session = await service.create_session("alice", "Alice Only", "local")
-        v1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        v1 = await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
 
         # Bob tries to revert -- should be 404
         resp = bob_client.post(
@@ -7404,7 +7917,7 @@ transforms:
 
         s1 = await service.create_session("alice", "Session 1", "local")
         s2 = await service.create_session("alice", "Session 2", "local")
-        v1_s2 = await service.save_composition_state(s2.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        v1_s2 = await _save_test_composition_state(service, s2.id, CompositionStateData(is_valid=True), provenance="session_seed")
 
         # Try to revert s1 using s2's state -- should fail
         resp = client.post(
@@ -7423,7 +7936,8 @@ class TestYamlEndpoint:
         _install_restricted_plugin_policy(app, PluginId("sink", "database"))
         client = TestClient(app)
         session = await service.create_session("alice", "Policy atomicity", "local")
-        before = await service.save_composition_state(
+        before = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(is_valid=True),
             provenance="session_seed",
@@ -7460,7 +7974,8 @@ sinks:
         app.state.operator_profile_registry.lower_options.side_effect = AssertionError("export must not lower private bindings")
         client = TestClient(app)
         session = await service.create_session("alice", "Historical disabled plugin", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 sources={
@@ -7559,7 +8074,8 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Corrupt plugin projection", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 sources=sources,
@@ -7886,10 +8402,12 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Opt-out import", "local")
-        await service.record_session_interpretation_opt_out(
-            session_id=session.id,
-            actor="user:alice",
-        )
+        async with _compose_session_operation_context(service, session.id) as opt_out_context:
+            await service.record_session_interpretation_opt_out(
+                session_id=session.id,
+                actor="user:alice",
+                session_operation_context=opt_out_context,
+            )
         yaml_text = """
 sources:
   source:
@@ -8991,7 +9509,8 @@ sinks:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={"plugin": "csv", "on_success": "out", "options": {"path": "/data.csv"}, "on_validation_failure": "quarantine"},
@@ -9037,7 +9556,8 @@ sinks:
                 ),
             )
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -9194,7 +9714,8 @@ sinks:
                 )
             },
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -9268,7 +9789,8 @@ sinks:
                 pipeline_yaml=None,
             ),
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -9342,7 +9864,8 @@ sinks:
                 get_blob=get_blob,
             )
         blob_ref = "NOT-A-CANONICAL-UUID" if custody_failure == "noncanonical" else str(blob_id)
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -9693,7 +10216,8 @@ sinks:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -9760,7 +10284,8 @@ sinks:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -9842,7 +10367,8 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -9897,8 +10423,11 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
-            session.id, CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True), provenance="session_seed"
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True),
+            provenance="session_seed",
         )
         leaked_value = "REDACTED-preflight-error-canary"
 
@@ -9930,8 +10459,11 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
-            session.id, CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True), provenance="session_seed"
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True),
+            provenance="session_seed",
         )
         seen_session_ids: list[uuid.UUID] = []
 
@@ -9960,8 +10492,11 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
-            session.id, CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True), provenance="session_seed"
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True),
+            provenance="session_seed",
         )
 
         async def pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
@@ -9987,8 +10522,11 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
-            session.id, CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True), provenance="session_seed"
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True),
+            provenance="session_seed",
         )
 
         failure = ValidationResult(
@@ -10021,8 +10559,11 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
-            session.id, CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True), provenance="session_seed"
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True),
+            provenance="session_seed",
         )
 
         secret_canary = "this-text-must-not-appear-in-the-response-body"
@@ -10077,8 +10618,11 @@ sinks:
         # rather than re-raising the AttributeError into the test runner.
         client = TestClient(app, raise_server_exceptions=False)
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
-            session.id, CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True), provenance="session_seed"
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True),
+            provenance="session_seed",
         )
 
         async def programmer_bug(state, *, settings, secret_service, user_id, session_id, **_policy_context):
@@ -10116,7 +10660,8 @@ sinks:
 
         app.state.scoped_secret_resolver = FakeResolvedSecretService()
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -10295,9 +10840,14 @@ class TestRunAlreadyActiveError:
         app, service = _make_app(tmp_path)
 
         session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        v1 = await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
         # Create a run to block the session
-        await service.create_run(session.id, v1.id)
+        async with _execute_session_operation_context(service, session.id) as context:
+            await service.create_run(
+                session.id,
+                v1.id,
+                session_operation_context=context,
+            )
 
         # Register the app-level exception handler (wired in create_app,
         # but our test app uses create_session_router directly). Wire it here.
@@ -10325,7 +10875,12 @@ class TestRunAlreadyActiveError:
         # Add a test endpoint that triggers the error
         @app.post("/api/_test_create_run")
         async def _test_create_run():
-            await service.create_run(session.id, v1.id)
+            async with _execute_session_operation_context(service, session.id) as context:
+                await service.create_run(
+                    session.id,
+                    v1.id,
+                    session_operation_context=context,
+                )
 
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.post("/api/_test_create_run")
@@ -10346,7 +10901,8 @@ class TestNewStateHasNoLineage:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(source={"plugin": "csv"}, is_valid=True),
             provenance="session_seed",
@@ -10376,7 +10932,8 @@ class TestNewStateHasNoLineage:
                 "options": {"path": "refunds.csv"},
             },
         }
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(sources=sources, is_valid=True),
             provenance="session_seed",
@@ -10486,7 +11043,8 @@ class TestComposerProgressRoutes:
             guided_session=guided,
         )
         initial_state_d = initial_state.to_dict()
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             service.session.id,
             CompositionStateData(
                 sources=initial_state_d["sources"],
@@ -10514,8 +11072,10 @@ class TestComposerProgressRoutes:
                 progress=None,
                 guided_terminal=None,
                 user_message_id: str | None = None,
+                session_operation_context: SessionOperationContext | None = None,
             ) -> ComposerResult:
                 del message, chat_messages, session_id, current_state_id, user_id, progress, user_message_id
+                assert session_operation_context is not None
                 assert guided_terminal == guided.terminal
                 return ComposerResult(message="Freeform response", state=state)
 
@@ -10992,7 +11552,7 @@ class TestPaginationRoutes:
 
         session = await service.create_session("alice", "Pipeline", "local")
         for _ in range(5):
-            await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
+            await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=False), provenance="session_seed")
 
         resp = client.get(
             f"/api/sessions/{session.id}/state/versions?limit=2",
@@ -12162,12 +12722,13 @@ def test_runtime_preflight_failure_500_detail_does_not_promise_journal_traceback
         partial_state=None,
     )
     service = SimpleNamespace()
+    session_id = _UUID("00000000-0000-4000-8000-000000000001")
 
     body = asyncio.run(
         _handle_runtime_preflight_failure(
             exc,
             service,
-            _UUID("00000000-0000-4000-8000-000000000001"),
+            session_id,
             "user-id",
             "compose",
             None,
@@ -12176,6 +12737,15 @@ def test_runtime_preflight_failure_500_detail_does_not_promise_journal_traceback
             plugin_snapshot=PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service()),
             profile_registry=MagicMock(spec=OperatorProfileRegistry),
             catalog=create_catalog_service(),
+            session_operation_context=SessionOperationContext(
+                fence=SessionOperationFence(
+                    session_id=str(session_id),
+                    operation_id="operation_1",
+                    lease_token="lease_1",
+                    operation_epoch=1,
+                ),
+                operation_kind=SessionOperationKind.COMPOSE,
+            ),
         ),
     )
 
@@ -13857,7 +14427,8 @@ def test_send_message_state_advance_preserves_existing_composer_meta(tmp_path: P
     client = TestClient(app)
     session_id = client.post("/api/sessions", json={"title": "T"}).json()["id"]
     asyncio.run(
-        service.save_composition_state(
+        _save_test_composition_state(
+            service,
             uuid.UUID(session_id),
             CompositionStateData(
                 sources={},
@@ -13941,7 +14512,8 @@ def test_recompose_state_advance_preserves_existing_composer_meta(tmp_path: Path
     client = TestClient(app)
     session_id = client.post("/api/sessions", json={"title": "T"}).json()["id"]
     asyncio.run(
-        service.save_composition_state(
+        _save_test_composition_state(
+            service,
             uuid.UUID(session_id),
             CompositionStateData(
                 sources={},
@@ -14017,6 +14589,34 @@ class TestSendMessageTranscriptSnapshot:
     write-locked transaction) and never re-calls ``get_messages`` on
     that path.
     """
+
+    @pytest.mark.asyncio
+    async def test_competing_compose_lease_returns_409_without_persisting_user_message(self, tmp_path) -> None:
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = _make_composer_mock(response_text="must not run")
+
+        @app.exception_handler(SessionOperationConflictError)
+        async def handle_conflict(_request: object, _exc: SessionOperationConflictError) -> JSONResponse:
+            return JSONResponse(status_code=409, content={"detail": "Session operation is already active"})
+
+        session = await service.create_session("alice", "Replica conflict", "local")
+        blocking_context = service.session_operation_authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id="competing-replica",
+            lease_seconds=30,
+        )
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.post(
+                    f"/api/sessions/{session.id}/messages",
+                    json={"content": "must remain uncommitted"},
+                )
+        finally:
+            service.session_operation_authority.release(blocking_context)
+
+        assert response.status_code == 409
+        assert await service.get_messages(session.id, limit=None) == []
 
     def test_send_message_proceeds_when_get_messages_returns_stale_pre_insert_snapshot(self, tmp_path) -> None:
         """T2 (structural): a stale get_messages cannot 500 the send path.
@@ -14529,8 +15129,12 @@ def test_send_message_does_not_re_emit_the_already_persisted_turn_prose(tmp_path
 
     async def _compose_with_midloop_persist(*_args, **_kwargs) -> ComposerResult:
         # What the compose loop's P4 does mid-turn: commit the assistant row
-        # carrying this turn's prose plus the tool_calls envelope.
+        # carrying this turn's prose plus the tool_calls envelope. The hook
+        # runs inside the route's own COMPOSE operation, so the forwarded exact
+        # context is that operation's authority — acquiring a second one here
+        # would be a competing lease, not a faithful stand-in for P4.
         outcome = await service.persist_compose_turn_async(
+            session_operation_context=cast(SessionOperationContext, _kwargs["session_operation_context"]),
             session_id=str(session_id),
             assistant_content=prose,
             raw_content=None,

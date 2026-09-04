@@ -44,6 +44,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import (
@@ -80,15 +81,17 @@ from elspeth.web.interpretation_state import (
     SOURCE_COMPONENT_ID,
 )
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import sessions_table
+from elspeth.web.sessions.models import session_operation_fences_table, sessions_table
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
+    CompositionStateRecord,
     InterpretationDraftMismatchError,
     InterpretationPlaceholderConsumedError,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
 # Fixtures
@@ -108,10 +111,79 @@ def engine():
 
 @pytest.fixture
 def service(engine) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
+    )
+
+
+def _insert_test_session_with_released_create_fence(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    *,
+    title: str,
+) -> None:
+    """Seed a fixed test UUID with the released CREATE fence production leaves."""
+    created_at = datetime.now(UTC)
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title=title,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+        )
+        conn.execute(
+            insert(session_operation_fences_table).values(
+                session_id=str(session_id),
+                operation_id=f"create-{session_id}",
+                lease_token=f"create-token-{session_id}",
+                operation_kind=SessionOperationKind.CREATE.value,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                operation_epoch=1,
+                lease_expires_at=created_at,
+                released_at=created_at,
+            )
+        )
+
+
+async def _save_composition_state_with_compose_authority(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+) -> CompositionStateRecord:
+    """Persist test state under an authority-issued live COMPOSE context."""
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance="tool_call",
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
+
+
+async def _acquire_compose_context(service: SessionServiceImpl, session_id: UUID) -> SessionOperationContext:
+    return await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
     )
 
 
@@ -389,73 +461,54 @@ async def _fake_create_pending_interpretation_event(**kwargs: Any) -> Interpreta
 
 async def _seed_session(service: SessionServiceImpl, session_id: UUID) -> UUID:
     """Seed a session row + a composition_states row; return the state id."""
-    from datetime import UTC, datetime
-
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Phase 5b Task 5 Test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Phase 5b Task 5 Test",
+    )
     # Persist a production-shaped composition_states row that the writer's
     # affected_node_id boundary check can read against.
     state_dict = _state_with(_llm_node()).to_dict()
-    state = await service.save_composition_state(
+    state = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             nodes=state_dict["nodes"],
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     return state.id
 
 
 async def _seed_node_session(service: SessionServiceImpl, session_id: UUID, *, node: NodeSpec) -> UUID:
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Phase 5b Task 5 Node Test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Phase 5b Task 5 Node Test",
+    )
     state_dict = _state_with(node).to_dict()
-    state = await service.save_composition_state(
+    state = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             nodes=state_dict["nodes"],
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     return state.id
 
 
 async def _seed_source_session(service: SessionServiceImpl, session_id: UUID, *, source: SourceSpec | None = None) -> UUID:
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Phase 5b Task 5 Source Test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Phase 5b Task 5 Source Test",
+    )
     state_dict = _state_with_source(source if source is not None else _llm_generated_source()).to_dict()
-    state = await service.save_composition_state(
+    state = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             sources=state_dict["sources"],
@@ -463,7 +516,6 @@ async def _seed_source_session(service: SessionServiceImpl, session_id: UUID, *,
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     return state.id
 
@@ -636,7 +688,8 @@ async def _save_event_liveness_state(
     state: CompositionState,
 ) -> UUID:
     state_dict = state.to_dict()
-    record = await service.save_composition_state(
+    record = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             sources=state_dict["sources"],
@@ -646,7 +699,6 @@ async def _save_event_liveness_state(
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     return record.id
 
@@ -656,17 +708,11 @@ async def _seed_event_liveness_session(
     session_id: UUID,
     state: CompositionState,
 ) -> UUID:
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Interpretation event liveness test",
-                created_at=_now(),
-                updated_at=_now(),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Interpretation event liveness test",
+    )
     return await _save_event_liveness_state(service, session_id, state)
 
 
@@ -1413,7 +1459,7 @@ async def test_02_happy_path_produces_success_and_db_row(service: SessionService
     )
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == "rate_node"
+    assert result.affected_nodes == ("rate_node",)
     assert result.data["kind"] == "vague_term"
     assert "user_term" not in result.data
     assert "llm_draft" not in result.data
@@ -1436,7 +1482,15 @@ async def test_02b_opted_out_session_does_not_return_pending_payload(service: Se
     """After session opt-out, the tool reports suppression and writes no PENDING row."""
     session_id = uuid4()
     state_id = await _seed_session(service, session_id)
-    await service.record_session_interpretation_opt_out(session_id=session_id, actor="user:alice")
+    context = await _acquire_compose_context(service, session_id)
+    try:
+        await service.record_session_interpretation_opt_out(
+            session_id=session_id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
     state = _state_with(_llm_node())
 
     result = await _handle_request_interpretation_review(
@@ -1501,7 +1555,7 @@ async def test_02c_structured_pending_requirement_happy_path(service: SessionSer
 
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == "rate_node"
+    assert result.affected_nodes == ("rate_node",)
     assert result.data["kind"] == "vague_term"
     assert "user_term" not in result.data
     assert "llm_draft" not in result.data
@@ -1781,7 +1835,7 @@ async def test_request_interpretation_review_accepts_source_component_for_invent
     )
 
     assert result.success is True
-    assert result.data["affected_node_id"] == SOURCE_COMPONENT_ID
+    assert result.affected_nodes == (SOURCE_COMPONENT_ID,)
     assert result.data["kind"] == "invented_source"
 
 
@@ -1816,7 +1870,7 @@ async def test_request_interpretation_review_accepts_named_source_component_for_
     )
 
     assert result.success is True
-    assert result.data["affected_node_id"] == "source:orders"
+    assert result.affected_nodes == ("source:orders",)
     assert result.data["kind"] == "invented_source"
 
 
@@ -1972,7 +2026,7 @@ async def test_request_interpretation_review_invented_source_persists_with_real_
 
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == SOURCE_COMPONENT_ID
+    assert result.affected_nodes == (SOURCE_COMPONENT_ID,)
     assert result.data["kind"] == "invented_source"
     rows = await service.list_interpretation_events(session_id, status="pending")
     assert len(rows) == 1
@@ -2007,7 +2061,7 @@ async def test_request_interpretation_review_accepts_pipeline_decision_kind(serv
 
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == "drop_raw_html"
+    assert result.affected_nodes == ("drop_raw_html",)
     assert result.data["kind"] == "pipeline_decision"
     rows = await service.list_interpretation_events(session_id, status="pending")
     assert len(rows) == 1
@@ -2149,17 +2203,11 @@ async def test_08_per_term_rate_cap_after_three_surfacings(service: SessionServi
     # reads composition_states.nodes inside its locked transaction and validates
     # each affected_node_id; all four must be present from the outset because
     # ``composition_state_id`` is fixed across the iterations.
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Per-term rate cap test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Per-term rate cap test",
+    )
     multi_node_state = CompositionState(
         source=None,
         nodes=tuple(_llm_node(node_id=f"rate_node_{i}", term=sensitive_term) for i in range(4)),
@@ -2169,14 +2217,14 @@ async def test_08_per_term_rate_cap_after_three_surfacings(service: SessionServi
         version=1,
     )
     state_dict = multi_node_state.to_dict()
-    persisted = await service.save_composition_state(
+    persisted = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             nodes=state_dict["nodes"],
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     state_id = persisted.id
 
@@ -2745,7 +2793,8 @@ async def test_15_per_session_day_rate_cap_resets_at_utc_midnight(service: Sessi
     for i in range(10):
         # Persist a composition_states row with an LLM node carrying the
         # iteration's placeholder so the writer's boundary check passes.
-        per_iter_state_record = await service.save_composition_state(
+        per_iter_state_record = await _save_composition_state_with_compose_authority(
+            service,
             session_id,
             CompositionStateData(
                 nodes=_state_with(
@@ -2756,7 +2805,6 @@ async def test_15_per_session_day_rate_cap_resets_at_utc_midnight(service: Sessi
                 ).to_dict()["nodes"],
                 is_valid=True,
             ),
-            provenance="tool_call",
         )
         await service.create_pending_interpretation_event(
             session_id=session_id,
@@ -2914,7 +2962,7 @@ async def test_dedup_second_pending_restage_is_idempotent(service: SessionServic
     # Affected node + kind flow through for frontend correlation. Raw review
     # text stays in the scoped interpretation-events API, not the ToolResult
     # sent back to the LLM or persisted in chat-message audit payloads.
-    assert second.data["affected_node_id"] == "rate_node"
+    assert second.affected_nodes == ("rate_node",)
     assert second.data["kind"] == "vague_term"
     assert "user_term" not in second.data
     assert "llm_draft" not in second.data
@@ -3375,17 +3423,11 @@ async def test_16_rate_cap_breach_writes_no_audit_row(service: SessionServiceImp
     """
     session_id = uuid4()
 
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Rate-cap breach test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Rate-cap breach test",
+    )
     multi_node_state = CompositionState(
         source=None,
         nodes=tuple(_llm_node(node_id=f"rate_node_{i}") for i in range(4)),
@@ -3395,14 +3437,14 @@ async def test_16_rate_cap_breach_writes_no_audit_row(service: SessionServiceImp
         version=1,
     )
     state_dict = multi_node_state.to_dict()
-    persisted = await service.save_composition_state(
+    persisted = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             nodes=state_dict["nodes"],
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     state_id = persisted.id
 
@@ -3465,12 +3507,17 @@ async def test_17_auto_interpreted_no_surfaces_writer(service: SessionServiceImp
     session_id = uuid4()
     await _seed_session(service, session_id)
 
-    event = await service.record_auto_interpreted_no_surfaces_event(
-        session_id=session_id,
-        actor="composer-llm",
-        kind=InterpretationKind.VAGUE_TERM,
-        **_provenance_kwargs(),
-    )
+    context = await _acquire_compose_context(service, session_id)
+    try:
+        event = await service.record_auto_interpreted_no_surfaces_event(
+            session_id=session_id,
+            actor="composer-llm",
+            kind=InterpretationKind.VAGUE_TERM,
+            session_operation_context=context,
+            **_provenance_kwargs(),
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
     assert event.interpretation_source is InterpretationSource.AUTO_INTERPRETED_NO_SURFACES
     assert event.choice is InterpretationChoice.OPTED_OUT
     # Surface fields NULL.

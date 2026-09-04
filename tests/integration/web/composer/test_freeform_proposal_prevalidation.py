@@ -17,6 +17,7 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.blobs.protocol import BlobPendingProposalError
 from elspeth.web.blobs.service import BlobServiceImpl
@@ -28,6 +29,7 @@ from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerAvail
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate as real_build_set_pipeline_candidate
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.validation import ProfileAwareValidationResult
@@ -38,6 +40,7 @@ from elspeth.web.sessions.models import (
     composition_proposals_table,
     composition_states_table,
     proposal_events_table,
+    session_operation_fences_table,
     sessions_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -395,15 +398,34 @@ async def test_final_profile_rejection_is_unapplied_audited_and_repairable(tmp_p
     assert invalid_payload["data"] == {
         "status": "PREVALIDATION_REJECTED",
         "applied": False,
-        "applied_version": state.version,
         "candidate_version": state.version + 1,
         "message": (
             "The candidate pipeline failed prevalidation, was not applied, and was not submitted for approval. "
             "Repair the reported validation errors and retry."
         ),
     }
-    assert invalid_payload["version"] == state.version + 1
+    # The envelope's version is the UNAPPLIED state, so it agrees with the audit
+    # rather than contradicting it, and there is no `applied_version` twin under
+    # `data` (SYS-R3-3). `candidate_version` is the one fact the envelope lacks.
+    assert invalid_payload["version"] == state.version
     assert tuple(invocation.version_after for invocation in result.tool_invocations) == (state.version, state.version)
+    assert invalid_payload["data"]["candidate_version"] == invalid_payload["version"] + 1
+    # Nothing was applied, so no field may describe a change. Both of these came
+    # from the DISCARDED candidate while ``version`` named the unchanged state:
+    # ``affected_nodes`` listed the components the candidate would have touched,
+    # and the delta against the candidate's prior validation reported
+    # ``resolved_errors`` naming errors the unapplied state still has — the
+    # field the skill tells the model to act on instead of re-reading state
+    # (LLM seat LLM-R3B-1). This is now the APPROVAL_REQUIRED envelope's shape.
+    assert invalid_payload["affected_nodes"] == []
+    assert "validation_delta" not in invalid_payload
+    assert set(invalid_payload) == {"success", "validation", "affected_nodes", "version", "data"}
+    # ``validation`` deliberately stays the candidate's: it is the rejection the
+    # model repairs from, and the skill now says whose it is. The unapplied
+    # state has two errors of its OWN, which is what the departed delta used to
+    # report as ``resolved_errors``.
+    assert [error["error_code"] for error in invalid_payload["validation"]["errors"]] == ["profile_complete_state_rejected"]
+    assert {entry.error_code for entry in state.validate().errors} == {"no_sinks_configured", "source_on_success_dangling"}
     files_after = tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_file()))
     assert files_after == files_before
 
@@ -438,21 +460,47 @@ async def test_inline_candidate_materializes_one_custody_safe_proposal_without_r
         _fake_llm_response(content="The inline pipeline proposal is pending approval."),
     )
 
-    with (
-        patch.object(harness.service, "_call_llm", new=llm),
-        patch(
-            "elspeth.web.composer.tool_batch.build_set_pipeline_candidate",
-            wraps=real_build_set_pipeline_candidate,
-        ) as builder,
-    ):
-        result = await harness.service.compose(
-            "Build a reviewed pipeline with generated CSV content.",
-            [],
-            state,
-            session_id=harness.session_id,
-            user_id="proposal-prevalidation-user",
-            user_message_id=harness.user_message_id,
+    seeded_at = datetime.now(UTC)
+    with harness.engine.begin() as conn:
+        conn.execute(
+            insert(session_operation_fences_table).values(
+                session_id=harness.session_id,
+                operation_id=str(uuid4()),
+                lease_token=f"seed-{uuid4()}",
+                operation_kind=SessionOperationKind.CREATE.value,
+                owner_instance_id="proposal-prevalidation-seed",
+                operation_epoch=1,
+                lease_expires_at=seeded_at,
+                released_at=seeded_at,
+            )
         )
+
+    compose_lease = await SessionOperationLease.acquire(
+        harness.sessions.session_operation_authority,
+        session_id=UUID(harness.session_id),
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=harness.sessions.session_operation_owner_instance_id,
+        lease_seconds=harness.sessions.session_operation_lease_seconds,
+    )
+    try:
+        with (
+            patch.object(harness.service, "_call_llm", new=llm),
+            patch(
+                "elspeth.web.composer.tool_batch.build_set_pipeline_candidate",
+                wraps=real_build_set_pipeline_candidate,
+            ) as builder,
+        ):
+            result = await harness.service.compose(
+                "Build a reviewed pipeline with generated CSV content.",
+                [],
+                state,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+                session_operation_context=compose_lease.context,
+            )
+    finally:
+        await compose_lease.close()
 
     proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
     assert len(proposals) == 1
@@ -513,16 +561,54 @@ async def test_inline_candidate_materializes_one_custody_safe_proposal_without_r
 
     blob_service = BlobServiceImpl(harness.engine, tmp_path)
     blob_id = UUID(safe_arguments["source"]["blob_id"])
-    with pytest.raises(BlobPendingProposalError):
-        await blob_service.delete_blob(blob_id)
-    rejected = await harness.sessions.reject_composition_proposal(
+    pending_delete_lease = await SessionOperationLease.acquire(
+        harness.sessions.session_operation_authority,
         session_id=UUID(harness.session_id),
-        proposal_id=proposals[0].id,
-        actor="composer-parity-test",
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=harness.sessions.session_operation_owner_instance_id,
+        lease_seconds=harness.sessions.session_operation_lease_seconds,
     )
+    try:
+        with pytest.raises(BlobPendingProposalError):
+            await blob_service.delete_blob(
+                blob_id,
+                session_operation_context=pending_delete_lease.context,
+            )
+    finally:
+        await pending_delete_lease.close()
+    proposal_context = await harness.sessions._run_sync(
+        lambda: harness.sessions.session_operation_authority.acquire(
+            session_id=UUID(harness.session_id),
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=harness.sessions.session_operation_owner_instance_id,
+            lease_seconds=harness.sessions.session_operation_lease_seconds,
+        )
+    )
+    try:
+        rejected = await harness.sessions.reject_composition_proposal(
+            session_id=UUID(harness.session_id),
+            proposal_id=proposals[0].id,
+            actor="composer-parity-test",
+            session_operation_context=proposal_context,
+        )
+    finally:
+        await harness.sessions._run_sync(harness.sessions.session_operation_authority.release, proposal_context)
     assert rejected.status == "rejected"
     assert Path(blob_row.storage_path).exists()
-    await blob_service.delete_blob(blob_id)
+    final_delete_lease = await SessionOperationLease.acquire(
+        harness.sessions.session_operation_authority,
+        session_id=UUID(harness.session_id),
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=harness.sessions.session_operation_owner_instance_id,
+        lease_seconds=harness.sessions.session_operation_lease_seconds,
+    )
+    try:
+        await blob_service.delete_blob(
+            blob_id,
+            session_operation_context=final_delete_lease.context,
+        )
+    finally:
+        await final_delete_lease.close()
     assert not Path(blob_row.storage_path).exists()
 
 

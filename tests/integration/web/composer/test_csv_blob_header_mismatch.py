@@ -212,7 +212,7 @@ def test_csv_blob_without_header_and_no_declared_overlap_blocks(schema_mode: str
     assert matching[0]["evidence_locator"]["observed_header_count"] == 1
     assert matching[0]["evidence_locator"]["observed_headers_redacted"] is True
     assert "observed_headers" not in matching[0]["evidence_locator"]
-    assert data["is_valid"] is False
+    assert data["preview_is_valid"] is False
 
 
 def test_csv_blob_with_matching_header_does_not_block(tmp_path: Path) -> None:
@@ -237,7 +237,7 @@ def test_csv_blob_with_matching_header_does_not_block(tmp_path: Path) -> None:
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes
-    assert data["is_valid"] is True
+    assert data["preview_is_valid"] is True
 
 
 def test_csv_blob_with_normalized_header_does_not_block(tmp_path: Path) -> None:
@@ -262,7 +262,7 @@ def test_csv_blob_with_normalized_header_does_not_block(tmp_path: Path) -> None:
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes
-    assert data["is_valid"] is True
+    assert data["preview_is_valid"] is True
 
 
 def test_csv_blob_with_field_mapping_header_does_not_block(tmp_path: Path) -> None:
@@ -290,7 +290,7 @@ def test_csv_blob_with_field_mapping_header_does_not_block(tmp_path: Path) -> No
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes
-    assert data["is_valid"] is True
+    assert data["preview_is_valid"] is True
 
 
 def test_csv_blob_with_normalization_collision_returns_blocking_diagnostic(tmp_path: Path) -> None:
@@ -316,7 +316,7 @@ def test_csv_blob_with_normalization_collision_returns_blocking_diagnostic(tmp_p
     matching = [item for item in data["proof_diagnostics"] if item["code"] == _HEADER_RESOLUTION_ERROR_CODE]
     assert matching
     assert matching[0]["severity"] == "blocking"
-    assert data["is_valid"] is False
+    assert data["preview_is_valid"] is False
     # The raw resolver exception text (which quotes the colliding header values)
     # must NOT be echoed — header-resolution failure means a headerless/malformed
     # CSV can make a data row look like headers, so observed values are withheld.
@@ -352,7 +352,7 @@ def test_csv_blob_with_invalid_field_mapping_returns_blocking_diagnostic(tmp_pat
     matching = [item for item in data["proof_diagnostics"] if item["code"] == _HEADER_RESOLUTION_ERROR_CODE]
     assert matching
     assert matching[0]["severity"] == "blocking"
-    assert data["is_valid"] is False
+    assert data["preview_is_valid"] is False
     # Raw resolver text (which quotes the unmatched field_mapping keys / headers)
     # is withheld; observed values are redacted to a count.
     diagnostic_blob = repr(matching[0])
@@ -386,7 +386,7 @@ def test_csv_blob_headerless_columns_mode_does_not_block(tmp_path: Path) -> None
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes
-    assert data["is_valid"] is True
+    assert data["preview_is_valid"] is True
 
 
 def test_csv_fixed_schema_omits_columns_redacts_observed_values(tmp_path: Path) -> None:
@@ -428,7 +428,7 @@ def test_csv_fixed_schema_omits_columns_redacts_observed_values(tmp_path: Path) 
     assert "observed_columns" not in ev
     assert ev["missing_column_count"] >= 1
     assert "missing_columns" not in ev
-    assert data["is_valid"] is False
+    assert data["preview_is_valid"] is False
 
 
 def test_jsonl_blob_does_not_fire_csv_header_mismatch(tmp_path: Path) -> None:
@@ -453,4 +453,4 @@ def test_jsonl_blob_does_not_fire_csv_header_mismatch(tmp_path: Path) -> None:
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes
-    assert data["is_valid"] is True
+    assert data["preview_is_valid"] is True

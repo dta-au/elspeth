@@ -87,6 +87,10 @@ from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon_router
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
+from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.coordination.repository import PostgresSessionOperationRepository, SessionOperationConflictError
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.deployment_contract import DEPLOYMENT_TARGET_AWS_ECS, resolve_deployment_state_mode
 from elspeth.web.execution.progress import ProgressBroadcaster
@@ -128,7 +132,7 @@ from elspeth.web.schema_probe import postgres_engine_kwargs
 from elspeth.web.secrets.routes import create_secrets_router
 from elspeth.web.secrets.server_store import ServerSecretStore
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
-from elspeth.web.secrets.user_store import UserSecretStore
+from elspeth.web.secrets.user_store import RepositoryUserSecretAuthority, UserSecretStore
 from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
 from elspeth.web.sessions.engine import create_session_engine
@@ -143,11 +147,13 @@ from elspeth.web.sessions.protocol import (
     AuditAccessLogWriteError,
     RunAlreadyActiveError,
     RunRecord,
+    SessionOperationAuthority,
     StaleComposeStateError,
 )
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
+from elspeth.web.sessions.skill_markdown_history import RepositorySkillMarkdownHistoryAuthority
 from elspeth.web.sessions.telemetry import _SessionsTelemetry, build_sessions_telemetry
 from elspeth.web.shareable_reviews.routes import create_shareable_reviews_router
 from elspeth.web.shareable_reviews.service import ShareableReviewService
@@ -638,8 +644,8 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     #   * ``execution_service`` (for mark-time validation)
     #   * ``readiness_service`` (for the frozen-at-mark-time audit-readiness
     #     snapshot embedded in the share blob)
-    #   * the sessions-DB engine (for ``composer_completion_events_table``
-    #     audit writes)
+    #   * the sessions-DB engine (for authenticated completion-event reads)
+    #   * the session-operation authority (for fenced completion-event writes)
     #   * a ``FilesystemPayloadStore`` (for the content-addressed snapshot
     #     blob — created here, not shared with ``BlobServiceImpl`` because
     #     ``BlobServiceImpl`` owns its own internal payload store with a
@@ -665,6 +671,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         signer=share_token_signer,
         settings=settings,
         sessions_db_engine=app.state.session_engine,
+        session_operation_authority=session_service.session_operation_authority,
         payload_store=payload_store,
         # Phase 8 Sub-task 7c — composer.session.completed_total counter.
         # ``app.state.sessions_telemetry`` is set in ``create_app`` (the
@@ -1162,6 +1169,15 @@ def _create_app(
     app.state.operator_telemetry = operator_runtime
     app.state.deployment_state_mode = resolved_state_mode
 
+    @app.exception_handler(SessionOperationFenceLost)
+    async def _session_operation_fence_lost_handler(_request: Request, _exc: SessionOperationFenceLost) -> JSONResponse:
+        """Map ownership races to the same nonleaking absence response."""
+        return JSONResponse(status_code=404, content={"detail": "Session not found"})
+
+    @app.exception_handler(SessionOperationConflictError)
+    async def _session_operation_conflict_handler(_request: Request, _exc: SessionOperationConflictError) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": "Session operation is already active"})
+
     @app.exception_handler(AuditIntegrityError)
     async def _audit_integrity_error_handler(request: Request, exc: AuditIntegrityError) -> JSONResponse:
         # ~40 raise sites produce byte-identical fail-closed 500s through
@@ -1509,6 +1525,18 @@ def _create_app(
     # Shares the session engine; preferences live on the same metadata.
     app.state.preferences_service = PreferencesService(session_engine)
 
+    session_operation_authority: SessionOperationAuthority
+    if session_engine.dialect.name == "sqlite":
+        session_operation_authority = SQLiteLocalSessionOperationAuthority(session_engine)
+    elif session_engine.dialect.name == "postgresql":
+        session_operation_authority = PostgresSessionOperationRepository(session_engine)
+    else:
+        raise NotImplementedError(f"Session operation authority is not implemented for dialect {session_engine.dialect.name}")
+    audit_access_log_authority = RepositoryAuditAccessLogAuthority(session_engine)
+    app.state.audit_access_log_authority = audit_access_log_authority
+    skill_markdown_history_authority = RepositorySkillMarkdownHistoryAuthority(session_engine)
+    app.state.skill_markdown_history_authority = skill_markdown_history_authority
+
     # --- Blob service ---
     app.state.blob_service = BlobServiceImpl(
         session_engine,
@@ -1517,10 +1545,16 @@ def _create_app(
     )
 
     # --- Secret service ---
+    user_secret_authority = RepositoryUserSecretAuthority(session_engine)
+    app.state.user_secret_authority = user_secret_authority
     # Purpose-derived, not the raw secret_key: see web/key_derivation.py. This
     # value decrypts every stored user secret, so it is bound to the epoch
     # window in which the sessions store is recreated.
-    user_secret_store = UserSecretStore(session_engine, derive_user_secret_master_key(settings.secret_key))
+    user_secret_store = UserSecretStore(
+        session_engine,
+        derive_user_secret_master_key(settings.secret_key),
+        mutation_authority=user_secret_authority,
+    )
     server_secret_store = ServerSecretStore(settings.server_secret_allowlist)
     app.state.user_secret_store = user_secret_store
     app.state.server_secret_store = server_secret_store
@@ -1573,6 +1607,9 @@ def _create_app(
         operator_profile_registry=app.state.operator_profile_registry,
         catalog=app.state.catalog_service,
         runtime_preflight=_session_runtime_preflight,
+        session_operation_authority=session_operation_authority,
+        audit_access_log_authority=audit_access_log_authority,
+        skill_markdown_history_authority=skill_markdown_history_authority,
     )
     app.state.session_service = session_service
     readiness_probe_runner = ReadinessProbeRunner()

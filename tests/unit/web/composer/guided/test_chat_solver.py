@@ -3348,6 +3348,7 @@ async def test_step_2_pair_with_config_invalid_sink_at_cap_returns_retain_alone(
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
 async def test_step_2_pair_with_shape_invalid_sink_returns_retain_alone(monkeypatch: pytest.MonkeyPatch) -> None:
     """A pair whose sink half fails its shape contract keeps the valid retain."""
 

@@ -47,6 +47,8 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import seed_live_compose_context
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -62,7 +64,7 @@ def engine():
 
 @pytest.fixture
 def service(engine) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -325,6 +327,7 @@ async def test_settlement_surfacer_mints_the_card_for_a_blocked_uploaded_source(
         state_from_record(state),
         sessions_service=service,
         session_id=str(sid),
+        session_operation_context=seed_live_compose_context(service._engine, sid),
         current_state_id=str(state.id),
         model_identifier="anthropic/test-model",
         model_version="1",
@@ -415,6 +418,7 @@ async def test_settlement_surfacer_supersedes_a_pending_legacy_v1_card(
         state_from_record(state),
         sessions_service=service,
         session_id=str(sid),
+        session_operation_context=seed_live_compose_context(service._engine, sid),
         current_state_id=str(state.id),
         model_identifier="anthropic/test-model",
         model_version="1",

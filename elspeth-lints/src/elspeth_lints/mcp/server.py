@@ -151,15 +151,17 @@ _CONTINUE_ON_BLOCK_JUDGE_CALL_THRESHOLD = 10
 
 def _require_str_arg(arguments: dict[str, Any], name: str) -> str:
     value = arguments.get(name)
-    if not isinstance(value, str) or not value:
+    if type(value) is not str or not value:
         raise ValueError(f"argument {name!r} is required and must be a non-empty string")
     return value
 
 
 def _resolve_bundle_path(ctx: _ServerContext, arguments: dict[str, Any]) -> Path:
     """Resolve ``<staged_dir>/<bundle_id>.json`` from the ``bundle_id`` arg."""
+    from elspeth_lints.core.review_bundle import resolve_staged_bundle_path
+
     bundle_id = _require_str_arg(arguments, "bundle_id")
-    return ctx.staged_dir / f"{bundle_id}.json"
+    return resolve_staged_bundle_path(staged_dir=ctx.staged_dir, bundle_id=bundle_id)
 
 
 def _shell_join_keep_user(parts: list[str]) -> str:
@@ -576,8 +578,7 @@ def _tool_stage_scan(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
     from elspeth_lints.core.review_bundle import SCHEMA_VERSION, ReviewBundle, write_bundle
     from elspeth_lints.core.source_snapshot import SourceSnapshotChangedError, observe_source_snapshot
 
-    bundle_id_arg = arguments.get("bundle_id")
-    bundle_id = bundle_id_arg if isinstance(bundle_id_arg, str) and bundle_id_arg else f"stage-scan-{uuid.uuid4().hex[:12]}"
+    bundle_id = _require_str_arg(arguments, "bundle_id") if "bundle_id" in arguments else f"stage-scan-{uuid.uuid4().hex[:12]}"
     staged_by_arg = arguments.get("staged_by")
     staged_by = staged_by_arg if isinstance(staged_by_arg, str) and staged_by_arg else "elspeth-judge-agent"
 
@@ -858,8 +859,7 @@ def _tool_stage_rekey(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
 
     old_key_env = _require_str_arg(arguments, "old_key_env")
     new_key_env = _require_str_arg(arguments, "new_key_env")
-    bundle_id_arg = arguments.get("bundle_id")
-    bundle_id = bundle_id_arg if isinstance(bundle_id_arg, str) and bundle_id_arg else f"stage-rekey-{uuid.uuid4().hex[:12]}"
+    bundle_id = _require_str_arg(arguments, "bundle_id") if "bundle_id" in arguments else f"stage-rekey-{uuid.uuid4().hex[:12]}"
     staged_by_arg = arguments.get("staged_by")
     staged_by = staged_by_arg if isinstance(staged_by_arg, str) and staged_by_arg else "elspeth-judge-agent"
 

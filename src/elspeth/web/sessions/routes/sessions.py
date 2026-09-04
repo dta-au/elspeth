@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+import asyncio
+import sys
+from collections.abc import Awaitable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -19,11 +21,19 @@ from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.implicit_decisions import merge_implicit_decisions_meta
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.coordination.contracts import (
+    FenceLossReason,
+    SessionOperationContext,
+    SessionOperationFenceLost,
+)
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.protocol import (
     GuidedForkSettlementCommand,
     GuidedOperationFailureCode,
+    GuidedOperationFence,
     GuidedOperationFenceLostError,
     GuidedSessionResult,
+    SessionForkParentAuthority,
     SessionGuidedOperationInProgressError,
     SessionNotFoundError,
 )
@@ -635,6 +645,62 @@ def _rewrite_fork_state_blob_custody(
     )
 
 
+async def _close_fork_operation_leases(
+    child: SessionOperationLease | None,
+    parent: SessionOperationLease | None,
+    primary: BaseException | None,
+) -> None:
+    """Reverse-close without replacing a stale retry or cancellation."""
+    first_close_error: BaseException | None = None
+    for lease in (child, parent):
+        if lease is None or lease.closed:
+            continue
+        try:
+            await lease.close()
+        except BaseException as close_error:
+            if primary is not None:
+                primary.add_note(f"Fork lease reverse-close also failed with {type(close_error).__name__}.")
+            elif first_close_error is None:
+                first_close_error = close_error
+    if first_close_error is not None:
+        raise first_close_error
+
+
+async def _await_fork_authority_adoption[T](
+    awaitable: Awaitable[T],
+) -> tuple[T, asyncio.CancelledError | None]:
+    """Join stage+adoption before allowing request cancellation to unwind."""
+    authority_task = asyncio.ensure_future(awaitable)
+    caller_task = asyncio.current_task()
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(authority_task)
+        except asyncio.CancelledError as exc:
+            if authority_task.done() and authority_task.cancelled():
+                if cancellation is not None:
+                    cancellation.add_note("Fork staging/adoption was cancelled after request cancellation.")
+                    raise cancellation from exc
+                raise
+            if caller_task is None or caller_task.cancelling() == 0:
+                raise
+            if cancellation is None:
+                cancellation = exc
+            if not authority_task.done():
+                continue
+            try:
+                result = authority_task.result()
+            except BaseException as failure:
+                cancellation.add_note(f"Fork staging/adoption failed after request cancellation with {type(failure).__name__}.")
+                raise cancellation from failure
+        except Exception as failure:
+            if cancellation is None:
+                raise
+            cancellation.add_note(f"Fork staging/adoption failed after request cancellation with {type(failure).__name__}.")
+            raise cancellation from failure
+        return result, cancellation
+
+
 def register_session_routes(router: APIRouter) -> None:
 
     @router.post("", status_code=201, response_model=SessionResponse)
@@ -834,36 +900,79 @@ def register_session_routes(router: APIRouter) -> None:
         # losses are pathological lease churn and terminate in an explicit
         # integrity failure instead of an unbounded retry.
         for _fence_rejoin_attempt in range(_FORK_FENCE_REJOIN_ATTEMPTS):
-            try:
-                reserved = await reserve_or_replay_guided_operation(
-                    service=service,
-                    session_id=session_id,
-                    kind="session_fork",
-                    request=body,
-                    replay=_replay,
-                )
-            except SessionNotFoundError as exc:
-                raise HTTPException(status_code=404, detail="Session not found") from exc
-            if reserved is None:  # pragma: no cover - reservation is enabled
-                raise AuditIntegrityError("Session fork operation was not reserved")
-            if not isinstance(reserved, GuidedOperationLease):
-                return reserved
-
-            fence = reserved.fence
+            # Per-attempt lease state: hoisting these out of the loop would
+            # leak the previous attempt's lease into the next one. The
+            # reservation itself lives in the guarded block below, which is a
+            # strict superset of the pre-fence form (it adds the
+            # ``SessionOperationFenceLost``/``MISSING`` 404 arm and binds
+            # ``parent_lease``) — reserving here as well would allocate two
+            # operation rows per attempt.
+            parent_lease: SessionOperationLease | None = None
+            child_lease: SessionOperationLease | None = None
             staged = None
+            close_primary: BaseException | None = None
             try:
-                staged = await service.fork_session(
-                    fence,
-                    fork_message_id=body.from_message_id,
-                    new_message_content=body.new_message_content,
-                )
+                try:
+                    reserved = await reserve_or_replay_guided_operation(
+                        service=service,
+                        session_id=session_id,
+                        kind="session_fork",
+                        request=body,
+                        replay=_replay,
+                    )
+                except SessionOperationFenceLost as exc:
+                    if exc.reason is FenceLossReason.MISSING:
+                        raise HTTPException(status_code=404, detail="Session not found") from exc
+                    raise
+                except SessionNotFoundError as exc:
+                    raise HTTPException(status_code=404, detail="Session not found") from exc
+                if reserved is None:  # pragma: no cover - reservation is enabled
+                    raise AuditIntegrityError("Session fork operation was not reserved")
+                if not isinstance(reserved, GuidedOperationLease):
+                    return reserved
+                parent_lease = reserved.session_lease
+                active_parent_lease = parent_lease
 
-                async def _checkpoint() -> None:
+                fence = reserved.fence
+
+                async def _stage_and_adopt_child_authority(
+                    parent_context: SessionOperationContext = active_parent_lease.context,
+                    guided_operation_fence: GuidedOperationFence = fence,
+                ) -> None:
+                    nonlocal child_lease, staged
+                    staged = await service.fork_session(
+                        SessionForkParentAuthority(
+                            parent_context=parent_context,
+                            guided_fence=guided_operation_fence,
+                        ),
+                        fork_message_id=body.from_message_id,
+                        new_message_content=body.new_message_content,
+                    )
+                    child_lease = await SessionOperationLease.adopt_fork_child(
+                        service.session_operation_authority,
+                        staged.authority,
+                        lease_seconds=service.session_operation_lease_seconds,
+                    )
+
+                _, staging_cancellation = await _await_fork_authority_adoption(_stage_and_adopt_child_authority())
+                if staged is None or child_lease is None:
+                    raise AuditIntegrityError("Fork staging completed without adopted child authority")
+                active_child_lease = child_lease
+                if staging_cancellation is not None:
+                    raise staging_cancellation
+
+                async def _checkpoint(
+                    parent_operation_lease: SessionOperationLease = active_parent_lease,
+                    child_operation_lease: SessionOperationLease = active_child_lease,
+                ) -> None:
                     nonlocal fence
+                    parent_operation_lease.raise_if_lost()
+                    child_operation_lease.raise_if_lost()
                     fence = await service.renew_guided_operation(
                         fence,
                         actor="composer_route",
                         lease_seconds=300,
+                        session_operation_context=parent_operation_lease.context,
                     )
 
                 source_blobs = {entry.source_blob_id: await blob_service.get_blob(entry.source_blob_id) for entry in staged.blob_plan}
@@ -902,8 +1011,7 @@ def register_session_routes(router: APIRouter) -> None:
                 await _checkpoint()
                 await service.settle_guided_fork_operation(
                     GuidedForkSettlementCommand(
-                        fence=fence,
-                        child_session_id=staged.session.id,
+                        authority=staged.authority,
                         expected_current_state_id=staged.state.id if staged.state is not None else None,
                         edited_message_id=staged.messages[-1].id,
                         rewritten_state_id=uuid4() if rewritten_state is not None else None,
@@ -912,11 +1020,20 @@ def register_session_routes(router: APIRouter) -> None:
                         actor="composer_route",
                     )
                 )
+                await child_lease.close()
+                child_lease = None
+                await parent_lease.close()
                 return response
-            except (GuidedOperationFenceLostError, BlobForkFenceLostError):
+            except (
+                GuidedOperationFenceLostError,
+                BlobForkFenceLostError,
+                SessionOperationFenceLost,
+            ) as retry_error:
                 # A stale worker never cleans a child now owned by takeover.
+                close_primary = retry_error
                 continue
             except Exception as primary_exc:
+                close_primary = primary_exc
                 failure_code: GuidedOperationFailureCode = (
                     "quota_exceeded"
                     if isinstance(primary_exc, BlobQuotaExceededError)
@@ -924,8 +1041,6 @@ def register_session_routes(router: APIRouter) -> None:
                     if isinstance(primary_exc, (AuditIntegrityError, BlobContentMissingError, BlobIntegrityError))
                     else "operation_failed"
                 )
-                cleanup_integrity_exc: AuditIntegrityError | BlobContentMissingError | BlobIntegrityError | None = None
-
                 if isinstance(primary_exc, AuditIntegrityError):
                     # The ONLY carrier of what failed is ``str(primary_exc)``:
                     # ``fail_guided_operation`` durably records a code, not a
@@ -938,6 +1053,12 @@ def register_session_routes(router: APIRouter) -> None:
                     # last-resort record; the failed operation (and, after
                     # staging, the archived child) is the audit evidence, this
                     # is the diagnostic that says which key.
+                    #
+                    # This record is taken BEFORE the ``staged is None`` arm
+                    # below, which raises: the pre-staging case is the one that
+                    # names a key no other surface can, so settling the
+                    # operation first would discard exactly the diagnostic this
+                    # exists for.
                     _log_last_resort_diagnostic(
                         slog.error,
                         "session.fork_rewrite_integrity_error",
@@ -947,6 +1068,26 @@ def register_session_routes(router: APIRouter) -> None:
                         exc_class=type(primary_exc).__name__,
                         message=str(primary_exc),
                     )
+
+                if staged is None:
+                    # Staging itself failed: the reserved row must still reach
+                    # a terminal state under the parent authority, otherwise
+                    # every replay joiner polls until the lease expires.
+                    if parent_lease is None:
+                        raise
+                    try:
+                        failed = await service.fail_guided_operation(
+                            fence,
+                            failure_code=failure_code,
+                            actor="composer_route",
+                            session_operation_context=parent_lease.context,
+                        )
+                    except (GuidedOperationFenceLostError, SessionOperationFenceLost) as failure_fence_error:
+                        close_primary = failure_fence_error
+                        continue
+                    raise_guided_operation_failure(failed)
+
+                cleanup_integrity_exc: AuditIntegrityError | BlobContentMissingError | BlobIntegrityError | None = None
 
                 if staged is not None:
                     try:
@@ -1025,17 +1166,30 @@ def register_session_routes(router: APIRouter) -> None:
                     # session would also destroy the frozen plan envelope.
 
                 try:
-                    failed = await service.fail_guided_operation(
-                        fence,
+                    # A staged fork settles through the fork authority, not the
+                    # bare guided fence: the parent context, the child context
+                    # and the guided fence must all still be live for the CAS
+                    # to win, and ``fail_guided_operation`` would settle under
+                    # the guided fence alone. ``SessionOperationFenceLost`` is
+                    # the second fence's loss signal and rejoins like the
+                    # first: only the fail-CAS winner owns settlement.
+                    failed = await service.fail_guided_fork_operation(
+                        staged.authority,
                         failure_code=failure_code,
                         actor="composer_route",
                     )
-                except GuidedOperationFenceLostError:
-                    # Only the fail-CAS winner owns cleanup and settlement.
+                except (GuidedOperationFenceLostError, SessionOperationFenceLost) as failure_fence_error:
+                    close_primary = failure_fence_error
                     continue
 
                 if cleanup_integrity_exc is not None:
                     raise cleanup_integrity_exc from primary_exc
 
                 raise_guided_operation_failure(failed)
+            finally:
+                await _close_fork_operation_leases(
+                    child_lease,
+                    parent_lease,
+                    sys.exception() or close_primary,
+                )
         raise AuditIntegrityError("Session fork lost its operation fence on every rejoin attempt without a joinable winner")

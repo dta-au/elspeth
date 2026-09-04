@@ -9,6 +9,7 @@ from typing import Any, get_args
 from uuid import UUID
 
 import pytest
+from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
@@ -17,6 +18,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.secrets import SecretInventoryItem
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.audit_readiness.service import ReadinessService
 from elspeth.web.composer.state import (
     CompositionState,
@@ -26,6 +28,8 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.coordination import repository as coordination_repository
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import (
     ValidationCheck,
@@ -34,6 +38,53 @@ from elspeth.web.execution.schemas import (
     ValidationReadinessBlocker,
     ValidationResult,
 )
+from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.schema import initialize_session_schema
+
+_TEST_SESSION_ID = UUID("11111111-1111-1111-1111-111111111111")
+_session_operation_context: SessionOperationContext | None = None
+
+
+def _blob_read_context() -> SessionOperationContext:
+    if _session_operation_context is None:
+        raise RuntimeError("live session-operation context fixture is not active")
+    return _session_operation_context
+
+
+@pytest.fixture(autouse=True)
+def _live_blob_read_context(monkeypatch: pytest.MonkeyPatch):
+    """Acquire the exact context used by every readiness behaviour test."""
+    global _session_operation_context
+    engine = create_session_engine(
+        "sqlite:///:memory:",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    initialize_session_schema(engine)
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    monkeypatch.setattr(coordination_repository, "_new_session_id", lambda: _TEST_SESSION_ID)
+    created = authority.create_session_with_initial_fence(
+        user_id="alice",
+        title="Readiness context",
+        auth_provider_type="local",
+        owner_instance_id="readiness-test",
+        lease_seconds=30,
+    )
+    assert created.id == _TEST_SESSION_ID
+    context = authority.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id="readiness-test",
+        lease_seconds=30,
+    )
+    _session_operation_context = context
+    try:
+        yield
+    finally:
+        _session_operation_context = None
+        authority.release(context)
+        engine.dispose()
+
 
 # ── Test factories ────────────────────────────────────────────────────────────
 # Co-located here; if this conftest grows, extract to
@@ -635,6 +686,7 @@ def test_validation_row_ok_when_no_errors():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     assert _row(snap, "validation").status == "ok"
@@ -692,6 +744,7 @@ def test_compute_snapshot_populates_utc_checked_at():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     after = datetime.now(UTC)
@@ -710,6 +763,7 @@ def test_compute_snapshot_validates_already_read_state():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -718,6 +772,7 @@ def test_compute_snapshot_validates_already_read_state():
         state,
         user_id="alice",
         session_id=UUID("11111111-1111-1111-1111-111111111111"),
+        session_operation_context=_blob_read_context(),
         completion_gates=None,
     )
 
@@ -750,6 +805,7 @@ def test_compute_snapshot_passes_persisted_completion_gates():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -761,6 +817,7 @@ def test_compute_snapshot_passes_persisted_completion_gates():
             for_graph="0" * 64,
         )
     )
+    assert kwargs["session_operation_context"] is _blob_read_context()
 
 
 def test_snapshot_preserves_raw_validation_result():
@@ -792,6 +849,7 @@ def test_snapshot_preserves_raw_validation_result():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -819,6 +877,7 @@ def test_validation_row_error_lists_component_ids():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "validation")
@@ -850,6 +909,7 @@ def test_validation_row_drops_engineer_prefix_and_uses_problem_wording():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "validation")
@@ -886,6 +946,7 @@ def test_validation_row_pluralizes_and_joins_messages_only():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "validation")
@@ -907,6 +968,7 @@ def test_plugin_trust_row_ok_summary_when_boundary_plugins_present():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "plugin_trust")
@@ -973,6 +1035,7 @@ def test_plugin_trust_row_ok_summary_when_no_boundary_plugins():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "plugin_trust")
@@ -993,6 +1056,7 @@ def test_plugin_trust_row_error_on_unknown_plugin():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "plugin_trust")
@@ -1022,6 +1086,7 @@ def test_provenance_warning_on_identity_advisory():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "provenance")
@@ -1059,6 +1124,7 @@ def test_provenance_not_applicable_when_identity_advisory_check_was_skipped():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -1097,6 +1163,7 @@ def test_provenance_not_applicable_when_validation_failed_before_identity_adviso
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -1112,6 +1179,7 @@ def test_retention_row_reports_system_value():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "retention")
@@ -1132,6 +1200,7 @@ def test_llm_interpretations_not_applicable_when_no_llm_transforms():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -1178,6 +1247,7 @@ def test_llm_interpretations_not_applicable_when_llm_present_but_no_events():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -1219,6 +1289,7 @@ def test_llm_interpretations_warning_when_pending_events_present():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -1251,6 +1322,7 @@ def test_llm_interpretations_ok_when_all_events_resolved():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -1284,6 +1356,7 @@ def test_llm_interpretations_not_applicable_when_session_opted_out():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -1319,6 +1392,7 @@ def test_llm_interpretations_ok_when_auto_interpreted_no_surfaces_baked_in():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -1352,6 +1426,7 @@ def test_llm_interpretations_ok_when_composer_and_runtime_models_differ():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -1383,6 +1458,7 @@ def test_llm_interpretations_ok_when_runtime_model_matches_recorded():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -1412,6 +1488,7 @@ def test_llm_interpretations_opt_out_overrides_runtime_model_drift():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -1424,6 +1501,7 @@ def test_secrets_not_applicable_when_no_refs():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     assert _row(snap, "secrets").status == "not_applicable"
@@ -1450,6 +1528,7 @@ def test_secrets_not_applicable_when_secret_refs_check_reports_no_refs():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -1483,6 +1562,7 @@ def test_secrets_not_applicable_when_no_ref_check_has_unrelated_inventory():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -1523,6 +1603,7 @@ def test_resolved_secret_row_is_invariant_to_unrelated_owner_inventory():
             _make_service(_state(), result, inventory=inventory).compute_snapshot(
                 session_id=UUID("11111111-1111-1111-1111-111111111111"),
                 user_id="alice",
+                session_operation_context=_blob_read_context(),
             )
         )
         rows.append(_row(snapshot, "secrets"))
@@ -1549,6 +1630,7 @@ def test_absent_secret_check_is_inventory_invariant_and_does_not_read_inventory(
             service.compute_snapshot(
                 session_id=UUID("11111111-1111-1111-1111-111111111111"),
                 user_id="alice",
+                session_operation_context=_blob_read_context(),
             )
         )
         rows.append(_row(snapshot, "secrets"))
@@ -1593,6 +1675,7 @@ def test_secrets_error_on_missing_refs():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     assert _row(snap, "secrets").status == "error"
@@ -1619,6 +1702,7 @@ def test_secrets_error_when_secret_refs_check_failed_without_typed_error():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -1657,6 +1741,7 @@ def test_secrets_error_on_fabricated_secret():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     assert _row(snap, "secrets").status == "error"
@@ -1683,6 +1768,7 @@ def test_secrets_error_on_disallowed_secret_ref():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     assert _row(snap, "secrets").status == "error"
@@ -1724,6 +1810,7 @@ def test_secrets_not_applicable_when_secret_check_was_skipped():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -1742,6 +1829,7 @@ def test_plugin_trust_row_errors_on_non_catalog_plugin_name():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -1767,6 +1855,7 @@ def test_snapshot_raises_when_no_state():
             svc.compute_snapshot(
                 session_id=UUID("11111111-1111-1111-1111-111111111111"),
                 user_id="alice",
+                session_operation_context=_blob_read_context(),
             )
         )
 

@@ -26,6 +26,8 @@
 
 import { expect, test, type Page, type Route } from "@playwright/test";
 
+import { TUTORIAL_TRANSFORMS_PROMPT } from "@/components/tutorial/tutorialMachine";
+
 const tutorialSession = {
   id: "11111111-1111-4111-8111-111111111111",
   title: "New session",
@@ -108,14 +110,64 @@ interface GuidedFixtureState {
   requestLog: string[];
 }
 
+// The server line that follows the goal on every started or converted session
+// (GUIDED_GOAL_ACKNOWLEDGEMENT, composer/guided/protocol.py). Held literally
+// here, as the other server strings in this mock are: this file IS the server
+// for the canary walk.
+const GUIDED_GOAL_ACKNOWLEDGEMENT =
+  "Goal saved. The planner will build from it once the source and output are reviewed. First, the source: where does the data come from?";
+
+/** One `chat_history` entry in the closed ChatTurn wire shape. */
+function chatTurn(
+  role: "user" | "assistant",
+  content: string,
+  seq: number,
+  step: string,
+): Record<string, unknown> {
+  return {
+    role,
+    content,
+    seq,
+    step,
+    ts_iso: "2026-05-19T12:00:00Z",
+    assistant_message_kind: role === "assistant" ? "assistant" : null,
+    synthetic_failure_reason: null,
+    turn_token: null,
+  };
+}
+
+// Goal-first (elspeth-378cfa0e18): a started session's transcript OPENS with
+// the author's goal and the server's acknowledgement, both stamped with the
+// step the session opens on — for the tutorial, the frozen transforms prompt at
+// step_1_source. A fixture returning `chat_history: []` models a session the
+// backend can no longer emit, and it is exactly the seeded goal turn that the
+// rewritten locked-prompt predicate (ChatPanel `tutorialPromptSentForStep`)
+// has to survive: under the old "any user turn at this step that isn't Explain"
+// form this pair alone flips the locked source box to the static "Sent" line
+// and un-suppresses the rival single-select. With an empty transcript the
+// canary cannot tell the two forms apart.
+function seededGoalTurns(): Array<Record<string, unknown>> {
+  return [
+    chatTurn("user", TUTORIAL_TRANSFORMS_PROMPT, 0, "step_1_source"),
+    chatTurn("assistant", GUIDED_GOAL_ACKNOWLEDGEMENT, 1, "step_1_source"),
+  ];
+}
+
 // A guided session at a given step with no terminal yet.
-function guidedSession(step: string): Record<string, unknown> {
+function guidedSession(
+  step: string,
+  chatHistory: Array<Record<string, unknown>> = seededGoalTurns(),
+): Record<string, unknown> {
   return {
     step,
     history: [],
     terminal: null,
-    chat_history: [],
-    chat_turn_seq: 0,
+    chat_history: chatHistory,
+    chat_turn_seq: chatHistory.length,
+    // Server-projected reviewed ledger (elspeth-f2a8550b3d). Empty here: this
+    // route mock drives the stepper and transcript, not the pre-commit graph,
+    // and the decoder requires the key to be present rather than absent.
+    reviewed_components: { sources: [], outputs: [] },
     // null profile == empty/live; the tutorial seeds via /guided/start. The
     // shell reads profile.bookends but tolerates a null profile (defaults true).
     profile: {
@@ -273,9 +325,11 @@ const wireTurn: Record<string, unknown> = {
   },
 };
 
-function completedSession(): Record<string, unknown> {
+function completedSession(
+  chatHistory: Array<Record<string, unknown>> = seededGoalTurns(),
+): Record<string, unknown> {
   return {
-    ...guidedSession("step_4_wire"),
+    ...guidedSession("step_4_wire", chatHistory),
     terminal: {
       kind: "completed",
       reason: null,
@@ -288,6 +342,11 @@ async function installTutorialRoutes(
   page: Page,
   state: GuidedFixtureState,
 ): Promise<void> {
+  // The transcript ACCUMULATES, as the server's does: every answered /guided/chat
+  // appends the user's message and the reply at the step it was sent on, on top
+  // of the seeded goal pair. A mock that reset the history each turn would make
+  // the locked-prompt predicate trivially false forever.
+  const chatHistory: Array<Record<string, unknown>> = seededGoalTurns();
   await page.route("**/api/**", async (route: Route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -431,7 +490,7 @@ async function installTutorialRoutes(
     ) {
       await route.fulfill({
         json: {
-          guided_session: guidedSession("step_1_source"),
+          guided_session: guidedSession("step_1_source", [...chatHistory]),
           next_turn: singleSelectTurn("Which data source would you like to use?", [
             ["inline_blob", "inline_blob"],
             ["csv", "csv"],
@@ -450,8 +509,23 @@ async function installTutorialRoutes(
       state.guidedRespondCount += 1;
       const n = state.guidedRespondCount;
       state.requestLog.push(`guided-chat:${n}`);
+      const body = request.postDataJSON() as { message?: unknown };
+      const sentStep = n === 1 ? "step_1_source" : "step_2_sink";
+      const assistantMessage =
+        n === 1
+          ? "I set this up as an inline source."
+          : "I set up a JSONL output.";
+      chatHistory.push(
+        chatTurn(
+          "user",
+          typeof body.message === "string" ? body.message : "",
+          chatHistory.length,
+          sentStep,
+        ),
+        chatTurn("assistant", assistantMessage, chatHistory.length + 1, sentStep),
+      );
       let next: Record<string, unknown> | null;
-      let session = guidedSession("step_2_sink");
+      let session = guidedSession("step_2_sink", [...chatHistory]);
       if (n === 1) {
         next = singleSelectTurn("What format should the output be in?", [
           ["jsonl", "jsonl"],
@@ -459,14 +533,11 @@ async function installTutorialRoutes(
         ], 1);
       } else {
         next = wireTurn;
-        session = guidedSession("step_4_wire");
+        session = guidedSession("step_4_wire", [...chatHistory]);
       }
       await route.fulfill({
         json: {
-          assistant_message:
-            n === 1
-              ? "I set this up as an inline source."
-              : "I set up a JSONL output.",
+          assistant_message: assistantMessage,
           assistant_message_kind: "assistant",
           guided_session: session,
           next_turn: next,
@@ -485,24 +556,26 @@ async function installTutorialRoutes(
       const n = state.guidedRespondCount;
       state.requestLog.push(`guided-respond:${n}`);
       // Drive a deterministic walk: source → sink → wire → completed. The
-      // mock ignores the request body and advances by count.
+      // mock ignores the request body and advances by count. Every response
+      // carries the transcript accumulated so far — a respond never drops the
+      // chat turns that preceded it.
       let next: Record<string, unknown> | null;
-      let session = guidedSession("step_2_sink");
+      let session = guidedSession("step_2_sink", [...chatHistory]);
       if (n === 1) {
         // after source pick → sink pick turn
         next = singleSelectTurn("What format should the output be in?", [
           ["jsonl", "jsonl"],
           ["json", "json"],
         ], 1);
-        session = guidedSession("step_2_sink");
+        session = guidedSession("step_2_sink", [...chatHistory]);
       } else if (n === 2) {
         // after sink pick → wire turn
         next = wireTurn;
-        session = guidedSession("step_4_wire");
+        session = guidedSession("step_4_wire", [...chatHistory]);
       } else {
         // wire confirm → completed
         next = null;
-        session = completedSession();
+        session = completedSession([...chatHistory]);
       }
       const terminal =
         next === null

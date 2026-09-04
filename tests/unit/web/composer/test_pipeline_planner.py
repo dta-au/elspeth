@@ -7,6 +7,7 @@ candidate state as a provider result.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import threading
@@ -68,6 +69,7 @@ from elspeth.web.composer.pipeline_planner import (
     _allowlisted_candidate_feedback,
     _candidate_shape_hash,
     _derive_finalizer_owned_refs,
+    _entry_component_ref,
     _feedback_error_codes,
     _FinalizerOwnedRefs,
     _materialize_terminal_payload,
@@ -88,6 +90,7 @@ from elspeth.web.composer.pipeline_proposal import (
 )
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids, planner_plugin_contract
 from elspeth.web.composer.prompts import build_system_prompt
+from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import (
     CoalesceUnionTypeDetail,
     CompositionState,
@@ -126,8 +129,8 @@ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeW
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, composition_proposals_table
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _TEST_SESSION_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -149,7 +152,41 @@ _TEST_SESSION_ID = "11111111-1111-4111-8111-111111111111"
 # provider or transport limit — it is a tripwire that makes scaffolding
 # growth a thing someone looks at, so it is set to leave working room rather
 # than to sit one edit away from tripping on noise.
-_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = 106 * 1024
+_FIXED_SCAFFOLDING_BASELINE_BYTES = 106 * 1024
+# Standing operator ruling 2026-09-03 (John): the scaffold will rise and fall
+# as the tech-debt burn-down retires duplicated keys and teaches the surviving
+# ones, so the ratchet carries a PRE-APPROVED 10% band above the baseline
+# instead of costing an operator round-trip per edit. Move within the band on
+# the change's own merits; bring the numbers to the operator when the scaffold
+# leaves it. A shrink of more than 10% below the baseline is the other
+# boundary — it means teaching was lost rather than retired — and is a
+# judgement call for the operator, not a gate here. Measured 2026-09-03 at
+# 0dda01dfb (tool-result envelope data-key teaching, elspeth-e405ad7cd2):
+# 109,924 B; then two round-3 teaching corrections in the same lane moved it
+# before any census work did — the failure-schema and terminal-state
+# reconciliation (6da628fd3) to 109,983 B, +59 B, and diff_pipeline dropping
+# its version twin (414850e27) to 110,043 B, +60 B. Re-measured after the
+# census stopped declining comprehension-valued payloads and the eleven keys
+# it newly enumerated were taught (elspeth-e405ad7cd2 RED2-2 residue):
+# 110,328 B, +285 B on 110,043. Those two steps were reconstructed by
+# measuring every commit in between, because the entry below them recorded
+# +285 against the 109,924 above them: the arithmetic did not close and a
+# reader adding it up landed 119 B low. The chain is the record, so every
+# figure in it must be a measured predecessor of the next. The edge_contracts
+# CARDINALITY correction (elspeth-e405ad7cd2 LLM-R5-1) then moved it to
+# 110,564 B, +236 B, recording that only in its commit message; the same
+# description's REQUIREMENT-SOURCE correction (elspeth-e405ad7cd2 LLM-R5C-3)
+# moves it to 110,753 B, +189 B; deleting one false parenthetical from that
+# same correction — it scoped the schema-declared-fields route to a typed
+# source producer, which holds for a node consumer and not for a sink
+# (elspeth-e405ad7cd2 LLM-F1) — brings it back to 110,706 B, -47 B. Each figure
+# is read from this assertion in a throwaway export with the ceiling lowered to
+# 1, per commit, not inferred from a diff. Two model-facing edits in that round
+# cost nothing here and are worth knowing about: the sink_contract_violation
+# repair guidance is per-ERROR text rather than scaffolding, and
+# pipeline_composer.md is not the skill this request carries (the harness
+# renders pipeline_capabilities.md), so both measured +0 B.
+_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
 
 
 @dataclass
@@ -2737,7 +2774,11 @@ async def test_redacted_planner_preserves_canonical_failed_state_read(
     assert payload["success"] is False
     assert payload["data"].get("error_code") != "surface_projection_unavailable"
     if "unexpected" in arguments:
-        assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
+        # The argument rejection rides under ``data`` as ``argument_error``,
+        # never as a second ``success`` / ``validation`` beside the envelope's
+        # own (SYS-R3-1): the envelope's ``validation`` here is the STATE's.
+        assert set(payload["data"]) == {"argument_error"}
+        assert payload["data"]["argument_error"]["error_code"] == "SCHEMA_VALIDATION"
     else:
         assert payload["data"]["error"] == (
             "Component 'missing-component' not found. Specify 'source', a node ID, an output name, "
@@ -2911,8 +2952,13 @@ async def test_list_sources_disclosure_closes_authoritative_validation_envelope(
     payload = json.loads(tool_message["content"])
     assert payload["success"] is not failed
     if failed:
-        assert payload["data"]["success"] is False
-        assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
+        # ``data`` carries the argument rejection under its own name. It must
+        # not restate the envelope's ``success`` (a twin) or shadow the
+        # envelope's ``validation``, which on this arm is the STATE's and whose
+        # errors are the pipeline's, not the argument's (SYS-R3-1).
+        assert set(payload["data"]) == {"argument_error"}
+        assert payload["data"]["argument_error"]["error_code"] == "SCHEMA_VALIDATION"
+        assert payload["validation"]["errors"] != [payload["data"]["argument_error"]]
     else:
         assert isinstance(payload["data"], dict)
         assert isinstance(payload["data"]["available"], list)
@@ -2974,8 +3020,13 @@ async def test_preview_pipeline_disclosure_fails_closed_when_authoritative_data_
         assert all(canary not in tool_message["content"] for canary in _ALL_PROVIDER_DISCLOSURE_CANARIES)
         if failed:
             assert payload["success"] is False
-            assert payload["data"]["success"] is False
-            assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
+            # Same shape on the RESTRICTED surface, which is where it matters
+            # most: ``_closed_provider_discovery_payload`` strips messages from
+            # the envelope's validation and then passes ``data`` through
+            # verbatim, so a second validation envelope under ``data`` would
+            # defeat that closure (SYS-R3-1).
+            assert set(payload["data"]) == {"argument_error"}
+            assert payload["data"]["argument_error"]["error_code"] == "SCHEMA_VALIDATION"
             assert payload["data"].get("error_code") != "surface_projection_unavailable"
         else:
             assert payload["success"] is False
@@ -2988,7 +3039,7 @@ async def test_preview_pipeline_disclosure_fails_closed_when_authoritative_data_
         assert _HIDDEN_CONNECTION_COMPONENT_CANARY in tool_message["content"]
         assert _HIDDEN_EDGE_COMPONENT_CANARY in tool_message["content"]
         if not failed:
-            assert "authoring_validation" in payload["data"]
+            assert "preview_is_valid" in payload["data"]
 
 
 @pytest.mark.parametrize(
@@ -5733,7 +5784,7 @@ async def _session_context(*, content: str = "Use this CSV: name,score\nada,42\n
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.pipeline-planner-custody"),
@@ -9872,6 +9923,7 @@ def test_truncated_component_rejection_feedback_reports_what_was_withheld() -> N
                 message=f"Output 'main{index}': Invalid options for sink 'json': RAW_MESSAGE_CANARY",
                 severity="high",
                 error_code="plugin_options_invalid",
+                rejected_component=f"output:main{index}",
             )
             for index in range(1, 9)
         ),
@@ -10179,22 +10231,23 @@ def test_candidate_rejection_fingerprint_discriminates_disjoint_component_sets()
                 errors=tuple(
                     ValidationEntry(
                         component="rejected_mutation",
-                        message=f"{subject}: Invalid options for plugin 'json': RAW_MESSAGE_CANARY",
+                        message="Invalid options for plugin 'json': RAW_MESSAGE_CANARY",
                         severity="high",
                         error_code="plugin_options_invalid",
+                        rejected_component=subject,
                     )
                     for subject in subjects
                 ),
             )
         )
 
-    disjoint_first = _rejection_fingerprint(cast(Any, rejection("Source 'rows_in'", "Node 'clean'")))
-    disjoint_second = _rejection_fingerprint(cast(Any, rejection("Output 'rows_out'", "Node 'score'")))
+    disjoint_first = _rejection_fingerprint(cast(Any, rejection("source:rows_in", "node:clean")))
+    disjoint_second = _rejection_fingerprint(cast(Any, rejection("output:rows_out", "node:score")))
     assert disjoint_first != disjoint_second
 
     # A genuine repeat — same components, same codes — still fingerprints the
     # same, so the notice it earns still fires.
-    assert _rejection_fingerprint(cast(Any, rejection("Source 'rows_in'", "Node 'clean'"))) == disjoint_first
+    assert _rejection_fingerprint(cast(Any, rejection("source:rows_in", "node:clean"))) == disjoint_first
 
 
 @pytest.mark.asyncio
@@ -10402,3 +10455,120 @@ def test_withheld_component_count_crashes_on_corrupt_first_party_count() -> None
 
     with pytest.raises(AuditIntegrityError, match="must be an int"):
         pipeline_planner._withheld_component_count(_withheld_result({COMPONENTS_WITHHELD_KEY: "3"}))
+
+
+def test_rejection_subject_is_read_structurally_never_parsed_from_the_message() -> None:
+    """``rejected_component`` is the only source of a rejection entry's subject.
+
+    Until elspeth-e405ad7cd2 the planner recovered the subject from the
+    ``Output 'rows': …`` message prefix with a regex — the prose-parsing shape
+    that lost three ``plugin_identity`` parsers. Now an entry that carries the
+    ref is attributed to it and disclosed when the finalizer owns something
+    ELSE; an entry that does not carry it is unattributable and fails closed
+    (masked to ``pipeline``) even though its message still names the subject
+    in exactly the format the regex used to read.
+    """
+    attributed = ValidationEntry(
+        component="rejected_mutation",
+        message="Output 'rows': RAW_MESSAGE_CANARY",
+        severity="high",
+        error_code="plugin_options_invalid",
+        rejected_component="output:rows",
+    )
+    unattributed = ValidationEntry(
+        component="rejected_mutation",
+        message="Output 'rows': RAW_MESSAGE_CANARY",
+        severity="high",
+        error_code="plugin_options_invalid",
+    )
+    assert _entry_component_ref(attributed) == "output:rows"
+    assert _entry_component_ref(unattributed) is None
+
+    owns_something_else = _FinalizerOwnedRefs(config=frozenset({"source"}), routing=frozenset())
+
+    disclosed = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=ValidationSummary(is_valid=False, errors=(attributed,)), updated_state=object())),
+        finalizer_owned=owns_something_else,
+    )
+    (disclosed_entry,) = disclosed["validation"]["errors"]
+    assert disclosed_entry["component"] == "output:rows"
+    assert disclosed_entry["detail"] == "Output 'rows': RAW_MESSAGE_CANARY"
+
+    withheld = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=ValidationSummary(is_valid=False, errors=(unattributed,)), updated_state=object())),
+        finalizer_owned=owns_something_else,
+    )
+    (withheld_entry,) = withheld["validation"]["errors"]
+    assert withheld_entry["component"] == "pipeline"
+    assert "RAW_MESSAGE_CANARY" not in json.dumps(withheld_entry)
+
+
+def test_argument_rejection_projections_split_by_surface() -> None:
+    """The argument rejection has two shapes because it has two surfaces, and one entry builder.
+
+    On the repair loop it is the WHOLE tool message
+    (``_allowlisted_argument_feedback``), with nothing around it, so ``success``
+    and ``validation`` are the message's own top-level fields — the family shape
+    ``_canonical_schema_feedback`` and the other terminal-rejection builders use
+    there. On the discovery arm it rides under the ``data`` of a ``ToolResult``
+    that already carries a ``success`` and a ``validation`` of its own, so the
+    same two keys would be a twin and a homonym: the envelope's ``validation``
+    is the STATE's (its errors are the pipeline's), while this one is the
+    rejected argument (systems seat SYS-R3-1). ``_allowlisted_argument_error_payload``
+    names it ``argument_error`` instead.
+
+    Both projections carry the SAME entry, so a field added to one cannot go
+    missing from the other; the entry's own key ORDER is pinned because it is
+    the wire order on both surfaces.
+    """
+    error = ToolArgumentError(argument="plugin_type", expected="a plugin kind", actual_type="str", code="DISCOVERY_ONLY")
+    entry = pipeline_planner._allowlisted_argument_error_entry(error)
+    assert tuple(entry) == ("component", "severity", "error_code", "error_class")
+    assert entry == {
+        # ``plugin_type`` is not in the closed schema-owned label vocabulary,
+        # so ToolArgumentError canonicalizes it: what the projection carries is
+        # operator-owned whatever the raiser passed.
+        "component": "tool argument",
+        "severity": "high",
+        "error_code": "DISCOVERY_ONLY",
+        "error_class": "ToolArgumentError",
+    }
+
+    payload = pipeline_planner._allowlisted_argument_error_payload(error)
+    assert tuple(payload) == ("argument_error",)
+    assert payload["argument_error"] == entry
+    assert "success" not in payload, "the envelope's success already says the call failed"
+    assert "validation" not in payload, "a data.validation beside the envelope's is a homonym"
+
+    message = pipeline_planner._allowlisted_argument_feedback(error)
+    assert tuple(message) == ("success", "validation")
+    assert message["validation"]["errors"] == [entry]
+    assert tuple(pipeline_planner._canonical_schema_feedback()) == tuple(message), (
+        "the whole-message surface keeps one family shape; this is the sibling that pins it"
+    )
+
+
+def test_discovery_argument_rejection_builds_its_data_inline() -> None:
+    """The discovery ARG_ERROR result's ``data=`` IS the payload constructor call.
+
+    Built inline, the payload has no local, alias or ``cast`` target for a later
+    store to travel through, and ``ToolResult.__post_init__`` freezes it before
+    any other statement runs — the closure c6f857aa0 applied to the
+    APPROVAL_REQUIRED payload, for the same reason. Read from the AST rather
+    than from behaviour because what is pinned is that no OTHER shape can be
+    written here: a re-introduced ``feedback = _allowlisted_argument_feedback(exc)``
+    fed to ``data=dict(feedback)`` (the shape this replaced) reds this test
+    while shipping a payload a behavioural assertion on one example might miss.
+    """
+    tree = ast.parse(Path(pipeline_planner.__file__).read_text(encoding="utf-8"))
+    fns = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "execute_one_discovery"]
+    assert len(fns) == 1, "premise: one execute_one_discovery in the planner"
+    results = [
+        node for node in ast.walk(fns[0]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ToolResult"
+    ]
+    assert len(results) == 1, "premise: the discovery arm constructs exactly one ToolResult"
+    (data_kw,) = [kw for kw in results[0].keywords if kw.arg == "data"]
+    assert isinstance(data_kw.value, ast.Call), "data= must be the payload constructor call, not a name or a dict"
+    assert isinstance(data_kw.value.func, ast.Name)
+    assert data_kw.value.func.id == "_allowlisted_argument_error_payload"
+    assert not data_kw.value.keywords and len(data_kw.value.args) == 1

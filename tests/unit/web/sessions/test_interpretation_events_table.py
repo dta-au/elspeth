@@ -196,7 +196,7 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_50() -> None:
+def test_current_session_schema_epoch_is_52() -> None:
     """Tripwire, not a truth check — this test deliberately restates the constant.
 
     Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
@@ -210,12 +210,14 @@ def test_current_session_schema_epoch_is_50() -> None:
     bumping; do not replace this with a derived check unless it stays a
     forced second touch.
     """
-    # 50: pluggable SSO and the identity substrate (elspeth-07cd19ba73). The
+    # 51: the multi-replica session-operation substrate landed on top of
+    # mainline's 50 (elspeth-4d6c0dd0f5).
+    # 52: pluggable SSO and the identity substrate (elspeth-07cd19ba73). The
     # auth provider discriminator widens from three values to five on both
     # tables carrying it, and the identity, org-tree and workflow-governance
     # tables all land inside this one epoch so the sprint needs exactly one
     # cutover window. Cut over together with Landscape epoch 37.
-    assert SESSION_SCHEMA_EPOCH == 50
+    assert SESSION_SCHEMA_EPOCH == 52
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

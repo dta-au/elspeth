@@ -135,6 +135,7 @@ from .._helpers import (
 from ..guided_operations import (
     GuidedOperationExpired,
     GuidedOperationLease,
+    guided_operation_lease_guard,
     raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
@@ -149,6 +150,7 @@ from .guided_chat_intent_management import (
     deferred_request_retained_intent_ids,
     maybe_prepare_schema8_management_rewind,
 )
+from .guided_proposal_rebase import carried_pending_proposal_rebase
 
 type GuidedChatProviderOutcome = (
     GuidedStepChatOnlyResult
@@ -1174,7 +1176,10 @@ async def _step_1_inline_source_inspection_facts(
     only exists after this operation settles. The LLM authorship breadcrumb
     lives in ``source_description`` instead.
     """
-    facts = await _inspect_latest_ready_session_blob(blob_service, session_id)
+    facts = await _inspect_latest_ready_session_blob(
+        blob_service,
+        session_id,
+    )
     if facts is None:
         content = resolution.content.encode("utf-8")
         record = await blob_service.create_blob(
@@ -1411,6 +1416,7 @@ async def post_guided_chat_schema8(
             if type(reserved) is not GuidedOperationLease:  # pragma: no cover
                 raise AuditIntegrityError("Guided Chat reservation returned no lease")
 
+            lease_guard = guided_operation_lease_guard(service=service, lease=reserved)
             recorder = BufferingRecorder()
             attempt_message_id = uuid4()
             originating_message = GuidedOriginatingUserMessageDraft(
@@ -1465,6 +1471,7 @@ async def post_guided_chat_schema8(
                             ),
                             blob_service=request.app.state.blob_service,
                             session_id=session_id,
+                            session_operation_context=reserved.session_operation_context,
                         )
                     uploaded_mismatch_facts = (
                         uploaded_candidate[1] if uploaded_candidate is not None and uploaded_candidate[0] is None else None
@@ -1657,7 +1664,12 @@ async def post_guided_chat_schema8(
                         )
 
                 async with compose_lock:
-                    fence = await service.renew_guided_operation(reserved.fence, actor="composer_route", lease_seconds=300)
+                    fence = await service.renew_guided_operation(
+                        reserved.fence,
+                        actor="composer_route",
+                        lease_seconds=300,
+                        session_operation_context=reserved.session_operation_context,
+                    )
                     current_record = await service.get_current_state(session_id)
                     if (current_record is None) != (frozen.state_record is None):
                         raise GuidedOperationSettlementConflictError()
@@ -2270,6 +2282,21 @@ async def post_guided_chat_schema8(
                         if current_record is not None and current_record.composer_meta is not None
                         else {}
                     )
+                    # A guided chat settles a new checkpoint while leaving any
+                    # pending proposal under review: the transcript lives
+                    # inside ``composer_meta``, so there is no chat-only write
+                    # channel and the row always advances. The proposal's
+                    # anchor therefore has to follow the row being written
+                    # (elspeth-ed67eb9d0d). A rewind that CLEARS the proposal
+                    # supplies ``invalidated_pending_proposal`` instead and
+                    # leaves no carried proposal here — the settlement refuses
+                    # a command carrying both.
+                    chat_rebase = carried_pending_proposal_rebase(
+                        resulting_guided,
+                        from_state_id=(current_record.id if current_record is not None else None),
+                        base_composition_content_hash=(composition_content_hash(current_state) if current_record is not None else None),
+                        reason="advisory_chat",
+                    )
                     existing_meta["guided_session"] = resulting_guided.to_dict()
                     state_dict = resulting_state.to_dict()
                     is_valid: bool
@@ -2356,8 +2383,10 @@ async def post_guided_chat_schema8(
                             retained_deferred_intent_ids=retained_intent_ids,
                             deferred_intent_action=settled_management_action,
                             invalidated_pending_proposal=invalidated_pending_proposal,
+                            rebased_pending_proposal=chat_rebase,
                         ),
                         payload_store=payload_store,
+                        session_operation_context=reserved.session_operation_context,
                     )
                     response = response_from_record(settlement.result_state)
 
@@ -2387,7 +2416,8 @@ async def post_guided_chat_schema8(
                                     llm_calls=recorder.llm_calls,
                                     chat_turns=recorder.chat_turns,
                                 ),
-                            )
+                            ),
+                            session_operation_context=reserved.session_operation_context,
                         )
                     )
                 except GuidedOperationFenceLostError:
@@ -2468,12 +2498,15 @@ async def post_guided_chat_schema8(
                                 llm_calls=recorder.llm_calls,
                                 chat_turns=recorder.chat_turns,
                             ),
-                        )
+                        ),
+                        session_operation_context=reserved.session_operation_context,
                     )
                 except GuidedOperationFenceLostError:
                     rejoin_after_lock = True
                 else:
                     raise_guided_operation_failure(failed)
+            finally:
+                await lease_guard.finish_active_exception()
         if rejoin_after_lock:
             joined = await reserve_or_replay_guided_operation(
                 service=service,
@@ -2482,6 +2515,7 @@ async def post_guided_chat_schema8(
                 request=body,
                 replay=replay,
                 reserve_if_absent=False,
+                takeover_expired=False,
             )
             if joined is None:
                 raise AuditIntegrityError("Guided Chat fence was lost without a joinable winner")

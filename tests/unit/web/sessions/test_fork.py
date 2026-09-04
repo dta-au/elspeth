@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import fork_blob_id
@@ -31,6 +32,7 @@ from elspeth.web.sessions.models import (
     composition_states_table,
     guided_operations_table,
     proposal_events_table,
+    session_operation_fences_table,
     sessions_table,
 )
 from elspeth.web.sessions.protocol import (
@@ -40,6 +42,7 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationTakenOver,
     GuidedOriginatingUserMessageDraft,
     InvalidForkTargetError,
+    SessionForkParentAuthority,
 )
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.routes.guided_operations import guided_response_hash
@@ -48,6 +51,7 @@ from elspeth.web.sessions.schemas import ForkSessionResponse
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _FORK_SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 _FORK_OUTPUT_ID = "22222222-2222-4222-8222-222222222222"
@@ -256,7 +260,7 @@ def engine():
 
 @pytest.fixture
 def service(engine):
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -276,33 +280,57 @@ async def _fork_session(
     parent = await service.get_session(source_session_id)
     assert parent.user_id == user_id
     assert parent.auth_provider_type == auth_provider_type
-    reserved = await service.reserve_guided_operation(
-        session_id=source_session_id,
-        operation_id=str(uuid.uuid4()),
-        kind="session_fork",
-        request_hash="a" * 64,
-        actor="composer_route",
-        lease_seconds=300,
-    )
-    assert type(reserved) in {GuidedOperationClaimed, GuidedOperationTakenOver}
-    staged = await service.fork_session(
-        reserved.fence,
-        fork_message_id=fork_message_id,
-        new_message_content=new_message_content,
-    )
-    active = await service.settle_guided_fork_operation(
-        GuidedForkSettlementCommand(
-            fence=reserved.fence,
-            child_session_id=staged.session.id,
-            expected_current_state_id=staged.state.id if staged.state is not None else None,
-            edited_message_id=staged.messages[-1].id,
-            rewritten_state_id=None,
-            rewritten_state=None,
-            response_hash="b" * 64,
-            actor="composer_route",
+    parent_context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=source_session_id,
+            operation_kind=SessionOperationKind.SESSION_FORK,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
         )
     )
-    return active, list(staged.messages), staged.state
+    staged = None
+    try:
+        reserved = await service.reserve_guided_operation(
+            session_id=source_session_id,
+            operation_id=str(uuid.uuid4()),
+            kind="session_fork",
+            request_hash="a" * 64,
+            actor="composer_route",
+            lease_seconds=300,
+            session_operation_context=parent_context,
+        )
+        assert type(reserved) in {GuidedOperationClaimed, GuidedOperationTakenOver}
+        parent_authority = SessionForkParentAuthority(
+            parent_context=parent_context,
+            guided_fence=reserved.fence,
+        )
+        staged = await service.fork_session(
+            parent_authority,
+            fork_message_id=fork_message_id,
+            new_message_content=new_message_content,
+        )
+        active = await service.settle_guided_fork_operation(
+            GuidedForkSettlementCommand(
+                authority=staged.authority,
+                expected_current_state_id=staged.state.id if staged.state is not None else None,
+                edited_message_id=staged.messages[-1].id,
+                rewritten_state_id=None,
+                rewritten_state=None,
+                response_hash="b" * 64,
+                actor="composer_route",
+            )
+        )
+        return active, list(staged.messages), staged.state
+    finally:
+        if staged is not None:
+            await service._run_sync(
+                service.session_operation_authority.release,
+                staged.authority.child_context,
+            )
+        await service._run_sync(
+            service.session_operation_authority.release,
+            parent_context,
+        )
 
 
 async def _complete_guided_start_authority(
@@ -315,14 +343,23 @@ async def _complete_guided_start_authority(
 ) -> None:
     """Bind a fixture root and existing guided head through the production start APIs."""
     from elspeth.contracts.hashing import stable_hash
+    from elspeth.web.composer.guided.profile import kind_for_profile
+    from elspeth.web.sessions.converters import state_from_record
     from elspeth.web.sessions.guided_operations import guided_operation_request_hash
     from elspeth.web.sessions.schemas import StartGuidedRequest
 
+    # Hash under the profile the checkpoint ACTUALLY carries. The custody
+    # helper recovers the discriminator from the start checkpoint rather than
+    # assuming "live" (goal-first, elspeth-378cfa0e18), so a tutorial-profile
+    # checkpoint whose start operation was hashed as live is a state no real
+    # start can produce — and pinning it would pin a fiction.
+    head_guided = state_from_record(state).guided_session
+    assert head_guided is not None
     operation_id = str(uuid.uuid4())
     request = StartGuidedRequest.model_validate(
         {
             "operation_id": operation_id,
-            "profile": "live",
+            "profile": kind_for_profile(head_guided.profile).value,
             "intent": root_message.content,
         },
         strict=True,
@@ -1940,7 +1977,7 @@ def _make_fork_app(
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
-    session_service = SessionServiceImpl(
+    session_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -2072,6 +2109,11 @@ class TestForkEndpoint:
                     ).scalar_one()
                     == 1
                 )
+            # A dead worker loses BOTH database-clocked leases: the guided
+            # operation row and its session-operation fence. Expire both so the
+            # takeover winner acquires the parent SESSION_FORK lease honestly
+            # instead of stealing a live one.
+            expired_at = datetime.now(UTC) - timedelta(seconds=1)
             with service._engine.begin() as conn:
                 conn.execute(
                     update(guided_operations_table)
@@ -2079,7 +2121,16 @@ class TestForkEndpoint:
                         guided_operations_table.c.session_id == str(parent.id),
                         guided_operations_table.c.operation_id == operation_id,
                     )
-                    .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+                    .values(lease_expires_at=expired_at)
+                )
+                conn.execute(
+                    update(session_operation_fences_table)
+                    .where(
+                        session_operation_fences_table.c.session_id == str(parent.id),
+                        session_operation_fences_table.c.operation_kind == SessionOperationKind.SESSION_FORK.value,
+                        session_operation_fences_table.c.released_at.is_(None),
+                    )
+                    .values(lease_expires_at=expired_at)
                 )
 
             winner_response = await asyncio.to_thread(
@@ -2295,6 +2346,14 @@ class TestForkEndpoint:
             "fork",
             writer_principal="route_user_message",
         )
+        parent_context = await service._run_sync(
+            lambda: service.session_operation_authority.acquire(
+                session_id=parent.id,
+                operation_kind=SessionOperationKind.SESSION_FORK,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
+            )
+        )
         claimed = await service.reserve_guided_operation(
             session_id=parent.id,
             operation_id=str(uuid.uuid4()),
@@ -2302,10 +2361,11 @@ class TestForkEndpoint:
             request_hash="a" * 64,
             actor="test",
             lease_seconds=300,
+            session_operation_context=parent_context,
         )
         assert isinstance(claimed, GuidedOperationClaimed)
         staged = await service.fork_session(
-            claimed.fence,
+            SessionForkParentAuthority(parent_context=parent_context, guided_fence=claimed.fence),
             fork_message_id=fork_message.id,
             new_message_content="edited",
         )
@@ -3008,7 +3068,7 @@ class TestForkEndpoint:
             poolclass=StaticPool,
         )
         initialize_session_schema(engine)
-        session_service = SessionServiceImpl(
+        session_service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),

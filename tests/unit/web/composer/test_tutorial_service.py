@@ -31,6 +31,7 @@ from elspeth.web.composer.tutorial_service import (
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.protocol import RunRecord
 from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.helpers.session_fences import RecordingSessionOperationAuthority
 
 
 def _make_tutorial_settings(data_dir: Path, **overrides: Any) -> WebSettings:
@@ -206,6 +207,10 @@ async def test_tutorial_run_executes_the_exact_state_revision_readiness_approved
     executed_state_ids: list[Any] = []
 
     class FakeSessionService:
+        session_operation_authority = RecordingSessionOperationAuthority()
+        session_operation_owner_instance_id = "tutorial-test-owner"
+        session_operation_lease_seconds = 60
+
         async def get_current_state(self, requested_session_id: Any) -> Any:
             nonlocal current_state_reads
             assert requested_session_id == session_id
@@ -225,10 +230,13 @@ async def test_tutorial_run_executes_the_exact_state_revision_readiness_approved
             requested_session_id: Any,
             state_id: Any = None,
             *,
+            session_operation_lease: Any = None,
             user_id: str,
             auth_provider_type: str,
         ) -> Any:
             del user_id, auth_provider_type
+            if session_operation_lease is not None:
+                await session_operation_lease.close()
             assert requested_session_id == session_id
             received_state_ids.append(state_id)
             if state_id is None:
@@ -279,11 +287,19 @@ async def test_failed_live_tutorial_run_response_omits_raw_run_error(tmp_path: P
     sentinel_error = "INTERNAL_ROW_VALUE_SHOULD_NOT_LEAVE_TUTORIAL_RESPONSE"
 
     class FakeExecutionService:
-        async def execute(self, session_id: Any, state_id: Any = None, *, user_id: str, auth_provider_type: str) -> Any:
+        async def execute(
+            self, session_id: Any, state_id: Any = None, *, session_operation_lease: Any = None, user_id: str, auth_provider_type: str
+        ) -> Any:
             del session_id, state_id, user_id, auth_provider_type
+            if session_operation_lease is not None:
+                await session_operation_lease.close()
             return run_id
 
     class FakeSessionService:
+        session_operation_authority = RecordingSessionOperationAuthority()
+        session_operation_owner_instance_id = "tutorial-test-owner"
+        session_operation_lease_seconds = 60
+
         async def get_run(self, requested_run_id: Any) -> RunRecord:
             assert requested_run_id == run_id
             now = datetime.now(UTC)
@@ -347,8 +363,12 @@ async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tm
     session_id = uuid4()
 
     class FakeExecutionService:
-        async def execute(self, session_id: Any, state_id: Any = None, *, user_id: str, auth_provider_type: str) -> Any:
+        async def execute(
+            self, session_id: Any, state_id: Any = None, *, session_operation_lease: Any = None, user_id: str, auth_provider_type: str
+        ) -> Any:
             del session_id, state_id, user_id, auth_provider_type
+            if session_operation_lease is not None:
+                await session_operation_lease.close()
             raise UnresolvedInterpretationPlaceholderError(
                 sites=(
                     InterpretationReviewSite(
@@ -371,7 +391,11 @@ async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tm
             session_id=session_id,
             state_id=uuid4(),
             settings=settings,
-            session_service=SimpleNamespace(),
+            session_service=SimpleNamespace(
+                session_operation_authority=RecordingSessionOperationAuthority(),
+                session_operation_owner_instance_id="tutorial-test-owner",
+                session_operation_lease_seconds=60,
+            ),
         )
 
     assert exc_info.value.status_code == 409
@@ -393,11 +417,19 @@ async def test_cancelled_live_tutorial_run_returns_409_with_machine_code(tmp_pat
     state_id = uuid4()
 
     class FakeExecutionService:
-        async def execute(self, session_id: Any, state_id: Any = None, *, user_id: str, auth_provider_type: str) -> Any:
+        async def execute(
+            self, session_id: Any, state_id: Any = None, *, session_operation_lease: Any = None, user_id: str, auth_provider_type: str
+        ) -> Any:
             del session_id, state_id, user_id, auth_provider_type
+            if session_operation_lease is not None:
+                await session_operation_lease.close()
             return run_id
 
     class FakeSessionService:
+        session_operation_authority = RecordingSessionOperationAuthority()
+        session_operation_owner_instance_id = "tutorial-test-owner"
+        session_operation_lease_seconds = 60
+
         async def get_run(self, requested_run_id: Any) -> RunRecord:
             assert requested_run_id == run_id
             now = datetime.now(UTC)
@@ -447,8 +479,12 @@ async def test_live_tutorial_wait_uses_transport_ceiling_minus_headroom(
     captured_timeout: list[float | None] = []
 
     class FakeExecutionService:
-        async def execute(self, session_id: Any, state_id: Any = None, *, user_id: str, auth_provider_type: str) -> Any:
+        async def execute(
+            self, session_id: Any, state_id: Any = None, *, session_operation_lease: Any = None, user_id: str, auth_provider_type: str
+        ) -> Any:
             del session_id, state_id, user_id, auth_provider_type
+            if session_operation_lease is not None:
+                await session_operation_lease.close()
             return "run-1"
 
     async def fake_wait_for_terminal_run(
@@ -479,7 +515,11 @@ async def test_live_tutorial_wait_uses_transport_ceiling_minus_headroom(
             session_id="session-1",
             state_id=uuid4(),
             settings=settings,
-            session_service=SimpleNamespace(),
+            session_service=SimpleNamespace(
+                session_operation_authority=RecordingSessionOperationAuthority(),
+                session_operation_owner_instance_id="tutorial-test-owner",
+                session_operation_lease_seconds=60,
+            ),
         )
 
     assert captured_timeout == [270.0]

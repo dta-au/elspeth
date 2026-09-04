@@ -7,10 +7,11 @@ import pytest
 from elspeth.contracts.composer_interpretation import InterpretationKind, InterpretationSource
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY, SOURCE_COMPONENT_ID
 from elspeth.web.sessions.protocol import CompositionStateData
-from tests.integration.web.conftest import _make_session
+from tests.integration.web.conftest import _make_session, _save_composition_state_with_compose_authority
 
 
 def _state_with_three_review_surfaces() -> CompositionState:
@@ -104,7 +105,8 @@ async def test_opted_out_session_still_records_surface_specific_rows(composer_te
     with composer_test_client.app.state.phase3_engine.begin() as conn:
         _make_session(conn, session_id=str(session_id), user_id="alice")
     state_dict = _state_with_three_review_surfaces().to_dict()
-    state = await service.save_composition_state(
+    state = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             sources=state_dict["sources"],
@@ -114,7 +116,22 @@ async def test_opted_out_session_still_records_surface_specific_rows(composer_te
         ),
         provenance="tool_call",
     )
-    marker = await service.record_session_interpretation_opt_out(session_id=session_id, actor="user:alice")
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        marker = await service.record_session_interpretation_opt_out(
+            session_id=session_id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
 
     requests = [
         (InterpretationKind.INVENTED_SOURCE, SOURCE_COMPONENT_ID, "inline_source_url_list", "https://example.gov.au"),

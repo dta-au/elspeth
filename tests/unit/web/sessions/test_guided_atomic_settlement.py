@@ -90,6 +90,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web.composer.guided.test_propose_pipeline_protocol import _payload as _advisory_proposal_payload
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 def _empty_composition_state() -> CompositionState:
@@ -1762,7 +1763,7 @@ def test_replay_requires_final_turn_to_be_current_and_unanswered(response_kind: 
 def service_and_engine(tmp_path: Path):
     engine = create_session_engine(f"sqlite:///{tmp_path / 'guided-atomic.db'}")
     initialize_session_schema(engine)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided-atomic"),
@@ -2038,13 +2039,17 @@ async def test_failure_after_operation_complete_rolls_back_bind_terminal_and_all
     )
     assert isinstance(claimed, GuidedOperationClaimed)
     command = _empty_respond_command(claimed.fence)
-    complete = service.complete_guided_operation_on_connection
+    # The lane's settlement writes the terminal row through the guided
+    # mutation capability; inject the failure after that exact write.
+    from elspeth.web.sessions.service import _GuidedSessionMutations
 
-    def _complete_then_fail(*args, **kwargs):
-        complete(*args, **kwargs)
+    complete = _GuidedSessionMutations.complete
+
+    def _complete_then_fail(self, *args, **kwargs):
+        complete(self, *args, **kwargs)
         raise AuditIntegrityError("injected failure after terminal update")
 
-    monkeypatch.setattr(service, "complete_guided_operation_on_connection", _complete_then_fail)
+    monkeypatch.setattr(_GuidedSessionMutations, "complete", _complete_then_fail)
     with pytest.raises(AuditIntegrityError, match="after terminal"):
         await service.settle_guided_state_operation(command)
 

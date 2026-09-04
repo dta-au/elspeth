@@ -36,6 +36,11 @@ import {
   makePhraseFor,
 } from "@/lib/validationHumaniser";
 
+/** Validation codes whose backend suggestion points at the Secrets panel.
+ *  Both are raised by web/execution/_validation_authoring.py; they are the
+ *  only producers whose suggestion names that panel. */
+const SECRETS_PANEL_SUGGESTION_CODES = new Set(["missing_secret_ref", "fabricated_secret"]);
+
 export interface PipelineValidationSummaryProps {
   /** Tutorial surface flag: the tutorial has no Secrets panel, so a
    *  Secrets-panel suggestion gets an honest availability note. */
@@ -84,6 +89,7 @@ export function PipelineValidationSummary({
   let glyph: string;
   let body: string;
   let suggestion: string | null = null;
+  let suggestionCode: string | null = null;
   let rawDetail: string | null = null;
 
   if (errors.length > 0) {
@@ -103,6 +109,7 @@ export function PipelineValidationSummary({
     rawDetail = finding.raw;
     body = formatFindingBody(errors.length, label, finding, first.component_id, first.component_type, phraseFor);
     suggestion = first.suggestion;
+    suggestionCode = first.error_code ?? null;
   } else if (warnings.length > 0) {
     const first = warnings[0];
     tone = "warning";
@@ -112,6 +119,9 @@ export function PipelineValidationSummary({
     rawDetail = finding.raw;
     body = formatFindingBody(warnings.length, label, finding, first.component_id, first.component_type, phraseFor);
     suggestion = first.suggestion;
+    // No code on this branch: ValidationWarning carries no error_code, and
+    // both Secrets-panel producers raise ERRORS (missing_secret_ref,
+    // fabricated_secret), so a warning can never want the note.
   } else {
     tone = "ok";
     glyph = "✓";
@@ -123,8 +133,16 @@ export function PipelineValidationSummary({
   // Secrets panel, so say so rather than pointing at an affordance that
   // isn't on screen. The suggestion string itself is UI-safe by design
   // (execution/validation.py never echoes secret values into it).
+  //
+  // Keyed on the finding's CLOSED error_code, never on its prose (systems seat
+  // SYS-R3-4). Exactly two producers reach validationResult with a
+  // Secrets-panel suggestion — _validation_authoring.py's missing_secret_ref
+  // and fabricated_secret — and they are the same two codes the backend's own
+  // copy of this question was re-keyed onto; a rewording there used to drop
+  // the note silently and point a tutorial user at a panel that is not on
+  // screen.
   const suggestionNote =
-    isTutorial && suggestion !== null && /secrets panel/i.test(suggestion)
+    isTutorial && suggestion !== null && SECRETS_PANEL_SUGGESTION_CODES.has(suggestionCode ?? "")
       ? " (The Secrets panel is part of the full composer, outside this tutorial.)"
       : "";
 

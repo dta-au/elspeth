@@ -32,6 +32,7 @@ from elspeth.web.sessions.models import (
     guided_operation_events_table,
     guided_operations_table,
     proposal_events_table,
+    session_operation_fences_table,
 )
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
@@ -53,6 +54,7 @@ from elspeth.web.sessions.routes.guided_operations import (
 )
 from elspeth.web.sessions.schemas import CompositionProposalResponse
 from elspeth.web.sessions.service import _composition_state_data_content_hash
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 
 
 def _dml_target_table(context: ExecutionContext) -> FromClause | None:
@@ -510,7 +512,11 @@ def test_guided_full_failure_settlement_error_surfaces_integrity_error(
 
     secondary_secret = "secondary-cleanup-secret-must-not-be-logged"  # secret-scan: allow-this-line
 
-    async def fail_cleanup(_command):
+    # The double carries the real writer's keyword-only fence argument. A
+    # narrower stub raises TypeError inside the route's failure arm, so the
+    # secondary diagnostic below would read that TypeError instead of the
+    # failure this test injects.
+    async def fail_cleanup(_command, *, session_operation_context):
         raise RuntimeError(secondary_secret)
 
     composer_test_client.app.state.composer_service = _PrimaryFailurePlanner()
@@ -551,7 +557,10 @@ def test_guided_full_no_winner_after_failure_fence_loss_preserves_primary_outcom
 
     real_reserve = reserve_or_replay_guided_operation
 
-    async def lose_failure_fence(command):
+    # The double carries the real writer's keyword-only fence argument: a
+    # narrower stub raises TypeError before it can raise the fence loss this
+    # test is about.
+    async def lose_failure_fence(command, *, session_operation_context):
         raise GuidedOperationFenceLostError(command.fence)
 
     async def no_winner_lookup(**kwargs):
@@ -816,7 +825,8 @@ def test_guided_full_preserves_an_existing_canonical_state_as_the_checkpoint_bas
     session = composer_test_client.post("/api/sessions", json={"title": "guided full existing"}).json()
     service = composer_test_client.app.state.session_service
     existing = asyncio.run(
-        service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            service,
             UUID(session["id"]),
             CompositionStateData(
                 sources={
@@ -888,7 +898,8 @@ def test_guided_full_settlement_rejects_command_state_that_differs_from_the_obse
     session_id = UUID(session["id"])
     service = composer_test_client.app.state.session_service
     existing = asyncio.run(
-        service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            service,
             session_id,
             CompositionStateData(
                 sources={},
@@ -903,7 +914,7 @@ def test_guided_full_settlement_rejects_command_state_that_differs_from_the_obse
     )
     real_stage = service.stage_guided_full_pipeline_proposal
 
-    async def stage_mismatched_state(command):
+    async def stage_mismatched_state(command, *, session_operation_context):
         mismatched_state = replace(command.state, metadata_={"name": "different checkpoint bytes"})
         mismatched_hash = _composition_state_data_content_hash(mismatched_state)
         mismatched_proposal = PipelineProposal.create(
@@ -924,7 +935,8 @@ def test_guided_full_settlement_rejects_command_state_that_differs_from_the_obse
                 command,
                 state=mismatched_state,
                 plan=replace(command.plan, proposal=mismatched_proposal),
-            )
+            ),
+            session_operation_context=session_operation_context,
         )
 
     monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", stage_mismatched_state)
@@ -997,15 +1009,15 @@ def test_guided_full_replay_fails_closed_on_persisted_authority_tamper(
     engine = composer_test_client.app.state.session_engine
     service = composer_test_client.app.state.session_service
     if tamper == "response_hash":
-        reserve = service.reserve_guided_operation
+        get_operation = service.get_guided_operation
 
-        async def tampered_reserve(*args, **kwargs):
-            outcome = await reserve(*args, **kwargs)
+        async def tampered_get_operation(*args, **kwargs):
+            outcome = await get_operation(*args, **kwargs)
             if isinstance(outcome, GuidedOperationCompleted):
                 return replace(outcome, response_hash="0" * 64)
             return outcome
 
-        monkeypatch.setattr(service, "reserve_guided_operation", tampered_reserve)
+        monkeypatch.setattr(service, "get_guided_operation", tampered_get_operation)
     else:
         get_messages = service.get_messages
 
@@ -1657,7 +1669,11 @@ def test_guided_full_cancellation_settlement_error_surfaces_integrity_error(
             self.started.set()
             await asyncio.Event().wait()
 
-    async def fail_cleanup(_command):
+    # The double carries the real writer's keyword-only fence argument. A
+    # narrower stub raises TypeError inside the route's failure arm, so the
+    # secondary diagnostic below would read that TypeError instead of the
+    # failure this test injects.
+    async def fail_cleanup(_command, *, session_operation_context):
         raise RuntimeError(secondary_secret)
 
     planner = _BlockingPlanner()
@@ -1716,7 +1732,10 @@ def test_guided_full_cancellation_fence_loss_checks_for_a_winner_before_preservi
     real_reserve = reserve_or_replay_guided_operation
     winner_lookups = 0
 
-    async def lose_failure_fence(command):
+    # The double carries the real writer's keyword-only fence argument: a
+    # narrower stub raises TypeError before it can raise the fence loss this
+    # test is about.
+    async def lose_failure_fence(command, *, session_operation_context):
         raise GuidedOperationFenceLostError(command.fence)
 
     async def no_winner_lookup(**kwargs):
@@ -1801,7 +1820,10 @@ def test_guided_full_cancellation_fence_loss_propagates_a_failed_winner_lookup(
     planner = _BlockingPlanner()
     real_reserve = reserve_or_replay_guided_operation
 
-    async def lose_failure_fence(command):
+    # The double carries the real writer's keyword-only fence argument: a
+    # narrower stub raises TypeError before it can raise the fence loss this
+    # test is about.
+    async def lose_failure_fence(command, *, session_operation_context):
         raise GuidedOperationFenceLostError(command.fence)
 
     async def failing_winner_lookup(**kwargs):
@@ -1888,6 +1910,15 @@ def test_guided_full_takeover_fences_stale_worker_and_joins_one_winner(
                         "session_id": session["id"],
                         "operation_id": operation_id,
                     },
+                )
+                # A takeover owns both authorities. Expiring only the guided
+                # row while the original COMPOSE fence remains live must fail;
+                # release that exact session-operation generation too so the
+                # test models an actually abandoned worker.
+                conn.execute(
+                    session_operation_fences_table.update()
+                    .where(session_operation_fences_table.c.session_id == session["id"])
+                    .values(released_at=datetime.now(UTC))
                 )
             winner = asyncio.create_task(client.post(f"/api/sessions/{session['id']}/guided/plan", json=body))
             await asyncio.wait_for(planner.takeover_started.wait(), timeout=3)

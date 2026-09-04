@@ -25,6 +25,7 @@ from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerServ
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.guided_replay import project_composition_proposal, project_guided_full_decline
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
@@ -59,7 +60,6 @@ from .._helpers import (
     _request_plugin_policy_context,
     _safe_frame_strings,
     _state_from_record,
-    _track_compose_inflight,
     _verify_session_ownership,
     get_current_user,
     get_rate_limiter,
@@ -72,6 +72,7 @@ from ..guided_operations import (
     raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
+from .guided_proposal_rebase import carried_pending_proposal_rebase
 from .pipeline_settlement import (
     _GUIDED_ATOMIC_SETTLEMENT_COMPLETED,
     _GUIDED_ATOMIC_SETTLEMENT_FAILURE,
@@ -285,7 +286,6 @@ async def post_guided_plan(
     request: Request,
     user: UserIdentity = Depends(get_current_user),  # noqa: B008
     rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
-    _inflight_tally: None = Depends(_track_compose_inflight),
 ) -> CompositionProposalResponse | GuidedPlanDeclinedResponse:
     """Plan and atomically stage one full guided proposal.
 
@@ -324,12 +324,20 @@ async def post_guided_plan(
             proposal_id=result.proposal_id,
             reviewed_facts={},
         )
+        # The replay locator names the checkpoint this operation STAGED at,
+        # so it binds to ``proposal.base`` — the immutable reviewed identity
+        # hashed into ``draft_hash``. The row's ``base_state_id`` is NOT
+        # compared here any more: it tracks the proposal's lifecycle-managed
+        # ANCHOR, which a later guided settlement legally moves forward when
+        # it carries the still-pending proposal across a new checkpoint
+        # (elspeth-ed67eb9d0d). The restore already binds the row column to
+        # that derived anchor, and replaying this operation afterwards must
+        # still verify against what the operation actually did.
         if (
             authority.proposal.surface is not PlannerSurface.GUIDED_FULL
             or type(authority.proposal.base) is not PresentBase
             or authority.proposal.base.state_id != result.checkpoint_state_id
             or authority.proposal.base.composition_content_hash != composition_content_hash(_state_from_record(checkpoint))
-            or authority.row.base_state_id != result.checkpoint_state_id
             or authority.row.user_message_id is None
         ):
             raise AuditIntegrityError("guided-full replay authority differs from its operation locator")
@@ -382,6 +390,7 @@ async def post_guided_plan(
         request_id=body.operation_id,
         user_id=user.user_id,
     )
+    joined_after_fence_loss = False
     try:
         catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
         compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
@@ -409,6 +418,7 @@ async def post_guided_plan(
                 reserved.fence,
                 actor="composer_route",
                 lease_seconds=300,
+                session_operation_context=reserved.session_operation_context,
             )
 
         state_dict = observed_state.to_dict()
@@ -441,6 +451,7 @@ async def post_guided_plan(
                 plugin_snapshot=plugin_snapshot,
                 recorder=recorder,
                 operation_fence=fence,
+                session_operation_context=reserved.session_operation_context,
                 progress=progress,
             )
 
@@ -453,11 +464,25 @@ async def post_guided_plan(
             # GuidedOperationFailureCode (mirrors the freeform surface's
             # identical PlannerDeclined handling in ComposerServiceImpl).
             decline_text = outcome.decline_text.strip() or _EMPTY_DECLINE_FALLBACK
+            # The checkpoint above copies ``observed_record.composer_meta``
+            # verbatim, so a guided walk holding a pending proposal carries
+            # that proposal across this settlement. Its anchor has to follow
+            # the row being written or every later currency check names a
+            # checkpoint that is no longer current — the same permanent brick
+            # elspeth-ed67eb9d0d fixed on the guided RESPOND and CHAT paths,
+            # reachable here through the same session.
+            decline_rebase = carried_pending_proposal_rebase(
+                observed_state.guided_session,
+                from_state_id=(observed_record.id if observed_record is not None else None),
+                base_composition_content_hash=(composition_content_hash(observed_state) if observed_record is not None else None),
+                reason="guided_full_declined",
+            )
             async with compose_lock:
                 renewed_fence = await service.renew_guided_operation(
                     fence,
                     actor="composer_route",
                     lease_seconds=300,
+                    session_operation_context=reserved.session_operation_context,
                 )
                 decline_settlement = await _await_guided_atomic_settlement(
                     service.decline_guided_full_pipeline_proposal(
@@ -477,7 +502,9 @@ async def post_guided_plan(
                                 planner_attempts=recorder.planner_attempts,
                                 chat_turns=recorder.chat_turns,
                             ),
-                        )
+                            rebased_pending_proposal=decline_rebase,
+                        ),
+                        session_operation_context=reserved.session_operation_context,
                     )
                 )
             decline_response = project_guided_full_decline(decline_settlement.decline_message)
@@ -500,6 +527,7 @@ async def post_guided_plan(
                 fence,
                 actor="composer_route",
                 lease_seconds=300,
+                session_operation_context=reserved.session_operation_context,
             )
             settlement = await _await_guided_atomic_settlement(
                 service.stage_guided_full_pipeline_proposal(
@@ -527,7 +555,8 @@ async def post_guided_plan(
                         # Quota ceiling for the deferred inline-custody settle
                         # inside the staging transaction (elspeth-1e3ad83d89).
                         custody_max_storage_per_session=(request.app.state.settings.max_blob_storage_per_session_bytes),
-                    )
+                    ),
+                    session_operation_context=reserved.session_operation_context,
                 )
             )
         proposal_response = project_composition_proposal(settlement.proposal)
@@ -642,7 +671,8 @@ async def post_guided_plan(
                             planner_attempts=recorder.planner_attempts,
                             chat_turns=recorder.chat_turns,
                         ),
-                    )
+                    ),
+                    session_operation_context=reserved.session_operation_context,
                 )
             )
         except GuidedOperationFenceLostError as fence_lost:
@@ -734,7 +764,8 @@ async def post_guided_plan(
                         planner_attempts=recorder.planner_attempts,
                         chat_turns=recorder.chat_turns,
                     ),
-                )
+                ),
+                session_operation_context=reserved.session_operation_context,
             )
         except GuidedOperationFenceLostError as fence_lost:
             try:
@@ -787,6 +818,12 @@ async def post_guided_plan(
             raise AuditIntegrityError("Guided PLAN could not record its terminal failure") from cleanup_exc
         await progress(_guided_full_failed_progress_event(failure_code))
         raise_guided_operation_failure(failed)
+    finally:
+        try:
+            await reserved.close()
+        except SessionOperationFenceLost:
+            if not joined_after_fence_loss:
+                raise
 
 
 __all__ = ["router"]

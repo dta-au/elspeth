@@ -104,6 +104,29 @@ function reviewStatusCopy(
   }
 }
 
+/**
+ * The proposal's one-line summary, DERIVED from the node count.
+ *
+ * It used to be the fixed sentence "A complete pipeline is ready for review."
+ * That sentence was a claim the card could not support: a zero-node
+ * pass-through — rows going straight from source to output, which is a
+ * legitimate proposal when the goal names no processing — was announced as a
+ * "complete pipeline", and so was every planner result regardless of what it
+ * actually built. Reading the count the payload already carries says the true
+ * thing in both cases and costs nothing (the counts strip below renders the
+ * same field).
+ */
+function proposalHeadline(nodeCount: number): string {
+  if (nodeCount === 0) {
+    return "The assistant proposes no processing steps — rows pass straight from your source to your output.";
+  }
+  // Singular matters: the one-node case is the common shape for a simple goal,
+  // and "1 processing steps" reads as a bug in the thing the user is being
+  // asked to trust.
+  const steps = nodeCount === 1 ? "1 processing step" : `${nodeCount} processing steps`;
+  return `The assistant proposed ${steps} from your goal.`;
+}
+
 export function ProposePipelineTurn({
   payload,
   reviewState,
@@ -212,7 +235,7 @@ export function ProposePipelineTurn({
     <article className="guided-turn guided-proposal" aria-labelledby="guided-proposal-heading">
       <header className="guided-proposal__header">
         <h3 id="guided-proposal-heading">Review pipeline proposal</h3>
-        <p>A complete pipeline is ready for review.</p>
+        <p>{proposalHeadline(payload.component_counts.nodes)}</p>
         <p>Review its structure, routes, and blockers before checking the detailed wiring.</p>
         <p className="guided-proposal__counts">
           {payload.component_counts.sources} sources · {payload.component_counts.nodes} nodes ·{" "}
@@ -356,23 +379,24 @@ export function ProposePipelineTurn({
           the tutorial realistically sees (interpretation_required) clears via
           the Accept cards outside this turn.
 
-          That presupposition only holds AFTER the frozen prompt has been
-          sent. The step-2→step-3 transition auto-plans a FIRST proposal
-          before any transforms instruction exists (tutorial run 18: a
-          source→sink passthrough that committed and then failed the tutorial
-          launch gate). The auto-proposal carries supersedes_draft_hash null;
-          a Send re-plans it as a superseding revision. Until that revision
-          arrives, withhold "Review wiring" and direct the learner to Send. */}
+          That presupposition now holds on the FIRST proposal the learner
+          sees. Goal-first (elspeth-378cfa0e18) makes the tutorial's frozen
+          transforms prompt the session's ROOT INTENT, stated at
+          /guided/start, so the step-2 finish plans ONCE from it and produces
+          real processing steps. The withheld arm below is gone with the
+          proposal it existed for: that transition used to auto-plan a
+          source-to-sink pass-through before any transforms instruction
+          existed (tutorial run 18: it committed and then failed the tutorial
+          launch gate), which a later Send had to supersede — so "Review
+          wiring" was withheld while supersedes_draft_hash was null. The one
+          planned proposal the walk now produces carries a null
+          supersedes_draft_hash and IS the thing to review, so gating on that
+          field would strand the learner on a card with no forward
+          affordance. */}
       {isTutorial ? (
-        payload.supersedes_draft_hash === null ? (
-          <p className="guided-proposal__tutorial-note">
-            This starting sketch only connects your reviewed source to your output. Press Send below to give the assistant your processing instructions — it will replan the pipeline with those steps before you review the wiring.
-          </p>
-        ) : (
-          <p className="guided-proposal__tutorial-note">
-            The assistant planned this pipeline from your prompt. Review how its sources, processing steps, routes, and outputs fit together, then press Review wiring to continue.
-          </p>
-        )
+        <p className="guided-proposal__tutorial-note">
+          The assistant planned this pipeline from your prompt. Review how its sources, processing steps, routes, and outputs fit together, then press Review wiring to continue.
+        </p>
       ) : null}
       <div className="guided-proposal__controls">
         <div className="guided-proposal__primary-actions">
@@ -397,24 +421,22 @@ export function ProposePipelineTurn({
               Retry {retainedInstruction.revision_mode} revision
             </Button>
           ) : null}
-          {!(isTutorial && payload.supersedes_draft_hash === null) && (
-            <Button
-              variant="bare"
-              className="guided-turn-primary"
-              disabled={!actionEnabled({ kind: "review_wiring" }) || payload.blockers.length > 0}
-              onClick={() => onSubmit({
-                chosen: ["review_wiring"],
-                edited_values: null,
-                custom_inputs: null,
-                edit_target: null,
-                control_signal: null,
-                proposal_id: payload.proposal_id,
-                draft_hash: payload.draft_hash,
-              } satisfies GuidedRespondAction)}
-            >
-              Review wiring
-            </Button>
-          )}
+          <Button
+            variant="bare"
+            className="guided-turn-primary"
+            disabled={!actionEnabled({ kind: "review_wiring" }) || payload.blockers.length > 0}
+            onClick={() => onSubmit({
+              chosen: ["review_wiring"],
+              edited_values: null,
+              custom_inputs: null,
+              edit_target: null,
+              control_signal: null,
+              proposal_id: payload.proposal_id,
+              draft_hash: payload.draft_hash,
+            } satisfies GuidedRespondAction)}
+          >
+            Review wiring
+          </Button>
           {/* The shortcut for an operator who has read the proposal above and
               does not need the wiring detail. Same gate as Review wiring —
               it dispatches review_wiring first — and withheld from the

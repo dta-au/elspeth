@@ -13,6 +13,7 @@ from uuid import UUID
 
 import structlog
 
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_commit import (
@@ -158,6 +159,8 @@ async def settle_pipeline_proposal_under_compose_lock(
     telemetry_source: Literal["compose", "recompose"] = "compose",
     transition_assistant: TransitionAssistantDraft | None = None,
     required_trust_mode: ComposerTrustMode | None = None,
+    require_transition_consumed: bool = True,
+    session_operation_context: SessionOperationContext,
 ) -> PipelineRouteSettlement:
     """Settle one exact canonical proposal while the caller holds the lock.
 
@@ -192,6 +195,7 @@ async def settle_pipeline_proposal_under_compose_lock(
             _state_from_record(state),
             session_id=str(proposal.session_id),
             current_state_id=str(state.id),
+            session_operation_context=session_operation_context,
         )
         return PipelineRouteSettlement(
             settlement=PipelineProposalSettlementResult(proposal=proposal, state=state),
@@ -251,6 +255,8 @@ async def settle_pipeline_proposal_under_compose_lock(
                         captured,
                         None,
                         plugin_crash_pending=True,
+                        session_operation_context=session_operation_context,
+                        session_operation_kind=session_operation_context.operation_kind,
                     ),
                     state=cancellation_state,
                 )
@@ -274,6 +280,7 @@ async def settle_pipeline_proposal_under_compose_lock(
                         reason=reason,
                         dispatch=persisted_dispatch,
                         actor=f"system:pipeline_commit:user:{user.user_id}",
+                        session_operation_context=session_operation_context,
                     ),
                     state=cancellation_state,
                 )
@@ -295,6 +302,8 @@ async def settle_pipeline_proposal_under_compose_lock(
                     captured,
                     None,
                     plugin_crash_pending=True,
+                    session_operation_context=session_operation_context,
+                    session_operation_kind=session_operation_context.operation_kind,
                 ),
                 state=cancellation_state,
             )
@@ -313,6 +322,8 @@ async def settle_pipeline_proposal_under_compose_lock(
                     (prepared.invocation,),
                     None,
                     plugin_crash_pending=False,
+                    session_operation_context=session_operation_context,
+                    session_operation_kind=session_operation_context.operation_kind,
                 ),
                 state=cancellation_state,
             )
@@ -350,6 +361,8 @@ async def settle_pipeline_proposal_under_compose_lock(
                 actor=f"user:{user.user_id}",
                 transition_assistant=transition_assistant,
                 required_trust_mode=required_trust_mode,
+                require_transition_consumed=require_transition_consumed,
+                session_operation_context=session_operation_context,
             ),
             state=cancellation_state,
         )
@@ -373,6 +386,7 @@ async def settle_pipeline_proposal_under_compose_lock(
         prepared.result.updated_state,
         session_id=str(proposal.session_id),
         current_state_id=str(settled.state.id),
+        session_operation_context=session_operation_context,
     )
     return PipelineRouteSettlement(settlement=settled, validation=validation)
 
@@ -403,6 +417,7 @@ async def settle_auto_commit_intent(
     composer_meta: Mapping[str, object] | None,
     telemetry_source: Literal["compose", "recompose"],
     transition_assistant: TransitionAssistantDraft | None,
+    session_operation_context: SessionOperationContext,
 ) -> PipelineRouteSettlement | AutoCommitRevoked:
     """Settle a planner-minted auto-commit intent, or report revocation.
 
@@ -427,6 +442,7 @@ async def settle_auto_commit_intent(
             telemetry_source=telemetry_source,
             transition_assistant=transition_assistant,
             required_trust_mode="auto_commit",
+            session_operation_context=session_operation_context,
         )
     except TrustModeAutoCommitRevokedError as exc:
         # The locked settlement transaction committed this revocation before

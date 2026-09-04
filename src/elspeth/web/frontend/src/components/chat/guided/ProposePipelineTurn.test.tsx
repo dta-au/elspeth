@@ -636,11 +636,40 @@ describe("ProposePipelineTurn", () => {
       />,
     );
 
-    expect(screen.getByText("A complete pipeline is ready for review.")).toBeVisible();
+    // Headline derived from the node count (goal-first, elspeth-378cfa0e18).
+    // The fixture carries 4 nodes.
+    expect(
+      screen.getByText("The assistant proposed 4 processing steps from your goal."),
+    ).toBeVisible();
     expect(
       screen.getByText("Review its structure, routes, and blockers before checking the detailed wiring."),
     ).toBeVisible();
     expect(screen.queryByText("guided.proposal.rationale.review_required.v1")).toBeNull();
+  });
+
+  // The headline was a FIXED sentence — "A complete pipeline is ready for
+  // review." — regardless of what the planner actually built. It made a claim
+  // the card could not support, most visibly on a zero-node pass-through,
+  // which is a legitimate proposal when the stated goal names no processing.
+  it.each([
+    [0, "The assistant proposes no processing steps — rows pass straight from your source to your output."],
+    [1, "The assistant proposed 1 processing step from your goal."],
+    [4, "The assistant proposed 4 processing steps from your goal."],
+  ])("derives the headline from a node count of %i", (nodes, expected) => {
+    const base = payload();
+    render(
+      <ProposePipelineTurn
+        payload={{
+          ...base,
+          component_counts: { ...base.component_counts, nodes },
+        }}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(expected)).toBeVisible();
+    expect(screen.queryByText("A complete pipeline is ready for review.")).toBeNull();
   });
 
   it("collects exact feedback before submitting a proposal-bound node revision", async () => {
@@ -934,14 +963,19 @@ describe("ProposePipelineTurn", () => {
     ]);
   });
 
-  it("withholds Review wiring on the tutorial pre-Send auto-proposal and tells the learner to press Send", () => {
-    // Tutorial run 18 (session 07e8a3a8): the step-2→step-3 transition
-    // auto-plans a first proposal from the degenerate fallback intent before
-    // the learner's frozen transforms prompt is sent — a source→sink
-    // passthrough. Accepting it commits a transform-less pipeline that the
-    // tutorial launch gate then 409s. The auto-proposal is identified by
-    // supersedes_draft_hash === null; withhold the primary and direct the
-    // learner to Send so the revision re-plan carries the real scenario.
+  it("offers Review wiring on the tutorial's single proposal, whose supersedes hash is null", () => {
+    // The withheld arm this replaces existed for the pre-Send auto-proposal:
+    // the step-2 finish used to plan a source-to-sink pass-through from a
+    // degenerate fallback intent before the learner's frozen transforms prompt
+    // was sent, and accepting it committed a transform-less pipeline the
+    // tutorial launch gate then 409'd (run 18, session 07e8a3a8). Goal-first
+    // (elspeth-378cfa0e18) removes that proposal at the source — the frozen
+    // prompt is the session's root intent from /guided/start, so the one
+    // planner run produces real steps. Its supersedes_draft_hash is null, the
+    // exact value the withhold keyed on, so the gate now has to go: it would
+    // hide the only forward affordance on the card the learner must accept
+    // (reject/revise stay withheld, and there is no step-3 locked prompt to
+    // Send any more).
     const onSubmit = vi.fn();
     render(
       <ProposePipelineTurn
@@ -951,12 +985,19 @@ describe("ProposePipelineTurn", () => {
         isTutorial
       />,
     );
+    expect(payload().supersedes_draft_hash).toBeNull();
     expect(screen.getByText("The proposed structure is drawn in the Graph pane.")).toBeVisible();
     expect(screen.queryByRole("img", { name: /pipeline proposal graph/i })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Review wiring" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
+    // Off-script affordances stay withheld for the passive learner.
     expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
     expect(screen.queryByRole("button", { name: /Revise/ })).toBeNull();
-    expect(screen.getByText(/press Send/i)).toBeVisible();
+    // The retired copy pointed at a step-3 Send that no longer exists.
+    expect(screen.queryByText(/press Send/i)).toBeNull();
+    expect(screen.queryByText(/starting sketch/i)).toBeNull();
+    expect(
+      screen.getByText(/The assistant planned this pipeline from your prompt\./),
+    ).toBeVisible();
     expect(onSubmit).not.toHaveBeenCalled();
   });
 

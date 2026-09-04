@@ -18,12 +18,13 @@ import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict, cast
 from uuid import UUID
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.async_workers import run_sync_in_worker
@@ -156,6 +157,52 @@ if TYPE_CHECKING:
 
 
 _MAX_PENDING_PROPOSALS_PER_TURN: Final[int] = 10
+
+
+class _ProposalPayload(TypedDict):
+    """The ``data`` payload of an APPROVAL_REQUIRED tool result, in wire order.
+
+    No ``success`` inside the payload: the envelope's own ``success`` already
+    says it, and ``status`` is the discriminator a reader keys on
+    (elspeth-e405ad7cd2, F1).
+
+    Constructed inline as the ``data=`` argument in ``run_tool_batch`` and never
+    bound to a name: that — not the type — is what stops a later re-shaping,
+    because there is no local, alias, ``cast`` widening or callee for a store to
+    travel through (verify-gate VG-F1 measured all three escaping both mypy and
+    the previous name-based gate). The type's own job is the constructor call:
+    mypy refuses an extra, missing or mistyped key there. The envelope gate pins
+    the call's keyword order to the wire order and to this class's keys.
+    """
+
+    status: Literal["APPROVAL_REQUIRED"]
+    proposal_id: str
+    tool_name: str
+    summary: str
+    message: str
+
+
+class _PrevalidationRejectedStatus(TypedDict):
+    """The status fields merged onto a PREVALIDATION_REJECTED payload, in wire order.
+
+    The payload itself is the candidate's own ``data`` (its ``error`` /
+    ``error_code``) plus these; they are merged through a TypedDict constructor
+    rather than a bare dict literal so mypy refuses an extra key at the merge —
+    a ``"success": True`` added here is the F1 twin returning eleven lines from
+    the payload that pins it out, and nothing in the tree killed that mutant
+    (red-team RED-R3-2, mutant G6).
+
+    No ``applied_version``. The result now carries the unapplied state on its
+    envelope, so the envelope's ``version`` IS the applied version and a second
+    copy under ``data`` would be a twin (systems seat SYS-R3-3).
+    ``candidate_version`` stays: it is the only carrier of a fact the envelope
+    does not have.
+    """
+
+    status: Literal["PREVALIDATION_REJECTED"]
+    applied: Literal[False]
+    candidate_version: int
+    message: str
 
 
 _MISSING_TOOL_CALL_FIELD = object()
@@ -508,6 +555,7 @@ class ToolBatchContext:
     discovery_cache: dict[str, _CachedDiscoveryPayload]
     runtime_preflight_cache: _RuntimePreflightCache
     session_id: str | None
+    session_operation_context: SessionOperationContext | None
     user_id: str | None
     user_message_id: str | None
     user_message_content: str | None
@@ -1310,20 +1358,55 @@ async def run_tool_batch(
                             # _prevalidation_feedback_seed for the full contract.
                             feedback_data = dict(_prevalidation_feedback_seed(finalized_candidate_result.data))
                             feedback_data.update(
-                                {
-                                    "status": "PREVALIDATION_REJECTED",
-                                    "applied": False,
-                                    "applied_version": state.version,
-                                    "candidate_version": finalized_candidate_result.updated_state.version,
-                                    "message": (
+                                _PrevalidationRejectedStatus(
+                                    status="PREVALIDATION_REJECTED",
+                                    applied=False,
+                                    candidate_version=finalized_candidate_result.updated_state.version,
+                                    message=(
                                         "The candidate pipeline failed prevalidation, was not applied, and was not "
                                         "submitted for approval. Repair the reported validation errors and retry."
                                     ),
-                                }
+                                )
                             )
+                            # ``updated_state=state``: nothing was applied, so the
+                            # envelope's ``version`` — which the skill teaches as
+                            # "the state version after the call" — must be the
+                            # unapplied one. Keeping the candidate's state made the
+                            # wire say the mutation landed while the audit
+                            # (``_version_after``), the loop (which refuses the
+                            # candidate state) and ``_append_tool_outcome`` all
+                            # recorded that it had not (systems seat SYS-R3-3).
+                            # Contained to this result: it reaches only
+                            # ``_do_dispatch`` -> ``dispatch_with_audit`` ->
+                            # ``_serialize_tool_result`` / ``_append_tool_outcome``,
+                            # and ``pipeline_commit`` builds its own candidate from
+                            # the proposal rather than reading this one.
+                            #
+                            # ``prior_validation=None`` and ``affected_nodes=()``
+                            # for the same reason: both describe CHANGES, and
+                            # nothing changed. ``to_dict`` emits
+                            # ``validation_delta`` only when ``prior_validation``
+                            # is set, and the delta it emitted was measurably
+                            # false — on a real compose loop it reported
+                            # ``resolved_errors`` naming the two errors the
+                            # unapplied state still had, next to a ``version``
+                            # saying nothing was applied, while the skill tells
+                            # the model to act on the delta and never re-read
+                            # state to check it (LLM seat LLM-R3B-1). The
+                            # candidate's own ``affected_nodes`` said the same
+                            # thing in the other direction: components touched by
+                            # a state that was discarded. ``validation`` stays the
+                            # candidate's — it is the rejection the model repairs
+                            # from, and the skill says whose it is. This is now
+                            # the APPROVAL_REQUIRED envelope's shape on the same
+                            # path: unapplied state, empty affected_nodes, no
+                            # delta.
                             prevalidated_unapplied_result = replace(
                                 finalized_candidate_result,
                                 data=feedback_data,
+                                updated_state=state,
+                                prior_validation=None,
+                                affected_nodes=(),
                             )
                             # Route the rejected result through canonical
                             # dispatch/outcome without proposal publication.
@@ -1423,8 +1506,11 @@ async def run_tool_batch(
                         covered_deferred_intent_ids=(),
                         supersedes_draft_hash=None,
                     )
+                    if type(ctx.session_operation_context) is not SessionOperationContext:
+                        raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
                     proposal = await turn_sessions_service.create_pipeline_composition_proposal(
                         session_id=turn_session_uuid,
+                        session_operation_context=ctx.session_operation_context,
                         plan=PipelinePlanResult(
                             proposal=pipeline_proposal,
                             tool_call_id=tool_call.id,
@@ -1444,8 +1530,11 @@ async def run_tool_batch(
                         composer_provider=ctx.service._availability.provider or "unknown",
                     )
                 else:
+                    if type(ctx.session_operation_context) is not SessionOperationContext:
+                        raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
                     proposal = await turn_sessions_service.create_composition_proposal(
                         session_id=turn_session_uuid,
+                        session_operation_context=ctx.session_operation_context,
                         tool_call_id=tool_call.id,
                         tool_name=proposal_tool_name,
                         summary=proposal_summary.summary,
@@ -1463,14 +1552,6 @@ async def run_tool_batch(
                         tool_arguments_hash=audit.binding_arguments_hash,
                     )
                 proposals_this_turn += 1
-                proposal_payload = {
-                    "success": True,
-                    "status": "APPROVAL_REQUIRED",
-                    "proposal_id": str(proposal.id),
-                    "tool_name": proposal_tool_name,
-                    "summary": proposal.summary,
-                    "message": "The requested pipeline change is pending human approval and has not been applied.",
-                }
                 proposal_result = ToolResult(
                     success=True,
                     updated_state=state,
@@ -1484,7 +1565,19 @@ async def run_tool_batch(
                         )
                     ),
                     affected_nodes=(),
-                    data=proposal_payload,
+                    # Built inline and never bound to a name, so nothing stands between
+                    # construction and the freeze in ``ToolResult.__post_init__``: there is no
+                    # local, alias, ``cast`` widening or callee that could re-shape it.
+                    # No ``success`` inside the payload: the envelope's own ``success`` already
+                    # says it, and ``status`` is the discriminator a reader keys on
+                    # (elspeth-e405ad7cd2, F1).
+                    data=_ProposalPayload(
+                        status="APPROVAL_REQUIRED",
+                        proposal_id=str(proposal.id),
+                        tool_name=proposal_tool_name,
+                        summary=proposal.summary,
+                        message="The requested pipeline change is pending human approval and has not been applied.",
+                    ),
                 )
                 recorder.record(
                     finish_success(
@@ -1883,6 +1976,7 @@ async def run_tool_batch(
                     audit=audit,
                     recorder=recorder,
                     session_id=session_id,
+                    session_operation_context=ctx.session_operation_context,
                     current_state_id=current_state_id,
                     composer_model_version=provider_model_version,
                     llm_messages=llm_messages,

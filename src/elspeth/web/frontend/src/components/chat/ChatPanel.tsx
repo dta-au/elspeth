@@ -2,6 +2,7 @@
 import {
   Fragment,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -46,6 +47,13 @@ import {
   actionableProposals,
 } from "./PendingProposalsBanner";
 import { GuidedChatHistory } from "./guided/GuidedChatHistory";
+import { GuidedDecisionSheet } from "./guided/GuidedDecisionSheet";
+import {
+  guidedDecisionRecord,
+  guidedDecisionRows,
+  guidedDecisionTurns,
+  reviewedGuidedStages,
+} from "./guided/guidedDecisionStages";
 import { GuidedPendingStrip } from "./guided/GuidedPendingStrip";
 import {
   GUIDED_EXPLAIN_MESSAGE,
@@ -81,6 +89,7 @@ import {
   runComposeWithTimeout,
 } from "@/config/composer";
 import type { WireBlockerLink } from "./guided/WireStageTurn";
+import { wireStagePlaceholder } from "./guided/WireStageTurn";
 import { InlineSourceCreatedTurn } from "./InlineSourceCreatedTurn";
 import { InlineSourceDisambiguationTurn } from "./InlineSourceDisambiguationTurn";
 import { InlineSourceFallbackPrompt } from "./InlineSourceFallbackPrompt";
@@ -96,6 +105,7 @@ import type {
 import {
   GUIDED_CHAT_MESSAGE_MAX_LENGTH,
   type ChatTurn as GuidedChatTurn,
+  type GuidedSession,
   type GuidedSourceBlobCandidate,
   type GuidedStep,
   type GuidedRevisionMode,
@@ -635,31 +645,26 @@ function isInlineSourceBlob(metadata: BlobMetadata): boolean {
  * shapes what the LLM will engage with.  Mirrors the playbook fragments in
  * src/elspeth/web/composer/guided/skills/step_*.md.
  *
- * CLOSED LIST — must cover every GuidedStep member.  Adding a new step
- * member without extending this map produces a TypeScript exhaustiveness
- * error at the lookup site (see assertion in the lookup below).
+ * CLOSED LIST — must cover every GuidedStep member EXCEPT `step_4_wire`,
+ * whose caption is no longer a constant: it is a function of live blocker
+ * state, and lives in `wireStagePlaceholder` (WireStageTurn.tsx) beside the
+ * card whose two controls it names (elspeth-e4c2ebb697). The `Exclude` in the
+ * type is what keeps that split honest in both directions — the key cannot
+ * come back here without a compile error, and the lookup below only type-
+ * checks inside the branch where TypeScript has already narrowed `step` to
+ * the remaining three. Adding a NEW step member without extending this map
+ * still produces a TypeScript exhaustiveness error at that lookup site.
  */
-const GUIDED_CHAT_PLACEHOLDERS: Record<GuidedStep, string> = {
+const GUIDED_CHAT_PLACEHOLDERS: Record<
+  Exclude<GuidedStep, "step_4_wire">,
+  string
+> = {
   step_1_source:
     "Describe the source you have — e.g. a CSV, a store query, or pages to scrape…",
   step_2_sink:
     "Describe the output you want — the shape and fields the pipeline should produce…",
   step_3_transforms:
     "Describe what each row should become, or how to fix the proposed transforms…",
-  // Names the real next action instead of circularly pointing at a possibly
-  // disabled button (elspeth-3b35abf148 variant 1): at the wire stage the
-  // unblock path is the acknowledgement cards + the Confirm wiring button on
-  // the current decision card. "Card", not "panel": the copy is shared by
-  // both layouts, and the tutorial workspace no longer has a decision panel
-  // beside the composer — the decision is a card in the conversation column.
-  // Length budget (Wave D2 measured handoff): a placeholder produces no
-  // scroll overflow, so anything past the 3-row box at the 360px pane is cut
-  // silently. The previous 93-char wording rendered 4 lines with the last
-  // clipped; every fitting sibling placeholder is ≤80 chars, so this stays
-  // ≤80. "Clear" is the stack's own doctrine ("clear it to proceed",
-  // AcknowledgementStack.tsx header).
-  step_4_wire:
-    "Clear pending acknowledgements, then press Confirm wiring on the decision card.",
 };
 
 /**
@@ -683,6 +688,29 @@ const GUIDED_CHAT_PLACEHOLDERS: Record<GuidedStep, string> = {
  */
 const GUIDED_COMPLETED_CHAT_PLACEHOLDER =
   "Ask about the pipeline you just built — a step, a route, or what a check means.";
+
+/**
+ * Goal card copy, shown while a guided session has no composition state yet
+ * (goal-first, elspeth-378cfa0e18).
+ *
+ * A SEPARATE pair of constants for the same reason
+ * GUIDED_COMPLETED_CHAT_PLACEHOLDER is one: the step-keyed map is a closed
+ * `GuidedStep` contract and "before the session has started" is not a step —
+ * the session IS at step_1_source, it just has nothing persisted. This mirrors
+ * the local "ready" pseudo-step idiom (a stepper-only label kept out of the
+ * wire-keyed map) rather than widening the map and losing its exhaustiveness.
+ *
+ * The question is the CARD's, so it is a heading, not a placeholder; the
+ * placeholder carries the worked example. Length budget does not bind the same
+ * way here (the box is the only affordance on screen and the card carries the
+ * question), but it stays close to the ≤80-char sibling register by leading
+ * with the short instruction.
+ */
+const GUIDED_GOAL_QUESTION = "What should this pipeline produce?";
+const GUIDED_GOAL_HINT =
+  "One sentence is enough. The assistant plans the processing steps from it after you have reviewed your source and output.";
+const GUIDED_GOAL_PLACEHOLDER =
+  "In one sentence: what should come out the other end — e.g. a summary per page, saved as JSON…";
 
 interface ChatPanelProps {
   onOpenSecrets?: () => void;
@@ -870,6 +898,60 @@ export function ChatPanel({
   const guidedSelfHealNotice = useSessionStore((s) => s.guidedSelfHealNotice);
   const guidedApprovalNotice = useSessionStore((s) => s.guidedApprovalNotice);
   const approveWiring = useSessionStore((s) => s.approveWiring);
+  // ── Decision sheets (elspeth-f2a8550b3d, slice E first landing) ───────────
+  //
+  // The stage whose read-only decision sheet is open, or null. Client-only
+  // state: opening a sheet issues NO request — every fact it shows is already
+  // in the published session — so this never touches the store, never races a
+  // live turn and cannot be resumed into a stale view.
+  const [openDecisionStep, setOpenDecisionStep] = useState<GuidedStep | null>(
+    null,
+  );
+  const decisionSheetId = useId();
+  // Ticks that can open a sheet, so Close and Escape can put focus back on the
+  // control the user pressed. Keyed by stage rather than held as one ref: four
+  // ticks are mounted at once and any of them can be the opener.
+  const decisionTickRefs = useRef(new Map<GuidedStep, HTMLButtonElement>());
+  const registerDecisionTick = useCallback(
+    (step: GuidedStep, element: HTMLButtonElement | null) => {
+      if (element === null) decisionTickRefs.current.delete(step);
+      else decisionTickRefs.current.set(step, element);
+    },
+    [],
+  );
+  const closeDecisionSheet = useCallback(() => {
+    // Focus BEFORE the unmount, not inside the state updater: an updater runs
+    // during render and must stay pure. Moving focus to the tick first also
+    // means it is never on a node React is about to remove, so it can't fall
+    // through to <body>.
+    if (openDecisionStep !== null) {
+      decisionTickRefs.current.get(openDecisionStep)?.focus();
+    }
+    setOpenDecisionStep(null);
+  }, [openDecisionStep]);
+  const toggleDecisionSheet = useCallback((step: GuidedStep) => {
+    // The tick is the disclosure control, so pressing the open one closes it.
+    // No focus restore here — the tick IS the click target and already holds
+    // focus, and re-focusing it would fight a pointer user's next click.
+    setOpenDecisionStep((current) => (current === step ? null : step));
+  }, []);
+  const guidedStepForDecisionSheets = guidedSession?.step ?? null;
+  const guidedTerminalKindForDecisionSheets =
+    guidedSession?.terminal?.kind ?? null;
+  useEffect(() => {
+    // A sheet records a SETTLED stage; when the walk moves, what is settled
+    // moves with it, so the open sheet stops being the answer to the question
+    // the user asked. Close rather than re-project it under the new step.
+    //
+    // No focus restore: reaching a new step means the user pressed a control
+    // in the turn widget, so focus was never inside the sheet, and the
+    // step-advance focus effect below is already claiming it for the new turn.
+    setOpenDecisionStep(null);
+  }, [
+    guidedStepForDecisionSheets,
+    guidedTerminalKindForDecisionSheets,
+    activeSessionId,
+  ]);
   const isProposalRevisionComposer =
     guidedSession?.step === "step_3_transforms" &&
     guidedNextTurn?.type === "propose_pipeline";
@@ -2729,6 +2811,70 @@ export function ChatPanel({
     </div>
   );
 
+  // ── Decision sheets: which ticks offer one, and what one contains ─────────
+  //
+  // Both halves read `guidedSession.reviewed_components` — the SERVER's ledger
+  // — rather than the store's `guidedReviewedComponents` copy. See the module
+  // note in guidedDecisionStages.ts: the copy is deliberately emptied on the
+  // refresh-required path so the right-pane graph stops drawing pre-failure
+  // nodes, and a stepper that forgot along with it would tell the user their
+  // finished stages never happened.
+  const guidedDecisionStagesFor = (
+    session: GuidedSession,
+  ): ReadonlySet<GuidedStep> =>
+    reviewedGuidedStages(
+      session.reviewed_components,
+      session.step,
+      session.terminal?.kind === "completed",
+    );
+
+  /**
+   * The open stage's sheet, or null when none is open. Built from the
+   * published session, the live wire card and the committed composition — no
+   * request, and nothing the transcript does not already hold.
+   */
+  const buildGuidedDecisionSheet = (
+    session: GuidedSession,
+  ): React.ReactNode => {
+    if (openDecisionStep === null) return null;
+    // Defensive rather than decorative: `openDecisionStep` is cleared whenever
+    // the step or the terminal moves, but a store publication can land in the
+    // same commit as the click, and a sheet for a stage that is no longer
+    // settled would claim a decision that does not exist.
+    if (!guidedDecisionStagesFor(session).has(openDecisionStep)) return null;
+    const completed = session.terminal?.kind === "completed";
+    return (
+      <GuidedDecisionSheet
+        id={decisionSheetId}
+        stage={openDecisionStep}
+        rows={guidedDecisionRows(
+          openDecisionStep,
+          session.reviewed_components,
+          guidedNextTurn?.type === "confirm_wiring"
+            ? guidedNextTurn.payload.nodes
+            : [],
+          compositionState,
+          completed,
+        )}
+        chatTurns={guidedDecisionTurns(
+          openDecisionStep,
+          session.chat_history,
+          afterConfirmationChatToken(session),
+          // The token outlives the completion (a reenter on changed content
+          // rewinds to Step 2 with terminal=null and keeps the answered
+          // confirmation record), so the post-commit boundary is only a
+          // boundary while the session is still completed — see
+          // guidedDecisionTurns.
+          completed,
+        )}
+        // Non-null on the wire stage only; guidedDecisionRecord owns that rule
+        // so the call site cannot disagree with it.
+        record={guidedDecisionRecord(openDecisionStep, session.history)}
+        onClose={closeDecisionSheet}
+      />
+    );
+  };
+
   // ── Guided-mode discriminator ────────────────────────────────────────────────
   //
   // Precedence (intentional):
@@ -2766,10 +2912,23 @@ export function ChatPanel({
         <GuidedWorkflowStepper
           activeStep="ready"
           readyStepLabel={COMPLETED_READY_STEP_LABELS[guidedCompletionOutcome]}
+          // Every stage of a committed pipeline is settled, and none of them is
+          // current — so all four ticks open a read-only sheet here.
+          reviewedSteps={guidedDecisionStagesFor(guidedSession)}
+          openStep={openDecisionStep}
+          sheetId={decisionSheetId}
+          onOpenStep={toggleDecisionSheet}
+          registerTick={registerDecisionTick}
         />
         {error && (
           <GuidedErrorBanner error={error} onDismiss={clearError} />
         )}
+        {/* Between the stepper and the transcript, and OUTSIDE the scroll
+            group below: the sheet replays settled turns in GuidedChatHistory's
+            static `replay` mode, which must not sit inside the live transcript
+            log. Directly after the tick that opened it, so keyboard focus moves
+            forward into the panel rather than jumping past the conversation. */}
+        {buildGuidedDecisionSheet(guidedSession)}
         {/* The guided wire-confirm commit surfaces interpretation events
             AFTER the terminal lands (the writer boundary needs the committed
             nodes), so the completion surface is the FIRST place the Accept
@@ -2880,21 +3039,39 @@ export function ChatPanel({
     !guidedSession.terminal &&
     isGuidedBuildActive(guidedSession, guidedNextTurn)
   ) {
+    // Nothing is persisted for this session yet: the store adopted the lazy
+    // GET /guided stub (non-mutating) so the panel can open on the goal card
+    // without writing a rootless wizard. The session's first Send goes through
+    // chatGuided's cold-start branch and becomes POST /guided/start's intent.
+    const awaitingGoal = compositionState === null;
     // Tutorial: the per-stage locked prompt has already been Sent once the
     // current step carries a user turn in the server-authoritative chat_history.
     // Only true after a SUCCESSFUL chatGuided round-trip (an HTTP failure leaves
     // chat_history untouched — see sessionStore.chatGuided catch), so a failed
     // send still shows the box for retry.
+    //
+    // TRIMMED EXACT EQUALITY against the step's locked prompt, not "any user
+    // turn that isn't Explain" (goal-first, elspeth-378cfa0e18): a started
+    // session's transcript now OPENS with the seeded goal turn, which the
+    // server stamps with step_1_source. Under the old predicate that turn alone
+    // satisfied step 1, so the locked source box flipped to the static "Sent"
+    // line before the learner had sent anything and the single-select the
+    // tutorial suppresses came back. Comparing against the prompt itself is
+    // also what the predicate always meant, and it subsumes the Explain
+    // exclusion the old shape needed as a special case. Trimmed on both sides
+    // because ChatInput trims on send (ChatInput.tsx) — the same trimmed
+    // comparison guidedReplay.ts uses for its own dedupe.
+    const lockedPromptForStep = (
+      lockedChatPrompt?.[guidedSession.step] ?? ""
+    ).trim();
     const tutorialPromptSentForStep =
       isTutorial === true &&
+      lockedPromptForStep !== "" &&
       guidedSession.chat_history.some(
         (t) =>
           t.role === "user" &&
           t.step === guidedSession.step &&
-          // The Explain button's canned question is NOT the step's prompt:
-          // on confirm-only steps it must not flip the locked box to the
-          // "Sent" line (exact-string filter; the constant owns the copy).
-          t.content !== GUIDED_EXPLAIN_MESSAGE,
+          t.content.trim() === lockedPromptForStep,
       );
     // Only swap the locked box for the static "Sent" line when there is actually
     // a forward affordance to confirm below — the turn widget OR a pending
@@ -2926,9 +3103,46 @@ export function ChatPanel({
     // to establish the durable root; a step-3 proposal-review turn revises the
     // staged proposal via /guided/respond; other later messages use /guided/chat
     // against the existing checkpoint. The caption is keyed on the live step via
-    // GUIDED_CHAT_PLACEHOLDERS.
+    // GUIDED_CHAT_PLACEHOLDERS — except at the wire stage, where it is keyed on
+    // live blocker state instead (see below).
     const stepComposer = buildGuidedComposer({
-      placeholder: GUIDED_CHAT_PLACEHOLDERS[guidedSession.step],
+      // Before the goal the box IS the goal box: the step-keyed caption would
+      // ask for a source description, which is not what this Send does (it
+      // establishes the session's root intent).
+      //
+      // At step 4 the caption is a FUNCTION of what is actually blocking the
+      // confirm, not a constant (elspeth-e4c2ebb697): the old single-state
+      // wording named the acknowledgement cards unconditionally, so on the
+      // common path — nothing pending, nothing invalid — it told the learner to
+      // clear a stack that was not there. `wireStagePlaceholder` owns the three
+      // arms and their length budget; it lives beside the card so the caption
+      // and the card's own blocker panel cannot drift apart.
+      //
+      // The two counts are the SAME memos the card's blockers panel renders
+      // (`wirePendingAcknowledgements` / `wireValidationIssues`, passed to the
+      // wire turn below), and the third argument is the SAME payload the card
+      // itself reads, so the box under the card and the card describe one
+      // screen. Without that payload the caption could not see `can_confirm`
+      // or `blockers` — the usual reason Confirm is off at step 4, since the
+      // pre-commit guided composition is empty-by-design and contributes no
+      // `wireValidationIssues` — and fell through to telling the learner to
+      // press a disabled button. No `isTutorial` branch: the tutorial's
+      // `lockedChatPrompt` has no `step_4_wire` key, so its read-only box is
+      // empty and this line is the only thing in it — which is exactly the
+      // explanation of why Send does nothing there.
+      placeholder: awaitingGoal
+        ? GUIDED_GOAL_PLACEHOLDER
+        : guidedSession.step === "step_4_wire"
+          ? wireStagePlaceholder(
+              {
+                pendingAcknowledgements: wirePendingAcknowledgements.length,
+                validationIssues: wireValidationIssues.length,
+              },
+              guidedNextTurn?.type === "confirm_wiring"
+                ? guidedNextTurn.payload
+                : null,
+            )
+          : GUIDED_CHAT_PLACEHOLDERS[guidedSession.step],
       // Tutorial: the box is locked read-only and prefilled with the CURRENT
       // phase's per-stage prompt (wire has none → empty, confirm-only).
       lockedValue: isTutorial
@@ -3009,6 +3223,31 @@ export function ChatPanel({
     // recorded tutorial.css fill-viewport failure); inside the scroll region
     // the step-advance focus effect scrolls it into view after a Send instead.
     const decisionSection = (() => {
+      // Before the goal there is no decision to show. The stub's first
+      // single_select asks the user to pick a source, which is the wrong
+      // question two steps early — and the card's Explain button would be
+      // WORSE than wrong: Explain sends its canned question through
+      // sendGuidedChat, which pre-start is the cold-start branch, so pressing
+      // it would make "Why am I seeing this?" the session's root intent and
+      // the planner's brief. The goal card replaces the whole section (never
+      // renders beside it), so the id, the role=log live region and the
+      // Explain affordance all belong to exactly one of the two.
+      if (awaitingGoal) {
+        return (
+          <section
+            className="guided-goal-prompt"
+            aria-labelledby="guided-goal-prompt-heading"
+          >
+            <h2
+              id="guided-goal-prompt-heading"
+              className="guided-goal-prompt__question"
+            >
+              {GUIDED_GOAL_QUESTION}
+            </h2>
+            <p className="guided-goal-prompt__hint">{GUIDED_GOAL_HINT}</p>
+          </section>
+        );
+      }
       const stepIsSendDriven =
         isTutorial && (lockedChatPrompt?.[guidedSession.step] ?? "") !== "";
       // Lead the decision with the dynamic build rationale (the LLM's "what I
@@ -3244,12 +3483,23 @@ export function ChatPanel({
             </div>
           </div>
         )}
-        <GuidedWorkflowStepper activeStep={guidedSession.step} />
+        <GuidedWorkflowStepper
+          activeStep={guidedSession.step}
+          reviewedSteps={guidedDecisionStagesFor(guidedSession)}
+          openStep={openDecisionStep}
+          sheetId={decisionSheetId}
+          onOpenStep={toggleDecisionSheet}
+          registerTick={registerDecisionTick}
+        />
         {/* Suppressed while the inline respond-rejection alert renders next to
             the turn widget (errorDetails non-empty) — one alert, one announce. */}
         {error && (errorDetails == null || errorDetails.length === 0) && (
           <GuidedErrorBanner error={error} onDismiss={clearError} />
         )}
+        {/* Between the stepper and the transcript, and OUTSIDE the scroll
+            group: the sheet's replayed turns must not land inside the live
+            transcript log. See the completed branch for the full rationale. */}
+        {buildGuidedDecisionSheet(guidedSession)}
         {/* "What just happened / what to do" surfaces. The common
             ComposerWorkspace owns artifact and inspector content; this branch
             supplies only the guided authoring pane. */}
@@ -3368,7 +3618,19 @@ export function ChatPanel({
         aria-label="Guided composer"
         data-testid="tutorial-guided-loading"
       >
-        <GuidedWorkflowStepper activeStep={placeholderStep} />
+        {/* Same ledger rule as the two live branches — a stage the server has
+            settled must not read "not started" just because the panel is
+            mid-load. No onOpenStep: there is nothing to open a sheet against
+            while the session is still resolving, and a tick that offered one
+            and then lost it as the real branch mounted would be a flicker. */}
+        <GuidedWorkflowStepper
+          activeStep={placeholderStep}
+          reviewedSteps={
+            guidedSession === null
+              ? undefined
+              : guidedDecisionStagesFor(guidedSession)
+          }
+        />
         <p role="status" className="guided-loading-status">
           Preparing your guided pipeline…
         </p>
@@ -3834,7 +4096,12 @@ type WorkflowStepId = GuidedStep | "ready";
 const GUIDED_STEP_PURPOSES: Record<GuidedStep, string> = {
   step_1_source: "Choose the input and confirm what ELSPETH can read.",
   step_2_sink: "Choose the output shape and the fields the pipeline should produce.",
-  step_3_transforms: "Review the transform stages that turn source data into the output.",
+  // Names where the steps came from (goal-first, elspeth-378cfa0e18): the
+  // session states its goal up front and the planner runs ONCE, at the step-2
+  // finish, from that goal. "Review the transform stages" described a stage the
+  // user was expected to author here; what actually happens is a review of what
+  // the assistant proposed.
+  step_3_transforms: "Review the processing steps the assistant proposed from your goal.",
   step_4_wire: "Review and confirm the wiring between your pipeline steps.",
 };
 
@@ -3850,6 +4117,9 @@ const GUIDED_WORKFLOW_STEPS: ReadonlyArray<{
   // stays local rather than widening the shared wire-keyed map.
   { id: "ready", label: "Ready" },
 ];
+
+/** No stage settled — the stepper's default, and the shape of a fresh session. */
+const EMPTY_REVIEWED_STEPS: ReadonlySet<GuidedStep> = new Set<GuidedStep>();
 
 // Terminal-step label on the COMPLETED surface (elspeth-bf9c296ee5): the
 // pseudo-step stays fifth and current (the wizard genuinely finished), but
@@ -3869,9 +4139,30 @@ const COMPLETED_READY_STEP_LABELS: Record<CompletionOutcome, string> = {
 function GuidedWorkflowStepper({
   activeStep,
   readyStepLabel = "Ready",
+  reviewedSteps = EMPTY_REVIEWED_STEPS,
+  openStep = null,
+  sheetId,
+  onOpenStep,
+  registerTick,
 }: {
   activeStep: WorkflowStepId;
   readyStepLabel?: string;
+  /**
+   * The stages the server has a settled decision for
+   * (`reviewedGuidedStages`). A tick is COMPLETE because it is in here — not
+   * because its index sits below the current step. The two agree on a forward
+   * walk and part company the moment a learner returns to an earlier stage:
+   * the Output they already settled is then downstream of the current step,
+   * and an index rule would call it "not started".
+   */
+  reviewedSteps?: ReadonlySet<GuidedStep>;
+  /** The stage whose decision sheet is open, so its tick reads as expanded. */
+  openStep?: GuidedStep | null;
+  /** DOM id of the mounted sheet, for the open tick's aria-controls. */
+  sheetId?: string;
+  /** Omit to render a stepper with no disclosure behaviour at all. */
+  onOpenStep?: (step: GuidedStep) => void;
+  registerTick?: (step: GuidedStep, element: HTMLButtonElement | null) => void;
 }) {
   const activeIndex = GUIDED_WORKFLOW_STEPS.findIndex((step) => step.id === activeStep);
   return (
@@ -3882,24 +4173,27 @@ function GuidedWorkflowStepper({
           elspeth-8fa71e6d15). */}
       <ol className="guided-workflow-list">
         {GUIDED_WORKFLOW_STEPS.map((step, index) => {
+          // "ready" is a stepper-only pseudo-step with no wire identity, so it
+          // is never in the reviewed set and never opens a sheet.
+          const wireStep: GuidedStep | null =
+            step.id === "ready" ? null : step.id;
           const state =
-            index < activeIndex
-              ? "complete"
-              : index === activeIndex
-                ? "current"
+            index === activeIndex
+              ? "current"
+              : wireStep !== null && reviewedSteps.has(wireStep)
+                ? "complete"
                 : "upcoming";
-          return (
-            <li
-              key={step.id}
-              className={`guided-workflow-step guided-workflow-step--${state}`}
-              aria-current={state === "current" ? "step" : undefined}
-            >
-              {/* Indicator is aria-hidden in every state: list order already
-                  conveys position, a bare numeral adds noise, and the check
-                  is purely visual. Complete/upcoming get a visually-hidden
-                  state suffix because with the indicator hidden from AT the
-                  distinction is otherwise visual-only; current needs none —
-                  aria-current announces it. */}
+          const openable =
+            state === "complete" && wireStep !== null && onOpenStep !== undefined;
+          const isOpen = wireStep !== null && openStep === wireStep;
+          // Indicator is aria-hidden in every state: list order already
+          // conveys position, a bare numeral adds noise, and the check is
+          // purely visual. Complete/upcoming get a visually-hidden state
+          // suffix because with the indicator hidden from AT the distinction
+          // is otherwise visual-only; current needs none — aria-current
+          // announces it.
+          const tickContent = (
+            <>
               <span className="guided-workflow-index" aria-hidden="true">
                 {state === "complete" ? (
                   <svg
@@ -3921,6 +4215,36 @@ function GuidedWorkflowStepper({
                 <span className="visually-hidden">
                   {state === "complete" ? ", completed" : ", not started"}
                 </span>
+              )}
+            </>
+          );
+          return (
+            <li
+              key={step.id}
+              className={`guided-workflow-step guided-workflow-step--${state}`}
+              aria-current={state === "current" ? "step" : undefined}
+            >
+              {/* A settled stage the user is not standing on becomes a
+                  disclosure for its decision sheet; current and upcoming ticks
+                  stay static text. aria-controls is emitted only while THIS
+                  tick's sheet is mounted — one sheet exists at a time, so a
+                  closed tick would be pointing at an id that is not in the
+                  document. */}
+              {openable && wireStep !== null ? (
+                <Button
+                  variant="bare"
+                  className="guided-workflow-step-button"
+                  aria-expanded={isOpen}
+                  aria-controls={isOpen ? sheetId : undefined}
+                  ref={(element) => {
+                    registerTick?.(wireStep, element);
+                  }}
+                  onClick={() => onOpenStep(wireStep)}
+                >
+                  {tickContent}
+                </Button>
+              ) : (
+                tickContent
               )}
             </li>
           );

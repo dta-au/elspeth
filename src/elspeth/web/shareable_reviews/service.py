@@ -59,11 +59,12 @@ import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, NotRequired, Protocol, TypedDict, cast
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from sqlalchemy import desc, insert, select
+from sqlalchemy import desc, select
 from sqlalchemy.engine import Engine
 
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import canonical_json
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.audit_readiness.models import AuditReadinessSnapshot
@@ -78,9 +79,11 @@ from elspeth.web.composer.yaml_generator import (
     generate_public_yaml,
 )
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.repository import SessionDerivedCustodyError
 from elspeth.web.execution.completion_gates import CompletionGateFacts, parse_completion_gates
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import composer_completion_events_table
+from elspeth.web.sessions.protocol import SessionOperationAuthority
 from elspeth.web.shareable_reviews.models import (
     CompositionStateResponse,
     MarkReadyForReviewResponse,
@@ -156,19 +159,32 @@ class _SessionServiceLike(Protocol):
 
 
 class _ExecutionServiceLike(Protocol):
-    async def validate(self, session_id: UUID, *, user_id: str | None = None) -> Any: ...
+    async def validate(
+        self,
+        session_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+        user_id: str | None = None,
+    ) -> Any: ...
     async def validate_state(
         self,
         state: Any,
         *,
         user_id: str | None = None,
         session_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
         completion_gates: CompletionGateFacts | None = None,
     ) -> Any: ...
 
 
 class _ReadinessServiceLike(Protocol):
-    async def compute_snapshot(self, *, session_id: UUID, user_id: str) -> AuditReadinessSnapshot: ...
+    async def compute_snapshot(
+        self,
+        *,
+        session_id: UUID,
+        user_id: str,
+        session_operation_context: SessionOperationContext,
+    ) -> AuditReadinessSnapshot: ...
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -364,6 +380,7 @@ class ShareableReviewService:
         signer: ShareTokenSigner,
         settings: WebSettings,
         sessions_db_engine: Engine,
+        session_operation_authority: SessionOperationAuthority,
         payload_store: FilesystemPayloadStore,
         telemetry: SessionsTelemetry,
     ) -> None:
@@ -373,6 +390,7 @@ class ShareableReviewService:
         self._signer = signer
         self._settings = settings
         self._sessions_db_engine = sessions_db_engine
+        self._session_operation_authority = session_operation_authority
         self._payload_store = payload_store
         # Phase 8 Sub-task 7c — composer.session.completed_total counter.
         # Mirrors the sessions/service.py pattern at line 48/2446 (the
@@ -383,7 +401,14 @@ class ShareableReviewService:
         # exits cleanly.
         self._telemetry = telemetry
 
-    async def mark_ready_for_review(self, *, session_id: UUID, user_id: str, username: str) -> MarkReadyForReviewResponse:
+    async def mark_ready_for_review(
+        self,
+        *,
+        session_id: UUID,
+        user_id: str,
+        username: str,
+        session_operation_context: SessionOperationContext,
+    ) -> MarkReadyForReviewResponse:
         """Build a signed share artifact for ``(session_id, current state)``.
 
         ``user_id`` is the opaque identity id — it scopes ownership, the
@@ -424,6 +449,7 @@ class ShareableReviewService:
             composition_state,
             user_id=user_id,
             session_id=session_id,
+            session_operation_context=session_operation_context,
             completion_gates=parse_completion_gates(state_record.composer_meta),
         )
         if not validation.is_valid:
@@ -451,7 +477,11 @@ class ShareableReviewService:
                 detail="composition completion gates have not passed; resolve blockers before sharing",
             )
 
-        audit_readiness = await self._readiness_service.compute_snapshot(session_id=session_id, user_id=user_id)
+        audit_readiness = await self._readiness_service.compute_snapshot(
+            session_id=session_id,
+            user_id=user_id,
+            session_operation_context=session_operation_context,
+        )
         if _has_error_readiness_row(audit_readiness):
             raise CompositionNotRunnableError(
                 reason="readiness_error_row",
@@ -477,21 +507,25 @@ class ShareableReviewService:
         lifetime = timedelta(seconds=self._settings.shareable_link_lifetime_seconds)
         expires_at = snapshot.created_at + lifetime
 
-        # AUDIT FIRST. Sync, crash-on-failure. If this raises, no blob
-        # gets written and the caller sees the error.
-        with self._sessions_db_engine.begin() as conn:
-            conn.execute(
-                insert(composer_completion_events_table).values(
-                    id=str(uuid4()),
-                    session_id=str(session_id),
-                    composition_state_id=str(snapshot.state_id),
-                    event_type="mark_ready_for_review",
+        # AUDIT FIRST under the exact BLOB_READ authority already spanning
+        # validation and readiness. The facet re-proves that this is still
+        # the current state in the same transaction as the insert.
+        try:
+            self._session_operation_authority.mutate(
+                session_operation_context,
+                lambda transaction: transaction.composer_completion.mark_ready_for_review(
+                    composition_state_id=snapshot.state_id,
                     actor=user_id,
                     created_at=snapshot.created_at,
                     payload_digest=snapshot.payload_digest,
                     expires_at=expires_at,
-                )
+                ),
             )
+        except SessionDerivedCustodyError:
+            raise CompositionNotRunnableError(
+                reason="readiness_state_drift",
+                detail="composition changed while preparing the review snapshot; retry against the current state",
+            ) from None
 
         # Phase 8 Sub-task 7c (telemetry-backfill: phase-6).
         # Audit primacy: the helper runs AFTER the engine.begin() block

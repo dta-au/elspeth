@@ -900,6 +900,147 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
         ),
     ),
     ReviewedWriter(
+        path="src/elspeth/web/coordination/repository.py",
+        enclosing_symbol="_RepositoryCompositionStateMutations.append_state",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "Lane authority writer (recovered deferred-platform merge): the "
+            "COMPOSE-only composition-state facet owns the exact fence/session "
+            "check, predecessor custody check, version allocation, and insert "
+            "in one serialized mutation transaction (checkpoint bae72a268)."
+        ),
+    ),
+    ReviewedWriter(
+        path="src/elspeth/web/coordination/repository.py",
+        enclosing_symbol="_RepositoryInterpretationMutations.create_or_reconcile_pending",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "Lane interpretation facet: pending-interpretation state writes "
+            "run under exact COMPOSE custody inside the repository mutation "
+            "transaction; opt-out event+session atomicity is owned here "
+            "(checkpoint bc9cb0d5d)."
+        ),
+    ),
+    ReviewedWriter(
+        path="src/elspeth/web/coordination/repository.py",
+        enclosing_symbol="_ForkChildSessionMutations.insert_child_state",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "Fork creation transaction: the staged child's copied state is "
+            "inserted under the dual parent/child fork authority inside "
+            "_ForkCreationTransaction; settlement later re-proves the exact "
+            "operation binding before activation."
+        ),
+    ),
+    ReviewedWriter(
+        path="src/elspeth/web/coordination/repository.py",
+        enclosing_symbol="_ForkChildSessionMutations.append_child_messages",
+        table="chat_messages",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "Fork creation transaction: the staged child's copied transcript "
+            "is appended as one cohort under the dual fork authority in the "
+            "same transaction as the child state insert."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/testcontainer/web/test_session_derived_mutations_postgres.py",
+        enclosing_symbol="_seed_run_and_blob",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "PostgreSQL derived-mutation fixture: seeds the parent "
+            "composition_states row required by run/blob FK constraints before "
+            "exercising the production repository mutation authority."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_session_derived_mutations.py",
+        enclosing_symbol="_seed_run_and_blob",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "Derived-mutation fixture: seeds the parent composition_states row "
+            "required by run/blob FK constraints before exercising the "
+            "production repository mutation authority on SQLite."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_session_operation_fence.py",
+        enclosing_symbol="test_composer_completion_mutations_write_fixed_shapes_under_exact_blob_read",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "fence-suite fixture: seeds a composition_states row so the composer-completion BLOB_READ mutation facet can be exercised against a real latest-state binding."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_session_operation_fence.py",
+        enclosing_symbol="test_composer_completion_mutations_enforce_kind_session_and_latest_state",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "fence-suite fixture: seeds the state rows whose kind/session/latest-state refusals the completion facet is being proven against."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_session_operation_fence.py",
+        enclosing_symbol="test_composer_completion_released_authority_writes_zero_and_successor_writes_once",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "fence-suite fixture: seeds the state row used to prove a released authority writes zero rows and its successor writes exactly once."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_sqlite_session_operation_authority.py",
+        enclosing_symbol="_seed_parent_messages",
+        table="chat_messages",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "fork-authority fixture: seeds the parent transcript the fork creation transaction copies; the copy itself runs through the production authority."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_sqlite_session_operation_authority.py",
+        enclosing_symbol="_mutate_fork",
+        table="chat_messages",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "fork-authority race harness: issues the competing direct write the fork transaction must fence out; the assertion is that the AUTHORITY refuses it."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/coordination/test_sqlite_session_operation_authority.py",
+        enclosing_symbol="test_fork_creation_transaction_refuses_third_session_writes.forbidden",
+        table="chat_messages",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "fork-authority adversarial probe: attempts a third-session write inside the fork pair transaction to prove the connection registry refuses it."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_schema.py",
+        enclosing_symbol="_seed_session_state",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "schema fixture: seeds a composition_states parent row so FK/CHECK constraints can be exercised directly on the owned in-memory engine."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/shareable_reviews/test_service.py",
+        enclosing_symbol="test_mark_ready_for_review_rejects_state_superseded_after_readiness_without_side_effects.supersede_after_readiness",
+        table="composition_states",
+        operation="sqlalchemy_table_insert",
+        purpose=(
+            "shareable-review race harness: inserts the superseding state row mid-flow to prove readiness marking rejects a superseded state without side effects."
+        ),
+    ),
+    ReviewedWriter(
         path="src/elspeth/web/coordination/run_diagnostics_authority.py",
         enclosing_symbol="RepositoryRunDiagnosticsAuditAuthority.append_audit_messages",
         table="chat_messages",
@@ -1403,13 +1544,16 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
     ),
     ReviewedWriter(
         path="tests/unit/web/sessions/test_guided_custody_gate.py",
-        enclosing_symbol="TestWriteBoundaryGate.test_set_active_state_refuses_to_copy_a_legacy_unbindable_active_row",
+        enclosing_symbol="TestWriteBoundaryGate.test_guided_revert_refuses_to_copy_a_legacy_unbindable_active_row",
         table="composition_states",
         operation="sqlalchemy_insert_call",
         purpose=(
             "Seeds a composition_states row that predates the pre-persist guided "
-            "custody gate (elspeth-4c442aaaa8) so set_active_state's refusal to "
-            "re-tip onto it can be pinned; the gate itself blocks the service path."
+            "custody gate (elspeth-4c442aaaa8) so the fenced guided revert's refusal "
+            "to re-tip onto it can be pinned; the gate itself blocks the service path. "
+            "Renamed with its test when the unfenced set_active_state setter this "
+            "originally pinned was removed (fc84028df); same row, same purpose, and "
+            "revert_state_for_guided_operation reaches the same custody gate."
         ),
     ),
     ReviewedWriter(
@@ -1749,7 +1893,14 @@ _LOCK_DISCIPLINE_NEGATIVE_TESTS: tuple[LockDisciplineNegativeTest, ...] = (
 # (a new direct insert added in either file) shows up as a violation.
 
 _BLOBS_ALLOWLIST_PATH = "tests/unit/web/blobs/test_service.py"
-_BLOBS_EXPECTED_LINES = (318, 377, 441, 520, 590, 656, 733, 795, 1366, 1521, 1976, 2344)
+# Re-pinned by the multi-replica merge (elspeth-4d6c0dd0f5). Mainline's fix
+# for elspeth-3db5745ba7 replaced FOUR of the platform's twelve direct
+# ``composition_states_table.insert()`` fixtures with ``_seed_active_run``,
+# which routes through the real writer ``save_composition_state``. The
+# inventory legitimately SHRINKS: fewer direct writers is the point of that
+# fix, and the four that went are exactly the ones that seeded a populated
+# bare ``source`` column no production writer has emitted since f0fd36087.
+_BLOBS_EXPECTED_LINES = (829, 888, 952, 1170, 4616, 4771, 5511, 5879)
 _COMPOSER_TOOLS_ALLOWLIST_PATH = "tests/unit/web/composer/test_tools.py"
 _COMPOSER_TOOLS_EXPECTED_LINES = (3125, 3188, 7581, 7634, 7875)
 

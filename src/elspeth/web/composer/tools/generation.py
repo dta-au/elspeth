@@ -11,7 +11,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Literal, NotRequired, TypedDict, final
+from typing import Any, Final, Literal, TypedDict, final
 from uuid import UUID
 
 from opentelemetry import metrics
@@ -61,8 +61,8 @@ from elspeth.web.composer.state import (
     _source_options_have_schema,
     _validate_gate_expression,
 )
+from elspeth.web.composer.tool_result_envelope import ValidationCodeGuidance, ValidationGuidance
 from elspeth.web.composer.tools._common import (
-    _DATA_ERROR_KEY,
     _PLUGIN_UNAVAILABLE_EXPLANATIONS,
     ToolContext,
     ToolResult,
@@ -80,9 +80,6 @@ from elspeth.web.composer.tools.blobs import (
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
-)
-from elspeth.web.composer.tools.sessions import (
-    _authoring_validation_payload,
 )
 from elspeth.web.execution.schemas import CHECK_OUTCOME_SKIPPED_AFTER_FAILURE, ValidationResult
 from elspeth.web.interpretation_state import (
@@ -270,7 +267,13 @@ _GET_PLUGIN_SCHEMA_DECLARATION = ToolDeclaration(
     name="get_plugin_schema",
     handler=_handle_get_plugin_schema,
     kind=ToolKind.DISCOVERY,
-    description="Get the full configuration schema for a plugin.",
+    description=(
+        "Get the full configuration schema for a plugin. Result `data` carries `name`, `plugin_type`, "
+        "`description`, `json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, and "
+        "`web_config_authority` (`user_configurable` — author raw `options` directly; "
+        "`user_configurable_with_policy` — author raw `options` the same way; `operator_profiled` — do not "
+        "author raw options, author `options.profile` instead)."
+    ),
     json_schema={
         "type": "object",
         "properties": {
@@ -297,14 +300,18 @@ def _handle_get_expression_grammar(
     context: ToolContext,
 ) -> ToolResult:
     del context  # unused; signature uniformity with the other handlers.
-    return _discovery_result(state, get_expression_grammar())
+    # A closed one-key payload, not the bare reference string: ``ToolResult``
+    # admits only mapping / sequence / model payloads (elspeth-e405ad7cd2,
+    # D2), and a scalar was the one discovery shape that slipped past the
+    # scoped gate runs until the planner suite constructed this result.
+    return _discovery_result(state, {"grammar": get_expression_grammar()})
 
 
 _GET_EXPRESSION_GRAMMAR_DECLARATION = ToolDeclaration(
     name="get_expression_grammar",
     handler=_handle_get_expression_grammar,
     kind=ToolKind.DISCOVERY,
-    description="Get the gate expression syntax reference.",
+    description="Get the gate expression syntax reference. The result carries the full reference text under `grammar`.",
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
 )
@@ -352,6 +359,11 @@ _PLUGIN_UNAVAILABLE_FIXES: Final[dict[PluginUnavailableReason, str]] = {
 
 
 _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
+    (
+        r"diff_baseline_unavailable|No baseline available",
+        "diff_pipeline has nothing to compare against: the session was created without a loaded baseline state.",
+        "Do not retry diff_pipeline in this session. Use get_pipeline_state to read the current state instead.",
+    ),
     (
         r"No source configured",
         "The pipeline has no data source. Every pipeline needs exactly one source to read input data from.",
@@ -861,7 +873,11 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "non-require_all union coalesce guarantees the INTERSECTION of its arms — find them in your own candidate (the "
         "nodes whose routing publishes into it, or its branches' producers) and patch every one. A nested coalesce "
         "guarantees its branch NAMES only under require_all — repoint there; else it guarantees nothing: use union merge "
-        "or require_all. Call preview_pipeline until edge_contracts shows satisfied=true. A source guarantee names only "
+        "or require_all. Call preview_pipeline until the violation is gone: that edge_contracts row stops being a "
+        "violation once EVERY 'missing_fields' name is gone from what the sink REQUIRES — it then reads satisfied "
+        "true, or disappears entirely where the sink is left requiring nothing. Emptying required_fields is not the "
+        "whole repair: a name the sink still requires through its 'fields', or through a writing option such as a "
+        "text or document sink's 'field', keeps the violation standing. A source guarantee names only "
         "VERIFIED fields, never intent: "
         "patch_source_options(patch={'schema':{'mode':'observed','guaranteed_fields':[...]}}), a COMPLETE list. Only "
         "without 'contract' facts: get_pipeline_state on the sink, then reconcile its required fields upstream.",
@@ -1682,25 +1698,15 @@ def explain_validation_code(code: str) -> tuple[str, str] | None:
 # tool envelope (tools._dispatch). Two copies would drift, and the parity
 # suite pins the string.
 EXPLAIN_VALIDATION_ERROR_GUIDANCE: Final[str] = "To expand any code, call explain_validation_error with the exact code string."
+"""Planner-surface pointer: there the catalogue text rides inline on each entry, so no container is named."""
 
-
-class ValidationCodeGuidance(TypedDict):
-    """The catalogue's ``(explanation, suggested_fix)`` for one closed code."""
-
-    explanation: str
-    suggested_fix: str
-
-
-class ValidationGuidance(TypedDict):
-    """Inline repair guidance for one failed mutation envelope.
-
-    ``codes`` is keyed by the closed ``error_code`` so N entries sharing a
-    code cost the text once. ``explain_tool`` rides only when some entry got
-    no inline guidance — see :func:`build_validation_guidance`.
-    """
-
-    codes: dict[str, ValidationCodeGuidance]
-    explain_tool: NotRequired[str]
+EXPLAIN_TOOL_GUIDANCE: Final[str] = (
+    "An entry whose error_code has no entry under 'validation_guidance.codes' — or that has no error_code "
+    "at all — can be expanded by calling explain_validation_error with the entry's error_code, or with its "
+    "full message when it has none."
+)
+"""Freeform-envelope pointer (``validation_guidance.explain_tool``): names the container the codes live in,
+so the model knows which codes the call can still add something for (elspeth-e405ad7cd2)."""
 
 
 def build_validation_guidance(codes: Iterable[str | None]) -> ValidationGuidance | None:
@@ -1756,7 +1762,7 @@ def build_validation_guidance(codes: Iterable[str | None]) -> ValidationGuidance
         return None
     payload = ValidationGuidance(codes=resolved)
     if any_unresolved:
-        payload["explain_tool"] = EXPLAIN_VALIDATION_ERROR_GUIDANCE
+        payload["explain_tool"] = EXPLAIN_TOOL_GUIDANCE
     return payload
 
 
@@ -1868,7 +1874,9 @@ _EXPLAIN_VALIDATION_ERROR_DECLARATION = ToolDeclaration(
     handler=_execute_explain_validation_error,
     kind=ToolKind.DISCOVERY,
     description="Get a human-readable explanation of a validation error "
-    "with suggested fixes. Pass the exact error text from a validation result.",
+    "with suggested fixes. Pass the entry's `message`, or its `error_code` when "
+    "that is all you have. Returns the `error_text` echoed, an `explanation`, a "
+    "`suggested_fix`, and — when the text matched a closed code — the `error_code`.",
     json_schema={
         "type": "object",
         "properties": {
@@ -1998,12 +2006,15 @@ _GET_PLUGIN_ASSISTANCE_DECLARATION = ToolDeclaration(
         "Retrieve plugin-owned guidance for a source, transform, or sink. "
         "Two modes by ``issue_code``:\n"
         "  * Omit ``issue_code`` (or pass null) to get discovery-time guidance "
-        "    — a summary of the plugin and composer_hints. (The same hints "
+        "    — a `summary` of the plugin and its `composer_hints`. (The same hints "
         "    are also carried on list_sources / list_transforms / list_sinks / "
         "    get_plugin_schema responses; this tool is the explicit path.)\n"
         "  * Pass an ``issue_code`` (validators emit these as requirement_code "
         "    on semantic_contracts entries) to get failure-time guidance — "
-        "    summary, suggested_fixes, and example before/after configurations."
+        "    `summary`, `suggested_fixes`, and `examples` — each a `title` with the "
+        "    `before` and `after` configurations it contrasts.\n"
+        "Every result names the `plugin_name` and `plugin_type` it describes; a plugin with no published "
+        "guidance returns `summary` null and empty lists."
     ),
     json_schema={
         "type": "object",
@@ -2091,8 +2102,10 @@ _GET_AUDIT_INFO_DECLARATION = ToolDeclaration(
         "Landscape, or 'how do I record what the pipeline did'. Audit is "
         "mandatory and operator-managed; the composer cannot configure the "
         "backend (security boundary — see yaml_generator.py:179, fix S1). "
-        "Returns enabled status, composer_modifiable flag, and a canonical "
-        "summary to paraphrase. Does NOT return the audit URL/path/DSN — "
+        "Returns `enabled`, the `composer_modifiable` flag, a canonical "
+        "`summary` to paraphrase, and `audit_export_summary` (the optional "
+        "operator-configured export feature, also not composer-controllable). "
+        "Does NOT return the audit URL/path/DSN — "
         "that is operator-internal and intentionally not surfaced to the LLM."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
@@ -2207,7 +2220,11 @@ _LIST_MODELS_DECLARATION = ToolDeclaration(
     "returns matching model IDs (capped at limit). For provider='openrouter/' "
     "the returned slugs are normalised to OpenRouter's HTTP API form "
     "(without the litellm-internal 'openrouter/' routing prefix) — these "
-    "are the values to put directly in `model:`.",
+    "are the values to put directly in `model:`. Result `data` carries "
+    "`providers` (provider name → model count) with `total_models` and a "
+    "`hint` on narrowing the query when no filter is given, or `models` with "
+    "`count` (matches found) and `truncated` (true when the limit cut the "
+    "list) with a filter.",
     json_schema={
         "type": "object",
         "properties": {
@@ -3702,8 +3719,8 @@ def _runtime_preflight_not_run_error() -> ValidationEntryDict:
     """Build the marker naming an un-run Stage 2 in a preview's error channel.
 
     A fresh dict per call: the entry is handed to the caller inside
-    ``data["errors"]``, so a shared module constant would let one consumer's
-    mutation leak into every later preview.
+    ``data["preview_errors"]``, so a shared module constant would let one
+    consumer's mutation leak into every later preview.
 
     Deliberately NOT registered in ``_CLOSED_VALIDATION_ERROR_CODES`` — that
     tuple is a claim about the codes the planner's redacted repair feedback
@@ -3715,8 +3732,8 @@ def _runtime_preflight_not_run_error() -> ValidationEntryDict:
         message=(
             "The runtime preflight stage did not run for this preview, so this pipeline has not been "
             "checked against the real engine at all (path allowlist, plugin instantiation, graph "
-            "structure, schema compatibility, secret refs, policy gates). is_valid is false because no "
-            "verdict on those checks exists, not because one of them failed. This is a server wiring "
+            "structure, schema compatibility, secret refs, policy gates). preview_is_valid is false because "
+            "no verdict on those checks exists, not because one of them failed. This is a server wiring "
             "omission, not a defect in the pipeline: do not rewrite the pipeline to try to clear it — "
             "report that preview_pipeline returned runtime_preflight_not_run."
         ),
@@ -3815,27 +3832,38 @@ def _execute_preview_pipeline(
 ) -> ToolResult:
     """Preview pipeline configuration — dry-run validation with source summary.
 
-    Returns ``authoring_validation`` (Stage 1), ``runtime_preflight``
-    (Stage 2 from the caller-supplied callback), and ``proof_diagnostics``
-    (Stage 3 — operator-input-aware proof against the observed source
-    blob). The presence of any blocking ``proof_diagnostics`` entry means
-    ``is_valid=False`` even when authoring + runtime checks pass.
+    Three checks, each on its own surface: the authoring check rides on the
+    envelope's own ``validation``; the runtime preflight (the caller-supplied
+    callback) on the envelope's ``runtime_preflight``; the operator-input-aware
+    proof against the observed source blob under ``data["proof_diagnostics"]``.
+    ``data["preview_is_valid"]`` is their conjunct — any blocking
+    ``proof_diagnostics`` entry makes it false even when authoring + runtime
+    pass.
+
+    ``data`` carries only what the preview stage itself produces: the
+    conjunct, ``preview_errors`` (entries the preview stage mints — never a
+    copy of the authoring errors, which the envelope already carries),
+    ``edge_contracts`` (the one authoring fact the envelope does not carry),
+    the proof diagnostics, and a read-only overview. Hoisting the authoring
+    verdict here again put byte-twins of ``validation`` on the wire under a
+    second name and made ``is_valid`` a homonym (elspeth-e405ad7cd2 R4).
 
     An un-run stage never rides the success side: with no runtime callback
-    wired, ``is_valid`` is false and ``errors`` carries an explicit
-    ``runtime_preflight_not_run`` entry naming the stage that did not run.
+    wired, ``preview_is_valid`` is false and ``preview_errors`` carries an
+    explicit ``runtime_preflight_not_run`` entry naming the stage that did
+    not run.
     """
     validation = context.catalog.validate_composition_state(state).validation
     _AUTHORING_VALIDATION_COUNTER.add(
         1,
         {"outcome": "valid" if validation.is_valid else "invalid"},
     )
-    authoring_payload = _authoring_validation_payload(state, validation)
     runtime_result = context.runtime_preflight(state) if context.runtime_preflight is not None else None
     # Wired only when the caller's strict Stage-2 verdict is handoff-shaped
     # (elspeth-229e9e8195). Additive advisory block: it never joins the
-    # ``is_valid`` conjunct below — folding tolerant findings into the strict
-    # verdict would misreport a review-pending state as a validator objection.
+    # ``preview_is_valid`` conjunct below — folding tolerant findings into the
+    # strict verdict would misreport a review-pending state as a validator
+    # objection.
     structural_preview = (
         _structural_preview_block(state, context.structural_preflight(state)) if context.structural_preflight is not None else None
     )
@@ -3847,10 +3875,10 @@ def _execute_preview_pipeline(
     )
     has_blocking_proof = any(d["severity"] == "blocking" for d in proof_diagnostics)
 
-    is_valid = validation.is_valid
-    summary_errors = authoring_payload["errors"]
+    preview_is_valid = validation.is_valid
+    preview_errors: list[ValidationEntryDict] = []
     if runtime_result is not None:
-        is_valid = is_valid and runtime_result.is_valid
+        preview_is_valid = preview_is_valid and runtime_result.is_valid
     else:
         # Three live callers wire Stage 2 for preview: the operator channel
         # precomputes it per call (tool_batch.py), the stdio MCP server wires
@@ -3864,24 +3892,19 @@ def _execute_preview_pipeline(
         # an un-run stage must not ride the success side of the conjunct: fail
         # closed and name the stage, because ``runtime_preflight: null`` alone
         # cannot tell a caller "not computed" apart from "nothing to report".
-        is_valid = False
-        # A fresh list, never an in-place append: this list object IS
-        # ``authoring_payload["errors"]``, which the summary also embeds as
-        # ``authoring_validation`` — Stage 1's own report must stay Stage-1-true.
-        summary_errors = [*summary_errors, _runtime_preflight_not_run_error()]
+        preview_is_valid = False
+        preview_errors.append(_runtime_preflight_not_run_error())
     if has_blocking_proof:
-        is_valid = False
+        preview_is_valid = False
 
     summary: dict[str, Any] = {
-        "is_valid": is_valid,
-        "errors": summary_errors,
-        "warnings": authoring_payload["warnings"],
-        "suggestions": authoring_payload["suggestions"],
-        "edge_contracts": authoring_payload["edge_contracts"],
-        "semantic_contracts": authoring_payload["semantic_contracts"],
-        "graph_repair_suggestions": authoring_payload["graph_repair_suggestions"],
-        "authoring_validation": authoring_payload,
-        "runtime_preflight": runtime_result.model_dump() if runtime_result is not None else None,
+        "preview_is_valid": preview_is_valid,
+        "preview_errors": preview_errors,
+        "edge_contracts": [ec.to_dict() for ec in validation.edge_contracts],
+        # No nested ``runtime_preflight`` copy: the same value rides on the
+        # envelope's own ``runtime_preflight`` field (set below), and a
+        # byte-identical twin under ``data`` was two keys the model had to be
+        # taught were one (elspeth-e405ad7cd2, F9).
         "proof_diagnostics": proof_diagnostics,
         "sources": {
             name: {
@@ -3913,10 +3936,27 @@ _PREVIEW_PIPELINE_DECLARATION = ToolDeclaration(
     name="preview_pipeline",
     handler=_execute_preview_pipeline,
     kind=ToolKind.DISCOVERY,
-    description="Preview the current pipeline configuration — returns "
-    "validation status, source summary, and node/output overview "
-    "without executing. Use this to confirm the pipeline is set up "
-    "correctly before running.",
+    description="Preview the current pipeline without executing it. The "
+    "envelope's `validation` is the authoring check and `runtime_preflight` "
+    "(top-level, when a runtime check ran) is the dry-run. `data` carries "
+    "`preview_is_valid` (true only when the authoring check, the runtime "
+    "check and the source proof all pass), `preview_errors` (entries only "
+    "the preview stage produces, such as `runtime_preflight_not_run`), "
+    "`edge_contracts` (one entry per producer->consumer pair that was "
+    "checked, and a pair is checked only where the consumer REQUIRES "
+    "fields — through `required_fields`, through a fixed/flexible schema's "
+    "declared fields, or, "
+    "for a sink, through an option naming the field it writes from — so an "
+    "edge requiring none has no entry and an empty "
+    "list is not proof of a satisfied contract: `from`, `to` which is "
+    "`output:<name>` for a sink, the `producer_guarantees` and "
+    "`consumer_requires` field names, the `missing_fields` between them, "
+    "and `satisfied`), `proof_diagnostics`, "
+    "`structural_preview` when present (an advisory re-check whose "
+    "`is_valid` is not the verdict), and a read-only overview: `sources` "
+    "(keyed by source name, each with `plugin`, `on_success` and "
+    "`has_schema_config`), `nodes`, `outputs`, `node_count`, "
+    "`output_count`.",
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=False,
 )
@@ -3941,12 +3981,13 @@ def _execute_diff_pipeline(
     baseline = context.baseline
     current_validation = context.current_validation
     if baseline is None:
-        return _discovery_result(
+        # A failure, not a success carrying an ``error`` key: ``error`` is a
+        # failure-only key on every surface (elspeth-e405ad7cd2 D5). The
+        # current version already rides the envelope's ``version``.
+        return _failure_result(
             state,
-            {
-                _DATA_ERROR_KEY: "No baseline available. Load or create a session first.",
-                "current_version": state.version,
-            },
+            "No baseline available. Load or create a session first.",
+            error_code="diff_baseline_unavailable",
         )
 
     baseline_validation = context.catalog.validate_composition_state(baseline).validation
@@ -3964,8 +4005,13 @@ _DIFF_PIPELINE_DECLARATION = ToolDeclaration(
     handler=_execute_diff_pipeline,
     kind=ToolKind.DISCOVERY,
     description="Show what changed since the session was loaded or created. "
-    "Returns added, removed, and modified nodes/edges/outputs, "
-    "plus warnings introduced or resolved.",
+    "On success `data` carries `from_version` (the baseline; the version it "
+    "changed TO is the envelope's own `version`), `sources_changed`, "
+    "`metadata_changed`, `total_changes`, `warnings_introduced`, "
+    "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
+    "lists under `nodes`, `edges`, `outputs`, and — only when `sources_changed` — `sources`. Without a "
+    "baseline (no session loaded or created yet) it fails with `error` and "
+    "`error_code` only.",
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=False,
 )

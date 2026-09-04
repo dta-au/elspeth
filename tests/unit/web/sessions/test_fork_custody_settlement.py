@@ -79,13 +79,17 @@ async def _stage_copy_rewrite(
     data_dir: Path,
 ):
     """Run the route's pre-settlement chain with the route's own argument shapes."""
-    fence = await _claim_fork(service, parent_id, operation_id=str(uuid4()))
-    staged = await service.fork_session(fence, fork_message_id=fork_message_id, new_message_content="edited")
+    parent_authority = await _claim_fork(service, parent_id, operation_id=str(uuid4()))
+    staged = await service.fork_session(parent_authority, fork_message_id=fork_message_id, new_message_content="edited")
     assert staged.state is not None
 
     async def checkpoint() -> None:
         return None
 
+    # The route builds the blob write fence from the GUIDED fence inside the
+    # parent authority pair (``routes/sessions.py`` line ~983), not from the
+    # session-operation context that rides beside it.
+    guided_fence = parent_authority.guided_fence
     source_blobs = {entry.source_blob_id: await blob_service.get_blob(entry.source_blob_id) for entry in staged.blob_plan}
     blob_map = await blob_service.copy_blobs_for_fork(
         parent_id,
@@ -94,9 +98,9 @@ async def _stage_copy_rewrite(
         BlobForkWriteFence(
             source_session_id=parent_id,
             target_session_id=staged.session.id,
-            operation_id=fence.operation_id,
-            lease_token=fence.lease_token,
-            attempt=fence.attempt,
+            operation_id=guided_fence.operation_id,
+            lease_token=guided_fence.lease_token,
+            attempt=guided_fence.attempt,
         ),
         checkpoint=checkpoint,
     )
@@ -110,13 +114,15 @@ async def _stage_copy_rewrite(
         parent_session_id=parent_id,
         child_session_id=staged.session.id,
     )
-    return fence, staged, blob_map, rewritten
+    return staged, blob_map, rewritten
 
 
-def _settlement_command(fence, staged, rewritten: CompositionStateData | None) -> GuidedForkSettlementCommand:
+def _settlement_command(staged, rewritten: CompositionStateData | None) -> GuidedForkSettlementCommand:
+    # The merged command carries the whole fork authority pair (parent guided
+    # fence + adopted child session-operation context) and derives the child
+    # session id from it, so neither may be passed alongside.
     return GuidedForkSettlementCommand(
-        fence=fence,
-        child_session_id=staged.session.id,
+        authority=staged.authority,
         expected_current_state_id=staged.state.id,
         edited_message_id=staged.messages[-1].id,
         rewritten_state_id=uuid4() if rewritten is not None else None,
@@ -177,7 +183,7 @@ async def test_incident_shaped_fork_settles_and_child_names_only_its_own_blob(en
         writer_principal="route_user_message",
     )
 
-    fence, staged, blob_map, rewritten = await _stage_copy_rewrite(
+    staged, blob_map, rewritten = await _stage_copy_rewrite(
         service,
         blob_service,
         parent_id=parent.id,
@@ -188,7 +194,7 @@ async def test_incident_shaped_fork_settles_and_child_names_only_its_own_blob(en
     child_blob = blob_map[blob.id]
     assert rewritten is not None
 
-    settled = await service.settle_guided_fork_operation(_settlement_command(fence, staged, rewritten))
+    settled = await service.settle_guided_fork_operation(_settlement_command(staged, rewritten))
     assert settled.archived_at is None
 
     child_state = await service.get_current_state(staged.session.id)
@@ -247,7 +253,7 @@ async def test_settlement_rejects_rewritten_state_keyed_by_parent_blob(engine, t
         composition_state_id=state.id,
         writer_principal="route_user_message",
     )
-    fence, staged, _blob_map, rewritten = await _stage_copy_rewrite(
+    staged, _blob_map, rewritten = await _stage_copy_rewrite(
         service,
         blob_service,
         parent_id=parent.id,
@@ -272,7 +278,7 @@ async def test_settlement_rejects_rewritten_state_keyed_by_parent_blob(engine, t
     )
 
     with pytest.raises(AuditIntegrityError, match=_SETTLEMENT_TEXT):
-        await service.settle_guided_fork_operation(_settlement_command(fence, staged, keyed_state))
+        await service.settle_guided_fork_operation(_settlement_command(staged, keyed_state))
 
     assert (await service.get_session(staged.session.id)).archived_at is not None
 
@@ -539,7 +545,7 @@ async def test_settlement_rejects_a_rewritten_state_whose_validation_errors_reta
     message = await service.add_message(
         parent.id, "user", "fork here", composition_state_id=state.id, writer_principal="route_user_message"
     )
-    fence, staged, _blob_map, rewritten = await _stage_copy_rewrite(
+    staged, _blob_map, rewritten = await _stage_copy_rewrite(
         service, blob_service, parent_id=parent.id, fork_message_id=message.id, data_dir=tmp_path
     )
     assert rewritten is not None
@@ -555,7 +561,7 @@ async def test_settlement_rejects_a_rewritten_state_whose_validation_errors_reta
     )
 
     with pytest.raises(AuditIntegrityError, match=_SETTLEMENT_TEXT):
-        await service.settle_guided_fork_operation(_settlement_command(fence, staged, tainted))
+        await service.settle_guided_fork_operation(_settlement_command(staged, tainted))
 
 
 @pytest.mark.parametrize("entry_shape", ["exact", "embedded"])
@@ -583,8 +589,8 @@ async def test_settlement_rejects_a_staged_state_whose_validation_errors_retain_
     message = await service.add_message(
         parent.id, "user", "fork here", composition_state_id=state.id, writer_principal="route_user_message"
     )
-    fence = await _claim_fork(service, parent.id, operation_id=str(uuid4()))
-    staged = await service.fork_session(fence, fork_message_id=message.id, new_message_content="edited")
+    parent_authority = await _claim_fork(service, parent.id, operation_id=str(uuid4()))
+    staged = await service.fork_session(parent_authority, fork_message_id=message.id, new_message_content="edited")
     assert staged.state is not None and staged.blob_plan == ()
     with engine.begin() as conn:
         conn.execute(
@@ -599,7 +605,7 @@ async def test_settlement_rejects_a_staged_state_whose_validation_errors_retain_
         )
 
     with pytest.raises(AuditIntegrityError, match=_SETTLEMENT_TEXT):
-        await service.settle_guided_fork_operation(_settlement_command(fence, staged, None))
+        await service.settle_guided_fork_operation(_settlement_command(staged, None))
 
 
 # --- T6: the fork plan row never reaches GET /messages ------------------------

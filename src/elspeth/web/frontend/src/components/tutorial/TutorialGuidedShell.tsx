@@ -29,8 +29,16 @@ import { TutorialWorkspaceFrame } from "./TutorialWorkspaceFrame";
  * its stage's intent so the light model can focus. The SOURCE prompt carries NO
  * URLs in its constant — the LLM cannot guess the runtime-served addresses, so
  * the resolved synthetic URLs (fetched per-session from the 8a GET surface) are
- * appended to the source prompt only (the sink/transforms phases don't need
- * them). Wire is confirm-only (no chat prompt).
+ * appended to the source prompt only (the sink phase doesn't need them).
+ *
+ * TRANSFORMS has no entry (goal-first, elspeth-378cfa0e18): the frozen
+ * transforms prompt is now the session's ROOT INTENT, seeded at
+ * `/guided/start` by the mount effect below — the same shape a live goal
+ * takes. It is stated once, at the start, and the planner reads it at the
+ * step-2 finish; re-Sending it at step 3 would be a second planner run asking
+ * for what the first was already given. Step 3 therefore joins step 4 as
+ * confirm-only, with the empty read-only box the absent entry already
+ * produces. Frozen prompt TEXTS are unchanged (ADR-031).
  */
 function buildLockedPrompts(
   sampleUrls: string[],
@@ -38,7 +46,6 @@ function buildLockedPrompts(
   return {
     step_1_source: `${TUTORIAL_SOURCE_PROMPT}\n${sampleUrls.join("\n")}`,
     step_2_sink: TUTORIAL_SINK_PROMPT,
-    step_3_transforms: TUTORIAL_TRANSFORMS_PROMPT,
   };
 }
 
@@ -173,7 +180,11 @@ export function TutorialGuidedShell({
         return true;
       };
       try {
-        await seedGuided(sessionId, "tutorial");
+        // The frozen lesson prompt IS the tutorial session's goal, seeded as
+        // the start's root intent exactly as a live goal is (goal-first). Not
+        // a tutorial-special path: the server requires an intent on every
+        // start, and the learner reads it back as the first transcript turn.
+        await seedGuided(sessionId, "tutorial", TUTORIAL_TRANSFORMS_PROMPT);
         if (await exitIfRequested()) {
           return;
         }

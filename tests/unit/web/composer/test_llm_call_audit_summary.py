@@ -277,6 +277,7 @@ class _CapturingSessionService:
         *,
         writer_principal: str,
         composition_state_id: UUID | None = None,
+        **_fenced_kwargs: object,
     ) -> None:
         # In-memory double: the cohort is trivially atomic, so record one
         # captured message per draft with the same kwargs shape the old

@@ -4,7 +4,9 @@ import sys
 from dataclasses import replace as _replace_dataclass
 
 from elspeth.contracts.errors import GuidedCustodyIntegrityError
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerResult
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.titles import is_default_session_title
 
 from ._helpers import (
@@ -131,7 +133,16 @@ def register_message_routes(router: APIRouter) -> None:
         service: SessionServiceProtocol = request.app.state.session_service
         settings = request.app.state.settings
         compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
-        async with compose_lock:
+        async with (
+            compose_lock,
+            await SessionOperationLease.acquire(
+                service.session_operation_authority,
+                session_id=session.id,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
+            ) as compose_operation_lease,
+        ):
             # 1. Load or create CompositionState — needed before user message
             #    for pre-send provenance (AD-7: user msg records what user saw).
             state_record = await service.get_current_state(session.id)
@@ -216,6 +227,7 @@ def register_message_routes(router: APIRouter) -> None:
                 body.content,
                 composition_state_id=pre_send_state_id,
                 writer_principal="route_user_message",
+                session_operation_context=compose_operation_lease.context,
             )
             progress_registry = _get_composer_progress_registry(request)
             progress_sink = _composer_progress_sink(
@@ -291,7 +303,7 @@ def register_message_routes(router: APIRouter) -> None:
                 # gets re-titled. Tighten to a separate auto_titled_at
                 # column if this becomes annoying.
                 if len(records) == 1 and is_default_session_title(session.title):
-                    auto_title_task = asyncio.create_task(
+                    auto_title_task = compose_operation_lease.create_task(
                         maybe_auto_title_session(
                             service=service,
                             session_id=session.id,
@@ -299,6 +311,7 @@ def register_message_routes(router: APIRouter) -> None:
                             model=settings.composer_model,
                             temperature=settings.composer_temperature,
                             seed=settings.composer_seed,
+                            session_operation_context=compose_operation_lease.context,
                             # Auto-title uses the PRIMARY composer role only
                             # (Phase 3 Task 2 endpoint affordance) — never
                             # the advisor's endpoint.
@@ -335,6 +348,7 @@ def register_message_routes(router: APIRouter) -> None:
                             user_id=str(user.user_id),
                             progress=progress_sink,
                             guided_terminal=_guided_terminal_for_compose,
+                            session_operation_context=compose_operation_lease.context,
                             # Bind the freshly persisted user message id so any
                             # inline_blob created by
                             # this turn's tool calls can record provenance
@@ -368,6 +382,7 @@ def register_message_routes(router: APIRouter) -> None:
                         plugin_snapshot=plugin_snapshot,
                         profile_registry=profile_registry,
                         catalog=request.app.state.catalog_service,
+                        session_operation_context=compose_operation_lease.context,
                     )
                     raise HTTPException(status_code=422, detail=response_body) from exc
                 except LiteLLMAuthError as exc:
@@ -511,6 +526,7 @@ def register_message_routes(router: APIRouter) -> None:
                         plugin_snapshot=plugin_snapshot,
                         profile_registry=profile_registry,
                         catalog=request.app.state.catalog_service,
+                        session_operation_context=compose_operation_lease.context,
                     )
                     await _publish_progress(
                         progress_sink,
@@ -576,6 +592,7 @@ def register_message_routes(router: APIRouter) -> None:
                         plugin_snapshot=plugin_snapshot,
                         profile_registry=profile_registry,
                         catalog=request.app.state.catalog_service,
+                        session_operation_context=compose_operation_lease.context,
                     )
                     raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
                 except PipelinePlannerError as exc:
@@ -710,6 +727,7 @@ def register_message_routes(router: APIRouter) -> None:
                 if result.pipeline_commit_intent is not None:
                     settlement_outcome = await settle_auto_commit_intent(
                         request=request,
+                        session_operation_context=compose_operation_lease.context,
                         user=user,
                         service=service,
                         session_id=session.id,
@@ -803,6 +821,7 @@ def register_message_routes(router: APIRouter) -> None:
                             plugin_snapshot=plugin_snapshot,
                             profile_registry=profile_registry,
                             catalog=request.app.state.catalog_service,
+                            session_operation_context=compose_operation_lease.context,
                         )
                         raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
                     await _publish_progress(
@@ -821,6 +840,7 @@ def register_message_routes(router: APIRouter) -> None:
                             state=state_data,
                             assistant_content=_turn_end.content,
                             raw_content=_turn_end.raw_content,
+                            session_operation_context=compose_operation_lease.context,
                         )
                         new_state_record = transition_settlement.state
                         assistant_msg = transition_settlement.message
@@ -831,6 +851,7 @@ def register_message_routes(router: APIRouter) -> None:
                             # Successful send-message state advance after the LLM
                             # composer returns a newer state version.
                             provenance="post_compose",
+                            session_operation_context=compose_operation_lease.context,
                         )
                     state_response = _state_response(new_state_record, live_validation=validation)
                     post_compose_state_id = new_state_record.id
@@ -860,6 +881,7 @@ def register_message_routes(router: APIRouter) -> None:
                         state=_transition_state_data,
                         assistant_content=_turn_end.content,
                         raw_content=_turn_end.raw_content,
+                        session_operation_context=compose_operation_lease.context,
                     )
                     _transition_record = transition_settlement.state
                     assistant_msg = transition_settlement.message
@@ -1090,9 +1112,13 @@ def register_message_routes(router: APIRouter) -> None:
             include_raw_content=include_raw_content,
         ):
             audit_query_args = {key: value for key, value in request.query_params.items() if key in AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST}
+            # The authority re-proves (session, principal, provider) against the
+            # live row before writing, so the provider is the session's own —
+            # ownership above already proved it equals the deployment's.
             await service.record_audit_grade_view_async(
                 session_id=str(session.id),
                 requesting_principal=user.user_id,
+                auth_provider_type=session.auth_provider_type,
                 request_path=request.url.path,
                 query_args=audit_query_args,
                 ip_address=request.client.host if request.client else None,

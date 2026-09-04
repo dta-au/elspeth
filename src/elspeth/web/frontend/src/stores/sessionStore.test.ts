@@ -42,6 +42,16 @@ vi.mock("@/api/client", () => ({
   renameSession: vi.fn(),
   getGuided: vi.fn(),
   respondGuided: vi.fn(),
+  // The three WRITING guided-entry routes. Mocked (rather than absent) so the
+  // goal-first tests below can assert they were NOT called: "nothing is
+  // persisted before the user states a goal" is the whole point of the
+  // GET-first probe, and an unmocked export makes that assertion impossible
+  // to state.
+  startGuidedSession: vi.fn(),
+  convertToGuided: vi.fn(),
+  reenterGuided: vi.fn(),
+  reconcileGuidedStartOperation: vi.fn(),
+  chatGuided: vi.fn(),
   GuidedResponseReceiptError: class extends Error {},
   // Phase 1B — sessionStore.createSession calls resolveDefaultMode() on the
   // preferencesStore, which falls back to fetchUserComposerPreferences()
@@ -99,6 +109,38 @@ function makeCompositionState(version: number, nodeIds: string[] = []): Composit
     edges: [],
     outputs: [],
     metadata: { name: null, description: null },
+  };
+}
+
+/**
+ * The lazy in-memory stub GET /guided returns for a session with no persisted
+ * guided state (get_guided's docstring): the first step-1 turn, an empty
+ * transcript, and `composition_state: null`. Nothing has been written — which
+ * is exactly what a guided-default session looks like before its goal.
+ */
+function guidedStubResponse() {
+  return {
+    guided_session: {
+      step: "step_1_source",
+      history: [],
+      terminal: null,
+      chat_history: [],
+      chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] },
+      profile: null,
+    },
+    next_turn: {
+      type: "single_select",
+      step_index: 0,
+      turn_token: "a".repeat(64),
+      payload: {
+        question: "Which source plugin should we use?",
+        options: [{ id: "csv", label: "CSV", hint: null }],
+        allow_custom: false,
+      },
+    },
+    terminal: null,
+    composition_state: null,
   };
 }
 
@@ -2818,6 +2860,129 @@ describe("sessionStore", () => {
     });
   });
 
+  // ── Reload of a guided session that has not stated its goal ───────────────
+  //
+  // Goal-first (elspeth-378cfa0e18) removed the write that used to make this
+  // work by accident: convert persisted a rootless checkpoint, so a reload saw
+  // a real composition state and restored guided. With nothing persisted the
+  // probe returns the same lazy stub it returned the first time, and the only
+  // evidence that this session belongs on the guided surface is the account's
+  // default mode. Getting this wrong drops the user into freeform with the
+  // goal card gone — the failure the stub adoption exists to prevent.
+  describe("selectSession restores a goal-less guided-default session", () => {
+    async function setDefaultMode(mode: "guided" | "freeform"): Promise<void> {
+      const { usePreferencesStore } = await import("@/stores/preferencesStore");
+      usePreferencesStore.setState({
+        loaded: true,
+        defaultMode: mode,
+        bannerDismissedAt: null,
+        writing: false,
+      });
+    }
+
+    async function selectWithStub(
+      messages: ReadonlyArray<Record<string, unknown>> = [],
+    ): Promise<void> {
+      const apiClient = await import("@/api/client");
+      (apiClient.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue(
+        messages,
+      );
+      (
+        apiClient.fetchCompositionState as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(null);
+      (
+        apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>
+      ).mockResolvedValue([]);
+      (
+        apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(null);
+      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue(
+        guidedStubResponse(),
+      );
+      await useSessionStore.getState().selectSession("sess-goal");
+    }
+
+    it("re-adopts the stub under a guided default so the session reopens on the goal card", async () => {
+      await setDefaultMode("guided");
+
+      await selectWithStub();
+
+      const state = useSessionStore.getState();
+      expect(state.activeSessionId).toBe("sess-goal");
+      expect(state.guidedSession).not.toBeNull();
+      expect(state.guidedNextTurn).not.toBeNull();
+      // Still nothing persisted: re-adopting must not be a write either.
+      expect(state.compositionState).toBeNull();
+      const apiClient = await import("@/api/client");
+      expect(apiClient.convertToGuided).not.toHaveBeenCalled();
+      expect(apiClient.startGuidedSession).not.toHaveBeenCalled();
+    });
+
+    it("ignores the stub under a freeform default (a stub is not evidence of guided use)", async () => {
+      // The stub is returned for ANY session with no persisted guided state,
+      // including a brand-new freeform one. Adopting it unconditionally would
+      // flip a freeform-preferring user onto the guided surface on first load.
+      await setDefaultMode("freeform");
+
+      await selectWithStub();
+
+      const state = useSessionStore.getState();
+      expect(state.activeSessionId).toBe("sess-goal");
+      expect(state.guidedSession).toBeNull();
+      expect(state.guidedNextTurn).toBeNull();
+    });
+
+    it("leaves a worked freeform session in freeform even under a guided default", async () => {
+      // The stub is not a per-session signal — GET /guided answers with it for
+      // ANY session with no composition state, including a freeform session
+      // whose conversation never produced one (a message that triggered no
+      // compose tool call). Adopting on the preference alone would hide that
+      // real transcript behind the goal card, because the guided surface
+      // renders guided chat_history and not `messages`, and would do it
+      // retroactively to every message-only session the moment the user
+      // switched their default to guided. The adoption needs evidence about
+      // THIS session as well: an untouched one has no messages.
+      await setDefaultMode("guided");
+
+      await selectWithStub([
+        {
+          id: "user-1",
+          session_id: "sess-goal",
+          role: "user",
+          content: "what plugins can read a CSV?",
+          tool_calls: null,
+          created_at: "2026-09-03T00:00:00Z",
+        },
+      ]);
+
+      const state = useSessionStore.getState();
+      expect(state.activeSessionId).toBe("sess-goal");
+      expect(state.guidedSession).toBeNull();
+      expect(state.guidedNextTurn).toBeNull();
+      expect(state.messages).toHaveLength(1);
+    });
+
+    it("degrades to freeform when the default mode cannot be resolved", async () => {
+      // resolveDefaultMode throws when the preferences bootstrap produced no
+      // mode. Session selection must not become an error, and must not guess
+      // guided: the fallback is the same one createSession degrades to.
+      const { usePreferencesStore } = await import("@/stores/preferencesStore");
+      usePreferencesStore.setState({
+        loaded: true,
+        defaultMode: null,
+        bannerDismissedAt: null,
+        writing: false,
+      });
+
+      await selectWithStub();
+
+      const state = useSessionStore.getState();
+      expect(state.activeSessionId).toBe("sess-goal");
+      expect(state.guidedSession).toBeNull();
+      expect(state.error).toBeNull();
+    });
+  });
+
   describe("retryMessage abort handling", () => {
     it("drops stale retryMessage responses after the active session changes", async () => {
       const { recompose: mockRecompose } = await import("@/api/client");
@@ -3107,6 +3272,7 @@ describe("sessionStore", () => {
           terminal: { kind: "completed", reason: null },
           chat_history: [],
           chat_turn_seq: 0,
+          reviewed_components: { sources: [], outputs: [] },
           profile: null,
         } as never,
         guidedNextTurn: {} as never,
@@ -3249,6 +3415,7 @@ describe("sessionStore", () => {
           terminal: null,
           chat_history: [],
           chat_turn_seq: 0,
+          reviewed_components: { sources: [], outputs: [] },
           profile: null,
         },
         guidedNextTurn: {
@@ -3338,6 +3505,53 @@ describe("sessionStore", () => {
       await useSessionStore.getState().createSession();
 
       expect(enterGuided).toHaveBeenCalledTimes(1);
+      // The intent-less call is the contract: a brand-new session has no goal
+      // yet, so entry must land on the goal card (see the end-to-end pin
+      // below) rather than starting or converting anything.
+      expect(enterGuided).toHaveBeenCalledWith();
+    });
+
+    it("guided default: lands on the goal card by adopting the GET stub, writing NOTHING", async () => {
+      // The defect this pins (goal-first, elspeth-378cfa0e18): createSession's
+      // guided arm called enterGuided(), which called convertToGuided(), whose
+      // "no persisted state" branch PERSISTS a fresh rootless wizard. Every
+      // guided-default session was therefore created with a planner-reachable
+      // wizard behind no stated intent, and — because composition state was
+      // then non-null — the goal card could never render for it.
+      //
+      // enterGuided is deliberately NOT spied here: the sibling test above
+      // mocks it out and so proves only that the arm fires. This one runs the
+      // real action against a mocked GET so the routing itself is pinned.
+      const apiClient = await import("@/api/client");
+      const { usePreferencesStore } = await import("@/stores/preferencesStore");
+      usePreferencesStore.setState({
+        loaded: true,
+        defaultMode: "guided",
+        bannerDismissedAt: null,
+        writing: false,
+      });
+      (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        id: "sess-goal",
+        title: "untitled",
+        created_at: "2026-05-14T00:00:00Z",
+        updated_at: "2026-05-14T00:00:00Z",
+      });
+      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        guidedStubResponse(),
+      );
+
+      await useSessionStore.getState().createSession();
+
+      const state = useSessionStore.getState();
+      expect(apiClient.getGuided).toHaveBeenCalledWith("sess-goal");
+      expect(apiClient.convertToGuided).not.toHaveBeenCalled();
+      expect(apiClient.startGuidedSession).not.toHaveBeenCalled();
+      expect(state.guidedSession).not.toBeNull();
+      expect(state.guidedNextTurn).not.toBeNull();
+      // Null composition state IS the goal card's condition in ChatPanel, and
+      // it is the honest description of the session: nothing is persisted.
+      expect(state.compositionState).toBeNull();
+      expect(state.error).toBeNull();
     });
 
     it("prefs-bootstrap failure does NOT mask successful session creation (Panel M1)", async () => {

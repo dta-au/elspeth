@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, cast, get_origin
 from unittest.mock import patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -38,6 +38,7 @@ import elspeth.web.operator_telemetry as operator_telemetry_module
 from elspeth.contracts import RunStatus
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import PluginCapability
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
@@ -64,8 +65,10 @@ from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX,
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
     CompositionStateData,
+    CompositionStateRecord,
     RunRecord,
 )
+from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry, observed_value
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
@@ -183,6 +186,31 @@ def _settings(tmp_path: Path, **overrides) -> WebSettings:
     }
     defaults.update(overrides)
     return WebSettings(**defaults)  # type: ignore[arg-type]
+
+
+async def _save_session_seed_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+) -> CompositionStateRecord:
+    """Persist startup-test state under a real live COMPOSE authority."""
+    authority = service.session_operation_authority
+    context = await service._run_sync(
+        lambda: authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(authority.release, context)
 
 
 def _aws_settings(tmp_path: Path, **overrides: object) -> WebSettings:
@@ -374,6 +402,35 @@ class TestCreateApp:
         app = create_app(settings)
         assert app.state.settings is settings
         assert app.state.settings.port == 9999
+
+    def test_blob_acquire_archive_race_maps_to_nonleaking_not_found(self, tmp_path, monkeypatch) -> None:
+        """Archive may win after ownership verification but before lease acquire."""
+        from elspeth.web.auth.middleware import get_current_user
+        from elspeth.web.auth.models import UserIdentity
+        from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+
+        app = create_app(_settings(tmp_path))
+
+        async def _mock_user() -> UserIdentity:
+            return UserIdentity(user_id="test-user", username="test-user")
+
+        app.dependency_overrides[get_current_user] = _mock_user
+        client = TestClient(app, raise_server_exceptions=False)
+        created = client.post("/api/sessions", json={"title": "Acquire race"})
+        assert created.status_code == 201
+        session_id = created.json()["id"]
+
+        authority = app.state.session_service.session_operation_authority
+
+        def _archive_won(**_kwargs: object) -> None:
+            raise SessionOperationFenceLost(FenceLossReason.OWNER_INACTIVE)
+
+        monkeypatch.setattr(authority, "acquire", _archive_won)
+        response = client.get(f"/api/sessions/{session_id}/blobs/{uuid4()}")
+
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Session not found"}
+        assert "owner" not in response.text.lower()
 
     def test_repeated_create_app_reuses_process_telemetry_provider(self, tmp_path) -> None:
         first = create_app(_settings(tmp_path / "first"))
@@ -1229,6 +1286,10 @@ class TestSessionWiring:
         service = app.state.session_service
         assert service._operator_profile_registry is app.state.operator_profile_registry
         assert service._plugin_snapshot_factory.__self__ is app.state.plugin_snapshot_factory
+        assert service._audit_access_log_authority is app.state.audit_access_log_authority
+        assert service._skill_markdown_history_authority is app.state.skill_markdown_history_authority
+        assert app.state.user_secret_store._mutation_authority is app.state.user_secret_authority
+        assert app.state.preferences_service._mutation_authority is app.state.user_preference_authority
 
     def test_session_routes_registered(self, tmp_path) -> None:
         app = create_app(_settings(tmp_path))
@@ -1615,10 +1676,29 @@ class TestLifespanShutdown:
         )
         session_service = app.state.session_service
         session = await session_service.create_session("alice", "Pipeline", "local")
-        state = await session_service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        web_run = await session_service.create_run(session.id, state.id)
+        state = await _save_session_seed_state(session_service, session.id)
         landscape_run_id = "lscp-startup-orphan"
-        await session_service.update_run_status(web_run.id, "running", landscape_run_id=landscape_run_id)
+        authority = session_service.session_operation_authority
+        execute_context = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+        try:
+            web_run = await session_service.create_run(
+                session.id,
+                state.id,
+                session_operation_context=execute_context,
+            )
+            await session_service.update_run_status(
+                web_run.id,
+                "running",
+                landscape_run_id=landscape_run_id,
+                session_operation_context=execute_context,
+            )
+        finally:
+            authority.release(execute_context)
 
         with LandscapeDB.from_url(app.state.settings.get_landscape_url()) as db:
             RecorderFactory(db).run_lifecycle.begin_run(
@@ -1657,9 +1737,28 @@ class TestLifespanShutdown:
         )
         service = app.state.session_service
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        web_run = await service.create_run(session.id, state.id)
-        await service.update_run_status(web_run.id, "running", landscape_run_id="RAW_ABSENT_ANCHOR_SENTINEL")
+        state = await _save_session_seed_state(service, session.id)
+        authority = service.session_operation_authority
+        execute_context = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        try:
+            web_run = await service.create_run(
+                session.id,
+                state.id,
+                session_operation_context=execute_context,
+            )
+            await service.update_run_status(
+                web_run.id,
+                "running",
+                landscape_run_id="RAW_ABSENT_ANCHOR_SENTINEL",
+                session_operation_context=execute_context,
+            )
+        finally:
+            authority.release(execute_context)
 
         with capture_logs() as logs, patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
             async with lifespan(app):
@@ -1691,8 +1790,22 @@ class TestLifespanShutdown:
         )
         service = app.state.session_service
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        web_run = await service.create_run(session.id, state.id)
+        state = await _save_session_seed_state(service, session.id)
+        authority = service.session_operation_authority
+        execute_context = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        try:
+            web_run = await service.create_run(
+                session.id,
+                state.id,
+                session_operation_context=execute_context,
+            )
+        finally:
+            authority.release(execute_context)
 
         real_finalize = app_module._finalize_orphaned_landscape_runs
 
@@ -1713,10 +1826,29 @@ class TestLifespanShutdown:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
         service = app.state.session_service
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        web_run = await service.create_run(session.id, state.id)
+        state = await _save_session_seed_state(service, session.id)
         landscape_run_id = "landscape-marker-retry"
-        await service.update_run_status(web_run.id, "running", landscape_run_id=landscape_run_id)
+        authority = service.session_operation_authority
+        execute_context = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        try:
+            web_run = await service.create_run(
+                session.id,
+                state.id,
+                session_operation_context=execute_context,
+            )
+            await service.update_run_status(
+                web_run.id,
+                "running",
+                landscape_run_id=landscape_run_id,
+                session_operation_context=execute_context,
+            )
+        finally:
+            authority.release(execute_context)
         with LandscapeDB.from_url(app.state.settings.get_landscape_url()) as db:
             RecorderFactory(db).run_lifecycle.begin_run(
                 config={},

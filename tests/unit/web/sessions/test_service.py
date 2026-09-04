@@ -23,6 +23,7 @@ from elspeth.web.execution.schemas import (
     RunAccountingTokens,
     RunStatusResponse,
 )
+from elspeth.web.sessions.archive_quarantine import archive_quarantine_paths, list_archive_quarantine_manifests
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import (
@@ -50,8 +51,10 @@ from elspeth.web.sessions.protocol import (
     SessionRecord,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import QuarantineCleanupError, SessionServiceImpl
+from elspeth.web.sessions.service import QuarantineCleanupError
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import seed_session_operation_fence
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -73,7 +76,7 @@ def engine():
 @pytest.fixture
 def service(engine):
     """Create a SessionServiceImpl backed by the in-memory engine."""
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -196,7 +199,7 @@ class TestSessionCRUD:
         data_dir = tmp_path / "data"
         data_dir.mkdir()
 
-        service_with_dir = SessionServiceImpl(
+        service_with_dir = DualFencedSessionServiceHarness(
             engine,
             data_dir=data_dir,
             telemetry=build_sessions_telemetry(),
@@ -238,7 +241,7 @@ class TestSessionCRUD:
         data_dir = tmp_path / "data"
         data_dir.mkdir()
 
-        service_with_dir = SessionServiceImpl(
+        service_with_dir = DualFencedSessionServiceHarness(
             engine,
             data_dir=data_dir,
             telemetry=build_sessions_telemetry(),
@@ -252,14 +255,13 @@ class TestSessionCRUD:
         blob_file = blob_dir / "some-blob_data.csv"
         blob_file.write_text("col1\nval1")
 
-        quarantine_dir = data_dir / ".archive_quarantine" / sid
-
         def fail_rmtree(_path: object) -> None:
             raise OSError("permission denied removing staged blob directory")
 
         class _FailingRmtreeShutil:
             """Stand-in for the ``shutil`` name as seen from inside
-            ``elspeth.web.sessions.service``, scoped to that module only.
+            ``elspeth.web.sessions.archive_quarantine`` (where the purge now
+            lives), scoped to that module only.
 
             ``monkeypatch.setattr("...service.shutil.rmtree", ...)`` would
             resolve ``...service.shutil`` to the *real* ``shutil`` module
@@ -273,9 +275,9 @@ class TestSessionCRUD:
 
             rmtree = staticmethod(fail_rmtree)
 
-        monkeypatch.setattr("elspeth.web.sessions.service.shutil", _FailingRmtreeShutil())
+        monkeypatch.setattr("elspeth.web.sessions.archive_quarantine.shutil", _FailingRmtreeShutil())
 
-        with pytest.raises(QuarantineCleanupError, match=r"delete committed.*quarantine cleanup failed") as exc_info:
+        with pytest.raises(QuarantineCleanupError, match=r"archive committed.*quarantine cleanup remains pending") as exc_info:
             await service_with_dir.archive_session(session.id)
         assert isinstance(exc_info.value.__cause__, OSError)
         assert "permission denied removing staged blob directory" in str(exc_info.value.__cause__)
@@ -284,8 +286,15 @@ class TestSessionCRUD:
             await service_with_dir.get_session(session.id)
 
         assert not blob_dir.exists()
-        assert quarantine_dir.is_dir()
-        assert (quarantine_dir / blob_file.name).read_text() == "col1\nval1"
+        # The archive quarantine is an exact per-operation obligation
+        # (.archive_quarantine/v1/<session>/<epoch>-<operation>/payload); the
+        # staged payload must survive the failed purge byte-for-byte.
+        (manifest,) = list_archive_quarantine_manifests(data_dir, session.id)
+        assert manifest.identity.session_id == session.id
+        assert manifest.source_present is True
+        payload_dir = archive_quarantine_paths(data_dir, manifest.identity).payload
+        assert payload_dir.is_dir()
+        assert (payload_dir / blob_file.name).read_text() == "col1\nval1"
 
 
 class TestRunEvents:
@@ -305,6 +314,7 @@ class TestRunEvents:
                     updated_at=created_at,
                 )
             )
+            seed_session_operation_fence(conn, session_id, owner_instance_id=service.session_operation_owner_instance_id)
             conn.execute(
                 insert(composition_states_table).values(
                     id=str(state_id),
@@ -729,79 +739,6 @@ class TestGetStateInSession:
             await service.get_state_in_session(uuid.uuid4(), session.id)
 
 
-class TestSetActiveState:
-    """Tests for set_active_state -- revert by copying a prior version."""
-
-    @pytest.mark.asyncio
-    async def test_revert_creates_new_version(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await service.save_composition_state(
-            session.id, CompositionStateData(source={"type": "csv"}, is_valid=True), provenance="session_seed"
-        )
-        await service.save_composition_state(
-            session.id, CompositionStateData(source={"type": "api"}, is_valid=True), provenance="session_seed"
-        )
-        # Revert to v1 -- should create v3 as a copy of v1
-        reverted = await service.set_active_state(session.id, v1.id)
-        assert reverted.version == 3
-        # Content should match v1, not v2
-        assert reverted.sources == v1.sources
-        # Lineage: reverted state records where it came from (D6)
-        assert reverted.derived_from_state_id == v1.id
-
-    @pytest.mark.asyncio
-    async def test_revert_preserves_named_sources(self, service) -> None:
-        session = await service.create_session("alice", "Multi-source", "local")
-        sources = {
-            "orders": {"plugin": "csv", "on_success": "orders_rows", "on_validation_failure": "discard", "options": {"path": "orders.csv"}},
-            "refunds": {
-                "plugin": "csv",
-                "on_success": "refunds_rows",
-                "on_validation_failure": "discard",
-                "options": {"path": "refunds.csv"},
-            },
-        }
-        v1 = await service.save_composition_state(
-            session.id,
-            CompositionStateData(sources=sources, is_valid=True),
-            provenance="session_seed",
-        )
-        await service.save_composition_state(
-            session.id,
-            CompositionStateData(source={"plugin": "json", "on_success": "rows", "on_validation_failure": "discard", "options": {}}),
-            provenance="session_seed",
-        )
-
-        reverted = await service.set_active_state(session.id, v1.id)
-
-        assert reverted.sources == sources
-
-    @pytest.mark.asyncio
-    async def test_revert_preserves_history(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-        v2 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.set_active_state(session.id, v2.id)
-        versions = await service.get_state_versions(session.id)
-        # All three versions should exist (v1, v2, v3)
-        assert len(versions) == 3
-        assert [v.version for v in versions] == [1, 2, 3]
-
-    @pytest.mark.asyncio
-    async def test_revert_state_not_found_raises(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        with pytest.raises(ValueError, match="not found"):
-            await service.set_active_state(session.id, uuid.uuid4())
-
-    @pytest.mark.asyncio
-    async def test_revert_state_wrong_session_raises(self, service) -> None:
-        s1 = await service.create_session("alice", "Session 1", "local")
-        s2 = await service.create_session("alice", "Session 2", "local")
-        state = await service.save_composition_state(s1.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        with pytest.raises(ValueError, match="does not belong"):
-            await service.set_active_state(s2.id, state.id)
-
-
 class TestGetRun:
     """Tests for get_run -- fetch a RunRecord by UUID."""
 
@@ -1158,80 +1095,6 @@ class TestLandscapeRunIdWriteOnce:
 
 class TestCancelOrphanedRuns:
     """Tests for D5 -- cancel_orphaned_runs."""
-
-    @pytest.mark.asyncio
-    async def test_cancels_stale_running_run(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        # Cancel with max_age_seconds=0 so ANY running run is considered stale
-        cancelled = await service.cancel_orphaned_runs(
-            session.id,
-            max_age_seconds=0,
-        )
-        assert len(cancelled) == 1
-        assert cancelled[0].id == run.id
-        assert cancelled[0].status == "cancelled"
-
-    @pytest.mark.asyncio
-    async def test_does_not_cancel_recent_running_run(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        # max_age_seconds=3600 -- run was just created, so not stale
-        cancelled = await service.cancel_orphaned_runs(
-            session.id,
-            max_age_seconds=3600,
-        )
-        assert len(cancelled) == 0
-
-    @pytest.mark.asyncio
-    async def test_does_not_cancel_completed_runs(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(run.id, "completed", landscape_run_id="lscp-orphan-1")
-        cancelled = await service.cancel_orphaned_runs(
-            session.id,
-            max_age_seconds=0,
-        )
-        assert len(cancelled) == 0
-
-    @pytest.mark.asyncio
-    async def test_cancel_unblocks_session_for_new_run(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.cancel_orphaned_runs(session.id, max_age_seconds=0)
-        # Session should now accept a new run
-        run2 = await service.create_run(session.id, state.id)
-        assert run2.status == "pending"
-
-    @pytest.mark.asyncio
-    async def test_cancel_includes_pending_orphans(self, service) -> None:
-        """A run stuck in 'pending' (crash before transition to running) is also cleaned."""
-        session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        # Create run that stays in pending (simulates crash before running transition)
-        await service.create_run(session.id, state.id)
-        cancelled = await service.cancel_orphaned_runs(session.id, max_age_seconds=0)
-        assert len(cancelled) == 1
-        assert cancelled[0].status == "cancelled"
-
-    @pytest.mark.asyncio
-    async def test_cancel_does_not_touch_completed_runs(self, service) -> None:
-        """Completed runs are never cancelled regardless of age."""
-        session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(run.id, "completed", landscape_run_id="lscp-orphan-2")
-        cancelled = await service.cancel_orphaned_runs(session.id, max_age_seconds=0)
-        assert len(cancelled) == 0
 
 
 class TestCancelAllOrphanedRuns:
@@ -1874,101 +1737,6 @@ class TestPagination:
         assert versions[1].version == 5
 
 
-class TestPruneStateVersions:
-    """Tests for prune_state_versions -- delete old versions, preserve recent and run-referenced."""
-
-    @pytest.mark.asyncio
-    async def test_prune_deletes_old_versions(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        for _ in range(5):
-            await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-
-        deleted = await service.prune_state_versions(session.id, keep_latest=2)
-        assert deleted == 3
-
-        remaining = await service.get_state_versions(session.id)
-        assert len(remaining) == 2
-        assert [v.version for v in remaining] == [4, 5]
-
-    @pytest.mark.asyncio
-    async def test_prune_preserves_run_referenced_versions(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-
-        # Create a run referencing v1
-        await service.create_run(session.id, v1.id)
-
-        # Prune keeping only latest 1 -- v1 should survive (run-referenced), v2 deleted
-        deleted = await service.prune_state_versions(session.id, keep_latest=1)
-        assert deleted == 1  # only v2 deleted
-
-        remaining = await service.get_state_versions(session.id)
-        remaining_versions = [v.version for v in remaining]
-        assert 1 in remaining_versions  # preserved by run reference
-        assert 2 not in remaining_versions  # deleted
-        assert 3 in remaining_versions  # kept as latest
-
-    @pytest.mark.asyncio
-    async def test_prune_returns_zero_when_nothing_to_prune(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        for _ in range(2):
-            await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-
-        deleted = await service.prune_state_versions(session.id, keep_latest=5)
-        assert deleted == 0
-
-    @pytest.mark.asyncio
-    async def test_prune_preserves_derived_from_lineage(self, service) -> None:
-        """States referenced via derived_from_state_id must survive pruning.
-
-        Scenario: v1 (normal), v2 (normal), v3 (revert to v1).
-        Prune with keep_latest=1 keeps v3 (latest).  v1 must survive
-        because v3.derived_from_state_id points at it.  v2 can be deleted.
-        """
-        session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-        # Revert to v1 — creates v3 with derived_from_state_id = v1.id
-        v3 = await service.set_active_state(session.id, v1.id)
-        assert v3.derived_from_state_id == v1.id
-
-        deleted = await service.prune_state_versions(session.id, keep_latest=1)
-        assert deleted == 1  # only v2 deleted
-
-        remaining = await service.get_state_versions(session.id)
-        remaining_ids = {v.id for v in remaining}
-        assert v1.id in remaining_ids, "v1 must survive — referenced by v3.derived_from_state_id"
-        assert v3.id in remaining_ids, "v3 must survive — it is the latest version"
-
-    @pytest.mark.asyncio
-    async def test_prune_preserves_transitive_derived_lineage(self, service) -> None:
-        """Transitive derived_from chains must be fully preserved.
-
-        Scenario: v1, v2, v3 (revert→v1), v4, v5 (revert→v3).
-        Prune with keep_latest=1 keeps v5.  v3 must survive (v5 points
-        at it), and v1 must survive (v3 points at it).  v2 and v4 can go.
-        """
-        session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-        # v3: revert to v1
-        v3 = await service.set_active_state(session.id, v1.id)
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-        # v5: revert to v3
-        v5 = await service.set_active_state(session.id, v3.id)
-
-        deleted = await service.prune_state_versions(session.id, keep_latest=1)
-        assert deleted == 2  # v2 and v4 deleted
-
-        remaining = await service.get_state_versions(session.id)
-        remaining_ids = {v.id for v in remaining}
-        assert v1.id in remaining_ids, "v1 must survive — v3.derived_from_state_id"
-        assert v3.id in remaining_ids, "v3 must survive — v5.derived_from_state_id"
-        assert v5.id in remaining_ids, "v5 must survive — latest version"
-
-
 class TestAddMessageWithTranscript:
     """Single-transaction write+read for the freeform send snapshot (F-1).
 
@@ -2062,7 +1830,7 @@ class TestAddMessageWithTranscript:
         engine = create_session_engine(f"sqlite:///{tmp_path / 'stale-reader-sessions.db'}")
         initialize_session_schema(engine)
         try:
-            service = SessionServiceImpl(
+            service = DualFencedSessionServiceHarness(
                 engine,
                 telemetry=build_sessions_telemetry(),
                 log=structlog.get_logger("test.stale-reader"),
@@ -2116,7 +1884,7 @@ class TestAddMessageWithTranscript:
         engine = create_session_engine(f"sqlite:///{tmp_path / 'one-conn-sessions.db'}")
         initialize_session_schema(engine)
         try:
-            service = SessionServiceImpl(
+            service = DualFencedSessionServiceHarness(
                 engine,
                 telemetry=build_sessions_telemetry(),
                 log=structlog.get_logger("test.one-conn"),
@@ -2262,7 +2030,7 @@ class TestCreateRunSessionLockDomain:
     def test_create_run_waits_for_session_custody_lock(self, tmp_path) -> None:
         engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
         initialize_session_schema(engine)
-        service = SessionServiceImpl(
+        service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),

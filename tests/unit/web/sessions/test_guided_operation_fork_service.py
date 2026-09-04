@@ -9,6 +9,7 @@ import os
 import re
 import threading
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -27,30 +28,42 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.blobs.protocol import BlobForkWriteFence, BlobInProgressForkError, fork_blob_id
 from elspeth.web.blobs.service import BlobServiceImpl
+from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost, SessionOperationKind
+from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, chat_messages_table, guided_operations_table, sessions_table
+from elspeth.web.sessions.models import (
+    blobs_table,
+    chat_messages_table,
+    guided_operation_events_table,
+    guided_operations_table,
+    session_operation_fences_table,
+    sessions_table,
+)
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
+    CompositionStateProvenance,
     CompositionStateRecord,
     GuidedForkSettlementCommand,
     GuidedOperationActive,
     GuidedOperationClaimed,
     GuidedOperationCompleted,
     GuidedOperationFailed,
+    GuidedOperationFenceLostError,
     GuidedOperationTakenOver,
     GuidedSessionResult,
-    SessionGuidedOperationInProgressError,
-    SessionNotFoundError,
+    SessionForkParentAuthority,
 )
 from elspeth.web.sessions.routes.sessions import _rewrite_fork_state_blob_custody
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import (
     SessionServiceImpl,
     _fork_blob_plan_from_content,
+    _GuidedSessionMutations,
     _value_references_parent_blob,
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 from tests.unit.web.sessions.test_fork import _complete_guided_start_authority, _make_fork_app
 
 
@@ -67,7 +80,7 @@ def engine():
 
 @pytest.fixture()
 def service(engine) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -93,11 +106,84 @@ def durable_engine(request: pytest.FixtureRequest, tmp_path: Path):
 
 
 def _service_for(engine: Any) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.fork-race"),
     )
+
+
+async def _create_test_blob(
+    session_service: SessionServiceImpl,
+    blob_service: BlobServiceImpl,
+    session_id: UUID,
+    filename: str,
+    content: bytes,
+    mime_type: str,
+):
+    context = await session_service._run_sync(
+        lambda: session_service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.CREATE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await blob_service.create_blob(
+            session_id,
+            filename,
+            content,
+            mime_type,
+        )
+    finally:
+        await session_service._run_sync(session_service.session_operation_authority.release, context)
+
+
+async def _delete_test_blob(
+    session_service: SessionServiceImpl,
+    blob_service: BlobServiceImpl,
+    session_id: UUID,
+    blob_id: UUID,
+) -> None:
+    context = await session_service._run_sync(
+        lambda: session_service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        await blob_service.delete_blob(blob_id)
+    finally:
+        await session_service._run_sync(session_service.session_operation_authority.release, context)
+
+
+async def _save_composition_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
 
 
 async def _service_lock_contention(
@@ -107,26 +193,66 @@ async def _service_lock_contention(
     first: Callable[[], Awaitable[Any]],
     second: Callable[[], Awaitable[Any]],
 ) -> tuple[Any, Any]:
-    """Pause the winner while it holds the real session lock, then contend."""
+    """Pause the winner inside the operation authority, then contend."""
 
-    original_first_lock = first_service._session_write_lock
+    first_authority = first_service.session_operation_authority
+    second_authority = second_service.session_operation_authority
+    original_first_single = first_authority._locked_transaction
+    original_first_pair = first_authority._locked_pair_transaction
+    original_second_single = second_authority._locked_transaction
+    original_second_pair = second_authority._locked_pair_transaction
     original_second_begin = second_service._session_process_locked_begin
     original_second_lock = second_service._session_write_lock
-    held = threading.Barrier(2)
-    release = threading.Barrier(2)
+    held = threading.Event()
+    release = threading.Event()
     contender_waiting = threading.Event()
     contender_acquired = threading.Event()
     paused = False
+    first_single_calls = 0
+
+    def pause_first(locked_session_ids: tuple[str, ...]) -> None:
+        nonlocal paused
+        if str(session_id) in locked_session_ids and not paused:
+            paused = True
+            held.set()
+            assert release.wait(timeout=10)
 
     @contextlib.contextmanager
-    def controlled_first_lock(conn: Any, locked_session_id: str):
-        nonlocal paused
-        with original_first_lock(conn, locked_session_id):
-            if locked_session_id == str(session_id) and not paused:
-                paused = True
-                held.wait(timeout=5)
-                release.wait(timeout=5)
-            yield
+    def controlled_first_single(locked_session_id: str):
+        nonlocal first_single_calls
+        with original_first_single(locked_session_id) as conn:
+            first_single_calls += 1
+            # Archive uses three short authority transactions: acquire,
+            # decision, then terminal cascade. Pause the terminal transaction
+            # so "archive first" means the contender observes the committed
+            # cascade, not merely the earlier lease acquisition.
+            if first_single_calls >= 3:
+                pause_first((locked_session_id,))
+            yield conn
+
+    @contextlib.contextmanager
+    def controlled_first_pair(first_session_id: str, second_session_id: str):
+        with original_first_pair(first_session_id, second_session_id) as conn:
+            pause_first((first_session_id, second_session_id))
+            yield conn
+
+    @contextlib.contextmanager
+    def observed_second_single(locked_session_id: str):
+        if locked_session_id == str(session_id):
+            contender_waiting.set()
+        with original_second_single(locked_session_id) as conn:
+            if locked_session_id == str(session_id):
+                contender_acquired.set()
+            yield conn
+
+    @contextlib.contextmanager
+    def observed_second_pair(first_session_id: str, second_session_id: str):
+        if str(session_id) in {first_session_id, second_session_id}:
+            contender_waiting.set()
+        with original_second_pair(first_session_id, second_session_id) as conn:
+            if str(session_id) in {first_session_id, second_session_id}:
+                contender_acquired.set()
+            yield conn
 
     @contextlib.contextmanager
     def observed_second_begin(locked_session_id: str):
@@ -143,16 +269,19 @@ async def _service_lock_contention(
             yield
 
     with (
-        patch.object(first_service, "_session_write_lock", new=controlled_first_lock),
+        patch.object(first_authority, "_locked_transaction", new=controlled_first_single),
+        patch.object(first_authority, "_locked_pair_transaction", new=controlled_first_pair),
+        patch.object(second_authority, "_locked_transaction", new=observed_second_single),
+        patch.object(second_authority, "_locked_pair_transaction", new=observed_second_pair),
         patch.object(second_service, "_session_process_locked_begin", new=observed_second_begin),
         patch.object(second_service, "_session_write_lock", new=observed_second_lock),
     ):
         first_task = asyncio.create_task(first())
-        await asyncio.to_thread(held.wait, 5)
+        assert await asyncio.to_thread(held.wait, 10)
         second_task = asyncio.create_task(second())
-        assert await asyncio.to_thread(contender_waiting.wait, 5)
+        assert await asyncio.to_thread(contender_waiting.wait, 10)
         was_blocked = not contender_acquired.is_set()
-        await asyncio.to_thread(release.wait, 5)
+        release.set()
         results = tuple(await asyncio.gather(first_task, second_task, return_exceptions=True))
         assert was_blocked
         return results  # type: ignore[return-value]
@@ -164,44 +293,49 @@ async def _blob_delete_first_contention(
     delete_first: Callable[[], Awaitable[Any]],
     reserve_second: Callable[[], Awaitable[Any]],
 ) -> tuple[Any, Any]:
-    """Hold blob deletion's source lock while fork reservation contends on it."""
+    """Hold blob deletion's custody lock while fork reservation contends on it.
+
+    ``delete_blob`` holds ``_blob_custody_session_lock`` across its phase
+    transaction; on SQLite that is the same-session process mutex every other
+    same-session writer (the operation authority's reservation, fork staging)
+    must take first. The contender must be observed asking for that mutex and
+    must hold it only after the delete releases.
+    """
 
     from elspeth.web.blobs import service as blob_service_module
+    from elspeth.web.sessions import locking as session_locking
 
+    del reserve_service  # the contender is observed at the lock, not on a service seam
     original_blob_lock = blob_service_module._blob_custody_session_lock
-    original_service_begin = reserve_service._session_process_locked_begin
-    original_service_lock = reserve_service._session_write_lock
+    original_mutex = session_locking.sqlite_session_mutex
     held = threading.Barrier(2)
     release = threading.Barrier(2)
     reserve_waiting = threading.Event()
     reserve_acquired = threading.Event()
+    delete_thread: list[threading.Thread] = []
 
     @contextlib.contextmanager
     def controlled_blob_lock(engine: Any, locked_session_id: str):
         with original_blob_lock(engine, locked_session_id) as conn:
             if locked_session_id == str(session_id):
+                delete_thread.append(threading.current_thread())
                 held.wait(timeout=5)
                 release.wait(timeout=5)
             yield conn
 
     @contextlib.contextmanager
-    def observed_service_begin(locked_session_id: str):
-        if locked_session_id == str(session_id):
+    def observed_mutex(engine: Any, locked_session_id: str):
+        contender = locked_session_id == str(session_id) and delete_thread and threading.current_thread() is not delete_thread[0]
+        if contender:
             reserve_waiting.set()
-        with original_service_begin(locked_session_id) as conn:
-            yield conn
-
-    @contextlib.contextmanager
-    def observed_service_lock(conn: Any, locked_session_id: str):
-        with original_service_lock(conn, locked_session_id):
-            if locked_session_id == str(session_id):
+        with original_mutex(engine, locked_session_id):
+            if contender:
                 reserve_acquired.set()
             yield
 
     with (
         patch.object(blob_service_module, "_blob_custody_session_lock", new=controlled_blob_lock),
-        patch.object(reserve_service, "_session_process_locked_begin", new=observed_service_begin),
-        patch.object(reserve_service, "_session_write_lock", new=observed_service_lock),
+        patch.object(session_locking, "sqlite_session_mutex", new=observed_mutex),
     ):
         delete_task = asyncio.create_task(delete_first())
         await asyncio.to_thread(held.wait, 5)
@@ -220,12 +354,13 @@ async def _fork_first_blob_contention(
     fork_first: Callable[[], Awaitable[Any]],
     delete_second: Callable[[], Awaitable[Any]],
 ) -> tuple[Any, Any]:
-    """Hold fork reservation's source lock while blob deletion contends on it."""
+    """Hold fork staging's custody transaction while blob deletion contends on it."""
 
     from elspeth.web.blobs import service as blob_service_module
+    from elspeth.web.coordination import repository as coordination_repository
 
     original_blob_lock = blob_service_module._blob_custody_session_lock
-    original_service_lock = fork_service._session_write_lock
+    original_transaction_lock = coordination_repository.transaction_session_lock
     held = threading.Barrier(2)
     release = threading.Barrier(2)
     delete_waiting = threading.Event()
@@ -233,9 +368,9 @@ async def _fork_first_blob_contention(
     paused = False
 
     @contextlib.contextmanager
-    def controlled_service_lock(conn: Any, locked_session_id: str):
+    def controlled_transaction_lock(conn: Any, engine: Any, locked_session_id: str):
         nonlocal paused
-        with original_service_lock(conn, locked_session_id):
+        with original_transaction_lock(conn, engine, locked_session_id):
             if locked_session_id == str(session_id) and not paused:
                 paused = True
                 held.wait(timeout=5)
@@ -252,7 +387,7 @@ async def _fork_first_blob_contention(
             yield conn
 
     with (
-        patch.object(fork_service, "_session_write_lock", new=controlled_service_lock),
+        patch.object(coordination_repository, "transaction_session_lock", new=controlled_transaction_lock),
         patch.object(blob_service_module, "_blob_custody_session_lock", new=observed_blob_lock),
     ):
         fork_task = asyncio.create_task(fork_first())
@@ -272,16 +407,157 @@ def _cleanup_race_user(engine: Any, user_id: str) -> None:
 
 
 async def _claim_fork(service: SessionServiceImpl, parent_id: UUID, *, operation_id: str | None = None):
+    return await _claim_dual_fenced_fork(
+        service,
+        parent_id,
+        operation_id=operation_id,
+    )
+
+
+async def _claim_dual_fenced_fork(
+    service: SessionServiceImpl,
+    parent_id: UUID,
+    *,
+    operation_id: str | None = None,
+) -> SessionForkParentAuthority:
+    parent_context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=parent_id,
+            operation_kind=SessionOperationKind.SESSION_FORK,
+            owner_instance_id=service._owner_instance_id,
+            lease_seconds=service._session_operation_lease_seconds,
+        )
+    )
     claimed = await service.reserve_guided_operation(
         session_id=parent_id,
         operation_id=operation_id or str(uuid4()),
         kind="session_fork",
         request_hash="a" * 64,
         actor="composer_route",
-        lease_seconds=300,
+        lease_seconds=service._session_operation_lease_seconds,
+        session_operation_context=parent_context,
     )
     assert type(claimed) in {GuidedOperationClaimed, GuidedOperationTakenOver}
-    return claimed.fence
+    return SessionForkParentAuthority(
+        parent_context=parent_context,
+        guided_fence=claimed.fence,
+    )
+
+
+def _release_fork_authority(
+    service: SessionServiceImpl,
+    authority,
+) -> None:
+    service.session_operation_authority.release(authority.child_context)
+    service.session_operation_authority.release(authority.parent.parent_context)
+
+
+@pytest.mark.asyncio
+async def test_dual_fenced_fork_server_mints_child_epoch_two_and_takeover_rotates_both(
+    service: SessionServiceImpl,
+    engine,
+) -> None:
+    parent, fork_message = await _parent_with_fork_message(service)
+    operation_id = str(uuid4())
+    first_authority = await _claim_dual_fenced_fork(service, parent.id, operation_id=operation_id)
+    first = await service.fork_session(
+        first_authority,
+        fork_message_id=fork_message.id,
+        new_message_content="edited",
+    )
+
+    assert first.authority.parent is first_authority
+    assert first.authority.parent.guided_fence.operation_id == operation_id
+    assert first.authority.child_context.operation_kind is SessionOperationKind.SESSION_FORK
+    assert first.authority.child_context.fence.operation_epoch == 2
+    assert first.authority.child_context.fence.operation_id != first.authority.parent.parent_context.fence.operation_id != operation_id
+
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+    with engine.begin() as conn:
+        conn.execute(
+            update(session_operation_fences_table)
+            .where(
+                session_operation_fences_table.c.session_id.in_(
+                    [
+                        str(parent.id),
+                        str(first.session.id),
+                    ]
+                )
+            )
+            .values(lease_expires_at=expired)
+        )
+        conn.execute(
+            update(guided_operations_table)
+            .where(
+                guided_operations_table.c.session_id == str(parent.id),
+                guided_operations_table.c.operation_id == operation_id,
+            )
+            .values(lease_expires_at=expired)
+        )
+
+    takeover_authority = await _claim_dual_fenced_fork(service, parent.id, operation_id=operation_id)
+    resumed = await service.fork_session(
+        takeover_authority,
+        fork_message_id=fork_message.id,
+        new_message_content="edited",
+    )
+
+    assert resumed.session.id == first.session.id
+    assert resumed.authority.parent.guided_fence.operation_id == operation_id
+    assert resumed.authority.parent.parent_context.fence.operation_epoch > first_authority.parent_context.fence.operation_epoch
+    assert resumed.authority.child_context.fence.operation_epoch > first.authority.child_context.fence.operation_epoch
+    assert resumed.authority.parent.parent_context.fence.lease_token != first_authority.parent_context.fence.lease_token
+    assert resumed.authority.child_context.fence.lease_token != first.authority.child_context.fence.lease_token
+
+
+@pytest.mark.asyncio
+async def test_hidden_fork_child_lease_uses_only_exact_composite_validation_and_renewal(
+    service: SessionServiceImpl,
+    engine,
+) -> None:
+    parent, fork_message = await _parent_with_fork_message(service)
+    parent_authority = await _claim_dual_fenced_fork(service, parent.id)
+    staged = await service.fork_session(
+        parent_authority,
+        fork_message_id=fork_message.id,
+        new_message_content="edited",
+    )
+    authority = service.session_operation_authority
+
+    assert authority.validate_fork_child_lease(staged.authority) == staged.authority.child_context
+    with pytest.raises(SessionOperationFenceLost) as generic_cas:
+        authority.compare_and_swap(staged.authority.child_context)
+    assert generic_cas.value.reason is FenceLossReason.OWNER_INACTIVE
+
+    with engine.connect() as conn:
+        before = conn.execute(
+            select(session_operation_fences_table.c.lease_expires_at).where(
+                session_operation_fences_table.c.session_id == str(staged.session.id)
+            )
+        ).scalar_one()
+    assert authority.renew_fork_child_lease(staged.authority, lease_seconds=600) == staged.authority.child_context
+    with engine.connect() as conn:
+        after = conn.execute(
+            select(session_operation_fences_table.c.lease_expires_at).where(
+                session_operation_fences_table.c.session_id == str(staged.session.id)
+            )
+        ).scalar_one()
+    assert after > before
+
+    with engine.begin() as conn:
+        conn.execute(
+            update(guided_operations_table)
+            .where(
+                guided_operations_table.c.session_id == str(parent.id),
+                guided_operations_table.c.operation_id == staged.authority.parent.guided_fence.operation_id,
+            )
+            .values(result_session_id=None)
+        )
+    with pytest.raises(AuditIntegrityError, match="exact bound child"):
+        authority.validate_fork_child_lease(staged.authority)
+
+    authority.release(staged.authority.child_context)
+    authority.release(staged.authority.parent.parent_context)
 
 
 async def _parent_with_fork_message(service: SessionServiceImpl):
@@ -379,14 +655,27 @@ async def test_fork_stages_one_hidden_bound_child_and_takeover_reuses_it(service
     assert first.state is None
     assert first.messages[-1].content == "edited"
     assert [session.id for session in await service.list_sessions("alice", "local", include_archived=True)] == [parent.id]
+    with engine.connect() as conn:
+        initial_fence = conn.execute(
+            select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(first.session.id))
+        ).one()
+    assert initial_fence.operation_kind == SessionOperationKind.SESSION_FORK.value
+    assert initial_fence.operation_epoch == 2
+    assert initial_fence.released_at is None
     with engine.begin() as conn:
+        expired = datetime.now(UTC) - timedelta(seconds=1)
+        conn.execute(
+            update(session_operation_fences_table)
+            .where(session_operation_fences_table.c.session_id.in_([str(parent.id), str(first.session.id)]))
+            .values(lease_expires_at=expired)
+        )
         conn.execute(
             update(guided_operations_table)
             .where(
                 guided_operations_table.c.session_id == str(parent.id),
                 guided_operations_table.c.operation_id == operation_id,
             )
-            .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+            .values(lease_expires_at=expired)
         )
     takeover_fence = await _claim_fork(service, parent.id, operation_id=operation_id)
 
@@ -406,9 +695,9 @@ async def test_fork_stages_one_hidden_bound_child_and_takeover_reuses_it(service
 @pytest.mark.asyncio
 async def test_takeover_fails_closed_when_bound_child_lineage_drifted(service, engine) -> None:
     parent, fork_message = await _parent_with_fork_message(service)
-    fence = await _claim_fork(service, parent.id)
+    parent_authority = await _claim_dual_fenced_fork(service, parent.id)
     staged = await service.fork_session(
-        fence,
+        parent_authority,
         fork_message_id=fork_message.id,
         new_message_content="edited",
     )
@@ -419,7 +708,7 @@ async def test_takeover_fails_closed_when_bound_child_lineage_drifted(service, e
 
     with pytest.raises(AuditIntegrityError, match="bound child"):
         await service.fork_session(
-            fence,
+            parent_authority,
             fork_message_id=fork_message.id,
             new_message_content="edited",
         )
@@ -428,7 +717,8 @@ async def test_takeover_fails_closed_when_bound_child_lineage_drifted(service, e
 @pytest.mark.asyncio
 async def test_settlement_rewrites_state_activates_child_and_completes_locator_atomically(service) -> None:
     parent = await service.create_session("alice", "Parent", "local")
-    original_state = await service.save_composition_state(
+    original_state = await _save_composition_state(
+        service,
         parent.id,
         CompositionStateData(
             sources={"orders": {"plugin": "csv", "options": {"blob_ref": str(uuid4())}}},
@@ -443,9 +733,9 @@ async def test_settlement_rewrites_state_activates_child_and_completes_locator_a
         composition_state_id=original_state.id,
         writer_principal="route_user_message",
     )
-    fence = await _claim_fork(service, parent.id)
+    parent_authority = await _claim_dual_fenced_fork(service, parent.id)
     staged = await service.fork_session(
-        fence,
+        parent_authority,
         fork_message_id=fork_message.id,
         new_message_content="edited",
     )
@@ -455,8 +745,7 @@ async def test_settlement_rewrites_state_activates_child_and_completes_locator_a
 
     settled = await service.settle_guided_fork_operation(
         GuidedForkSettlementCommand(
-            fence=fence,
-            child_session_id=staged.session.id,
+            authority=staged.authority,
             expected_current_state_id=staged.state.id,
             edited_message_id=staged.messages[-1].id,
             rewritten_state_id=uuid4(),
@@ -480,7 +769,7 @@ async def test_settlement_rewrites_state_activates_child_and_completes_locator_a
     assert edited_message.composition_state_id == current_state.id
     operation = await service.get_guided_operation(
         session_id=parent.id,
-        operation_id=fence.operation_id,
+        operation_id=parent_authority.guided_fence.operation_id,
         kind="session_fork",
         request_hash="a" * 64,
     )
@@ -488,6 +777,69 @@ async def test_settlement_rewrites_state_activates_child_and_completes_locator_a
         result=GuidedSessionResult(session_id=staged.session.id),
         response_hash=response_hash,
     )
+
+
+@pytest.mark.asyncio
+async def test_settlement_validates_composite_and_terminalizes_guided_before_child_activation(
+    service: SessionServiceImpl,
+) -> None:
+    parent, fork_message = await _parent_with_fork_message(service)
+    parent_authority = await _claim_dual_fenced_fork(service, parent.id)
+    staged = await service.fork_session(
+        parent_authority,
+        fork_message_id=fork_message.id,
+        new_message_content="edited",
+    )
+    observed_child_archived: list[bool] = []
+    original_complete = _GuidedSessionMutations.complete
+
+    def observed_complete(facet, *args, **kwargs):
+        observed_child_archived.append(staged.session.archived_at is not None)
+        return original_complete(facet, *args, **kwargs)
+
+    with patch.object(
+        _GuidedSessionMutations,
+        "complete",
+        new=observed_complete,
+    ):
+        settled = await service.settle_guided_fork_operation(
+            GuidedForkSettlementCommand(
+                authority=staged.authority,
+                expected_current_state_id=None,
+                edited_message_id=staged.messages[-1].id,
+                rewritten_state_id=None,
+                rewritten_state=None,
+                response_hash="c" * 64,
+                actor="composer_route",
+            )
+        )
+
+    assert observed_child_archived == [True]
+    assert settled.archived_at is None
+
+    stale_parent = replace(
+        staged.authority.parent.parent_context,
+        fence=replace(
+            staged.authority.parent.parent_context.fence,
+            lease_token="stale-parent-token",
+        ),
+    )
+    stale_authority = replace(
+        staged.authority,
+        parent=replace(staged.authority.parent, parent_context=stale_parent),
+    )
+    with pytest.raises(GuidedOperationFenceLostError):
+        await service.settle_guided_fork_operation(
+            GuidedForkSettlementCommand(
+                authority=stale_authority,
+                expected_current_state_id=None,
+                edited_message_id=staged.messages[-1].id,
+                rewritten_state_id=None,
+                rewritten_state=None,
+                response_hash="d" * 64,
+                actor="composer_route",
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -509,8 +861,7 @@ async def test_settlement_rejects_missing_retained_frozen_blob_plan(service, eng
     with pytest.raises(AuditIntegrityError, match="exactly one retained frozen blob plan"):
         await service.settle_guided_fork_operation(
             GuidedForkSettlementCommand(
-                fence=fence,
-                child_session_id=staged.session.id,
+                authority=staged.authority,
                 expected_current_state_id=None,
                 edited_message_id=staged.messages[-1].id,
                 rewritten_state_id=None,
@@ -548,8 +899,7 @@ async def test_settlement_requires_exact_ready_child_blob_cohort(service, engine
     with pytest.raises(AuditIntegrityError, match="child blob"):
         await service.settle_guided_fork_operation(
             GuidedForkSettlementCommand(
-                fence=fence,
-                child_session_id=staged.session.id,
+                authority=staged.authority,
                 expected_current_state_id=None,
                 edited_message_id=staged.messages[-1].id,
                 rewritten_state_id=None,
@@ -562,7 +912,7 @@ async def test_settlement_requires_exact_ready_child_blob_cohort(service, engine
     assert (await service.get_session(staged.session.id)).archived_at is not None
     operation = await service.get_guided_operation(
         session_id=parent.id,
-        operation_id=fence.operation_id,
+        operation_id=fence.guided_fence.operation_id,
         kind="session_fork",
         request_hash="a" * 64,
     )
@@ -585,7 +935,8 @@ async def test_settlement_rejects_rewritten_state_with_parent_blob_custody(
         session_id=parent.id,
         storage_path=parent_storage_path,
     )
-    original_state = await service.save_composition_state(
+    original_state = await _save_composition_state(
+        service,
         parent.id,
         CompositionStateData(sources={"orders": {"plugin": "csv", "options": {"path": "old.csv"}}}),
         provenance="session_seed",
@@ -617,8 +968,7 @@ async def test_settlement_rejects_rewritten_state_with_parent_blob_custody(
     with pytest.raises(AuditIntegrityError, match="retains parent blob custody"):
         await service.settle_guided_fork_operation(
             GuidedForkSettlementCommand(
-                fence=fence,
-                child_session_id=staged.session.id,
+                authority=staged.authority,
                 expected_current_state_id=staged.state.id,
                 edited_message_id=staged.messages[-1].id,
                 rewritten_state_id=uuid4(),
@@ -641,7 +991,8 @@ async def test_settlement_rejects_parent_blob_reference_excluded_from_ready_plan
         session_id=parent.id,
         status="pending",
     )
-    original_state = await service.save_composition_state(
+    original_state = await _save_composition_state(
+        service,
         parent.id,
         CompositionStateData(
             sources={
@@ -667,8 +1018,7 @@ async def test_settlement_rejects_parent_blob_reference_excluded_from_ready_plan
     with pytest.raises(AuditIntegrityError, match="retains parent blob custody"):
         await service.settle_guided_fork_operation(
             GuidedForkSettlementCommand(
-                fence=fence,
-                child_session_id=staged.session.id,
+                authority=staged.authority,
                 expected_current_state_id=staged.state.id,
                 edited_message_id=staged.messages[-1].id,
                 rewritten_state_id=uuid4(),
@@ -696,7 +1046,8 @@ async def test_settlement_fault_rolls_back_every_surface_and_child_remains_takeo
     fault_point: str,
 ) -> None:
     parent = await service.create_session("alice", "Parent", "local")
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         parent.id,
         CompositionStateData(sources={"source": {"plugin": "csv", "options": {"path": "old.csv"}}}, is_valid=True),
         provenance="session_seed",
@@ -738,8 +1089,7 @@ async def test_settlement_fault_rolls_back_every_surface_and_child_remains_takeo
         with pytest.raises(RuntimeError, match=fault_point):
             await service.settle_guided_fork_operation(
                 GuidedForkSettlementCommand(
-                    fence=fence,
-                    child_session_id=staged.session.id,
+                    authority=staged.authority,
                     expected_current_state_id=staged.state.id,
                     edited_message_id=staged.messages[-1].id,
                     rewritten_state_id=uuid4(),
@@ -763,7 +1113,7 @@ async def test_settlement_fault_rolls_back_every_surface_and_child_remains_takeo
     assert retained_edited.composition_state_id == staged.state.id
     operation = await service.get_guided_operation(
         session_id=parent.id,
-        operation_id=fence.operation_id,
+        operation_id=fence.guided_fence.operation_id,
         kind="session_fork",
         request_hash="a" * 64,
     )
@@ -782,7 +1132,7 @@ async def test_postgres_settlement_fault_matrix() -> None:
     initialize_session_schema(postgres_engine)
     with postgres_engine.connect() as conn:
         before_ids = {row.id for row in conn.execute(select(sessions_table.c.id)).all()}
-    postgres_service = SessionServiceImpl(
+    postgres_service = DualFencedSessionServiceHarness(
         postgres_engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.postgres-fork-settlement"),
@@ -811,7 +1161,7 @@ async def test_failed_binding_clear_retains_hidden_archived_child_and_plan(servi
     )
     assert staged.session.id not in {session.id for session in await service.list_sessions("alice", "local", include_archived=True)}
 
-    await service.fail_guided_operation(fence, failure_code="operation_failed", actor="composer_route")
+    await service.fail_guided_fork_operation(staged.authority, failure_code="operation_failed", actor="composer_route")
 
     listed = await service.list_sessions("alice", "local", include_archived=True)
     assert staged.session.id not in {session.id for session in listed}
@@ -831,7 +1181,7 @@ async def test_failed_binding_clear_retains_hidden_archived_child_and_plan(servi
 
 
 @pytest.mark.asyncio
-async def test_archiving_completed_fork_child_soft_archives_due_to_result_binding(service) -> None:
+async def test_archiving_completed_fork_child_soft_archives_due_to_result_binding(service, engine) -> None:
     parent, fork_message = await _parent_with_fork_message(service)
     fence = await _claim_fork(service, parent.id)
     staged = await service.fork_session(
@@ -841,8 +1191,7 @@ async def test_archiving_completed_fork_child_soft_archives_due_to_result_bindin
     )
     await service.settle_guided_fork_operation(
         GuidedForkSettlementCommand(
-            fence=fence,
-            child_session_id=staged.session.id,
+            authority=staged.authority,
             expected_current_state_id=None,
             edited_message_id=staged.messages[-1].id,
             rewritten_state_id=None,
@@ -851,16 +1200,47 @@ async def test_archiving_completed_fork_child_soft_archives_due_to_result_bindin
             actor="composer_route",
         )
     )
+    _release_fork_authority(service, staged.authority)
 
     await service.archive_session(staged.session.id)
 
     retained = await service.get_session(staged.session.id)
     assert retained.archived_at is not None
     assert staged.session.id in {session.id for session in await service.list_sessions("alice", "local", include_archived=True)}
+    with engine.connect() as conn:
+        archive_fence = conn.execute(
+            select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(staged.session.id))
+        ).one()
+    assert archive_fence.operation_kind == SessionOperationKind.ARCHIVE.value
+    assert archive_fence.operation_epoch == 3
+    assert archive_fence.released_at is not None
 
 
 @pytest.mark.asyncio
-async def test_archiving_completed_fork_parent_preserves_child_and_terminal_replay(service) -> None:
+async def test_archiving_in_progress_fork_child_is_refused_and_releases_archive_context(service, engine) -> None:
+    parent, fork_message = await _parent_with_fork_message(service)
+    fence = await _claim_fork(service, parent.id)
+    staged = await service.fork_session(
+        fence,
+        fork_message_id=fork_message.id,
+        new_message_content="edited",
+    )
+
+    with pytest.raises(SessionOperationConflictError):
+        await service.archive_session(staged.session.id)
+
+    assert (await service.get_session(staged.session.id)).archived_at is not None
+    with engine.connect() as conn:
+        released_fence = conn.execute(
+            select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(staged.session.id))
+        ).one()
+    assert released_fence.operation_kind == SessionOperationKind.SESSION_FORK.value
+    assert released_fence.operation_epoch == 2
+    assert released_fence.released_at is None
+
+
+@pytest.mark.asyncio
+async def test_archiving_completed_fork_parent_preserves_child_and_terminal_evidence(service) -> None:
     parent, fork_message = await _parent_with_fork_message(service)
     operation_id = str(uuid4())
     fence = await _claim_fork(service, parent.id, operation_id=operation_id)
@@ -871,8 +1251,7 @@ async def test_archiving_completed_fork_parent_preserves_child_and_terminal_repl
     )
     await service.settle_guided_fork_operation(
         GuidedForkSettlementCommand(
-            fence=fence,
-            child_session_id=staged.session.id,
+            authority=staged.authority,
             expected_current_state_id=None,
             edited_message_id=staged.messages[-1].id,
             rewritten_state_id=None,
@@ -881,15 +1260,22 @@ async def test_archiving_completed_fork_parent_preserves_child_and_terminal_repl
             actor="composer_route",
         )
     )
+    _release_fork_authority(service, staged.authority)
 
     await service.archive_session(parent.id)
-    replay = await service.reserve_guided_operation(
+    with pytest.raises(SessionOperationFenceLost) as inactive:
+        service.session_operation_authority.acquire(
+            session_id=parent.id,
+            operation_kind=SessionOperationKind.SESSION_FORK,
+            owner_instance_id=service._owner_instance_id,
+            lease_seconds=service._session_operation_lease_seconds,
+        )
+    assert inactive.value.reason is FenceLossReason.OWNER_INACTIVE
+    replay = await service.get_guided_operation(
         session_id=parent.id,
         operation_id=operation_id,
         kind="session_fork",
         request_hash="a" * 64,
-        actor="composer_route",
-        lease_seconds=300,
     )
 
     assert replay == GuidedOperationCompleted(
@@ -910,16 +1296,23 @@ async def test_archiving_failed_fork_parent_preserves_failed_operation_and_child
         fork_message_id=fork_message.id,
         new_message_content="edited",
     )
-    await service.fail_guided_operation(fence, failure_code="operation_failed", actor="composer_route")
+    await service.fail_guided_fork_operation(staged.authority, failure_code="operation_failed", actor="composer_route")
+    _release_fork_authority(service, staged.authority)
 
     await service.archive_session(parent.id)
-    replay = await service.reserve_guided_operation(
+    with pytest.raises(SessionOperationFenceLost) as inactive:
+        service.session_operation_authority.acquire(
+            session_id=parent.id,
+            operation_kind=SessionOperationKind.SESSION_FORK,
+            owner_instance_id=service._owner_instance_id,
+            lease_seconds=service._session_operation_lease_seconds,
+        )
+    assert inactive.value.reason is FenceLossReason.OWNER_INACTIVE
+    replay = await service.get_guided_operation(
         session_id=parent.id,
         operation_id=operation_id,
         kind="session_fork",
         request_hash="a" * 64,
-        actor="composer_route",
-        lease_seconds=300,
     )
 
     assert replay == GuidedOperationFailed(failure_code="operation_failed")
@@ -932,7 +1325,7 @@ async def test_archive_parent_rejects_in_progress_fork_under_database_guard(serv
     parent, _fork_message = await _parent_with_fork_message(service)
     await _claim_fork(service, parent.id)
 
-    with pytest.raises(SessionGuidedOperationInProgressError):
+    with pytest.raises(SessionOperationConflictError):
         await service.archive_session(parent.id)
 
     assert (await service.get_session(parent.id)).id == parent.id
@@ -943,7 +1336,7 @@ async def test_reservation_rejects_parent_already_removed_without_operation_or_c
     parent, _fork_message = await _parent_with_fork_message(service)
     await service.archive_session(parent.id)
 
-    with pytest.raises(SessionNotFoundError):
+    with pytest.raises(SessionOperationFenceLost):
         await _claim_fork(service, parent.id)
 
     with engine.connect() as conn:
@@ -962,8 +1355,7 @@ async def test_fork_of_fork_preserves_historical_plan_but_selects_current_bindin
     )
     await service.settle_guided_fork_operation(
         GuidedForkSettlementCommand(
-            fence=first_fence,
-            child_session_id=first.session.id,
+            authority=first.authority,
             expected_current_state_id=None,
             edited_message_id=first.messages[-1].id,
             rewritten_state_id=None,
@@ -972,6 +1364,7 @@ async def test_fork_of_fork_preserves_historical_plan_but_selects_current_bindin
             actor="composer_route",
         )
     )
+    _release_fork_authority(service, first.authority)
     second_fork_message = await service.add_message(
         first.session.id,
         "user",
@@ -989,6 +1382,49 @@ async def test_fork_of_fork_preserves_historical_plan_but_selects_current_bindin
     assert second.session.forked_from_session_id == first.session.id
     assert second.session.archived_at is not None
     assert second.messages[-1].content == "second edit"
+
+
+@pytest.mark.asyncio
+async def test_fork_of_fork_rejects_malformed_retained_historical_plan(service) -> None:
+    parent, fork_message = await _parent_with_fork_message(service)
+    first_fence = await _claim_fork(service, parent.id)
+    first = await service.fork_session(
+        first_fence,
+        fork_message_id=fork_message.id,
+        new_message_content="first edit",
+    )
+    await service.settle_guided_fork_operation(
+        GuidedForkSettlementCommand(
+            authority=first.authority,
+            expected_current_state_id=None,
+            edited_message_id=first.messages[-1].id,
+            rewritten_state_id=None,
+            rewritten_state=None,
+            response_hash="b" * 64,
+            actor="composer_route",
+        )
+    )
+    _release_fork_authority(service, first.authority)
+    await service.add_message(
+        first.session.id,
+        "audit",
+        "{",
+        writer_principal="session_fork",
+    )
+    second_fork_message = await service.add_message(
+        first.session.id,
+        "user",
+        "fork child",
+        writer_principal="route_user_message",
+    )
+    second_fence = await _claim_fork(service, first.session.id)
+
+    with pytest.raises(AuditIntegrityError, match="not valid JSON"):
+        await service.fork_session(
+            second_fence,
+            fork_message_id=second_fork_message.id,
+            new_message_content="second edit",
+        )
 
 
 @pytest.mark.asyncio
@@ -1032,7 +1468,8 @@ async def test_parent_archive_and_fork_staging_serialize_under_lock_contention(
                 lambda: reserve_and_stage(other_service),
             )
             assert archive_result is None
-            assert isinstance(stage_result, SessionNotFoundError)
+            assert isinstance(stage_result, SessionOperationFenceLost)
+            assert stage_result.reason is FenceLossReason.MISSING
             with durable_engine.connect() as conn:
                 assert (
                     conn.execute(
@@ -1055,7 +1492,7 @@ async def test_parent_archive_and_fork_staging_serialize_under_lock_contention(
                 lambda: archive(other_service),
             )
             assert not isinstance(staged, BaseException)
-            assert isinstance(archive_error, SessionGuidedOperationInProgressError)
+            assert isinstance(archive_error, SessionOperationConflictError)
             assert staged.session.archived_at is not None
             assert (await race_service.get_session(parent.id)).archived_at is None
             with durable_engine.connect() as conn:
@@ -1088,7 +1525,8 @@ async def test_source_blob_delete_and_planned_copy_serialize_under_lock_contenti
     user_id = f"fork-blob-race-{uuid4()}"
     parent = await race_service.create_session(user_id, "Parent", "local")
     source_blob = await blob_service.create_blob(parent.id, "source.csv", b"a,b\n1,2\n", "text/csv")
-    state = await race_service.save_composition_state(
+    state = await _save_composition_state(
+        race_service,
         parent.id,
         CompositionStateData(
             sources={
@@ -1127,9 +1565,9 @@ async def test_source_blob_delete_and_planned_copy_serialize_under_lock_contenti
             BlobForkWriteFence(
                 source_session_id=parent.id,
                 target_session_id=staged.session.id,
-                operation_id=fence.operation_id,
-                lease_token=fence.lease_token,
-                attempt=fence.attempt,
+                operation_id=fence.guided_fence.operation_id,
+                lease_token=fence.guided_fence.lease_token,
+                attempt=fence.guided_fence.attempt,
             ),
             checkpoint=checkpoint,
         )
@@ -1161,9 +1599,10 @@ async def test_source_blob_delete_and_planned_copy_serialize_under_lock_contenti
                     child_session_id=staged.session.id,
                 )
             await race_service.fail_guided_operation(
-                fence,
+                fence.guided_fence,
                 failure_code="integrity_error",
                 actor="composer_route",
+                session_operation_context=fence.parent_context,
             )
             await blob_service.cleanup_blobs_for_fork(parent.id, staged.session.id, operation_id)
             assert [item.id for item in await race_service.list_sessions(user_id, "local")] == [parent.id]
@@ -1189,8 +1628,7 @@ async def test_source_blob_delete_and_planned_copy_serialize_under_lock_contenti
             response_hash = "b" * 64
             settled = await race_service.settle_guided_fork_operation(
                 GuidedForkSettlementCommand(
-                    fence=fence,
-                    child_session_id=staged.session.id,
+                    authority=staged.authority,
                     expected_current_state_id=staged.state.id,
                     edited_message_id=staged.messages[-1].id,
                     rewritten_state_id=uuid4(),
@@ -1216,7 +1654,8 @@ async def test_fork_rebases_parent_session_sink_paths_into_child_namespace(
     parent_output = tmp_path / "outputs" / str(parent.id) / "result.jsonl"
     foreign_id = uuid4()
     foreign_output = tmp_path / "outputs" / str(foreign_id) / "foreign.jsonl"
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         parent.id,
         CompositionStateData(
             sources={},
@@ -1280,6 +1719,7 @@ async def test_current_fence_and_concurrent_takeover_reuse_one_hidden_child(dura
     try:
         current_results = await asyncio.gather(current_worker(), current_worker())
         assert {item.session.id for item in current_results} == {initial.session.id}
+        _release_fork_authority(race_service, initial.authority)
 
         with durable_engine.begin() as conn:
             conn.execute(
@@ -1290,6 +1730,14 @@ async def test_current_fence_and_concurrent_takeover_reuse_one_hidden_child(dura
                 )
                 .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
             )
+        takeover_parent_context = await race_service._run_sync(
+            lambda: race_service.session_operation_authority.acquire(
+                session_id=parent.id,
+                operation_kind=SessionOperationKind.SESSION_FORK,
+                owner_instance_id=race_service._owner_instance_id,
+                lease_seconds=race_service._session_operation_lease_seconds,
+            )
+        )
 
         takeover_barrier = asyncio.Barrier(2)
 
@@ -1302,18 +1750,25 @@ async def test_current_fence_and_concurrent_takeover_reuse_one_hidden_child(dura
                 request_hash="a" * 64,
                 actor="composer_route",
                 lease_seconds=300,
+                session_operation_context=takeover_parent_context,
             )
 
         outcomes = await asyncio.gather(takeover_worker(), takeover_worker())
         takeover = next(item for item in outcomes if isinstance(item, GuidedOperationTakenOver))
         assert sum(isinstance(item, GuidedOperationTakenOver) for item in outcomes) == 1
         assert sum(isinstance(item, GuidedOperationActive) for item in outcomes) == 1
+        takeover_authority = SessionForkParentAuthority(
+            parent_context=takeover_parent_context,
+            guided_fence=takeover.fence,
+        )
         resumed = await race_service.fork_session(
-            takeover.fence,
+            takeover_authority,
             fork_message_id=message.id,
             new_message_content="edited",
         )
         assert resumed.session.id == initial.session.id
+        assert resumed.authority.parent.parent_context.fence.operation_epoch > initial.authority.parent.parent_context.fence.operation_epoch
+        assert resumed.authority.child_context.fence.operation_epoch > initial.authority.child_context.fence.operation_epoch
         with durable_engine.connect() as conn:
             assert (
                 conn.execute(select(func.count()).select_from(sessions_table).where(sessions_table.c.user_id == user_id)).scalar_one() == 2
@@ -2583,3 +3038,143 @@ async def test_fork_rewriter_changes_exactly_the_composer_meta_keys_declared_as_
     assert set(before) == set(after) == set(composer_meta), "the rewriter must neither add nor drop composer_meta keys"
     changed = {key for key in composer_meta if before[key] != after[key]}
     assert changed == FORK_REWRITTEN_COMPOSER_META_KEYS
+
+
+async def _parent_with_guided_root_fork_message(service: SessionServiceImpl):
+    """A parent whose pre-send state carries a guided session bound to a root intent."""
+    from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
+    from elspeth.web.composer.guided.state_machine import GuidedSession, TurnRecord
+
+    parent = await service.create_session("alice", "Parent", "local")
+    root = await service.add_message(parent.id, "user", "root", writer_principal="route_user_message")
+    guided = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        history=(
+            TurnRecord(
+                step=GuidedStep.STEP_1_SOURCE,
+                turn_type=TurnType.INSPECT_AND_CONFIRM,
+                payload_hash="a" * 64,
+                response_hash=None,
+                emitter="server",
+            ),
+        ),
+        root_intent_message_id=str(root.id),
+    )
+    from tests.unit.web.sessions.test_fork import _complete_guided_start_authority
+
+    state_data = CompositionStateData(
+        sources={},
+        nodes=[],
+        edges=[],
+        outputs=[],
+        metadata_={"name": "Guided", "description": ""},
+        is_valid=True,
+        composer_meta={"guided_session": guided.to_dict()},
+    )
+    state = await _save_composition_state(service, parent.id, state_data, provenance="session_seed")
+    await _complete_guided_start_authority(
+        service,
+        session_id=parent.id,
+        root_message=root,
+        state=state,
+        state_data=state_data,
+    )
+    fork_message = await service.add_message(
+        parent.id,
+        "user",
+        "fork here",
+        composition_state_id=state.id,
+        writer_principal="route_user_message",
+    )
+    return parent, fork_message
+
+
+@pytest.mark.asyncio
+async def test_settled_fork_authority_requires_completed_parent_bound_to_child(
+    service: SessionServiceImpl,
+) -> None:
+    """The settled-authority check is the post-completion form: live session
+    fences plus a parent fork row already ``completed`` for exactly this child.
+
+    Before settlement the parent row is still ``in_progress``, so the settled
+    check must refuse (fail closed) even though the live-lease check accepts.
+    """
+    parent, fork_message = await _parent_with_guided_root_fork_message(service)
+    parent_authority = await _claim_dual_fenced_fork(service, parent.id)
+    staged = await service.fork_session(
+        parent_authority,
+        fork_message_id=fork_message.id,
+        new_message_content="edited",
+    )
+    try:
+        parent_id, child_id = str(parent.id), str(staged.session.id)
+
+        def _check_before_settlement() -> None:
+            with service._session_pair_locked_begin(parent_id, child_id) as conn:
+                service._require_session_fork_authority_on_connection(conn, staged.authority)
+                with pytest.raises(GuidedOperationFenceLostError):
+                    service._require_settled_session_fork_authority_on_connection(conn, staged.authority)
+
+        await service._run_sync(_check_before_settlement)
+    finally:
+        _release_fork_authority(service, staged.authority)
+
+
+@pytest.mark.asyncio
+async def test_settling_a_guided_root_fork_records_the_child_terminal_event_after_parent_completion(
+    service: SessionServiceImpl,
+    engine,
+) -> None:
+    """Settlement completes the parent fork row first (so a later failure rolls
+    it back atomically) and then records the child's synthetic ``guided_start``
+    completion under the settled form of the fork authority. Demanding a live
+    guided lease there refused every guided-root fork and left replay joiners
+    polling until lease expiry.
+    """
+    parent, fork_message = await _parent_with_guided_root_fork_message(service)
+    parent_authority = await _claim_dual_fenced_fork(service, parent.id)
+    staged = await service.fork_session(
+        parent_authority,
+        fork_message_id=fork_message.id,
+        new_message_content="edited",
+    )
+    assert staged.state is not None
+    try:
+        settled = await service.settle_guided_fork_operation(
+            GuidedForkSettlementCommand(
+                authority=staged.authority,
+                expected_current_state_id=staged.state.id,
+                edited_message_id=staged.messages[-1].id,
+                rewritten_state_id=None,
+                rewritten_state=None,
+                response_hash="b" * 64,
+                actor="composer_route",
+            )
+        )
+    finally:
+        _release_fork_authority(service, staged.authority)
+    assert settled.id == staged.session.id
+
+    with engine.connect() as conn:
+        parent_row = conn.execute(
+            select(guided_operations_table).where(
+                guided_operations_table.c.session_id == str(parent.id),
+                guided_operations_table.c.operation_id == parent_authority.guided_fence.operation_id,
+            )
+        ).one()
+        assert parent_row.status == "completed"
+        assert parent_row.result_session_id == str(settled.id)
+        child_start = conn.execute(
+            select(guided_operations_table).where(
+                guided_operations_table.c.session_id == str(settled.id),
+                guided_operations_table.c.kind == "guided_start",
+            )
+        ).one()
+        assert child_start.status == "completed"
+        events = conn.execute(
+            select(guided_operation_events_table.c.event_kind).where(
+                guided_operation_events_table.c.session_id == str(settled.id),
+                guided_operation_events_table.c.operation_id == child_start.operation_id,
+            )
+        ).all()
+        assert [event.event_kind for event in events] == ["completed"]

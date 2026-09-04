@@ -16,14 +16,14 @@ from uuid import uuid4
 import pytest
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
-from elspeth.web.sessions.protocol import CompositionStateRecord, InterpretationPlaceholderConsumedError
-from elspeth.web.sessions.service import (
+from elspeth.web.sessions.pending_interpretation import (
     _has_matching_vague_term_requirement,
     _matching_pending_requirement_index,
     _patch_structured_interpretation_prompt,
     _require_mapping,
     _reviewed_content_identity,
 )
+from elspeth.web.sessions.protocol import CompositionStateRecord, InterpretationPlaceholderConsumedError
 
 
 def _llm_node(options: dict[str, object]) -> dict[str, object]:

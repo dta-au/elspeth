@@ -12,11 +12,13 @@ enforced per-row at runtime by ADR-016's ``SourceGuaranteedFieldsContract``.
 This module computes the card's field set — the MINIMAL set of fields the
 pipeline genuinely requires from one source — by DELTA-RUNNING the Stage-1
 validator's own edge-contract accounting (``CompositionState.validate()``,
-whose per-edge ``EdgeContract`` rows are produced by the composer twin of the
-``core/dag/guarantees.py`` propagation walk). The demand is DERIVED, never
-restated: a field is demanded exactly when it is missing on some edge today
-AND stamping it into this source's ``schema.guaranteed_fields`` makes that
-edge's miss go away through the transparent-node walk. By construction the
+whose ``EdgeContract`` rows are one check per producer->consumer PAIR — the
+real upstream walked past forwarding nodes, not one row per graph edge —
+produced by the composer twin of the ``core/dag/guarantees.py`` propagation
+walk). The demand is DERIVED, never restated: a field is demanded exactly
+when it is missing on some pair today AND stamping it into this source's
+``schema.guaranteed_fields`` makes that pair's miss go away through the
+transparent-node walk. By construction the
 set can never contain a field no downstream consumer requires, and never
 contains a field an intermediate node already guarantees or that this
 source's guarantee cannot reach.
@@ -183,7 +185,15 @@ def _source_options_without_guaranteed_fields(
 
 
 def _unsatisfied_edge_misses(state: CompositionState) -> dict[tuple[str, str], frozenset[str]]:
-    """Per-edge missing required fields from Stage-1 validation's own ledger."""
+    """Missing required fields per producer->consumer PAIR, from Stage-1's own ledger.
+
+    Keyed on the ledger's own ``(from_id, to_id)`` — one entry per pair
+    Stage 1 checked and found UNSATISFIED, not one per graph edge. An
+    absent key conflates two states the ledger does not separate: the pair
+    was checked and satisfied, or it was never checked at all (the consumer
+    requires nothing, or the producer abstains under ADR-007). Callers that
+    read absence as "no misses" are reading the first meaning only.
+    """
     return {
         (contract.from_id, contract.to_id): frozenset(contract.missing_fields)
         for contract in state.validate().edge_contracts

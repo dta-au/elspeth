@@ -10,6 +10,7 @@ function session(overrides: Partial<GuidedSession>): GuidedSession {
     terminal: null,
     chat_history: [],
     chat_turn_seq: 0,
+    reviewed_components: { sources: [], outputs: [] },
     profile: null,
     ...overrides,
   } as GuidedSession;
@@ -269,5 +270,81 @@ describe("latestAssistantRationale — conversational openers", () => {
     "Heres-a-weird-id set as the source name.",
   ])("keeps the decision-naming headline %j", (content) => {
     expect(latestAssistantRationale(assistantSaying(content))).toBe(content);
+  });
+});
+
+describe("the seeded goal acknowledgement (goal-first, elspeth-378cfa0e18)", () => {
+  // A started session's transcript opens with a user turn carrying the goal
+  // and one server line acknowledging it, BOTH stamped step_1_source. That
+  // assistant line is the newest assistant turn for step 1 the moment the
+  // session opens, so it is a candidate for the decision card's headline —
+  // where it would be wrong twice over: it is a handoff to the source
+  // question, not the name of a decision, and it duplicates the bubble
+  // directly below it.
+  //
+  // No new predicate and no duplicated server constant guard this: the
+  // acknowledgement is deliberately MULTI-SENTENCE, which the existing
+  // conversational-prose rejection already discards. That coupling is what is
+  // pinned here — rewording the server constant to a single sentence would put
+  // it in the h2, and this test is where that shows up.
+  const GOAL_ACKNOWLEDGEMENT =
+    "Goal saved. The planner will build from it once the source and output are reviewed. First, the source: where does the data come from?";
+
+  function seededSession(): GuidedSession {
+    return session({
+      step: "step_1_source",
+      chat_history: [
+        {
+          role: "user",
+          content: "Summarise each page and save the results as JSON.",
+          seq: 0,
+          step: "step_1_source",
+          ts_iso: "t",
+          assistant_message_kind: null,
+          synthetic_failure_reason: null,
+          turn_token: null,
+        },
+        {
+          role: "assistant",
+          content: GOAL_ACKNOWLEDGEMENT,
+          seq: 1,
+          step: "step_1_source",
+          ts_iso: "t",
+          assistant_message_kind: "assistant",
+          synthetic_failure_reason: null,
+          turn_token: null,
+        },
+      ],
+    });
+  }
+
+  it("never becomes the decision headline, so the static step purpose renders", () => {
+    expect(latestAssistantRationale(seededSession())).toBeNull();
+  });
+
+  it("stays multi-sentence — the property the rejection depends on", () => {
+    // Stated as its own assertion so a reworded constant fails HERE, naming
+    // the cause, rather than only failing the assertion above.
+    expect(GOAL_ACKNOWLEDGEMENT.split(/(?<=[.!?])\s+/).length).toBeGreaterThan(1);
+  });
+
+  it("still yields a real step-1 headline once the assistant names a decision", () => {
+    // Non-vacuous counterpart: the seeded pair must not poison the step for
+    // the rest of the build.
+    const s = seededSession();
+    s.chat_history = [
+      ...s.chat_history,
+      {
+        role: "assistant",
+        content: "Source created as a 3-row CSV.",
+        seq: 3,
+        step: "step_1_source",
+        ts_iso: "t",
+        assistant_message_kind: "assistant",
+        synthetic_failure_reason: null,
+        turn_token: null,
+      },
+    ];
+    expect(latestAssistantRationale(s)).toBe("Source created as a 3-row CSV.");
   });
 });

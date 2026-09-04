@@ -1,0 +1,17 @@
+{
+ "_doc": "Tool-result envelope keys deliberately left untaught, each with a checkable reason. Read by tests/unit/web/composer/test_tool_result_envelope_gate.py, which fails on any 'pending' reason: every entry is an adjudicated decision (elspeth-e405ad7cd2). A fence must not outlive what it fences — the gate also fails when a fenced key becomes taught or stops shipping.",
+ "fenced": [
+  {
+   "surface": "plugin-schema",
+   "tool": "*",
+   "key": "plugin_schemas.<kind/plugin>.policy_capabilities",
+   "reason": "Server-side control-coverage bookkeeping (CapabilityDeclaration) consumed only by the policy, availability and planner-aid modules; no composer authoring path reads it and the required-control admission gate rejects independently of anything the model infers from it, so teaching it invites second-guessing a judgment the server makes (ratified F3b, 2026-09-02)."
+  },
+  {
+   "surface": "tool-data",
+   "tool": "get_plugin_schema",
+   "key": "data.policy_capabilities",
+   "reason": "Same field as plugin_schemas.<kind/plugin>.policy_capabilities on the discovery surface: server-side control-coverage bookkeeping (CapabilityDeclaration) that no composer authoring path reads and that the required-control admission gate enforces independently, so the model gains nothing actionable from it (ratified F3b, 2026-09-02)."
+  }
+ ]
+}

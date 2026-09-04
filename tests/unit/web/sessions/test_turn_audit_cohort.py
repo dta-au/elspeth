@@ -51,6 +51,7 @@ class _CohortCapturingService:
         *,
         writer_principal: str,
         composition_state_id: UUID | None = None,
+        **_fenced_kwargs: object,
     ) -> None:
         if self.raise_on_call is not None:
             raise self.raise_on_call

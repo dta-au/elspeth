@@ -143,7 +143,7 @@ _ROLLBACK_BASELINE_LANDSCAPE_EPOCH = 29
 _SCENARIO_B_STRUCTURAL_CHANGES = (
     f"session_epoch_{_ROLLBACK_BASELINE_SESSION_EPOCH}_to_{SESSION_SCHEMA_EPOCH}"
     f"_landscape_epoch_{_ROLLBACK_BASELINE_LANDSCAPE_EPOCH}_to_{SQLITE_SCHEMA_EPOCH}"
-    "_blob_cleanup_guided_decline_and_row_union_barrier"
+    "_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema"
 )
 
 

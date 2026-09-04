@@ -23,6 +23,7 @@ from typer.testing import CliRunner
 
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.checkpoint import manager as checkpoint_manager_module
 from elspeth.core.config import load_settings_from_yaml_string
@@ -42,6 +43,7 @@ from elspeth.engine.executors.sink_effects import SinkEffectCoordinator, SinkEff
 from elspeth.engine.orchestrator import Orchestrator
 from elspeth.engine.processor import RowProcessor
 from elspeth.plugins.sinks import _local_file_effects
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
@@ -65,6 +67,7 @@ from tests.e2e.recovery.test_sink_effect_process_death_matrix import (
     _install_short_sink_lease,
     _wait_until_run_is_resumable,
 )
+from tests.helpers.session_fences import RecordingSessionOperationAuthority
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
 
 _PROFILE_RUN_LIVENESS_SECONDS = 5.0
@@ -425,9 +428,20 @@ async def _execute_web_leader(run_id: str, settings_path: str) -> None:
         return future
 
     service._executor.submit = capture_submit  # type: ignore[method-assign]
+    # The /execute route owns an EXECUTE session-operation lease and transfers
+    # it into the run; this web-hosted leader mints the same lease shape from
+    # the recording authority (the sessions service here is a Mock).
+    lease = await SessionOperationLease.acquire(
+        RecordingSessionOperationAuthority(),
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id="task9-web-leader",
+        lease_seconds=60,
+    )
     try:
         launched = await service.execute(
             session_id,
+            session_operation_lease=lease,
             user_id="task9-web-user",
             auth_provider_type="local",
         )
@@ -436,6 +450,7 @@ async def _execute_web_leader(run_id: str, settings_path: str) -> None:
         await asyncio.wrap_future(submitted[0])
     finally:
         try:
+            await lease.close()
             await service.shutdown()
         finally:
             session_bridge_loop.close()

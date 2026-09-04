@@ -47,9 +47,9 @@ from __future__ import annotations
 # classid assigned in this registry; chosen so a Postgres operator
 # inspecting pg_locks sees a recognisable value rather than a random
 # magic number. Used by SessionServiceImpl._acquire_session_advisory_lock
-# (src/elspeth/web/sessions/service.py) for the session-scoped write
-# lock that serialises persist_compose_turn / save_composition_state /
-# set_active_state writers within a single Postgres cluster.
+# (src/elspeth/web/sessions/service.py) and the shared Sessions locking
+# helpers for the session-scoped write lock that serialises same-session
+# writers within a single Postgres cluster.
 ELSPETH_SESSIONS_LOCK_CLASSID: int = 0x454C5350
 
 # 0x53434845 = ASCII "SCHE". Session and Landscape initialization use the
@@ -72,3 +72,10 @@ ELSPETH_ROUTING_GROUP_LOCK_CLASSID: int = 0x524F5554
 # collisions only over-serialize unrelated lineages and cannot weaken
 # the registry's insert-once guarantee.
 ELSPETH_AUDIT_EXPORT_LOCK_CLASSID: int = 0x41455850
+
+# 0x50524546 = ASCII "PREF". Used by RepositoryUserPreferenceAuthority
+# to serialize the read-resolve-upsert transition for one user_id. The
+# advisory lock precedes the prior-row read so concurrent creation of an
+# absent row is serialized too; SELECT FOR UPDATE cannot lock a missing row.
+# This immutable value is on-the-wire ABI under the module commitment above.
+ELSPETH_USER_PREFERENCES_LOCK_CLASSID: int = 0x50524546

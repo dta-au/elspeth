@@ -15,15 +15,32 @@ from uuid import uuid4
 import pytest
 
 import elspeth.web.sessions._auto_title as at
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 
 _SENTINEL_CREDENTIAL = "sk-auto-title-endpoint-affordance-sentinel"  # secret-scan: allow-this-line
+_TEST_CONTEXT = SessionOperationContext(
+    fence=SessionOperationFence(
+        session_id="auto-title-endpoint-session",
+        operation_id="auto-title-endpoint-operation",
+        lease_token="auto-title-endpoint-token",
+        operation_epoch=2,
+    ),
+    operation_kind=SessionOperationKind.COMPOSE,
+)
 
 
 class _TitleService:
     def __init__(self) -> None:
         self.updates: list[tuple[object, str]] = []
 
-    async def update_session_title(self, session_id: object, title: str) -> None:
+    async def update_session_title(
+        self,
+        session_id: object,
+        title: str,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
+        del session_operation_context
         self.updates.append((session_id, title))
 
 
@@ -48,6 +65,7 @@ async def test_auto_title_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.M
         model="gpt-5",
         temperature=None,
         seed=None,
+        session_operation_context=_TEST_CONTEXT,
     )
 
     assert "api_base" not in captured
@@ -71,6 +89,7 @@ async def test_auto_title_sends_configured_primary_endpoint(monkeypatch: pytest.
         model="gpt-4o",
         temperature=None,
         seed=None,
+        session_operation_context=_TEST_CONTEXT,
         api_base="https://primary-gateway.example.test/v1",
         api_key=_SENTINEL_CREDENTIAL,
     )
