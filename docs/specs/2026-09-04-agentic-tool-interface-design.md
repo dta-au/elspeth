@@ -20,6 +20,72 @@ return-arrow exemplar this document mirrors), `elspeth-15c60e7c66`
 (prevalidation error-code flattening), `elspeth-15b400881f` (no
 `guaranteed_fields` authored downstream of the source).
 
+## RESOLVED — read this before the analysis below
+
+**The `locked_input_extras` investigation that occupies much of this document
+reached the wrong subject.** The LLM-specialist seat found the misreading and
+it is verified in-tree. Three corrections, in order of consequence:
+
+**1. The attempt audit's shape hash records the candidate SUBMITTED at that
+attempt, not the one the rejection was answering.** `pipeline_planner.py:3915`
+parses the terminal tool call, takes `arguments["pipeline"]`, hashes it, and
+passes it to `trail.begin_attempt`. So attempt #3's code is the code the
+values-only repair EARNED, not the code it was answering.
+
+Re-reading the walk correctly:
+- #2 submitted a candidate → rejected `validation_error`
+- #3 submitted a values-only edit ANSWERING `validation_error` → earned
+  `locked_input_extras`
+- #4 repaired `locked_input_extras` **structurally, in one turn, accepted**
+
+**2. `locked_input_extras` was therefore never the problem, and its facts were
+forwarded.** `web_scrape` is a transform, so it is model-authored, so
+`withholding.contract` is False — and the one-turn structural repair is the
+behavioural proof. The withholding question this document spends three
+sections on is settled, and settled the way the mechanism predicted. Both
+branches are no longer live; the forwarded one is confirmed by behaviour.
+
+**3. The wasted turn was `validation_error` — a rejection carrying no repair
+information at all.** A rejection constructor that passes no `error_code`
+resolves to the literal string `validation_error` (`pipeline_planner.py:2101`,
+`:2165`, `:2315`, `:2446`), and the entry the model receives then carries
+component, severity, `error_code` and `error_class` and nothing else. The
+envelope advertises `explain_validation_error`, which for such a code replies
+that it "does not match any known validation message or closed error_code"
+(`tools/generation.py:1862`) — the server disclaiming its own token.
+
+The seat's formulation is the one to keep: **a values-only edit is correct
+inference from an address without a fault.** The model was told WHERE and not
+WHAT, so it changed the only thing an address licenses you to change.
+
+### The structural defect this exposes
+
+Graph validation is unreachable while any component rejection stands.
+`tools/sessions.py:1619` returns the collected component failure before spec
+construction, with the reason stated in the code: whole-state checks need a
+COMPLETE component set or they report artefacts. Validation is therefore
+STAGED, and the staging is invisible to the model.
+
+`composer_planner_repair_budget` defaults to exactly **2**
+(`web/config.py:312`).
+
+**So a candidate carrying one Stage-1 defect and one Stage-2 defect costs two
+repair turns BY CONSTRUCTION, against a budget of two. Zero margin.** No
+teaching change and no instance-fact change alters that arithmetic. This is
+the defect the tutorial's ceiling was actually measuring, and it is an
+interface-shape problem of exactly the kind this document is about: the model
+cannot see that it is being validated in stages, so it cannot know that fixing
+everything it was told about still leaves a second gate it has not been shown.
+
+### What this costs the rest of the document
+
+The three-layer architecture below stands, but its motivating example does
+not. Layer 1 (persist what was projected) keeps its own justification — the
+record IS lossy — but must no longer be sold on the tutorial's repair thrash.
+The `guided_amend_contract_violation` finding two sections down is unaffected
+and remains the strongest concrete instance: facts computed, tested,
+documented as the repair payload, and never sent.
+
 ## Problem
 
 The composer asks the planner to satisfy a contract it is never shown.
