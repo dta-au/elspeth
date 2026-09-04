@@ -28,6 +28,8 @@ from typing import Any
 
 import pytest
 
+from tests.helpers.tree_gate import iter_gate_files
+
 _ROOT = Path(__file__).resolve().parents[4]
 
 # These verbs decide custody, liveness, expiry, takeover, or stale-owner
@@ -2589,7 +2591,7 @@ def _scan_production(paths: Iterable[str] | None = None) -> tuple[ClockViolation
         if paths is not None
         else (
             relative
-            for source_file in sorted((_ROOT / "src/elspeth").rglob("*.py"))
+            for source_file in iter_gate_files(_ROOT / "src/elspeth")
             if (relative := source_file.relative_to(_ROOT).as_posix()).startswith(_AUTHORITY_SCOPE_PREFIXES)
         )
     )
@@ -2713,7 +2715,7 @@ def _sessions_import_violations(sources: dict[str, str]) -> tuple[str, ...]:
 def _clock_boundary_inventory() -> tuple[ClockBoundary, ...]:
     sources = {
         source_file.relative_to(_ROOT).as_posix(): source_file.read_text(encoding="utf-8")
-        for source_file in sorted((_ROOT / "src/elspeth").rglob("*.py"))
+        for source_file in iter_gate_files(_ROOT / "src/elspeth")
     }
     return _discover_authority_boundaries(sources)
 
@@ -5742,7 +5744,7 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
 
 
 def test_landscape_core_does_not_import_sessions_clock_authority() -> None:
-    source_files = sorted((_ROOT / "src/elspeth").rglob("*.py"))
+    source_files = iter_gate_files(_ROOT / "src/elspeth")
     sources = {file.relative_to(_ROOT).as_posix(): file.read_text(encoding="utf-8") for file in source_files}
     forbidden = _sessions_import_violations(sources)
     assert forbidden == (), "Landscape imported Sessions clock authority:\n" + "\n".join(forbidden)
@@ -5750,7 +5752,7 @@ def test_landscape_core_does_not_import_sessions_clock_authority() -> None:
 
 def test_no_cross_database_clock_name_crosses_authority_adapters() -> None:
     offenders: list[str] = []
-    for source_file in sorted((_ROOT / "src/elspeth").rglob("*.py")):
+    for source_file in iter_gate_files(_ROOT / "src/elspeth"):
         relative = source_file.relative_to(_ROOT).as_posix()
         tree = ast.parse(source_file.read_text(encoding="utf-8"), filename=relative)
         for node in ast.walk(tree):
