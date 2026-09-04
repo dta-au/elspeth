@@ -41,7 +41,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
-from typing import ClassVar, Final, TypedDict
+from typing import ClassVar, Final, Protocol, TypedDict
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -382,3 +382,71 @@ def cookie_attributes(value: str | None) -> CookieAttributes:
         "max_age": 0 if value is None else COOKIE_MAX_AGE_SECONDS,
     }
     return attributes
+
+
+# ── the handoff ──────────────────────────────────────────────────────────
+#
+# The callback cannot hand the browser a session token: it answers a
+# top-level GET, so anything in that URL reaches the load balancer's logs,
+# uvicorn's logs and the browser's history. It hands back a HANDOFF code in
+# the URL fragment instead — browsers never send fragments to servers — and
+# ``complete`` trades that code for the token over POST.
+#
+# The code is therefore a bearer credential for exactly one exchange, and is
+# treated like one: 32 random bytes, only its SHA-256 stored, single use
+# enforced by the database rather than by a read-then-write in Python.
+
+HANDOFF_TTL_SECONDS: Final = 900
+
+
+def new_handoff_code() -> str:
+    """Mint a handoff code.
+
+    ``token_urlsafe(32)`` is 256 bits of entropy. It travels in a URL
+    fragment and is exchanged within 15 minutes, but it authorises minting a
+    session token, so it is sized as a credential rather than as a nonce.
+    """
+    return secrets.token_urlsafe(32)
+
+
+def handoff_code_hash(code: str) -> str:
+    """Hash a handoff code for storage.
+
+    Only the hash is ever stored. A database read — a backup, a replica, an
+    accidental log of a row — must not yield anything that can be redeemed,
+    and the code's own entropy means a hash is enough: there is no dictionary
+    to attack, so no salt or stretching is required.
+    """
+    return hashlib.sha256(code.encode("ascii")).hexdigest()
+
+
+class HandoffStore(Protocol):
+    """Where handoffs live. Injected, not imported.
+
+    ``sso_handoffs`` is a SESSIONS-store table, and ``web.auth`` does not
+    depend on ``web.sessions`` — the dependency runs the other way in
+    ``sessions/ownership.py``, and the local provider reaches the identity
+    substrate through injected callables for the same reason. A Protocol here
+    keeps that direction intact and lets the login service be tested without
+    a database.
+    """
+
+    def issue(self, *, code_hash: str, identity_id: str, request_id: str) -> None:
+        """Record a handoff. Called after the identity is verified."""
+        ...
+
+    def consume(self, *, code_hash: str) -> str | None:
+        """Atomically claim a handoff, returning its identity_id or None.
+
+        MUST be one conditional UPDATE against the DATABASE clock — never a
+        SELECT then an UPDATE. Two ``complete`` calls racing on one code is
+        the expected case (a double-submitted form, a retried request), and a
+        read-then-write would let both win and mint two sessions from one
+        login.
+
+        ``None`` covers unknown, already-consumed and expired alike. The
+        caller cannot distinguish them and must not: telling a caller which
+        of those it hit is telling an attacker whether a guessed code ever
+        existed.
+        """
+        ...
