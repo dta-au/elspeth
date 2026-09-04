@@ -382,8 +382,33 @@ the model-authored transforms are not.
 
 The narrowing that holds: `locked_input_extras` is emitted only for NODE
 consumers — sinks emit `sink_locked_extras`, a different code, from
-`_sink_locked_extras_error` (`state.py:5474`) — so the only way this detail is
-withheld is a **source producer**.
+`_sink_locked_extras_error` (`state.py:5474`). The red-team seat checked every
+emitter and could not break that premise.
+
+**The conclusion drawn from it — "so the only way this detail is withheld is a
+SOURCE producer" — is FALSE, and was broken by running it.** A config-owned
+NODE producer is withheld too, demonstrated against the live
+`_allowlisted_candidate_feedback`. Two authorities create config-owned nodes:
+auto-wired required controls (`pipeline_planner.py:881`,
+`required_controls.py:753`) and **every predecessor node on a guided
+correction turn** (`service.py:4127`).
+
+**And the ownership set has two authorities, not one.** This document credited
+`_derive_finalizer_owned_refs` alone. `pipeline_planner.py:4478` unions the
+structural diff with an explicit enumeration from `materialize_guided_delta`:
+
+```python
+finalizer_owned_refs = _FinalizerOwnedRefs(
+    config=materializer_owned_refs.config | finalizer_refs.config,
+    routing=materializer_owned_refs.routing | finalizer_refs.routing,
+)
+```
+
+Because `pipeline` at that call site is ALREADY the bound guided candidate, the
+structural diff sees only what `wire_required_controls` inserted. **On the
+guided surface the diff is not the authority this document assumed it was** —
+the materializer's self-reported enumeration is. Any reasoning about guided
+withholding that starts from the diff starts in the wrong place.
 
 **A second narrowing was attempted here and is WITHDRAWN.** Revision 2 argued:
 the extras are `web_scrape`'s six emitted fields, so `web_scrape` is the

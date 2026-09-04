@@ -7604,10 +7604,17 @@ def test_schema_contract_detail_withholding_follows_the_participants_not_the_ent
     finalizer-bound one. An entry ABOUT a model-authored node can therefore
     still quote a reviewed source's or sink's field set through its contract
     payload, which is why the withholding decision reads the participants and
-    not just ``_entry_component_ref``. That cross-reference arm had no test:
-    ``_contract_participant_refs`` was referenced nowhere under ``tests/``
-    before this one, so nothing would have caught a narrowing that dropped
-    the participant check and disclosed reviewed field names.
+    not just ``_entry_component_ref``.
+
+    CORRECTION (red-team seat, 2026-09-04). This docstring originally claimed
+    the arm "had no test", on the grounds that ``_contract_participant_refs``
+    was referenced nowhere under ``tests/``. That measured a SYMBOL NAME, not
+    coverage, and the claim was false.
+    ``test_allowlisted_candidate_feedback_withholds_cross_component_fact_payloads``
+    (landed 2026-08-04) already covers this arm and covers it BETTER: it kills
+    a mutant this test survives — dropping the ``f"node:{participant}"``
+    normalization. Treat that test as the guard and this one as a readable
+    matrix of the rule.
 
     It is pinned in both directions deliberately. Withholding too little is a
     custody leak; withholding too much is the failure recorded in
