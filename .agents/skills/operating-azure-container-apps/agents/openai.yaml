@@ -1,0 +1,6 @@
+interface:
+  display_name: "Operate Azure Container Apps"
+  short_description: "Publish, deploy, and validate ELSPETH on Azure Container Apps"
+  default_prompt: "Use $operating-azure-container-apps to publish, deploy, validate, or diagnose the ELSPETH Azure Container Apps container."
+policy:
+  allow_implicit_invocation: true
