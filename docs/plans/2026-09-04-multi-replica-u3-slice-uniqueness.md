@@ -1,6 +1,20 @@
 # U3 — how much of `3f3857d20` is still unique against `a2176dfe2`?
 
 Measured 2026-09-04 from the shared checkout (repository root)
+
+> **Re-verified at `release/0.8.0` @ `cbae1ef0c` (2026-09-04 rebaseline).**
+> Every finding below holds unchanged. The two comparands — `3f3857d20` and
+> `a2176dfe2` — are fixed refs, and each mainline-dependent claim was re-run:
+> `resolve_pending`, `SessionInterpretationResolutionCommand`,
+> `SessionInterpretationValidationInputs` and
+> `_SessionInterpretationResolutionPlanner` still return **zero** files on both
+> branches; `interpretation_validation.py` and
+> `test_interpretation_validation_inputs.py` are still **absent from both**; and
+> `git rev-list --count 64b7d144e..feature/deferred-platform-recovery --
+> src/elspeth/web/sessions/routes/interpretation.py` is still **0**, so harvest
+> item 3 still applies with no reconciliation. The verdict stands: the step-8
+> list of three is **TOO NARROW**.
+
 (`release/0.8.0` @ `91816d0f3`). Read-only: no test run, no commit, no branch
 touched. Revs used throughout:
 

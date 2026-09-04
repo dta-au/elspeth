@@ -1,6 +1,17 @@
 # Re-verification of the multi-replica resume brief's measured anchors
 
 **Brief under review:** `docs/plans/2026-09-03-multi-replica-resume-brief.md`
+
+> **SUPERSEDED ON FIGURES, current on reasoning.** This is a snapshot taken at
+> `release/0.8.0` @ `77537c8de`. Mainline has since moved to `cbae1ef0c` (two
+> major changes: `51b43a770`, `cbae1ef0c`). Live values now: **496 behind / 74
+> ahead**, **843 mainline-changed files**, **82 touched on both sides**, **33
+> merge conflicts**, **`SESSION_SCHEMA_EPOCH` = 50**, **nine worktrees**, and
+> mainline is **PUSHED** (`origin/release/0.8.0 == HEAD`), which retires the
+> public/private inversion §2 of the brief describes. Read the per-claim
+> *reasoning* and *commands* below as current; read every *number* as needing
+> a re-run. Rebaseline summary: `2026-09-03-multi-replica-resume-brief.md` §0.
+
 (801 lines, written 2026-09-03, tracked on mainline since `91816d0f3`).
 
 **Measured:** 2026-09-04 (local, UTC+10) — i.e. 2026-09-03T16:00–16:15Z.

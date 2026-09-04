@@ -5,7 +5,18 @@ Reconstructed 2026-09-04 from the nine comments on filigree `elspeth-4d6c0dd0f5`
 2026-09-01) plus §4 step 7 / §7 / H3 / H6 / H10 of
 `docs/plans/2026-09-03-multi-replica-resume-brief.md`.
 
-Every number below is measured today unless labelled *(from comment N)*.
+**Baseline: `release/0.8.0` @ `cbae1ef0c`** (== `origin`, pushed). Rebaselined
+2026-09-04 after two major changes landed — `51b43a770` (guided-decline anchor
+rebase, P0 `elspeth-ed67eb9d0d`) and `cbae1ef0c` (composer tool-result
+envelope). What that rebaseline moved, in one place: **conflicts 31 → 33**
+(§4.1), **behind 408 → 496**, **mainline-changed files 789 → 843**, **both-sides
+80 → 82**, **`SESSION_SCHEMA_EPOCH` 49 → 50** so H6's collision is now two
+epochs wide (§8 D3). The cohort partition, the resolution rule, the operator
+rulings and every §8 decision are unaffected in substance — only the arithmetic
+moved. **The rate is the finding:** mainline advanced 88 commits and added two
+conflicts in a single working day, all of it in M3.
+
+Every number below is measured at that baseline unless labelled *(from comment N)*.
 This is a **document, not an execution**. No branch was checked out, nothing was
 committed, staged, or pushed. `git merge-tree --write-tree` was used for conflict
 measurement — it writes only loose objects, touches no ref and no worktree.
@@ -22,11 +33,11 @@ contents of **Phase-0 cohort E** are not, and are routed to the operator in §8.
 | Claim in the record | Source | Measured today | Status |
 |---|---|---|---|
 | platform branch is **UNPUSHED** | 8915, 8966, 9075, 9099 | `git rev-parse origin/feature/deferred-platform-recovery` = `a2176dfe225bd9d56d5eed642f7a8aff0a9485d2`, identical to the local branch | **FALSE NOW.** The branch is pushed and backed up on origin. The 9099 urgency ("only copy", "protect the branch") no longer applies to *this* branch. |
-| "74 ahead, 405 behind" | brief §7 / §1 | `git rev-list --left-right --count release/0.8.0...feature/deferred-platform-recovery` = **408 / 74** | Behind-count is now **408**, not 405, and still growing. |
-| "405 commits, 758 files, 77 touched on both sides" | brief §7 | union of both sides = **937 files**; mainline side **789**, platform side **228**, **80 files touched on both sides** | Re-measure; the brief's figures were taken at `f7d741d2f`. |
+| "74 ahead, 405 behind" | brief §7 / §1 | `git rev-list --left-right --count release/0.8.0...feature/deferred-platform-recovery` = **496 / 74** | Behind-count is **496** at `cbae1ef0c` (405 at `f7d741d2f`, 408 at `77537c8de`). It grew 88 in one working day. |
+| "405 commits, 758 files, 77 touched on both sides" | brief §7 | mainline side **843**, platform side **228**, **82 files touched on both sides** | Re-measure every time; the brief's figures were taken at `f7d741d2f`, and these at `cbae1ef0c`. |
 | open decision 5 (`create_run` lock domain) is **open**, needs a PG two-connection proof | 8915 dec. 5; brief H9 repeats it as an outstanding caveat | **8949 records it DONE**: 4 PostgreSQL proofs pass in `tests/testcontainer/web/test_run_admission_custody_lock_postgres.py`; "The lock domains DO match (authority.mutate takes transaction_session_lock = the same advisory key)"; ADR-038 `FOR UPDATE` (obs `elspeth-obs-a346487a1f`) already proven both orders by `test_token_outcome_atomicity_postgres.py` — "no new test owed" | **CLOSED WITH EVIDENCE.** The brief and `elspeth-obs-a346487a1f` still carry it as open. Correct both. Caveat: `addopts` on **both** branches carries `-m "not … testcontainer …"`, so those proofs are **not in the default gate** — the proof exists, it is not a standing gate. |
 | base pinned at `3575d0a72` (9075's ruling) | 9075 | `3575d0a72` and `b4405257a` are both now **ancestors of `release/0.8.0`** | Pin is stale, exactly as 9099 predicted. The pin must be re-taken at a live SHA. |
-| `release/0.8.0` @ `91816d0f3` | this session's own brief | `git rev-parse release/0.8.0` = `77537c8de8b7ce59cc916f0c5b3ee6ae419a8ce8` | The shared checkout **moved during this session** (sibling lanes). Any pin taken by hand is stale on arrival; capture `BASE=$(git rev-parse …)` inside the script. |
+| `release/0.8.0` @ `91816d0f3` | this session's own brief | `git rev-parse release/0.8.0` = `cbae1ef0ca6e351a6e82b0afea53880b3c668d43` | The shared checkout moved **twice** while this document was being written: `91816d0f3 → 77537c8de → cbae1ef0c`. Any pin taken by hand is stale on arrival; capture `BASE=$(git rev-parse …)` inside the script. |
 | 8949 `MERGEABILITY` line: "13 architecture adjudications" | 8949 | 8949's own enumeration is 9 session-facet + 7 landscape + 1 intentional-WIP = **17**; 8966 item (vi) also says **17** | Discrepancy **surfaced, not resolved**: 13 (8949 summary) vs 17 (8949 detail + 8966). Use 17 and re-derive. |
 
 ---
@@ -61,20 +72,24 @@ instruct the resolver to drop the fences.
 
 ## 2. Preconditions (all before the first conflict is touched)
 
-**P1. Fix H1 on mainline first.** `src/elspeth/web/sessions/routes/composer/state.py:642-646`
-passes `_surface_reverted_interpretation_reviews` as `replay=` with no
-`after_verified=`, so a completed `state_revert` retry writes to
-`interpretation_events` before the hash check. Introduced by `370e3bdf0`
-(mainline-only). Landing 74 commits that *preserve* the write-after-verify
-invariant onto a base that *violates* it buries the defect in a 70,000-line
-diff. Fixture requirement from the brief: the state record must have **populated
-metadata** and **missing evidence**, or the regression takes the early return at
-`state.py:102-103` and proves nothing.
+**P1. Fix H1 on mainline first — DISCHARGED.** Landed at `2a64b8ff7`
+("fix(composer): repair state_revert surfacing only after hash verification"),
+merged to `release/0.8.0` via `b74783a5e` and present in this baseline. The
+`state_revert` durable surfacing now runs as `after_verified=`, so the 74
+platform commits that *preserve* the write-after-verify invariant no longer
+land on a base that *violates* it. **Carry one thing forward into M3:** the
+new gate `tests/unit/architecture/test_guided_operation_replay_after_verified_sites.py`
+pins the per-`(module, function, posture)` **count** of every
+`reserve_or_replay_guided_operation` site (23 today, 8 entries). Merging 74
+commits that touch `guided.py`, `guided_plan.py`, `guided_chat_atomic.py` and
+`state.py` will move that census, and the gate is *supposed* to go red — its
+inventory must be re-derived from the merged tree and each posture re-argued,
+never widened to make the red go away.
 *(Brief §7 action 3 / H1 — this precondition is brief-only, it is not in the nine comments.)*
 
 **P2. Re-take the base pin at a live SHA, inside the script.** `3575d0a72` is
-now an ancestor of everything. `release/0.8.0` moved `91816d0f3 → 77537c8de`
-during this session. `BASE=$(git rev-parse <target>)` — never a hand-expanded
+now an ancestor of everything. `release/0.8.0` moved `91816d0f3 → 77537c8de →
+cbae1ef0c` during this session — twice, in one working day. `BASE=$(git rev-parse <target>)` — never a hand-expanded
 short hash.
 
 **P3. Settle the target ref with the operator** (§8 D1). The nine comments never
@@ -91,7 +106,10 @@ with **both** `elspeth.__file__` and `elspeth_lints.__file__` verified inside th
 worktree. §8 D2.
 
 **P5. Settle `SESSION_SCHEMA_EPOCH`** with the operator before resolving merge cohort M1.
-Measured: platform `48` (`models.py:248`), mainline `49` (`models.py:255`).
+Measured at `cbae1ef0c`: platform `48` (`models.py:248`), mainline **`50`**
+(`models.py:267`, bumped by `b7992af66`). The collision is now **two** epochs
+wide, not one, and it widened by an unrelated mainline fix — so it will widen
+again if this is left to the end.
 `src/elspeth/web/sessions/models.py` **is in the conflict set**, and the coupled
 consumer `src/elspeth/web/_aws_ecs_acceptance/receipt_contracts.py` is in the
 both-sides set — it bakes the epoch into the rollback-baseline receipt string.
@@ -203,25 +221,46 @@ substitute.
   8966 says "cohorts A/B/D and part of C/E" and nowhere states E's contents.
   **UNSETTLED**; do not infer it (§8 D6).
 
-### 4.1 Measured conflict set, 2026-09-04
+### 4.1 Measured conflict set — REBASELINED at `cbae1ef0c`
 
 `git merge-tree --write-tree --name-only --messages release/0.8.0 feature/deferred-platform-recovery`
-→ exit 1, **31 conflicted files**, all content conflicts (no file/directory
+→ exit 1, **33 conflicted files**, all content conflicts (no file/directory
 conflict today — 9075's `.claude/skills/loomweave-workflow` file/dir conflict has
 resolved itself).
 
 Conflict-count growth, and why the target choice moves it:
 
-| candidate target | conflicted files today | behind / ahead |
+| candidate target | conflicted files | behind / ahead |
 |---|---|---|
-| `release/0.8.0` @ `77537c8de` | **31** | 408 / 74 |
+| `release/0.8.0` @ `cbae1ef0c` | **33** | 496 / 74 |
 | `feature/unified-lineage` @ `0e11d0580` | **28** | 351 / 74 |
 | `interim-merge-target` @ `4b34d972c` | **24** | 325 / 74 |
 
 *(9075 measured 12 + 1 against `3575d0a72` on 08-31; 9099 measured 19 vs
-`feature/unified-lineage` and 24 vs `interim-merge-target` on 09-01. The trend
-9075 predicted — "merge cost is the only cost that grows monotonically" — holds:
-12 → 19 → 28 on the same lineage.)*
+`feature/unified-lineage` and 24 vs `interim-merge-target` on 09-01; this
+document measured 31 vs `release/0.8.0` @ `77537c8de` earlier on 09-04. The
+trend 9075 predicted — "merge cost is the only cost that grows monotonically" —
+holds without exception: 12 → 19 → 28 → 31 → 33 on the same lineage, the last
+step costing two files in a single working day. **Nothing has ever left the
+conflict set.** The two non-`release/0.8.0` rows are unchanged only because
+those refs have not moved.)*
+
+**The two files the rebaseline added, and why they are not routine.** Both
+arrived with the 2026-09-04 baseline (`51b43a770`, then `cbae1ef0c`):
+
+- **`src/elspeth/web/sessions/routes/composer/proposals.py`** — entirely new to
+  the set. The `strany/tool-result-envelope` merge message records that this
+  same file carried *"the semantic merge conflict … that git auto-merged
+  silently and only the mypy hook caught."* That is §3.1's failure signature,
+  already realised once on this exact path. Resolve it under §3.3's re-audit
+  rule, not by reading the diff.
+- **`src/elspeth/web/sessions/routes/composer/guided_plan.py`** — promoted from
+  the "auto-merging, still audit" column of M3 into a real conflict. It holds
+  five `reserve_or_replay_guided_operation` sites, so a careless resolution is
+  a fence-loss candidate, not a text merge.
+
+Both belong to **M3**, which keeps M3 the cohort where the resolution rule
+earns its keep.
 
 **9099 also rules the target out of one of these:** *"interim-merge-target is a
 BUG-FIX-ONLY interim branch and this multi-replica platform programme must not
@@ -239,7 +278,7 @@ the order 8915 recorded and 8917/8919 executed.
 |---|---|---|---|---|
 | **M1** | **Foundation / schema / contracts** *(from 8915(a))* | `src/elspeth/web/sessions/models.py`; (auto-merging, still audit) `sessions/schema.py`, `contracts/blobs.py`, `web/_aws_ecs_acceptance/receipt_contracts.py`, `config/cicd/contracts-whitelist.yaml` | 8915(a): coordination modules, `contracts/session_operation.py`, `models.py` lane authority tables, epoch, protocol union | **LANE semantics.** The lane authority tables and `session_operation_fences` exist only here (5 platform src files, 0 mainline). **Blocked on epoch ruling D3.** |
 | **M2** | **`sessions/service.py` + `sessions/protocol.py` + `pending_interpretation.py`** *(from 8915(b); `protocol.py` **moved here from 8915(a)** — a deliberate deviation from 8915's partition, so all three H3 files are audited together)* | `sessions/service.py` (conflicts); `sessions/protocol.py` (auto-merges); `pending_interpretation.py` (untouched by mainline) | 8915(b): symbol-level 3-way, 115 lane-only / 16 HEAD-new / 36 both-changed | **LANE semantics + mandatory H3 re-audit (§3.3).** Symbol-level 3-way, never file-level. Two of three surface nothing to git. |
-| **M3** | **Composer + session routes (the threading surface)** *(from 8915(c)+(d))* | `web/app.py`, `composer/protocol.py`, `composer/turn_audit.py`, `composer/guided/emitters.py`, `routes/_helpers.py`, `routes/messages.py`, `routes/sessions.py`, `routes/composer/{compose,guided,guided_chat_atomic,state}.py`; (auto-merging, still audit) `composer/service.py`, `composer/tool_batch.py`, `composer/tools/blobs.py`, `routes/composer/guided_plan.py`, `routes/interpretation.py`, `core/blobs_inline.py`, `web/blobs/service.py`, `web/execution/service.py` | 8915(c)+(d) took these **HEAD wholesale in the OTHER direction**; 8917 then had to re-thread all of them | **LANE semantics — this is the cohort 9075's rule was written for.** Every resolution keeps `session_operation_lease` / context threading. This is where a dropped fence becomes a hang (§3.1). **Note:** `web/preferences/service.py` is in **neither** the conflict set nor the both-sides set (untouched by either side since `7cd2fc6db`), so ruling 3 is a **standing semantics constraint** on this cohort — nothing may reintroduce compose-lease serialization of preferences — not a conflict to resolve. |
+| **M3** | **Composer + session routes (the threading surface)** *(from 8915(c)+(d))* | `web/app.py`, `composer/protocol.py`, `composer/turn_audit.py`, `composer/guided/emitters.py`, `routes/_helpers.py`, `routes/messages.py`, `routes/sessions.py`, `routes/composer/{compose,guided,guided_chat_atomic,guided_plan,proposals,state}.py`; (auto-merging, still audit) `composer/service.py`, `composer/tool_batch.py`, `composer/tools/blobs.py`, `routes/interpretation.py`, `core/blobs_inline.py`, `web/blobs/service.py`, `web/execution/service.py` | 8915(c)+(d) took these **HEAD wholesale in the OTHER direction**; 8917 then had to re-thread all of them | **LANE semantics — this is the cohort 9075's rule was written for.** Every resolution keeps `session_operation_lease` / context threading. This is where a dropped fence becomes a hang (§3.1). **Note:** `web/preferences/service.py` is in **neither** the conflict set nor the both-sides set (untouched by either side since `7cd2fc6db`), so ruling 3 is a **standing semantics constraint** on this cohort — nothing may reintroduce compose-lease serialization of preferences — not a conflict to resolve. |
 | **M4** | **`elspeth-lints/`** *(from 8915(e))* | (auto-merging) `elspeth-lints/src/elspeth_lints/core/review_bundle.py` | 8915(e): HEAD | **HEAD-first *per hunk*.** Never a file-level restore — that is exactly what `54ce1f9cf` did and it reverted a path-traversal fix (§3.2). Inventory the lane's containment fix (`resolve_staged_bundle_path`, `_require_str_arg` str-subclass rejection, `stage_scan`/`stage_rekey` invalid-`bundle_id` rejection, all landed in `a2176dfe2`) and confirm each survives. 8915(e) also names `src/elspeth/contracts/runtime_val_manifest.py`: it is in **neither** set today (platform-side only, untouched by mainline) — nothing to resolve, do not hunt for it. |
 | **M5** | **Tests** *(from 8915(f))* | 14 conflicted test files: `tests/e2e/recovery/test_sink_effect_deployment_profiles.py`, `tests/integration/web/test_preflight_per_class.py`, `tests/unit/web/composer/guided/test_emitters.py`, `.../test_compose_loop_interpretation_review_dispatch.py`, `.../test_request_interpretation_review_tool.py`, `tests/unit/web/sessions/routes/composer/test_state_boundaries.py`, `tests/unit/web/sessions/test_blob_inline_resolutions_schema.py`, `.../test_guided_operation_fork_service.py`, `.../test_guided_operations_service.py`, `.../test_guided_start.py`, `.../test_interpretation_events_routes.py`, `.../test_interpretation_events_service.py`, `.../test_interpretation_events_table.py`, `.../test_routes.py` | 8915(f): HEAD's conflicting tests from HEAD, lane's new test files kept | **Mixed, per file.** Mainline's *new coverage* is kept; the lane's *fence contracts* are kept. Where they collide the fenced contract wins and mainline's assertion is re-expressed against a leased harness (`tests/helpers/session_fences.py`, `tests/helpers/composer_lease.py`). **Preserve the platform-only guard test** `tests/unit/web/sessions/routes/test_guided_operations.py::test_terminal_replay_never_acquires_session_authority` — measured: **1 hit on `a2176dfe2`, 0 on `release/0.8.0`** (`git grep -c … -- tests`, zero-count files are omitted by `-c`, hence the explicit 0). `git log -S` shows it was never on mainline; there is nothing to fall back on. |
 | **M6** | **Docs / config / runbooks** *(from 8915(g))* | `README.md`, `docs/guides/sharing-pipelines.md`, `docs/runbooks/aws-ecs-deployment.md`, `docs/runbooks/staging-session-db-recreation.md` | 8915(g): HEAD | **HEAD (mainline).** Plus H4: delete or supersede `a2176dfe2:docs/superpowers/plans/2026-08-02-multi-replica-platform-pause-handoff.md` (the stale 369-line 23:09 revision, missing the 23:12 hash-drift paragraph) and retire the branch's whole `docs/superpowers/` tree — 5 files, measured — which mainline renamed at `8548a5e29`. A merge otherwise resurrects retired paths. |
@@ -248,8 +287,10 @@ M4 and M6 carry no fence risk and can be resolved in parallel with M1–M3.
 M2 **must not** start before M1; M3 **must not** start before M2; M5 is resolved
 last because its resolutions are re-expressions of M3's decisions.
 
-The 31 conflicted files partition exactly across M1–M6 with no overlap and no
-remainder: M1 = 1, M2 = 1, M3 = 11, M4 = 0, M5 = 14, M6 = 4.
+The 33 conflicted files partition exactly across M1–M6 with no overlap and no
+remainder: M1 = 1, M2 = 1, M3 = **13**, M4 = 0, M5 = 14, M6 = 4. Both files the
+2026-09-04 rebaseline added landed in M3, so the cohort that already carried the
+most fence risk is the one that grew.
 
 ### 4.3 The mechanical cohort survives the merge — re-verified today
 
@@ -400,9 +441,9 @@ not a substitute for it.
 
 | # | decision | why it cannot be taken by an agent | measured input |
 |---|---|---|---|
-| **D1** | **Which ref is "mainline" for this pass** — `release/0.8.0`, `feature/unified-lineage`, or something else. | The nine comments never name `release/0.8.0`; 9099's *"target is the FEATURE branch"* was written against a now-ancestor SHA. Conflict count, epoch decision and cohort contents all move with the choice. `interim-merge-target` is **ruled out** by John (9099: bug-fix-only interim). | 31 conflicts vs `release/0.8.0` @ `77537c8de`; 28 vs `feature/unified-lineage` @ `0e11d0580`; 24 vs `interim-merge-target` (forbidden). All 74/408, 74/351, 74/325. |
+| **D1** | **Which ref is "mainline" for this pass** — `release/0.8.0`, `feature/unified-lineage`, or something else. | The nine comments never name `release/0.8.0`; 9099's *"target is the FEATURE branch"* was written against a now-ancestor SHA. Conflict count, epoch decision and cohort contents all move with the choice. `interim-merge-target` is **ruled out** by John (9099: bug-fix-only interim). | **33** conflicts vs `release/0.8.0` @ `cbae1ef0c`; 28 vs `feature/unified-lineage` @ `0e11d0580`; 24 vs `interim-merge-target` (forbidden). Behind-counts 496, 351, 325; ahead 74 in all three. **The `release/0.8.0` row moves every few hours and the others do not, which is itself an argument for deciding D1 now rather than re-measuring it.** |
 | **D2** | **Which checkout or worktree hosts the pass.** | The platform branch has no worktree (9099: removed in the 09-01 cleanup). Brief §4 step 5's two arms are written for *test* runs, not for a 74-commit merge; Arm B's shared `.venv` is unsafe for anything that installs. Seven lanes share this `.git`. | All seven `.claude/worktrees/*` symlink `.venv` → main checkout. `<repo>/.worktrees/` does not exist. |
-| **D3** | **`SESSION_SCHEMA_EPOCH`: 48, 49, or 50.** | H6. Platform 48 (post-ruling-2 table drop, "epoch 48 has not shipped"); mainline 49 set by unrelated composer work (`07e417a7d`). `models.py` conflicts; `receipt_contracts.py` bakes the value into a rollback-baseline receipt string. | `a2176dfe2:models.py:248` = 48; `release/0.8.0:models.py:255` = 49. Both files in the both-sides set. |
+| **D3** | **`SESSION_SCHEMA_EPOCH`: 48, 50, or 51.** *(Was "48, 49 or 50" — mainline has since moved to 50, so the option set shifted up by one.)* | H6. Platform 48 (post-ruling-2 table drop, "epoch 48 has not shipped"); mainline **50**, set by `b7992af66` (the guided-decline-rebind fix) — the second unrelated bump in a week, so the collision widened from one epoch to two while this document was being written. `models.py` conflicts; `receipt_contracts.py` bakes the value into a rollback-baseline receipt string. **The drift itself is the argument for settling D3 early: every mainline bump re-opens it.** | `a2176dfe2:models.py:248` = 48; `release/0.8.0:models.py:267` = **50**. Both files in the both-sides set. |
 | **D4** | **Which deferred-platform plan governs** — restore the 27-task revision (blob `1e62a12cc`) to `docs/plans/`, or formally supersede it. | Brief §7 action 2. Nothing downstream is safely numberable: the same task number names different work in the two revisions, and one puts provider packaging inside the "stop before Task 14" boundary. Compounded by H8 (branch carries the v3 spec against the v1 plan; zero `- [x]` on both revisions). | — |
 | **D5** | **`state_envelope.py` cherry-pick to mainline: now, with the merge, or not at all.** | 9075 required re-verifying the defect reproduces before cherry-picking (`61e561061`, `7f7a2ec75` touched `composition_states`); 9099 records it **not re-verified**. H7 warns the naive fix (`_unwrap_envelope` alone) downgrades a fail-**closed** prong to a fail-**open** one — a blob referenced only from a source's options would read as unreferenced. `elspeth-3db5745ba7` is open P1; **do not file a duplicate**. | `src/elspeth/web/sessions/state_envelope.py`: **PRESENT** on `a2176dfe2`; **ABSENT** on `release/0.8.0`, `feature/unified-lineage`, `interim-merge-target`. The writer/reader asymmetry is live on mainline today. |
 | **D6** | **What Phase-0 cohort E was.** | 8966 claims "part of C/E" complete; **E is defined nowhere in the nine comments.** Either the operator knows, or it is re-derived from the remaining 8949/8966 open items and re-named. | Cohorts A (stage 1–3 merge), B (ruling-5 PG proofs), C (contention + characterization leasing), D (architecture repin) are all defined. E is not. |
@@ -493,17 +534,18 @@ figure below is reproducible by re-running the commands as written.
 git rev-parse origin/feature/deferred-platform-recovery
   → a2176dfe225bd9d56d5eed642f7a8aff0a9485d2   (== local branch; PUSHED)
 git rev-parse release/0.8.0
-  → 77537c8de8b7ce59cc916f0c5b3ee6ae419a8ce8   (was 91816d0f3 at session start)
+  → cbae1ef0ca6e351a6e82b0afea53880b3c668d43
+  (91816d0f3 → 77537c8de → cbae1ef0c across one working day; == origin, PUSHED)
 git merge-base release/0.8.0 feature/deferred-platform-recovery
   → 7cd2fc6db08714386bfb7e9d1ddd9b012f8c589d
 git rev-list --left-right --count release/0.8.0...feature/deferred-platform-recovery
-  → 408   74
+  → 496   74                                        (was 408 74 at 77537c8de)
 git merge-tree --write-tree --name-only --messages release/0.8.0 feature/deferred-platform-recovery
-  → exit 1, 31 conflicted files, all content conflicts
-git diff --name-only 7cd2fc6db release/0.8.0                        → 789 files
+  → exit 1, 33 conflicted files, all content conflicts   (was 31 at 77537c8de;
+    added routes/composer/proposals.py and routes/composer/guided_plan.py)
+git diff --name-only 7cd2fc6db release/0.8.0                        → 843 files
 git diff --name-only 7cd2fc6db feature/deferred-platform-recovery   → 228 files
-comm -12                                                            →  80 files both sides
-union                                                               → 937 files
+comm -12                                                            →  82 files both sides
 git rev-parse 0b676d195^ 0b676d195^2   → 7cd2fc6db… / 4c59c9d02…
   (H3: all three named files match neither parent — table in §3.3)
 git grep -c 'SessionOperationContext' a2176dfe2 -- 'src/*'   → 23 files, 276 hits
@@ -511,7 +553,8 @@ git grep -c 'SessionOperationContext' release/0.8.0 -- 'src/*' → 0 files
 git show a2176dfe2:pyproject.toml     | sed -n '450,455p'   → addopts, no -n
 git show release/0.8.0:pyproject.toml | sed -n '450,462p'   → addopts … "-n","12"
 git show a2176dfe2:…/models.py     | grep SESSION_SCHEMA_EPOCH → 248: = 48
-git show release/0.8.0:…/models.py | grep SESSION_SCHEMA_EPOCH → 255: = 49
+git show release/0.8.0:…/models.py | grep SESSION_SCHEMA_EPOCH → 267: = 50
+  (was 255: = 49 at 77537c8de; bumped by b7992af66 — the collision is now 2)
 git cat-file -e <ref>:src/elspeth/web/sessions/state_envelope.py
   → PRESENT a2176dfe2; ABSENT release/0.8.0, feature/unified-lineage, interim-merge-target
 ```

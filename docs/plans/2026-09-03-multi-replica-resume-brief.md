@@ -18,18 +18,34 @@ identical on `origin`.
 ## 0. Processed 2026-09-04 — corrections, and what is now discharged
 
 Read this section before §1. Everything below §0 is a correct measurement **as
-of 2026-09-03** and is left standing as such; this section records what a
-2026-09-04 re-measurement changed, and which of §7's actions are done. Every
-figure the brief states was re-derived at its own base `f7d741d2f` and
-**reproduced exactly** — the brief was right, the tree moved.
+of 2026-09-03** and is left standing as such; this section records what
+re-measurement changed, and which of §7's actions are done. Every figure the
+brief states was re-derived at its own base `f7d741d2f` and **reproduced
+exactly** — the brief was right, the tree moved.
 
-**Anchors that moved (mainline drifts ~1 commit / 80 min).** Mainline is
-`77537c8de` (via `91816d0f3`, then a sibling `fix/guided-phase2` merge), 8
-ahead of `origin/release/0.8.0` @ `8ef46621b`, still unpushed. Integration debt
-is **408 commits / 789 mainline-changed files / 80 touched on both sides**. The
-workspace table in §3 now holds **eight** worktrees — `identity-sprint` is new.
+**Baseline: `release/0.8.0` @ `cbae1ef0c`, and mainline is now PUSHED.**
+`origin/release/0.8.0 == cbae1ef0c == HEAD`, 0 ahead / 0 behind. **The inversion
+this brief highlights in §2 is gone** — mainline is no longer the private side,
+so "do not push" now reads only as its surviving intent: *do not merge or open a
+PR from `feature/deferred-platform-recovery` into `release/0.8.0`* until the
+corpus is reaccepted. Two major changes set this baseline: `51b43a770`
+(fix/guided-decline-rebind — a settlement carrying a proposal must rebase its
+anchor, P0 `elspeth-ed67eb9d0d`; it also bumped the schema epoch) and
+`cbae1ef0c` (strany/tool-result-envelope — every `data.*` key the composer ships
+is taught or fenced, and `ToolResult.data` closed to a real union per ADR-032).
+
+**Anchors that moved.** Integration debt is now **496 commits / 843
+mainline-changed files / 82 touched on both sides** (was 408 / 789 / 80 eight
+hours earlier — the gap is widening fast, so re-measure before acting on it).
+§3's workspace table now holds **nine** worktrees: `identity-sprint` and
+`guided-decline-brick` are new. **H6's epoch collision widened from one to two:
+mainline is now `SESSION_SCHEMA_EPOCH = 50`** (set by `b7992af66`), platform
+still 48. The `receipt_contracts.py` coupling H6 names is unchanged and still
+bakes the epoch into the rollback-baseline receipt.
 Full per-claim corrections list (34 still true, 10 moved, each with the command
-that settles it): [`2026-09-04-multi-replica-anchor-reverification.md`](2026-09-04-multi-replica-anchor-reverification.md).
+that settles it): [`2026-09-04-multi-replica-anchor-reverification.md`](2026-09-04-multi-replica-anchor-reverification.md)
+— measured at `77537c8de`, so read its *reasoning* as current and its *figures*
+as superseded by the paragraph above.
 
 **§4 step 8 and U3 — SETTLED, and the harvest list is TOO NARROW.** The
 2026-08-02 handoff enumerates **four** things the interrupted implementer
@@ -78,10 +94,19 @@ anything during the integration, not a prohibition.
    is an operator call.
 2. **Settle which plan governs — STILL OPEN**, and now one of **eight**
    operator decisions, not one. See the method document below.
-3. **Fix the `state_revert` ordering (H1) — DONE.** The durable surfacing call
-   moved out of `_replay` into `after_verified=`, mirroring
+3. **Fix the `state_revert` ordering (H1) — LANDED** at `2a64b8ff7`
+   ("fix(composer): repair state_revert surfacing only after hash
+   verification"), merged to `release/0.8.0` via `b74783a5e`. The durable
+   surfacing call moved out of `_replay` into `after_verified=`, mirroring
    `post_guided_respond`. Proven RED-then-GREEN with a non-vacuity control, and
-   signed off by three independent adversarial reviewers.
+   signed off by three independent adversarial reviewers. It ships with a new
+   whole-tree gate, `tests/unit/architecture/test_guided_operation_replay_after_verified_sites.py`,
+   which pins the per-`(module, function, posture)` **count** of every
+   `reserve_or_replay_guided_operation` call site and forbids rebinding the
+   primitive's name. **Read its docstring before adding a route:** it states
+   plainly that no declaration-level key — count or set — can see a durable
+   write added *inside* an existing `replay` callable, which is the shape H1
+   itself had. Green at `cbae1ef0c`; the site census is unchanged at 23.
 
 **The integration method is now written down**, as §7 requires it to be before
 the pass starts: [`2026-09-04-multi-replica-integration-method.md`](2026-09-04-multi-replica-integration-method.md).
