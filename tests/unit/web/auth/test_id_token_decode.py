@@ -15,8 +15,8 @@ from typing import Any
 
 import pytest
 
+from elspeth.web.auth.id_token import JWKSTokenValidator
 from elspeth.web.auth.models import AuthenticationError
-from elspeth.web.auth.oidc import JWKSTokenValidator
 from tests.unit.web.auth.conftest import build_rsa_jwk, make_rsa_token
 
 ISSUER = "https://issuer.example.gov.au"
@@ -225,3 +225,74 @@ class TestSignature:
         message = str(excinfo.value)
         assert "some-other-app" not in message
         assert token.split(".")[1] not in message
+
+
+# --------------------------------------------------------------------------
+# Moved here with JWKSTokenValidator itself. These four tests are the
+# CONTRACTUAL anchors of the @trust_boundary decorators in
+# ``elspeth/web/auth/id_token.py`` — the trust_boundary.tests rule resolves
+# each ``test_ref`` nodeid and fails when it does not exist. Left in
+# test_oidc_provider.py they would have been deleted along with the legacy
+# provider, silently breaking an enforced gate on code that is staying.
+# --------------------------------------------------------------------------
+
+
+class TestJWKSValidatorBoundaryRaises:
+    """Direct-call boundary tests for the @trust_boundary-decorated JWKS validators.
+
+    These tests invoke each validator with the malformed external value passed
+    DIRECTLY as the decorator's ``source_param`` (no httpx mock indirection) so
+    the trust_boundary.tests honesty gate can prove the raising invariant
+    against the named parameter. The IdP-driven shape-failure paths are also
+    exercised end-to-end through ``authenticate`` in
+    ``TestOIDCJWKSShapeValidation`` above; these direct-call tests pin the
+    boundary contract at the function granularity the decorator attests.
+    """
+
+    @staticmethod
+    def _validator() -> JWKSTokenValidator:
+        return JWKSTokenValidator(issuer=ISSUER, audience=AUDIENCE)
+
+    def test_validate_discovery_document_non_dict_raises(self) -> None:
+        """A non-object discovery payload is rejected at the boundary, not coerced."""
+        validator = self._validator()
+        with pytest.raises(AuthenticationError, match="not a JSON object"):
+            validator._validate_discovery_document(discovery=["not", "a", "dict"])
+
+    def test_validate_jwks_document_missing_keys_raises(self) -> None:
+        """A JWKS document without a 'keys' list is rejected at the boundary."""
+        with pytest.raises(AuthenticationError, match="missing 'keys' list"):
+            JWKSTokenValidator._validate_jwks_document(jwks={"not_keys": []})
+
+    def test_get_token_algorithm_missing_alg_raises(self) -> None:
+        """A token header without a non-empty string 'alg' is rejected at the boundary."""
+        with pytest.raises(AuthenticationError, match="non-empty string 'alg'"):
+            JWKSTokenValidator._get_token_algorithm(header={"kid": "k1"})
+
+    def test_get_jwk_algorithm_invalid_alg_raises(self) -> None:
+        """A matched JWK with a non-string 'alg' is rejected at the boundary.
+
+        The no-match / missing-alg paths return None (honest absence); the
+        boundary only RAISES when a matched key advertises an invalid 'alg'
+        value, which is the invariant the decorator attests.
+        """
+        jwks = {"keys": [{"kid": "k1", "alg": 42}]}
+        with pytest.raises(AuthenticationError, match="invalid non-empty string 'alg'"):
+            JWKSTokenValidator._get_jwk_algorithm(jwks=jwks, kid="k1")
+
+    def test_manual_claim_helper_is_a_trust_boundary(self) -> None:
+        from elspeth.web.auth.id_token import _validate_cognito_access_claims
+
+        with pytest.raises(AuthenticationError, match="token_use"):
+            _validate_cognito_access_claims(
+                {"client_id": AUDIENCE, "token_use": "id"},
+                audience=AUDIENCE,
+            )
+
+        metadata = _validate_cognito_access_claims.__trust_boundary__  # type: ignore[attr-defined]
+        assert metadata.tier == 3
+        assert metadata.test_ref == (
+            "tests/unit/web/auth/test_id_token_decode.py::TestJWKSValidatorBoundaryRaises::test_manual_claim_helper_is_a_trust_boundary"
+        )
+        assert "client_id" in metadata.invariant
+        assert "token_use" in metadata.invariant

@@ -13,8 +13,9 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from structlog.testing import capture_logs
 
+from elspeth.web.auth.id_token import JWKSTokenValidator
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, UserIdentity
-from elspeth.web.auth.oidc import JWKSTokenValidator, OIDCAuthProvider
+from elspeth.web.auth.oidc import OIDCAuthProvider
 from tests.unit.web.auth.conftest import build_rsa_jwk, make_rs256_token, make_rsa_token
 
 ISSUER = "https://login.example.com"
@@ -94,7 +95,7 @@ def mock_httpx_discovery(jwks_response):
     client_mock.__aenter__.return_value = client_mock
     client_mock.__aexit__.return_value = False
 
-    return patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client_mock)
+    return patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=client_mock)
 
 
 class TestOIDCDiscovery:
@@ -113,7 +114,7 @@ class TestOIDCDiscovery:
     )
     def test_rejects_unsafe_issuer_before_discovery_network_call(self, issuer: str) -> None:
         with (
-            patch("elspeth.web.auth.oidc.httpx.AsyncClient") as async_client,
+            patch("elspeth.web.auth.id_token.httpx.AsyncClient") as async_client,
             pytest.raises(ValueError),
         ):
             JWKSTokenValidator(issuer=issuer, audience=AUDIENCE)
@@ -165,7 +166,7 @@ class TestOIDCDiscovery:
         success_client.__aenter__.return_value = success_client
         success_client.__aexit__.return_value = False
 
-        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=success_client):
+        with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=success_client):
             await provider.authenticate(token)
 
         # Second call: mock raises on any HTTP call -- if caching works,
@@ -178,7 +179,7 @@ class TestOIDCDiscovery:
         failing_client.__aenter__.return_value = failing_client
         failing_client.__aexit__.return_value = False
 
-        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=failing_client):
+        with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=failing_client):
             identity = await provider.authenticate(token)
             assert identity.user_id == "user-123"
 
@@ -220,7 +221,7 @@ class TestOIDCSigningKeyRotation:
         client.__aenter__.return_value = client
         client.__aexit__.return_value = False
 
-        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client):
+        with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=client):
             assert (await provider.authenticate(old_token)).user_id == "user-123"
             discovery_fetches = 0
             jwks_fetches = 0
@@ -284,7 +285,7 @@ class TestOIDCSigningKeyRotation:
         client.__aenter__.return_value = client
         client.__aexit__.return_value = False
 
-        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client):
+        with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=client):
             assert (await provider.authenticate(old_token)).user_id == "user-123"
             discovery_fetches = 0
             jwks_fetches = 0
@@ -339,7 +340,7 @@ class TestOIDCSigningKeyRotation:
         client.__aenter__.return_value = client
         client.__aexit__.return_value = False
 
-        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client):
+        with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=client):
             assert (await provider.authenticate(old_token)).user_id == "user-123"
             discovery_fetches = 0
             decode_calls = 0
@@ -385,7 +386,7 @@ class TestOIDCSigningKeyRotation:
         client.__aenter__.return_value = client
         client.__aexit__.return_value = False
 
-        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client):
+        with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=client):
             assert (await provider.authenticate(old_token)).user_id == "user-123"
             discovery_fetches = 0
             active_jwks = rotated_jwks
@@ -614,23 +615,6 @@ class TestOIDCAudienceClaimModes:
         with pytest.raises(AuthenticationError, match="algorithm"):
             validator.decode_token(token, build_rsa_jwk(public_key, alg=None))
 
-    def test_manual_claim_helper_is_a_trust_boundary(self) -> None:
-        from elspeth.web.auth.oidc import _validate_cognito_access_claims
-
-        with pytest.raises(AuthenticationError, match="token_use"):
-            _validate_cognito_access_claims(
-                {"client_id": AUDIENCE, "token_use": "id"},
-                audience=AUDIENCE,
-            )
-
-        metadata = _validate_cognito_access_claims.__trust_boundary__  # type: ignore[attr-defined]
-        assert metadata.tier == 3
-        assert metadata.test_ref == (
-            "tests/unit/web/auth/test_oidc_provider.py::TestOIDCAudienceClaimModes::test_manual_claim_helper_is_a_trust_boundary"
-        )
-        assert "client_id" in metadata.invariant
-        assert "token_use" in metadata.invariant
-
     def test_jwks_discovery_requires_exact_issuer(self) -> None:
         validator = JWKSTokenValidator(ISSUER, AUDIENCE)
         with pytest.raises(AuthenticationError, match="issuer"):
@@ -834,7 +818,7 @@ class TestOIDCJWKSFailures:
 
         with (
             patch(
-                "elspeth.web.auth.oidc.httpx.AsyncClient",
+                "elspeth.web.auth.id_token.httpx.AsyncClient",
                 return_value=client_mock,
             ),
             pytest.raises(AuthProviderUnavailable, match="JWKS unavailable"),
@@ -860,7 +844,7 @@ class TestOIDCJWKSFailures:
 
         with (
             patch(
-                "elspeth.web.auth.oidc.httpx.AsyncClient",
+                "elspeth.web.auth.id_token.httpx.AsyncClient",
                 return_value=client_mock,
             ),
             pytest.raises(
@@ -888,7 +872,7 @@ class TestOIDCJWKSFailures:
 
         with (
             patch(
-                "elspeth.web.auth.oidc.httpx.AsyncClient",
+                "elspeth.web.auth.id_token.httpx.AsyncClient",
                 return_value=client_mock,
             ),
             pytest.raises(AuthProviderUnavailable, match="JWKS unavailable"),
@@ -945,7 +929,7 @@ class TestOIDCJWKSFailures:
         failing_client.__aexit__.return_value = False
 
         with patch(
-            "elspeth.web.auth.oidc.httpx.AsyncClient",
+            "elspeth.web.auth.id_token.httpx.AsyncClient",
             return_value=failing_client,
         ):
             # Should succeed using stale cache, not raise
@@ -975,7 +959,7 @@ class TestOIDCJWKSFailures:
 
         with (
             patch(
-                "elspeth.web.auth.oidc.httpx.AsyncClient",
+                "elspeth.web.auth.id_token.httpx.AsyncClient",
                 return_value=client_mock,
             ),
             pytest.raises(AuthProviderUnavailable, match="JWKS unavailable"),
@@ -1007,7 +991,7 @@ class TestOIDCJWKSShapeValidation:
         client_mock.get = mock_get
         client_mock.__aenter__.return_value = client_mock
         client_mock.__aexit__.return_value = False
-        return patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client_mock)
+        return patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=client_mock)
 
     @pytest.mark.asyncio
     async def test_discovery_json_array_raises_auth_error(self) -> None:
@@ -1063,7 +1047,7 @@ class TestOIDCJWKSShapeValidation:
         client_mock.__aexit__.return_value = False
 
         with (
-            patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client_mock),
+            patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=client_mock),
             pytest.raises(AuthenticationError, match="same origin as issuer"),
         ):
             await provider.authenticate("some-token")
@@ -1094,7 +1078,7 @@ class TestOIDCJWKSShapeValidation:
         client_mock.__aexit__.return_value = False
 
         with (
-            patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client_mock),
+            patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=client_mock),
             pytest.raises(AuthenticationError, match="HTTPS URL"),
         ):
             await provider.authenticate("some-token")
@@ -1237,7 +1221,7 @@ class TestOIDCStaleCacheBackoff:
         failing_client.__aenter__.return_value = failing_client
         failing_client.__aexit__.return_value = False
 
-        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=failing_client):
+        with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=failing_client):
             # First call under outage: attempts one fetch, falls back to stale cache.
             identity1 = await provider.authenticate(token)
             # Second call within the 60s backoff window: MUST use cache, not re-fetch.
@@ -1286,7 +1270,7 @@ class TestOIDCStaleCacheBackoff:
         failing_client.__aenter__.return_value = failing_client
         failing_client.__aexit__.return_value = False
 
-        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=failing_client):
+        with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=failing_client):
             await provider.authenticate(token)  # first failed fetch
             # Simulate time passing past the retry window.
             provider._validator._next_refresh_at = time.monotonic() - 1
@@ -1329,13 +1313,13 @@ class TestOIDCAbsoluteJWKSStaleness:
         token = make_rs256_token(private_key, _valid_claims())
         attempts: list[str] = []
 
-        with patch("elspeth.web.auth.oidc.time.monotonic", side_effect=lambda: now):
+        with patch("elspeth.web.auth.id_token.time.monotonic", side_effect=lambda: now):
             with mock_httpx_discovery:
                 await provider.authenticate(token)
 
             now = 1_001.0
             failing_client = self._failing_client(attempts)
-            with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=failing_client):
+            with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=failing_client):
                 # The first outage refresh is within the absolute grace period.
                 assert (await provider.authenticate(token)).user_id == "user-123"
 
@@ -1367,13 +1351,13 @@ class TestOIDCAbsoluteJWKSStaleness:
         token = make_rs256_token(private_key, _valid_claims())
         attempts: list[str] = []
 
-        with patch("elspeth.web.auth.oidc.time.monotonic", side_effect=lambda: now):
+        with patch("elspeth.web.auth.id_token.time.monotonic", side_effect=lambda: now):
             with mock_httpx_discovery:
                 await provider.authenticate(token)
 
             now = 2_005.0
             failing_client = self._failing_client(attempts)
-            with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=failing_client):
+            with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=failing_client):
                 assert (await provider.authenticate(token)).user_id == "user-123"
 
             # Recover after the retry window. This successful validation must
@@ -1384,7 +1368,7 @@ class TestOIDCAbsoluteJWKSStaleness:
 
             now = 2_040.0
             failing_client = self._failing_client(attempts)
-            with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=failing_client):
+            with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=failing_client):
                 assert (await provider.authenticate(token)).user_id == "user-123"
 
                 now = 2_046.0
@@ -1411,7 +1395,7 @@ class TestOIDCAbsoluteJWKSStaleness:
         )
         token = make_rs256_token(private_key, _valid_claims())
 
-        with patch("elspeth.web.auth.oidc.time.monotonic", side_effect=lambda: now):
+        with patch("elspeth.web.auth.id_token.time.monotonic", side_effect=lambda: now):
             with mock_httpx_discovery:
                 await provider.authenticate(token)
 
@@ -1441,7 +1425,7 @@ class TestOIDCAbsoluteJWKSStaleness:
         )
         token = make_rs256_token(private_key, _valid_claims())
 
-        with patch("elspeth.web.auth.oidc.time.monotonic", side_effect=lambda: now):
+        with patch("elspeth.web.auth.id_token.time.monotonic", side_effect=lambda: now):
             with mock_httpx_discovery:
                 await provider.authenticate(token)
             assert provider._validator._jwks_last_success_at == 4_000.0
@@ -1469,7 +1453,7 @@ class TestOIDCAbsoluteJWKSStaleness:
         )
         token = make_rs256_token(private_key, _valid_claims())
 
-        with patch("elspeth.web.auth.oidc.time.monotonic", side_effect=lambda: now):
+        with patch("elspeth.web.auth.id_token.time.monotonic", side_effect=lambda: now):
             with mock_httpx_discovery:
                 await provider.authenticate(token)
 
@@ -1516,7 +1500,7 @@ class TestOIDCJWKSFailureLogRedaction:
         failing_client.__aexit__.return_value = False
 
         with (
-            patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=failing_client),
+            patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=failing_client),
             capture_logs() as cap_logs,
         ):
             identity = await provider.authenticate(token)
@@ -1552,7 +1536,7 @@ class TestOIDCJWKSFailureLogRedaction:
         failing_client.__aexit__.return_value = False
 
         with (
-            patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=failing_client),
+            patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=failing_client),
             capture_logs() as cap_logs,
             pytest.raises(AuthProviderUnavailable, match="JWKS unavailable: InvalidURL"),
         ):
@@ -1635,7 +1619,7 @@ class TestOIDCShapeFailureBackoff:
         shape_client.__aenter__.return_value = shape_client
         shape_client.__aexit__.return_value = False
 
-        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=shape_client):
+        with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=shape_client):
             # First call: enters critical section, hits shape validator,
             # propagates AuthenticationError. This is the "do not serve
             # stale cache on the failure path" contract.
@@ -1721,7 +1705,7 @@ class TestOIDCConcurrentStaleDuringOutage:
         hanging_client.__aenter__.return_value = hanging_client
         hanging_client.__aexit__.return_value = False
 
-        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=hanging_client):
+        with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=hanging_client):
             # Winner: acquires the lock and blocks inside hanging_get.
             winner = asyncio.create_task(provider.authenticate(token))
             # Poll until the winner has reached hanging_get; asyncio.Lock
@@ -1769,7 +1753,7 @@ class TestOIDCConcurrentStaleDuringOutage:
         values re-introduce the partial DoS documented in
         elspeth-32982f17cf.
         """
-        from elspeth.web.auth.oidc import JWKSTokenValidator
+        from elspeth.web.auth.id_token import JWKSTokenValidator
 
         for cls in (JWKSTokenValidator, OIDCAuthProvider):
             sig = inspect.signature(cls.__init__)
@@ -1779,7 +1763,7 @@ class TestOIDCConcurrentStaleDuringOutage:
 
     def test_default_max_stale_seconds_is_finite(self) -> None:
         """Provider defaults must never permit indefinitely renewable stale keys."""
-        from elspeth.web.auth.oidc import JWKSTokenValidator
+        from elspeth.web.auth.id_token import JWKSTokenValidator
 
         for cls in (JWKSTokenValidator, OIDCAuthProvider):
             sig = inspect.signature(cls.__init__)
@@ -1838,7 +1822,7 @@ class TestOIDCStaleCacheDoesNotLaunderProgrammerBugs:
 
         with (
             patch(
-                "elspeth.web.auth.oidc.httpx.AsyncClient",
+                "elspeth.web.auth.id_token.httpx.AsyncClient",
                 return_value=buggy_client,
             ),
             pytest.raises(AttributeError, match="NoneType"),
@@ -1873,7 +1857,7 @@ class TestOIDCStaleCacheDoesNotLaunderProgrammerBugs:
 
         with (
             patch(
-                "elspeth.web.auth.oidc.httpx.AsyncClient",
+                "elspeth.web.auth.id_token.httpx.AsyncClient",
                 return_value=buggy_client,
             ),
             pytest.raises(TypeError, match="unsupported operand"),
@@ -1913,7 +1897,7 @@ class TestOIDCStaleCacheDoesNotLaunderProgrammerBugs:
 
         with (
             patch(
-                "elspeth.web.auth.oidc.httpx.AsyncClient",
+                "elspeth.web.auth.id_token.httpx.AsyncClient",
                 return_value=buggy_client,
             ),
             pytest.raises(KeyError, match="internal_dict_lookup_bug"),
@@ -1949,7 +1933,7 @@ class TestOIDCStaleCacheDoesNotLaunderProgrammerBugs:
         outage_client.__aexit__.return_value = False
 
         with patch(
-            "elspeth.web.auth.oidc.httpx.AsyncClient",
+            "elspeth.web.auth.id_token.httpx.AsyncClient",
             return_value=outage_client,
         ):
             identity = await provider.authenticate(token)
@@ -1987,7 +1971,7 @@ class TestOIDCStaleCacheDoesNotLaunderProgrammerBugs:
         malformed_client.__aexit__.return_value = False
 
         with patch(
-            "elspeth.web.auth.oidc.httpx.AsyncClient",
+            "elspeth.web.auth.id_token.httpx.AsyncClient",
             return_value=malformed_client,
         ):
             identity = await provider.authenticate(token)
@@ -2025,7 +2009,7 @@ class TestOIDCStaleCacheDoesNotLaunderProgrammerBugs:
         invalid_url_client.__aexit__.return_value = False
 
         with patch(
-            "elspeth.web.auth.oidc.httpx.AsyncClient",
+            "elspeth.web.auth.id_token.httpx.AsyncClient",
             return_value=invalid_url_client,
         ):
             identity = await provider.authenticate(token)
@@ -2077,7 +2061,7 @@ class TestOIDCColdStartBackoff:
         failing_client.__aenter__.return_value = failing_client
         failing_client.__aexit__.return_value = False
 
-        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=failing_client):
+        with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=failing_client):
             # First call: attempts fetch, has no stale cache, raises AuthProviderUnavailable.
             with pytest.raises(AuthProviderUnavailable):
                 await provider.authenticate(token)
@@ -2126,7 +2110,7 @@ class TestOIDCColdStartBackoff:
         failing_client.__aexit__.return_value = False
 
         with (
-            patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=failing_client),
+            patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=failing_client),
             pytest.raises(AuthProviderUnavailable),
         ):
             await provider.authenticate(token)
@@ -2172,7 +2156,7 @@ class TestOIDCColdStartBackoff:
         failing_client.__aenter__.return_value = failing_client
         failing_client.__aexit__.return_value = False
 
-        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=failing_client):
+        with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=failing_client):
             results = await asyncio.gather(
                 *(provider.authenticate(token) for _ in range(5)),
                 return_exceptions=True,
@@ -2198,47 +2182,3 @@ class TestOIDCProtocolConformance:
 
         provider = OIDCAuthProvider(issuer=ISSUER, audience=AUDIENCE)
         assert isinstance(provider, AuthProvider)
-
-
-class TestJWKSValidatorBoundaryRaises:
-    """Direct-call boundary tests for the @trust_boundary-decorated JWKS validators.
-
-    These tests invoke each validator with the malformed external value passed
-    DIRECTLY as the decorator's ``source_param`` (no httpx mock indirection) so
-    the trust_boundary.tests honesty gate can prove the raising invariant
-    against the named parameter. The IdP-driven shape-failure paths are also
-    exercised end-to-end through ``authenticate`` in
-    ``TestOIDCJWKSShapeValidation`` above; these direct-call tests pin the
-    boundary contract at the function granularity the decorator attests.
-    """
-
-    @staticmethod
-    def _validator() -> JWKSTokenValidator:
-        return JWKSTokenValidator(issuer=ISSUER, audience=AUDIENCE)
-
-    def test_validate_discovery_document_non_dict_raises(self) -> None:
-        """A non-object discovery payload is rejected at the boundary, not coerced."""
-        validator = self._validator()
-        with pytest.raises(AuthenticationError, match="not a JSON object"):
-            validator._validate_discovery_document(discovery=["not", "a", "dict"])
-
-    def test_validate_jwks_document_missing_keys_raises(self) -> None:
-        """A JWKS document without a 'keys' list is rejected at the boundary."""
-        with pytest.raises(AuthenticationError, match="missing 'keys' list"):
-            JWKSTokenValidator._validate_jwks_document(jwks={"not_keys": []})
-
-    def test_get_token_algorithm_missing_alg_raises(self) -> None:
-        """A token header without a non-empty string 'alg' is rejected at the boundary."""
-        with pytest.raises(AuthenticationError, match="non-empty string 'alg'"):
-            JWKSTokenValidator._get_token_algorithm(header={"kid": "k1"})
-
-    def test_get_jwk_algorithm_invalid_alg_raises(self) -> None:
-        """A matched JWK with a non-string 'alg' is rejected at the boundary.
-
-        The no-match / missing-alg paths return None (honest absence); the
-        boundary only RAISES when a matched key advertises an invalid 'alg'
-        value, which is the invariant the decorator attests.
-        """
-        jwks = {"keys": [{"kid": "k1", "alg": 42}]}
-        with pytest.raises(AuthenticationError, match="invalid non-empty string 'alg'"):
-            JWKSTokenValidator._get_jwk_algorithm(jwks=jwks, kid="k1")
