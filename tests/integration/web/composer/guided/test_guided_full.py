@@ -632,13 +632,24 @@ def test_guided_full_main_fence_loss_without_a_replayable_winner_preserves_the_p
 
     planner = _FenceLosingPlanner()
     real_reserve = reserve_or_replay_guided_operation
+    reserved_leases: list[GuidedOperationLease] = []
 
     async def no_replayable_winner(**kwargs):
         if kwargs.get("reserve_if_absent") is not False:
-            return await real_reserve(**kwargs)
+            reserved = await real_reserve(**kwargs)
+            if type(reserved) is GuidedOperationLease:
+                reserved_leases.append(reserved)
+            return reserved
         if lookup_outcome == "lease":
+            # A live claim owns both authorities. The only live session lease
+            # on this session is the route's own reservation (a second acquire
+            # would conflict at the session fence), so the modelled winner
+            # shares it: the route's no-winner arm never touches
+            # ``session_lease`` and the route's own ``finally`` closes that
+            # lease exactly once.
             assert planner.fence is not None
-            return GuidedOperationLease(fence=planner.fence)
+            (reserved,) = reserved_leases
+            return GuidedOperationLease(fence=planner.fence, session_lease=reserved.session_lease)
         if lookup_outcome == "expired":
             return GuidedOperationExpired(attempt=1)
         if lookup_outcome == "lookup_error":
