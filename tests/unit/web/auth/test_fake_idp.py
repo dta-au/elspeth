@@ -30,8 +30,8 @@ import httpx
 import jwt
 import pytest
 
+from elspeth.web.auth.id_token import JWKSTokenValidator
 from elspeth.web.auth.models import AuthenticationError
-from elspeth.web.auth.oidc import JWKSTokenValidator
 from tests.helpers.fake_idp import FakeIdP
 
 

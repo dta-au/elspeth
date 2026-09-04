@@ -97,7 +97,7 @@ def mock_httpx_discovery(jwks_response):
     Intentionally kept separate — different ISSUER and JWKS URL patterns.
     """
     client = _DiscoveryAsyncClient(jwks_response)
-    return patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client)
+    return patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=client)
 
 
 class TestEntraTenantValidation:
@@ -235,7 +235,7 @@ class TestEntraSigningKeyRotation:
         provider = EntraAuthProvider(tenant_id=TENANT_ID, audience=AUDIENCE)
         client = _DiscoveryAsyncClient(old_jwks)
 
-        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client):
+        with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=client):
             assert (await provider.authenticate(old_token)).user_id == "entra-user-456"
             client.discovery_fetches = 0
             client.jwks_fetches = 0
