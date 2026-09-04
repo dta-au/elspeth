@@ -5809,16 +5809,26 @@ class TestCancelMechanism:
         assert status.cancel_requested is True
 
     @pytest.mark.asyncio
-    async def test_cancel_pending_run_updates_status(
+    async def test_cancel_pending_run_without_local_execute_authority_fails_closed(
         self,
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
     ) -> None:
-        """When no shutdown event exists (pending), update status directly."""
+        """A pending run with no local shutdown event is not ours to cancel.
+
+        The shutdown event is registered by the instance that holds the run's
+        EXECUTE lease. Its absence means this process has no authority over the
+        run, so ``cancel()`` must refuse (``service.py``, the pending arm of
+        ``cancel``) rather than write a ``cancelled`` status another instance's
+        worker would then race. Terminal runs stay an idempotent no-op; that is
+        pinned separately by ``test_cancel_terminal_run_is_noop``.
+        """
         run_id = uuid4()
-        # No event in _shutdown_events — run is pending
-        await service.cancel(run_id)
-        mock_session_service.update_run_status.assert_called()
+        assert mock_session_service.get_run.return_value.status == "pending"
+        # No event in _shutdown_events — no local EXECUTE authority for this run.
+        with pytest.raises(RuntimeError, match="Cannot cancel a non-terminal run without local EXECUTE authority"):
+            await service.cancel(run_id)
+        mock_session_service.update_run_status.assert_not_called()
 
     @pytest.mark.parametrize("terminal_status", ["completed", "completed_with_failures", "failed", "empty", "cancelled"])
     @pytest.mark.asyncio
