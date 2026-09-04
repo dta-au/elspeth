@@ -7686,6 +7686,84 @@ def test_schema_contract_detail_withholding_follows_the_participants_not_the_ent
     assert freeform["validation"]["errors"][0]["contract"]["extra_fields"] == ["content", "fingerprint"]
 
 
+def test_connectivity_facts_are_withheld_per_change_kind_not_per_component(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Routing ownership withholds connectivity but KEEPS the component id; config ownership takes both.
+
+    The sibling of ``_contract_participant_refs``: the other arm of the same
+    withholding predicate, and it was uncovered the same way. Six tests
+    reference ``coalesce_branch_unreachable``, but the only one that exercises
+    the code path calls ``_allowlisted_candidate_feedback`` with no
+    ``finalizer_owned``, so it runs against ``_FINALIZER_OWNS_NOTHING`` and
+    asserts the missing-fact ``KeyError``. It never reaches the withholding
+    branch at all. Exercising a function is not covering a branch.
+
+    Both failure directions are live here. Over-withholding is not theoretical:
+    the code comment at that branch records guided session 277fb6c4 burning its
+    WHOLE repair budget re-emitting a coalesce because nothing named the
+    connections that actually existed. Under-withholding discloses
+    finalizer-written routing destinations. The middle row below is the whole
+    point of scoping ownership per CHANGE KIND rather than per component — a
+    routing retarget suppresses the facts that would quote it, and nothing
+    else.
+
+    Mutation-verified: dropping the ``routing`` set from the withholding
+    predicate makes the middle assertion below fail. A first attempt at that
+    mutation emptied ``_CONNECTIVITY_FACT_CODES`` instead and the pin survived
+    — that constant feeds the aggregate ``withheld`` flag, while the
+    projection guard reads ``withholding.connectivity``. Recorded because the
+    surviving mutant looked like a worthless test and was actually a
+    mis-aimed mutation.
+    """
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    facts = {"co": {"reachable_branches": ["a"], "published_connections": ["straight_to_sink"]}}
+    monkeypatch.setattr(planner_module, "coalesce_reachability_facts", lambda _state: facts)
+
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="node:co",
+                message="closed diagnostic",
+                severity="error",
+                error_code="coalesce_branch_unreachable",
+            ),
+        ),
+    )
+    result = cast(Any, SimpleNamespace(validation=summary, updated_state=object()))
+
+    def entry_for(owned: _FinalizerOwnedRefs | None) -> Mapping[str, Any]:
+        feedback = (
+            _allowlisted_candidate_feedback(result) if owned is None else _allowlisted_candidate_feedback(result, finalizer_owned=owned)
+        )
+        return feedback["validation"]["errors"][0]
+
+    # Nothing owned: the planner gets the wiring facts it needs to repair.
+    disclosed = entry_for(None)
+    assert disclosed["connectivity"] == facts["co"]
+    assert disclosed["component"] == "node:co"
+
+    # THE ARM THIS TEST EXISTS FOR. A routing-only retarget suppresses the
+    # connectivity facts — they would quote finalizer-written destinations —
+    # while KEEPING the true component id, because the node's options are
+    # still exactly what the model authored.
+    routing_owned = entry_for(_FinalizerOwnedRefs(routing=frozenset({"node:co"})))
+    assert "connectivity" not in routing_owned
+    assert routing_owned["component"] == "node:co"
+
+    # Config ownership takes both: facts AND identity.
+    config_owned = entry_for(_FinalizerOwnedRefs(config=frozenset({"node:co"})))
+    assert "connectivity" not in config_owned
+    assert config_owned["component"] == "pipeline"
+
+    # Ownership of an UNRELATED component must not withhold anything here —
+    # the predecessor candidate-global predicate did exactly that, and it is
+    # what made guided repair permanently blind.
+    unrelated = entry_for(_FinalizerOwnedRefs(config=frozenset({"source"})))
+    assert unrelated["connectivity"] == facts["co"]
+    assert unrelated["component"] == "node:co"
+
+
 def test_an_entry_without_a_carried_identity_attaches_nothing() -> None:
     """Fail closed on absence — there is no parse fallback.
 
