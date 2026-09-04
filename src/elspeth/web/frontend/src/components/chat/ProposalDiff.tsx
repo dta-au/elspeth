@@ -12,6 +12,12 @@
 // - The "after" side of every row is literally what the proposal's arguments
 //   say (identity + summary derived from the args), never a client-side
 //   simulation of the committed result.
+// - Those arguments are REDACTED. The input is `arguments_redacted_json`, so
+//   structural identity (ids, plugin names, sink names) survives while open
+//   LLM-authored surfaces — plugin options and metadata values — arrive as
+//   summaries. utils/redactedArguments is the single authority for reading
+//   them, and a row may only claim what actually survived: see
+//   optionPatchEntries and metadataPatchEntries for what each form supports.
 // - The "before" side is the matching fragment of the CURRENT composition
 //   state. Callers must only render this for pending, non-stale proposals —
 //   for stale or already-resolved proposals the current state is no longer
@@ -32,6 +38,13 @@ import {
   type DiffEntry,
   type DiffSection,
 } from "@/components/recovery/RecoveryDiff";
+import { plural } from "@/utils/plural";
+import {
+  decodeMetadataPatchSummary,
+  decodeRedactedOptionSummary,
+  describeRedactedOptionSummary,
+  isRedactedOptionSummary,
+} from "@/utils/redactedArguments";
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -126,64 +139,105 @@ function removeEntry(
 }
 
 /**
- * Per-key option rows for the patch_*_options tools. Patch semantics are the
- * documented tool contract (shallow merge; null deletes; missing unchanged) —
- * per-key old/new pairs are directly derivable without simulating a merge.
+ * The single option row for a patch_*_options proposal.
+ *
+ * PER-KEY ROWS ARE NOT DERIVABLE HERE (elspeth-b1c14dd3c2). This projection
+ * reads `arguments_redacted_json`, and the redactor replaces the patch with a
+ * shape summary — entry count and value-shape counts, no key names and no
+ * values (`_summarize_set_source_options`). Plugin options carry filesystem
+ * paths, connection strings and API keys, so that summarisation is the
+ * correct behaviour and the consumer's job is to say honestly what survives
+ * it. An earlier version of this function walked `Object.entries(patch)` as
+ * though the raw patch arrived; on the live path it never did, `asRecord`
+ * returned null for the summary string, and the arm was dead.
+ *
+ * The BEFORE side is not redacted — it is the frontend's own composition
+ * state — so the row still contrasts the real current option set against the
+ * measured size of the proposed patch.
+ *
+ * Returns null when the patch is not a summary this module recognises ("no
+ * projection"), and [] for an empty patch, which merges to a no-op.
  */
 function optionPatchEntries(
-  prefix: string,
+  target: string,
   currentOptions: Record<string, unknown>,
-  patch: Record<string, unknown>,
-): DiffEntry[] {
-  const entries: DiffEntry[] = [];
-  for (const [key, value] of Object.entries(patch)) {
-    const identity = `${prefix}.${key}`;
-    const hasBefore = key in currentOptions;
-    const before = currentOptions[key];
-    if (value === null) {
-      if (hasBefore) {
-        entries.push(removeEntry("option", identity, before, valueSummary(before)));
-      }
-      // Deleting an option that is not set is a no-op — no row.
-      continue;
-    }
-    if (!hasBefore) {
-      entries.push(upsertEntry("option", identity, undefined, null, valueSummary(value), value));
-      continue;
-    }
-    if (stableStringify(before) !== stableStringify(value)) {
-      entries.push({
-        kind: "changed",
-        section: "option",
-        identity,
-        before,
-        after: value,
-        beforeSummary: valueSummary(before),
-        afterSummary: valueSummary(value),
-      });
-    }
-  }
-  return entries;
+  patch: unknown,
+): DiffEntry[] | null {
+  const summary = decodeRedactedOptionSummary(patch);
+  // A patch is always a mapping (the tools' argument models require a dict);
+  // any other root shape means this is not the payload we think it is.
+  if (summary === null || summary.rootShape !== "mapping") return null;
+  if (summary.entryCount === 0) return [];
+  return [
+    {
+      kind: "changed",
+      section: "option",
+      identity: `${target}.options`,
+      before: currentOptions,
+      // No "after" value exists to hold: the proposed options were redacted
+      // before they reached this surface.
+      after: undefined,
+      beforeSummary: `${plural(Object.keys(currentOptions).length, "option")} set`,
+      afterSummary: `patch of ${describeRedactedOptionSummary(summary)}`,
+    },
+  ];
 }
 
+/**
+ * Metadata rows for a set_metadata proposal.
+ *
+ * Unlike options, key IDENTITY survives redaction: the sentinel names which
+ * of {name, description} the patch touches (`_summarize_set_metadata_patch`).
+ * Values do not survive, which constrains what a row may claim:
+ *
+ *   * Every row is "changed", never "added". "Added" would assert the patch
+ *     sets a non-null value, and a patch that clears a field to null is
+ *     indistinguishable from one that sets it.
+ *   * No row is suppressed as a no-op. The old code skipped keys whose new
+ *     value equalled the current one; that comparison is no longer possible,
+ *     so a row means "the proposal writes this field", not "this field
+ *     changes value".
+ *
+ * A patch touching a key outside {name, description} gets its own row rather
+ * than being dropped: this is an approval surface, and silently omitting part
+ * of what the operator is approving is the failure mode to avoid. The field
+ * cannot be named because unrecognised key names are LLM-controlled text and
+ * the producer collapses them all to one token.
+ *
+ * Returns null for `<metadata-patch:invalid>` and any unrecognised form, and
+ * [] for `<metadata-patch:empty>` — a projection that found nothing to report.
+ */
 function metadataPatchEntries(
   current: CompositionState,
-  patch: Record<string, unknown>,
-): DiffEntry[] {
+  patch: unknown,
+): DiffEntry[] | null {
+  const summary = decodeMetadataPatchSummary(patch);
+  if (summary === null) return null;
+  if (summary.kind === "empty") return [];
+
   const entries: DiffEntry[] = [];
-  for (const key of ["name", "description"] as const) {
-    if (!(key in patch)) continue;
+  for (const key of summary.keys) {
     const before = current.metadata[key];
-    const after = patch[key];
-    if (stableStringify(before ?? null) === stableStringify(after ?? null)) continue;
     entries.push({
-      kind: before === null || before === undefined ? "added" : "changed",
+      kind: "changed",
       section: "metadata",
       identity: key,
       before,
-      after,
-      beforeSummary: before === null || before === undefined ? "" : valueSummary(before),
-      afterSummary: valueSummary(after),
+      after: undefined,
+      beforeSummary:
+        before === null || before === undefined ? "(not set)" : valueSummary(before),
+      afterSummary: "new value redacted",
+    });
+  }
+  if (summary.touchesUnknownField) {
+    entries.push({
+      kind: "changed",
+      section: "metadata",
+      identity: "(unrecognised field)",
+      before: undefined,
+      after: undefined,
+      beforeSummary: "not a pipeline metadata field",
+      afterSummary: "field name and value redacted",
     });
   }
   return entries;
@@ -192,9 +246,21 @@ function metadataPatchEntries(
 /**
  * set_pipeline replaces the whole pipeline; project the args' collections
  * against the current state by identity. For identities present on both
- * sides, only the keys the args actually provide are compared (an omitted
- * arg key is "unknown", not "unchanged" — it is simply not compared), so a
- * "Changed" row always reflects an explicitly proposed difference.
+ * sides, only the keys carried by the args are compared — a key the state
+ * fragment does not hold at all is skipped rather than called a change.
+ *
+ * WHAT A "Changed" ROW HERE DOES AND DOES NOT MEAN. It reports that a key
+ * present on both sides compares unequal. It does NOT prove the planner
+ * authored that difference: this projection reads `arguments_redacted_json`,
+ * whose payload has been through the redactor's argument model, and pydantic
+ * materialises every unset optional field as an explicit null. "Omitted" and
+ * "explicitly set to null" are therefore indistinguishable at this point, so
+ * a default-filled null can present as a change (elspeth-d6147d73ed — the
+ * information is destroyed upstream of this file and recovering it needs a
+ * producer-side decision).
+ *
+ * Redacted option summaries are excluded from the comparison entirely; see
+ * providedKeysDiffer.
  */
 function setPipelineEntries(
   current: CompositionState,
@@ -279,6 +345,14 @@ function setPipelineEntries(
  * fragment. Keys the fragment does not carry at all (e.g. blob_id /
  * inline_blob on source args) are skipped — we cannot honestly call them a
  * change to state the state model does not hold.
+ *
+ * Redacted option summaries are skipped for the same reason, one step
+ * further on. The proposal's `options` is a shape-summary STRING while the
+ * state's is the real mapping, so they never compare equal: before this skip,
+ * every set_pipeline source/node/output row reported "Changed" on every
+ * proposal, whether or not the options differed. A skip under-reports a real
+ * options change; the alternative asserted a change that may not exist, on
+ * the surface an operator uses to approve one.
  */
 function providedKeysDiffer(
   before: Record<string, unknown>,
@@ -288,6 +362,7 @@ function providedKeysDiffer(
   for (const [key, value] of Object.entries(provided)) {
     const beforeKey = keyAliases.get(key) ?? key;
     if (!(beforeKey in before)) continue;
+    if (isRedactedOptionSummary(value)) continue;
     if (stableStringify(before[beforeKey]) !== stableStringify(value)) {
       return true;
     }
@@ -450,33 +525,33 @@ export function buildProposalDiff(
       if (before === undefined) return [];
       return [removeEntry("output", name, before, outputSummary(before))];
     }
+    // The four arms below read `args.patch`, which the redactor replaces with
+    // a summary before it reaches this surface. They hand it to the shared
+    // decoders in utils/redactedArguments rather than to asRecord, which
+    // returns null for every string and left all four arms unreachable
+    // (elspeth-b1c14dd3c2).
     case "set_metadata": {
-      const patch = asRecord(args.patch);
-      if (patch === null) return null;
-      return metadataPatchEntries(currentState, patch);
+      return metadataPatchEntries(currentState, args.patch);
     }
     case "patch_source_options": {
       const name = asString(args.source_name) ?? "source";
-      const patch = asRecord(args.patch);
       const fragment = currentState.sources?.[name];
-      if (patch === null || fragment === undefined) return null;
-      return optionPatchEntries(name, fragment.options, patch);
+      if (fragment === undefined) return null;
+      return optionPatchEntries(name, fragment.options, args.patch);
     }
     case "patch_node_options": {
       const nodeId = asString(args.node_id);
-      const patch = asRecord(args.patch);
-      if (nodeId === null || patch === null) return null;
+      if (nodeId === null) return null;
       const fragment = currentState.nodes.find((node) => node.id === nodeId);
       if (fragment === undefined) return null;
-      return optionPatchEntries(nodeId, fragment.options, patch);
+      return optionPatchEntries(nodeId, fragment.options, args.patch);
     }
     case "patch_output_options": {
       const name = asString(args.sink_name);
-      const patch = asRecord(args.patch);
-      if (name === null || patch === null) return null;
+      if (name === null) return null;
       const fragment = currentState.outputs.find((output) => output.name === name);
       if (fragment === undefined) return null;
-      return optionPatchEntries(name, fragment.options, patch);
+      return optionPatchEntries(name, fragment.options, args.patch);
     }
     case "set_pipeline": {
       return setPipelineEntries(currentState, args);

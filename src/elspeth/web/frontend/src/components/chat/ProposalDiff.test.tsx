@@ -8,6 +8,7 @@ import {
 } from "./ProposalDiff";
 import type { CompositionState } from "@/types/api";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import { redactedArguments } from "@/test/redactedArgumentFixture";
 
 function makeState(overrides: Partial<CompositionState> = {}): CompositionState {
   return {
@@ -145,83 +146,195 @@ describe("buildProposalDiff", () => {
     ]);
   });
 
-  it("projects patch_node_options as per-key option rows honouring patch semantics", () => {
-    const entries = buildProposalDiff(
-      "patch_node_options",
-      {
-        node_id: "extract",
-        patch: {
-          mappings: { a: "c" }, // changed
-          model: "anthropic/claude-haiku-4.5", // added
-          unused: null, // delete of a key that is not set → no row
-        },
-      },
-      makeState(),
-    );
-    expect(entries).toHaveLength(2);
-    expect(entries).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          kind: "changed",
-          section: "option",
-          identity: "extract.mappings",
-          beforeSummary: '{"a":"b"}',
-          afterSummary: '{"a":"c"}',
-        }),
-        expect.objectContaining({
-          kind: "added",
-          section: "option",
-          identity: "extract.model",
-        }),
-      ]),
-    );
-  });
+  // ---------------------------------------------------------------------
+  // patch_*_options and set_metadata.
+  //
+  // Every case below feeds `redactedArguments(...)` — the payload the Python
+  // redactor really produced, read from the committed fixture. These arms
+  // previously had tests that hand-built `patch` as a plain object and all
+  // four passed while the arms were DEAD on the live path (elspeth-b1c14dd3c2):
+  // the producer ships a summary string, so `asRecord` returned null and every
+  // projection bailed. Do not "simplify" these back to inline objects — an
+  // input the producer cannot emit certifies nothing about the producer.
+  // ---------------------------------------------------------------------
 
-  it("projects a null patch value on an existing key as a removed option", () => {
+  it("projects patch_node_options as one row: real current options vs the patch's measured size", () => {
     const entries = buildProposalDiff(
       "patch_node_options",
-      { node_id: "extract", patch: { mappings: null } },
+      redactedArguments("patch_node_options_mixed_shapes"),
       makeState(),
     );
+
+    // The patch carried four entries (a mapping, a sequence, a scalar and a
+    // null). Per-key rows are impossible — the summary names no keys — so the
+    // row states the size of the patch and nothing it cannot know.
     expect(entries).toEqual([
       expect.objectContaining({
-        kind: "removed",
+        kind: "changed",
         section: "option",
-        identity: "extract.mappings",
+        identity: "extract.options",
+        beforeSummary: "1 option set",
+        afterSummary: "patch of 4 entries, keys and values redacted",
       }),
     ]);
   });
 
-  it("returns an empty projection (not null) when a patch is all no-ops", () => {
-    const entries = buildProposalDiff(
-      "patch_node_options",
-      { node_id: "extract", patch: { mappings: { a: "b" } } },
-      makeState(),
-    );
-    expect(entries).toEqual([]);
+  it("projects patch_source_options and patch_output_options through the same row", () => {
+    expect(
+      buildProposalDiff(
+        "patch_source_options",
+        redactedArguments("patch_source_options_two_scalars"),
+        makeState(),
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        section: "option",
+        identity: "source.options",
+        beforeSummary: "1 option set",
+        afterSummary: "patch of 2 entries, keys and values redacted",
+      }),
+    ]);
+
+    expect(
+      buildProposalDiff(
+        "patch_output_options",
+        redactedArguments("patch_output_options_one_scalar"),
+        makeState(),
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        section: "option",
+        identity: "results.options",
+        afterSummary: "patch of 1 entry, keys and values redacted",
+      }),
+    ]);
+  });
+
+  it("returns an empty projection (not null) for an empty patch, which merges to a no-op", () => {
+    expect(
+      buildProposalDiff(
+        "patch_node_options",
+        redactedArguments("patch_node_options_empty_patch"),
+        makeState(),
+      ),
+    ).toEqual([]);
   });
 
   it("returns null when a patch targets a node missing from the current state", () => {
     expect(
-      buildProposalDiff("patch_node_options", { node_id: "ghost", patch: { x: 1 } }, makeState()),
+      buildProposalDiff(
+        "patch_node_options",
+        redactedArguments("patch_node_options_missing_node"),
+        makeState(),
+      ),
     ).toBeNull();
   });
 
-  it("projects set_metadata field changes", () => {
+  it("projects set_metadata per named key, claiming only that the field is written", () => {
     const entries = buildProposalDiff(
       "set_metadata",
-      { patch: { name: "Renamed", description: "Now described" } },
+      redactedArguments("set_metadata_name_and_description"),
       makeState(),
     );
-    expect(entries).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ kind: "changed", section: "metadata", identity: "name" }),
-        expect.objectContaining({ kind: "added", section: "metadata", identity: "description" }),
-      ]),
+
+    // "changed", not "added", even for the unset description: the sentinel
+    // names the key but not the value, and a patch that clears a field to
+    // null is indistinguishable from one that sets it.
+    expect(entries).toEqual([
+      expect.objectContaining({
+        kind: "changed",
+        section: "metadata",
+        identity: "description",
+        beforeSummary: "(not set)",
+        afterSummary: "new value redacted",
+      }),
+      expect.objectContaining({
+        kind: "changed",
+        section: "metadata",
+        identity: "name",
+        beforeSummary: '"My pipeline"',
+        afterSummary: "new value redacted",
+      }),
+    ]);
+  });
+
+  it("surfaces a metadata patch's unrecognised field instead of dropping it", () => {
+    const entries = buildProposalDiff(
+      "set_metadata",
+      redactedArguments("set_metadata_unknown_key"),
+      makeState(),
     );
+
+    // This is an approval surface: an operator must not be shown a partial
+    // account of what they are approving. The field cannot be named because
+    // the producer collapses every unrecognised key to one token.
+    expect(entries).toEqual([
+      expect.objectContaining({ section: "metadata", identity: "name" }),
+      expect.objectContaining({
+        section: "metadata",
+        identity: "(unrecognised field)",
+        afterSummary: "field name and value redacted",
+      }),
+    ]);
+  });
+
+  it("separates an empty metadata patch from an unreadable one", () => {
+    // empty → the projection ran and found nothing to report.
+    expect(
+      buildProposalDiff("set_metadata", redactedArguments("set_metadata_empty"), makeState()),
+    ).toEqual([]);
+    // invalid → no honest projection; ToolCallCard falls back to the raw
+    // argument fields. "No projection" is not "no change".
+    expect(
+      buildProposalDiff("set_metadata", redactedArguments("set_metadata_invalid"), makeState()),
+    ).toBeNull();
+  });
+
+  it("reports nothing when set_pipeline replays the current state verbatim", () => {
+    // The live-shape regression for the spurious-"Changed" defect. The
+    // redactor summarises every `options` mapping into a string, which can
+    // never equal the unredacted mapping in state — before providedKeysDiffer
+    // learned to skip those, this proposal reported source, node AND output
+    // as changed while proposing no change at all.
+    const entries = buildProposalDiff(
+      "set_pipeline",
+      redactedArguments("set_pipeline_replaying_current_state"),
+      makeState(),
+    );
+
+    expect(entries).toEqual([]);
+  });
+
+  it("keeps the identity-bearing arms working on the real redacted payload", () => {
+    // upsert_node's projection reads id / node_type / plugin, which survive
+    // redaction while `options` does not. Pinned on the live payload so a
+    // future redaction change that starts summarising them fails here rather
+    // than silently emptying the proposal card.
+    const entries = buildProposalDiff(
+      "upsert_node",
+      redactedArguments("upsert_node_with_options"),
+      makeState(),
+    );
+
+    expect(entries).toEqual([
+      expect.objectContaining({
+        kind: "changed",
+        section: "node",
+        identity: "extract",
+        beforeSummary: "transform field_mapper",
+        afterSummary: "transform html_extract",
+      }),
+    ]);
   });
 
   it("projects set_pipeline as added/removed/changed rows across collections", () => {
+    // SYNTHETIC payload, deliberately: this exercises the collection-matching
+    // logic (added / removed / changed / identity alignment) across a spread
+    // of differences that one recorded proposal does not contain. The
+    // identity keys it feeds — id, plugin, sink_name, edge endpoints — are
+    // the ones that DO survive redaction unchanged, which the live-shape
+    // tests above pin. Do not add option or metadata assertions here; those
+    // arrive summarised and belong on a fixture-driven test.
     const entries = buildProposalDiff(
       "set_pipeline",
       {

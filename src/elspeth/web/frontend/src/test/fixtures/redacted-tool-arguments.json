@@ -1,0 +1,281 @@
+{
+  "_comment": "GENERATED FILE -- do not hand-edit. Each 'redacted' payload is the output of elspeth.web.composer.redaction.redact_tool_call_arguments for its 'arguments'. Frontend tests read these payloads so they are driven by the real producer; a Python test re-derives them so the two languages cannot drift (elspeth-b1c14dd3c2).",
+  "_regenerate": ".venv/bin/python scripts/cicd/bootstrap_proposal_diff_fixture.py --write",
+  "cases": {
+    "patch_node_options_empty_patch": {
+      "arguments": {
+        "node_id": "extract",
+        "patch": {}
+      },
+      "redacted": {
+        "node_id": "extract",
+        "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}"
+      },
+      "tool": "patch_node_options"
+    },
+    "patch_node_options_missing_node": {
+      "arguments": {
+        "node_id": "ghost",
+        "patch": {
+          "threshold": 0.5
+        }
+      },
+      "redacted": {
+        "node_id": "ghost",
+        "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
+      },
+      "tool": "patch_node_options"
+    },
+    "patch_node_options_mixed_shapes": {
+      "arguments": {
+        "node_id": "extract",
+        "patch": {
+          "mappings": {
+            "a": "c"
+          },
+          "model": "anthropic/claude-haiku-4.5",
+          "tags": [
+            "x",
+            "y"
+          ],
+          "unused": null
+        }
+      },
+      "redacted": {
+        "node_id": "extract",
+        "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":4,\"value_shape_counts\":{\"mapping\":1,\"scalar\":2,\"sequence\":1,\"set\":0}}"
+      },
+      "tool": "patch_node_options"
+    },
+    "patch_node_options_one_mapping": {
+      "arguments": {
+        "node_id": "extract",
+        "patch": {
+          "mappings": {
+            "a": "c"
+          }
+        }
+      },
+      "redacted": {
+        "node_id": "extract",
+        "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":1,\"scalar\":0,\"sequence\":0,\"set\":0}}"
+      },
+      "tool": "patch_node_options"
+    },
+    "patch_output_options_one_scalar": {
+      "arguments": {
+        "patch": {
+          "path": "out2.json"
+        },
+        "sink_name": "results"
+      },
+      "redacted": {
+        "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+        "sink_name": "results"
+      },
+      "tool": "patch_output_options"
+    },
+    "patch_source_options_two_scalars": {
+      "arguments": {
+        "patch": {
+          "delimiter": ";",
+          "path": "s3://bucket/in.csv"
+        },
+        "source_name": "source"
+      },
+      "redacted": {
+        "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":2,\"value_shape_counts\":{\"mapping\":0,\"scalar\":2,\"sequence\":0,\"set\":0}}",
+        "source_name": "source"
+      },
+      "tool": "patch_source_options"
+    },
+    "set_metadata_empty": {
+      "arguments": {
+        "patch": {}
+      },
+      "redacted": {
+        "patch": "<metadata-patch:empty>"
+      },
+      "tool": "set_metadata"
+    },
+    "set_metadata_invalid": {
+      "arguments": {
+        "patch": "not-a-mapping"
+      },
+      "redacted": {
+        "patch": "<metadata-patch:invalid>"
+      },
+      "tool": "set_metadata"
+    },
+    "set_metadata_name_and_description": {
+      "arguments": {
+        "patch": {
+          "description": "Now described",
+          "name": "Renamed"
+        }
+      },
+      "redacted": {
+        "patch": "<metadata-patch:description,name>"
+      },
+      "tool": "set_metadata"
+    },
+    "set_metadata_name_only": {
+      "arguments": {
+        "patch": {
+          "name": "Renamed"
+        }
+      },
+      "redacted": {
+        "patch": "<metadata-patch:name>"
+      },
+      "tool": "set_metadata"
+    },
+    "set_metadata_unknown_key": {
+      "arguments": {
+        "patch": {
+          "colour": "red",
+          "name": "Renamed"
+        }
+      },
+      "redacted": {
+        "patch": "<metadata-patch:name,unknown>"
+      },
+      "tool": "set_metadata"
+    },
+    "set_output_with_options": {
+      "arguments": {
+        "options": {
+          "path": "errors.csv"
+        },
+        "plugin": "csv",
+        "sink_name": "errors"
+      },
+      "redacted": {
+        "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+        "plugin": "csv",
+        "sink_name": "errors"
+      },
+      "tool": "set_output"
+    },
+    "set_pipeline_replaying_current_state": {
+      "arguments": {
+        "edges": [
+          {
+            "edge_type": "on_success",
+            "from_node": "source",
+            "id": "e1",
+            "label": null,
+            "to_node": "extract"
+          }
+        ],
+        "nodes": [
+          {
+            "id": "extract",
+            "input": "rows",
+            "node_type": "transform",
+            "on_error": null,
+            "on_success": "mapped",
+            "options": {
+              "mappings": {
+                "a": "b"
+              }
+            },
+            "plugin": "field_mapper"
+          }
+        ],
+        "outputs": [
+          {
+            "options": {
+              "path": "out.json"
+            },
+            "plugin": "json",
+            "sink_name": "results"
+          }
+        ],
+        "source": {
+          "on_success": "rows",
+          "on_validation_failure": "discard",
+          "options": {
+            "path": "input.csv"
+          },
+          "plugin": "csv"
+        }
+      },
+      "redacted": {
+        "edges": [
+          {
+            "edge_type": "on_success",
+            "from_node": "source",
+            "id": "e1",
+            "label": null,
+            "to_node": "extract"
+          }
+        ],
+        "metadata": "<metadata-patch:invalid>",
+        "nodes": [
+          {
+            "branches": null,
+            "condition": null,
+            "description": null,
+            "expected_output_count": null,
+            "fork_to": null,
+            "id": "extract",
+            "input": "rows",
+            "merge": null,
+            "node_type": "transform",
+            "on_error": null,
+            "on_success": "mapped",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":1,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+            "output_mode": null,
+            "plugin": "field_mapper",
+            "policy": null,
+            "routes": null,
+            "scope_name": null,
+            "scope_opener": null,
+            "scope_policy": null,
+            "timeout_seconds": null,
+            "trigger": null
+          }
+        ],
+        "outputs": [
+          {
+            "description": null,
+            "on_write_failure": null,
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+            "plugin": "json",
+            "sink_name": "results"
+          }
+        ],
+        "source": {
+          "blob_id": null,
+          "description": null,
+          "on_success": "rows",
+          "on_validation_failure": "discard",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+          "plugin": "csv"
+        },
+        "sources": null
+      },
+      "tool": "set_pipeline"
+    },
+    "upsert_node_with_options": {
+      "arguments": {
+        "id": "extract",
+        "input": "rows",
+        "node_type": "transform",
+        "options": {
+          "selector": ".body"
+        },
+        "plugin": "html_extract"
+      },
+      "redacted": {
+        "id": "extract",
+        "input": "rows",
+        "node_type": "transform",
+        "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+        "plugin": "html_extract"
+      },
+      "tool": "upsert_node"
+    }
+  }
+}
