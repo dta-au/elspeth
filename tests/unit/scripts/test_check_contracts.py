@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.check_contracts import (
+    DictAliasIndex,
     FieldCoverageViolation,
     FieldMappingViolation,
     FieldMappingVisitor,
@@ -1613,3 +1614,268 @@ def test_hardcode_violation_dataclass() -> None:
     assert violation.subsystem == "retry"
     assert violation.file == "/path/to/runtime.py"
     assert violation.line == 0
+
+
+# =============================================================================
+# dict[str, Any] alias resolution
+#
+# `_is_dict_str_any` matches the SPELLING `dict[str, Any]`, so a module-level
+# alias of that type reads as a typed annotation and scans as nothing at all.
+# Six real returns hid behind three such aliases in mcp/types.py until 2026-09-04.
+# =============================================================================
+
+
+def _alias_package(tmp_path: Path) -> Path:
+    """Write a package whose `types.py` defines a dict[str, Any] alias."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "types.py").write_text(
+        "\n".join(
+            [
+                "from typing import Any",
+                "",
+                "RunDetail = dict[str, Any]",
+                "",
+            ]
+        )
+    )
+    return package
+
+
+def test_dict_alias_index_resolves_an_alias_through_the_import_that_carries_it(tmp_path: Path) -> None:
+    """A name bound to dict[str, Any] is scanned like the pattern it aliases."""
+    package = _alias_package(tmp_path)
+    consumer = package / "reader.py"
+    consumer.write_text(
+        "\n".join(
+            [
+                "from pkg.types import RunDetail",
+                "",
+                "def get_run() -> RunDetail:",
+                "    return {}",
+                "",
+            ]
+        )
+    )
+
+    index = DictAliasIndex.build(package)
+    aliases = index.names_in_scope(consumer, package)
+    assert aliases == frozenset({"RunDetail"})
+
+    violations = find_dict_violations(consumer, whitelist=set(), matched_entries={}, aliases=aliases)
+    assert [(violation.context, violation.param_name) for violation in violations] == [("get_run", "return")]
+
+    # Without the alias set the same annotation is invisible — this is the defect
+    # the index exists to close, asserted rather than described.
+    assert find_dict_violations(consumer, whitelist=set(), matched_entries={}) == []
+
+
+def test_dict_alias_resolution_covers_the_optional_and_list_wrappers(tmp_path: Path) -> None:
+    """`RunDetail | None` and `list[RunDetail]` resolve like their spelled-out forms."""
+    package = _alias_package(tmp_path)
+    consumer = package / "reader.py"
+    consumer.write_text(
+        "\n".join(
+            [
+                "from pkg.types import RunDetail",
+                "",
+                "def get_run() -> RunDetail | None:",
+                "    return None",
+                "",
+                "def list_runs() -> list[RunDetail]:",
+                "    return []",
+                "",
+                "def ingest(payload: RunDetail) -> None:",
+                "    return None",
+                "",
+            ]
+        )
+    )
+
+    index = DictAliasIndex.build(package)
+    violations = find_dict_violations(consumer, whitelist=set(), matched_entries={}, aliases=index.names_in_scope(consumer, package))
+
+    assert [(violation.context, violation.param_name) for violation in violations] == [
+        ("get_run", "return"),
+        ("list_runs", "return (list)"),
+        ("ingest", "payload"),
+    ]
+
+
+def test_dict_alias_does_not_leak_into_a_module_that_never_imported_it(tmp_path: Path) -> None:
+    """Resolution is by import, not by name — a same-named type elsewhere is untouched.
+
+    The cheap implementation of this index is a tree-wide set of alias NAMES. That
+    version reports any annotation spelled `RunDetail` anywhere, including a module
+    that binds the name to a real TypedDict. This test is what separates the two.
+    """
+    package = _alias_package(tmp_path)
+    stranger = package / "stranger.py"
+    stranger.write_text(
+        "\n".join(
+            [
+                "from typing import TypedDict",
+                "",
+                "class RunDetail(TypedDict):",
+                "    run_id: str",
+                "",
+                "def get_run() -> RunDetail:",
+                '    return {"run_id": ""}',
+                "",
+            ]
+        )
+    )
+
+    index = DictAliasIndex.build(package)
+    assert index.names_in_scope(stranger, package) == frozenset()
+    assert find_dict_violations(stranger, whitelist=set(), matched_entries={}, aliases=index.names_in_scope(stranger, package)) == []
+
+
+def test_dict_alias_index_records_the_forms_it_deliberately_cannot_resolve(tmp_path: Path) -> None:
+    """The index's documented holes, asserted so they stay documented.
+
+    Each form below is a real way to launder `dict[str, Any]` past this scan. None
+    is resolved, and that is a stated scope limit rather than an aspiration: a
+    future widening must delete the matching assertion here, which is the point.
+    """
+    package = _alias_package(tmp_path)
+    evader = package / "evader.py"
+    evader.write_text(
+        "\n".join(
+            [
+                "from typing import Any",
+                "import pkg.types",
+                "from pkg.types import RunDetail as Renamed",
+                "",
+                "def _local_alias() -> None:",
+                "    Inner = dict[str, Any]",  # alias bound in a function body
+                "    def nested() -> Inner:",
+                "        return {}",
+                "",
+                "def via_attribute() -> pkg.types.RunDetail:",  # attribute access
+                "    return {}",
+                "",
+                "def via_rename() -> Renamed:",  # renamed on import
+                "    return {}",
+                "",
+                'def via_string() -> "RunDetail":',  # string forward reference
+                "    return {}",
+                "",
+            ]
+        )
+    )
+
+    index = DictAliasIndex.build(package)
+    aliases = index.names_in_scope(evader, package)
+
+    # `Inner` is function-local, so it is not importable and is not indexed.
+    assert "Inner" not in aliases
+    # `RunDetail` is imported only under a new name, which this index does not follow.
+    assert aliases == frozenset()
+    assert find_dict_violations(evader, whitelist=set(), matched_entries={}, aliases=aliases) == []
+
+
+# =============================================================================
+# Scope of the dict[str, Any] scan
+#
+# These tests record what the scan does NOT look at. A green run is evidence
+# about parameters and returns spelled `dict[str, Any]`, and about nothing else.
+# Widening the scanner should turn these red — that is their function.
+# =============================================================================
+
+
+def test_dict_pattern_scan_is_blind_to_variable_and_class_attribute_annotations(tmp_path: Path) -> None:
+    """`ast.AnnAssign` sites are not scanned. Measured 2026-09-04: 293 exist in src/elspeth."""
+    test_file = tmp_path / "annassign.py"
+    test_file.write_text(
+        "\n".join(
+            [
+                "from typing import Any",
+                "",
+                "MODULE_LEVEL: dict[str, Any] = {}",
+                "",
+                "class Holder:",
+                "    attribute: dict[str, Any] = {}",
+                "",
+                "    def method(self) -> None:",
+                "        local: dict[str, Any] = {}",
+                "        del local",
+                "",
+            ]
+        )
+    )
+
+    assert find_dict_violations(test_file, whitelist=set(), matched_entries={}) == []
+
+
+def test_dict_pattern_scan_is_blind_to_positional_only_and_variadic_parameters(tmp_path: Path) -> None:
+    """posonlyargs, *args and **kwargs are not scanned.
+
+    LATENT at 2026-09-04: zero such annotated sites exist in src/elspeth, so this
+    records a hole rather than a live bypass. It is pinned because the cost of
+    finding out later is a silently unscanned parameter, not because it is firing.
+    """
+    test_file = tmp_path / "variadic.py"
+    test_file.write_text(
+        "\n".join(
+            [
+                "from typing import Any",
+                "",
+                "def positional_only(payload: dict[str, Any], /) -> None:",
+                "    return None",
+                "",
+                "def variadic(*args: dict[str, Any], **kwargs: dict[str, Any]) -> None:",
+                "    return None",
+                "",
+            ]
+        )
+    )
+
+    assert find_dict_violations(test_file, whitelist=set(), matched_entries={}) == []
+
+    # The same annotation in an ordinary parameter IS reported — so the blindness
+    # above is about parameter KIND, not about the annotation being unrecognised.
+    control = tmp_path / "control.py"
+    control.write_text(
+        "\n".join(
+            [
+                "from typing import Any",
+                "",
+                "def ordinary(payload: dict[str, Any]) -> None:",
+                "    return None",
+                "",
+            ]
+        )
+    )
+    assert [violation.param_name for violation in find_dict_violations(control, whitelist=set(), matched_entries={})] == ["payload"]
+
+
+def test_dict_pattern_scan_covers_only_dict_containers_with_an_any_value(tmp_path: Path) -> None:
+    """Mapping forms and object-valued mappings are out of scope, by design.
+
+    `dict[str, object]` and `Mapping[str, object]` already force narrowing at every
+    use site, so excluding them is deliberate. `Mapping[str, Any]` does NOT force
+    narrowing and is excluded anyway — measured 2026-09-04 at 729 sites in
+    src/elspeth, the largest single form this scan cannot see.
+    """
+    test_file = tmp_path / "containers.py"
+    test_file.write_text(
+        "\n".join(
+            [
+                "from collections.abc import Mapping, MutableMapping",
+                "from typing import Any",
+                "",
+                "def read_mapping(payload: Mapping[str, Any]) -> Mapping[str, Any]:",
+                "    return payload",
+                "",
+                "def read_mutable(payload: MutableMapping[str, Any]) -> None:",
+                "    return None",
+                "",
+                "def read_object(payload: dict[str, object]) -> Mapping[str, object]:",
+                "    return payload",
+                "",
+            ]
+        )
+    )
+
+    assert find_dict_violations(test_file, whitelist=set(), matched_entries={}) == []

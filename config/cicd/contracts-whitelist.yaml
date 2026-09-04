@@ -577,11 +577,42 @@ allowed_dict_patterns:
   # ═══════════════════════════════════════════════════════════════════════════
   # MCP SERVER + ANALYZER - Genuinely dynamic patterns
   # SQL query results have user-defined columns; call_tool receives MCP protocol input.
-  # All other MCP returns are now typed via TypedDicts in mcp/types.py.
+  # MOST other MCP returns are typed via TypedDicts in mcp/types.py. Three are NOT,
+  # and were invisible here until 2026-09-04: RunDetail / NodeDetail / CallDetail
+  # (mcp/types.py:297-303) are `dict[str, Any]` ALIASES, so the six returns annotated
+  # with them read as typed and scanned as untyped. The previous wording of this
+  # header claimed "all other MCP returns are now typed via TypedDicts", which was
+  # false for exactly those six. The scanner now resolves module-level aliases, so
+  # they appear as the entries below instead of as nothing at all.
   # ═══════════════════════════════════════════════════════════════════════════
   # Facade (mcp/analyzer.py) - delegates to submodules
   - "src/elspeth/mcp/analyzer.py:LandscapeAnalyzer.query:params"
   - "src/elspeth/mcp/analyzer.py:LandscapeAnalyzer.query:return (list)"
+  # ---------------------------------------------------------------------------
+  # Alias-typed returns: dataclass_to_dict() projections of ONE owned dataclass.
+  #
+  # ADR-032 says nominally type what ELSPETH owns, and `Run` (contracts/audit.py:131),
+  # `Node` (:169) and `Call` (:523) ARE owned — each alias is produced from exactly one
+  # of them, not from a variant family. MEASURED 2026-09-04: run_lifecycle.get_run ->
+  # `Run | None`, data_flow.get_nodes -> `list[Node]`, query.get_calls -> `list[Call]`.
+  # So the comment at mcp/types.py that once read "the exact shape depends on the
+  # dataclass variant" did not describe these three; it has been corrected.
+  #
+  # They are whitelisted anyway, and the honest reason is NOT dynamism. The value is a
+  # recursive JSON projection built by `dataclass_to_dict` (core/landscape/serialization.py:56,
+  # itself `Any -> Any`). Writing a TypedDict for it would hand-copy 20+ fields of `Run`
+  # and its nested dataclasses into a second declaration with NOTHING pinning the two
+  # equal — the same two-copies-of-one-authority hazard tracked elsewhere, traded for a
+  # type that only looks stronger. The real fix is a mirror DERIVED from the dataclass,
+  # or returning the dataclass and serializing at the MCP boundary. Both are design
+  # work, not an annotation change; tracked separately.
+  # ---------------------------------------------------------------------------
+  - "src/elspeth/mcp/analyzer.py:LandscapeAnalyzer.get_run:return"
+  - "src/elspeth/mcp/analyzer.py:LandscapeAnalyzer.list_nodes:return (list)"
+  - "src/elspeth/mcp/analyzer.py:LandscapeAnalyzer.get_calls:return (list)"
+  - "src/elspeth/mcp/analyzers/queries.py:get_run:return"
+  - "src/elspeth/mcp/analyzers/queries.py:list_nodes:return (list)"
+  - "src/elspeth/mcp/analyzers/queries.py:get_calls:return (list)"
   # Submodule functions (mcp/analyzers/)
   - "src/elspeth/mcp/analyzers/queries.py:explain_token:return"
   - "src/elspeth/mcp/analyzers/queries.py:get_errors:return"
