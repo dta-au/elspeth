@@ -233,12 +233,6 @@ class DualFencedSessionServiceHarness(SessionServiceImpl):
     append_run_event = _run_writer("append_run_event")
     record_blob_inline_resolutions = _run_writer("record_blob_inline_resolutions")
     del _run_writer
-
-    async def record_audit_grade_view_async(self, *, auth_provider_type="local", **kwargs):
-        # The lane made the auth provider an explicit audit fact; legacy tests
-        # predate it and only ever exercised the local provider.
-        return await super().record_audit_grade_view_async(auth_provider_type=auth_provider_type, **kwargs)
-
     del _kw_writer
 
     async def stage_guided_pipeline_proposal(self, command, *, session_operation_context=None, **kwargs):

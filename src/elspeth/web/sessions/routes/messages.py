@@ -1112,9 +1112,13 @@ def register_message_routes(router: APIRouter) -> None:
             include_raw_content=include_raw_content,
         ):
             audit_query_args = {key: value for key, value in request.query_params.items() if key in AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST}
+            # The authority re-proves (session, principal, provider) against the
+            # live row before writing, so the provider is the session's own —
+            # ownership above already proved it equals the deployment's.
             await service.record_audit_grade_view_async(
                 session_id=str(session.id),
                 requesting_principal=user.user_id,
+                auth_provider_type=session.auth_provider_type,
                 request_path=request.url.path,
                 query_args=audit_query_args,
                 ip_address=request.client.host if request.client else None,
