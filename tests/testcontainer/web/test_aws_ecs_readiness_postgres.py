@@ -214,7 +214,7 @@ def test_ready_returns_200_for_current_postgres(tmp_path: Path, runtime_database
         payload = response.json()
         assert payload["ready"] is True
         assert [check["name"] for check in payload["checks"]] == list(READINESS_CHECK_NAMES)
-        assert len({check["name"] for check in payload["checks"]}) == 8
+        assert len({check["name"] for check in payload["checks"]}) == 9
         assert all(check["ok"] for check in payload["checks"])
         assert probe_session_schema(session_owner) is SchemaState.CURRENT
         assert probe_landscape_schema(landscape_owner) is SchemaState.CURRENT

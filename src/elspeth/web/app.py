@@ -89,6 +89,15 @@ from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.coordination.membership_authority import (
+    RepositoryWebInstanceMembershipAuthority,
+    web_instance_identity_from_settings,
+)
+from elspeth.web.coordination.membership_lifecycle import (
+    RegisteredWebInstanceMembership,
+    SingleProcessWebInstanceMembership,
+    WebInstanceMembership,
+)
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository, SessionOperationConflictError
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
@@ -560,6 +569,12 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             attributes={"source": "startup", "excluded_live_runs": 0},
         )
 
+    # Join the deployment only after the startup sweeps have settled: from
+    # here on peers see this process as a live owner. A registration failure
+    # (a live process already holds this instance id, or the database is
+    # unreachable) fails boot, exactly like the sweeps above.
+    await app.state.web_instance_membership.start()
+
     # Resolve the paired browser endpoints from discovery or explicit config.
     if settings.auth_provider in ("oidc", "entra"):
         if settings.oidc_issuer:
@@ -799,6 +814,11 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # Drain first: readiness fails at once and the membership row says
+        # ``draining`` while the executor's work drains, so the platform stops
+        # routing new work here before anything is torn down. The row write's
+        # outcome is returned, never raised — shutdown proceeds regardless.
+        await app.state.web_instance_membership.begin_drain()
         # Cancel periodic cleanup before shutting down the executor. A fatal
         # sweeper failure cancels this owning task via the done callback above;
         # awaiting the completed task then restores that original failure.
@@ -814,7 +834,14 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             # Shutdown execution service thread pool without blocking the loop:
             # worker cleanup still schedules terminal-state writes back onto it.
             try:
-                await execution_service.shutdown()
+                try:
+                    await execution_service.shutdown()
+                finally:
+                    # The membership row records ``stopped`` (lease expired at
+                    # once, so peers take over immediately) only after the
+                    # executor has drained; a failed executor shutdown must
+                    # not leave the row draining under a live lease.
+                    await app.state.web_instance_membership.stop()
             finally:
                 # Tier-2 operator telemetry stops only after all audited execution
                 # work has drained. Expected collector outages are bounded/redacted
@@ -1612,6 +1639,26 @@ def _create_app(
         skill_markdown_history_authority=skill_markdown_history_authority,
     )
     app.state.session_service = session_service
+
+    # --- Web-instance membership (the web_instances writer) ---
+    # A PostgreSQL-backed replica registers itself under the SAME instance id
+    # it fences with (session_operation_owner_instance_id): peers join an
+    # expired fence's owner to web_instances and may take over only once the
+    # membership lease has also expired. A single-process SQLite deployment
+    # keeps no membership rows but owns the same draining signal, so the
+    # readiness gate reads identically on both modes. Registration and the
+    # heartbeat start in the lifespan, after the startup sweeps.
+    web_instance_membership: WebInstanceMembership
+    if session_engine.dialect.name == "postgresql":
+        web_instance_membership = RegisteredWebInstanceMembership(
+            RepositoryWebInstanceMembershipAuthority(session_engine),
+            web_instance_identity_from_settings(settings, instance_id=session_service.session_operation_owner_instance_id),
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+    else:
+        web_instance_membership = SingleProcessWebInstanceMembership()
+    app.state.web_instance_membership = web_instance_membership
+    app.state.instance_draining = web_instance_membership.draining
     readiness_probe_runner = ReadinessProbeRunner()
     app.state.readiness_probe_runner = readiness_probe_runner
     app.state.readiness_cache = ReadinessCache()
@@ -2000,6 +2047,7 @@ def _create_app(
                 request.app.state.session_engine,
                 request.app.state.readiness_probe_runner,
                 request.app.state.deployment_state_mode,
+                instance_draining=request.app.state.instance_draining,
             )
 
         try:
