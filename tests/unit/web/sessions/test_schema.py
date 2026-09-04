@@ -271,10 +271,11 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     initialize_session_schema(eng)
     inspector = inspect(eng)
 
-    # 48 -> 51 by the multi-replica merge (elspeth-4d6c0dd0f5): mainline
-    # independently reached 50, so the union schema takes the next free
-    # integer rather than letting one number name two shapes.
-    assert SESSION_SCHEMA_EPOCH == 51
+    # 48 -> 51 by the multi-replica merge (elspeth-4d6c0dd0f5), then -> 52
+    # when the pluggable-SSO identity substrate landed (elspeth-07cd19ba73).
+    # _COORDINATION_HARD_CUT_EPOCH tracks this by exact equality, so a bump
+    # that missed it would stop every session DB from opening.
+    assert SESSION_SCHEMA_EPOCH == 52
     expected_tables = frozenset(
         {
             "web_instances",

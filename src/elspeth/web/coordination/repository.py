@@ -68,6 +68,7 @@ from elspeth.web.coordination.mutation_connection_registry import (
 from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import locked_session_transaction, process_session_lock, transaction_session_lock
 from elspeth.web.sessions.models import (
+    approvals_table,
     blob_deletion_cleanups_table,
     blob_inline_resolutions_table,
     blob_replacement_cleanups_table,
@@ -79,8 +80,11 @@ from elspeth.web.sessions.models import (
     composition_states_table,
     guided_operations_table,
     interpretation_events_table,
+    library_entries_table,
     proposal_blob_effect_receipts_table,
     proposal_events_table,
+    review_attestations_table,
+    review_requests_table,
     run_events_table,
     runs_table,
     session_operation_fences_table,
@@ -602,6 +606,25 @@ class _RepositorySessionMutations:
                     guided_operations_table.c.result_session_id == session_id,
                 )
                 .limit(1)
+            ).first()
+            # Workflow governance (epoch 52, elspeth-07cd19ba73). Each of these
+            # is an authority record about the session: someone was asked to
+            # approve it, asked to review it, attested to it, or published it
+            # to the shared library. Physically deleting a session that carries
+            # any of them would destroy the evidence for a decision somebody
+            # made — so their presence makes the archive a SOFT one, exactly as
+            # a run or a completion event does.
+            or connection.execute(select(approvals_table.c.approval_id).where(approvals_table.c.session_id == session_id).limit(1)).first()
+            or connection.execute(
+                select(review_requests_table.c.request_id).where(review_requests_table.c.session_id == session_id).limit(1)
+            ).first()
+            or connection.execute(
+                select(review_attestations_table.c.attestation_id).where(review_attestations_table.c.session_id == session_id).limit(1)
+            ).first()
+            # Library entries point BACK at the session they were published
+            # from, so the join column differs from the four above.
+            or connection.execute(
+                select(library_entries_table.c.entry_id).where(library_entries_table.c.published_from_session_id == session_id).limit(1)
             ).first()
         )
         if not durable_history_exists:

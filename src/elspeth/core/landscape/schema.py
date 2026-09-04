@@ -343,7 +343,25 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        is unchanged (row_id kept, argument on that decision at the
 #        constraint's own definition). Pre-1.0 delete-and-recreate boundary;
 #        no migration.
-SQLITE_SCHEMA_EPOCH = 36
+#   37 → pluggable SSO (elspeth-07cd19ba73, spec
+#        docs/specs/2026-09-02-pluggable-sso-design.md): auth_events gains a
+#        nullable indexed identity_id and its event_type CHECK widens from
+#        three values to twenty-three, covering admission, authority, the org
+#        tree and workflow governance. That CHECK is CLOSED, so a value
+#        missing from it is a self-inflicted outage — R4 refuses the mutation
+#        whose audit write failed — which is why the whole vocabulary lands
+#        now rather than arriving with the features that use it. The auth
+#        provider discriminator also widens from three values to five —
+#        ck_run_attributions_auth_provider_type and ck_auth_events_provider
+#        both admit 'vanguard' and 'google'. Landscape compares declared
+#        CHECK text against the reflected constraint structurally, so a
+#        widened constraint trips the schema validator against an existing
+#        database exactly as the 2026-08-14 index change did; it is a schema
+#        change even though every value the old constraint admitted is still
+#        admitted. Cut over in the SAME service-stop window as sessions
+#        epoch 50 (one window, two stores). Pre-1.0 delete-and-recreate
+#        boundary; no migration, rollback_permitted: false.
+SQLITE_SCHEMA_EPOCH = 37
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -462,7 +480,10 @@ run_attributions_table = Table(
     Column("recorded_at", DateTime(timezone=True), nullable=False),
     Column("initiated_by_user_id", String(255), nullable=False),
     Column("auth_provider_type", String(32), nullable=False),
-    CheckConstraint("auth_provider_type IN ('local', 'oidc', 'entra')", name="ck_run_attributions_auth_provider_type"),
+    CheckConstraint(
+        "auth_provider_type IN ('local', 'oidc', 'entra', 'vanguard', 'google')",
+        name="ck_run_attributions_auth_provider_type",
+    ),
 )
 Index("ix_run_attributions_user", run_attributions_table.c.initiated_by_user_id, run_attributions_table.c.auth_provider_type)
 
@@ -2457,8 +2478,26 @@ auth_events_table = Table(
     Column("client_host", String(128)),
     Column("user_agent", Text),
     Column("metadata_json", Text, nullable=False),
+    # Nullable and indexed: rows written before the identity substrate
+    # existed have none, and a login that fails before an identity is
+    # resolved never will. ``user_id`` stays for the audit reader.
+    Column("identity_id", String(64)),
+    # Hand-written and pinned against ``AuthAuditEventType`` by
+    # ``tests/unit/web/auth/test_provider_type_contract.py``. Deriving the SQL
+    # from the Literal would let a contract edit change what the database
+    # admits with no epoch bump; pinning it means the drift is caught instead.
     CheckConstraint(
-        "event_type IN ('login', 'token_issued', 'auth_failure')",
+        "event_type IN ("
+        "'login', 'token_issued', 'auth_failure', 'logout', "
+        "'identity_activated', 'identity_disabled', 'identity_enabled', "
+        "'role_granted', 'role_revoked', "
+        "'relationship_asserted', 'relationship_revoked', "
+        "'approval_requested', 'approval_decided', "
+        "'review_requested', 'review_request_cancelled', 'review_attested', "
+        "'library_published', 'library_accepted', 'library_rejected', "
+        "'library_deprecated', 'library_recalled', "
+        "'quota_set', 'quota_exceeded'"
+        ")",
         name="ck_auth_events_event_type",
     ),
     CheckConstraint(
@@ -2466,7 +2505,7 @@ auth_events_table = Table(
         name="ck_auth_events_outcome",
     ),
     CheckConstraint(
-        "provider IN ('local', 'oidc', 'entra')",
+        "provider IN ('local', 'oidc', 'entra', 'vanguard', 'google')",
         name="ck_auth_events_provider",
     ),
 )
@@ -2474,6 +2513,7 @@ auth_events_table = Table(
 Index("ix_auth_events_occurred_at", auth_events_table.c.occurred_at)
 Index("ix_auth_events_type_outcome", auth_events_table.c.event_type, auth_events_table.c.outcome)
 Index("ix_auth_events_user", auth_events_table.c.user_id)
+Index("ix_auth_events_identity", auth_events_table.c.identity_id)
 
 # === Pre-flight Results (Pipeline Dependencies & Commencement Gates) ===
 

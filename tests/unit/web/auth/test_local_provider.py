@@ -22,7 +22,13 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth import local as auth_local
 from elspeth.web.auth.local import LocalAuthProvider
-from elspeth.web.auth.models import AuthenticationError, UserIdentity, UserProfile
+from elspeth.web.auth.models import AccessPending, AuthenticationError, IdentityDisabled, UserIdentity, UserProfile
+from elspeth.web.auth.session_token import LOCAL_AUDIENCE
+from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import identities_table
+from elspeth.web.sessions.schema import initialize_session_schema
+
+from .conftest import build_local_auth_provider
 
 
 class _CommitFailingConnection:
@@ -65,16 +71,38 @@ def _fail_commits(provider: LocalAuthProvider, monkeypatch: pytest.MonkeyPatch) 
 @pytest.fixture
 def provider(tmp_path):
     """Create a LocalAuthProvider with a temporary SQLite database."""
-    return LocalAuthProvider(
-        db_path=tmp_path / "auth.db",
-        secret_key="test-secret-key-for-unit-tests",
-        token_expiry_hours=24,
-    )
+    return build_local_auth_provider(tmp_path / "auth.db", token_expiry_hours=24)
 
 
 def _signed_local_token(provider: LocalAuthProvider, claims: dict[str, Any]) -> str:
-    """Create a signed local JWT for boundary-shape tests."""
-    return pyjwt.encode(claims, provider._secret_key, algorithm="HS256")
+    """Sign an arbitrary claim set with the provider's real signing key.
+
+    For boundary-shape tests only: it produces a GENUINELY signed token whose
+    claims are deliberately wrong, which is the only way to test what the
+    envelope checks do once the signature has already passed.
+
+    Callers must supply the full envelope (``iss``, ``aud``, ``provider``,
+    ``jti``) except for the one claim under test — otherwise the token is
+    refused for a reason the test did not intend and the assertion passes for
+    the wrong cause.
+    """
+    return pyjwt.encode(claims, provider._token_issuer._signing_key, algorithm="HS256")
+
+
+def _envelope(**overrides: Any) -> dict[str, Any]:
+    """A complete, valid claim set to mutate one field of."""
+    claims: dict[str, Any] = {
+        "sub": "some-identity-id",
+        "username": "alice",
+        "provider": "local",
+        "iss": "elspeth",
+        "aud": LOCAL_AUDIENCE,
+        "jti": "test-jti",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 3600,
+    }
+    claims.update(overrides)
+    return claims
 
 
 def _delete_user(provider: LocalAuthProvider, user_id: str) -> None:
@@ -152,16 +180,32 @@ class TestCreateUser:
 
     def test_auth_database_is_created_owner_only_under_permissive_umask(self, tmp_path) -> None:
         db_path = tmp_path / "auth.db"
+        # A real subprocess, because umask is process state: setting it in
+        # this process would leak into every other test in the worker. The
+        # collaborators are wired inline rather than imported from conftest,
+        # which is not reliably importable by path from a child interpreter.
         script = """
 import os
 import stat
 import sys
 from pathlib import Path
 from elspeth.web.auth.local import LocalAuthProvider
+from elspeth.web.auth.session_token import LOCAL_AUDIENCE, SessionTokenIssuer
 
 os.umask(0)
 path = Path(sys.argv[1])
-LocalAuthProvider(db_path=path, secret_key="subprocess-test-key")
+LocalAuthProvider(
+    db_path=path,
+    token_issuer=SessionTokenIssuer(
+        signing_key=b"subprocess-test-signing-key-32b!",
+        provider="local",
+        audience=LOCAL_AUDIENCE,
+        token_expiry_hours=24,
+        max_refresh_chain_hours=168,
+        principal_is_active=lambda identity_id: True,
+    ),
+    admit_identity=lambda claims: (_ for _ in ()).throw(AssertionError("no login happens here")),
+)
 print(oct(stat.S_IMODE(path.stat().st_mode)))
 """
         completed = subprocess.run(
@@ -180,16 +224,16 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         db_path.chmod(0o644)
 
         with pytest.raises(RuntimeError, match="owner-only"):
-            LocalAuthProvider(db_path=db_path, secret_key="test-key")
+            build_local_auth_provider(db_path)
 
     def test_auth_database_rejects_symlink(self, tmp_path) -> None:
         target = tmp_path / "target.db"
-        LocalAuthProvider(db_path=target, secret_key="test-key")
+        build_local_auth_provider(target)
         db_path = tmp_path / "auth.db"
         db_path.symlink_to(target)
 
         with pytest.raises(RuntimeError, match="regular owner-only file"):
-            LocalAuthProvider(db_path=db_path, secret_key="test-key")
+            build_local_auth_provider(db_path)
 
     def test_open_owner_only_database_creates_missing_file_owner_only(self, tmp_path) -> None:
         """The ``FileNotFoundError`` arm creates the file and the identity check admits it."""
@@ -517,10 +561,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             )
             assert audit_entered.wait(timeout=2)
             now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
-            restarted = LocalAuthProvider(
-                db_path=provider._db_path,
-                secret_key="test-secret-key-for-unit-tests",
-            )
+            restarted = build_local_auth_provider(provider._db_path)
             replacement_token = restarted.register_open_user_with_audit(
                 "alice",
                 "replacement456",
@@ -571,10 +612,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             )
             assert audit_entered.wait(timeout=2)
             now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
-            restarted = LocalAuthProvider(
-                db_path=provider._db_path,
-                secret_key="test-secret-key-for-unit-tests",
-            )
+            restarted = build_local_auth_provider(provider._db_path)
             replacement_token = restarted.register_open_user_with_audit(
                 "alice",
                 "replacement456",
@@ -632,10 +670,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             )
             assert audit_entered.wait(timeout=2)
             now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
-            restarted = LocalAuthProvider(
-                db_path=provider._db_path,
-                secret_key="test-secret-key-for-unit-tests",
-            )
+            restarted = build_local_auth_provider(provider._db_path)
             retry_token = restarted.verify_email_and_issue_token(
                 verification_token,
                 record_token_issued=lambda _identity, _access_token: None,
@@ -653,10 +688,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         provider.create_user("alice", "password123", display_name="Alice")
         _insert_crashed_intent(provider, user_id="alice", issuance_path="register", created_at=1_000)
 
-        restarted = LocalAuthProvider(
-            db_path=provider._db_path,
-            secret_key="test-secret-key-for-unit-tests",
-        )
+        restarted = build_local_auth_provider(provider._db_path)
 
         assert _audit_intents(restarted) == []
         with pytest.raises(AuthenticationError, match="Invalid credentials"):
@@ -696,10 +728,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         )
 
         now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
-        restarted = LocalAuthProvider(
-            db_path=provider._db_path,
-            secret_key="test-secret-key-for-unit-tests",
-        )
+        restarted = build_local_auth_provider(provider._db_path)
 
         assert _audit_intents(restarted) == []
         issued_tokens: list[str] = []
@@ -720,10 +749,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             created_at=int(time.time()),
         )
 
-        restarted = LocalAuthProvider(
-            db_path=provider._db_path,
-            secret_key="test-secret-key-for-unit-tests",
-        )
+        restarted = build_local_auth_provider(provider._db_path)
 
         assert _audit_intents(restarted) == [("alice", "register")]
         token = restarted._login_sync("alice", "password123")
@@ -866,7 +892,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         tmp_path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         outbox_path = tmp_path / "email-verifications.jsonl"
         real_append = auth_local._append_email_verification_record
 
@@ -888,7 +914,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             provider._login_sync("alice", "password123")
 
         monkeypatch.setattr(auth_local, "_append_email_verification_record", real_append)
-        restarted = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        restarted = build_local_auth_provider(tmp_path / "auth.db")
         restarted.publish_pending_email_verifications(outbox_path)
 
         records = [json.loads(line) for line in outbox_path.read_text(encoding="utf-8").splitlines()]
@@ -1010,7 +1036,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
     def test_retry_after_expiry_rotates_pending_registration_delivery(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
         now = [1_000]
         monkeypatch.setattr(auth_local.time, "time", lambda: now[0])
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         outbox_path = tmp_path / "email-verifications.jsonl"
         kwargs = {
             "verification_origin": "https://composer.example.test",
@@ -1040,7 +1066,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         assert records[1]["token"] != first["token"]
 
     def test_publish_retry_deduplicates_append_before_ack_crash(self, tmp_path) -> None:
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         outbox_path = tmp_path / "email-verifications.jsonl"
         provider.register_email_verified_user(
             "alice",
@@ -1059,7 +1085,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         assert len(records) == 1
 
     def test_publish_retry_rejects_divergent_payload_for_existing_delivery_id(self, tmp_path) -> None:
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         outbox_path = tmp_path / "email-verifications.jsonl"
         provider.register_email_verified_user(
             "alice",
@@ -1123,7 +1149,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
     ) -> None:
         now = [1_000]
         monkeypatch.setattr(auth_local.time, "time", lambda: now[0])
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.register_email_verified_user(
             "alice",
             "password123",
@@ -1134,7 +1160,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         )
 
         now[0] += auth_local._EMAIL_VERIFICATION_TOKEN_TTL_SECONDS + auth_local._PENDING_REGISTRATION_RETENTION_SECONDS + 1
-        restarted = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        restarted = build_local_auth_provider(tmp_path / "auth.db")
         restarted.create_user("alice", "replacement-password", display_name="Replacement")
 
         token = restarted._login_sync("alice", "replacement-password")
@@ -1182,8 +1208,12 @@ class TestAuthenticate:
         token = await provider.login("alice", "pw")
         identity = await provider.authenticate(token)
         assert isinstance(identity, UserIdentity)
-        assert identity.user_id == "alice"
         assert identity.username == "alice"
+        # user_id is the IDENTITY_ID, not the username. It is the value every
+        # ownership row points at, so it must be the identity substrate's key
+        # and not a display string an administrator can change.
+        assert identity.user_id != "alice"
+        assert provider._token_issuer.decode(token).identity_id == identity.user_id
 
     @pytest.mark.asyncio
     async def test_authenticate_garbage_token(self, provider) -> None:
@@ -1193,22 +1223,16 @@ class TestAuthenticate:
     @pytest.mark.asyncio
     async def test_authenticate_expired_token(self, tmp_path) -> None:
         """Token with 0-second expiry should fail after creation."""
-        import jwt as pyjwt
 
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-            token_expiry_hours=24,
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db", token_expiry_hours=24)
         provider.create_user("alice", "pw", display_name="Alice")
 
-        # Manually create an already-expired token
-        payload = {
-            "sub": "alice",
-            "username": "alice",
-            "exp": int(time.time()) - 10,  # 10 seconds in the past
-        }
-        expired_token = pyjwt.encode(payload, "test-key", algorithm="HS256")
+        # A COMPLETE envelope whose only defect is expiry, so the refusal can
+        # only be the expiry check.
+        expired_token = _signed_local_token(
+            provider,
+            _envelope(iat=int(time.time()) - 7200, exp=int(time.time()) - 10),
+        )
 
         with pytest.raises(AuthenticationError):
             await provider.authenticate(expired_token)
@@ -1228,16 +1252,9 @@ class TestAuthenticate:
     @pytest.mark.asyncio
     async def test_authenticate_wrong_secret_key(self, tmp_path) -> None:
         """Token signed with a different key should fail."""
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="correct-key",
-        )
-        payload = {
-            "sub": "alice",
-            "username": "alice",
-            "exp": int(time.time()) + 3600,
-        }
-        bad_token = pyjwt.encode(payload, "wrong-key", algorithm="HS256")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        # Every claim correct; only the signing key is wrong.
+        bad_token = pyjwt.encode(_envelope(), "wrong-key", algorithm="HS256")
         with pytest.raises(AuthenticationError, match="Invalid token"):
             await provider.authenticate(bad_token)
 
@@ -1316,7 +1333,9 @@ class TestGetUserInfo:
         token = await provider.login("alice", "pw")
         profile = await provider.get_user_info(token)
         assert isinstance(profile, UserProfile)
-        assert profile.user_id == "alice"
+        # The profile is read from auth.db by USERNAME while user_id carries
+        # the identity_id — the two are different keys into different stores.
+        assert profile.user_id == provider._token_issuer.decode(token).identity_id
         assert profile.username == "alice"
         assert profile.display_name == "Alice Smith"
         assert profile.email == "alice@example.com"
@@ -1389,57 +1408,87 @@ class TestTimingDefense:
 class TestRefresh:
     """Tests for the token refresh method."""
 
+    async def _logged_in(self, provider) -> str:
+        provider.create_user("alice", "pw", display_name="Alice")
+        return await provider.login("alice", "pw")
+
+    @staticmethod
+    def _backdated(provider, token: str, *, age_seconds: int) -> str:
+        """Re-mint a real token with its chain start pushed into the past.
+
+        Refresh now takes the TOKEN, so a test can no longer hand it a
+        fabricated ``original_iat`` — which is the point: no caller can claim
+        a chain age the signature does not support. To age a chain, the test
+        must mint a genuine token with an old ``iat``.
+        """
+        claims = provider._token_issuer.decode(token)
+        return provider._token_issuer.mint(
+            identity_id=claims.identity_id,
+            username=claims.username,
+            issued_at=int(time.time()) - age_seconds,
+        )
+
     @pytest.mark.asyncio
     async def test_refresh_deleted_user_raises(self, provider) -> None:
         """A deleted user cannot obtain fresh tokens via refresh."""
-        provider.create_user("alice", "pw", display_name="Alice")
+        token = await self._logged_in(provider)
         # Access _db_path directly — no public API to delete users by design
         _delete_user(provider, "alice")
-        with pytest.raises(AuthenticationError, match="User not found"):
-            await provider.refresh("alice", "alice", original_iat=int(time.time()))
+        with pytest.raises(AuthenticationError, match="Invalid token"):
+            await provider.refresh(token)
 
     @pytest.mark.asyncio
     async def test_refresh_valid_user_returns_jwt(self, provider) -> None:
-        provider.create_user("alice", "pw", display_name="Alice")
-        token = await provider.refresh("alice", "alice", original_iat=int(time.time()))
+        token = await provider.refresh(await self._logged_in(provider))
         assert isinstance(token, str)
         assert len(token.split(".")) == 3
 
     @pytest.mark.asyncio
     async def test_refresh_with_iat_within_limit_succeeds(self, provider) -> None:
-        """Refresh with original_iat within max_refresh_chain_hours succeeds."""
-        provider.create_user("alice", "pw", display_name="Alice")
-        recent_iat = int(time.time()) - 3600  # 1 hour ago
-        token = await provider.refresh("alice", "alice", original_iat=recent_iat)
+        """A chain inside max_refresh_chain_hours is renewed."""
+        aged = self._backdated(provider, await self._logged_in(provider), age_seconds=3600)
+        token = await provider.refresh(aged)
         assert isinstance(token, str)
         assert len(token.split(".")) == 3
 
     @pytest.mark.asyncio
     async def test_refresh_with_expired_chain_raises(self, provider) -> None:
-        """Refresh with original_iat older than max_refresh_chain_hours raises."""
-        provider.create_user("alice", "pw", display_name="Alice")
-        # Default max_refresh_chain_hours=168 (7 days). Set iat to 8 days ago.
-        old_iat = int(time.time()) - (8 * 24 * 3600)
+        """A chain older than max_refresh_chain_hours (168h) is refused."""
+        aged = self._backdated(provider, await self._logged_in(provider), age_seconds=8 * 24 * 3600)
         with pytest.raises(AuthenticationError, match="Token refresh chain expired"):
-            await provider.refresh("alice", "alice", original_iat=old_iat)
+            await provider.refresh(aged)
 
     @pytest.mark.asyncio
     async def test_refresh_carries_original_iat_forward(self, provider) -> None:
-        """Refreshed token preserves the original iat, not a fresh one."""
-        import jwt
+        """Refreshed token preserves the original iat, not a fresh one.
 
-        provider.create_user("alice", "pw", display_name="Alice")
-        original_iat = int(time.time()) - 7200  # 2 hours ago
-        token = await provider.refresh("alice", "alice", original_iat=original_iat)
-        claims = jwt.decode(token, "test-secret-key-for-unit-tests", algorithms=["HS256"])
-        assert claims["iat"] == original_iat
+        The expected value is READ BACK from the aged token rather than
+        recomputed from the clock. Computing it twice raced a one-second tick
+        and failed roughly once per full-suite run.
+        """
+        aged = self._backdated(provider, await self._logged_in(provider), age_seconds=7200)
+        original_iat = provider._token_issuer.decode(aged).issued_at
+
+        renewed = await provider.refresh(aged)
+
+        assert provider._token_issuer.decode(renewed).issued_at == original_iat
 
     @pytest.mark.asyncio
-    async def test_refresh_without_iat_raises(self, provider) -> None:
-        """Refresh without original_iat must not start a fresh chain."""
-        provider.create_user("alice", "pw", display_name="Alice")
-        with pytest.raises(AuthenticationError, match="Token missing iat"):
-            await provider.refresh("alice", "alice", original_iat=None)
+    async def test_refresh_of_a_token_without_iat_raises(self, provider) -> None:
+        """A chain with no start cannot be bounded, so it is refused.
+
+        Previously the ROUTE checked this against the middleware's unverified
+        claims. It is now a decode requirement, which means a token missing
+        ``iat`` cannot reach any refresh path at all.
+        """
+        token = await self._logged_in(provider)
+        claims = provider._token_issuer.decode(token)
+        payload = _envelope(sub=claims.identity_id)
+        del payload["iat"]
+        no_iat = _signed_local_token(provider, payload)
+
+        with pytest.raises(AuthenticationError, match="Invalid token"):
+            await provider.refresh(no_iat)
 
 
 class TestListUsers:
@@ -1490,3 +1539,96 @@ class TestSetPassword:
         provider.create_user("alice", "old-password-1", display_name="Alice")
         with pytest.raises(ValueError, match="72"):
             provider.set_password("alice", "x" * 80)
+
+
+class TestD12AdmissionWallOnEveryIssuancePath:
+    """The pending wall belongs to ISSUANCE, not to logging in.
+
+    Three paths hand out a session token: login, open registration, and email
+    verification. A wall that only ``login`` honours is not a wall — and the
+    failure is quiet rather than loud, because the token an unadmitted path
+    issues is inert. The person receives a credential that never works and an
+    error they cannot tell apart from an expired session, while a
+    ``token_issued`` audit row asserts a token was issued to a principal that
+    has no admission. A provably false audit row is worse than a refusal.
+
+    Every test here uses a CLOSED provider (``registration_open=False``),
+    which is what a ``registration_mode`` of ``email_verified`` or ``closed``
+    produces in app.py. The shared fixture defaults to open, so none of these
+    paths were exercised against a pending identity before this class existed.
+    """
+
+    @pytest.fixture
+    def closed(self, tmp_path):
+        """A deployment where D12 actually bites: first sight lands pending."""
+        return build_local_auth_provider(tmp_path / "auth.db", registration_open=False)
+
+    @pytest.mark.asyncio
+    async def test_login_refuses_a_pending_identity(self, closed) -> None:
+        closed.create_user("alice", "pw", display_name="Alice")
+        with pytest.raises(AccessPending):
+            await closed.login("alice", "pw")
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_not_a_credential_failure(self, closed) -> None:
+        """The password was RIGHT. Saying otherwise misreports it to the admin."""
+        closed.create_user("alice", "pw", display_name="Alice")
+        with pytest.raises(AuthenticationError) as excinfo:
+            await closed.login("alice", "pw")
+        assert "Invalid credentials" not in excinfo.value.detail
+
+    def test_email_verification_refuses_a_pending_identity(self, closed) -> None:
+        """The path that actually fires in a registration_mode=email_verified deployment.
+
+        Without the wall this returns 200 with a token that every
+        authenticated route then rejects.
+        """
+        closed.create_user("alice", "pw", display_name="Alice", email="a@example.com", email_verified=False)
+        verification = closed.create_email_verification_token("alice")
+
+        with pytest.raises(AccessPending):
+            closed.verify_email_and_issue_token(
+                verification,
+                record_token_issued=lambda _identity, _token: None,
+            )
+
+    def test_no_token_issued_audit_is_written_for_a_refused_admission(self, closed) -> None:
+        """The audit trail must not claim a token that was never issued."""
+        closed.create_user("alice", "pw", display_name="Alice", email="a@example.com", email_verified=False)
+        verification = closed.create_email_verification_token("alice")
+        recorded: list[str] = []
+
+        with pytest.raises(AuthenticationError):
+            closed.verify_email_and_issue_token(
+                verification,
+                record_token_issued=lambda _identity, token: recorded.append(token),
+            )
+
+        assert recorded == []
+
+    def test_open_registration_refuses_a_disabled_identity(self, tmp_path) -> None:
+        """Re-registering a freed username must not resurrect a disabled admission.
+
+        Reachable on the OPEN path, which is why this one does not use the
+        ``closed`` fixture: an identity already disabled, whose credential row
+        was then deleted, can be re-registered under the same username.
+        Without the wall that returns a token bound to the disabled identity.
+        """
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'identities.db'}")
+        initialize_session_schema(engine)
+        provider = build_local_auth_provider(tmp_path / "auth.db", session_engine=engine)
+
+        provider.create_user("alice", "pw", display_name="Alice")
+        identity_id = provider._admit("alice").record.identity_id
+        with engine.begin() as conn:
+            conn.execute(identities_table.update().where(identities_table.c.identity_id == identity_id).values(access_state="disabled"))
+        _delete_user(provider, "alice")
+
+        with pytest.raises(IdentityDisabled):
+            provider.register_open_user_with_audit(
+                "alice",
+                "new-password",
+                "Alice Again",
+                None,
+                record_token_issued=lambda _token: None,
+            )

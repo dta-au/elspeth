@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, get_args
 
 from sqlalchemy import or_, select
 from sqlalchemy.engine import Connection
@@ -29,6 +29,7 @@ from elspeth.contracts import (
     SecretResolutionInput,
 )
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationToken,
@@ -146,7 +147,11 @@ _IMMUTABLE_SUCCESS_RUN_STATUSES = frozenset(
 )
 _IMMUTABLE_SUCCESS_RUN_STATUS_VALUES = tuple(status.value for status in _IMMUTABLE_SUCCESS_RUN_STATUSES)
 
-_AUTH_PROVIDER_TYPES = frozenset({"local", "oidc", "entra"})
+# Derived from the L0 contract rather than restated: this is a write-side
+# guard, and a guard that restates its authority drifts from it silently.
+# The schema CHECK stays hand-written on purpose -- changing what the
+# database admits must cost an epoch bump, not follow a Literal edit.
+_AUTH_PROVIDER_TYPES: Final[frozenset[str]] = frozenset(get_args(AuthProviderType))
 _OPENROUTER_CATALOG_SOURCES = frozenset({"live", "bundled"})
 _NON_RESUMABLE_EFFECT_OPERATION_ERROR: Final[str] = "run finalized as non-resumable before sink effect completed"
 

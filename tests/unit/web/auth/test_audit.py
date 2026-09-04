@@ -16,7 +16,8 @@ from elspeth.core.landscape.auth_audit_repository import AuthAuditRepository
 from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.web.auth import audit as audit_module
-from elspeth.web.auth.audit import AuthAuditRecorder
+from elspeth.web.auth.audit import AuthAuditRecorder, classify_authentication_failure
+from elspeth.web.auth.models import AccessPending, AuthenticationError, IdentityDisabled
 from elspeth.web.schema_probe import EXTERNAL_POSTGRES_POOL_KWARGS
 
 _STATE_POLICY_MATRIX = [
@@ -133,7 +134,14 @@ def _request() -> Request:
 def _writer_kwargs(method_name: str) -> dict[str, object]:
     common: dict[str, object] = {"provider": "local"}
     if method_name == "record_login_success_and_token_issued":
-        token = jwt.encode({"iat": 1, "exp": 2}, "bounded-test-key-that-is-at-least-32-bytes", algorithm="HS256")
+        # ``sub`` is required: the recorder reads the identity it is
+        # attributing from the token itself rather than from a value passed
+        # alongside, so a token without one is an audit-integrity error.
+        token = jwt.encode(
+            {"sub": "identity-1", "iat": 1, "exp": 2},
+            "bounded-test-key-that-is-at-least-32-bytes",
+            algorithm="HS256",
+        )
         return {
             **common,
             "user_id": "user-1",
@@ -145,7 +153,14 @@ def _writer_kwargs(method_name: str) -> dict[str, object]:
     if method_name == "record_login_failure":
         return {**common, "username": "alice", "failure_category": "invalid_credentials"}
     if method_name == "record_token_issued":
-        token = jwt.encode({"iat": 1, "exp": 2}, "bounded-test-key-that-is-at-least-32-bytes", algorithm="HS256")
+        # ``sub`` is required: the recorder reads the identity it is
+        # attributing from the token itself rather than from a value passed
+        # alongside, so a token without one is an audit-integrity error.
+        token = jwt.encode(
+            {"sub": "identity-1", "iat": 1, "exp": 2},
+            "bounded-test-key-that-is-at-least-32-bytes",
+            algorithm="HS256",
+        )
         return {
             **common,
             "user_id": "user-1",
@@ -335,3 +350,53 @@ def test_every_writer_propagates_and_redacts_expected_database_failures(
         "/api/auth/login",
     ):
         assert sentinel not in rendered
+
+
+class TestAdmissionFailureCategories:
+    """A correct password refused at the D12 wall is not a bad credential.
+
+    Recording it as one poisons both trails an administrator reads: the queue
+    of people waiting for approval, and the trail that would show a
+    brute-force attempt. These four categories are what the login route now
+    derives instead of hardcoding ``invalid_credentials``.
+    """
+
+    def test_a_pending_identity_is_not_a_credential_failure(self) -> None:
+        assert classify_authentication_failure(AccessPending()) == "access_pending"
+
+    def test_a_disabled_identity_is_its_own_category(self) -> None:
+        """A revocation taking effect, not a failed guess."""
+        assert classify_authentication_failure(IdentityDisabled()) == "identity_disabled"
+
+    def test_rewording_the_message_does_not_change_the_category(self) -> None:
+        """The point of classifying on the TYPE.
+
+        A prefix match put the same literal in the raiser and the classifier
+        with nothing binding them, so an ordinary copy edit to the message an
+        operator reads would silently reclassify the audit event — and a test
+        that built the literal itself would keep passing.
+        """
+        assert classify_authentication_failure(AccessPending("Hold tight, someone is reviewing this")) == "access_pending"
+        assert classify_authentication_failure(IdentityDisabled("This account was closed")) == "identity_disabled"
+
+    def test_a_genuinely_bad_credential_keeps_its_category(self) -> None:
+        """The control: adding the arms above must not lose this one."""
+        exc = AuthenticationError("Invalid credentials")
+        assert classify_authentication_failure(exc) == "invalid_credentials"
+
+    def test_an_unverified_email_is_distinguishable(self) -> None:
+        exc = AuthenticationError("Email verification required")
+        assert classify_authentication_failure(exc) == "email_unverified"
+
+    def test_the_four_admission_outcomes_are_all_distinct(self) -> None:
+        """A classifier that collapsed any two would defeat the point."""
+        categories = {
+            classify_authentication_failure(exc)
+            for exc in (
+                AccessPending(),
+                IdentityDisabled(),
+                AuthenticationError("Invalid credentials"),
+                AuthenticationError("Email verification required"),
+            )
+        }
+        assert len(categories) == 4

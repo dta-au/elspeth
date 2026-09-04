@@ -226,6 +226,37 @@ def test_get_shared_inspect_happy_path(
     }
 
 
+def test_get_shared_inspect_attributes_the_share_to_the_username(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    """The route must send the sharer's USERNAME, not only the identity id.
+
+    The shared view's banner names who shared the pipeline. Its recipient
+    has no login, so the opaque ``created_by_user_id`` names nobody to
+    them. The authenticated identity here carries a username distinct from
+    its user_id precisely so a route that passed ``user.user_id`` for both
+    would fail this test.
+    """
+    client, session_id = audit_readiness_client_with_state
+    named_identity = UserIdentity(user_id=_TEST_AUTHED_USER_ID, username="alice-the-analyst")
+
+    async def _named() -> UserIdentity:
+        return named_identity
+
+    original_override = client.app.dependency_overrides[get_current_user]
+    client.app.dependency_overrides[get_current_user] = _named
+    try:
+        token = _mint_token(client, session_id)
+        response = client.get(f"/api/sessions/shared/{token}")
+    finally:
+        client.app.dependency_overrides[get_current_user] = original_override
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["created_by_username"] == "alice-the-analyst"
+    assert body["created_by_user_id"] == _TEST_AUTHED_USER_ID
+
+
 def test_shared_route_and_persistence_expose_only_public_projection(
     audit_readiness_client_with_state: tuple[TestClient, UUID],
 ) -> None:

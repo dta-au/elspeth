@@ -160,6 +160,7 @@ describe("shareableReviews API client", () => {
       yaml: "version: 1\n",
       audit_readiness: _validReadinessSnapshot,
       created_by_user_id: "alice",
+      created_by_username: "alice-the-analyst",
       created_at: "2026-05-19T00:00:00+00:00",
       expires_at: "2026-06-19T00:00:00+00:00",
     };
@@ -196,6 +197,7 @@ describe("shareableReviews API client", () => {
       yaml: "version: 1\n",
       audit_readiness: "not-an-object", // wrong type
       created_by_user_id: "alice",
+      created_by_username: "alice-the-analyst",
       created_at: "2026-05-19T00:00:00+00:00",
       expires_at: "2026-06-19T00:00:00+00:00",
     };
@@ -230,6 +232,7 @@ describe("shareableReviews API client", () => {
       yaml: "version: 1\n",
       audit_readiness: _validReadinessSnapshot,
       created_by_user_id: "alice",
+      created_by_username: "alice-the-analyst",
       created_at: "2026-05-19T00:00:00+00:00",
       expires_at: "2026-06-19T00:00:00+00:00",
       ...overrides,
@@ -251,6 +254,26 @@ describe("shareableReviews API client", () => {
     expect(response.audit_readiness.rows).toHaveLength(6);
     expect(response.pipeline_metadata.name).toBe("Demo");
     expect(response.composition_snapshot.nodes).toEqual([]);
+  });
+
+  it("fetchSharedInspect accepts a null created_by_username (pre-field snapshot)", async () => {
+    // The backend sends null for snapshots minted before it froze the
+    // sharer's username into the blob; those bytes are signed and cannot be
+    // backfilled, so null is a valid wire value, not a shape error.
+    _mockJsonResponse(_buildValidSharedInspectBody({ created_by_username: null }));
+    const response = await fetchSharedInspect("legacy-token");
+    expect(response.created_by_username).toBeNull();
+    expect(response.created_by_user_id).toBe("alice");
+  });
+
+  it("fetchSharedInspect rejects a body with created_by_username absent", async () => {
+    // Null is a value the backend chooses; an absent key means producer drift.
+    const body = _buildValidSharedInspectBody();
+    delete body.created_by_username;
+    _mockJsonResponse(body);
+    await expect(fetchSharedInspect("any-token")).rejects.toMatchObject({
+      detail: expect.stringContaining("shared-inspect"),
+    });
   });
 
   it("fetchSharedInspect rejects audit_readiness with malformed row (missing required row fields)", async () => {

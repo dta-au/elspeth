@@ -153,6 +153,7 @@ def test_shared_inspect_response_carries_audit_readiness() -> None:
         yaml="version: 1\n",
         audit_readiness=snapshot,
         created_by_user_id="user-1",
+        created_by_username="user-one",
         created_at=datetime.now(UTC),
         expires_at=datetime.now(UTC),
     )
@@ -180,6 +181,7 @@ def test_shared_inspect_response_accepts_plural_sources_snapshot() -> None:
         yaml="version: 1\n",
         audit_readiness=snapshot,
         created_by_user_id="user-1",
+        created_by_username="user-one",
         created_at=datetime.now(UTC),
         expires_at=datetime.now(UTC),
     )
@@ -198,6 +200,7 @@ def test_shared_inspect_response_rejects_extra_field() -> None:
             yaml="version: 1\n",
             audit_readiness=snapshot,
             created_by_user_id="user-1",
+            created_by_username="user-one",
             created_at=datetime.now(UTC),
             expires_at=datetime.now(UTC),
             something_extra=True,  # type: ignore[call-arg]
@@ -214,6 +217,7 @@ def test_shared_inspect_response_requires_audit_readiness() -> None:
             composition_snapshot=_make_composition_snapshot(),
             yaml="version: 1\n",
             created_by_user_id="user-1",
+            created_by_username="user-one",
             created_at=datetime.now(UTC),
             expires_at=datetime.now(UTC),
         )
@@ -241,6 +245,7 @@ def test_shared_inspect_response_rejects_extra_pipeline_metadata_key() -> None:
             yaml="version: 1\n",
             audit_readiness=snapshot,
             created_by_user_id="user-1",
+            created_by_username="user-one",
             created_at=datetime.now(UTC),
             expires_at=datetime.now(UTC),
         )
@@ -260,6 +265,7 @@ def test_shared_inspect_response_rejects_extra_composition_snapshot_key() -> Non
             yaml="version: 1\n",
             audit_readiness=snapshot,
             created_by_user_id="user-1",
+            created_by_username="user-one",
             created_at=datetime.now(UTC),
             expires_at=datetime.now(UTC),
         )
@@ -282,6 +288,7 @@ def test_shared_inspect_response_rejects_wrong_pipeline_metadata_field_type() ->
             yaml="version: 1\n",
             audit_readiness=snapshot,
             created_by_user_id="user-1",
+            created_by_username="user-one",
             created_at=datetime.now(UTC),
             expires_at=datetime.now(UTC),
         )
@@ -324,6 +331,7 @@ def test_shared_inspect_response_accepts_queue_node_in_snapshot() -> None:
         yaml="version: 1\n",
         audit_readiness=snapshot,
         created_by_user_id="user-1",
+        created_by_username="user-one",
         created_at=datetime.now(UTC),
         expires_at=datetime.now(UTC),
     )

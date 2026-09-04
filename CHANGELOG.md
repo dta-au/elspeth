@@ -55,7 +55,7 @@ security and recovery fixes. The notes below intentionally cover only major
 changes and critical correctness or security fixes.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
-to 51. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
+to 52. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
 completed guided-plan decline contract, epoch 38 adds the decline result
 message locator that pins the exact assistant message a decline replays, and
 epoch 39 adds the `policy_blocked` guided-operation failure code so a
@@ -103,8 +103,12 @@ and is rejected outright; no migration exists. That substrate carried the
 number 44 and then 48 on its original lane and shipped under neither — both of
 those integers already name different schemas on this release line, and the
 epoch sentinel is enforced by exact equality, so one integer must name exactly
-one shape.
-Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 36. Epoch 30 adds durable
+one shape. Epoch 52 carries the pluggable-SSO identity substrate: the auth
+provider discriminator widens from three values to five on both `sessions` and
+`user_secrets`, and the identity, org-tree and workflow-governance tables land
+in the same epoch so the sprint costs exactly one cutover window rather than
+two (elspeth-07cd19ba73).
+Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 37. Epoch 30 adds durable
 row-union barrier attribution, epoch 31 closes scheduler status over the public
 six-state vocabulary, epoch 32 atomically records aggregation results and their
 ordered members, and epoch 33 adds the composite `(run_id, token_id)` outcome
@@ -114,12 +118,16 @@ access path. Epoch 34 adds the unified-lineage groundwork:
 lineage columns and makes lineage frames and paths the sole lineage truth.
 Epoch 36 adds `coalesce_effects.group_id`, allowing sibling fork groups that
 share a row id to restore their independent merge receipts without a false
-audit-integrity failure.
+audit-integrity failure. Epoch 37 widens the auth provider CHECK constraints
+on `auth_events` and `run_attributions` to admit `vanguard` and `google`; the
+constraint only widens, but Landscape compares declared CHECK text against the
+reflected constraint structurally, so it is a schema change like any other and
+cuts over in the same service-stop window as session epoch 50.
 
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.0. A Landscape database below
-epoch 36 is not current and must be recreated. Do not roll older code back over
+epoch 37 is not current and must be recreated. Do not roll older code back over
 the recreated databases; keep the service drained and repair this release
 forward.
 

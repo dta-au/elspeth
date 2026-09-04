@@ -61,7 +61,10 @@ const _validResponse: SharedInspectResponse = {
   } as unknown as SharedInspectResponse["composition_snapshot"],
   yaml: "version: 1\nname: Demo\n",
   audit_readiness: _validReadiness,
-  created_by_user_id: "alice",
+  // Opaque identity id and human-readable username are deliberately
+  // different values here: a banner that renders the wrong one must fail.
+  created_by_user_id: "4b3f0e0a-4c2e-4c8f-9b3a-1f2c3d4e5f60",
+  created_by_username: "alice-the-analyst",
   created_at: "2026-05-19T00:00:00+00:00",
   expires_at: "2026-06-19T00:00:00+00:00",
 };
@@ -95,6 +98,42 @@ describe("SharedInspectView", () => {
     expect(screen.getByTestId("shared-inspect-readiness-row-retention")).toBeInTheDocument();
     expect(screen.getByTestId("shared-inspect-readiness-row-llm_interpretations")).toBeInTheDocument();
     expect(screen.getByTestId("shared-inspect-readiness-row-secrets")).toBeInTheDocument();
+  });
+
+  it("names the sharer by username, not by the opaque identity id", async () => {
+    // The recipient of a share link has no login, so the identity id names
+    // nobody to them. The banner must show the username the backend froze
+    // into the snapshot.
+    vi.spyOn(api, "fetchSharedInspect").mockResolvedValueOnce(_validResponse);
+    render(<SharedInspectView token="abc" />);
+    await waitFor(() =>
+      expect(screen.getByTestId("shared-inspect-loaded")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("shared-inspect-shared-by")).toHaveTextContent(
+      "alice-the-analyst",
+    );
+    expect(screen.getByTestId("shared-inspect-banner")).not.toHaveTextContent(
+      _validResponse.created_by_user_id,
+    );
+  });
+
+  it("falls back to the identity id when the snapshot predates the username", async () => {
+    // Snapshots minted before the backend froze a username are immutable
+    // signed blobs, so `created_by_username` is null forever for them. The
+    // deliberate choice is a degraded-but-honest identifier the reviewer can
+    // quote back to the sender, rather than an unattributed banner.
+    const legacy: SharedInspectResponse = {
+      ..._validResponse,
+      created_by_username: null,
+    };
+    vi.spyOn(api, "fetchSharedInspect").mockResolvedValueOnce(legacy);
+    render(<SharedInspectView token="abc" />);
+    await waitFor(() =>
+      expect(screen.getByTestId("shared-inspect-loaded")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("shared-inspect-shared-by")).toHaveTextContent(
+      legacy.created_by_user_id,
+    );
   });
 
   it("renders the 401 error path for tampered/expired tokens", async () => {

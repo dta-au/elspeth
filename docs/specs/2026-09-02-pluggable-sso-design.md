@@ -1,7 +1,7 @@
 # Pluggable SSO and identity substrate — backend-for-frontend login for Entra, VANguard, Google, and generic OIDC
 
-Date: 2026-09-02. Status: design, revision 2.8, implementation plan = tracker milestone elspeth-07cd19ba73.
-Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**. Revision 2.8 applies the verified remainder of that review — the surviving high and medium findings and rulings D24 to D34 — marked **[rev2.8]**; findings the verification pass refuted were not applied, and are listed with their refuting reason in the review record.
+Date: 2026-09-02. Status: design, revision 2.10, implementation plan = tracker milestone elspeth-07cd19ba73.
+Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**. Revision 2.8 applies the verified remainder of that review — the surviving high and medium findings and rulings D24 to D34 — marked **[rev2.8]**; findings the verification pass refuted were not applied, and are listed with their refuting reason in the review record. Revision 2.9 corrects what implementation measured against the tree, marked **[rev2.9]**: the §Discriminator widening site inventory undercounted the `routes.py` local-only guards (four, not two) and misclassified them as sites needing a value edit. Revision 2.10 records five further things implementation measured, marked **[rev2.10]**: the third raw consumer of `secret_key`, what a pre-existing local user's first login does, the refresh chain's unverified-claim input, the conditional quota row, and the three places that compared a user id with a configured username.
 Branch: `release/0.8.0`.
 Revision 2 incorporates six independent reviews (security architecture,
 solution design, reality check against the tree, systems risk, functional
@@ -217,9 +217,63 @@ deriving it from `secret_key` would replace an independent secret with a
 dependent one — the opposite of the goal.** Changing the user-secret key
 derivation invalidates every stored secret, so it is bound to the epoch window
 where both stores are recreated (§Two epochs) and is stated in the operator
-notice; it must never ship in a release that keeps an existing store. Each provider supplies a
+notice; it must never ship in a release that keeps an existing store.
+
+**A THIRD raw consumer existed [rev2.10].** This section named two jobs;
+implementation found `secret_key.encode("utf-8")` also feeding
+`generation_key`, the HMAC that tags plugin-binding evidence
+(`plugin_policy/availability.py`), at TWO construction sites — the app factory
+and the AWS ECS acceptance harness. Spec silence was not a carve-out: unlike
+`shareable_link_signing_key` it had no reasoned exemption, and leaving it raw
+would have contradicted the stated goal. It is derived, and both sites move
+together — the fingerprint is compared against a queued run's frozen copy in
+`_require_current_binding_generation`, so one converted site alone would
+refuse valid runs naming the wrong cause. It joins the user-secret key in the
+epoch-window notice, because the fingerprint is persisted as run evidence in
+the Landscape `run_web_plugin_policy` table and embedded in exports: bundles
+written either side of the change carry different fingerprints for identical
+policy state.
+
+`config.py` keeps its raw read and must. `_enforce_secret_key_in_production`
+weighs the operator's bytes for entropy, and HKDF output is uniformly
+distributed by construction — validating a derived key would pass for every
+input, including `"aaaa…"`. **Validation reads raw; consumption reads
+derived.** Each provider supplies a
 `principal_is_active(identity_id)` callback; for local that is the `auth.db`
 row plus the identity row, for SSO the identity row.
+
+**`refresh` takes the TOKEN, not decomposed claims [rev2.10].** The route
+previously read `iat` from `request.state.auth_claims` — the middleware's
+signature-UNVERIFIED decode — and passed it to `LocalAuthProvider.refresh` as
+the chain bound. The signature was verified elsewhere so it was not
+exploitable, but a security bound reading a value obtained without verifying a
+signature is a shape that only stays safe by accident. The issuer now reads
+`iat` from its own verified decode, and the route's whole claims-extraction
+stage is deleted along with the `refresh_claims` audit failure category it
+produced.
+
+**The quota row is written only where a quota regime exists [rev2.10].**
+D31 requires every activating path to write the per-identity row from
+`quota_default_tokens_per_day` / `quota_default_storage_bytes`. Both are
+OPTIONAL settings, and a container that configures neither has no quota regime
+at all: there is no allowance to record, and inventing a number would impose a
+limit the operator never chose. So activation writes the row when both
+defaults are configured, and writes nothing when they are not. **Consequence
+to close with the enforcement:** enabling quotas on a container that has
+already admitted people needs a backfill, and phase 4's enforcement must
+refuse on "a regime is configured and this identity has no row", never on
+"no row".
+
+**Three sites compared a user id with a configured username [rev2.10].**
+Once `sub` became the identity_id, `UserIdentity.user_id` stopped being a
+username, and every comparison against an operator-configured name broke.
+Found and fixed: `admin_routes._require_dev_admin` (the whole dev-admin
+surface would 404 for its own admin), `routes.py` `/me`'s `dev_admin` flag
+(the frontend would show a surface the backend then refuses), and
+`admin_routes.delete_user`'s self-delete guard (which would have stopped
+firing, letting the admin delete their own credentials mid-session). All three
+now compare `username`. Ownership comparisons needed no change: both sides
+became identity_ids together.
 
 `SsoAuthProvider` (one class, parameterised by profile) implements
 `AuthProvider`: `authenticate` verifies the session token and confirms the
@@ -350,7 +404,16 @@ Closed set, each an explicit exception class, never a `detail` prefix:
 6. `web/config.py::_validate_auth_fields` — per-provider required/forbidden
    matrix from the registry.
 7. `cli.py:4007` `--auth` help text and value validation.
-8. `web/auth/routes.py` provider guards at lines 246 and 405.
+8. `web/auth/routes.py` local-only guards — **four of them, not the two this
+   list claimed before [rev2.9]** (login, register, password change, refresh),
+   plus the `== "local"` `dev_admin_user` affordance. **None needs a value
+   edit:** every one compares `settings.auth_provider != "local"`, which stays
+   correct as the Literal widens. The pin is therefore an invariant, not an
+   edit — the contract test asserts the set of literals compared against
+   `auth_provider` in that module is exactly `{"local"}`, which catches the
+   real risk (a guard enumerating an IdP, which would expose the credential
+   routes on the next provider added) without pinning a route count that
+   ordinary work may legitimately change.
 9. `web/frontend/src/types/index.ts` provider union.
 10. `tests/unit/web/auth/test_provider_type_contract.py` pins all of the
     above plus registry parity and **both** CHECK strings
@@ -443,7 +506,7 @@ compatibility-record example.
 | rebound_at | datetime null | D10 detection: verified email changed under the same subject |
 | first_seen_at | datetime | row creation, including for a pre-provisioned row nobody has used [rev2.8] |
 | last_login_at | datetime null | **nullable [rev2.8]:** a pre-provisioned or never-used identity has no login to stamp, and inventing one would falsify the dormancy window R9 measures |
-| access_state | text | CHECK `('pending','active','disabled')`; default `pending` (D12). Local follows `registration_mode`: `open` activates on registration, otherwise `pending`. Read on **every request** in `get_current_user` [rev2.2], so revocation latency is one request, not the token lifetime. |
+| access_state | text | CHECK `('pending','active','disabled')`; default `pending` (D12). Local follows `registration_mode`: `open` activates on registration, otherwise `pending`. **A pre-existing local user's first login counts as their registration for this rule [rev2.10].** `auth.db` is never recreated by the reset runbook, so after the epoch pass every existing local account authenticates with valid credentials and no identity row — that path, not registration, is the normal one. Under `open` the deployment has already declared that anyone may admit themselves, so holding back the people who did so before this table existed while admitting every newcomer instantly would be incoherent; under any other mode they land `pending` and D21 re-admission is how the known cohort is cleared. **An existing row is never downgraded and never upgraded by a login:** a pre-provisioned `active` row survives a closed deployment, a `pending` row is not escapable by logging in again, and a `disabled` row stays disabled — re-authenticating is not an appeal. Read on **every request** in `get_current_user` [rev2.2], so revocation latency is one request, not the token lifetime. |
 | pre_provisioned_at | datetime null | [rev2.2] An admin may create the row `active` by `(provider, subject)` before first login; first login binds instead of creating. This is how nine people are onboarded without each hitting a wall. |
 | activated_at | datetime null | |
 | activated_by_identity_id | text null FK | |

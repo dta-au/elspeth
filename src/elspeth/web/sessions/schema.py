@@ -31,7 +31,7 @@ from elspeth.web.sessions.models import (
 _SQLITE_INTERNAL_TABLES: frozenset[str] = frozenset({"sqlite_sequence"})
 _SESSION_METADATA_CREATE_LOCK = Lock()
 
-_COORDINATION_HARD_CUT_EPOCH = 51
+_COORDINATION_HARD_CUT_EPOCH = 52
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
@@ -369,8 +369,14 @@ def _validate_coordination_hard_cut_metadata() -> None:
 
     The generic metadata/live-schema comparison catches deployment drift, but
     cannot catch an accidental edit that removes the same table or expiry index
-    from the declared metadata. Epoch 51 (the multi-replica hard cut, 44 then 48 on the original lane) names this exact
-    coordination substrate, so startup also verifies the model-side release contract.
+    from the declared metadata. The coordination substrate landed at epoch 51
+    (the multi-replica hard cut, 44 then 48 on the original lane), and the
+    pluggable-SSO identity substrate took 52 in the same release. This constant
+    tracks ``SESSION_SCHEMA_EPOCH`` by exact equality, so it moves with every
+    epoch bump: it names the CURRENT declared schema, not the release in which
+    coordination first shipped. Leaving it behind an epoch is why the check is
+    strict — a stale value stops every session DB from opening on any dialect,
+    which is the loudest possible signal and the intended one.
     """
 
     if SESSION_SCHEMA_EPOCH != _COORDINATION_HARD_CUT_EPOCH:

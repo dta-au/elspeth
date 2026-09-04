@@ -6,6 +6,7 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 
+from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web.composer.guided.state_machine import GUIDED_SESSION_SCHEMA_VERSION
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
@@ -150,7 +151,10 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert "elspeth composer users add" in html and "--password" in html
     assert "SESSION_SCHEMA_EPOCH" in html and f"35 → {SESSION_SCHEMA_EPOCH}" in html
     assert f"guided schema changes 10 → {GUIDED_SESSION_SCHEMA_VERSION}" in html
-    assert "SQLITE_SCHEMA_EPOCH" in html and "29 → 36" in html
+    # Derived, like the session epoch above: hardcoding the Landscape half
+    # made a Landscape epoch bump fail here with no hint that the published
+    # page was the thing out of date.
+    assert "SQLITE_SCHEMA_EPOCH" in html and f"29 → {SQLITE_SCHEMA_EPOCH}" in html
     assert "aws-ecs-deployment.md" in html
 
 

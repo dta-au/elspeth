@@ -93,6 +93,11 @@ def create_shareable_reviews_router() -> APIRouter:
                 result = await service.mark_ready_for_review(
                     session_id=session_id,
                     user_id=user.user_id,
+                    # The identity id is what everything downstream authorises
+                    # and signs on; the username rides alongside purely so the
+                    # shared view can name the sharer to a recipient who cannot
+                    # resolve an opaque id.
+                    username=user.username,
                     session_operation_context=lease.context,
                 )
             except CompositionNotRunnableError as exc:

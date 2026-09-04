@@ -46,6 +46,7 @@ from elspeth.web.composer.service import _litellm_acompletion
 from elspeth.web.config import settings_from_env
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.service import _build_web_plugin_policy_evidence
+from elspeth.web.key_derivation import derive_binding_generation_key
 from elspeth.web.operator_telemetry import build_aws_operator_pipeline_telemetry
 from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
@@ -482,7 +483,11 @@ def build_plugin_policy_acceptance(
             profiles=profiles,
             principal_scope="system:aws-ecs-acceptance",
             secret_inventory=_AcceptanceSecretInventory(),
-            generation_key=secret_key.encode("utf-8"),
+            # Must match app.py's derivation exactly. The fingerprint this
+            # produces is compared against a queued run's frozen copy, so a
+            # harness deriving differently would report a binding rotation
+            # that never happened.
+            generation_key=derive_binding_generation_key(secret_key),
         )
         tutorial_state_profile = runtime.default_llm_profile
         if tutorial_state_profile is None:

@@ -841,7 +841,7 @@ function App() {
         {showUserAdmin && authUser !== null && (
           <UserAdminDialog
             onClose={closeUserAdmin}
-            currentUserId={authUser.user_id}
+            currentUsername={authUser.username}
           />
         )}
         <CommandPalette

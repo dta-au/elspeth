@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import SecretStr
 from sqlalchemy.engine import make_url
 from structlog.testing import capture_logs
 
@@ -524,6 +525,22 @@ class _FakeEngine:
         self.disposed = True
 
 
+# What EVERY IdP deployment needs, whichever profile is selected. Shared by
+# the readiness cases so a change to the common set is made in one place.
+_IDP_COMMON: dict[str, object] = {
+    "sso_client_id": "client",
+    # SecretStr, not str: WebSettings holds these as secrets, and a stub that
+    # holds plain strings would let readiness pass here while failing against
+    # the real model.
+    "sso_client_secret": SecretStr("secret"),
+    "sso_transaction_secret": SecretStr("transaction-secret"),
+    "public_base_url": "https://elspeth.example.gov.au",
+    "compartment_id": "compartment-a",
+    "quota_default_tokens_per_day": 100_000,
+    "quota_default_storage_bytes": 1_000_000,
+}
+
+
 def _settings_stub(tmp_path: Path, **overrides: object) -> Any:
     data_dir = tmp_path / "data"
     payload_dir = tmp_path / "payloads"
@@ -549,6 +566,20 @@ def _settings_stub(tmp_path: Path, **overrides: object) -> Any:
         "oidc_audience": None,
         "oidc_client_id": None,
         "entra_tenant_id": None,
+        # Every name auth_setting_values() reads. The stub has to carry all
+        # of them or it stops modelling WebSettings: a missing attribute
+        # would surface as AttributeError from a readiness probe whose whole
+        # job is to be total.
+        "sso_client_id": None,
+        "sso_client_secret": None,
+        "sso_transaction_secret": None,
+        "sso_issuer": None,
+        "sso_endpoint_origins": (),
+        "google_hosted_domain": None,
+        "public_base_url": None,
+        "compartment_id": None,
+        "quota_default_tokens_per_day": None,
+        "quota_default_storage_bytes": None,
     }
     values.update(overrides)
     settings = SimpleNamespace(**values)
@@ -884,14 +915,28 @@ class TestReadinessAuthAndReport:
         ("provider", "fields", "ok"),
         [
             ("local", {}, True),
-            ("oidc", {"oidc_issuer": "https://issuer.invalid", "oidc_audience": "aud", "oidc_client_id": "client"}, True),
-            ("oidc", {"oidc_audience": "aud", "oidc_client_id": "client"}, False),
-            ("oidc", {"oidc_issuer": "https://issuer.invalid", "oidc_client_id": "client"}, False),
-            ("oidc", {"oidc_issuer": "https://issuer.invalid", "oidc_audience": "aud"}, False),
-            ("entra", {"entra_tenant_id": "tenant", "oidc_audience": "aud", "oidc_client_id": "client"}, True),
-            ("entra", {"oidc_audience": "aud", "oidc_client_id": "client"}, False),
-            ("entra", {"entra_tenant_id": "tenant", "oidc_client_id": "client"}, False),
-            ("entra", {"entra_tenant_id": "tenant", "oidc_audience": "aud"}, False),
+            # Every IdP needs the common confidential-client settings; the
+            # provider-specific one is what varies.
+            ("oidc", {**_IDP_COMMON, "sso_issuer": "https://issuer.invalid"}, True),
+            ("oidc", _IDP_COMMON, False),
+            ("vanguard", {**_IDP_COMMON, "sso_issuer": "https://vanguard.invalid"}, True),
+            ("vanguard", _IDP_COMMON, False),
+            ("entra", {**_IDP_COMMON, "entra_tenant_id": "tenant"}, True),
+            ("entra", _IDP_COMMON, False),
+            ("google", {**_IDP_COMMON, "google_hosted_domain": "example.gov.au"}, True),
+            ("google", _IDP_COMMON, False),
+            # A blank string is "configured" to anything checking for None,
+            # and is exactly how a task definition ships a broken deployment.
+            ("google", {**_IDP_COMMON, "google_hosted_domain": "   "}, False),
+            # Each common setting is individually load-bearing.
+            *(
+                (provider, {**_IDP_COMMON, **specific, missing: None}, False)
+                for provider, specific in (
+                    ("oidc", {"sso_issuer": "https://issuer.invalid"}),
+                    ("google", {"google_hosted_domain": "example.gov.au"}),
+                )
+                for missing in _IDP_COMMON
+            ),
             ("unknown", {}, False),
         ],
     )
@@ -900,6 +945,26 @@ class TestReadinessAuthAndReport:
         check = _check_auth_mode(settings)
         assert check.name == "auth_mode"
         assert check.ok is ok
+
+    def test_auth_mode_names_every_missing_field(self, tmp_path: Path) -> None:
+        """An operator reading a not-ready response has no other way to look.
+
+        The previous form said only "OIDC configuration incomplete", which
+        does not distinguish eight settings from one.
+        """
+        settings = _settings_stub(tmp_path, auth_provider="google", sso_client_id="client")
+        check = _check_auth_mode(settings)
+        assert check.ok is False
+        assert "google_hosted_domain" in check.detail
+        assert "sso_client_secret" in check.detail
+        # Already supplied, so it must NOT be named.
+        assert "sso_client_id, " not in check.detail
+
+    def test_auth_mode_names_the_registered_providers_when_one_is_unknown(self, tmp_path: Path) -> None:
+        check = _check_auth_mode(_settings_stub(tmp_path, auth_provider="saml"))
+        assert check.ok is False
+        for registered in ("local", "oidc", "entra", "vanguard", "google"):
+            assert registered in check.detail
 
     @pytest.mark.asyncio
     async def test_report_has_exact_order_and_unique_names(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

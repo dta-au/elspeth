@@ -36,12 +36,15 @@ from elspeth.core.landscape.schema import (
 from tests.fixtures.landscape import make_recorder_with_run
 
 
-def test_epoch_is_thirty_six() -> None:
-    # WS1b Phase B: unified-lineage flip (tri-column retirement) landed
-    # epoch 35. Epoch 36 (elspeth-8655045f98): coalesce_effects.group_id,
-    # nullable=False with no defaulting branch, a genuine table-shape
-    # change (schema.py's epoch comment carries the full arch-M1 rationale).
-    assert SQLITE_SCHEMA_EPOCH == 36
+def test_epoch_is_thirty_seven() -> None:
+    # Epoch 36 (elspeth-8655045f98) added coalesce_effects.group_id. Epoch 37
+    # (elspeth-07cd19ba73, pluggable SSO): ck_auth_events_provider and
+    # ck_run_attributions_auth_provider_type both widen from three provider
+    # values to five. Landscape compares declared CHECK text against the
+    # reflected constraint structurally, so a widening is a schema change
+    # even though every previously admitted value is still admitted. Cut
+    # over in the same window as sessions epoch 50.
+    assert SQLITE_SCHEMA_EPOCH == 37
 
 
 def test_unified_lineage_tables_exist_with_exact_keys() -> None:

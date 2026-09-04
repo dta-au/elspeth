@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from elspeth.web.auth.urls import (
+    https_url_origin,
     validate_oidc_browser_endpoints,
     validate_oidc_browser_origins,
 )
@@ -267,3 +268,39 @@ def test_url_values_must_be_exact_str_not_a_subclass_or_lookalike(impostor: Any)
     with pytest.raises(ValueError, match="OIDC browser allowed origin failed string check"):
         validate_oidc_browser_origins((impostor,))
     assert _LyingStr.consulted is False
+
+
+class TestHttpsUrlOrigin:
+    """``https_url_origin`` runs the full parse, not a convenience split.
+
+    It exists because an ISSUER may legitimately have no path, which
+    ``oidc_browser_endpoint_origin`` refuses. The risk in adding it is that
+    someone reaches for ``urlsplit`` instead and skips every check the module
+    exists for, so these pin that it did not.
+    """
+
+    def test_it_returns_the_origin_with_and_without_a_path(self) -> None:
+        assert https_url_origin("https://accounts.google.com") == "https://accounts.google.com"
+        assert https_url_origin("https://issuer.example.gov.au/realms/x") == "https://issuer.example.gov.au"
+
+    def test_the_default_https_port_is_canonicalised_away(self) -> None:
+        assert https_url_origin("https://issuer.example.gov.au:443/x") == "https://issuer.example.gov.au"
+
+    def test_a_non_default_port_is_part_of_the_origin(self) -> None:
+        assert https_url_origin("https://issuer.example.gov.au:8443/x") == "https://issuer.example.gov.au:8443"
+
+    @pytest.mark.parametrize(
+        "hostile",
+        [
+            "http://issuer.example.gov.au",
+            "https://user:pass@issuer.example.gov.au",
+            "https://issuer.example.gov.au\\@evil.example",
+            "https://evil.example/%2f..%2f",
+            "https://",
+            "   ",
+            "https://issuer.example.gov.au\x00",
+        ],
+    )
+    def test_it_refuses_what_the_endpoint_parser_refuses(self, hostile: str) -> None:
+        with pytest.raises(ValueError):
+            https_url_origin(hostile)

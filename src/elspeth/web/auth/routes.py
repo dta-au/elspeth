@@ -172,8 +172,12 @@ def _route_auth_failure(
         provider=settings.auth_provider,
         failure_category=failure_category,
         failure_stage=failure_stage,
-        user_id=None if user is None else user.user_id,
+        # ``user_id`` is the principal as the request named it; the
+        # identity_id goes in its own column. Splitting them keeps one query
+        # per question instead of a column that means two things.
+        user_id=None if user is None else user.username,
         username=None if user is None else user.username,
+        identity_id=None if user is None else user.user_id,
         exception_class=None if exc is None else type(exc).__name__,
     )
     return HTTPException(status_code=401, detail=detail)
@@ -256,7 +260,12 @@ def create_auth_router() -> APIRouter:
                 request,
                 provider=settings.auth_provider,
                 username=body.username,
-                failure_category="invalid_credentials",
+                # Classified, not hardcoded. Login can now fail for reasons
+                # that are not a bad credential — an identity awaiting
+                # approval, or one that has been disabled — and recording
+                # those as invalid_credentials would hide an approval queue
+                # inside the trail that is supposed to surface brute force.
+                failure_category=classify_authentication_failure(exc),
             )
             raise HTTPException(status_code=401, detail=exc.detail) from exc
 
@@ -368,7 +377,7 @@ def create_auth_router() -> APIRouter:
             recorder.record_token_issued(
                 request,
                 provider=settings.auth_provider,
-                user_id=identity.user_id,
+                user_id=identity.username,
                 username=identity.username,
                 access_token=access_token,
                 issuance_path="email_verification",
@@ -396,54 +405,23 @@ def create_auth_router() -> APIRouter:
         request: Request,
         response: Response,
     ) -> TokenResponse:
-        """Re-issue a JWT from a valid existing token (local auth only).
+        """Re-issue a session token from a valid existing one (local auth only).
 
-        Passes the original ``iat`` claim through so the provider can
-        enforce a maximum refresh chain lifetime.
+        Hands the provider the TOKEN. The chain bound used to be enforced
+        against an ``iat`` read here from the middleware's unverified decode;
+        the provider's issuer now reads it from its own verified decode, so
+        the route no longer stands between a signature and a security bound.
         """
         settings: WebSettings = request.app.state.settings
         if settings.auth_provider != "local":
             raise HTTPException(status_code=404, detail="Not found")
 
         user = await get_current_user(request)
-
-        # Extract iat from claims parsed by the auth middleware.
-        # The middleware decodes claims without signature verification for
-        # downstream use, then verifies the signature via authenticate().
-        # If authenticate() fails, this route handler never executes.
-        #
-        # If claims are None (decode failed despite valid signature), refuse
-        # the refresh — we cannot enforce chain lifetime without iat.
-        claims = request.state.auth_claims
-        if claims is None:
-            raise _route_auth_failure(
-                request,
-                detail="Token claims could not be parsed — re-authenticate",
-                failure_category="claims_invalid",
-                failure_stage="refresh_claims",
-                user=user,
-            )
-        if "iat" not in claims:
-            raise _route_auth_failure(
-                request,
-                detail="Token missing required iat claim — re-authenticate",
-                failure_category="claims_invalid",
-                failure_stage="refresh_claims",
-                user=user,
-            )
-        original_iat = claims["iat"]
-        if type(original_iat) is not int:
-            raise _route_auth_failure(
-                request,
-                detail="Token missing required iat claim — re-authenticate",
-                failure_category="claims_invalid",
-                failure_stage="refresh_claims",
-                user=user,
-            )
+        token = request.state.auth_token
 
         provider: CredentialAuthProvider = request.app.state.auth_provider
         try:
-            new_token = await provider.refresh(user.user_id, user.username, original_iat=original_iat)
+            new_token = await provider.refresh(token)
         except AuthenticationError as exc:
             raise _route_auth_failure(
                 request,
@@ -457,7 +435,7 @@ def create_auth_router() -> APIRouter:
         recorder.record_token_issued(
             request,
             provider=settings.auth_provider,
-            user_id=user.user_id,
+            user_id=user.username,
             username=user.username,
             access_token=new_token,
             issuance_path="refresh",
@@ -510,8 +488,9 @@ def create_auth_router() -> APIRouter:
                 provider=settings.auth_provider,
                 failure_category="provider_unavailable",
                 failure_stage="profile_lookup",
-                user_id=user.user_id,
+                user_id=user.username,
                 username=user.username,
+                identity_id=user.user_id,
                 exception_class=type(exc).__name__,
             )
             raise HTTPException(status_code=503, detail=exc.detail) from exc
@@ -522,8 +501,9 @@ def create_auth_router() -> APIRouter:
                 provider=settings.auth_provider,
                 failure_category=classify_authentication_failure(exc),
                 failure_stage="profile_lookup",
-                user_id=user.user_id,
+                user_id=user.username,
                 username=user.username,
+                identity_id=user.user_id,
                 exception_class=type(exc).__name__,
             )
             raise HTTPException(status_code=401, detail=exc.detail) from exc
@@ -534,8 +514,12 @@ def create_auth_router() -> APIRouter:
             display_name=profile.display_name,
             email=profile.email,
             groups=list(profile.groups),
+            # Username, not user_id: ``dev_admin_user`` names a local account,
+            # while user_id is the identity_id. Must agree with the same
+            # comparison in admin_routes._require_dev_admin, or the frontend
+            # shows an admin surface the backend then 404s.
             dev_admin=(
-                settings.auth_provider == "local" and settings.dev_admin_user is not None and profile.user_id == settings.dev_admin_user
+                settings.auth_provider == "local" and settings.dev_admin_user is not None and profile.username == settings.dev_admin_user
             ),
         )
 

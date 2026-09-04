@@ -18,7 +18,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable
+from elspeth.web.auth.models import AccessPending, AuthenticationError, AuthProviderUnavailable, IdentityDisabled
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
 from elspeth.web.schema_probe import postgres_engine_kwargs
 
@@ -85,6 +85,19 @@ class AuthAuditWriter(Protocol):
         user_id: str | None,
         username: str | None,
         exception_class: str | None,
+        identity_id: str | None = None,
+    ) -> None: ...
+
+    # The one member with no ``request``: a self-admitting deployment
+    # activates inside the login worker, where there is none to read.
+    def record_identity_admitted(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        tokens_per_day: int | None,
+        storage_bytes: int | None,
     ) -> None: ...
 
 
@@ -137,6 +150,27 @@ def _issued_token_claims(access_token: str) -> dict[str, object]:
     return cast(dict[str, object], decoded)
 
 
+def _issued_identity_id(access_token: str) -> str:
+    """The identity a just-issued token authorises, read from its own ``sub``.
+
+    Taken from the token rather than threaded down from the provider on
+    purpose: the recorder ALREADY decodes this token for ``iat``/``exp``, and
+    the value it records must be the one the token actually carries. A value
+    passed alongside could disagree with the token — and the row would then
+    attribute a session to an identity the session does not name.
+
+    Unverified decode is correct here: the token was minted by this process
+    moments ago, and a signature check would only re-prove what we just did.
+    """
+    claims = _issued_token_claims(access_token)
+    if "sub" not in claims:
+        raise AuditIntegrityError("Issued access token missing 'sub' claim for auth audit identity")
+    subject = claims["sub"]
+    if type(subject) is not str or not subject:
+        raise AuditIntegrityError("Issued access token 'sub' claim must be a non-empty string")
+    return subject
+
+
 def _required_int_claim(claims: dict[str, object], claim_name: str) -> int:
     if claim_name not in claims:
         raise AuditIntegrityError(f"Issued access token missing {claim_name!r} claim for auth audit metadata")
@@ -160,8 +194,27 @@ def classify_authentication_failure(exc: AuthenticationError) -> str:
     """Classify auth errors without storing their external-data-bearing detail."""
     if type(exc) is AuthProviderUnavailable:
         return "provider_unavailable"
+    # Admission outcomes are matched by TYPE. They used to be matched on a
+    # message prefix, which put the same literal in the raiser and here with
+    # nothing binding the two: rewording the message an operator reads would
+    # have silently reclassified the event, and the tests — which built the
+    # literal themselves — would not have noticed.
+    if type(exc) is AccessPending:
+        return "access_pending"
+    if type(exc) is IdentityDisabled:
+        return "identity_disabled"
 
     detail = exc.detail
+    # Admission outcomes come FIRST and are their own categories. A correct
+    # password refused at the D12 wall is not a bad credential, and recording
+    # it as one poisons both trails an administrator reads: the queue of
+    # people waiting for approval, and the one that would show a brute-force
+    # attempt. Same for a disabled identity, which is a revocation taking
+    # effect, not a failed guess.
+    if detail.startswith("Invalid credentials"):
+        return "invalid_credentials"
+    if detail.startswith("Email verification required"):
+        return "email_unverified"
     if detail.startswith("Invalid tenant") or detail.startswith("Missing tenant claim"):
         return "tenant_claim_invalid"
     if detail.startswith("Missing required") or "group overage marker" in detail or detail.startswith("OIDC profile claim"):
@@ -256,6 +309,7 @@ class AuthAuditRecorder:
         with self._open_landscape(AuthAuditOperation.LOGIN_SUCCESS_AND_TOKEN_ISSUED) as db:
             RecorderFactory(db).auth_audit.record_login_success_and_token_issued(
                 provider=provider,
+                identity_id=_issued_identity_id(access_token),
                 user_id=user_id,
                 username=username,
                 request_id=_request_id(request),
@@ -282,6 +336,7 @@ class AuthAuditRecorder:
         with self._open_landscape(AuthAuditOperation.TOKEN_ISSUED) as db:
             RecorderFactory(db).auth_audit.record_token_issued(
                 provider=provider,
+                identity_id=_issued_identity_id(access_token),
                 user_id=user_id,
                 username=username,
                 request_id=_request_id(request),
@@ -304,6 +359,7 @@ class AuthAuditRecorder:
         user_id: str | None,
         username: str | None,
         exception_class: str | None,
+        identity_id: str | None = None,
     ) -> None:
         metadata = _request_metadata(request)
         metadata["failure_stage"] = failure_stage
@@ -311,6 +367,7 @@ class AuthAuditRecorder:
         with self._open_landscape(AuthAuditOperation.AUTH_FAILURE) as db:
             RecorderFactory(db).auth_audit.record_auth_failure(
                 provider=provider,
+                identity_id=identity_id,
                 user_id=user_id,
                 username=username,
                 failure_category=failure_category,
@@ -339,4 +396,78 @@ class AuthAuditRecorder:
                 client_host=_client_host(request),
                 user_agent=_bounded_text(_optional_header(request, "user-agent")),
                 metadata=_request_metadata(request),
+            )
+
+    def record_identity_admitted(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        tokens_per_day: int | None,
+        storage_bytes: int | None,
+    ) -> None:
+        """Write the ``identity_activated`` + ``quota_set`` pair for an admission.
+
+        Deliberately NOT request-bound, unlike every method above it. A
+        self-admitting deployment activates inside the login worker, which has
+        no ``Request`` to read a client host or a request id from; the
+        surrounding ``login`` event carries that context and this pair is
+        joined to it by ``identity_id``. Inventing request fields here would
+        put fabricated provenance in the audit trail.
+
+        Both rows are written under one Landscape open, in the order an
+        administrator would read them: the identity was admitted, and this is
+        the allowance it was admitted with. An activation whose quota row went
+        unaudited would leave the identity's first refusal unexplainable.
+        """
+        with self._open_landscape(AuthAuditOperation.LOGIN_SUCCESS) as db:
+            recorder = RecorderFactory(db).auth_audit
+            recorder.record_auth_event(
+                event_type="identity_activated",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                # The USERNAME, matching every request-bound event. The
+                # admission pair used to put the identity_id here, which meant
+                # an administrator querying by either value saw half the
+                # trail and no query returned a person's complete history.
+                user_id=username,
+                username=username,
+                failure_category=None,
+                request_id=None,
+                client_host=None,
+                user_agent=None,
+                metadata={"activated_by": "registration_mode", "actor": "operator"},
+            )
+            if tokens_per_day is None or storage_bytes is None:
+                # NO quota_set row. The caller writes a policy row only when
+                # BOTH container defaults are configured, so this container
+                # has no quota regime for the identity and there is no
+                # allowance to record. Emitting the event anyway would assert
+                # an allowance no row records, and point a later quota refusal
+                # at corruption rather than at the missing configuration —
+                # exactly backwards for whoever has to diagnose it.
+                return
+            recorder.record_auth_event(
+                event_type="quota_set",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                # The USERNAME, matching every request-bound event. The
+                # admission pair used to put the identity_id here, which meant
+                # an administrator querying by either value saw half the
+                # trail and no query returned a person's complete history.
+                user_id=username,
+                username=username,
+                failure_category=None,
+                request_id=None,
+                client_host=None,
+                user_agent=None,
+                metadata={
+                    "actor": "operator",
+                    "tokens_per_day": tokens_per_day,
+                    "storage_bytes": storage_bytes,
+                    "source": "container_defaults",
+                },
             )

@@ -45,18 +45,15 @@ def test_blob_inline_resolutions_table_exists_with_expected_columns(engine) -> N
     }
 
 
-def test_blob_inline_resolutions_schema_epoch_is_51(engine) -> None:
-    # 51: the multi-replica session-operation substrate lands on top of
-    # mainline's 50 — persistent session-operation authority
-    # (session_operation_fences), compatible-generation membership and
-    # run-start coordination, cross-replica ticket/progress/rate state,
-    # bounded cleanup claims, and durable proposal blob-effect receipts,
-    # plus seven new ``runs`` ownership/cancellation columns. 48 and 50
-    # already name different shapes on the two merged lines, so the union
-    # takes the next free integer (elspeth-4d6c0dd0f5).
-    assert SESSION_SCHEMA_EPOCH == 51
+def test_blob_inline_resolutions_schema_epoch_is_52(engine) -> None:
+    # 51: the multi-replica session-operation substrate landed on top of
+    # mainline's 50 (elspeth-4d6c0dd0f5).
+    # 52: pluggable SSO and the identity substrate (elspeth-07cd19ba73) —
+    # the widened auth provider discriminator plus the identity, org-tree
+    # and workflow-governance tables, all in one cutover window.
+    assert SESSION_SCHEMA_EPOCH == 52
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 51
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 52
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:

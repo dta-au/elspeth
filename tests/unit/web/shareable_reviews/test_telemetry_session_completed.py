@@ -338,6 +338,7 @@ async def test_mark_ready_for_review_emits_completion_counter(
     response = await service.mark_ready_for_review(
         session_id=session_record.id,
         user_id=session_record.user_id,
+        username="alice-the-analyst",
         session_operation_context=session_operation_context,
     )
     assert response.token
@@ -411,6 +412,7 @@ async def test_mark_ready_for_review_audit_failure_does_not_emit_counter(
         await service.mark_ready_for_review(
             session_id=session_record.id,
             user_id=session_record.user_id,
+            username="alice-the-analyst",
             session_operation_context=session_operation_context,
         )
 

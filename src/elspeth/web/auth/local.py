@@ -19,18 +19,39 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from urllib.parse import urlencode
 
 import bcrypt
-import jwt
 import structlog
-from jwt.exceptions import PyJWTError
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.auth.models import AuthenticationError, UserIdentity, UserProfile
-from elspeth.web.validation import has_visible_content
+from elspeth.web.auth.models import (
+    AccessPending,
+    AuthenticationError,
+    IdentityClaims,
+    IdentityDisabled,
+    UserIdentity,
+    UserProfile,
+)
+from elspeth.web.auth.session_token import SessionTokenIssuer
+
+if TYPE_CHECKING:
+    from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
+
+# Resolve a local username to the identity row that owns it, admitting the
+# person if this is their first sight. Injected rather than imported: the
+# implementation writes the SESSIONS store, and ``web.auth`` does not depend
+# on ``web.sessions`` (the dependency already runs the other way, in
+# ``sessions/ownership.py``).
+AdmitIdentity = Callable[[IdentityClaims], "EnsureIdentityOutcome"]
+
+# Retire the identity bound to a local username whose credential has been
+# deleted, so the next holder of that username cannot inherit its admission.
+# Injected for the same reason as AdmitIdentity: the write lands in the
+# SESSIONS store, which web.auth does not depend on.
+RetireIdentity = Callable[[str], None]
 
 _slog = structlog.get_logger(__name__)
 
@@ -69,23 +90,23 @@ class LocalAuthStorageSecurityError(RuntimeError):
     """The local credential store failed its owner-only file admission."""
 
 
+class LocalAuthSessionsUnavailable(RuntimeError):
+    """A session operation was attempted on an account-administration provider.
+
+    Not an ``AuthenticationError``: nobody failed to authenticate. This is a
+    wiring mistake — a provider built by
+    :meth:`LocalAuthProvider.for_account_administration` was asked to mint or
+    verify a token — and it must surface as a programming error rather than a
+    401 that would read as a credential problem.
+    """
+
+
 def bcrypt_password_bytes(password: str) -> bytes:
     """Encode a password after enforcing bcrypt's UTF-8 byte limit."""
     encoded_password = password.encode("utf-8")
     if len(encoded_password) > MAX_BCRYPT_PASSWORD_BYTES:
         raise ValueError(f"password must not exceed {MAX_BCRYPT_PASSWORD_BYTES} bytes")
     return encoded_password
-
-
-def _required_visible_string_claim(payload: dict[str, object], claim_name: str) -> str:
-    """Extract a required local-JWT claim as a visible string."""
-    try:
-        value = payload[claim_name]
-    except KeyError as exc:
-        raise AuthenticationError("Invalid token") from exc
-    if not isinstance(value, str) or not has_visible_content(value):
-        raise AuthenticationError("Invalid token")
-    return value
 
 
 def _verification_token_hash(token: str) -> str:
@@ -231,17 +252,54 @@ class LocalAuthProvider:
     def _get_dummy_hash(cls) -> bytes:
         return cls._dummy_hash
 
+    @classmethod
+    def for_account_administration(cls, db_path: Path) -> LocalAuthProvider:
+        """Build a provider that manages ACCOUNTS but cannot issue sessions.
+
+        ``create_user``, ``delete_user``, ``list_users`` and ``set_password``
+        touch ``auth.db`` alone. The CLI does exactly those, from a shell that
+        has no sessions engine and no Landscape recorder — so requiring it to
+        construct a token issuer and an identity substrate to add one local
+        account would be asking for collaborators the operation does not use.
+
+        Every token path refuses on a provider built this way, by name rather
+        than by AttributeError. Reach for this ONLY where no session is
+        issued; anything serving HTTP wants the full constructor.
+        """
+        return cls(db_path, token_issuer=None, admit_identity=None)
+
     def __init__(
         self,
         db_path: Path,
-        secret_key: str,
-        token_expiry_hours: int = 24,
-        max_refresh_chain_hours: int = 168,
+        *,
+        token_issuer: SessionTokenIssuer | None,
+        admit_identity: AdmitIdentity | None,
+        retire_identity: RetireIdentity | None = None,
     ) -> None:
+        """Bind the credential store to the token issuer and the identity substrate.
+
+        ``auth.db`` is CREDENTIALS ONLY from here on (D7). It answers "is this
+        password right and is this email verified"; it does not decide who a
+        person is or whether they may act. Those live in the ``identities``
+        substrate, which this provider reaches through ``admit_identity``
+        rather than by holding an engine -- so ``web.auth`` keeps its one-way
+        dependency on ``web.sessions``.
+
+        The token issuer owns expiry and the refresh bound. They used to be
+        constructor arguments here, which meant every provider that ever
+        wanted a token would have had its own copy of a security bound.
+
+        Both collaborators are OPTIONAL, and the two halves that split apart
+        are visible in the type rather than in a comment: a credential store
+        over ``auth.db``, and a session-issuing half needing the issuer and
+        the identity substrate. Use :meth:`for_account_administration` for the
+        first alone; mypy then forces every token path to say what it does
+        without them.
+        """
         self._db_path = db_path
-        self._secret_key = secret_key
-        self._token_expiry_hours = token_expiry_hours
-        self._max_refresh_chain_hours = max_refresh_chain_hours
+        self._token_issuer = token_issuer
+        self._admit_identity = admit_identity
+        self._retire_identity = retire_identity
         self._ensure_schema()
         with self._connect(immediate=True) as conn:
             now = int(time.time())
@@ -435,7 +493,17 @@ class LocalAuthProvider:
                 """,
                 (intent_id, user_id, now),
             )
-            access_token = self._issue_token(user_id, user_id)
+        # Minted AFTER the auth.db transaction commits. Admission writes the
+        # SESSIONS store, and the two databases share no transaction: doing it
+        # inside would mean an identity row surviving a rolled-back
+        # registration. Failing here leaves the intent uncleared, which is the
+        # documented crash-between-commit-and-audit case the reclaim sweep
+        # already quarantines.
+        # Registration is an ISSUANCE path, so it meets the same D12 wall as
+        # login. Reachable with consequence: an identity already disabled (or
+        # pre-provisioned pending) whose credential row was deleted can be
+        # re-registered, and without this it would be handed a token.
+        access_token = self._issue_token(self._admitted_identity_id(user_id), user_id)
         try:
             record_token_issued(access_token)
         except BaseException as audit_error:
@@ -525,9 +593,32 @@ class LocalAuthProvider:
         return cleared.rowcount == 1
 
     def delete_user(self, user_id: str) -> bool:
-        """Delete a local auth user and any pending verification tokens."""
+        """Delete a local auth user, and retire the identity it was bound to.
+
+        Deleting the credential is not enough. ``identities`` is a separate
+        store keyed on ``(provider, subject)`` — for local auth, the username
+        — and ``ensure_identity`` never upgrades or downgrades an existing
+        row. So without the second step the next holder of a freed username
+        binds to the deleted user's identity and inherits their admission,
+        their quota row and every row FK'd to that identity_id.
+
+        The identity is retired rather than deleted (its history and its
+        foreign keys must survive) and its natural key is retired with it, so
+        a later registration of the same username gets a FRESH identity rather
+        than being permanently refused at the admission wall.
+
+        Order: credential first. A retired identity whose credential deletion
+        then failed would lock out a user who still has a password; a deleted
+        credential whose identity retirement failed leaves an unreachable
+        identity that the next registration would inherit — worse, but it is
+        the ordering that fails safe for the person who is still using the
+        account, and the retirement is retried by the next delete.
+        """
         with self._connect() as conn:
-            return self._delete_user_rows(conn, user_id)
+            deleted = self._delete_user_rows(conn, user_id)
+        if deleted and self._retire_identity is not None:
+            self._retire_identity(user_id)
+        return deleted
 
     def list_users(self) -> list[LocalUserAccount]:
         """List every local account, ordered by user_id."""
@@ -915,8 +1006,18 @@ class LocalAuthProvider:
                 """,
                 (intent_id, user_id, token_hash, now, now),
             )
-            identity = UserIdentity(user_id=user_id, username=user_id)
-            access_token = self._issue_token(user_id, user_id)
+
+        # Outside the auth.db transaction, for the same reason as the open
+        # registration path: the identity write lands in a different database.
+        # Same wall. This is the path that actually fires in a
+        # ``registration_mode="email_verified"`` deployment, where admission
+        # defaults to pending: without it the user completes verification,
+        # receives a 200 with a token, and then every authenticated route
+        # refuses that token with an error they cannot distinguish from an
+        # expired session.
+        identity_id = self._admitted_identity_id(user_id)
+        identity = UserIdentity(user_id=identity_id, username=user_id)
+        access_token = self._issue_token(identity_id, user_id)
 
         try:
             record_token_issued(identity, access_token)
@@ -995,113 +1096,165 @@ class LocalAuthProvider:
         if not row[1]:
             raise AuthenticationError("Email verification required")
 
-        return self._issue_token(username, username)
+        # The credential was CORRECT; admission is a separate decision.
+        return self._issue_token(self._admitted_identity_id(username), username)
 
-    def _issue_token(self, user_id: str, username: str, *, issued_at: int | None = None) -> str:
-        now = int(time.time())
-        iat = now if issued_at is None else issued_at
-        payload = {
-            "sub": user_id,
-            "username": username,
-            "iat": iat,
-            "exp": now + self._token_expiry_hours * 3600,
-        }
-        token: str = jwt.encode(payload, self._secret_key, algorithm="HS256")
-        return token
+    @property
+    def _issuer(self) -> SessionTokenIssuer:
+        """The token issuer, or a refusal naming why there isn't one."""
+        if self._token_issuer is None:
+            raise LocalAuthSessionsUnavailable(
+                "This LocalAuthProvider was built for account administration and cannot issue or verify session tokens"
+            )
+        return self._token_issuer
 
-    async def refresh(self, user_id: str, username: str, *, original_iat: int) -> str:
-        """Issue a new JWT for an already-authenticated user.
+    def _admit(self, username: str) -> EnsureIdentityOutcome:
+        """Resolve this local username to its identity row.
 
-        Verifies the user still exists in the database — a deleted
-        user must not be able to obtain fresh tokens via refresh.
+        ``subject`` is the username: for local auth the credential store IS
+        the namespace, so the username is the stable per-provider subject.
 
-        Called by the token refresh route. Does NOT re-verify
-        credentials — the caller (get_current_user middleware)
-        has already validated the existing token.
+        Resolving is NOT admitting. Callers that are about to mint a token
+        must go through :meth:`_admitted_identity_id`, which is the one place
+        the D12 wall stands.
+        """
+        if self._admit_identity is None:
+            raise LocalAuthSessionsUnavailable("This LocalAuthProvider was built for account administration and has no identity substrate")
+        return self._admit_identity(
+            IdentityClaims(
+                provider="local",
+                subject=username,
+                username=username,
+            )
+        )
+
+    def _admitted_identity_id(self, username: str) -> str:
+        """Resolve the identity and refuse unless it may actually act.
+
+        THE SINGLE ADMISSION WALL. Every path that mints a token calls this,
+        not ``_admit``, because D12 is a property of ISSUANCE and not of
+        logging in: registration and email verification hand out a token too,
+        and a wall that only one of the three paths honours is not a wall.
+
+        Getting this wrong is quiet rather than loud. The issued token is
+        inert -- ``principal_is_active`` refuses it at authenticate and
+        refresh -- so the person is handed a credential that never works and
+        an error indistinguishable from an expired session, while a
+        ``token_issued`` row claims a token was issued to a principal that has
+        no admission. A false audit row is worse than a refusal.
+        """
+        admission = self._admit(username)
+        record = admission.record
+        if not record.is_active:
+            # Two states, two messages: the audit classifier keys on these
+            # prefixes, and waiting is a queue an administrator can clear
+            # while disabled is a decision already taken. Naming the state
+            # leaks nothing here -- the caller has already proven the
+            # credential, or just created it.
+            if record.access_state == "disabled":
+                raise IdentityDisabled
+            raise AccessPending
+        return record.identity_id
+
+    def _issue_token(self, identity_id: str, username: str, *, issued_at: int | None = None) -> str:
+        return self._issuer.mint(identity_id=identity_id, username=username, issued_at=issued_at)
+
+    async def refresh(self, token: str) -> str:
+        """Issue a successor token for an already-authenticated caller.
+
+        Takes the TOKEN, not decomposed claims. The chain bound used to be
+        enforced against an ``iat`` the route read from the middleware's
+        unverified decode; the issuer now reads it from its own verified
+        decode, so no unverified value reaches a security bound.
 
         Blocking sqlite work is offloaded to a bounded worker.
         """
-        return await run_sync_in_worker(self._refresh_sync, user_id, username, original_iat)
+        return await run_sync_in_worker(self._refresh_sync, token)
 
-    def _refresh_sync(self, user_id: str, username: str, original_iat: int | None) -> str:
-        """Synchronous refresh — called via run_sync_in_worker."""
-        now = int(time.time())
+    def _refresh_sync(self, token: str) -> str:
+        """Synchronous refresh — called via run_sync_in_worker.
 
-        # Max refresh chain: reject if the original token was issued too
-        # long ago.  This bounds how long a stolen token can be refreshed
-        # indefinitely without re-authentication.  Without a session DB
-        # (Sub-2c/2d), this is the only revocation-like mechanism.
-        if original_iat is None:
-            raise AuthenticationError("Token missing iat — please re-authenticate")
-        chain_age_hours = (now - original_iat) / 3600
-        if chain_age_hours > self._max_refresh_chain_hours:
-            raise AuthenticationError("Token refresh chain expired — please re-authenticate")
+        The issuer owns the chain bound and the identity check; what remains
+        here is the CREDENTIAL half, which only ``auth.db`` can answer: an
+        account deleted or un-verified since the token was minted must not be
+        renewable. Both halves must hold, and neither implies the other.
+        """
+        claims = self._issuer.decode(token)
+        if not self._credential_is_current(claims.username):
+            raise AuthenticationError("Invalid token")
+        return self._issuer.refresh(token)
 
+    def _credential_is_current(self, username: str) -> bool:
+        """Does a verified credential row still back this login?
+
+        Keyed by username, which for local auth IS the identity's ``subject``:
+        the credential store is the namespace, so ``_admit`` writes the same
+        value into both columns and they cannot diverge for this provider.
+        """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT email_verified FROM users WHERE user_id = ?",
-                (user_id,),
+                (username,),
             ).fetchone()
-        if row is None:
-            raise AuthenticationError("User not found")
-        if not row[0]:
-            raise AuthenticationError("Email verification required")
-
-        # Carry forward the original iat so the chain age accumulates.
-        # New logins get a fresh iat; refreshes preserve the original.
-        return self._issue_token(user_id, username, issued_at=original_iat)
+        return row is not None and bool(row[0])
 
     async def authenticate(self, token: str) -> UserIdentity:
-        """Validate a JWT and return the authenticated identity.
+        """Verify a session token and return the identity it authorises.
 
-        Raises AuthenticationError("Invalid token") on decode failure, expiry,
-        or if the user has been deleted since the token was issued.
+        THREE things must all hold, and each can fail independently:
+
+        1. the token is genuinely ours and unexpired (issuer);
+        2. the identity may still act -- not pending, not disabled (issuer,
+           through ``principal_is_active``);
+        3. a verified credential row still backs it (``auth.db``, here).
+
+        ``user_id`` on the returned identity is the ``identity_id``, not the
+        username. That is the value every ownership row points at.
+
+        ALL THREE run in ONE worker hop. Check 2 reaches the sessions store
+        through ``principal_is_active``, and that store is PostgreSQL in an
+        external-state deployment -- so leaving it on the event loop would put
+        a network round trip (two, with ``pool_pre_ping``) in front of every
+        authenticated request, and a pool-exhaustion wait would block the
+        whole ASGI worker rather than the one request. The credential read was
+        already offloaded; the identity read joins it rather than paying a
+        second hop. This is the shape ``_refresh_sync`` already uses.
         """
-        try:
-            payload = jwt.decode(token, self._secret_key, algorithms=["HS256"])
-        except PyJWTError as exc:
-            raise AuthenticationError("Invalid token") from exc
+        return await run_sync_in_worker(self._authenticate_sync, token)
 
-        user_id = _required_visible_string_claim(payload, "sub")
-        username = _required_visible_string_claim(payload, "username")
-
-        # Verify user still exists — deleted users must not retain access
-        exists = await run_sync_in_worker(self._user_exists, user_id)
-        if not exists:
+    def _authenticate_sync(self, token: str) -> UserIdentity:
+        """Verify token, admission, and credential together off the loop."""
+        claims = self._issuer.authenticate(token)
+        if not self._credential_is_current(claims.username):
             raise AuthenticationError("Invalid token")
-
         return UserIdentity(
-            user_id=user_id,
-            username=username,
+            user_id=claims.identity_id,
+            username=claims.username,
         )
 
-    def _user_exists(self, user_id: str) -> bool:
-        """Check if a verified user still exists in auth.db."""
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM users WHERE user_id = ? AND email_verified = 1",
-                (user_id,),
-            ).fetchone()
-            return row is not None
-
-    def _query_user(self, user_id: str) -> tuple[str, str | None] | None:
-        """Synchronous DB lookup — called via run_sync_in_worker."""
+    def _query_user(self, username: str) -> tuple[str, str | None] | None:
+        """Synchronous profile lookup by username — via run_sync_in_worker."""
         with self._connect() as conn:
             row: tuple[str, str | None] | None = conn.execute(
                 "SELECT display_name, email FROM users WHERE user_id = ?",
-                (user_id,),
+                (username,),
             ).fetchone()
             return row
 
     async def get_user_info(self, token: str) -> UserProfile:
-        """Decode the JWT, then query the users table for full profile.
+        """Verify the token, then read the profile from ``auth.db``.
+
+        Looked up by USERNAME, not by ``identity.user_id``. Since ``sub``
+        became the identity_id, the two are different values: ``auth.db`` is
+        keyed by username and knows nothing about identity ids, so passing
+        the identity_id here would miss every row.
 
         The DB query is offloaded to a thread to avoid blocking the
         event loop — sqlite3 is synchronous.
         """
         identity = await self.authenticate(token)
 
-        row = await run_sync_in_worker(self._query_user, identity.user_id)
+        row = await run_sync_in_worker(self._query_user, identity.username)
 
         if row is None:
             raise AuthenticationError("User not found")

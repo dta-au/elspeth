@@ -2,14 +2,16 @@
 
 Use this runbook when a run has durable sink debt, an effect lease expired, or
 an external call may have completed without its response reaching ELSPETH. It
-applies to Landscape schema epoch 36 and the `sink-effect-v1` protocol. A
+applies to Landscape schema epoch 37 and the `sink-effect-v1` protocol. A
 Landscape store still at epoch 31 or below predates aggregation result
 receipts, any store below epoch 33 predates the composite token-outcome
 access path, any store below epoch 34 predates the unified-lineage
 groundwork tables, and any store below epoch 35 predates the unified-lineage
 flip (tri-column lineage retirement — `token_lineage_frames`/`lineage_path_json`
 are the sole lineage truth). Any store below epoch 36 also lacks the required
-non-null lineage-group binding on coalesce effects. All are pre-1.0 recreate
+non-null lineage-group binding on coalesce effects, and any store below epoch
+37 predates the widened auth provider CHECK constraints on `auth_events` and
+`run_attributions`. All are pre-1.0 recreate
 boundaries: recreate the store
 (see [Staging Session DB Recreation](staging-session-db-recreation.md)) rather
 than running recovery against a stale schema.

@@ -17,7 +17,8 @@ from typing import Any, Literal
 import structlog
 from sqlalchemy import Engine, create_engine, text
 
-from elspeth.web.config import WebSettings
+from elspeth.web.auth.providers import PROFILE_REGISTRY, registered_provider_names
+from elspeth.web.config import WebSettings, configured_auth_settings
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
 from elspeth.web.paths import managed_blob_directory
 from elspeth.web.schema_probe import (
@@ -311,18 +312,36 @@ def _check_blob_dir(settings: WebSettings) -> _ProbeResult:
 
 
 def _check_auth_mode(settings: WebSettings) -> ReadinessCheck:
+    """Report whether the ACTIVE profile has everything it needs.
+
+    Driven entirely by the profile registry: there is no per-provider branch
+    here, so adding an IdP cannot leave readiness silently reporting an
+    unconfigured deployment as ready. The previous form was a hand-written
+    if/elif over the three providers that existed when it was written, which
+    meant a fifth provider fell through to "unsupported" — and the ECS runbook
+    gates its traffic cutover on this check.
+
+    The detail names each MISSING field, because an operator reading a
+    not-ready readiness response has no other way to find out which of eight
+    settings they left out of the task definition.
+    """
     # Treat the runtime value as open even though validated settings narrow it
     # statically; readiness is a total boundary if state is corrupted/mocked.
     provider = str(settings.auth_provider)
     if provider == "local":
         return ReadinessCheck("auth_mode", True, "local authentication configured")
-    if provider == "oidc":
-        ok = all((settings.oidc_issuer, settings.oidc_audience, settings.oidc_client_id))
-        return ReadinessCheck("auth_mode", ok, "OIDC authentication configured" if ok else "OIDC configuration incomplete")
-    if provider == "entra":
-        ok = all((settings.entra_tenant_id, settings.oidc_audience, settings.oidc_client_id))
-        return ReadinessCheck("auth_mode", ok, "Entra authentication configured" if ok else "Entra configuration incomplete")
-    return ReadinessCheck("auth_mode", False, "unsupported authentication provider")
+    if provider not in PROFILE_REGISTRY:
+        return ReadinessCheck(
+            "auth_mode",
+            False,
+            f"unsupported authentication provider (registered: {', '.join(registered_provider_names())})",
+        )
+    profile = PROFILE_REGISTRY[provider]
+    configured = configured_auth_settings(settings)
+    missing = [name for name in profile.required_settings if not configured[name]]
+    if missing:
+        return ReadinessCheck("auth_mode", False, f"{provider} configuration incomplete: missing {', '.join(missing)}")
+    return ReadinessCheck("auth_mode", True, f"{provider} authentication configured")
 
 
 def _finalize(checks: tuple[ReadinessCheck, ...]) -> ReadinessReport:
